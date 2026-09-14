@@ -1292,13 +1292,8 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         match &acc.usage {
             Some(u) if !u.limits.is_empty() => {
                 for limit in &u.limits {
-                    let (pct, live) = ClaudeWatch::display_percent(acc, limit, now);
-                    let resets = acc.live.as_ref().and_then(|l| match limit.kind.as_str() {
-                        "session" => l.five_hour_resets,
-                        "weekly_all" => l.seven_day_resets,
-                        _ => None,
-                    });
-                    usage_bar(ui, limit, pct, live, resets, now, dim, fg, c);
+                    let read = ClaudeWatch::reading(acc, limit, now);
+                    usage_bar(ui, limit, read, now, dim, fg, c);
                 }
             }
             _ => {
@@ -1320,19 +1315,17 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
 fn usage_bar(
     ui: &mut Ui,
     limit: &giverny_claude::usage::LimitEntry,
-    pct: f64,
-    live: bool,
-    // A reset time from the live push, for a window whose cached one lapsed.
-    live_resets: Option<jiff::Timestamp>,
+    read: crate::claude_watch::Reading,
     now: jiff::Timestamp,
     dim: Color32,
     fg: Color32,
     c: crate::chrome::Chrome,
 ) {
+    let pct = read.percent;
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
     let p = ui.painter_at(rect);
-    let color = if limit.critical() || pct >= 95.0 {
+    let color = if read.critical {
         c.poppy
     } else if pct >= 80.0 {
         c.amber
@@ -1366,8 +1359,9 @@ fn usage_bar(
         }
     }
     // Numbers. A leading dot marks a value pushed live by the statusline.
-    let mut right = format!("{}{:>3.0}%", if live { "·" } else { " " }, pct);
-    if let Some(cd) = countdown(limit, live_resets, now) {
+    let mut right = format!("{}{:>3.0}%", if read.live { "·" } else { " " }, pct);
+    if let Some(at) = read.resets {
+        let cd = giverny_claude::usage::countdown_to(at, now);
         right = format!("{right} {cd:>6}");
     }
     p.text(
@@ -1375,25 +1369,8 @@ fn usage_bar(
         Align2::RIGHT_CENTER,
         right,
         FontId::monospace(9.0),
-        if limit.critical() { c.poppy } else { dim },
+        if read.critical { c.poppy } else { dim },
     );
-}
-
-/// How long until this window renews, or `None` if nothing knows.
-///
-/// The push's reset time first: it comes from the running Claude, while the
-/// cache can be hours old — and a cache that has fallen behind the window it
-/// describes claims the reset already happened, which is why this line went
-/// missing for anyone whose cache refresh was failing.
-fn countdown(
-    limit: &giverny_claude::usage::LimitEntry,
-    live_resets: Option<jiff::Timestamp>,
-    now: jiff::Timestamp,
-) -> Option<String> {
-    live_resets
-        .filter(|at| *at > now)
-        .map(|at| giverny_claude::usage::countdown_to(at, now))
-        .or_else(|| limit.reset_countdown(now))
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -1407,36 +1384,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_lapsed_cache_does_not_silence_the_countdown() {
-        let now: jiff::Timestamp = "2025-10-09T12:00:00Z".parse().unwrap();
-        let limit = |resets: &str| -> giverny_claude::usage::LimitEntry {
-            serde_json::from_str(&format!(
-                r#"{{"kind":"session","percent":40,"severity":"normal","is_active":true,"resets_at":"{resets}"}}"#
-            ))
-            .unwrap()
-        };
-        let at = |s: &str| -> jiff::Timestamp { s.parse().unwrap() };
-
-        // Cache still ahead of the clock: it answers.
-        let l = limit("2025-10-09T14:30:00Z");
-        assert_eq!(countdown(&l, None, now).as_deref(), Some("2h30m"));
-        // Cache behind the window it describes — the case that left the line
-        // blank — and a push that knows better.
-        let l = limit("2025-10-09T09:00:00Z");
-        assert_eq!(countdown(&l, None, now), None);
-        assert_eq!(
-            countdown(&l, Some(at("2025-10-09T13:05:00Z")), now).as_deref(),
-            Some("1h05m")
-        );
-        // A push is fresher than the cache, so it wins even when both are live.
-        let l = limit("2025-10-09T14:30:00Z");
-        assert_eq!(
-            countdown(&l, Some(at("2025-10-09T12:20:00Z")), now).as_deref(),
-            Some("20m")
-        );
-    }
 
     #[test]
     fn a_repository_is_named_by_its_directory() {

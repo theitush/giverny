@@ -63,7 +63,9 @@ impl LimitEntry {
         }
     }
 
-    fn resets_at_ts(&self) -> Option<jiff::Timestamp> {
+    /// When this window renews, as the cache last understood it. In the past
+    /// for a window that lapsed while the cache was not being refreshed.
+    pub fn resets_at_ts(&self) -> Option<jiff::Timestamp> {
         self.resets_at.as_deref()?.parse().ok()
     }
 

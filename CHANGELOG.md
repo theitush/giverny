@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.7 — 2026-09-14
+
+- A usage bar is red when the limit is nearly out, not when the cache last
+  saw it nearly out. The percentage on screen comes from the status line push
+  whenever the on-disk cache has fallen behind, but the colour was still the
+  cache's severity, so a week 21% used came up red because the cache was
+  holding the last thing it managed to fetch. A window is read from one source
+  or the other, never half from each — and a cache still describing the window
+  it is in keeps its say.
+
 ## v0.7.6 — 2026-09-11
 
 - Claude resumes the conversation instead of opening at the first-run prompt.

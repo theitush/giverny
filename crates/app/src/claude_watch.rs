@@ -55,6 +55,23 @@ pub struct AccountPanel {
     pub statusline_on: bool,
 }
 
+/// One usage bar's numbers, taken from whichever source is freshest.
+///
+/// The cache and the statusline push disagree whenever the cache has stopped
+/// being refreshed, and they have to be read as a set: a percentage from the
+/// push beside a severity from the cache is how a week 21% used came up red,
+/// the cache still holding the last thing it managed to fetch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reading {
+    pub percent: f64,
+    /// The percentage came from a statusline push rather than the cache.
+    pub live: bool,
+    /// Out, or nearly. Red.
+    pub critical: bool,
+    /// When the window renews, if anything still knows.
+    pub resets: Option<jiff::Timestamp>,
+}
+
 /// Where an account's displayed numbers came from, and how old they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
@@ -973,33 +990,49 @@ impl ClaudeWatch {
         }
     }
 
-    /// Percent to display for one bucket: the statusline push when it is
-    /// fresher than the on-disk cache, else the cache value.
-    pub fn display_percent(
+    /// What one bar should show: the statusline push where it is fresher than
+    /// the on-disk cache, the cache otherwise.
+    pub fn reading(
         acc: &AccountPanel,
         limit: &giverny_claude::usage::LimitEntry,
         now: jiff::Timestamp,
-    ) -> (f64, bool) {
-        let cached = limit.effective_percent(now);
-        let Some(live) = &acc.live else {
-            return (cached, false);
+    ) -> Reading {
+        let pushed = acc.live.as_ref().filter(|live| {
+            let cache_age_ms = acc
+                .usage
+                .as_ref()
+                .map(|u| (now.as_millisecond() - u.fetched_at_ms as i64).max(0))
+                .unwrap_or(i64::MAX);
+            (live.at.elapsed().as_millis() as i64) < cache_age_ms
+        });
+        let window = |pick: fn(&LiveUsage) -> Option<f64>,
+                      reset: fn(&LiveUsage) -> Option<jiff::Timestamp>| {
+            (
+                pushed.and_then(pick).map(|p| p.clamp(0.0, 100.0)),
+                pushed.and_then(reset).filter(|at| *at > now),
+            )
         };
-        let cache_age_ms = acc
-            .usage
-            .as_ref()
-            .map(|u| (now.as_millisecond() - u.fetched_at_ms as i64).max(0))
-            .unwrap_or(i64::MAX);
-        if live.at.elapsed().as_millis() as i64 >= cache_age_ms {
-            return (cached, false);
-        }
-        let fresh = match limit.kind.as_str() {
-            "session" => live.five_hour,
-            "weekly_all" => live.seven_day,
-            _ => None,
+        let (fresh, pushed_reset) = match limit.kind.as_str() {
+            "session" => window(|l| l.five_hour, |l| l.five_hour_resets),
+            "weekly_all" => window(|l| l.seven_day, |l| l.seven_day_resets),
+            // A scoped window (one model's own allowance) is not in the push.
+            _ => (None, None),
         };
-        match fresh {
-            Some(p) => (p.clamp(0.0, 100.0), true),
-            None => (cached, false),
+        let percent = fresh.unwrap_or_else(|| limit.effective_percent(now));
+        // The cache's severity describes the cache's percentage. Where that is
+        // not the number being shown — a push took over, or the window it
+        // measured has since lapsed — the number on screen decides for itself.
+        let speaks_for_itself = fresh.is_some() || limit.rolled_over(now);
+        Reading {
+            percent,
+            live: fresh.is_some(),
+            critical: percent >= 95.0 || (!speaks_for_itself && limit.critical()),
+            // The push's reset time first: it comes from the running Claude,
+            // while the cache can be hours old — and a cache that has fallen
+            // behind the window it describes claims the reset already
+            // happened, which is why this line went missing for anyone whose
+            // cache refresh was failing.
+            resets: pushed_reset.or_else(|| limit.resets_at_ts().filter(|at| *at > now)),
         }
     }
 
@@ -1318,11 +1351,107 @@ mod tests {
         };
 
         // Stale cache + fresh push ⇒ push wins and is flagged live.
-        let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, Some(77.0)), &limit, now);
-        assert_eq!((pct, is_live), (77.0, true));
+        let read = ClaudeWatch::reading(&mk(120, Some(77.0)), &limit, now);
+        assert_eq!((read.percent, read.live), (77.0, true));
         // No push ⇒ cache value, not flagged.
-        let (pct, is_live) = ClaudeWatch::display_percent(&mk(120, None), &limit, now);
-        assert_eq!((pct, is_live), (5.0, false));
+        let read = ClaudeWatch::reading(&mk(120, None), &limit, now);
+        assert_eq!((read.percent, read.live), (5.0, false));
+    }
+
+    /// An account whose cache has stopped being refreshed, which is every
+    /// account whose `claude` Giverny cannot run: the statusline push is the
+    /// only thing still telling the truth, and the cache holds whatever it
+    /// last managed to fetch.
+    #[test]
+    fn a_stale_cache_decides_nothing_the_push_has_answered() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now: jiff::Timestamp = "2025-10-09T12:00:00Z".parse().unwrap();
+        let at = |s: &str| -> jiff::Timestamp { s.parse().unwrap() };
+        // What his cache still held: a week that ran out, days ago.
+        let limit: LimitEntry = serde_json::from_str(
+            r#"{"kind":"weekly_all","percent":97,"severity":"critical","is_active":true,
+                "resets_at":"2025-10-06T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let mk = |cache_age_min: i64, live: Option<LiveUsage>| AccountPanel {
+            profile: Profile {
+                name: "a".into(),
+                config_dir: PathBuf::from("/tmp/x"),
+                email: None,
+                account_uuid: None,
+            },
+            usage: Some(AccountUsage {
+                fetched_at_ms: (now.as_millisecond() - cache_age_min * 60_000) as u64,
+                limits: vec![],
+            }),
+            live,
+            statusline_on: true,
+        };
+        let push = |percent: f64, resets: Option<&str>| LiveUsage {
+            at: Instant::now(),
+            five_hour: None,
+            seven_day: Some(percent),
+            five_hour_resets: None,
+            seven_day_resets: resets.map(at),
+        };
+
+        // The bar ita saw red at 21%: the percentage was the push's, the
+        // colour the cache's. One source answers for a window, or none does.
+        let read = ClaudeWatch::reading(
+            &mk(4_000, Some(push(21.0, Some("2025-10-12T13:00:00Z")))),
+            &limit,
+            now,
+        );
+        assert_eq!(
+            (read.percent, read.live, read.critical),
+            (21.0, true, false)
+        );
+        assert_eq!(read.resets, Some(at("2025-10-12T13:00:00Z")));
+
+        // Still critical when the number itself says so.
+        let read = ClaudeWatch::reading(&mk(4_000, Some(push(99.0, None))), &limit, now);
+        assert!(read.critical);
+
+        // No push at all: the window the cache measured has lapsed, so it
+        // reports neither its percentage nor its severity nor its reset.
+        let read = ClaudeWatch::reading(&mk(4_000, None), &limit, now);
+        assert_eq!(
+            (read.percent, read.live, read.critical),
+            (0.0, false, false)
+        );
+        assert_eq!(read.resets, None);
+    }
+
+    /// A cache that is still describing the window it is in keeps its say.
+    #[test]
+    fn a_current_cache_is_believed() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now: jiff::Timestamp = "2025-10-09T12:00:00Z".parse().unwrap();
+        let limit: LimitEntry = serde_json::from_str(
+            r#"{"kind":"weekly_all","percent":88,"severity":"critical","is_active":true,
+                "resets_at":"2025-10-09T14:30:00Z"}"#,
+        )
+        .unwrap();
+        let acc = AccountPanel {
+            profile: Profile {
+                name: "a".into(),
+                config_dir: PathBuf::from("/tmp/x"),
+                email: None,
+                account_uuid: None,
+            },
+            usage: Some(AccountUsage {
+                fetched_at_ms: (now.as_millisecond() - 60_000) as u64,
+                limits: vec![],
+            }),
+            live: None,
+            statusline_on: true,
+        };
+        let read = ClaudeWatch::reading(&acc, &limit, now);
+        assert_eq!(
+            (read.percent, read.live, read.critical),
+            (88.0, false, true)
+        );
+        assert_eq!(read.resets, Some("2025-10-09T14:30:00Z".parse().unwrap()));
     }
 
     #[test]
