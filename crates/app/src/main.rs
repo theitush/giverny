@@ -2384,9 +2384,20 @@ impl App {
                     .flatten()
             });
         let Some(distro) = distro else {
+            // A default account is named by not naming it — the same rule the
+            // distribution branch below follows, and for the same reason.
+            // `GIVERNY_PROFILE_DIR` carries the attribution instead, so a hook
+            // still says which account its session ran under.
+            let (config_dir, profile_dir) = match &profile_dir {
+                Some(dir) if !giverny_claude::profiles::must_be_named(dir) => (None, profile_dir),
+                _ => (profile_dir.clone(), profile_dir),
+            };
+            if let Some(dir) = &profile_dir {
+                env.push(("GIVERNY_PROFILE_DIR".into(), dir.display().to_string()));
+            }
             return TabShape {
                 shell,
-                config_dir: profile_dir,
+                config_dir,
                 env,
                 in_wsl: false,
             };
@@ -3071,6 +3082,18 @@ fn doctor() {
             }
             None => println!("    usage      no cache yet — run /usage once in this account"),
         }
+        // What Giverny runs to move those numbers. Everything about it is
+        // inferred — where claude is, whether the account is named, which
+        // side of the WSL boundary it is on — so when the cache stops ageing
+        // backwards this is the line to try by hand.
+        match usage::refresh_describe(&p.config_dir) {
+            Ok(cmd) => println!("    refresh    {cmd}"),
+            Err(e) => println!("    refresh    CANNOT — {e}"),
+        }
+        println!(
+            "    writes to  {}",
+            profiles::identity_path(&p.config_dir).display()
+        );
     }
 
     restore_report(&profs);

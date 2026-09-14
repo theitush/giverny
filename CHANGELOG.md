@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.8 — 2026-09-14
+
+- The usage cache refreshes again, on every platform. Giverny asks Claude Code
+  to refresh by running `claude -p /usage` with `CLAUDE_CONFIG_DIR` naming the
+  account — and that variable also moves the file Claude Code keeps its state
+  in, which is the file the usage cache lives in. For a default account that
+  sent the fresh numbers *inside* `~/.claude`, while the bars kept reading
+  `~/.claude.json` beside it, where a default account's cache actually lives.
+  The refresh worked, reported success, and changed nothing anyone could see;
+  the numbers only moved when Claude Code was run some other way. A default
+  account is no longer named — not for the refresh, and not for a tab.
+
+- `giverny doctor` prints the refresh command it would run for each account,
+  and the file that command writes to.
+
 ## v0.7.7 — 2026-09-14
 
 - A usage bar is red when the limit is nearly out, not when the cache last

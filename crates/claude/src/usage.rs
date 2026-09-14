@@ -173,12 +173,27 @@ fn first_program_in(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<std::
     })
 }
 
+/// Name the account for the refresh, unless naming it would send the answer
+/// somewhere we will not read it.
+///
+/// `CLAUDE_CONFIG_DIR` moves the file Claude Code keeps its state in — and the
+/// usage cache is in that file. Point it at a default account and the refresh
+/// works, writes `cachedUsageUtilization` *inside* `~/.claude`, and the bars
+/// keep showing whatever is in `~/.claude.json`, which is where a default
+/// account's cache lives and what `read` above looks at. Nothing reports an
+/// error; the numbers simply never move.
+fn name_account(cmd: &mut std::process::Command, config_dir: &Path) {
+    if crate::profiles::must_be_named(config_dir) {
+        cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+}
+
 /// The command that asks Claude Code to refresh one account's cache, with
 /// the account already named.
 ///
-/// Unix needs nothing: `execvp` searches `$PATH` and the environment carries
-/// the config dir. Windows needs both halves spelled out — see the Windows
-/// implementation below.
+/// Unix needs nothing else: `execvp` searches `$PATH` and the environment
+/// carries the config dir. Windows needs both halves spelled out — see the
+/// Windows implementation below.
 #[cfg(not(windows))]
 fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
     // By path, not by name: `execvp` searches the `$PATH` this process has,
@@ -187,7 +202,7 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
         anyhow::anyhow!("claude is not on $PATH or in any known install location")
     })?;
     let mut cmd = std::process::Command::new(program);
-    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    name_account(&mut cmd, config_dir);
     Ok(cmd)
 }
 
@@ -239,12 +254,15 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
             anyhow::bail!("claude is not installed in WSL ({distro})");
         };
         let mut cmd = crate::wsl::command(&distro);
+        cmd.arg("--");
         // `env` rather than `Command::env`: a Windows environment does not
-        // reach a process inside the distribution.
-        cmd.arg("--")
-            .arg("env")
-            .arg(format!("CLAUDE_CONFIG_DIR={unix_dir}"))
-            .arg(bin);
+        // reach a process inside the distribution. And only for an account
+        // that must be named — see `name_account` above for what naming the
+        // default one costs.
+        if crate::profiles::must_be_named(config_dir) {
+            cmd.arg("env").arg(format!("CLAUDE_CONFIG_DIR={unix_dir}"));
+        }
+        cmd.arg(bin);
         return Ok(cmd);
     }
 
@@ -265,8 +283,31 @@ fn refresh_command(config_dir: &Path) -> anyhow::Result<std::process::Command> {
     } else {
         Command::new(exe)
     };
-    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    name_account(&mut cmd, config_dir);
     Ok(cmd)
+}
+
+/// The refresh command as a line someone can run themselves, for `giverny
+/// doctor`. Everything about this command is inferred — where `claude` is,
+/// whether the account is named, which side of the WSL boundary it is on —
+/// and when the numbers do not move, the first question is what was run.
+pub fn refresh_describe(config_dir: &Path) -> anyhow::Result<String> {
+    let cmd = refresh_command(config_dir)?;
+    let mut line = cmd.get_program().to_string_lossy().into_owned();
+    for arg in cmd.get_args() {
+        line.push(' ');
+        line.push_str(&arg.to_string_lossy());
+    }
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            line = format!(
+                "{}={} {line}",
+                key.to_string_lossy(),
+                value.to_string_lossy()
+            );
+        }
+    }
+    Ok(format!("{line} -p /usage"))
 }
 
 /// Ask Claude Code to refresh its own usage cache for one account.
@@ -363,6 +404,37 @@ pub fn age_minutes(usage: &AccountUsage, now: jiff::Timestamp) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why every account's numbers could sit six days old with nothing in the
+    /// log: the refresh named the account, Claude Code wrote the cache into
+    /// the directory it was handed, and `read` above looks beside it.
+    #[test]
+    fn a_default_account_is_not_named_for_the_refresh() {
+        let root = std::env::temp_dir().join(format!("giverny-refresh-{}", std::process::id()));
+        let home = root.join("home").join("ita");
+        let named = |dir: &Path| {
+            let mut cmd = std::process::Command::new("true");
+            name_account(&mut cmd, dir);
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+
+        let default = home.join(".claude");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.with_extension("json"), "{}").unwrap();
+        assert_eq!(named(&default), None, "a default account names itself");
+
+        let profile = home.join(".claude-work");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            named(&profile),
+            Some(Some(profile.display().to_string())),
+            "a profile is only reachable by name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     const FIXTURE: &str = r#"{
       "oauthAccount": { "emailAddress": "x@y.z" },
