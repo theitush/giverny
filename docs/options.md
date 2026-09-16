@@ -23,4 +23,4 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.skip_resume_summary` | `false` | Skip Claude Code's offer to resume from a summary, and resume the full session. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
-| `update.check` | `true` | Ask GitHub once a day whether a newer Giverny exists. |
+| `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |

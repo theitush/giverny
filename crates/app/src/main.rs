@@ -432,6 +432,8 @@ pub enum Action {
     /// Run the official install command in a visible tab.
     RunUpdate,
     DismissUpdate,
+    /// Hand over to the version the installer just put on disk.
+    RestartNow,
     ToggleSettings,
     ToggleKeys,
     /// Write one option back to config.toml and apply it now.
@@ -624,6 +626,11 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    /// The installer replaces the binary under the running process; these say
+    /// when to offer the restart that picks it up.
+    exe_mtime: Option<std::time::SystemTime>,
+    update_ran: bool,
+    pub update_installed: bool,
     /// Theme-derived colours for Giverny's own chrome.
     pub chrome: chrome::Chrome,
     pub settings: Option<settings_ui::SettingsState>,
@@ -934,15 +941,22 @@ impl App {
         // Update check runs on its own thread so a slow network never
         // delays startup; the UI picks the answer up when it lands.
         let update_rx = if cfg.update.check {
-            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (tx, rx) = crossbeam_channel::unbounded();
             let base = paths.base().to_path_buf();
             let ping = cc.egui_ctx.clone();
             std::thread::Builder::new()
                 .name("giverny update check".into())
                 .spawn(move || {
-                    let found = update::check(&base, true);
-                    let _ = tx.send(found);
-                    ping.request_repaint();
+                    // Keep asking. A window left open for a fortnight used to
+                    // check once, at startup, and never again.
+                    loop {
+                        let found = update::check(&base, true);
+                        if tx.send(found).is_err() {
+                            return;
+                        }
+                        ping.request_repaint();
+                        std::thread::sleep(Duration::from_secs(update::CHECK_INTERVAL_SECS));
+                    }
                 })
                 .ok()
                 .map(|_| rx)
@@ -1012,6 +1026,9 @@ impl App {
             update: None,
             update_rx,
             update_dismissed: false,
+            exe_mtime: update::binary_mtime(),
+            update_ran: false,
+            update_installed: false,
             chrome,
             settings: None,
             keys_overlay: None,
@@ -1439,9 +1456,25 @@ impl App {
                         ));
                     }
                 }
+                self.update_ran = true;
                 self.update_dismissed = true;
             }
             Action::DismissUpdate => self.update_dismissed = true,
+            Action::RestartNow => {
+                // Everything worth keeping is on disk already: the workspace
+                // saves itself as it goes, and a restored tab resumes its
+                // conversation. Hand over to the new binary and go.
+                self.closing = true;
+                self.persist_all();
+                let exe = std::env::current_exe().unwrap_or_else(|_| "giverny".into());
+                match std::process::Command::new(exe)
+                    .args(std::env::args_os().skip(1))
+                    .spawn()
+                {
+                    Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(err) => tracing::warn!("cannot start the new version: {err}"),
+                }
+            }
         }
     }
 
@@ -2176,11 +2209,21 @@ impl App {
         }
         self.last_info_refresh = Instant::now();
         self.snapshot_stalest_tab();
-        if let Some(rx) = &self.update_rx
-            && let Ok(found) = rx.try_recv()
-        {
-            self.update = found;
-            self.update_rx = None;
+        if let Some(rx) = &self.update_rx {
+            while let Ok(found) = rx.try_recv() {
+                // A dismissed banner stays dismissed until a *newer* version
+                // than the one waved away turns up.
+                if found.as_ref().map(|f| &f.version) != self.update.as_ref().map(|u| &u.version) {
+                    self.update_dismissed = false;
+                }
+                self.update = found;
+            }
+        }
+        // While an install is running in its tab, watch for the binary being
+        // replaced: that is the moment a restart has something to pick up.
+        if self.update_ran && !self.update_installed {
+            self.update_installed =
+                update::binary_mtime().is_some_and(|at| Some(at) != self.exe_mtime);
         }
         self.persist_font_size();
         self.track_foreground();

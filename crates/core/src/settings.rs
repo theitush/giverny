@@ -428,7 +428,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "update.check",
         label: "check for updates",
         section: Section::Updates,
-        doc: "Ask GitHub once a day whether a newer Giverny exists.",
+        doc: "Ask GitHub whether a newer Giverny exists, hourly while it is open.",
         note: &[
             "The only network request Giverny ever makes - set false and it",
             "makes none. GIVERNY_NO_UPDATE in the environment also disables it.",

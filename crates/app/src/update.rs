@@ -3,7 +3,7 @@
 //! This is the *only* network request Giverny ever makes: a GET to GitHub's
 //! releases API to compare the latest tag against this build. It is
 //! disclosed, disableable (`[update] check = false`, or `GIVERNY_NO_UPDATE`),
-//! throttled to once a day, and sends nothing but a User-Agent. Claude's
+//! throttled to once an hour, and sends nothing but a User-Agent. Claude's
 //! APIs are never contacted and credentials are never read — that promise is
 //! unconditional and separate from this.
 
@@ -17,8 +17,11 @@ pub const REPO_URL: &str = "https://github.com/y0av/giverny";
 const RELEASES_API: &str = "https://api.github.com/repos/y0av/giverny/releases/latest";
 const INSTALL_SH: &str = "https://github.com/y0av/giverny/releases/latest/download/install.sh";
 const INSTALL_PS1: &str = "https://github.com/y0av/giverny/releases/latest/download/install.ps1";
-/// One check per day is plenty for a terminal you leave open for weeks.
-const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// How often to ask, while the window is open. Once a day was too rare to be
+/// useful: a terminal stays open for weeks, the check only ran at startup, and
+/// a release published this morning went unmentioned until some restart days
+/// later. One request an hour is still nothing.
+pub const CHECK_INTERVAL_SECS: u64 = 60 * 60;
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
@@ -156,6 +159,18 @@ fn available_from(latest: &str) -> Option<Available> {
     })
 }
 
+/// When this binary was last written.
+///
+/// The installer replaces the file under the running process, so a change
+/// here is the update having landed — the moment there is something a restart
+/// would pick up. Watching the file beats reading the installer's output,
+/// which is a terminal's worth of text in whatever shell the user runs.
+pub fn binary_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(std::env::current_exe().ok()?)
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// The command the update button runs — in a visible terminal tab, so the
 /// user watches exactly what touches their machine.
 pub fn install_command() -> String {
@@ -169,6 +184,12 @@ pub fn install_command() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restart offer waits on this: no timestamp, no offer.
+    #[test]
+    fn the_running_binary_has_a_timestamp() {
+        assert!(binary_mtime().is_some());
+    }
 
     #[test]
     fn version_ordering() {

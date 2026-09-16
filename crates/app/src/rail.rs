@@ -1060,9 +1060,32 @@ fn tab_row(
     rect
 }
 
-/// Offer the new release, if the daily check found one.
+/// Offer the new release the hourly check found, and then the restart that
+/// finishes it.
+///
+/// It was a line of 10px text with a small button beside it, in a rail full of
+/// small text, and it went unseen for versions at a time. A release nobody
+/// installs is a release nobody has.
 fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     let c = app.chrome;
+    // The installer has already replaced the binary: the only thing left is
+    // handing over to it, and that offer outlives any dismissal.
+    if app.update_installed {
+        let version = app.update.as_ref().map(|u| u.version.as_str());
+        banner_button(
+            ui,
+            &match version {
+                Some(v) => format!("⟳ restart to finish v{v}"),
+                None => "⟳ restart to finish the update".into(),
+            },
+            c.amber,
+            c.panel,
+            "the new version is on disk.\nthis closes every tab and opens them again,\nresuming the claude sessions in them",
+            actions,
+            Action::RestartNow,
+        );
+        return;
+    }
     let Some(available) = &app.update else { return };
     if app.update_dismissed {
         return;
@@ -1070,23 +1093,61 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(format!("▲ v{} available", available.version))
-                .font(FontId::monospace(10.0))
-                .color(c.accent),
+        let width = (ui.available_width() - 28.0).max(60.0);
+        let button = egui::Button::new(
+            egui::RichText::new(format!("▲ update to v{}", available.version))
+                .font(FontId::monospace(11.5))
+                .color(c.panel),
         )
-        .on_hover_text(available.url.clone());
+        .fill(c.accent)
+        .corner_radius(4.0);
         if ui
-            .small_button("update")
-            .on_hover_text(
-                "opens a tab and runs the official install command,\nso you see exactly what runs",
-            )
+            .add_sized(Vec2::new(width, 22.0), button)
+            .on_hover_text(format!(
+                "{}\n\nopens a tab and runs the official install command,\nso you see exactly what runs",
+                available.url
+            ))
             .clicked()
         {
             actions.push(Action::RunUpdate);
         }
-        if ui.small_button("×").clicked() {
+        if ui
+            .small_button("×")
+            .on_hover_text("not now")
+            .clicked()
+        {
             actions.push(Action::DismissUpdate);
+        }
+    });
+}
+
+/// One button across the width of the rail.
+fn banner_button(
+    ui: &mut Ui,
+    text: &str,
+    fill: Color32,
+    ink: Color32,
+    hover: &str,
+    actions: &mut Vec<Action>,
+    action: Action,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let width = (ui.available_width() - 6.0).max(60.0);
+        let button = egui::Button::new(
+            egui::RichText::new(text)
+                .font(FontId::monospace(11.5))
+                .color(ink),
+        )
+        .fill(fill)
+        .corner_radius(4.0);
+        if ui
+            .add_sized(Vec2::new(width, 22.0), button)
+            .on_hover_text(hover)
+            .clicked()
+        {
+            actions.push(action);
         }
     });
 }

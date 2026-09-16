@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.3 — 2026-09-16
+
+- Giverny notices a new release while it is open. The check ran once, at
+  startup, and no more than once a day, so a release published this morning
+  went unmentioned until some restart days later. It now asks once an hour for
+  as long as the window is open.
+
+- The offer is a button across the rail, not a line of 10px text in a rail
+  already full of small text.
+
+- Once the installer has replaced the binary, the banner turns into "restart to
+  finish". One click hands over to the new version: tabs come back where they
+  were, and the Claude sessions in them resume.
+
 ## v0.8.2 — 2026-09-16
 
 - The settings screen wraps a list of choices onto as many lines as it needs.
