@@ -9,7 +9,7 @@ use giverny_core::state::RailView;
 use giverny_core::tabs::{CategoryId, TabId};
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
-use crate::{Action, App, RenameTarget, category_color};
+use crate::{Action, App, RenameTarget};
 
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
@@ -140,7 +140,7 @@ fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
 
 /// A repository always gets the same colour, whichever order the groups come
 /// out in and whichever machine it is on.
-fn repo_color(path: Option<&Path>) -> Color32 {
+fn repo_color(chrome: &crate::chrome::Chrome, path: Option<&Path>) -> Color32 {
     let Some(path) = path else {
         return Color32::GRAY;
     };
@@ -149,7 +149,7 @@ fn repo_color(path: Option<&Path>) -> Color32 {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    category_color(hash as usize)
+    chrome.category(hash as usize)
 }
 
 /// The rail's rows, grouped the way the user asked for.
@@ -160,7 +160,7 @@ fn groups(app: &App) -> Vec<GroupData> {
             .categories
             .iter()
             .map(|c| {
-                let color = category_color(c.color_index);
+                let color = app.chrome.category(c.color_index);
                 let rows: Vec<RowData> = app
                     .ws
                     .tabs_in(c.id)
@@ -202,7 +202,7 @@ fn groups(app: &App) -> Vec<GroupData> {
             });
             keys.into_iter()
                 .map(|key| {
-                    let color = repo_color(key.as_deref());
+                    let color = repo_color(&app.chrome, key.as_deref());
                     let rows: Vec<RowData> = app
                         .ws
                         .tabs
@@ -660,8 +660,8 @@ fn category_header(
         });
         ui.menu_button("color", |ui| {
             ui.horizontal(|ui| {
-                for (i, c) in crate::CATEGORY_PALETTE.iter().enumerate() {
-                    let btn = egui::Button::new("  ").fill(*c).corner_radius(3.0);
+                for (i, colour) in c.cats.iter().enumerate() {
+                    let btn = egui::Button::new("  ").fill(*colour).corner_radius(3.0);
                     if ui.add_sized(Vec2::splat(18.0), btn).clicked() {
                         actions.push(Action::SetCategoryColor(id, i));
                         ui.close();
@@ -922,7 +922,7 @@ fn tab_row(
             if row.exited {
                 p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
             } else {
-                p.circle_filled(dot, 3.5, Color32::from_rgb(0x7b, 0xa2, 0x5a));
+                p.circle_filled(dot, 3.5, c.green);
             }
         }
     }
@@ -1400,9 +1400,11 @@ mod tests {
     fn a_repository_keeps_its_colour() {
         let a = Path::new("/home/ita/work/orbital-api");
         let b = Path::new("/home/ita/work/atlas-web");
-        assert_eq!(repo_color(Some(a)), repo_color(Some(a)));
-        assert_ne!(repo_color(Some(a)), repo_color(Some(b)));
+        let chrome =
+            crate::chrome::Chrome::from_theme(&giverny_term::render::theme::Theme::monet_dark());
+        assert_eq!(repo_color(&chrome, Some(a)), repo_color(&chrome, Some(a)));
+        assert_ne!(repo_color(&chrome, Some(a)), repo_color(&chrome, Some(b)));
         // Tabs in no repository are grouped, not coloured.
-        assert_eq!(repo_color(None), Color32::GRAY);
+        assert_eq!(repo_color(&chrome, None), Color32::GRAY);
     }
 }

@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.8.0 — 2026-09-16
+
+- Six new dark themes: **rouen**, **phosphor**, **abyss**, **synthwave**,
+  **workbench** and **riso**. Pick one in settings (Ctrl+,); they apply to open
+  tabs straight away.
+
+- Rouen follows the clock. It is Monet's Rouen Cathedral series as a theme, one
+  façade in more than thirty lights: cool fog in the morning, gold at noon, rose
+  in the evening, deep blue at night, each blending into the next so the screen
+  never jumps. It checks the hour once a minute, idle or not.
+
+- Phosphor puts everything on one amber ramp. A theme's sixteen colours are its
+  own, but 24-bit colour goes straight past them, which is how Claude Code draws
+  its diffs. So a theme can now say that colour from outside the palette keeps
+  its brightness and loses its hue: a red diff and a green one stay two bands,
+  in amber.
+
+- Category colours come from the theme. They were a fixed set of Monet garden
+  hues, so Gruvbox, Nord, Tokyo Night and Catppuccin all had a rail painted in
+  another theme's pastels. The plain-shell dot was hardcoded Monet green too.
+  Monet-dark is unchanged apart from its rose category, which no colour slot
+  holds exactly and which is now a shade cooler.
+
+- A theme can name its own accent, instead of the chrome always taking the
+  bright cyan. Workbench's accent is Amiga orange.
+
+- Hint text stays readable on every rail. Paths and keys sit 45% of the way from
+  the text colour to the background, which on a light background, or a rail that
+  is itself a colour, was too faint to read. It now stops stepping back when it
+  reaches the point of being hard to read. Only monet-light changes.
+
 ## v0.7.8 — 2026-09-14
 
 - The usage cache refreshes again, on every platform. Giverny asks Claude Code

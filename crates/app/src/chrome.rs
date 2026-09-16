@@ -25,6 +25,28 @@ pub struct Chrome {
     pub poppy: Color32,
     /// Green: healthy.
     pub green: Color32,
+    /// Category colours, read from the theme in the order the Monet ones
+    /// were picked: wisteria, teal, sunlight, poppy, pond, garden, rose,
+    /// water. A fixed palette painted every theme's rail in Monet pastels.
+    pub cats: [Color32; 8],
+}
+
+/// WCAG contrast ratio between two colours: 1.0 for identical, 21.0 for
+/// black on white.
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let f = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    };
+    let (x, y) = (lum(a).max(lum(b)), lum(a).min(lum(b)));
+    (x + 0.05) / (y + 0.05)
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -46,19 +68,47 @@ impl Chrome {
                 theme.ansi[dark]
             }
         };
+        let panel = mix(
+            theme.bg,
+            theme.fg,
+            if theme.is_light() { 0.05 } else { 0.06 },
+        );
+        // Secondary text sits 45% of the way back toward the background, or
+        // nearer the text where that would leave it too faint on the rail —
+        // a background that is itself a colour (Workbench's blue) or a light
+        // one pulls a fixed mix below what can be read.
+        let dim = [0.45, 0.40, 0.35, 0.30, 0.25]
+            .into_iter()
+            .map(|t| mix(theme.fg, theme.bg, t))
+            .find(|d| contrast(*d, panel) >= 3.0)
+            .unwrap_or(theme.fg);
         Chrome {
-            panel: mix(
-                theme.bg,
-                theme.fg,
-                if theme.is_light() { 0.05 } else { 0.06 },
-            ),
+            panel,
             fg: theme.fg,
-            dim: mix(theme.fg, theme.bg, 0.45),
-            accent: pick(14, 6),
+            dim,
+            accent: theme.accent.unwrap_or_else(|| pick(14, 6)),
             amber: pick(11, 3),
             poppy: pick(9, 1),
             green: pick(10, 2),
+            cats: {
+                let a = &theme.ansi;
+                [
+                    a[5],
+                    a[6],
+                    a[3],
+                    a[1],
+                    a[4],
+                    a[2],
+                    mix(a[9], a[13], 0.5),
+                    a[14],
+                ]
+            },
         }
+    }
+
+    /// The colour a category with this index wears.
+    pub fn category(&self, index: usize) -> Color32 {
+        self.cats[index % self.cats.len()]
     }
 
     /// Push it into egui, so panels, text fields and buttons follow too.
@@ -112,6 +162,43 @@ mod tests {
         let gruvbox = Chrome::from_theme(&Theme::gruvbox());
         assert_ne!(monet.panel, gruvbox.panel, "rail background is themed");
         assert_ne!(monet.accent, gruvbox.accent, "accents are themed");
+    }
+
+    /// The house theme keeps the categories it always had; only rose, which
+    /// no ANSI slot holds, comes out a shade different.
+    #[test]
+    fn monet_keeps_its_category_colours() {
+        let c = Chrome::from_theme(&Theme::monet_dark());
+        let rgb = |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+        for (i, want) in [0x9a86b8, 0x5fa3a3, 0xd9b55f, 0xc35b4e, 0x5b7fa6, 0x7ba25a]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(c.cats[i], rgb(want), "category {i}");
+        }
+    }
+
+    /// Every built-in can be read: text against the background, and the rail's
+    /// secondary text distinct from both the rail and the primary text.
+    #[test]
+    fn every_theme_is_readable() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name);
+            let c = Chrome::from_theme(&theme);
+            assert!(
+                contrast(theme.fg, theme.bg) >= 7.0,
+                "{name}: text on background"
+            );
+            assert!(contrast(c.dim, c.panel) >= 3.0, "{name}: hints on the rail");
+            assert!(contrast(c.dim, c.fg) >= 1.5, "{name}: hints look like text");
+            assert_ne!(c.accent, c.amber, "{name}: selection looks like attention");
+        }
+    }
+
+    #[test]
+    fn a_theme_can_name_its_own_accent() {
+        let c = Chrome::from_theme(&Theme::workbench());
+        assert_eq!(c.accent, Color32::from_rgb(0xff, 0x88, 0x00));
     }
 
     #[test]

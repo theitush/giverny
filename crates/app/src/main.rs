@@ -33,20 +33,14 @@ use giverny_term::session::TermSession;
 use giverny_term::tee::TeeEvent;
 use giverny_term::widget::{DEFAULT_FONT_SIZE, RenderShared, TabView};
 
-/// Category accent colors — Monet garden hues, assigned round-robin.
-pub const CATEGORY_PALETTE: [Color32; 8] = [
-    Color32::from_rgb(0x9a, 0x86, 0xb8), // wisteria
-    Color32::from_rgb(0x5f, 0xa3, 0xa3), // lily-pond teal
-    Color32::from_rgb(0xd9, 0xb5, 0x5f), // sunlight
-    Color32::from_rgb(0xc3, 0x5b, 0x4e), // poppy
-    Color32::from_rgb(0x5b, 0x7f, 0xa6), // pond blue
-    Color32::from_rgb(0x7b, 0xa2, 0x5a), // garden green
-    Color32::from_rgb(0xd0, 0x8a, 0xa2), // rose
-    Color32::from_rgb(0x84, 0xc5, 0xc5), // water
-];
-
-pub fn category_color(index: usize) -> Color32 {
-    CATEGORY_PALETTE[index % CATEGORY_PALETTE.len()]
+/// The theme a name means right now. Only Rouen cares when now is: its light
+/// follows the local clock.
+fn theme_for(name: &str) -> Theme {
+    if name == "rouen" {
+        let now = jiff::Zoned::now();
+        return Theme::rouen_at(now.hour() as f32 + now.minute() as f32 / 60.0);
+    }
+    Theme::by_name(name)
 }
 
 /// Remember accounts that only the environment knew about.
@@ -646,6 +640,8 @@ pub struct App {
     layout: state::Layout,
     pub cfg: config::Config,
     cfg_mtime: Option<std::time::SystemTime>,
+    /// When a clock-driven theme last looked at the clock.
+    theme_tick: std::time::Instant,
     last_cfg_check: Instant,
 }
 
@@ -887,17 +883,17 @@ impl App {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
         remember_env_accounts(&paths, &mut cfg);
-        let theme = Theme::by_name(&cfg.theme.name);
+        let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
         let mut shared = RenderShared::with_family(theme, cfg.font.size, family)
             .or_else(|err| {
                 tracing::warn!("configured font unusable ({err}); auto-detecting");
-                RenderShared::new(Theme::by_name(&cfg.theme.name), cfg.font.size)
+                RenderShared::new(theme_for(&cfg.theme.name), cfg.font.size)
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
-        let chrome = chrome::Chrome::from_theme(&Theme::by_name(&cfg.theme.name));
-        chrome.apply(&cc.egui_ctx, &Theme::by_name(&cfg.theme.name));
+        let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
+        chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name));
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -1025,6 +1021,7 @@ impl App {
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
             cfg_mtime,
+            theme_tick: std::time::Instant::now(),
             cfg,
             last_cfg_check: Instant::now(),
         };
@@ -1958,21 +1955,25 @@ impl App {
         self.apply_config(ctx, cfg);
     }
 
+    /// Put a theme on the grid, on every open session, and on the chrome.
+    fn adopt_theme(&mut self, ctx: &egui::Context, theme: Theme) {
+        self.shared.set_theme(theme.clone());
+        for rt in self.rt.values() {
+            if let Some(session) = &rt.session {
+                *session.shared.theme.write() = theme.clone();
+                session.mark_dirty();
+            }
+        }
+        // The chrome is themed too, so the rail does not stay Monet-blue
+        // around a Gruvbox grid.
+        self.chrome = chrome::Chrome::from_theme(&theme);
+        self.chrome.apply(ctx, &theme);
+    }
+
     /// Adopt a freshly loaded config, applying what can be applied live.
     fn apply_config(&mut self, ctx: &egui::Context, cfg: config::Config) {
         if cfg.theme.name != self.cfg.theme.name {
-            let theme = Theme::by_name(&cfg.theme.name);
-            self.shared.set_theme(theme.clone());
-            for rt in self.rt.values() {
-                if let Some(session) = &rt.session {
-                    *session.shared.theme.write() = Theme::by_name(&cfg.theme.name);
-                    session.mark_dirty();
-                }
-            }
-            // The chrome is themed too, so the rail does not stay Monet-blue
-            // around a Gruvbox grid.
-            self.chrome = chrome::Chrome::from_theme(&theme);
-            self.chrome.apply(ctx, &theme);
+            self.adopt_theme(ctx, theme_for(&cfg.theme.name));
         }
         if cfg.font.size != self.cfg.font.size {
             self.shared.set_font_size(cfg.font.size);
@@ -2166,6 +2167,15 @@ impl App {
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
         self.reload_config_if_changed(ctx);
+        // Rouen's light moves with the clock. A minute is finer than anyone
+        // can see, and an idle window still has to wake up for it.
+        if self.cfg.theme.name == "rouen" {
+            if self.theme_tick.elapsed() >= std::time::Duration::from_secs(60) {
+                self.theme_tick = std::time::Instant::now();
+                self.adopt_theme(ctx, theme_for("rouen"));
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(60));
+        }
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_state();
         }
@@ -2662,7 +2672,7 @@ impl eframe::App for App {
                 .ws
                 .tab(active)
                 .and_then(|t| self.ws.category(t.category))
-                .map(|c| category_color(c.color_index))
+                .map(|c| self.chrome.category(c.color_index))
                 .unwrap_or(Color32::GRAY);
             let (strip, _) = ui.allocate_exact_size(
                 egui::Vec2::new(ui.available_width(), 3.0),

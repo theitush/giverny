@@ -9,7 +9,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 |---|---|---|
 | `font.family` | `""` | Preferred monospace family; empty auto-detects. Takes effect on restart. |
 | `font.size` | `13.0` | Point size of the terminal grid. |
-| `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin. |
+| `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin, rouen, phosphor, abyss, synthwave, workbench, riso. |
 | `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
 | `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
