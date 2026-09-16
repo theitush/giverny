@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.2 — 2026-09-16
+
+- The settings screen wraps a list of choices onto as many lines as it needs.
+  Thirteen themes did not fit on one, and the ones past the window edge could
+  not be seen or clicked.
+
 ## v0.8.1 — 2026-09-16
 
 - A session stopped by the usage limit starts again when the window actually

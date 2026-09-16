@@ -327,7 +327,9 @@ fn widget(
         }
         Kind::Choice { options, .. } => {
             let current = value.as_str().unwrap_or_default().to_string();
-            ui.horizontal(|ui| {
+            // Wrapped, not a single row: the theme list outgrew the window,
+            // and a choice you cannot see is a choice you do not have.
+            ui.horizontal_wrapped(|ui| {
                 for opt in *options {
                     let selected = current == *opt;
                     if ui
