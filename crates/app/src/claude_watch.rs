@@ -955,22 +955,55 @@ impl ClaudeWatch {
         self.scanned.stale
     }
 
-    /// When the five-hour window for `account` reopens, if the numbers say.
+    /// When the Claude on `account` can work again, if anything says.
     ///
     /// The message on screen names a reset time too, in the local words of
     /// whoever is reading it ("resets 3pm"); this is the same moment as a
-    /// timestamp, from the cache Claude Code writes.
-    pub fn window_reopens(&self, account: &str) -> Option<jiff::Timestamp> {
-        let panel = self.accounts.iter().find(|a| a.profile.name == account)?;
+    /// timestamp, read the same way the usage bars read it — the status line
+    /// push first, the cache behind it. The cache matters least here of
+    /// anywhere: refreshing it means running `claude` against the very
+    /// account that is out of limit.
+    ///
+    /// An account nobody could name falls back to whichever account reopens
+    /// first. A tab whose session never fired a hook has no account against
+    /// its name, and waiting forever is worse than waking on the wrong
+    /// window.
+    pub fn window_reopens(&self, account: Option<&str>) -> Option<jiff::Timestamp> {
         let now = jiff::Timestamp::now();
-        panel
-            .usage
-            .as_ref()?
-            .limits
+        let named = account
+            .and_then(|name| self.accounts.iter().find(|a| a.profile.name == name))
+            .and_then(|panel| Self::reopens_for(panel, now));
+        named.or_else(|| {
+            self.accounts
+                .iter()
+                .filter_map(|panel| Self::reopens_for(panel, now))
+                .min()
+        })
+    }
+
+    /// The window that is actually out, not merely the next one to come
+    /// round: a session stopped by the weekly limit is not freed when the
+    /// five-hour one resets.
+    fn reopens_for(panel: &AccountPanel, now: jiff::Timestamp) -> Option<jiff::Timestamp> {
+        let limits = panel.usage.as_ref().map(|u| u.limits.as_slice());
+        let read = |kind: &str| {
+            limits?
+                .iter()
+                .find(|l| l.kind == kind)
+                .map(|l| Self::reading(panel, l, now))
+        };
+        let spent = ["session", "weekly_all"]
             .iter()
-            .filter(|l| l.kind == "session")
-            .filter_map(|l| l.resets_at.as_deref()?.parse::<jiff::Timestamp>().ok())
-            .find(|at| *at > now)
+            .filter_map(|kind| read(kind))
+            .filter(|r| r.percent >= 95.0)
+            .filter_map(|r| r.resets)
+            .max();
+        spent
+            .or_else(|| read("session").and_then(|r| r.resets))
+            // No cache at all, which is every account whose numbers have only
+            // ever come from the status line.
+            .or_else(|| panel.live.as_ref().and_then(|l| l.five_hour_resets))
+            .filter(|at| *at > now)
     }
 
     /// How fresh this account's numbers actually are, and from where.
@@ -1356,6 +1389,88 @@ mod tests {
         // No push ⇒ cache value, not flagged.
         let read = ClaudeWatch::reading(&mk(120, None), &limit, now);
         assert_eq!((read.percent, read.live), (5.0, false));
+    }
+
+    /// Why a rate-limited session never woke up again: the reopening time was
+    /// read from the on-disk cache alone, and a rate-limited account is
+    /// exactly the one whose cache cannot refresh, because refreshing it
+    /// means running `claude` against the account that is out of limit.
+    #[test]
+    fn a_reopening_comes_from_the_push_when_the_cache_has_lapsed() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now = jiff::Timestamp::now();
+        let at = |mins: i64| now + jiff::Span::new().minutes(mins);
+        let limit = |kind: &str, percent: u32, resets: jiff::Timestamp| -> LimitEntry {
+            serde_json::from_str(&format!(
+                r#"{{"kind":"{kind}","percent":{percent},"severity":"critical",
+                     "is_active":true,"resets_at":"{resets}"}}"#
+            ))
+            .unwrap()
+        };
+        let panel = |name: &str, limits: Vec<LimitEntry>, live: Option<LiveUsage>| AccountPanel {
+            profile: Profile {
+                name: name.into(),
+                config_dir: PathBuf::from("/tmp").join(name),
+                email: None,
+                account_uuid: None,
+            },
+            usage: Some(AccountUsage {
+                fetched_at_ms: (now.as_millisecond() - 6 * 3_600_000) as u64,
+                limits,
+            }),
+            live,
+            statusline_on: true,
+        };
+
+        // The cache is six hours old: its five-hour window "reopened" an hour
+        // ago, which reads as no reopening at all. The push knows better.
+        let mut w = ClaudeWatch::for_tests();
+        w.accounts = vec![panel(
+            "a",
+            vec![limit("session", 100, at(-60))],
+            Some(LiveUsage {
+                at: Instant::now(),
+                five_hour: Some(100.0),
+                seven_day: Some(40.0),
+                five_hour_resets: Some(at(35)),
+                seven_day_resets: None,
+            }),
+        )];
+        assert_eq!(w.window_reopens(Some("a")), Some(at(35)));
+
+        // A tab whose session never fired a hook has no account against its
+        // name. Waking on another account's window beats waiting forever.
+        assert_eq!(w.window_reopens(None), Some(at(35)));
+        assert_eq!(w.window_reopens(Some("nobody")), Some(at(35)));
+
+        // Stopped by the weekly limit: the five-hour window coming round in
+        // half an hour does not free it.
+        let mut w = ClaudeWatch::for_tests();
+        w.accounts = vec![panel(
+            "a",
+            vec![
+                limit("session", 100, at(30)),
+                limit("weekly_all", 100, at(4_000)),
+            ],
+            None,
+        )];
+        assert_eq!(w.window_reopens(Some("a")), Some(at(4_000)));
+
+        // Only the five-hour window is out: the weekly one is not the answer.
+        let mut w = ClaudeWatch::for_tests();
+        w.accounts = vec![panel(
+            "a",
+            vec![
+                limit("session", 100, at(30)),
+                limit("weekly_all", 20, at(4_000)),
+            ],
+            None,
+        )];
+        assert_eq!(w.window_reopens(Some("a")), Some(at(30)));
+
+        // Nothing known at all is still nothing: no guessing.
+        let w = ClaudeWatch::for_tests();
+        assert_eq!(w.window_reopens(Some("a")), None);
     }
 
     /// An account whose cache has stopped being refreshed, which is every

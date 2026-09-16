@@ -1603,12 +1603,8 @@ impl App {
             if !giverny_claude::usage::looks_rate_limited(&session.screen_text()) {
                 continue;
             }
-            let reopens = self
-                .claude
-                .tabs
-                .get(&id)
-                .and_then(|t| t.account.as_deref())
-                .and_then(|account| self.claude.window_reopens(account));
+            let account = self.claude.tabs.get(&id).and_then(|t| t.account.clone());
+            let reopens = self.claude.window_reopens(account.as_deref());
             tracing::info!(
                 "tab {id:?}: out of limit{}",
                 match reopens {
@@ -1636,12 +1632,8 @@ impl App {
             .iter_mut()
             .filter_map(|(id, waiting)| {
                 if waiting.reopens.is_none() {
-                    waiting.reopens = self
-                        .claude
-                        .tabs
-                        .get(id)
-                        .and_then(|t| t.account.as_deref())
-                        .and_then(|account| self.claude.window_reopens(account));
+                    let account = self.claude.tabs.get(id).and_then(|t| t.account.clone());
+                    waiting.reopens = self.claude.window_reopens(account.as_deref());
                 }
                 waiting.reopens.filter(|at| *at <= now).map(|_| *id)
             })

@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.1 — 2026-09-16
+
+- A session stopped by the usage limit starts again when the window actually
+  reopens. Giverny read that moment from Claude Code's on-disk cache alone,
+  which is the one source that cannot be trusted here: refreshing it means
+  running `claude` against the very account that is out of limit. The status
+  line carries the same moment and keeps arriving, so it is read first now, the
+  cache behind it.
+
+- A tab whose account Giverny could not name waited forever. It now wakes on
+  the first window any account has coming, which beats waiting for a time that
+  will never arrive.
+
+- A session stopped by the *weekly* limit no longer wakes every five hours to
+  hit the same wall. Whichever window is actually out is the one waited on.
+
 ## v0.8.0 — 2026-09-16
 
 - Six new dark themes: **rouen**, **phosphor**, **abyss**, **synthwave**,
