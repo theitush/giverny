@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.0.0 — 2026-09-17
+
+- A welcome screen, in a tab of its own: the mark, the name, and where to find
+  people. It is printed into the terminal rather than typed at the shell, so it
+  leaves nothing in your history, and the links are real hyperlinks you can
+  click.
+
+- After an update, the same screen says which version you came from and lists
+  what changed in between, read from the changelog compiled into the binary.
+
+- Two places to find other people, in the welcome screen and in settings →
+  about: the support group at https://t.me/givernysupport and the announcement
+  channel at https://t.me/givernyapp.
+
 ## v0.8.3 — 2026-09-16
 
 - Giverny notices a new release while it is open. The check ran once, at

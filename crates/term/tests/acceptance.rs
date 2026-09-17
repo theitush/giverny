@@ -212,6 +212,9 @@ fn scrollback_survives_restart_via_preseed() {
     );
     a.shutdown();
 
+    // The divider belongs to whoever restores, not to the session: a preseed
+    // is advanced verbatim, which is also how the welcome screen arrives.
+    let restored = format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n");
     let b = headless_session_preseeded(
         Some((
             "/bin/sh".into(),
@@ -219,7 +222,7 @@ fn scrollback_survives_restart_via_preseed() {
         )),
         std::env::temp_dir(),
         None,
-        Some(&dump),
+        Some(&restored),
     );
     drain_until_done(&b);
     let screen = b.screen_text();

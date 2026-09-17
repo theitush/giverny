@@ -562,18 +562,35 @@ fn about_section(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>, c: Chr
             .to_string(),
     );
     line(ui, "state", app.paths.state_file().display().to_string());
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{:<10}", "repo"))
-                .font(FontId::monospace(11.5))
-                .color(c.dim),
-        );
-        ui.hyperlink_to(
-            RichText::new(crate::update::REPO_URL).font(FontId::monospace(11.5)),
-            crate::update::REPO_URL,
-        )
-        .on_hover_text("opens in your browser");
-    });
+    let link = |ui: &mut egui::Ui, label: &str, url: &str, hint: &str| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{label:<10}"))
+                    .font(FontId::monospace(11.5))
+                    .color(c.dim),
+            );
+            ui.hyperlink_to(RichText::new(url).font(FontId::monospace(11.5)), url)
+                .on_hover_text(hint);
+        });
+    };
+    link(
+        ui,
+        "repo",
+        crate::update::REPO_URL,
+        "the source, the issues, the releases",
+    );
+    link(
+        ui,
+        "support",
+        crate::splash::SUPPORT,
+        "the telegram group: ask, report, complain",
+    );
+    link(
+        ui,
+        "news",
+        crate::splash::NEWS,
+        "the telegram channel: what each release changed",
+    );
     ui.add_space(10.0);
     if ui
         .button(RichText::new("open config.toml in a tab").font(FontId::monospace(11.5)))

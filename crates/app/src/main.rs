@@ -10,6 +10,7 @@ mod oom;
 mod overlays;
 mod rail;
 mod settings_ui;
+mod splash;
 mod taskbar;
 mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -242,6 +243,19 @@ fn main() -> eframe::Result {
             giverny_claude::hooks::run_statusline(&Paths::default_dirs().hook_spool());
             return Ok(());
         }
+        Some("welcome") => {
+            let arg = std::env::args().nth(2);
+            print!(
+                "{}",
+                splash::render(&match arg.as_deref() {
+                    Some("first") | None => splash::Welcome::First,
+                    Some(from) => splash::Welcome::Updated {
+                        from: Some(from.to_string()),
+                    },
+                })
+            );
+            return Ok(());
+        }
         Some("doctor") => {
             doctor();
             return Ok(());
@@ -268,6 +282,8 @@ fn main() -> eframe::Result {
                 "giverny — a native terminal built around Claude Code\n\n\
                  USAGE:\n  giverny            launch the terminal\n  \
                  giverny doctor     diagnose Claude integration\n  \
+                 giverny welcome [from-version]\n                     \
+                 print the welcome screen\n  \
                  giverny update     check for a newer release\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
@@ -622,6 +638,8 @@ pub struct App {
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
+    /// The welcome screen owed to this launch, until the tab for it opens.
+    welcome: Option<splash::Welcome>,
     /// A newer release, once the background check finds one.
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
@@ -991,6 +1009,9 @@ impl App {
             }
         }
 
+        // Asked before the workspace moves into the app: a restored tab is how
+        // an upgrade is told apart from a first run.
+        let welcome = splash::due(paths.base(), !ws.tabs.is_empty());
         let mut app = App {
             shared,
             ws,
@@ -1025,6 +1046,7 @@ impl App {
             last_wsl_probe: Instant::now() - Duration::from_secs(60),
             update: None,
             update_rx,
+            welcome,
             update_dismissed: false,
             exe_mtime: update::binary_mtime(),
             update_ran: false,
@@ -1476,6 +1498,27 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A tab with the welcome already on its screen.
+    ///
+    /// Seeded rather than typed: the text is in the terminal before the shell
+    /// writes its first prompt, so nothing lands in anyone's history and the
+    /// links arrive as hyperlinks rather than as something to copy out.
+    fn open_welcome(&mut self, ctx: &egui::Context, welcome: &splash::Welcome) {
+        let category = self
+            .ws
+            .active_tab()
+            .map(|t| t.category)
+            .or_else(|| self.ws.categories.first().map(|c| c.id));
+        let Some(category) = category else { return };
+        splash::mark_seen(self.paths.base());
+        let id = self.ws.add_tab(category);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.cwd = dirs::home_dir();
+        }
+        self.spawn_session(ctx, id, Some(splash::render(welcome)));
+        self.reveal_terminal();
     }
 
     fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
@@ -2192,6 +2235,9 @@ impl App {
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
         self.reload_config_if_changed(ctx);
+        if let Some(welcome) = self.welcome.take() {
+            self.open_welcome(ctx, &welcome);
+        }
         // Rouen's light moves with the clock. A minute is finer than anyone
         // can see, and an idle window still has to wake up for it.
         if self.cfg.theme.name == "rouen" {
@@ -2761,7 +2807,8 @@ impl eframe::App for App {
             // Lazy restore: a tab from a previous run spawns its shell on
             // first focus, pre-seeded with its saved scrollback.
             if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
-                let preseed = state::load_snapshot(&self.paths, active);
+                let preseed = state::load_snapshot(&self.paths, active)
+                    .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
                 // The tab had a live Claude conversation — resume it; or a
                 // full-screen app worth starting again.

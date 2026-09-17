@@ -37,10 +37,11 @@ pub struct TermSession {
 }
 
 impl TermSession {
-    /// Spawn a tab. `preseed` is an ANSI dump (from [`Self::snapshot_ansi`])
-    /// advanced into the terminal *before* the shell starts — restored
-    /// scrollback appears above the fresh prompt, colors intact, and re-wraps
-    /// naturally at the current width.
+    /// Spawn a tab. `preseed` is ANSI advanced into the terminal *before* the
+    /// shell starts, verbatim: restored scrollback (from
+    /// [`Self::snapshot_ansi`]) appears above the fresh prompt, colors intact,
+    /// and re-wraps naturally at the current width; a welcome screen arrives
+    /// the same way. What it says is the caller's business.
     pub fn spawn(
         cfg: &SpawnCfg,
         egui_ctx: egui::Context,
@@ -88,10 +89,6 @@ impl TermSession {
             let mut parser: Processor = Processor::new();
             let mut guard = term.lock();
             parser.advance(&mut *guard, dump.as_bytes());
-            parser.advance(
-                &mut *guard,
-                "\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n".as_bytes(),
-            );
         }
 
         let tee = Tee::new(cfg.nonce.clone(), local_hostname());
