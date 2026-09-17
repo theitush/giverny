@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.4 — 2026-09-17
+
+- A usage bar stops jumping backwards. The percentage has two sources: the
+  status line, which reports the turn Claude is in, and the `/usage` cache,
+  which holds whatever was last fetched — possibly minutes earlier, and then
+  written with a fresh timestamp. Taking whichever was sampled most recently
+  meant the bar swapped between two numbers, 90 and 99 and back. Within a
+  window usage only ever climbs, so the bar does too, and it starts again when
+  the window does.
+
 ## v1.0.3 — 2026-09-17
 
 - The background list holds agents that are actually running. A `state.json`

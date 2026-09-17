@@ -53,6 +53,24 @@ pub struct AccountPanel {
     /// overriding the on-disk cache for the windows they cover.
     pub live: Option<LiveUsage>,
     pub statusline_on: bool,
+    /// The most any window has been used, for as long as that window lasts.
+    /// Keyed by `LimitEntry::kind`.
+    pub peak: HashMap<String, Peak>,
+}
+
+/// The high-water mark of one window.
+///
+/// Usage within a window only ever goes up, but the two sources it can be read
+/// from disagree: the status line reports the turn it is in, while the cache
+/// holds whatever `/usage` last fetched, which can be minutes behind and is
+/// then written with a *fresh* timestamp. Reading "whichever was sampled last"
+/// therefore walks backwards, and the bar bounces between two numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Peak {
+    pub percent: f64,
+    /// The window this belongs to. A different reset is a different window,
+    /// and the mark starts again.
+    pub resets: Option<jiff::Timestamp>,
 }
 
 /// One usage bar's numbers, taken from whichever source is freshest.
@@ -495,6 +513,7 @@ impl ClaudeWatch {
         titles: &HashMap<TabId, String>,
     ) -> WatchEffects {
         let mut effects = WatchEffects::default();
+        self.remember_peaks();
 
         // Hook stream first (crisp transitions).
         let msgs: Vec<RelayMsg> = self
@@ -734,6 +753,37 @@ impl ClaudeWatch {
             });
     }
 
+    /// Keep each window's high-water mark up to date.
+    ///
+    /// A window that has reset starts again: a different reset time is a
+    /// different window, and so is a number that has fallen away from the mark
+    /// rather than drifted from it — two sources disagree by a few points,
+    /// never by tens.
+    fn remember_peaks(&mut self) {
+        const A_RESET_NOT_A_DISAGREEMENT: f64 = 25.0;
+        let now = jiff::Timestamp::now();
+        for acc in &mut self.accounts {
+            let Some(usage) = &acc.usage else { continue };
+            for limit in &usage.limits {
+                let read = Self::sampled(acc, limit, now);
+                let peak = acc.peak.entry(limit.kind.clone()).or_insert(Peak {
+                    percent: read.percent,
+                    resets: read.resets,
+                });
+                if peak.resets != read.resets
+                    || read.percent + A_RESET_NOT_A_DISAGREEMENT < peak.percent
+                {
+                    *peak = Peak {
+                        percent: read.percent,
+                        resets: read.resets,
+                    };
+                } else {
+                    peak.percent = peak.percent.max(read.percent);
+                }
+            }
+        }
+    }
+
     /// Look for accounts again, off the UI thread, while none inside WSL has
     /// turned up.
     ///
@@ -782,22 +832,23 @@ impl ClaudeWatch {
 
     fn refresh_usage(&mut self) {
         self.last_usage = Instant::now();
-        let previous: HashMap<PathBuf, (Option<LiveUsage>, bool)> = self
+        // The panels are rebuilt from the profiles, so anything the panel
+        // learned rather than read — the last push, how far each window has
+        // got — has to be carried over or it resets every minute.
+        let mut previous: HashMap<PathBuf, (Option<LiveUsage>, HashMap<String, Peak>)> = self
             .accounts
             .drain(..)
-            .map(|a| (a.profile.config_dir, (a.live, a.statusline_on)))
+            .map(|a| (a.profile.config_dir, (a.live, a.peak)))
             .collect();
         self.accounts = self
             .profiles
             .iter()
             .map(|p| {
-                let (live, _) = previous
-                    .get(&p.config_dir)
-                    .cloned()
-                    .unwrap_or((None, false));
+                let (live, peak) = previous.remove(&p.config_dir).unwrap_or_default();
                 AccountPanel {
                     usage: usage::read(&p.config_dir),
                     live,
+                    peak,
                     statusline_on: hooks::statusline_installed_in(
                         &p.config_dir.join("settings.json"),
                     ),
@@ -1030,7 +1081,26 @@ impl ClaudeWatch {
 
     /// What one bar should show: the statusline push where it is fresher than
     /// the on-disk cache, the cache otherwise.
+    /// What one bar shows: the freshest sample, never lower than this window
+    /// has already been seen to reach.
     pub fn reading(
+        acc: &AccountPanel,
+        limit: &giverny_claude::usage::LimitEntry,
+        now: jiff::Timestamp,
+    ) -> Reading {
+        let mut read = Self::sampled(acc, limit, now);
+        if let Some(peak) = acc.peak.get(&limit.kind)
+            && peak.resets == read.resets
+            && peak.percent > read.percent
+        {
+            read.percent = peak.percent;
+            read.critical = read.critical || peak.percent >= 95.0;
+        }
+        read
+    }
+
+    /// The freshest of the two sources, whichever that is right now.
+    fn sampled(
         acc: &AccountPanel,
         limit: &giverny_claude::usage::LimitEntry,
         now: jiff::Timestamp,
@@ -1339,6 +1409,7 @@ mod tests {
             },
             usage: None,
             live: None,
+            peak: HashMap::new(),
             statusline_on: true,
         });
         let m = msg(
@@ -1385,6 +1456,7 @@ mod tests {
                 five_hour_resets: None,
                 seven_day_resets: None,
             }),
+            peak: HashMap::new(),
             statusline_on: true,
         };
 
@@ -1424,6 +1496,7 @@ mod tests {
                 limits,
             }),
             live,
+            peak: HashMap::new(),
             statusline_on: true,
         };
 
@@ -1478,6 +1551,75 @@ mod tests {
         assert_eq!(w.window_reopens(Some("a")), None);
     }
 
+    /// ita's bar bouncing between 90 and 99: two sources sampled at different
+    /// moments, taking turns at being the fresher one. Within a window usage
+    /// only goes up, so the bar does too.
+    #[test]
+    fn a_window_never_walks_backwards() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now = jiff::Timestamp::now();
+        let resets = now + jiff::Span::new().hours(2);
+        let limit = |percent: u32, at: jiff::Timestamp| -> LimitEntry {
+            serde_json::from_str(&format!(
+                r#"{{"kind":"session","percent":{percent},"severity":"normal",
+                     "is_active":true,"resets_at":"{at}"}}"#
+            ))
+            .unwrap()
+        };
+        let panel =
+            |cache_age_min: i64, cache: LimitEntry, push: Option<(f64, u64)>| AccountPanel {
+                profile: Profile {
+                    name: "a".into(),
+                    config_dir: PathBuf::from("/tmp/x"),
+                    email: None,
+                    account_uuid: None,
+                },
+                usage: Some(AccountUsage {
+                    fetched_at_ms: (now.as_millisecond() - cache_age_min * 60_000) as u64,
+                    limits: vec![cache],
+                }),
+                live: push.map(|(percent, age_s)| LiveUsage {
+                    at: Instant::now() - Duration::from_secs(age_s),
+                    five_hour: Some(percent),
+                    seven_day: None,
+                    five_hour_resets: Some(resets),
+                    seven_day_resets: None,
+                }),
+                peak: HashMap::new(),
+                statusline_on: true,
+            };
+
+        let mut w = ClaudeWatch::for_tests();
+        // The cache is ten minutes old and the push just arrived: 99.
+        w.accounts = vec![panel(10, limit(90, resets), Some((99.0, 1)))];
+        w.remember_peaks();
+        let acc = &w.accounts[0];
+        let read = ClaudeWatch::reading(acc, &acc.usage.as_ref().unwrap().limits[0], now);
+        assert_eq!(read.percent, 99.0);
+
+        // `/usage` refreshes, writing a number it fetched minutes ago: the
+        // freshest *sample* is now the lower one. The bar holds.
+        let peak = w.accounts[0].peak.clone();
+        w.accounts = vec![panel(0, limit(90, resets), Some((99.0, 600)))];
+        w.accounts[0].peak = peak;
+        w.remember_peaks();
+        let acc = &w.accounts[0];
+        let limits = &acc.usage.as_ref().unwrap().limits;
+        assert_eq!(ClaudeWatch::sampled(acc, &limits[0], now).percent, 90.0);
+        assert_eq!(ClaudeWatch::reading(acc, &limits[0], now).percent, 99.0);
+
+        // The window resets: a different reset time is a different window, and
+        // the mark goes with it.
+        let later = now + jiff::Span::new().hours(7);
+        let peak = w.accounts[0].peak.clone();
+        w.accounts = vec![panel(0, limit(3, later), None)];
+        w.accounts[0].peak = peak;
+        w.remember_peaks();
+        let acc = &w.accounts[0];
+        let limits = &acc.usage.as_ref().unwrap().limits;
+        assert_eq!(ClaudeWatch::reading(acc, &limits[0], now).percent, 3.0);
+    }
+
     /// An account whose cache has stopped being refreshed, which is every
     /// account whose `claude` Giverny cannot run: the statusline push is the
     /// only thing still telling the truth, and the cache holds whatever it
@@ -1505,6 +1647,7 @@ mod tests {
                 limits: vec![],
             }),
             live,
+            peak: HashMap::new(),
             statusline_on: true,
         };
         let push = |percent: f64, resets: Option<&str>| LiveUsage {
@@ -1564,6 +1707,7 @@ mod tests {
                 limits: vec![],
             }),
             live: None,
+            peak: HashMap::new(),
             statusline_on: true,
         };
         let read = ClaudeWatch::reading(&acc, &limit, now);
