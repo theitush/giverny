@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.2 — 2026-09-17
+
+- A background agent that has finished drops out of the rail. Claude Code keeps
+  its state file for as long as it likes, so the list grew by one every time an
+  agent completed, until the ones still running sat below the ones that stopped
+  days ago. The list is what still wants watching.
+
 ## v1.0.1 — 2026-09-17
 
 - The update button works on Windows. It ran the installer for the platform

@@ -556,7 +556,12 @@ impl ClaudeWatch {
         if self.last_jobs.elapsed() >= Duration::from_secs(3) {
             self.last_jobs = Instant::now();
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
-            self.jobs = jobs::scan(dirs);
+            // Finished agents drop off: the list is what still wants
+            // watching, not a record of everything that ever ran.
+            self.jobs = jobs::scan(dirs)
+                .into_iter()
+                .filter(|job| job.worth_watching())
+                .collect();
         }
 
         // Re-read the caches when the file says so, when a refresh we asked

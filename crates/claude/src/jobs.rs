@@ -99,6 +99,16 @@ pub struct Job {
 }
 
 impl Job {
+    /// Is there anything left to watch?
+    ///
+    /// A finished agent is a line that will never change again, and Claude
+    /// Code keeps its `state.json` for as long as it likes. Without this the
+    /// list grows by one every time a background agent completes, until the
+    /// ones still running are somewhere below the ones that stopped days ago.
+    pub fn worth_watching(&self) -> bool {
+        self.state != JobState::Done
+    }
+
     /// What to resume to attach a tab to this agent.
     pub fn resume_target(&self) -> Option<&str> {
         self.resume_session_id
@@ -273,6 +283,28 @@ mod tests {
             job.resume_target(),
             Some("aaaa1111-2222-3333-4444-555566667777")
         );
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// The rail is for agents that still need something from you, or are
+    /// still doing something. A finished one has neither.
+    #[test]
+    fn a_finished_agent_drops_out_of_the_list() {
+        let config = scratch("finished");
+        write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
+        write_job(&config, "bbbb2222", r#"{ "state": "blocked" }"#);
+        write_job(&config, "cccc3333", r#"{ "state": "done" }"#);
+        let jobs = scan([config.clone()]);
+        assert_eq!(jobs.len(), 3, "the scan still reports everything it finds");
+        let mut watching: Vec<&str> = jobs
+            .iter()
+            .filter(|j| j.worth_watching())
+            .map(|j| j.id.as_str())
+            .collect();
+        // Order is the scan's business (pinned first, then recency); this is
+        // about which ones survive.
+        watching.sort_unstable();
+        assert_eq!(watching, ["aaaa1111", "bbbb2222"]);
         let _ = std::fs::remove_dir_all(&config);
     }
 
