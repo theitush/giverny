@@ -34,6 +34,40 @@ use giverny_term::session::TermSession;
 use giverny_term::tee::TeeEvent;
 use giverny_term::widget::{DEFAULT_FONT_SIZE, RenderShared, TabView};
 
+/// Where an attached agent's tab belongs.
+///
+/// Not "whichever category happened to be open", which is how an agent
+/// working in one project ended up filed under another. The agent's own
+/// directory decides: a category already working there takes it, then one
+/// named after that directory, and failing both there is a new category with
+/// that name.
+fn category_for_agent(ws: &mut Workspace, cwd: Option<&Path>) -> CategoryId {
+    let here = |ws: &Workspace| {
+        ws.active_tab()
+            .map(|t| t.category)
+            .or_else(|| ws.categories.first().map(|c| c.id))
+    };
+    let Some(cwd) = cwd else {
+        return here(ws).unwrap_or_else(|| ws.add_category("agents"));
+    };
+    if let Some(cat) = ws
+        .tabs
+        .iter()
+        .find(|t| t.cwd.as_deref() == Some(cwd))
+        .map(|t| t.category)
+    {
+        return cat;
+    }
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "agents".into());
+    if let Some(cat) = ws.categories.iter().find(|c| c.name == name) {
+        return cat.id;
+    }
+    ws.add_category(&name)
+}
+
 /// The theme a name means right now. Only Rouen cares when now is: its light
 /// follows the local clock.
 fn theme_for(name: &str) -> Theme {
@@ -1344,21 +1378,31 @@ impl App {
                 }
             }
             Action::AttachJob(job) => {
-                let cat = self
-                    .ws
-                    .active_tab()
-                    .map(|t| t.category)
-                    .or_else(|| self.ws.categories.first().map(|c| c.id));
-                let (Some(cat), Some(sid)) = (cat, job.resume_target().map(str::to_string)) else {
+                let Some(sid) = job.resume_target().map(str::to_string) else {
                     tracing::warn!("job {} has no conversation to attach to", job.id);
                     return;
                 };
+                let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
                 let id = self.ws.add_tab(cat);
                 if let Some(tab) = self.ws.tab_mut(id) {
                     // The agent's own directory: `claude --resume` only finds a
                     // conversation from where it ran.
                     tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
                     tab.custom_title = Some(job.name.clone());
+                }
+                // A conversation that is not on disk cannot be resumed, and a
+                // shell opening on an empty screen looks like a tab that did
+                // nothing. Say what happened, in the agent's own directory.
+                if giverny_claude::registry::find_transcript(&job.config_dir, &sid).is_none() {
+                    tracing::info!("job {}: no transcript for {sid}", job.id);
+                    self.spawn_session(
+                        ctx,
+                        id,
+                        Some(format!(
+                            "\x1b[2mgiverny:\x1b[0m no conversation on disk for this agent\r\n                             \x1b[2m         {sid}\r\n                                      this tab is its directory; the agent itself is still                              wherever it is running.\x1b[0m\r\n\r\n"
+                        )),
+                    );
+                    return;
                 }
                 self.spawn_session(ctx, id, None);
                 self.apply(ctx, Action::ResumeSpecific(id, sid, job.config_dir.clone()));
@@ -3341,6 +3385,40 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ita's complaint: an agent working in one project opened a tab in
+    /// whichever category he happened to be looking at.
+    #[test]
+    fn an_agent_is_filed_with_its_own_work() {
+        let mut ws = Workspace::default();
+        let other = ws.add_category("notes");
+        let hoteleak = ws.add_category("hoteleak");
+        let tab = ws.add_tab(hoteleak);
+        ws.tab_mut(tab).unwrap().cwd = Some(PathBuf::from("/home/ita/Dev/hoteleak"));
+        // Adding a tab focuses it, so this is the category on screen.
+        ws.add_tab(other);
+
+        // A category already working in that directory takes it, whatever is
+        // on screen at the time.
+        assert_eq!(
+            category_for_agent(&mut ws, Some(Path::new("/home/ita/Dev/hoteleak"))),
+            hoteleak
+        );
+        // Nowhere to put it: a category named after the directory, made once
+        // and reused after that.
+        let made = category_for_agent(&mut ws, Some(Path::new("/home/ita/Dev/giverny")));
+        assert_eq!(
+            ws.categories.iter().find(|c| c.id == made).unwrap().name,
+            "giverny"
+        );
+        assert_eq!(
+            category_for_agent(&mut ws, Some(Path::new("/home/ita/Dev/giverny"))),
+            made,
+            "a second agent joins the first"
+        );
+        // No directory at all falls back to where the user is.
+        assert_eq!(category_for_agent(&mut ws, None), other);
     }
 
     /// The regression that shipped in v0.5.3: every Windows tab opened

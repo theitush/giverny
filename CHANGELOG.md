@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.0.3 — 2026-09-17
+
+- The background list holds agents that are actually running. A `state.json`
+  outlives the process that wrote it, so the list filled up with agents that
+  had finished, crashed, or were last seen days ago, each row still claiming to
+  be working. Only an agent the daemon is running a live worker for is listed
+  now.
+
+- An attached agent opens in a category that has something to do with it: one
+  already working in the agent's directory, else one named after that
+  directory, instead of wherever you happened to be looking.
+
+- Clicking an agent whose conversation is no longer on disk says so in the tab,
+  instead of opening a terminal with nothing in it.
+
 ## v1.0.2 — 2026-09-17
 
 - A background agent that has finished drops out of the rail. Claude Code keeps

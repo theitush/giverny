@@ -99,14 +99,15 @@ pub struct Job {
 }
 
 impl Job {
-    /// Is there anything left to watch?
+    /// Is this agent actually there to watch?
     ///
-    /// A finished agent is a line that will never change again, and Claude
-    /// Code keeps its `state.json` for as long as it likes. Without this the
-    /// list grows by one every time a background agent completes, until the
-    /// ones still running are somewhere below the ones that stopped days ago.
+    /// Only one the daemon is running a live worker for. A `state.json`
+    /// outlives the process that wrote it, so the directory fills up with
+    /// agents that finished, crashed, or were last seen days ago — and a row
+    /// reading "working" for something with no process is a lie that costs
+    /// whoever clicks it a terminal with nothing in it.
     pub fn worth_watching(&self) -> bool {
-        self.state != JobState::Done
+        self.live && self.state != JobState::Done
     }
 
     /// What to resume to attach a tab to this agent.
@@ -286,16 +287,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&config);
     }
 
-    /// The rail is for agents that still need something from you, or are
-    /// still doing something. A finished one has neither.
+    /// The rail is for agents that are running right now: still working, or
+    /// waiting on you. A finished one is neither, and neither is one whose
+    /// process went away while its state file stayed behind.
     #[test]
-    fn a_finished_agent_drops_out_of_the_list() {
+    fn only_a_running_agent_is_worth_watching() {
         let config = scratch("finished");
         write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
         write_job(&config, "bbbb2222", r#"{ "state": "blocked" }"#);
         write_job(&config, "cccc3333", r#"{ "state": "done" }"#);
+        write_job(&config, "dddd4444", r#"{ "state": "working" }"#);
+        // The daemon is running workers for three of them; the fourth has a
+        // state file and nothing behind it.
+        let me = std::process::id();
+        std::fs::create_dir_all(config.join("daemon")).unwrap();
+        std::fs::write(
+            config.join("daemon").join("roster.json"),
+            format!(
+                r#"{{"workers":{{"aaaa1111":{{"pid":{me}}},"bbbb2222":{{"pid":{me}}},
+                    "cccc3333":{{"pid":{me}}}}}}}"#
+            ),
+        )
+        .unwrap();
         let jobs = scan([config.clone()]);
-        assert_eq!(jobs.len(), 3, "the scan still reports everything it finds");
+        assert_eq!(jobs.len(), 4, "the scan still reports everything it finds");
         let mut watching: Vec<&str> = jobs
             .iter()
             .filter(|j| j.worth_watching())
