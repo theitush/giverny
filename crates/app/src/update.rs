@@ -174,8 +174,27 @@ pub fn binary_mtime() -> Option<std::time::SystemTime> {
 /// The command the update button runs — in a visible terminal tab, so the
 /// user watches exactly what touches their machine.
 pub fn install_command() -> String {
-    if cfg!(windows) {
-        format!("irm {INSTALL_PS1} | iex")
+    install_command_for(cfg!(windows))
+}
+
+/// The installer for the Giverny that is *running*, spelled so that it works
+/// whatever shell the tab happens to be.
+///
+/// Two different things were being confused. `cfg!(windows)` says which
+/// binary this is, not where the command will be typed: on Windows a tab
+/// opens a WSL shell by default, and a bash handed `irm … | iex` says
+/// "command not found". Going the other way is worse than useless — running
+/// the unix installer inside the distribution would fetch a Linux build,
+/// install it into the WSL home, and leave the Windows Giverny it was meant
+/// to update exactly where it was.
+///
+/// So a Windows build always crosses back to Windows to update itself.
+/// `powershell.exe` is reachable from a WSL shell, from cmd and from
+/// PowerShell alike, which is one command instead of three guesses about
+/// where it will land.
+fn install_command_for(windows: bool) -> String {
+    if windows {
+        format!("powershell.exe -NoProfile -Command \"irm {INSTALL_PS1} | iex\"")
     } else {
         format!("curl -fsSL {INSTALL_SH} | sh")
     }
@@ -189,6 +208,22 @@ mod tests {
     #[test]
     fn the_running_binary_has_a_timestamp() {
         assert!(binary_mtime().is_some());
+    }
+
+    /// What ita hit: a Windows Giverny opens WSL tabs, and the update button
+    /// typed a PowerShell one-liner into bash.
+    #[test]
+    fn the_installer_runs_where_the_binary_lives() {
+        let windows = install_command_for(true);
+        assert!(windows.starts_with("powershell.exe "), "{windows}");
+        assert!(windows.contains("install.ps1"), "{windows}");
+        // A unix shell can run this too, which is the point: the tab may be
+        // a distribution's bash while the binary being updated is Windows.
+        assert!(!windows.starts_with("irm"), "{windows}");
+
+        let unix = install_command_for(false);
+        assert!(unix.contains("install.sh"), "{unix}");
+        assert!(!unix.contains("powershell"), "{unix}");
     }
 
     #[test]

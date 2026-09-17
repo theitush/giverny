@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.1 — 2026-09-17
+
+- The update button works on Windows. It ran the installer for the platform
+  Giverny was *built* for, in whatever shell the tab happened to open, and on
+  Windows a tab opens a WSL shell by default: bash was handed a PowerShell
+  one-liner and said "command not found". Running the unix installer there
+  would have been worse, fetching a Linux build into the WSL home and leaving
+  the Windows Giverny it meant to update untouched. A Windows build now crosses
+  back to Windows to update itself, from a WSL shell, cmd or PowerShell alike.
+
 ## v1.0.0 — 2026-09-17
 
 - A welcome screen, in a tab of its own: the mark, the name, and where to find
