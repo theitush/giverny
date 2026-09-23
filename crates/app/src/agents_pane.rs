@@ -430,7 +430,14 @@ pub fn show(
     }
 
     let font = FontId::monospace(FONT_SIZE);
-    let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0')).max(1.0);
+    // The advance over a run, not one glyph: what the painter really steps.
+    let cw = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap("0".repeat(20), font.clone(), Color32::WHITE))
+        .size()
+        .x
+        / 20.0;
+    let cw = cw.max(1.0);
     let row_h = (FONT_SIZE * 1.45).round();
     let extra = usize::from(table.total.is_some()) + usize::from(table.footer.is_some());
     let want = (table.lines.len() + extra) as f32 * row_h + 10.0;
@@ -465,7 +472,13 @@ fn draw_table(
     cw: f32,
     row_h: f32,
 ) -> Option<RowClick> {
-    let cols = ((ui.available_width() / cw).floor() as usize).max(40);
+    // Leave the scrollbar its lane, or it paints over TOKENS.
+    // Floating bars allocate nothing and overlay the content, so reserve
+    // their full width either way.
+    let bar = &ui.spacing().scroll;
+    let bar_w = bar.bar_inner_margin + bar.bar_width + bar.bar_outer_margin;
+    let usable = ui.available_width() - bar_w - cw;
+    let cols = ((usable / cw).floor() as usize).max(40);
     let idw = table
         .lines
         .iter()
