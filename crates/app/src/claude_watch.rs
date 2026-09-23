@@ -17,6 +17,8 @@ use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
+use crate::agents_live::AgentsLive;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClaudeState {
     /// No Claude running in this tab.
@@ -123,9 +125,6 @@ pub struct WatchEffects {
     pub notify: Vec<(String, String)>,
     /// Any tab is animating (spinner/pulse) — keep repainting.
     pub animating: bool,
-    /// Tabs whose session was just `/clear`ed (`SessionStart`,
-    /// `source=clear`): a new conversation, so the agents pane starts empty.
-    pub cleared: Vec<TabId>,
 }
 
 pub struct ClaudeWatch {
@@ -168,6 +167,9 @@ pub struct ClaudeWatch {
     last_look: Instant,
     late_in_flight: Arc<AtomicFlag>,
     extra_dirs: Vec<PathBuf>,
+    /// Each tab's subagents, from relayed `subagentStatusLine` ticks — what
+    /// the agents pane draws. See [`AgentsLive::tracker`].
+    pub agents: AgentsLive,
 }
 
 /// How often the on-disk usage caches are re-read. The numbers inside them
@@ -332,6 +334,13 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
+            // Beside the spool: Giverny's own state dir.
+            agents: AgentsLive::load(
+                spool
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("agents.json"),
+            ),
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -438,6 +447,14 @@ impl ClaudeWatch {
             self.apply_statusline(msg);
             return;
         }
+        // Subagent-line ticks carry a tab's live workers, not its state.
+        if msg.hook_event() == Some(hooks::SUBAGENT_LINE_EVENT) {
+            if let Some(tab_id) = Self::tab_id_of(msg) {
+                let config_dir = self.canonical_dir(msg.config_dir.as_deref());
+                self.agents.apply_live(tab_id, config_dir, &msg.event);
+            }
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -454,9 +471,11 @@ impl ClaudeWatch {
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
                 entry.session_id = msg.session_id().map(str::to_string);
-                if msg.event.get("source").and_then(|v| v.as_str()) == Some("clear") {
-                    effects.cleared.push(tab_id);
-                }
+                self.agents.session_started(
+                    tab_id,
+                    msg.event.get("source").and_then(|v| v.as_str()),
+                    msg.session_id(),
+                );
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
@@ -532,6 +551,11 @@ impl ClaudeWatch {
                 .and_then(|id| titles.get(&id).cloned())
                 .unwrap_or_else(|| "tab".into());
             self.handle_msg(msg, active, &title, &mut effects);
+        }
+        // An empty title map is a workspace not built yet, not one with no
+        // tabs: keep every tracker until there is something to compare with.
+        if !titles.is_empty() {
+            self.agents.tick(|id| titles.contains_key(&id));
         }
 
         // Registry scan: baseline busy/idle + identity, ~1 Hz, off-thread.
@@ -1004,6 +1028,30 @@ impl ClaudeWatch {
         }
     }
 
+    /// Follow the `claude.agents_pane` setting in every account: on installs
+    /// `subagentStatusLine` (`giverny relay --subagent-line`), which feeds the
+    /// pane and hides Claude Code's own subagent panel; off removes it, and
+    /// Claude Code draws its panel natively again. Called at startup too, so
+    /// an account added since, or a moved binary, is brought in line. An
+    /// account with a `subagentStatusLine` of its own is left alone.
+    ///
+    /// Claude Code watches its settings files, so this reaches running
+    /// sessions without a restart.
+    pub fn set_agents_pane(&mut self, enable: bool) {
+        for p in &self.profiles {
+            let settings = p.config_dir.join("settings.json");
+            match hooks::set_subagent_line(&settings, enable) {
+                Ok(true) => tracing::info!(
+                    "subagentStatusLine {} for {}",
+                    if enable { "installed" } else { "removed" },
+                    p.name
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
+            }
+        }
+    }
+
     /// Do all profiles have the live-usage statusline?
     pub fn statusline_on(&self) -> bool {
         !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
@@ -1199,6 +1247,7 @@ impl ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),
+            agents: AgentsLive::in_memory(),
         }
     }
 
@@ -1216,6 +1265,34 @@ mod tests {
 
     fn msg(json: &str) -> RelayMsg {
         serde_json::from_str(json).expect("relay msg fixture")
+    }
+
+    /// A relayed `subagentStatusLine` tick lands in that tab's tracker and
+    /// says nothing about the tab's own state; `/clear` empties the table.
+    #[test]
+    fn subagent_line_ticks_feed_the_tabs_tracker() {
+        let mut w = ClaudeWatch::for_tests();
+        let tick = msg(&format!(
+            r#"{{"tab_id":"giverny-7","config_dir":"/tmp/giverny-nowhere",
+                "event":{{"hook_event_name":"{}","session_id":"s-1",
+                          "tasks":[{{"id":"a1","status":"running","startTime":1790000000000}}]}}}}"#,
+            hooks::SUBAGENT_LINE_EVENT
+        ));
+        feed(&mut w, &tick, Some(TAB));
+        let t = w.agents.tracker(TAB).expect("a tracker for the tab");
+        assert_eq!(t.rows().len(), 1);
+        assert_eq!(t.session_id.as_deref(), Some("s-1"));
+        assert_eq!(w.state_of(TAB), ClaudeState::None, "no state change");
+
+        feed(
+            &mut w,
+            &hook("SessionStart", r#","source":"clear""#),
+            Some(TAB),
+        );
+        assert!(
+            w.agents.tracker(TAB).unwrap().is_empty(),
+            "/clear empties it"
+        );
     }
 
     fn hook(event: &str, extra: &str) -> RelayMsg {
@@ -1773,25 +1850,5 @@ mod tests {
             Some(Duration::from_secs(600)),
             10
         ));
-    }
-
-    #[test]
-    fn a_clear_is_told_apart_from_a_start_or_a_resume() {
-        let mut w = ClaudeWatch::for_tests();
-        let fx = feed(
-            &mut w,
-            &hook("SessionStart", r#","source":"startup""#),
-            None,
-        );
-        assert!(fx.cleared.is_empty());
-        let fx = feed(&mut w, &hook("SessionStart", r#","source":"resume""#), None);
-        assert!(fx.cleared.is_empty());
-        let fx = feed(&mut w, &hook("SessionStart", r#","source":"clear""#), None);
-        assert_eq!(fx.cleared, vec![TAB]);
-        assert_eq!(
-            fx.captured.len(),
-            1,
-            "a clear is still a new session to capture"
-        );
     }
 }

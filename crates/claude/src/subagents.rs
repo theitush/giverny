@@ -1018,7 +1018,7 @@ impl Tracker {
 
 /// Timestamp of the first line of a transcript — its start, when no live
 /// list ever said.
-pub fn first_line_ms(path: &Path) -> Option<u64> {
+fn first_line_ms(path: &Path) -> Option<u64> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines().take(20) {

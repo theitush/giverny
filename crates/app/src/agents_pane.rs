@@ -15,12 +15,10 @@
 //! above it, and a ledger `total:` row — the same table
 //! `coo/tools/orchestrate-status` pins under Claude Code.
 //!
-//! **The seam.** [`show`] takes the tab's tracker as an argument and owns
-//! none: whoever keeps the trackers (the relay's per-tab store) hands one
-//! in. Until that store exists on this branch, [`LocalTrackers`] stands in —
-//! one tracker per tab, bound to the tab's session and refreshed from disk,
-//! guessing Running from transcript mtimes since nothing relays the live
-//! list yet. Swapping it for the relay's store is one argument in `main.rs`.
+//! **The rows are not kept here.** [`show`] is handed the tab's tracker —
+//! `ClaudeWatch::agents` (`agents_live.rs`), fed by the relay, persisted,
+//! emptied on `/clear` and refreshed once a second — and keeps only what the
+//! pane itself needs per tab: the feed it last read and the row last clicked.
 //!
 //! **Clicks** produce a [`RowClick`], which the app receives as
 //! `Action::AgentRowClicked`. What a click *does* is not decided here.
@@ -31,8 +29,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, PaneRow, Stage};
-use giverny_claude::subagents::{self, LiveSnapshot, LiveTask, Outcome, SubagentRow, Tracker};
-use giverny_core::tabs::{Tab, TabId};
+use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
+use giverny_core::tabs::TabId;
 
 use crate::chrome::Chrome;
 
@@ -43,10 +41,8 @@ pub const RUNNING: Color32 = Color32::from_rgb(0x00, 0x87, 0xd7);
 pub const PLANNED: Color32 = Color32::from_rgb(0x5f, 0x87, 0xaf);
 pub const DONE: Color32 = Color32::from_rgb(0x00, 0x87, 0x00);
 
-/// How often the disk is read and the feed file stat'ed.
+/// How often the feed file is stat'ed.
 const POLL: Duration = Duration::from_secs(1);
-/// Disk guess only: a transcript written this recently is a running worker.
-const FRESH: Duration = Duration::from_secs(600);
 
 // Column widths, in characters (orchestrate-status: HEAD_W, EL_W, ETA_W,
 // NOW_W, TOK_W).
@@ -99,115 +95,6 @@ impl Views {
     pub fn forget(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
     }
-}
-
-// ------------------------------------------------------ interim store ----
-
-/// Stand-in for the relay's per-tab tracker store, until it lands here: one
-/// [`Tracker`] per tab, bound to the tab's session, refreshed from disk once
-/// a second, with Running guessed from transcripts written in the last
-/// [`FRESH`] (nothing relays the live list yet). In memory only. Retired by
-/// the merge with the relay branch — see the module docs.
-#[derive(Default)]
-pub struct LocalTrackers {
-    tabs: HashMap<TabId, (Tracker, Option<Instant>)>,
-}
-
-impl LocalTrackers {
-    /// `tab`'s tracker, synced to its session and refreshed if due. `None`
-    /// until the tab has a Claude session.
-    pub fn tracker(&mut self, tab: &Tab) -> Option<&Tracker> {
-        let sid = tab.claude_session.as_deref()?;
-        let (tracker, last) = self.tabs.entry(tab.id).or_insert_with(|| {
-            let dir = tab.claude_config_dir.clone().or_else(default_config_dir);
-            (Tracker::new(dir), None)
-        });
-        if tracker.session_id.as_deref() != Some(sid) {
-            tracker.set_session(sid);
-            *last = None;
-        }
-        if last.is_none_or(|t| t.elapsed() >= POLL) {
-            *last = Some(Instant::now());
-            disk_guess(tracker);
-            tracker.refresh();
-        }
-        Some(&*tracker)
-    }
-
-    /// The tab's `/clear`, or its closing: a new conversation starts empty,
-    /// not as an alias of the old one (whose Done rows would come back).
-    pub fn clear(&mut self, tab: TabId) {
-        self.tabs.remove(&tab);
-    }
-}
-
-/// A synthetic live list from disk: every worker whose transcript was written
-/// in the last [`FRESH`] is Running. Notifications (read by `refresh` right
-/// after) still land them Done.
-fn disk_guess(tracker: &mut Tracker) {
-    let Some(config) = tracker.config_dir.clone() else {
-        return;
-    };
-    let sessions: Vec<String> = tracker
-        .session_id
-        .iter()
-        .chain(tracker.aliases.iter())
-        .cloned()
-        .collect();
-    let mut tasks = Vec::new();
-    for sid in &sessions {
-        let Some(dir) = subagents::subagents_dir(&config, sid) else {
-            continue;
-        };
-        for id in subagents::list_agent_ids(&dir) {
-            let path = subagents::agent_transcript(&dir, &id);
-            let fresh = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age < FRESH);
-            if !fresh {
-                continue;
-            }
-            let known = tracker.get(&id);
-            if known.is_some_and(|r| !r.running()) {
-                // Done; `refresh` decides revivals itself.
-                continue;
-            }
-            // Only a row new to us pays for the meta and first-line reads.
-            let (description, start_ms) = match known {
-                Some(r) => (r.description.clone(), r.started_ms),
-                None => (
-                    subagents::read_meta(&dir, &id).description,
-                    subagents::first_line_ms(&path),
-                ),
-            };
-            tasks.push(LiveTask {
-                id,
-                kind: None,
-                status: "running".into(),
-                description,
-                label: None,
-                name: None,
-                start_ms,
-                model: None,
-                tokens: None,
-                cwd: None,
-            });
-        }
-    }
-    let snap = LiveSnapshot {
-        session_id: None,
-        tasks,
-    };
-    tracker.apply_live(&snap, now_ms());
-}
-
-fn default_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
 }
 
 fn now_ms() -> u64 {
@@ -693,6 +580,7 @@ fn draw_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giverny_claude::subagents::LiveSnapshot;
 
     const T0: u64 = 1_790_000_000_000; // an epoch-ms "now"
 
