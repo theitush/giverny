@@ -738,6 +738,9 @@ pub struct App {
     /// Tabs following a worker's transcript, by transcript: a second click
     /// on the same worker goes back to its tab instead of opening another.
     follow_tabs: HashMap<PathBuf, TabId>,
+    /// A Running agents-pane row being attached: keys typed into its parent
+    /// tab's Claude Code, one per frame, to open the worker's view.
+    attach: Option<AttachJob>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -750,6 +753,15 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+}
+
+/// A running worker being attached: which tab is typed into, and the
+/// driver deciding each key from that tab's screen (`agent_open::Attach`).
+struct AttachJob {
+    tab: TabId,
+    /// The row's title, for a note if the attach stops short.
+    title: String,
+    driver: agent_open::Attach,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -1158,6 +1170,7 @@ impl App {
             agent_views: agents_pane::Views::default(),
             brief: None,
             follow_tabs: HashMap::new(),
+            attach: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -2686,8 +2699,112 @@ impl App {
         parent: TabId,
         click: &agents_pane::RowClick,
     ) {
-        use agent_open::{Body, Plan};
         match agent_open::plan(click) {
+            agent_open::Plan::Attach { title, agent_id } => {
+                if !self.start_attach(ctx, parent, &title, &agent_id, click) {
+                    self.carry_out_open(ctx, parent, agent_open::plan_open(click));
+                }
+            }
+            plan => self.carry_out_open(ctx, parent, plan),
+        }
+    }
+
+    /// Attach a running worker (giverny#23): show its parent tab and start
+    /// typing Claude Code's key path to the worker's view into it. False
+    /// when it cannot start — no live terminal in the tab, or no description
+    /// to find the worker by in Claude Code's list.
+    fn start_attach(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        agent_id: &str,
+        click: &agents_pane::RowClick,
+    ) -> bool {
+        let live = self.rt.get(&parent).is_some_and(|rt| rt.session.is_some())
+            && self.ws.tab(parent).is_some_and(|t| !t.exited);
+        if !live {
+            return false;
+        }
+        // The Agent call's description is what Claude Code's list shows.
+        let description = self
+            .claude
+            .agents
+            .tracker(parent)
+            .and_then(|t| t.get(agent_id))
+            .and_then(|r| r.description.clone())
+            .or_else(|| {
+                let dir = click.transcript.as_deref()?.parent()?;
+                giverny_claude::subagents::read_meta(dir, agent_id).description
+            })
+            .filter(|d| !d.trim().is_empty());
+        let Some(description) = description else {
+            tracing::info!("agents pane: no description for {agent_id}; opening its transcript");
+            return false;
+        };
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        self.reveal_terminal();
+        self.attach = Some(AttachJob {
+            tab: parent,
+            title: title.to_string(),
+            driver: agent_open::Attach::new(description, Instant::now()),
+        });
+        ctx.request_repaint();
+        true
+    }
+
+    /// One frame of an attach: read the parent's screen, maybe type a key.
+    fn process_attach(&mut self, ctx: &egui::Context) {
+        use agent_open::Tick;
+        let Some(job) = &mut self.attach else {
+            return;
+        };
+        // Switched away: stop typing into a tab nobody is looking at.
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        let (Some(session), true) = (session, self.ws.active == Some(job.tab)) else {
+            self.attach = None;
+            return;
+        };
+        let screen = session.screen_text();
+        let undimmed = session.screen_text_undimmed();
+        match job.driver.tick(Instant::now(), &screen, &undimmed) {
+            Tick::Send(key) => {
+                let mode = session.mode();
+                let bytes = agent_open::keystroke_bytes(key, |k, m| {
+                    giverny_term::input::encode_key(k, m, mode)
+                });
+                session.write(bytes);
+            }
+            Tick::Wait => {}
+            Tick::Done => self.attach = None,
+            Tick::Stuck(why) => {
+                tracing::info!("agents pane: attach stopped: {why:?}");
+                let text = why.explain(&job.driver.description);
+                let title = job.title.clone();
+                self.attach = None;
+                self.settings = None;
+                self.keys_overlay = None;
+                self.brief = Some(overlays::BriefOverlay {
+                    title,
+                    source: None,
+                    text,
+                });
+            }
+        }
+        if self.attach.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    /// Carry out an agents-pane plan that opens something other than the
+    /// worker's live view (Done rows, Planned rows, the attach fallback).
+    fn carry_out_open(&mut self, ctx: &egui::Context, parent: TabId, plan: agent_open::Plan) {
+        use agent_open::{Body, Plan};
+        match plan {
+            // Never planned here; `open_agent_row` handles it.
+            Plan::Attach { .. } => {}
             Plan::Show { title, body } => {
                 let (source, text) = match body {
                     Body::File(path) => {
@@ -2911,6 +3028,7 @@ impl eframe::App for App {
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
+        self.process_attach(&ctx);
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
