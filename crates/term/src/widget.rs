@@ -130,6 +130,9 @@ pub struct TabView {
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
     last_blink: bool,
+    /// When the cursor blink (re)started: on focus, and on every keystroke,
+    /// so the cursor is solid while typing. `None` while unfocused.
+    blink_from: Option<f64>,
     /// Open scrollback search (`Ctrl+Shift+F`).
     pub search: Option<Search>,
     /// Click target under the pointer while Ctrl is held.
@@ -152,6 +155,39 @@ struct Hints {
     dropped: usize,
 }
 
+/// Blink cycles per second.
+const BLINK_HZ: f64 = 1.4;
+/// Share of each cycle the cursor is shown.
+const BLINK_ON: f64 = 0.65;
+/// Seconds without typing after which the cursor stops blinking and stays
+/// shown, as kitty and VS Code do.
+const BLINK_FOR: f64 = 15.0;
+
+/// Whether the cursor is shown `since` seconds into a blink, and how long
+/// until that changes (`None` once the blink has stopped).
+fn cursor_blink(since: f64) -> (bool, Option<f64>) {
+    if since >= BLINK_FOR {
+        return (true, None);
+    }
+    let phase = (since * BLINK_HZ).fract();
+    let (visible, to_edge) = if phase < BLINK_ON {
+        (true, BLINK_ON - phase)
+    } else {
+        (false, 1.0 - phase)
+    };
+    // A hair past the edge, so the frame lands on the far side of it.
+    let wait = (to_edge / BLINK_HZ).min(BLINK_FOR - since) + 0.005;
+    (visible, Some(wait))
+}
+
+/// Input that restarts the blink: what a person typing produces.
+fn is_typing(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { pressed: true, .. } | egui::Event::Text(_) | egui::Event::Paste(_)
+    )
+}
+
 /// Home row first: the labels should be reachable without looking.
 const HINT_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
 
@@ -163,6 +199,7 @@ impl Default for TabView {
             had_focus: false,
             last_motion_cell: None,
             last_blink: true,
+            blink_from: None,
             search: None,
             hover_target: None,
             hints: None,
@@ -240,11 +277,23 @@ impl TabView {
         self.handle_focus_reporting(session, &response, mode);
 
         // Cursor blink: focused tabs pulse gently; unfocused show steady.
+        // A blink is a full repaint, so wake only at its on/off edges, and
+        // stop after a while without typing: a window left focused and idle
+        // would otherwise redraw forever (#35).
         let focused = response.has_focus();
-        let cursor_visible = !focused || ((ui.input(|i| i.time) * 1.4) % 1.0) < 0.65;
-        if focused {
+        let now = ui.input(|i| i.time);
+        if !focused {
+            self.blink_from = None;
+        } else if self.blink_from.is_none() || ui.input(|i| i.events.iter().any(is_typing)) {
+            self.blink_from = Some(now);
+        }
+        let (cursor_visible, next_edge) = match self.blink_from {
+            Some(from) => cursor_blink(now - from),
+            None => (true, None),
+        };
+        if let Some(wait) = next_edge {
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(180));
+                .request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
 
         // Paint.
@@ -1092,4 +1141,27 @@ fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) 
         Side::Right
     };
     (col, line, side)
+}
+
+#[cfg(test)]
+mod blink_tests {
+    use super::cursor_blink;
+
+    #[test]
+    fn the_blink_wakes_only_at_its_edges_and_then_stops() {
+        let (shown, wait) = cursor_blink(0.0);
+        assert!(shown);
+        // On for 0.65 of a 1/1.4 s cycle: the first edge is ~0.46 s away.
+        let wait = wait.unwrap();
+        assert!((0.46..0.47).contains(&wait), "{wait}");
+        let (shown, wait) = cursor_blink(0.5);
+        assert!(!shown);
+        assert!(wait.unwrap() < 0.25);
+        // Solid, and no more wake-ups, once nobody has typed for a while.
+        assert_eq!(cursor_blink(15.0), (true, None));
+        assert_eq!(cursor_blink(600.0), (true, None));
+        // The last wake-up before the stop lands on the stop.
+        let (_, wait) = cursor_blink(14.9);
+        assert!(wait.unwrap() <= 0.11);
+    }
 }

@@ -1410,6 +1410,7 @@ dependencies = [
  "giverny-core",
  "giverny-term",
  "jiff",
+ "khronos-egl",
  "notify-rust",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
