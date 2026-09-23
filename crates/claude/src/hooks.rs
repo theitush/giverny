@@ -357,6 +357,161 @@ pub fn run_statusline(spool: &Path) {
     println!("{}", parts.join("  ·  "));
 }
 
+// ---- subagentStatusLine: the agents pane's live rows ----------------------
+
+/// Synthetic event name for relayed `subagentStatusLine` input (not a Claude
+/// hook event). The message's `event` is Claude Code's stdin verbatim —
+/// `session_id`, `tasks[]`, … — with `hook_event_name` added, so
+/// [`crate::subagents::LiveSnapshot::from_value`] reads it directly.
+pub const SUBAGENT_LINE_EVENT: &str = "GivernySubagentLine";
+
+/// The argument after `relay` that selects the subagent-line mode.
+pub const SUBAGENT_LINE_FLAG: &str = "--subagent-line";
+
+/// The `subagentStatusLine` command for one account's `settings.json`.
+pub fn subagent_line_command_for(settings_path: &Path) -> String {
+    format!("{} relay {SUBAGENT_LINE_FLAG}", exe_for(settings_path))
+}
+
+/// Is this `subagentStatusLine` command ours, whatever binary path it names?
+fn is_our_subagent_line(command: &str) -> bool {
+    command.contains("giverny") && command.trim_end().ends_with(SUBAGENT_LINE_FLAG)
+}
+
+/// What the relay prints back to Claude Code for one tick: one
+/// `{"id":…,"content":""}` line per task when `hide`, else nothing.
+///
+/// Claude Code 2.1.280 drops any row whose decoration is the empty string
+/// from its subagent panel, and with every row dropped the panel — `● main`
+/// included — is not drawn at all (verified in a live session, giverny#3).
+/// Printing nothing leaves every row undecorated, which draws it natively.
+pub fn subagent_line_output(payload: &serde_json::Value, hide: bool) -> String {
+    if !hide {
+        return String::new();
+    }
+    let mut out = String::new();
+    for task in payload
+        .get("tasks")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(id) = task.get("id").and_then(|v| v.as_str()) {
+            out.push_str(&serde_json::json!({ "id": id, "content": "" }).to_string());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The message the relay forwards for one `subagentStatusLine` tick.
+pub fn subagent_line_msg(
+    payload: serde_json::Value,
+    tab_id: String,
+    config_dir: Option<String>,
+) -> RelayMsg {
+    let mut event = match payload {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    event.insert(
+        "hook_event_name".into(),
+        serde_json::Value::String(SUBAGENT_LINE_EVENT.into()),
+    );
+    RelayMsg {
+        tab_id: Some(tab_id),
+        config_dir,
+        event: serde_json::Value::Object(event),
+    }
+}
+
+/// The `giverny relay --subagent-line` entrypoint: Claude Code runs it at
+/// least every five seconds while a session has live workers, with the list
+/// on stdin. Inside a Giverny tab it forwards that list to the app (the
+/// agents pane's Running rows) and, when `pane_on`, hides every row of Claude
+/// Code's own panel. Outside a tab it does nothing and prints nothing, so an
+/// account-wide install never changes a session Giverny is not showing.
+///
+/// Like `relay`, it never fails: Claude Code logs a non-zero exit and drops
+/// the tick, and a relay problem must not cost the user their panel.
+pub fn run_subagent_line(spool: &Path, pane_on: bool) {
+    let mut input = String::new();
+    let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
+    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+        return;
+    };
+    let payload: serde_json::Value =
+        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let answer = subagent_line_output(&payload, pane_on);
+    deliver(&subagent_line_msg(payload, tab_id, account_dir()), spool);
+    print!("{answer}");
+}
+
+/// Is the Giverny `subagentStatusLine` configured in this settings file?
+pub fn subagent_line_installed_in(settings_path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("subagentStatusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(is_our_subagent_line)
+}
+
+/// Install or remove the Giverny `subagentStatusLine` in one settings file.
+/// Returns whether the file changed.
+///
+/// The house rules for `settings.json`: a command the user configured
+/// themselves is never replaced (an error, file untouched); nothing else in
+/// the file moves; the first write leaves the same one-time backup
+/// [`install_into`] does; and writing what is already there writes nothing,
+/// so Claude Code's settings watcher is not woken for a no-op. Removing only
+/// ever removes ours.
+pub fn set_subagent_line(settings_path: &Path, enable: bool) -> anyhow::Result<bool> {
+    let mut root: serde_json::Value = match std::fs::read(settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("won't touch unparseable settings: {e}"))?,
+        Err(_) if !enable => return Ok(false),
+        Err(_) => serde_json::json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings root is not an object"))?;
+    let current = obj
+        .get("subagentStatusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    if let Some(cmd) = &current
+        && !is_our_subagent_line(cmd)
+    {
+        anyhow::bail!("a custom subagentStatusLine is already configured — leaving it alone");
+    }
+    let want = subagent_line_command_for(settings_path);
+    match (enable, current.as_deref()) {
+        (true, Some(cmd)) if cmd == want => return Ok(false),
+        (false, None) => return Ok(false),
+        _ => {}
+    }
+    let backup = settings_path.with_extension("json.giverny-bak");
+    if settings_path.exists() && !backup.exists() {
+        let _ = std::fs::copy(settings_path, &backup);
+    }
+    if enable {
+        obj.insert(
+            "subagentStatusLine".into(),
+            serde_json::json!({ "type": "command", "command": want }),
+        );
+    } else {
+        obj.remove("subagentStatusLine");
+    }
+    write_settings(settings_path, &root)?;
+    Ok(true)
+}
+
 /// Is the Giverny statusline configured in this settings file?
 pub fn statusline_installed_in(settings_path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(settings_path) else {
@@ -574,7 +729,13 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
         .and_then(|s| s.get("command"))
         .and_then(|c| c.as_str())
         .is_some_and(|c| c.contains("giverny") && c != want_statusline);
-    hooks_stale || statusline_stale
+    let want_subagent_line = subagent_line_command_for(settings_path);
+    let subagent_line_stale = root
+        .get("subagentStatusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| is_our_subagent_line(c) && c != want_subagent_line);
+    hooks_stale || statusline_stale || subagent_line_stale
 }
 
 /// Install (or refresh) the relay hooks in one profile's `settings.json`.
@@ -860,6 +1021,141 @@ mod tests {
             set_statusline(&path, true).is_err(),
             "must not clobber a user statusline"
         );
+    }
+
+    /// Claude Code's stdin for one tick, trimmed from a live 2.1.280 capture.
+    const SUBAGENT_STDIN: &str = r#"{"session_id":"c923","cwd":"/w","columns":194,
+        "tasks":[{"id":"ac62","type":"local_agent","status":"running",
+                  "description":"Write a poem","label":"Write a poem",
+                  "startTime":1790156717475,"model":"claude-haiku-4-5","tokenCount":0,
+                  "tokenSamples":[0],"cwd":"/w"},
+                 {"id":"b7","type":"local_agent","status":"completed","tokenCount":9}]}"#;
+
+    #[test]
+    fn subagent_line_hides_every_row_only_when_asked() {
+        let payload: serde_json::Value = serde_json::from_str(SUBAGENT_STDIN).unwrap();
+        assert_eq!(
+            subagent_line_output(&payload, false),
+            "",
+            "off: native rows"
+        );
+
+        let out = subagent_line_output(&payload, true);
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per task: {out}");
+        assert_eq!(lines[0], serde_json::json!({"id":"ac62","content":""}));
+        assert_eq!(lines[1], serde_json::json!({"id":"b7","content":""}));
+
+        // Garbage in: nothing to hide, and no panic.
+        assert_eq!(subagent_line_output(&serde_json::Value::Null, true), "");
+    }
+
+    /// What the app receives is the stdin verbatim plus the event name, so
+    /// the live-row parser reads it with no translation layer in between.
+    #[test]
+    fn subagent_line_msg_is_the_stdin_the_parser_reads() {
+        let payload: serde_json::Value = serde_json::from_str(SUBAGENT_STDIN).unwrap();
+        let msg = subagent_line_msg(payload, "giverny-4".into(), Some("/c".into()));
+        assert_eq!(msg.hook_event(), Some(SUBAGENT_LINE_EVENT));
+        assert_eq!(msg.session_id(), Some("c923"));
+        assert_eq!(msg.tab_id.as_deref(), Some("giverny-4"));
+
+        // Through the wire format and back, as the listener does.
+        let wire: RelayMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let snap = crate::subagents::LiveSnapshot::from_value(&wire.event);
+        assert_eq!(snap.session_id.as_deref(), Some("c923"));
+        assert_eq!(snap.tasks.len(), 2);
+        assert_eq!(snap.tasks[0].id, "ac62");
+        assert_eq!(snap.tasks[0].start_ms, Some(1790156717475));
+    }
+
+    #[test]
+    fn subagent_line_install_is_idempotent_and_reversible() {
+        let path = scratch("subline");
+        std::fs::write(
+            &path,
+            r#"{"model":"opus","statusLine":{"type":"command","command":"mine.sh"}}"#,
+        )
+        .unwrap();
+        assert!(
+            set_subagent_line(&path, true).unwrap(),
+            "first install writes"
+        );
+        assert!(subagent_line_installed_in(&path));
+        assert!(
+            path.with_extension("json.giverny-bak").exists(),
+            "backup created"
+        );
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            !set_subagent_line(&path, true).unwrap(),
+            "second install is a no-op"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "and writes nothing"
+        );
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(root["model"], "opus", "the rest of the file survives");
+        assert_eq!(root["statusLine"]["command"], "mine.sh");
+        assert!(
+            root["subagentStatusLine"]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("relay --subagent-line")
+        );
+
+        assert!(set_subagent_line(&path, false).unwrap());
+        assert!(!subagent_line_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("subagentStatusLine").is_none());
+        assert_eq!(root["statusLine"]["command"], "mine.sh");
+        assert!(!set_subagent_line(&path, false).unwrap(), "already off");
+    }
+
+    #[test]
+    fn subagent_line_never_replaces_the_users_own() {
+        let path = scratch("subline-foreign");
+        let theirs = r#"{"subagentStatusLine":{"type":"command","command":"~/bin/agents.sh"}}"#;
+        std::fs::write(&path, theirs).unwrap();
+        assert!(set_subagent_line(&path, true).is_err(), "on: refused");
+        assert!(
+            set_subagent_line(&path, false).is_err(),
+            "off: not ours to remove"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs, "untouched");
+        assert!(!subagent_line_installed_in(&path));
+    }
+
+    #[test]
+    fn subagent_line_off_creates_no_file() {
+        let path = scratch("subline-none");
+        std::fs::remove_file(&path).ok();
+        assert!(!set_subagent_line(&path, false).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_subagent_line_path_is_detected_and_repaired() {
+        let path = scratch("subline-stale");
+        set_subagent_line(&path, true).unwrap();
+        assert!(!needs_path_refresh(&path));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let stale = text.replace(&relay_command(), "/old/giverny relay");
+        std::fs::write(&path, stale).unwrap();
+        assert!(needs_path_refresh(&path));
+        assert!(
+            subagent_line_installed_in(&path),
+            "still recognised as ours"
+        );
+        assert!(set_subagent_line(&path, true).unwrap(), "rewritten");
+        assert!(!needs_path_refresh(&path));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod agents_live;
 mod capture;
 mod chrome;
 mod claude_watch;
@@ -270,7 +271,14 @@ fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let cfg = config::load(paths.base());
+                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), agents_pane_on(&cfg));
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("statusline") => {
@@ -323,7 +331,9 @@ fn main() -> eframe::Result {
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
                  giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+                 giverny statusline (internal) Claude Code statusline entrypoint\n  \
+                 giverny relay --subagent-line\n                     \
+                 (internal) Claude Code subagentStatusLine entrypoint\n\n\
                  FLAGS:\n  -V, --version  print the version\n  \
                  -h, --help     print this help"
             );
@@ -737,6 +747,21 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
+/// Is the agents pane on? Read by its settings key rather than a struct
+/// field, so the relay and the installer follow whatever the settings table
+/// declares — and read as off in a build that does not declare it.
+fn agents_pane_on(cfg: &config::Config) -> bool {
+    giverny_core::settings::by_key("claude.agents_pane")
+        .and_then(|def| giverny_core::settings::current(cfg, def))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// `GIVERNY_FEED_DIR` as `%WSLENV%` lists it: `/p` translates the Windows
+/// path into the distribution's terms going in (`C:\…` → `/mnt/c/…`), so a
+/// feed writer inside WSL writes where the app reads.
+const FEED_DIR_WSLENV: &str = "GIVERNY_FEED_DIR/p";
+
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if claude.skip_resume_summary {
@@ -925,13 +950,15 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
                 .collect()
         })
         .unwrap_or_default();
-    for name in ours.iter().copied() {
-        // An entry may carry a flag (`VAR/p`); the name before it is the key.
+    for entry in ours.iter().copied() {
+        // An entry may carry a flag (`VAR/p`), ours or theirs; the name
+        // before it is the key.
+        let name = entry.split('/').next().unwrap_or(entry);
         if !parts
             .iter()
             .any(|p| p.split('/').next().is_some_and(|n| n == name))
         {
-            parts.push(name.to_string());
+            parts.push(entry.to_string());
         }
     }
     parts.join(":")
@@ -1103,6 +1130,7 @@ impl App {
         if app.cfg.claude.auto_mode {
             app.claude.ensure_auto_mode();
         }
+        app.claude.set_agents_pane(agents_pane_on(&app.cfg));
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -2096,6 +2124,9 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
+        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg) {
+            self.claude.set_agents_pane(agents_pane_on(&cfg));
+        }
         self.cfg = cfg;
         tracing::info!("config reloaded");
     }
@@ -2504,6 +2535,12 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
+        // Where an orchestrator in this tab writes its agents-pane feed
+        // (`docs/agents-pane.md`) — the directory this app reads.
+        env.push((
+            giverny_claude::feed::DIR_ENV.into(),
+            giverny_claude::feed::feed_dir().display().to_string(),
+        ));
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
@@ -2571,6 +2608,14 @@ impl App {
             // only what we set, since listing a name we did not set is what
             // put an empty CLAUDE_CONFIG_DIR in front of Claude Code.
             .filter(|name| name.starts_with("GIVERNY_") || name.starts_with("CLAUDE_"))
+            // A path, so it crosses translated.
+            .map(|name| {
+                if name == giverny_claude::feed::DIR_ENV {
+                    FEED_DIR_WSLENV
+                } else {
+                    name
+                }
+            })
             // These two come from the spawn itself rather than from here.
             .chain(["GIVERNY_TAB_ID", "GIVERNY_NONCE"])
             .collect();
@@ -3495,6 +3540,13 @@ mod tests {
 
         // Windows Terminal exports a trailing colon; an empty entry there
         // would list a variable with no name.
+        // Ours may carry a flag too: the feed dir is a path, translated with
+        // `/p` — and a name they already share is still not listed twice.
+        let feed = wslenv(None, &[FEED_DIR_WSLENV, "GIVERNY_TAB_ID"]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR/p:GIVERNY_TAB_ID");
+        let feed = wslenv(Some("GIVERNY_FEED_DIR".into()), &[FEED_DIR_WSLENV]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR", "theirs wins: {feed}");
+
         let theirs = wslenv(Some("WT_SESSION:WT_PROFILE_ID:".into()), &["GIVERNY_NONCE"]);
         assert_eq!(theirs, "WT_SESSION:WT_PROFILE_ID:GIVERNY_NONCE");
         assert!(!theirs.contains("::"), "{theirs}");
