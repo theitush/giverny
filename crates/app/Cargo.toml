@@ -38,6 +38,10 @@ pollster = "0.4"
 # root; see src/wayland_dnd.rs.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
 smithay-clipboard = "0.7.3"
+# WSLg's GPU path is an OpenGL driver picked by name (src/wslg.rs); a child
+# process tries it on a windowless EGL context first. The version and feature
+# wgpu's GL backend already uses, so no new tree.
+khronos-egl = { version = "6", features = ["dynamic"] }
 
 # Shutting down on a signal, so a logout or a `kill` gets the same
 # scrollback-and-state write that closing the window does.

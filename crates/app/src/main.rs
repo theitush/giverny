@@ -18,6 +18,8 @@ mod taskbar;
 mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -182,13 +184,16 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 ///
 /// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
 /// below re-launches itself.
-fn pick_renderer() -> eframe::Renderer {
+fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
     match std::env::var("GIVERNY_RENDERER").as_deref() {
         Ok("glow" | "gl" | "opengl") => {
             tracing::info!("renderer: OpenGL (GIVERNY_RENDERER)");
             eframe::Renderer::Glow
         }
         Ok("wgpu") => eframe::Renderer::Wgpu,
+        // OpenGL is known to reach the GPU; wgpu is not asked, because on
+        // WSLg its only Vulkan driver is lavapipe (see `wslg`).
+        _ if gpu_gl => eframe::Renderer::Glow,
         _ => {
             let adapter = wgpu_adapter();
             let renderer = renderer_for(adapter.as_ref());
@@ -209,6 +214,25 @@ fn pick_renderer() -> eframe::Renderer {
             renderer
         }
     }
+}
+
+/// Whether OpenGL has been pointed at a GPU that wgpu cannot reach: WSLg's
+/// d3d12 driver. Logs the outcome either way, since it decides the CPU cost.
+fn gpu_opengl() -> bool {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    match wslg::enable_d3d12() {
+        wslg::Gpu::NotApplicable => {}
+        wslg::Gpu::D3d12(renderer) => {
+            tracing::info!("renderer: OpenGL on the GPU through WSLg's d3d12 driver ({renderer})");
+            return true;
+        }
+        wslg::Gpu::Unavailable(why) => {
+            tracing::warn!(
+                "WSLg's d3d12 GL driver is unavailable, drawing may fall back to the CPU: {why}"
+            );
+        }
+    }
+    false
 }
 
 /// The adapter eframe's default wgpu setup would choose, asked for the same
@@ -376,6 +400,8 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        Some(wslg::PROBE_ARG) => std::process::exit(wslg::probe()),
         Some("update") => {
             update_cli();
             return Ok(());
@@ -456,7 +482,8 @@ fn main() -> eframe::Result {
 
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
-    let renderer = pick_renderer();
+    let gpu_gl = gpu_opengl();
+    let renderer = pick_renderer(gpu_gl);
     let layout = state::load_layout(&paths);
     let options = eframe::NativeOptions {
         renderer,
