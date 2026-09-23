@@ -5,7 +5,7 @@
 //! drawn only in a tab whose session has rows, as a resizable bottom panel
 //! inside the terminal's area.
 //!
-//! The rows are the [`Tracker`] (Claude Code's own data: live list,
+//! The rows are a [`Tracker`] (Claude Code's own data: live list,
 //! transcripts, notifications) merged with the optional feed file
 //! ([`feed::merge`], `docs/agents-pane.md`). This module owns only the look:
 //! the columns STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one but TASK a
@@ -15,12 +15,12 @@
 //! above it, and a ledger `total:` row — the same table
 //! `coo/tools/orchestrate-status` pins under Claude Code.
 //!
-//! **Where the rows come from.** [`TabPane::apply_live`] is the one seam for
-//! the relay: every `subagentStatusLine` snapshot for a tab goes there. Until
-//! a snapshot has arrived for a tab (or when none has for
-//! [`LIVE_STALE`]), the pane guesses Running from the transcripts on disk
-//! instead ([`TabPane::disk_fallback`]) — enough to be useful before the
-//! relay exists, and switched off by the first real snapshot.
+//! **The seam.** [`show`] takes the tab's tracker as an argument and owns
+//! none: whoever keeps the trackers (the relay's per-tab store) hands one
+//! in. Until that store exists on this branch, [`LocalTrackers`] stands in —
+//! one tracker per tab, bound to the tab's session and refreshed from disk,
+//! guessing Running from transcript mtimes since nothing relays the live
+//! list yet. Swapping it for the relay's store is one argument in `main.rs`.
 //!
 //! **Clicks** produce a [`RowClick`], which the app receives as
 //! `Action::AgentRowClicked`. What a click *does* is not decided here.
@@ -45,9 +45,7 @@ pub const DONE: Color32 = Color32::from_rgb(0x00, 0x87, 0x00);
 
 /// How often the disk is read and the feed file stat'ed.
 const POLL: Duration = Duration::from_secs(1);
-/// A tab with no live snapshot for this long falls back to the disk guess.
-pub const LIVE_STALE: Duration = Duration::from_secs(15);
-/// Disk fallback only: a transcript written this recently is a running worker.
+/// Disk guess only: a transcript written this recently is a running worker.
 const FRESH: Duration = Duration::from_secs(600);
 
 // Column widths, in characters (orchestrate-status: HEAD_W, EL_W, ETA_W,
@@ -62,160 +60,147 @@ const MIN_TITLE: usize = 12;
 
 const FONT_SIZE: f32 = 12.0;
 
-// ------------------------------------------------------------ per tab ----
+// --------------------------------------------------------- view state ----
 
-/// One tab's pane: its rows and where they are read from.
-pub struct TabPane {
-    /// The native rows. The relay feeds it through [`TabPane::apply_live`];
-    /// the pane refreshes it from disk once a second.
-    pub tracker: Tracker,
+/// What the pane itself keeps per tab: the feed it last read and the row
+/// last clicked. Never the rows — those are the tracker's.
+#[derive(Default)]
+struct View {
     feed: FeedCache,
     feed_now: Option<Feed>,
+    feed_session: Option<String>,
     last_poll: Option<Instant>,
-    last_live: Option<Instant>,
     /// The clicked row, by [`Line::ident`]. Only it is highlighted.
     selected: Option<String>,
 }
 
-impl TabPane {
-    pub fn new(config_dir: Option<PathBuf>) -> TabPane {
-        TabPane {
-            tracker: Tracker::new(config_dir),
-            feed: FeedCache::new(),
-            feed_now: None,
-            last_poll: None,
-            last_live: None,
-            selected: None,
-        }
-    }
-
-    /// **The relay's seam** (build task B): one `subagentStatusLine`
-    /// snapshot for this tab. Also switches the disk fallback off.
-    pub fn apply_live(&mut self, snap: &LiveSnapshot) {
-        self.tracker.apply_live(snap, now_ms());
-        self.last_live = Some(Instant::now());
-        self.last_poll = None; // re-read the disk and feed on the next frame
-    }
-
-    fn live_is_fresh(&self) -> bool {
-        self.last_live.is_some_and(|t| t.elapsed() < LIVE_STALE)
-    }
-
-    /// Follow the tab's session and account.
-    fn sync(&mut self, tab: &Tab) {
-        if self.tracker.config_dir.is_none() {
-            self.tracker.config_dir = tab.claude_config_dir.clone().or_else(default_config_dir);
-        }
-        if let Some(sid) = &tab.claude_session
-            && self.tracker.session_id.as_deref() != Some(sid)
-        {
-            self.tracker.set_session(sid);
-        }
-    }
-
-    /// Read the disk and the feed, at most once a [`POLL`].
-    fn poll(&mut self) {
-        if self.last_poll.is_some_and(|t| t.elapsed() < POLL) {
+impl View {
+    /// Re-read the feed for `session`, at most once a [`POLL`] (or at once
+    /// when the session changed).
+    fn poll_feed(&mut self, session: Option<&str>) {
+        let changed = self.feed_session.as_deref() != session;
+        if !changed && self.last_poll.is_some_and(|t| t.elapsed() < POLL) {
             return;
         }
         self.last_poll = Some(Instant::now());
-        if !self.live_is_fresh() {
-            self.disk_fallback();
-        }
-        self.tracker.refresh();
-        self.feed_now = self
-            .tracker
-            .session_id
-            .clone()
-            .and_then(|sid| self.feed.poll(&feed::feed_dir(), &sid).cloned());
-    }
-
-    /// Before the relay delivers anything: every worker whose transcript was
-    /// written in the last [`FRESH`] is Running, as a synthetic live list.
-    /// Notifications (read by `refresh` right after) still land them Done.
-    fn disk_fallback(&mut self) {
-        let Some(config) = self.tracker.config_dir.clone() else {
-            return;
-        };
-        let sessions: Vec<String> = self
-            .tracker
-            .session_id
-            .iter()
-            .chain(self.tracker.aliases.iter())
-            .cloned()
-            .collect();
-        let mut tasks = Vec::new();
-        for sid in &sessions {
-            let Some(dir) = subagents::subagents_dir(&config, sid) else {
-                continue;
-            };
-            for id in subagents::list_agent_ids(&dir) {
-                let path = subagents::agent_transcript(&dir, &id);
-                let fresh = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age < FRESH);
-                if !fresh {
-                    continue;
-                }
-                // A row already known keeps what it has; only a new one
-                // pays for the meta and first-line reads.
-                let known = self.tracker.get(&id);
-                if known.is_some_and(|r| !r.running()) {
-                    // Done, and `refresh` decides revivals itself.
-                    continue;
-                }
-                let (description, start_ms) = match known {
-                    Some(r) => (r.description.clone(), r.started_ms),
-                    None => (
-                        subagents::read_meta(&dir, &id).description,
-                        subagents::first_line_ms(&path),
-                    ),
-                };
-                tasks.push(LiveTask {
-                    id,
-                    kind: None,
-                    status: "running".into(),
-                    description,
-                    label: None,
-                    name: None,
-                    start_ms,
-                    model: None,
-                    tokens: None,
-                    cwd: None,
-                });
-            }
-        }
-        let snap = LiveSnapshot {
-            session_id: None,
-            tasks,
-        };
-        self.tracker.apply_live(&snap, now_ms());
+        self.feed_session = session.map(str::to_string);
+        self.feed_now = session.and_then(|sid| self.feed.poll(&feed::feed_dir(), sid).cloned());
     }
 }
 
-/// Every tab's pane. Tabs with the setting off, or never looked at with it
-/// on, have none.
+/// Every tab's pane view state.
 #[derive(Default)]
-pub struct Panes {
-    tabs: HashMap<TabId, TabPane>,
+pub struct Views {
+    tabs: HashMap<TabId, View>,
 }
 
-impl Panes {
-    /// The tab's pane, created on first use.
-    pub fn tab(&mut self, tab: &Tab) -> &mut TabPane {
-        self.tabs.entry(tab.id).or_insert_with(|| {
-            TabPane::new(tab.claude_config_dir.clone().or_else(default_config_dir))
-        })
+impl Views {
+    /// Forget a closed tab.
+    pub fn forget(&mut self, tab: TabId) {
+        self.tabs.remove(&tab);
+    }
+}
+
+// ------------------------------------------------------ interim store ----
+
+/// Stand-in for the relay's per-tab tracker store, until it lands here: one
+/// [`Tracker`] per tab, bound to the tab's session, refreshed from disk once
+/// a second, with Running guessed from transcripts written in the last
+/// [`FRESH`] (nothing relays the live list yet). In memory only. Retired by
+/// the merge with the relay branch — see the module docs.
+#[derive(Default)]
+pub struct LocalTrackers {
+    tabs: HashMap<TabId, (Tracker, Option<Instant>)>,
+}
+
+impl LocalTrackers {
+    /// `tab`'s tracker, synced to its session and refreshed if due. `None`
+    /// until the tab has a Claude session.
+    pub fn tracker(&mut self, tab: &Tab) -> Option<&Tracker> {
+        let sid = tab.claude_session.as_deref()?;
+        let (tracker, last) = self.tabs.entry(tab.id).or_insert_with(|| {
+            let dir = tab.claude_config_dir.clone().or_else(default_config_dir);
+            (Tracker::new(dir), None)
+        });
+        if tracker.session_id.as_deref() != Some(sid) {
+            tracker.set_session(sid);
+            *last = None;
+        }
+        if last.is_none_or(|t| t.elapsed() >= POLL) {
+            *last = Some(Instant::now());
+            disk_guess(tracker);
+            tracker.refresh();
+        }
+        Some(&*tracker)
     }
 
-    /// The tab's `/clear`: a new conversation, and a pane that starts empty.
-    /// Not an alias of the old one, so the old session's Done rows do not
-    /// come back from its transcript.
+    /// The tab's `/clear`, or its closing: a new conversation starts empty,
+    /// not as an alias of the old one (whose Done rows would come back).
     pub fn clear(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
     }
+}
+
+/// A synthetic live list from disk: every worker whose transcript was written
+/// in the last [`FRESH`] is Running. Notifications (read by `refresh` right
+/// after) still land them Done.
+fn disk_guess(tracker: &mut Tracker) {
+    let Some(config) = tracker.config_dir.clone() else {
+        return;
+    };
+    let sessions: Vec<String> = tracker
+        .session_id
+        .iter()
+        .chain(tracker.aliases.iter())
+        .cloned()
+        .collect();
+    let mut tasks = Vec::new();
+    for sid in &sessions {
+        let Some(dir) = subagents::subagents_dir(&config, sid) else {
+            continue;
+        };
+        for id in subagents::list_agent_ids(&dir) {
+            let path = subagents::agent_transcript(&dir, &id);
+            let fresh = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < FRESH);
+            if !fresh {
+                continue;
+            }
+            let known = tracker.get(&id);
+            if known.is_some_and(|r| !r.running()) {
+                // Done; `refresh` decides revivals itself.
+                continue;
+            }
+            // Only a row new to us pays for the meta and first-line reads.
+            let (description, start_ms) = match known {
+                Some(r) => (r.description.clone(), r.started_ms),
+                None => (
+                    subagents::read_meta(&dir, &id).description,
+                    subagents::first_line_ms(&path),
+                ),
+            };
+            tasks.push(LiveTask {
+                id,
+                kind: None,
+                status: "running".into(),
+                description,
+                label: None,
+                name: None,
+                start_ms,
+                model: None,
+                tokens: None,
+                cwd: None,
+            });
+        }
+    }
+    let snap = LiveSnapshot {
+        session_id: None,
+        tasks,
+    };
+    tracker.apply_live(&snap, now_ms());
 }
 
 fn default_config_dir() -> Option<PathBuf> {
@@ -535,14 +520,20 @@ fn cut(s: &str, max: usize) -> String {
 
 // ------------------------------------------------------------ drawing ----
 
-/// Draw the active tab's pane, if it has rows. Call inside the central
-/// panel, before the terminal takes the rest. Returns the row clicked this
-/// frame.
-pub fn show(panes: &mut Panes, tab: &Tab, chrome: &Chrome, ui: &mut Ui) -> Option<RowClick> {
-    let pane = panes.tab(tab);
-    pane.sync(tab);
-    pane.poll();
-    let table = build(pane.feed_now.as_ref(), pane.tracker.rows(), now_ms());
+/// Draw `tab`'s pane from `tracker`, if there are rows. Call inside the
+/// central panel, before the terminal takes the rest. Returns the row
+/// clicked this frame.
+pub fn show(
+    views: &mut Views,
+    tab: TabId,
+    tracker: Option<&Tracker>,
+    chrome: &Chrome,
+    ui: &mut Ui,
+) -> Option<RowClick> {
+    let tracker = tracker?;
+    let view = views.tabs.entry(tab).or_default();
+    view.poll_feed(tracker.session_id.as_deref());
+    let table = build(view.feed_now.as_ref(), tracker.rows(), now_ms());
     if table.is_empty() {
         return None;
     }
@@ -559,7 +550,7 @@ pub fn show(panes: &mut Panes, tab: &Tab, chrome: &Chrome, ui: &mut Ui) -> Optio
     let max_h = (ui.available_height() * 0.5).max(row_h * 3.0);
 
     let mut clicked = None;
-    egui::Panel::bottom(egui::Id::new(("agents_pane", tab.id)))
+    egui::Panel::bottom(egui::Id::new(("agents_pane", tab)))
         .resizable(true)
         .default_size(want.min(max_h))
         .size_range(row_h * 1.5..=max_h)
@@ -572,7 +563,7 @@ pub fn show(panes: &mut Panes, tab: &Tab, chrome: &Chrome, ui: &mut Ui) -> Optio
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked = draw_table(ui, &table, &mut pane.selected, chrome, &font, cw, row_h);
+                    clicked = draw_table(ui, &table, &mut view.selected, chrome, &font, cw, row_h);
                 });
         });
     clicked

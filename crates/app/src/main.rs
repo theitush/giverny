@@ -693,8 +693,10 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
-    /// Each tab's agents pane (`claude.agents_pane`).
-    pub agent_panes: agents_pane::Panes,
+    /// Each tab's agents pane (`claude.agents_pane`): its view state, and
+    /// the trackers it draws until the relay's own store replaces them.
+    pub agent_views: agents_pane::Views,
+    pub agent_trackers: agents_pane::LocalTrackers,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -1095,7 +1097,8 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
-            agent_panes: agents_pane::Panes::default(),
+            agent_views: agents_pane::Views::default(),
+            agent_trackers: agents_pane::LocalTrackers::default(),
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1232,7 +1235,8 @@ impl App {
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
-                self.agent_panes.clear(id);
+                self.agent_views.forget(id);
+                self.agent_trackers.clear(id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
@@ -2757,7 +2761,7 @@ impl eframe::App for App {
             }
         }
         for id in effects.cleared {
-            self.agent_panes.clear(id);
+            self.agent_trackers.clear(id);
         }
         for (summary, body) in effects.notify {
             desktop_notify(summary, body);
@@ -2877,7 +2881,13 @@ impl eframe::App for App {
             // The agents pane takes the bottom of the terminal's area.
             if self.cfg.claude.agents_pane
                 && let Some(tab) = self.ws.tab(active)
-                && let Some(click) = agents_pane::show(&mut self.agent_panes, tab, &self.chrome, ui)
+                && let Some(click) = agents_pane::show(
+                    &mut self.agent_views,
+                    active,
+                    self.agent_trackers.tracker(tab),
+                    &self.chrome,
+                    ui,
+                )
             {
                 actions.push(Action::AgentRowClicked(active, Box::new(click)));
             }
