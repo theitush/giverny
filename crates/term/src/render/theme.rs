@@ -368,6 +368,19 @@ impl Theme {
         }
     }
 
+    /// How far a worker's background leans toward the theme's magenta.
+    pub const WORKER_TINT: f32 = 0.12;
+
+    /// The background a tab shows while it is a worker rather than the
+    /// orchestrator (giverny#17): a Claude Code subagent view, or a tab that
+    /// follows a worker's transcript. A shift of this theme's own background
+    /// toward its own magenta, so it reads on light and dark themes alike,
+    /// follows a theme change (Rouen's hour included), and is not the accent
+    /// the chrome already uses for selection.
+    pub fn worker_bg(&self) -> Color32 {
+        mix(self.bg, self.ansi[5], Self::WORKER_TINT)
+    }
+
     /// Every built-in, in picker order. The names are the values of
     /// `theme.name`, and the settings schema is checked against this list.
     pub const NAMES: &'static [&'static str] = &[
@@ -543,6 +556,23 @@ mod tests {
             !Theme::by_name("nonsense").is_light(),
             "unknown names fall back to the default dark theme"
         );
+    }
+
+    /// Every built-in's worker background is visibly not its background, yet
+    /// stays on the same side of light and dark, so text keeps its contrast.
+    #[test]
+    fn worker_bg_is_a_visible_shift_of_every_theme() {
+        for name in Theme::NAMES {
+            let t = Theme::by_name(name);
+            let w = t.worker_bg();
+            let d = (w.r() as i32 - t.bg.r() as i32).abs()
+                + (w.g() as i32 - t.bg.g() as i32).abs()
+                + (w.b() as i32 - t.bg.b() as i32).abs();
+            assert!(d >= 12, "{name}: worker bg {w:?} too close to {:?}", t.bg);
+            assert!(d <= 90, "{name}: worker bg {w:?} too far from {:?}", t.bg);
+            let shifted = Theme { bg: w, ..t.clone() };
+            assert_eq!(shifted.is_light(), t.is_light(), "{name}");
+        }
     }
 
     /// Rouen never jumps: the palette on either side of any moment is the

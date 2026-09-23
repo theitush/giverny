@@ -251,6 +251,33 @@ pub mod cc_keys {
     pub const PROMPT: char = '❯';
     /// The dialog's top border.
     pub const DIALOG_TOP: char = '▔';
+    /// The footer strip's first row is the main session: `● main` while it
+    /// is the one on screen, `◯ main` (`( ) main` without Unicode) while a
+    /// subagent's or teammate's view is. Read off Claude Code 2.1.281's
+    /// strip row (`[❯ |  ]<● or ◯> main`, then `↑ N more` right-aligned).
+    pub const MAIN_UNVIEWED: &[&str] = &["◯ main", "( ) main"];
+}
+
+/// Whether Claude Code on this screen shows a worker's view rather than the
+/// main session (giverny#17) — entered by an attach, by `/tasks`, or by
+/// hand, and left with the strip's `main` or ←. Read from the screen alone,
+/// so it is right however the view was reached.
+///
+/// A strip row is the marker and nothing looser: the whole row is the
+/// unviewed `main`, save the pointer before it and a `↑ N more` after it,
+/// so a transcript line that merely mentions `◯ main` does not count.
+pub fn viewing_worker(screen: &str) -> bool {
+    screen.lines().any(|row| {
+        let row = row.trim();
+        let row = row
+            .strip_prefix(cc_keys::PROMPT)
+            .map_or(row, str::trim_start);
+        cc_keys::MAIN_UNVIEWED.iter().any(|m| {
+            row.strip_prefix(m).is_some_and(|rest| {
+                rest.is_empty() || (rest.starts_with("  ") && rest.trim_start().starts_with('↑'))
+            })
+        })
+    })
 }
 
 /// One key Giverny types into the parent's Claude Code.
@@ -859,6 +886,34 @@ mod tests {
             ]
         );
         assert_eq!(items.iter().position(|i| i.selected), Some(3));
+    }
+
+    /// The footer strip under a worker's view, as #23 saw it (`─── <desc> ─`,
+    /// the `Message @…` placeholder, `◯ main`), and the same strip on main.
+    fn strip_screen(main: &str, pointer: bool) -> String {
+        let p = if pointer { "❯ " } else { "  " };
+        format!(
+            "{TRANSCRIPT}─── theta worker ──────────────\n❯ Message @general-purpose…\n\
+             ──────────────────────────────\n  {p}{main} main                 ↑ 1 more\n  \
+             ◯ theta worker (running)\n"
+        )
+    }
+
+    #[test]
+    fn tells_a_worker_view_from_main() {
+        assert!(viewing_worker(&strip_screen("◯", false)));
+        assert!(viewing_worker(&strip_screen("◯", true)));
+        assert!(viewing_worker(&strip_screen("( )", false)));
+        assert!(!viewing_worker(&strip_screen("●", false)));
+        assert!(!viewing_worker(&strip_screen("⏺", true)));
+        // Main with the strip folded away, and the Background dialog.
+        assert!(!viewing_worker(&prompt_screen("")));
+        assert!(!viewing_worker(&list_screen(2)));
+        assert!(!viewing_worker(DETAIL));
+        // A transcript line that talks about the strip is not the strip.
+        assert!(!viewing_worker(
+            "● the worker view has a ◯ main strip to go back\n  ◯ main is how\n"
+        ));
     }
 
     #[test]

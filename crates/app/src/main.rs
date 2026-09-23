@@ -19,7 +19,7 @@ mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -627,7 +627,14 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// When the screen was last read for a worker's view (giverny#17).
+    worker_checked: Option<Instant>,
 }
+
+/// How often the active tab's screen is read for a worker's view: fast
+/// enough that the tint follows `main` and ← at a glance, rare enough to
+/// cost nothing.
+const WORKER_CHECK: Duration = Duration::from_millis(200);
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
 /// tab titles, and the clamp a restored width is held to.
@@ -660,6 +667,31 @@ const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 struct Snapshot {
     at: Instant,
     hash: u64,
+}
+
+/// Paint `rt` on the worker background while it is a worker's tab, or while
+/// its Claude Code shows a subagent's view (giverny#17). The screen is read
+/// at most every [`WORKER_CHECK`], and only for the tab on screen.
+fn update_worker_bg(ctx: &egui::Context, rt: &mut TabRuntime, worker_tab: bool) {
+    if worker_tab {
+        rt.view.worker_bg = true;
+        return;
+    }
+    let Some(session) = &rt.session else {
+        rt.view.worker_bg = false;
+        return;
+    };
+    let now = Instant::now();
+    if let Some(at) = rt.worker_checked
+        && now.duration_since(at) < WORKER_CHECK
+    {
+        // A burst of frames: look once more when it is over, so the last
+        // screen of it (the view just switched) is the one read.
+        ctx.request_repaint_after(WORKER_CHECK - now.duration_since(at));
+        return;
+    }
+    rt.worker_checked = Some(now);
+    rt.view.worker_bg = agent_open::viewing_worker(&session.screen_text());
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -787,6 +819,9 @@ pub struct App {
     /// Tabs following a worker's transcript, by transcript: a second click
     /// on the same worker goes back to its tab instead of opening another.
     follow_tabs: HashMap<PathBuf, TabId>,
+    /// Tabs opened for a worker (a Done row's follower, a row's open
+    /// command): painted on the worker background, like a subagent view.
+    worker_tabs: HashSet<TabId>,
     /// A Running agents-pane row being attached: keys typed into its parent
     /// tab's Claude Code, one per frame, to open the worker's view.
     attach: Option<AttachJob>,
@@ -1219,6 +1254,7 @@ impl App {
             agent_views: agents_pane::Views::default(),
             brief: None,
             follow_tabs: HashMap::new(),
+            worker_tabs: HashSet::new(),
             attach: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
@@ -1739,6 +1775,7 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    worker_checked: None,
                 });
                 entry.session = Some(session);
                 // Startup rc files may `cd` away from the spawn dir; verify
@@ -2947,6 +2984,7 @@ impl App {
             tab.cwd = cwd.or_else(dirs::home_dir);
             tab.custom_title = Some(title.to_string());
         }
+        self.worker_tabs.insert(id);
         self.spawn_session(ctx, id, None);
         // The deferred injection the other tab-opening paths use: give the
         // shell time to be ready before typing into it.
@@ -3252,6 +3290,7 @@ impl eframe::App for App {
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
+                update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
                 if let Some(session) = &mut rt.session {
                     let response = rt.view.show(ui, &mut self.shared, session);
                     if self.focus_terminal {
