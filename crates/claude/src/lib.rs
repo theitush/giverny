@@ -10,5 +10,6 @@ pub mod hooks;
 pub mod jobs;
 pub mod profiles;
 pub mod registry;
+pub mod subagents;
 pub mod usage;
 pub mod wsl;
