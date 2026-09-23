@@ -1,5 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod agent_open;
 mod agents_live;
 mod agents_pane;
 mod capture;
@@ -303,6 +304,25 @@ fn main() -> eframe::Result {
             doctor();
             return Ok(());
         }
+        // A worker's transcript, readable and live: what a Running or Done
+        // row of the agents pane opens.
+        Some("transcript") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+            let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+                eprintln!("usage: giverny transcript [--follow] <agent-<id>.jsonl>");
+                std::process::exit(2);
+            };
+            let stdout = std::io::stdout();
+            if let Err(err) =
+                giverny_claude::transcript::follow(Path::new(path), follow, &mut stdout.lock())
+                && err.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                eprintln!("giverny transcript: {path}: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some("update") => {
             update_cli();
             return Ok(());
@@ -328,6 +348,8 @@ fn main() -> eframe::Result {
                  giverny welcome [from-version]\n                     \
                  print the welcome screen\n  \
                  giverny update     check for a newer release\n  \
+                 giverny transcript [--follow] <agent jsonl>\n                     \
+                 print a worker's transcript, readable (and follow it)\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
@@ -508,7 +530,8 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
-    /// A row of the agents pane was clicked. What it opens is build task D.
+    /// A row of the agents pane was clicked: Running and Done open the
+    /// worker, Planned shows its brief (`agent_open`).
     AgentRowClicked(TabId, Box<agents_pane::RowClick>),
 }
 
@@ -706,6 +729,11 @@ pub struct App {
     /// Each tab's agents pane view state (`claude.agents_pane`); the rows
     /// are `claude.agents`'.
     pub agent_views: agents_pane::Views,
+    /// The read-only text a Planned agents-pane row opens (its brief).
+    pub brief: Option<overlays::BriefOverlay>,
+    /// Tabs following a worker's transcript, by transcript: a second click
+    /// on the same worker goes back to its tab instead of opening another.
+    follow_tabs: HashMap<PathBuf, TabId>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -1124,6 +1152,8 @@ impl App {
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
             agent_views: agents_pane::Views::default(),
+            brief: None,
+            follow_tabs: HashMap::new(),
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1285,10 +1315,7 @@ impl App {
                 self.layout.rail_view = view;
                 self.state_dirty = true;
             }
-            Action::AgentRowClicked(tab, click) => {
-                // Build task D decides what a click opens.
-                tracing::debug!("agents pane: {tab:?} clicked {click:?}");
-            }
+            Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -2647,6 +2674,121 @@ impl App {
         }
     }
 
+    /// A click on an agents-pane row of tab `parent`: open the worker
+    /// (Running and Done alike), or show a Planned row's brief.
+    fn open_agent_row(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &agents_pane::RowClick,
+    ) {
+        use agent_open::{Body, Plan};
+        match agent_open::plan(click) {
+            Plan::Show { title, body } => {
+                let (source, text) = match body {
+                    Body::File(path) => {
+                        let text = agent_open::read_brief(&path);
+                        (Some(path), text)
+                    }
+                    Body::Text(text) => (None, text),
+                };
+                self.settings = None;
+                self.keys_overlay = None;
+                self.brief = Some(overlays::BriefOverlay {
+                    title,
+                    source,
+                    text,
+                });
+            }
+            Plan::Follow { title, transcript } => {
+                // Already following this worker: go back to that tab.
+                if let Some(&id) = self.follow_tabs.get(&transcript)
+                    && self.ws.tab(id).is_some_and(|t| !t.exited)
+                {
+                    self.apply(ctx, Action::Select(id));
+                    return;
+                }
+                let exe = match std::env::current_exe() {
+                    Ok(exe) => exe,
+                    Err(err) => {
+                        tracing::warn!("agents pane: cannot name this binary: {err}");
+                        return;
+                    }
+                };
+                let command = agent_open::follow_command(&exe, &transcript);
+                let id = self.open_worker_tab(ctx, parent, &title, command);
+                self.follow_tabs.insert(transcript, id);
+            }
+            Plan::Run { title, command } => {
+                // The same guard a resume has: two claudes on one
+                // conversation interleave its transcript.
+                if let Some(sid) = agent_open::resumed_session(&command) {
+                    let dirs: Vec<PathBuf> = self
+                        .claude
+                        .profiles
+                        .iter()
+                        .map(|p| p.config_dir.clone())
+                        .collect();
+                    if giverny_claude::registry::session_is_live(dirs, &sid) {
+                        let holder = self
+                            .ws
+                            .tabs
+                            .iter()
+                            .find(|t| t.claude_session.as_deref() == Some(sid.as_str()))
+                            .map(|t| t.id);
+                        if let Some(id) = holder {
+                            self.apply(ctx, Action::Select(id));
+                        } else {
+                            self.brief = Some(overlays::BriefOverlay {
+                                title,
+                                source: None,
+                                text: format!(
+                                    "This worker's conversation is already running outside \
+                                     Giverny ({sid}). Resuming it here as well would put two \
+                                     claudes on one transcript, so nothing was opened.\n\n\
+                                     The row's open command:\n  {command}"
+                                ),
+                            });
+                        }
+                        return;
+                    }
+                }
+                self.open_worker_tab(ctx, parent, &title, command);
+            }
+        }
+    }
+
+    /// A new tab beside `parent` — its category, its directory — titled for
+    /// a worker, that runs `command` once its shell is up.
+    fn open_worker_tab(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        command: String,
+    ) -> TabId {
+        let cwd = self.ws.tab(parent).and_then(|t| t.cwd.clone());
+        let cat = match self.ws.tab(parent) {
+            Some(t) => t.category,
+            None => category_for_agent(&mut self.ws, cwd.as_deref()),
+        };
+        let id = self.ws.add_tab(cat);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.cwd = cwd.or_else(dirs::home_dir);
+            tab.custom_title = Some(title.to_string());
+        }
+        self.spawn_session(ctx, id, None);
+        // The deferred injection the other tab-opening paths use: give the
+        // shell time to be ready before typing into it.
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(900),
+            id,
+            Inject::Raw(format!("{command}\r").into_bytes()),
+        ));
+        self.apply(ctx, Action::Select(id));
+        id
+    }
+
     /// Picking a tab means "show me that tab": the settings screen and the
     /// key list take the terminal's place, so a tab clicked in the rail while
     /// one of them is open used to look like a click that did nothing — the
@@ -2654,6 +2796,7 @@ impl App {
     fn reveal_terminal(&mut self) {
         self.settings = None;
         self.keys_overlay = None;
+        self.brief = None;
         self.focus_terminal = true;
     }
 
@@ -2672,6 +2815,12 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        // The brief overlay closes on Esc, which must not reach the shell
+        // underneath as well.
+        if self.brief.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.brief = None;
+            self.focus_terminal = true;
+        }
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
@@ -2948,6 +3097,7 @@ impl eframe::App for App {
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
+        overlays::brief_ui(self, &ctx);
 
         for action in actions {
             self.apply(&ctx, action);

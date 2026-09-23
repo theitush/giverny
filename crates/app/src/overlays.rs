@@ -257,6 +257,92 @@ fn humanize(d: std::time::Duration) -> String {
     }
 }
 
+// ---- brief overlay (agents pane: a Planned row's brief) --------------------
+
+/// Read-only text over the terminal: what a click on a Planned row of the
+/// agents pane shows (its `brief`, else its `note`), and what a row that has
+/// nothing to open says instead of doing nothing. `Esc` closes it.
+pub struct BriefOverlay {
+    pub title: String,
+    /// Where the text came from, shown under the title when it is a file.
+    pub source: Option<std::path::PathBuf>,
+    pub text: String,
+}
+
+pub fn brief_ui(app: &mut App, ctx: &egui::Context) {
+    let Some(brief) = app.brief.take() else {
+        return;
+    };
+    let c = app.chrome;
+    // Esc is also consumed in `App::shortcuts` before the terminal sees it;
+    // this catches the frame the overlay opened on.
+    let mut close = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+
+    let screen = ctx.content_rect();
+    let width = (screen.width() * 0.6).clamp(360.0, 900.0);
+    let height = (screen.height() * 0.7).max(200.0);
+    egui::Window::new("giverny-brief")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&brief.title)
+                        .font(FontId::monospace(12.5))
+                        .color(c.accent),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .link(
+                            RichText::new("close")
+                                .font(FontId::monospace(10.0))
+                                .color(c.dim),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            if let Some(src) = &brief.source {
+                ui.label(
+                    RichText::new(src.display().to_string())
+                        .font(FontId::monospace(10.0))
+                        .color(c.dim),
+                );
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&brief.text)
+                                .font(FontId::monospace(11.5))
+                                .color(c.fg),
+                        )
+                        .wrap()
+                        .selectable(true),
+                    );
+                });
+            ui.separator();
+            ui.label(
+                RichText::new("read-only · esc close")
+                    .font(FontId::monospace(10.0))
+                    .color(c.dim),
+            );
+        });
+
+    if close {
+        app.focus_terminal = true;
+    } else {
+        app.brief = Some(brief);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
