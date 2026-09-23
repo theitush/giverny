@@ -432,9 +432,12 @@ pub fn show(
         .resizable(true)
         .default_size(want.min(max_h))
         .size_range(row_h * 1.5..=max_h)
+        // The session's own background, not the rail's lifted panel colour:
+        // the pane reads as part of the terminal above it. egui's separator
+        // line (on by default) keeps the boundary between the two.
         .frame(
             egui::Frame::NONE
-                .fill(chrome.panel)
+                .fill(shared.theme.bg)
                 .inner_margin(egui::Margin::symmetric(8, 5)),
         )
         .show(ui, |ui| {
