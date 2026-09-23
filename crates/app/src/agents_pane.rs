@@ -28,10 +28,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Sense, Ui};
+use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, PaneRow, Stage};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_core::tabs::TabId;
+use giverny_term::widget::RenderShared;
 
 use crate::chrome::Chrome;
 
@@ -54,8 +55,6 @@ const NOW_W: usize = 28;
 const TOK_W: usize = 6;
 const GAP: usize = 2;
 const MIN_TITLE: usize = 12;
-
-const FONT_SIZE: f32 = 12.0;
 
 // --------------------------------------------------------- view state ----
 
@@ -376,6 +375,12 @@ fn stage_color(s: Stage) -> Color32 {
 }
 
 /// Cut to `max` characters, the last one an ellipsis.
+/// Start column that makes `s` end at column `end` (right alignment on the
+/// cell grid).
+fn right_at(end: usize, s: &str) -> usize {
+    end.saturating_sub(s.chars().count())
+}
+
 fn cut(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -398,6 +403,7 @@ pub fn show(
     tab: TabId,
     tracker: Option<&Tracker>,
     chrome: &Chrome,
+    shared: &mut RenderShared,
     ui: &mut Ui,
 ) -> Option<RowClick> {
     let tracker = tracker?;
@@ -412,16 +418,11 @@ pub fn show(
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
-    let font = FontId::monospace(FONT_SIZE);
-    // The advance over a run, not one glyph: what the painter really steps.
-    let cw = ui
-        .ctx()
-        .fonts_mut(|f| f.layout_no_wrap("0".repeat(20), font.clone(), Color32::WHITE))
-        .size()
-        .x
-        / 20.0;
-    let cw = cw.max(1.0);
-    let row_h = (FONT_SIZE * 1.45).round();
+    // The session's own cell: the pane is drawn in the terminal's glyphs
+    // (face, size, hinting, grid), so it follows zoom and the font setting.
+    let cell = shared.cell_size(ui.ctx().pixels_per_point());
+    // A little air around each row; a table, not a wall of grid.
+    let row_h = (cell.y * 1.2).round().max(cell.y);
     let extra = usize::from(table.footer.is_some());
     let want = (table.lines.len() + extra) as f32 * row_h + 10.0;
     let max_h = (ui.available_height() * 0.5).max(row_h * 3.0);
@@ -440,7 +441,8 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked = draw_table(ui, &table, &mut view.selected, chrome, &font, cw, row_h);
+                    clicked =
+                        draw_table(ui, &table, &mut view.selected, chrome, shared, cell, row_h);
                 });
         });
     clicked
@@ -451,10 +453,11 @@ fn draw_table(
     table: &Table,
     selected: &mut Option<String>,
     chrome: &Chrome,
-    font: &FontId,
-    cw: f32,
+    shared: &mut RenderShared,
+    cell: egui::Vec2,
     row_h: f32,
 ) -> Option<RowClick> {
+    let cw = cell.x.max(1.0);
     // Leave the scrollbar its lane, or it paints over TOKENS.
     // Floating bars allocate nothing and overlay the content, so reserve
     // their full width either way.
@@ -494,26 +497,11 @@ fn draw_table(
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        let x = |chars: usize| rect.left() + chars as f32 * cw;
-        let y = rect.center().y;
-        let p = ui.painter();
-        let left = |at: usize, s: &str| {
-            p.text(
-                egui::pos2(x(at), y),
-                Align2::LEFT_CENTER,
-                s,
-                font.clone(),
-                color,
-            );
-        };
-        let right = |end: usize, s: &str| {
-            p.text(
-                egui::pos2(x(end), y),
-                Align2::RIGHT_CENTER,
-                s,
-                font.clone(),
-                color,
-            );
+        let top = rect.center().y - cell.y / 2.0;
+        let p = ui.painter().clone();
+        let mut left = |at: usize, s: &str| {
+            let at = egui::pos2(rect.left() + at as f32 * cw, top);
+            shared.paint_text(&p, at, s, color);
         };
         left(0, stage_word(line.stage));
         // The id is never cut; the title takes what is left.
@@ -524,10 +512,11 @@ fn draw_table(
             cut(&line.title, taskw)
         };
         left(x_task, &task);
-        right(x_el_end, &line.elapsed);
-        right(x_eta_end, &line.eta);
+        // Right-aligned: the text ends at the column's last cell.
+        left(right_at(x_el_end, &line.elapsed), &line.elapsed);
+        left(right_at(x_eta_end, &line.eta), &line.eta);
         left(x_now, &cut(&line.now, NOW_W));
-        right(x_tok_end, &line.tokens);
+        left(right_at(x_tok_end, &line.tokens), &line.tokens);
 
         let resp = match &line.click.note {
             Some(note) => resp.on_hover_text(note),
@@ -541,11 +530,11 @@ fn draw_table(
     if let Some(footer) = &table.footer {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::hover());
-        ui.painter().text(
-            egui::pos2(rect.left(), rect.center().y),
-            Align2::LEFT_CENTER,
-            cut(footer, cols),
-            font.clone(),
+        let top = rect.center().y - cell.y / 2.0;
+        shared.paint_text(
+            ui.painter(),
+            egui::pos2(rect.left(), top),
+            &cut(footer, cols),
             chrome.dim,
         );
     }
@@ -715,6 +704,12 @@ mod tests {
         let f = feed(r#"{"rows":[{"key":"k","stage":"planned"}],"footer":{"text":"session 3"}}"#);
         let t = build(Some(&f), &[], T0);
         assert_eq!(t.footer.as_deref(), Some("session 3"));
+    }
+
+    #[test]
+    fn right_at_ends_the_text_on_the_column() {
+        assert_eq!(right_at(10, "12m"), 7);
+        assert_eq!(right_at(2, "long"), 0);
     }
 
     #[test]

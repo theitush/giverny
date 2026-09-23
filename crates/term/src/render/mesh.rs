@@ -343,6 +343,60 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
     }
 }
 
+/// Glyph quads for one line of plain text on the terminal's cell grid: one
+/// cell per `char`, cell 0's top-left at `origin_px` (physical pixels, on the
+/// pixel grid). The same atlas, hinting and baseline as the grid itself, so
+/// UI text drawn with it is the session's font rather than a look-alike.
+#[allow(clippy::too_many_arguments)]
+pub fn text_line(
+    ctx: &egui::Context,
+    fonts: &FontSet,
+    atlas: &mut Atlas,
+    m: CellMetrics,
+    origin_px: Vec2,
+    pixels_per_point: f32,
+    text: &str,
+    color: Color32,
+) -> Vec<Mesh> {
+    let ppp = pixels_per_point;
+    let mut meshes: Vec<Mesh> = Vec::new();
+    for (col, c) in text.chars().enumerate() {
+        if c == ' ' {
+            continue;
+        }
+        let Some(r) = fonts.resolve(c, false, false) else {
+            continue;
+        };
+        let key = GlyphKey {
+            slot: r.slot,
+            glyph: r.glyph,
+            ppem_bits: m.ppem.to_bits(),
+            synth: 0,
+        };
+        let sprite = atlas.get(ctx, fonts, key);
+        if sprite.is_blank() {
+            continue;
+        }
+        let pen_x = origin_px.x + col as f32 * m.cell_w as f32 + sprite.left;
+        let pen_y = origin_px.y + m.baseline as f32 - sprite.top;
+        let min = Pos2::new(pen_x / ppp, pen_y / ppp);
+        let rect = Rect::from_min_size(min, sprite.size / ppp);
+        let tint = if sprite.is_color {
+            Color32::WHITE
+        } else {
+            color
+        };
+        push_uv(
+            mesh_for(&mut meshes, sprite.tex),
+            rect,
+            sprite.uv_min,
+            sprite.uv_max,
+            tint,
+        );
+    }
+    meshes
+}
+
 fn mesh_for(meshes: &mut Vec<Mesh>, tex: TextureId) -> &mut Mesh {
     if let Some(i) = meshes.iter().position(|m| m.texture_id == tex) {
         &mut meshes[i]
@@ -450,6 +504,26 @@ mod tests {
         let v = snap.cells.iter().find(|c| c.c == 'v').unwrap();
         assert_eq!(v.bg, Some(theme.ansi[1]), "inverse swaps fg into bg");
         assert_eq!(v.fg, theme.bg);
+    }
+
+    #[test]
+    fn text_line_puts_one_glyph_per_cell() {
+        let ctx = egui::Context::default();
+        let fonts = FontSet::load(None).unwrap();
+        let m = CellMetrics::compute(fonts.primary().as_font().unwrap(), 15.0);
+        let mut atlas = Atlas::default();
+        let color = Color32::from_rgb(1, 2, 3);
+        let meshes = text_line(&ctx, &fonts, &mut atlas, m, Vec2::ZERO, 1.0, "ab c", color);
+        let quads: Vec<&[Vertex]> = meshes.iter().flat_map(|m| m.vertices.chunks(4)).collect();
+        assert_eq!(quads.len(), 3, "the space draws nothing");
+        // 'c' sits in cell 3, whatever its side bearing.
+        let c_left = quads[2][0].pos.x;
+        let cell = m.cell_w as f32;
+        assert!(
+            c_left >= 3.0 * cell - 1.0 && c_left < 4.0 * cell,
+            "{c_left}"
+        );
+        assert!(quads.iter().all(|q| q[0].color == color));
     }
 
     #[test]

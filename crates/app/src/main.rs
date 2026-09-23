@@ -3195,6 +3195,7 @@ impl eframe::App for App {
                     active,
                     self.claude.agents.tracker(active),
                     &self.chrome,
+                    &mut self.shared,
                     ui,
                 )
             {
