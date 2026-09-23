@@ -171,15 +171,64 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 /// fallback, and nothing in this app knows the difference: every pixel is an
 /// egui mesh or texture either way.
 ///
+/// The same goes for a machine where wgpu *would* work but only on a CPU
+/// adapter (lavapipe, llvmpipe, WARP): WSLg with no GPU Vulkan driver is the
+/// common case, where OpenGL reaches the real GPU through Mesa's d3d12 driver
+/// and wgpu draws every frame in software at several cores' worth of CPU. So
+/// unless told otherwise, ask wgpu which adapter it would pick first.
+///
 /// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
 /// below re-launches itself.
 fn pick_renderer() -> eframe::Renderer {
     match std::env::var("GIVERNY_RENDERER").as_deref() {
         Ok("glow" | "gl" | "opengl") => {
-            tracing::info!("renderer: OpenGL");
+            tracing::info!("renderer: OpenGL (GIVERNY_RENDERER)");
             eframe::Renderer::Glow
         }
-        _ => eframe::Renderer::Wgpu,
+        Ok("wgpu") => eframe::Renderer::Wgpu,
+        _ => {
+            let adapter = wgpu_adapter();
+            let renderer = renderer_for(adapter.as_ref());
+            match (&adapter, renderer) {
+                (None, _) => tracing::info!("renderer: OpenGL, wgpu found no adapter"),
+                (Some(info), eframe::Renderer::Glow) => tracing::info!(
+                    "renderer: OpenGL, wgpu would draw on the CPU ({}, {:?})",
+                    info.name,
+                    info.backend
+                ),
+                (Some(info), _) => tracing::debug!(
+                    "renderer: wgpu on {} ({:?}, {:?})",
+                    info.name,
+                    info.backend,
+                    info.device_type
+                ),
+            }
+            renderer
+        }
+    }
+}
+
+/// The adapter eframe's default wgpu setup would choose, asked for the same
+/// way (same backends, same power preference) but without a window yet.
+fn wgpu_adapter() -> Option<eframe::wgpu::AdapterInfo> {
+    let setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    let instance = eframe::wgpu::Instance::new(setup.instance_descriptor);
+    let options = eframe::wgpu::RequestAdapterOptions {
+        power_preference: setup.power_preference,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    };
+    pollster::block_on(instance.request_adapter(&options))
+        .ok()
+        .map(|adapter| adapter.get_info())
+}
+
+/// wgpu unless its adapter is missing or a software rasterizer, where OpenGL
+/// is the better bet: it either reaches a GPU wgpu could not, or is no slower.
+fn renderer_for(adapter: Option<&eframe::wgpu::AdapterInfo>) -> eframe::Renderer {
+    match adapter {
+        Some(info) if info.device_type != eframe::wgpu::DeviceType::Cpu => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
     }
 }
 
@@ -3320,6 +3369,41 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_software_adapter_opens_on_opengl() {
+        use eframe::wgpu::DeviceType;
+        let adapter = |device_type| eframe::wgpu::AdapterInfo {
+            name: "llvmpipe (LLVM 19.1.1, 256 bits)".into(),
+            vendor: 0x10005,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: "llvmpipe".into(),
+            driver_info: "Mesa 25.0.7".into(),
+            backend: eframe::wgpu::Backend::Vulkan,
+            subgroup_min_size: 8,
+            subgroup_max_size: 8,
+            transient_saves_memory: false,
+        };
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(
+            renderer_for(Some(&adapter(DeviceType::Cpu))),
+            eframe::Renderer::Glow
+        );
+        for gpu in [
+            DeviceType::DiscreteGpu,
+            DeviceType::IntegratedGpu,
+            DeviceType::VirtualGpu,
+            DeviceType::Other,
+        ] {
+            assert_eq!(
+                renderer_for(Some(&adapter(gpu))),
+                eframe::Renderer::Wgpu,
+                "{gpu:?}"
+            );
+        }
+    }
 
     #[test]
     fn resume_thresholds_are_set_only_when_asked() {

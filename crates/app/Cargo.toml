@@ -29,6 +29,9 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
 # The window handle: Wayland drag-and-drop needs it, so does the taskbar badge.
 raw-window-handle = "0.6"
+# Blocks on wgpu's adapter request before the window exists (`pick_renderer`).
+# The version eframe already uses, so no new tree.
+pollster = "0.4"
 
 # Wayland drag-and-drop, which winit 0.30 does not implement. It arrives
 # through the clipboard crate eframe already uses — patched in the workspace
