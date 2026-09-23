@@ -19,10 +19,12 @@
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker —
 //! `ClaudeWatch::agents` (`agents_live.rs`), fed by the relay, persisted,
 //! emptied on `/clear` and refreshed once a second — and keeps only what the
-//! pane itself needs per tab: the feed it last read and the row last clicked.
+//! pane itself needs per tab: the feed it last read.
 //!
 //! **Clicks** produce a [`RowClick`], which the app receives as
-//! `Action::AgentRowClicked`. What a click *does* is not decided here.
+//! `Action::AgentRowClicked`. What a click *does* is not decided here, and
+//! it leaves no mark: a row is tinted only while the pointer is on it
+//! ([`row_tint`]), so nothing stays highlighted after a click (giverny#40).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,16 +60,15 @@ const MIN_TITLE: usize = 12;
 
 // --------------------------------------------------------- view state ----
 
-/// What the pane itself keeps per tab: the feed it last read and the row
-/// last clicked. Never the rows — those are the tracker's.
+/// What the pane itself keeps per tab: the feed it last read. Never the
+/// rows — those are the tracker's — and no selection: a click acts and
+/// leaves no mark (giverny#40).
 #[derive(Default)]
 struct View {
     feed: FeedCache,
     feed_now: Option<Feed>,
     feed_session: Option<String>,
     last_poll: Option<Instant>,
-    /// The clicked row, by [`Line::ident`]. Only it is highlighted.
-    selected: Option<String>,
 }
 
 impl View {
@@ -140,18 +141,6 @@ pub struct Line {
     pub now: String,
     pub tokens: String,
     pub click: RowClick,
-}
-
-impl Line {
-    /// Stable identity for selection: stage, key and worker.
-    fn ident(&self) -> String {
-        format!(
-            "{:?}|{}|{}",
-            self.stage,
-            self.click.key,
-            self.click.agent_id.as_deref().unwrap_or("")
-        )
-    }
 }
 
 /// The whole table: rows and the feed's footer line.
@@ -444,17 +433,28 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked =
-                        draw_table(ui, &table, &mut view.selected, chrome, shared, cell, row_h);
+                    clicked = draw_table(ui, &table, chrome, shared, cell, row_h);
                 });
         });
     clicked
 }
 
+/// A row's background tint, from the pointer alone: a deeper one while it is
+/// pressed, a light one while hovered, none otherwise. There is no third
+/// input — a click leaves nothing behind to highlight (giverny#40).
+fn row_tint(hovered: bool, pressed: bool) -> Option<f32> {
+    if pressed {
+        Some(0.22)
+    } else if hovered {
+        Some(0.10)
+    } else {
+        None
+    }
+}
+
 fn draw_table(
     ui: &mut Ui,
     table: &Table,
-    selected: &mut Option<String>,
     chrome: &Chrome,
     shared: &mut RenderShared,
     cell: egui::Vec2,
@@ -488,14 +488,9 @@ fn draw_table(
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
         let color = stage_color(line.stage);
-        let ident = line.ident();
-        let is_sel = selected.as_deref() == Some(ident.as_str());
-        if is_sel {
+        if let Some(alpha) = row_tint(resp.hovered(), resp.is_pointer_button_down_on()) {
             ui.painter()
-                .rect_filled(rect, 2.0, color.gamma_multiply(0.22));
-        } else if resp.hovered() {
-            ui.painter()
-                .rect_filled(rect, 2.0, color.gamma_multiply(0.10));
+                .rect_filled(rect, 2.0, color.gamma_multiply(alpha));
         }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -526,7 +521,6 @@ fn draw_table(
             None => resp,
         };
         if resp.clicked() {
-            *selected = Some(ident);
             clicked = Some(line.click.clone());
         }
     }
@@ -707,6 +701,15 @@ mod tests {
         let f = feed(r#"{"rows":[{"key":"k","stage":"planned"}],"footer":{"text":"session 3"}}"#);
         let t = build(Some(&f), &[], T0);
         assert_eq!(t.footer.as_deref(), Some("session 3"));
+    }
+
+    #[test]
+    fn a_row_is_tinted_only_while_the_pointer_is_on_it() {
+        // giverny#40: once the pointer has left, a clicked row looks like
+        // any other.
+        assert_eq!(row_tint(false, false), None);
+        assert_eq!(row_tint(true, false), Some(0.10));
+        assert_eq!(row_tint(true, true), Some(0.22));
     }
 
     #[test]
