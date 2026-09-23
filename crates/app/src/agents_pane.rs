@@ -456,10 +456,15 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(8, 5)),
         )
         .show(ui, |ui| {
+            // Measured outside the scroll area: inside it, the width shrinks
+            // by the bar's lane only while the rows overflow, and the right
+            // columns would jump as the pane is resized across that point
+            // (giverny#45).
+            let cols = table_cols(ui.available_width(), cell.x, bar_lane(ui));
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked = draw_table(ui, &table, chrome, shared, cell, row_h);
+                    clicked = draw_table(ui, &table, chrome, shared, cell, row_h, cols);
                 });
         });
     clicked
@@ -478,6 +483,21 @@ fn row_tint(hovered: bool, pressed: bool) -> Option<f32> {
     }
 }
 
+/// The scrollbar's full lane, in points, whether or not it is showing.
+fn bar_lane(ui: &Ui) -> f32 {
+    let bar = &ui.spacing().scroll;
+    bar.bar_inner_margin + bar.bar_width + bar.bar_outer_margin
+}
+
+/// How many character columns the table lays out in, from the pane's width
+/// *outside* the scroll area. The bar's lane is always left free, so it
+/// never paints over TOKENS and the columns never move when it appears.
+fn table_cols(width: f32, cell_w: f32, bar_lane: f32) -> usize {
+    let cw = cell_w.max(1.0);
+    let usable = width - bar_lane - cw;
+    ((usable / cw).floor() as usize).max(40)
+}
+
 fn draw_table(
     ui: &mut Ui,
     table: &Table,
@@ -485,15 +505,9 @@ fn draw_table(
     shared: &mut RenderShared,
     cell: egui::Vec2,
     row_h: f32,
+    cols: usize,
 ) -> Option<RowClick> {
     let cw = cell.x.max(1.0);
-    // Leave the scrollbar its lane, or it paints over TOKENS.
-    // Floating bars allocate nothing and overlay the content, so reserve
-    // their full width either way.
-    let bar = &ui.spacing().scroll;
-    let bar_w = bar.bar_inner_margin + bar.bar_width + bar.bar_outer_margin;
-    let usable = ui.available_width() - bar_w - cw;
-    let cols = ((usable / cw).floor() as usize).max(40);
     let idw = table
         .lines
         .iter()
@@ -742,6 +756,78 @@ mod tests {
     fn right_at_ends_the_text_on_the_column() {
         assert_eq!(right_at(10, "12m"), 7);
         assert_eq!(right_at(2, "long"), 0);
+    }
+
+    #[test]
+    fn the_columns_leave_the_bar_its_lane_and_ignore_whether_it_shows() {
+        let (width, cw, lane) = (800.0, 8.0, 10.0);
+        let cols = table_cols(width, cw, lane);
+        // TOKENS' last cell ends clear of the bar's lane.
+        assert!(cols as f32 * cw <= width - lane);
+        // The width the scroll area hands its content drops by the lane
+        // while the bar shows; the table is laid out from the width outside
+        // it, so that drop changes nothing; laid out from the inner width,
+        // it would have lost a column.
+        assert_ne!(cols, table_cols(width - lane, cw, lane));
+        // A cramped pane still gets a readable table.
+        assert_eq!(table_cols(100.0, cw, lane), 40);
+    }
+
+    /// The pane's shape in a headless egui (Chrome's scroll style, a bottom
+    /// panel, a vertical scroll area), with `rows` rows of 20pt: the width
+    /// measured outside the scroll area, where the table is laid out from,
+    /// and the one its content is handed inside.
+    fn pane_widths(rows: usize) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| {
+            s.spacing.scroll.floating_allocated_width = s.spacing.scroll.bar_width;
+            s.animation_time = 0.0;
+        });
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let (mut outer, mut inner) = (0.0, 0.0);
+        // The scroll area learns its content size a frame late.
+        for _ in 0..3 {
+            let _ = ctx.run_ui(input(), |ui| {
+                egui::Panel::bottom("pane")
+                    .exact_size(200.0)
+                    .show(ui, |ui| {
+                        outer = ui.available_width();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                inner = ui.available_width();
+                                for _ in 0..rows {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 20.0),
+                                        Sense::hover(),
+                                    );
+                                }
+                            });
+                    });
+            });
+        }
+        (outer, inner)
+    }
+
+    #[test]
+    fn the_columns_stay_put_as_the_rows_start_to_overflow() {
+        let (cw, lane) = (8.0, 10.0);
+        let (outer_fit, inner_fit) = pane_widths(3);
+        let (outer_over, inner_over) = pane_widths(30);
+        // The bug: inside the scroll area the width drops once a bar shows.
+        assert!(inner_over < inner_fit, "{inner_over} vs {inner_fit}");
+        // The fix: the table is laid out from the width outside it.
+        assert_eq!(outer_fit, outer_over);
+        assert_eq!(
+            table_cols(outer_fit, cw, lane),
+            table_cols(outer_over, cw, lane)
+        );
     }
 
     #[test]

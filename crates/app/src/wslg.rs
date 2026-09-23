@@ -42,6 +42,12 @@ pub enum Gpu {
 /// the screen. Child processes (the shells in each tab) inherit it, which is
 /// what WSLg's own guidance sets for GL applications anyway.
 pub fn enable_d3d12() -> Gpu {
+    // Opt-in: a window drawn through d3d12 on WSLg's Wayland came up black
+    // even though the windowless probe passed (#35), so it is not the default
+    // until a window is proven to present.
+    if std::env::var("GIVERNY_GPU").as_deref() != Ok("d3d12") {
+        return Gpu::NotApplicable;
+    }
     if !std::path::Path::new("/dev/dxg").exists() {
         return Gpu::NotApplicable;
     }
