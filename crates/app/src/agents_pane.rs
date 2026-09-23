@@ -12,8 +12,9 @@
 //! fixed width, no header row, the whole row tinted by its stage, a
 //! stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done row's
 //! `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's row
-//! above it, and a ledger `total:` row — the same table
-//! `coo/tools/orchestrate-status` pins under Claude Code.
+//! above it — the same table `coo/tools/orchestrate-status` pins under
+//! Claude Code. The session's token total is not here: it is on the status
+//! line's model row.
 //!
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker —
 //! `ClaudeWatch::agents` (`agents_live.rs`), fed by the relay, persisted,
@@ -154,12 +155,10 @@ impl Line {
     }
 }
 
-/// The whole table: rows, the ledger total, the feed's footer line.
+/// The whole table: rows and the feed's footer line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Table {
     pub lines: Vec<Line>,
-    /// `total:`'s number — every worker counted once — when any row has one.
-    pub total: Option<String>,
     pub footer: Option<String>,
 }
 
@@ -176,28 +175,12 @@ impl Table {
 pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
     let rows = feed::merge(feed, live);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-    let mut counted: Vec<&str> = Vec::new();
-    let mut total: u64 = 0;
-    let mut any_tokens = false;
     for row in &rows {
-        let line = format_row(row, now_ms);
-        if let Some(n) = row.tokens() {
-            any_tokens = true;
-            match row.agent_id() {
-                Some(id) if counted.contains(&id) => {}
-                Some(id) => {
-                    counted.push(id);
-                    total += n;
-                }
-                None => total += n,
-            }
-        }
-        lines.push(line);
+        lines.push(format_row(row, now_ms));
     }
     dittos(&rows, &mut lines);
     Table {
         lines,
-        total: any_tokens.then(|| fmt_tokens(total)),
         footer: feed.and_then(|f| f.footer.clone()),
     }
 }
@@ -439,7 +422,7 @@ pub fn show(
         / 20.0;
     let cw = cw.max(1.0);
     let row_h = (FONT_SIZE * 1.45).round();
-    let extra = usize::from(table.total.is_some()) + usize::from(table.footer.is_some());
+    let extra = usize::from(table.footer.is_some());
     let want = (table.lines.len() + extra) as f32 * row_h + 10.0;
     let max_h = (ui.available_height() * 0.5).max(row_h * 3.0);
 
@@ -555,27 +538,6 @@ fn draw_table(
             clicked = Some(line.click.clone());
         }
     }
-    if let Some(total) = &table.total {
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::hover());
-        let x = |chars: usize| rect.left() + chars as f32 * cw;
-        let y = rect.center().y;
-        // Ledger style: `total:` right-aligned in the column left of TOKENS.
-        ui.painter().text(
-            egui::pos2(x(x_now + NOW_W), y),
-            Align2::RIGHT_CENTER,
-            "total:",
-            font.clone(),
-            chrome.fg,
-        );
-        ui.painter().text(
-            egui::pos2(x(x_tok_end), y),
-            Align2::RIGHT_CENTER,
-            total,
-            font.clone(),
-            chrome.fg,
-        );
-    }
     if let Some(footer) = &table.footer {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::hover());
@@ -649,7 +611,6 @@ mod tests {
         assert_eq!(l.now, "Editing tools/board");
         assert_eq!(l.tokens, "64.1k");
         assert_eq!(l.eta, "");
-        assert_eq!(t.total.as_deref(), Some("64.1k"));
         assert_eq!(l.click.agent_id.as_deref(), Some("a1"));
     }
 
@@ -682,11 +643,10 @@ mod tests {
         assert_eq!(t.lines[2].elapsed, "1:05:00");
         assert_eq!(t.lines[2].eta, "(+5m)");
         assert_eq!(t.lines[2].now, "Review — ita");
-        assert_eq!(t.total.as_deref(), Some("6k"));
     }
 
     #[test]
-    fn a_worker_holding_two_rows_is_dittoed_and_counted_once() {
+    fn a_worker_holding_two_rows_is_dittoed() {
         let rows = live(
             r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
                 "startTime":1789999400000,"tokenCount":64100,"label":"Reading"}]}"#,
@@ -703,7 +663,6 @@ mod tests {
         assert_eq!(t.lines[1].eta, "\"");
         assert_eq!(t.lines[1].now, "\"");
         assert_eq!(t.lines[1].tokens, "\"");
-        assert_eq!(t.total.as_deref(), Some("64.1k"));
     }
 
     #[test]
@@ -756,7 +715,6 @@ mod tests {
         let f = feed(r#"{"rows":[{"key":"k","stage":"planned"}],"footer":{"text":"session 3"}}"#);
         let t = build(Some(&f), &[], T0);
         assert_eq!(t.footer.as_deref(), Some("session 3"));
-        assert_eq!(t.total, None);
     }
 
     #[test]
