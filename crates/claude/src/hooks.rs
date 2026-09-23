@@ -354,7 +354,39 @@ pub fn run_statusline(spool: &Path) {
     if let Some(p) = pct("seven_day") {
         parts.push(format!("wk {p}%"));
     }
+    parts.extend(statusline_tokens(&payload));
     println!("{}", parts.join("  ·  "));
+}
+
+/// `session <n>` and `total: <n>` for the status line (giverny#22): this
+/// conversation's own tokens, then that plus every subagent's, counted the way
+/// coo's `orchestrate-status` counts them (see [`crate::tokens`]).
+fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
+    use crate::tokens;
+    let transcript = payload
+        .get("transcript_path")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(PathBuf::from);
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let config_dir = account_dir()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    // No `transcript_path` on stdin: the session id names it, as in coo.
+    let transcript = transcript.filter(|t| t.exists()).or_else(|| {
+        let (cfg, sid) = (config_dir.as_ref()?, session_id?);
+        std::fs::read_dir(cfg.join("projects"))
+            .ok()?
+            .flatten()
+            .map(|e| e.path().join(format!("{sid}.jsonl")))
+            .find(|p| p.is_file())
+    });
+    let dirs =
+        tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
+    let session = tokens::session_tokens(payload, transcript.as_deref());
+    let (session, total) = tokens::session_and_total(session, &tokens::subagent_transcripts(&dirs));
+    tokens::segments(session, total)
 }
 
 // ---- subagentStatusLine: the agents pane's live rows ----------------------
