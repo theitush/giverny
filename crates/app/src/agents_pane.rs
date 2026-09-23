@@ -69,6 +69,9 @@ struct View {
     feed_now: Option<Feed>,
     feed_session: Option<String>,
     last_poll: Option<Instant>,
+    /// The height the pane last sized itself to, while the user has not
+    /// dragged it; `None` once they have.
+    fit: Option<f32>,
 }
 
 impl View {
@@ -412,23 +415,26 @@ pub fn show(
     let cell = shared.cell_size(ui.ctx().pixels_per_point());
     // A little air around each row; a table, not a wall of grid.
     let row_h = (cell.y * 1.2).round().max(cell.y);
-    let extra = usize::from(table.footer.is_some());
-    let want = (table.lines.len() + extra) as f32 * row_h + 10.0;
+    let rows = table.lines.len() + usize::from(table.footer.is_some());
+    let frame = pane_frame(shared.theme.bg);
+    let want = pane_height(
+        rows,
+        row_h,
+        ui.spacing().item_spacing.y,
+        frame.total_margin().sum().y,
+    );
+    let min_h = row_h * 1.5;
     let max_h = (ui.available_height() * 0.5).max(row_h * 3.0);
+    let fit = want.clamp(min_h, max_h);
+    let id = egui::Id::new(("agents_pane", tab));
+    follow_rows(ui.ctx(), id, &mut view.fit, fit);
 
     let mut clicked = None;
-    egui::Panel::bottom(egui::Id::new(("agents_pane", tab)))
+    egui::Panel::bottom(id)
         .resizable(true)
-        .default_size(want.min(max_h))
-        .size_range(row_h * 1.5..=max_h)
-        // The session's own background, not the rail's lifted panel colour:
-        // the pane reads as part of the terminal above it. egui's separator
-        // line (on by default) keeps the boundary between the two.
-        .frame(
-            egui::Frame::NONE
-                .fill(shared.theme.bg)
-                .inner_margin(egui::Margin::symmetric(8, 5)),
-        )
+        .default_size(fit)
+        .size_range(min_h..=max_h)
+        .frame(frame)
         .show(ui, |ui| {
             // Measured outside the scroll area: inside it, the width shrinks
             // by the bar's lane only while the rows overflow, and the right
@@ -442,6 +448,46 @@ pub fn show(
                 });
         });
     clicked
+}
+
+/// The pane's frame: the session's own background, not the rail's lifted
+/// panel colour, so the pane reads as part of the terminal above it. egui's
+/// separator line (on by default) keeps the boundary between the two.
+fn pane_frame(bg: Color32) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(bg)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+}
+
+/// The pane's outer height for `rows` rows of `row_h`: the rows, egui's
+/// `gap` between each two of them, and the frame's `margin`. Leave out the
+/// gaps and the rows overflow by one gap a row — about one row in seven —
+/// and the scroll area's fade dims the last row shown (giverny#38).
+fn pane_height(rows: usize, row_h: f32, gap: f32, margin: f32) -> f32 {
+    let n = rows as f32;
+    n * row_h + (n - 1.0).max(0.0) * gap + margin
+}
+
+/// Keep the pane sized to its rows as they come and go, until the user
+/// drags it: egui remembers a panel's height and only reads `default_size`
+/// the first time, so a pane opened with three rows would stay three rows
+/// tall. `fit` is the height the pane last sized itself to; a stored
+/// height that differs from it is the user's, and from then on theirs.
+fn follow_rows(ctx: &egui::Context, id: egui::Id, fit: &mut Option<f32>, want: f32) {
+    let stored = egui::containers::panel::PanelState::load(ctx, id).map(|s| s.size().y);
+    match (stored, *fit) {
+        // First sight: default_size applies.
+        (None, _) => *fit = Some(want),
+        // Still ours; resize to the rows if they changed.
+        (Some(h), Some(f)) if (h - f).abs() <= 1.0 => {
+            if (want - f).abs() > 0.5 {
+                ctx.data_mut(|d| d.remove::<egui::containers::panel::PanelState>(id));
+                *fit = Some(want);
+            }
+        }
+        // Dragged: the user's height stands.
+        _ => *fit = None,
+    }
 }
 
 /// A row's background tint, from the pointer alone: a deeper one while it is
@@ -802,6 +848,113 @@ mod tests {
             table_cols(outer_fit, cw, lane),
             table_cols(outer_over, cw, lane)
         );
+    }
+
+    /// Frames of the pane's own shape — its frame, a resizable bottom panel
+    /// sized by [`follow_rows`], a vertical scroll area of `rows` rows of
+    /// 20pt, with `height` giving the fitted height from (rows, gap, margin)
+    /// — run in a headless egui over one `fit`. Returns the panel's stored
+    /// outer height, and the scroll area's content and viewport heights.
+    fn run_pane(
+        ctx: &egui::Context,
+        fit: &mut Option<f32>,
+        rows: usize,
+        height: impl Fn(usize, f32, f32) -> f32,
+    ) -> (f32, f32, f32) {
+        let row_h = 20.0;
+        let id = egui::Id::new("pane");
+        let (mut content, mut viewport) = (0.0, 0.0);
+        // The scroll area learns its content size a frame late.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let frame = pane_frame(Color32::BLACK);
+                let want = height(
+                    rows,
+                    ui.spacing().item_spacing.y,
+                    frame.total_margin().sum().y,
+                );
+                let want = want.clamp(row_h * 1.5, 300.0);
+                follow_rows(ui.ctx(), id, fit, want);
+                egui::Panel::bottom(id)
+                    .resizable(true)
+                    .default_size(want)
+                    .size_range(row_h * 1.5..=300.0)
+                    .frame(frame)
+                    .show(ui, |ui| {
+                        let out = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for _ in 0..rows {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), row_h),
+                                        Sense::hover(),
+                                    );
+                                }
+                            });
+                        content = out.content_size.y;
+                        viewport = out.inner_rect.height();
+                    });
+            });
+        }
+        let stored = egui::containers::panel::PanelState::load(ctx, id).map_or(0.0, |s| s.size().y);
+        (stored, content, viewport)
+    }
+
+    fn chrome_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| {
+            s.spacing.scroll.floating_allocated_width = s.spacing.scroll.bar_width;
+            s.animation_time = 0.0;
+        });
+        ctx
+    }
+
+    #[test]
+    fn the_pane_is_tall_enough_for_every_row_it_holds() {
+        let fitted = |n, gap, margin| pane_height(n, 20.0, gap, margin);
+        // What the pane used to ask for: rows and margin, no gaps.
+        let gapless = |n: usize, _gap: f32, margin: f32| n as f32 * 20.0 + margin;
+        for rows in [1, 2, 3, 7, 12] {
+            let (_, content, viewport) = run_pane(&chrome_ctx(), &mut None, rows, fitted);
+            assert!(content <= viewport, "{rows} rows: {content} > {viewport}");
+        }
+        // The bug: seven rows overflow by six gaps, and the last one sits
+        // under the scroll area's fade.
+        let (_, content, viewport) = run_pane(&chrome_ctx(), &mut None, 7, gapless);
+        assert!(content > viewport, "{content} <= {viewport}");
+    }
+
+    #[test]
+    fn the_pane_follows_its_rows_until_it_is_dragged() {
+        let fitted = |n, gap, margin| pane_height(n, 20.0, gap, margin);
+        let ctx = chrome_ctx();
+        let mut fit = None;
+        let (three, ..) = run_pane(&ctx, &mut fit, 3, fitted);
+        let (seven, content, viewport) = run_pane(&ctx, &mut fit, 7, fitted);
+        assert!(seven > three, "{seven} vs {three}");
+        assert!(content <= viewport, "{content} > {viewport}");
+        // A height the pane did not choose is the user's drag: it stands.
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                egui::Id::new("pane"),
+                egui::containers::panel::PanelState {
+                    outer_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 90.0),
+                    ),
+                },
+            )
+        });
+        let (dragged, ..) = run_pane(&ctx, &mut fit, 12, fitted);
+        assert_eq!(dragged, 90.0);
+        assert_eq!(fit, None);
     }
 
     #[test]
