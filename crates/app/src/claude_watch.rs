@@ -123,6 +123,9 @@ pub struct WatchEffects {
     pub notify: Vec<(String, String)>,
     /// Any tab is animating (spinner/pulse) — keep repainting.
     pub animating: bool,
+    /// Tabs whose session was just `/clear`ed (`SessionStart`,
+    /// `source=clear`): a new conversation, so the agents pane starts empty.
+    pub cleared: Vec<TabId>,
 }
 
 pub struct ClaudeWatch {
@@ -451,6 +454,9 @@ impl ClaudeWatch {
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
                 entry.session_id = msg.session_id().map(str::to_string);
+                if msg.event.get("source").and_then(|v| v.as_str()) == Some("clear") {
+                    effects.cleared.push(tab_id);
+                }
                 effects
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
@@ -1767,5 +1773,25 @@ mod tests {
             Some(Duration::from_secs(600)),
             10
         ));
+    }
+
+    #[test]
+    fn a_clear_is_told_apart_from_a_start_or_a_resume() {
+        let mut w = ClaudeWatch::for_tests();
+        let fx = feed(
+            &mut w,
+            &hook("SessionStart", r#","source":"startup""#),
+            None,
+        );
+        assert!(fx.cleared.is_empty());
+        let fx = feed(&mut w, &hook("SessionStart", r#","source":"resume""#), None);
+        assert!(fx.cleared.is_empty());
+        let fx = feed(&mut w, &hook("SessionStart", r#","source":"clear""#), None);
+        assert_eq!(fx.cleared, vec![TAB]);
+        assert_eq!(
+            fx.captured.len(),
+            1,
+            "a clear is still a new session to capture"
+        );
     }
 }

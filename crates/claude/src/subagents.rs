@@ -739,6 +739,22 @@ impl SubagentRow {
     }
 }
 
+/// A native row is what the feed merge calls a live row.
+impl crate::feed::LiveAgent for SubagentRow {
+    fn agent_id(&self) -> &str {
+        SubagentRow::agent_id(self)
+    }
+    fn running(&self) -> bool {
+        SubagentRow::running(self)
+    }
+    fn started_ms(&self) -> Option<u64> {
+        self.started_ms
+    }
+    fn tokens(&self) -> Option<u64> {
+        self.tokens
+    }
+}
+
 /// The subagents of one tab's Claude session, Running and Done.
 ///
 /// Feed it [`LiveSnapshot`]s as the relay delivers them
@@ -1002,7 +1018,7 @@ impl Tracker {
 
 /// Timestamp of the first line of a transcript — its start, when no live
 /// list ever said.
-fn first_line_ms(path: &Path) -> Option<u64> {
+pub fn first_line_ms(path: &Path) -> Option<u64> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines().take(20) {

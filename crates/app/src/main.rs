@@ -1,5 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod agents_pane;
 mod capture;
 mod chrome;
 mod claude_watch;
@@ -497,6 +498,8 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
+    /// A row of the agents pane was clicked. What it opens is build task D.
+    AgentRowClicked(TabId, Box<agents_pane::RowClick>),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -690,6 +693,8 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
+    /// Each tab's agents pane (`claude.agents_pane`).
+    pub agent_panes: agents_pane::Panes,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -1090,6 +1095,7 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
+            agent_panes: agents_pane::Panes::default(),
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1226,6 +1232,7 @@ impl App {
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
+                self.agent_panes.clear(id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
@@ -1248,6 +1255,10 @@ impl App {
             Action::SetRailView(view) => {
                 self.layout.rail_view = view;
                 self.state_dirty = true;
+            }
+            Action::AgentRowClicked(tab, click) => {
+                // Build task D decides what a click opens.
+                tracing::debug!("agents pane: {tab:?} clicked {click:?}");
             }
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
@@ -2745,6 +2756,9 @@ impl eframe::App for App {
                 self.state_dirty = true;
             }
         }
+        for id in effects.cleared {
+            self.agent_panes.clear(id);
+        }
         for (summary, body) in effects.notify {
             desktop_notify(summary, body);
         }
@@ -2858,6 +2872,14 @@ impl eframe::App for App {
                 // full-screen app worth starting again.
                 self.queue_resume(active);
                 self.queue_app_restore(active);
+            }
+
+            // The agents pane takes the bottom of the terminal's area.
+            if self.cfg.claude.agents_pane
+                && let Some(tab) = self.ws.tab(active)
+                && let Some(click) = agents_pane::show(&mut self.agent_panes, tab, &self.chrome, ui)
+            {
+                actions.push(Action::AgentRowClicked(active, Box::new(click)));
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
