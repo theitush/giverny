@@ -84,7 +84,7 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `tokens` | non-negative integer | no | Tokens spent. A live worker's own count takes precedence; this is the fallback (a Planned row has none; a Done worker Claude Code has forgotten still has this). |
 | `group` | string | no | A lane or batch name. Informational; Giverny may draw rows of one group together. |
 | `brief` | string (absolute path) | no | A file shown read-only when a **Planned** row is clicked. |
-| `open` | string (shell command) | no | Run in a new tab when a **Running** or **Done** row is clicked, in place of Giverny's own transcript view — e.g. `claude --resume <id>`. |
+| `open` | string (shell command) | no | Run in a new tab when a **Running** or **Done** row is clicked, in place of Giverny's own transcript view (`giverny transcript --follow <agent jsonl>`) — e.g. `claude --resume <id>`. A command that resumes a conversation something is already running is not run: Giverny switches to the tab holding it, or says so. |
 | `note` | string | no | Free text; shown for a Planned row with no `brief`, and as a tooltip otherwise. |
 
 Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"`) is read, a fractional number is truncated, a negative `eta_s` or `tokens` reads as absent. `null` is the same as leaving the field out.

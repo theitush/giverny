@@ -268,7 +268,11 @@ fn scrub_inherited_claude_markers() {
 }
 
 fn main() -> eframe::Result {
-    scrub_inherited_claude_markers();
+    // The transcript follower runs inside a tab and starts no Claude, so it
+    // has no markers to clear — and no business announcing that it did.
+    if std::env::args().nth(1).as_deref() != Some("transcript") {
+        scrub_inherited_claude_markers();
+    }
 
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
