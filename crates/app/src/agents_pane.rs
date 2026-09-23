@@ -126,6 +126,9 @@ pub struct RowClick {
     pub brief: Option<PathBuf>,
     /// The feed's `note`.
     pub note: Option<String>,
+    /// The row's state in words, for the overlay's header: how it landed,
+    /// how long it took against its estimate, its tokens (giverny#41).
+    pub facts: Vec<String>,
 }
 
 // -------------------------------------------------------------- table ----
@@ -273,6 +276,7 @@ fn format_row(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Line {
             .unwrap_or_default(),
     };
     let tokens = row.tokens().map(fmt_tokens).unwrap_or_default();
+    let facts = row_facts(row.stage, &elapsed, &eta, &now, &tokens);
     Line {
         stage: row.stage,
         id,
@@ -293,8 +297,30 @@ fn format_row(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Line {
             open: f.and_then(|f| f.open.clone()),
             brief: f.and_then(|f| f.brief.clone()),
             note: f.and_then(|f| f.note.clone()),
+            facts,
         },
     }
+}
+
+/// The overlay header's facts, from the row's own cells before any ditto.
+fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) -> Vec<String> {
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let v = match stage {
+        Stage::Done => [
+            some(now),
+            some(elapsed).map(|e| format!("took {e}")),
+            some(eta).map(|d| format!("{d} vs estimate")),
+            some(tokens).map(|t| format!("{t} tokens")),
+        ],
+        Stage::Running => [
+            some(elapsed).map(|e| format!("running {e}")),
+            some(eta).map(|l| format!("{l} left")),
+            some(now),
+            some(tokens).map(|t| format!("{t} tokens")),
+        ],
+        Stage::Planned => [some(eta).map(|e| format!("est {e}")), None, None, None],
+    };
+    v.into_iter().flatten().collect()
 }
 
 fn outcome_word(o: Outcome) -> String {

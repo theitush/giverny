@@ -1,17 +1,18 @@
-//! A worker's transcript, rendered for a person: `giverny transcript`.
+//! A worker's transcript, rendered for a person.
 //!
-//! Claude Code cannot open a subagent by id, so a click on a Running or Done
-//! row of the agents pane opens a tab that follows the worker's own
-//! `agent-<id>.jsonl` instead — read-only, live, and compact enough to watch:
-//! what it said, each tool it called (one line, the argument that says what
-//! it is doing), and the first lines of what came back. Thinking, attachments
-//! and bookkeeping lines are left out.
+//! Claude Code cannot open a subagent by id, so Giverny reads the worker's
+//! own `agent-<id>.jsonl` instead: what it said, each tool it called (one
+//! line, the argument that says what it is doing), and the first lines of
+//! what came back. Thinking, attachments and bookkeeping lines are left out.
+//! Two views use it: the overlay a Running or Done row of the agents pane
+//! opens (giverny#41, #44), which keeps the task text whole, and
+//! `giverny transcript [--follow]`, which folds it to watch in a terminal.
 //!
-//! [`render_line`] is the pure half — one JSONL line in, zero or more
-//! terminal lines out — so it is tested without a file. [`follow`] is the
-//! `tail -f` around it: it reads from the start, then polls for growth,
-//! holds back a half-written last line until its newline arrives, and starts
-//! over if the file is truncated or replaced.
+//! [`render_rows`] is the pure half — one JSONL line in, zero or more rows
+//! out — so it is tested without a file; [`render_line`] paints those rows
+//! for a terminal. [`Tail`] is the `tail -f` under both views: it reads a
+//! whole line at a time, holds back a half-written last line until its
+//! newline arrives, and notices when the file is truncated or replaced.
 //!
 //! As everywhere in this crate, the lines are Claude Code's private format:
 //! fields are pulled out one at a time, and a line that does not parse is
@@ -56,6 +57,95 @@ impl Style {
     }
 }
 
+/// How much of the long parts a render keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fold {
+    /// Lines of a prompt or message kept; `None` keeps it whole, unclipped.
+    pub prompt_lines: Option<usize>,
+    /// Lines of a tool result kept.
+    pub result_lines: usize,
+}
+
+impl Fold {
+    /// The follower tab's: compact enough to watch scroll by.
+    pub const TERMINAL: Fold = Fold {
+        prompt_lines: Some(PROMPT_LINES),
+        result_lines: RESULT_LINES,
+    };
+    /// Giverny's overlay (giverny#41): the task text whole, tool output
+    /// still folded — it is the noise, not the task.
+    pub const OVERLAY: Fold = Fold {
+        prompt_lines: None,
+        result_lines: RESULT_LINES,
+    };
+}
+
+/// What a rendered row is, which is how it is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// The worker's own words, and a prompt's text.
+    Plain,
+    /// `◆`: a reply starts.
+    Reply,
+    /// `● Tool: what`.
+    Tool,
+    /// `▸ prompt` / `▸ message`.
+    Prompt,
+    /// Tool output, fold marks.
+    Dim,
+    /// Tool output that is an error.
+    Error,
+}
+
+/// One rendered row: `indent`, then the clock (for a row that starts an
+/// entry), then `text` in `tone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub indent: &'static str,
+    pub clock: Option<String>,
+    pub tone: Tone,
+    pub text: String,
+}
+
+impl Row {
+    fn new(indent: &'static str, tone: Tone, text: impl Into<String>) -> Row {
+        Row {
+            indent,
+            clock: None,
+            tone,
+            text: text.into(),
+        }
+    }
+
+    /// The row as a terminal line.
+    pub fn to_ansi(&self, style: Style) -> String {
+        let at = self
+            .clock
+            .as_deref()
+            .map(|c| style.paint(DIM, c) + " ")
+            .unwrap_or_default();
+        let code = match self.tone {
+            Tone::Plain => "",
+            Tone::Reply => BOLD,
+            Tone::Tool => CYAN,
+            Tone::Prompt => MAGENTA,
+            Tone::Dim => DIM,
+            Tone::Error => RED,
+        };
+        let text = if code.is_empty() {
+            self.text.clone()
+        } else {
+            style.paint(code, &self.text)
+        };
+        format!("{}{at}{text}", self.indent)
+    }
+
+    /// The row as plain text.
+    pub fn plain(&self) -> String {
+        self.to_ansi(Style { color: false })
+    }
+}
+
 /// `HH:MM:SS` in local time from the line's `timestamp`, if it has one.
 fn clock(v: &Value) -> Option<String> {
     let ts = v
@@ -78,23 +168,36 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// The first `keep` non-empty lines of `text`, each clipped, and a
-/// `… +N lines` tail when some were dropped.
-fn folded(text: &str, keep: usize, indent: &str, style: Style, code: &str) -> Vec<String> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let mut out: Vec<String> = lines
+/// The first `keep` non-empty lines of `text` (all of them, unclipped, when
+/// `keep` is `None`), and a `… +N lines` tail when some were dropped.
+fn folded(text: &str, keep: Option<usize>, indent: &'static str, tone: Tone) -> Vec<Row> {
+    let lines: Vec<&str> = match keep {
+        Some(_) => text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect(),
+        // Whole: keep its blank lines too, only not the trailing ones.
+        None => text.trim_end().lines().map(str::trim_end).collect(),
+    };
+    let keep_n = keep.unwrap_or(usize::MAX);
+    let mut out: Vec<Row> = lines
         .iter()
-        .take(keep)
-        .map(|l| format!("{indent}{}", style.paint(code, &clip(l, LINE_MAX))))
+        .take(keep_n)
+        .map(|l| {
+            let text = if keep.is_some() {
+                clip(l, LINE_MAX)
+            } else {
+                l.to_string()
+            };
+            Row::new(indent, tone, text)
+        })
         .collect();
-    if lines.len() > keep {
-        out.push(format!(
-            "{indent}{}",
-            style.paint(DIM, &format!("… +{} lines", lines.len() - keep))
+    if lines.len() > keep_n {
+        out.push(Row::new(
+            indent,
+            Tone::Dim,
+            format!("… +{} lines", lines.len() - keep_n),
         ));
     }
     out
@@ -122,14 +225,27 @@ fn result_text(content: &Value) -> String {
     }
 }
 
-/// Render one JSONL line. Unknown or uninteresting lines render as nothing.
+/// Render one JSONL line as terminal lines. Unknown or uninteresting lines
+/// render as nothing.
 pub fn render_line(line: &str, style: Style) -> Vec<String> {
+    render_rows(line, Fold::TERMINAL)
+        .iter()
+        .map(|r| r.to_ansi(style))
+        .collect()
+}
+
+/// Render one JSONL line as rows: the pure half of both views.
+pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
-    let at = clock(&v)
-        .map(|c| style.paint(DIM, &c) + " ")
-        .unwrap_or_default();
+    let at = clock(&v);
+    let head = |tone: Tone, text: String| Row {
+        indent: "",
+        clock: at.clone(),
+        tone,
+        text,
+    };
     let mut out = Vec::new();
     match v.get("type").and_then(Value::as_str) {
         Some("assistant") => {
@@ -142,15 +258,12 @@ pub fn render_line(line: &str, style: Style) -> Vec<String> {
                         let text = part.get("text").and_then(Value::as_str).unwrap_or("");
                         let mut lines = text.lines().map(str::trim_end);
                         let Some(first) = lines.next() else { continue };
-                        out.push(format!("{at}{}", style.paint(BOLD, "◆")));
-                        out.push(format!("  {first}"));
-                        out.extend(lines.map(|l| format!("  {l}")));
+                        out.push(head(Tone::Reply, "◆".into()));
+                        out.push(Row::new("  ", Tone::Plain, first));
+                        out.extend(lines.map(|l| Row::new("  ", Tone::Plain, l)));
                     }
                     Some("tool_use") => {
-                        out.push(format!(
-                            "{at}{}",
-                            style.paint(CYAN, &format!("● {}", describe_tool_use(part)))
-                        ));
+                        out.push(head(Tone::Tool, format!("● {}", describe_tool_use(part))));
                     }
                     // Thinking is private and often redacted; the tool calls
                     // around it say what it decided.
@@ -163,8 +276,8 @@ pub fn render_line(line: &str, style: Style) -> Vec<String> {
                 if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     return out;
                 }
-                out.push(format!("{at}{}", style.paint(MAGENTA, "▸ prompt")));
-                out.extend(folded(s, PROMPT_LINES, "  ", style, ""));
+                out.push(head(Tone::Prompt, "▸ prompt".into()));
+                out.extend(folded(s, fold.prompt_lines, "  ", Tone::Plain));
             }
             Some(Value::Array(parts)) => {
                 for part in parts {
@@ -172,24 +285,20 @@ pub fn render_line(line: &str, style: Style) -> Vec<String> {
                         Some("tool_result") => {
                             let error = part.get("is_error").and_then(Value::as_bool) == Some(true);
                             let text = result_text(part.get("content").unwrap_or(&Value::Null));
-                            let code = if error { RED } else { DIM };
-                            let mut body = folded(&text, RESULT_LINES, "    ", style, code);
+                            let tone = if error { Tone::Error } else { Tone::Dim };
+                            let mut body = folded(&text, Some(fold.result_lines), "    ", tone);
                             if body.is_empty() {
-                                body.push(format!("    {}", style.paint(DIM, "(no output)")));
+                                body.push(Row::new("    ", Tone::Dim, "(no output)"));
                             }
                             // The first line hangs off the ⎿, the rest indent under it.
                             let first = body.remove(0);
-                            out.push(format!(
-                                "  {}{}",
-                                style.paint(code, "⎿ "),
-                                first.trim_start()
-                            ));
+                            out.push(Row::new("  ", tone, format!("⎿ {}", first.text)));
                             out.extend(body);
                         }
                         Some("text") => {
                             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-                            out.push(format!("{at}{}", style.paint(MAGENTA, "▸ message")));
-                            out.extend(folded(text, PROMPT_LINES, "  ", style, ""));
+                            out.push(head(Tone::Prompt, "▸ message".into()));
+                            out.extend(folded(text, fold.prompt_lines, "  ", Tone::Plain));
                         }
                         _ => {}
                     }
@@ -200,6 +309,58 @@ pub fn render_line(line: &str, style: Style) -> Vec<String> {
         _ => {}
     }
     out
+}
+
+/// What [`Tail::read`] found since the last read.
+#[derive(Debug, Default)]
+pub struct Update {
+    /// The file shrank or was replaced: what was read before is void.
+    pub restarted: bool,
+    /// Whole JSONL lines appended since the last read.
+    pub lines: Vec<String>,
+}
+
+/// Reads a growing JSONL file a whole line at a time: the `tail -f` under
+/// both the follower tab and the overlay's live view.
+#[derive(Debug, Default)]
+pub struct Tail {
+    offset: u64,
+    pending: String,
+}
+
+impl Tail {
+    /// Read what was appended since the last call. A half-written last line
+    /// is held back until its newline arrives.
+    pub fn read(&mut self, path: &Path) -> std::io::Result<Update> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let mut update = Update::default();
+        if len < self.offset {
+            update.restarted = true;
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if len > self.offset {
+            file.seek(SeekFrom::Start(self.offset))?;
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(len - self.offset)
+                .read_to_end(&mut bytes)?;
+            self.offset += bytes.len() as u64;
+            self.pending.push_str(&String::from_utf8_lossy(&bytes));
+            if let Some(cut) = self.pending.rfind('\n') {
+                let complete: String = self.pending.drain(..=cut).collect();
+                update.lines = complete.lines().map(str::to_string).collect();
+            }
+        }
+        Ok(update)
+    }
+
+    /// The held-back last line, if the file ends without a newline — for a
+    /// read that will not wait for it.
+    pub fn rest(&self) -> Option<&str> {
+        Some(self.pending.as_str()).filter(|p| !p.trim().is_empty())
+    }
 }
 
 /// A header for the view: who the worker is, from `agent-<id>.meta.json`
@@ -239,11 +400,10 @@ pub fn follow(path: &Path, follow: bool, out: &mut impl Write) -> std::io::Resul
         writeln!(out, "{l}")?;
     }
     let mut waited = false;
-    let mut offset: u64 = 0;
-    let mut pending = String::new();
+    let mut tail = Tail::default();
     loop {
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
+        let update = match tail.read(path) {
+            Ok(u) => u,
             Err(_) if follow => {
                 if !waited {
                     writeln!(out, "{}", style.paint(DIM, "waiting for the transcript…"))?;
@@ -255,33 +415,19 @@ pub fn follow(path: &Path, follow: bool, out: &mut impl Write) -> std::io::Resul
             }
             Err(e) => return Err(e),
         };
-        let len = file.metadata()?.len();
-        if len < offset {
+        if update.restarted {
             // Truncated or replaced: start over rather than read garbage.
             writeln!(out, "{}", style.paint(DIM, "── transcript restarted ──"))?;
-            offset = 0;
-            pending.clear();
         }
-        if len > offset {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = Vec::new();
-            file.take(len - offset).read_to_end(&mut bytes)?;
-            offset = len;
-            pending.push_str(&String::from_utf8_lossy(&bytes));
-            // Only whole lines: the last one may still be being written.
-            if let Some(cut) = pending.rfind('\n') {
-                let complete: String = pending.drain(..=cut).collect();
-                for line in complete.lines() {
-                    for l in render_line(line, style) {
-                        writeln!(out, "{l}")?;
-                    }
-                }
+        for line in &update.lines {
+            for l in render_line(line, style) {
+                writeln!(out, "{l}")?;
             }
-            out.flush()?;
         }
+        out.flush()?;
         if !follow {
-            if !pending.trim().is_empty() {
-                for l in render_line(&pending, style) {
+            if let Some(rest) = tail.rest() {
+                for l in render_line(rest, style) {
                     writeln!(out, "{l}")?;
                 }
             }
@@ -387,6 +533,62 @@ mod tests {
         assert!(text.contains("general-purpose · opus"));
         assert!(text.contains("  hi"));
         assert!(text.contains("  tail"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_overlay_keeps_a_prompt_whole() {
+        let body: String = (1..=20).map(|i| format!("line {i}\n\n")).collect();
+        let long = "x".repeat(300);
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {"content": format!("{body}{long}")},
+        })
+        .to_string();
+        let rows = render_rows(&line, Fold::OVERLAY);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts[0], "▸ prompt");
+        assert!(texts.contains(&"line 20"), "{texts:?}");
+        assert!(texts.contains(&""), "blank lines are kept");
+        assert_eq!(texts.last().unwrap().chars().count(), 300, "not clipped");
+        assert!(!texts.iter().any(|t| t.starts_with("… +")));
+        // The terminal view folds the same prompt.
+        let folded = render_rows(&line, Fold::TERMINAL);
+        assert!(folded.last().unwrap().text.starts_with("… +"));
+    }
+
+    #[test]
+    fn rows_carry_tone_and_clock() {
+        let line = r#"{"type":"user","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"boom"}]}}"#;
+        let rows = render_rows(line, Fold::OVERLAY);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tone, Tone::Error);
+        assert_eq!(rows[0].plain(), "  ⎿ boom");
+        let line = r#"{"type":"assistant","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+        let rows = render_rows(line, Fold::OVERLAY);
+        assert_eq!(rows[0].tone, Tone::Tool);
+        assert!(rows[0].clock.is_some());
+    }
+
+    #[test]
+    fn tail_reads_whole_lines_and_notices_a_restart() {
+        let dir = std::env::temp_dir().join(format!("giverny-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-t.jsonl");
+        std::fs::write(&path, "a\nb").unwrap();
+        let mut tail = Tail::default();
+        let u = tail.read(&path).unwrap();
+        assert_eq!(u.lines, vec!["a"]);
+        assert_eq!(tail.rest(), Some("b"));
+        std::fs::write(&path, "a\nbc\nd\n").unwrap();
+        let u = tail.read(&path).unwrap();
+        assert!(!u.restarted);
+        assert_eq!(u.lines, vec!["bc", "d"]);
+        assert!(tail.read(&path).unwrap().lines.is_empty());
+        std::fs::write(&path, "z\n").unwrap();
+        let u = tail.read(&path).unwrap();
+        assert!(u.restarted);
+        assert_eq!(u.lines, vec!["z"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

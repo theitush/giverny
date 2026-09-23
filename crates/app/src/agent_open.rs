@@ -4,21 +4,25 @@
 //! touching the app, what that click means — so the decision is tested here
 //! and `main.rs::apply` only carries it out:
 //!
-//! * **Running** workers of this tab's Claude Code are *attached*
-//!   (giverny#23): Giverny types into the parent's own terminal the keys that
-//!   put Claude Code in that subagent's interactive view — its transcript
-//!   live, and a prompt that messages it. A subagent lives inside its parent
-//!   process, so no second `claude` can reach it, but the parent's pty is
-//!   Giverny's. The keys, and what they were established from, are
-//!   [`cc_keys`]; the typing is driven by [`Attach`], which reads the parent's
-//!   screen after every key rather than typing blind.
-//! * **Done**, and a Running row that cannot be attached (no worker id), open
-//!   the old way: a feed row's `open` command runs in a new tab — unless it
-//!   resumes a conversation something is already running, which two claudes
-//!   on one transcript would interleave. With no `open`, the worker's
-//!   transcript is followed read-only in a new tab
-//!   (`giverny transcript --follow`): a finished worker cannot be resumed.
-//! * **Planned** shows the row's brief, or its note, in an overlay.
+//! * **Running** and **Done** workers open an overlay over the current
+//!   terminal (giverny#41, #44) showing the worker's transcript, rendered as
+//!   `giverny transcript` renders it: a Running one live, following it as it
+//!   grows; a Done one opened at its end, on the final report. Nothing is
+//!   typed into Claude Code and no tab is opened.
+//! * From that overlay a Running worker can be *attached* (the overlay's
+//!   **Open in Claude Code**, giverny#23): Giverny types into the parent's
+//!   own terminal the keys that put Claude Code in that subagent's
+//!   interactive view. The keys, and what they were established from, are
+//!   [`cc_keys`]; the typing is driven by [`Attach`], which reads the
+//!   parent's screen after every key rather than typing blind.
+//! * A Done worker can be *revived* from it (**Revive**): only the parent
+//!   Claude Code can resume a finished subagent (`SendMessage` to its id),
+//!   so Giverny submits [`revive_line`] at the parent's prompt, driven by
+//!   [`Typer`] with the same screen checks.
+//! * **Planned** shows the row's brief, or its note, in the same overlay.
+//! * A Running row that names no worker but has a feed `open` command runs
+//!   it in a new tab — unless it resumes a conversation something is already
+//!   running, which two claudes on one transcript would interleave.
 //!
 //! A row with none of these still answers the click, with an overlay saying
 //! what is missing, rather than doing nothing.
@@ -31,19 +35,21 @@ use giverny_claude::feed::Stage;
 
 use crate::agents_pane::RowClick;
 
-/// The largest brief shown whole; past it the overlay shows the head and
-/// says so.
-pub const BRIEF_MAX: usize = 256 * 1024;
+/// The largest brief read; past it the overlay shows the head and says so.
+/// A safety net, not a fold: no brief comes near it.
+pub const BRIEF_MAX: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// Put the parent tab's Claude Code in this running subagent's view.
-    Attach { title: String, agent_id: String },
+    /// Show a worker's transcript in the overlay; `live` follows it.
+    Watch {
+        title: String,
+        transcript: PathBuf,
+        live: bool,
+    },
     /// Run the feed's `open` command in a new tab titled `title`.
     Run { title: String, command: String },
-    /// Follow a worker's transcript in a new tab.
-    Follow { title: String, transcript: PathBuf },
-    /// Show text over the terminal.
+    /// Show text in the overlay.
     Show { title: String, body: Body },
 }
 
@@ -54,8 +60,22 @@ pub enum Body {
     Text(String),
 }
 
+/// What the overlay offers besides reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offer {
+    Nothing,
+    /// A Running worker: open it in the parent's Claude Code (`Attach`).
+    OpenInClaude {
+        agent_id: String,
+    },
+    /// A Done worker: have the parent's Claude Code resume it (`Typer`).
+    Revive {
+        agent_id: String,
+    },
+}
+
 /// The row's title for a tab or overlay: `coo#158 · name`, whichever exist.
-fn title_of(click: &RowClick) -> String {
+pub fn title_of(click: &RowClick) -> String {
     match (click.key.is_empty(), click.name.is_empty()) {
         (false, false) if click.key != click.name => format!("{} · {}", click.key, click.name),
         (false, _) => click.key.clone(),
@@ -67,23 +87,12 @@ fn title_of(click: &RowClick) -> String {
     }
 }
 
-/// Decide what a click does.
-pub fn plan(click: &RowClick) -> Plan {
-    if click.stage == Stage::Running
-        && let Some(id) = click.agent_id.as_deref().filter(|id| !id.is_empty())
-    {
-        return Plan::Attach {
-            title: title_of(click),
-            agent_id: id.to_string(),
-        };
-    }
-    plan_open(click)
+fn agent_id(click: &RowClick) -> Option<&str> {
+    click.agent_id.as_deref().filter(|id| !id.is_empty())
 }
 
-/// What a click does when the worker is not attached: what a Done row always
-/// does, and a Running one falls back to when the attach cannot start (the
-/// parent tab runs no Claude Code, or the worker's description is unknown).
-pub fn plan_open(click: &RowClick) -> Plan {
+/// Decide what a click does.
+pub fn plan(click: &RowClick) -> Plan {
     let title = title_of(click);
     let open = click
         .open
@@ -92,27 +101,42 @@ pub fn plan_open(click: &RowClick) -> Plan {
         .filter(|c| !c.is_empty());
     match click.stage {
         Stage::Running | Stage::Done => {
-            if let Some(cmd) = open {
+            let live = click.stage == Stage::Running;
+            if let Some(t) = &click.transcript {
+                return Plan::Watch {
+                    title,
+                    transcript: t.clone(),
+                    live,
+                };
+            }
+            let id = agent_id(click);
+            if live
+                && id.is_none()
+                && let Some(cmd) = open
+            {
                 return Plan::Run {
                     title,
                     command: cmd.to_string(),
                 };
             }
-            if let Some(t) = &click.transcript {
-                return Plan::Follow {
-                    title,
-                    transcript: t.clone(),
-                };
-            }
-            let why = match &click.agent_id {
-                Some(id) => format!(
+            let mut why = match (id, live) {
+                (Some(id), true) => format!(
                     "No transcript for worker {id} yet — Claude Code writes it once the \
                      worker's first turn lands. Click again in a moment."
                 ),
-                None => "This row names no worker and no `open` command, so there is \
-                         nothing to open."
+                (Some(id), false) => {
+                    format!("No transcript was found for worker {id}, so there is nothing to show.")
+                }
+                (None, _) if open.is_some() => {
+                    "This row names no worker, so there is no transcript to show.".to_string()
+                }
+                (None, _) => "This row names no worker and no `open` command, so there is \
+                              nothing to open."
                     .to_string(),
             };
+            if let Some(cmd) = open.filter(|_| !live) {
+                why.push_str(&format!("\n\nThe row's open command:\n  {cmd}"));
+            }
             Plan::Show {
                 title,
                 body: Body::Text(note_then(click, &why)),
@@ -136,6 +160,45 @@ pub fn plan_open(click: &RowClick) -> Plan {
                 body: Body::Text(note),
             }
         }
+    }
+}
+
+/// What the overlay for this click offers.
+pub fn offer(click: &RowClick) -> Offer {
+    match (click.stage, agent_id(click)) {
+        (Stage::Running, Some(id)) => Offer::OpenInClaude {
+            agent_id: id.to_string(),
+        },
+        (Stage::Done, Some(id)) => Offer::Revive {
+            agent_id: id.to_string(),
+        },
+        _ => Offer::Nothing,
+    }
+}
+
+/// The conversation a Done row's `open` command resumes, if it does: a
+/// click on it goes to the tab running that conversation rather than
+/// showing the overlay (giverny#41).
+pub fn done_resumes(click: &RowClick) -> Option<String> {
+    if click.stage != Stage::Done {
+        return None;
+    }
+    resumed_session(click.open.as_deref()?)
+}
+
+/// The line Revive submits to the parent's Claude Code: its description
+/// (one line, quotes made single) and id, so the parent's `SendMessage`
+/// finds the worker, and the instruction to pick up where it stopped.
+pub fn revive_line(description: Option<&str>, agent_id: &str) -> String {
+    let desc = description
+        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|d| d.replace('"', "'"))
+        .filter(|d| !d.is_empty());
+    match desc {
+        Some(d) => {
+            format!("revive worker \"{d}\" (agent {agent_id}): continue where you left off")
+        }
+        None => format!("revive worker (agent {agent_id}): continue where you left off"),
     }
 }
 
@@ -187,60 +250,49 @@ pub fn resumed_session(command: &str) -> Option<String> {
     None
 }
 
-/// The shell line that follows `transcript` with this very binary.
-pub fn follow_command(exe: &Path, transcript: &Path) -> String {
-    use giverny_term::input::quote_path;
-    format!(
-        "{} transcript --follow {}",
-        quote_path(&exe.to_string_lossy()),
-        quote_path(&transcript.to_string_lossy())
-    )
-}
-
 // ------------------------------------------------------------ attach ----
 
 /// Claude Code's key path to one subagent's interactive view: the one place
 /// that depends on Claude Code's keybindings and screen, so a Claude Code
 /// update that moves them is fixed here.
 ///
-/// Established on Claude Code 2.1.280 with `"tui": "fullscreen"` by driving
-/// a real `claude` in a pty with live background subagents (giverny#23 has
-/// the full findings):
+/// Established on Claude Code 2.1.281 with `"tui": "fullscreen"` by driving
+/// a real `claude` in tmux with background subagents (giverny#44; #23 has
+/// the earlier `/tasks` findings). Nothing is typed: only arrow keys and
+/// Enter, so nothing is left in the prompt and no dialog flickers open.
 ///
-/// 1. At the prompt, `/tasks` + Enter opens the *Background* dialog. It is an
-///    immediate command, so it opens mid-turn too, and from inside a subagent
-///    view. A draft in the prompt would be sent with it, so a draft is first
-///    stashed with Ctrl+S (`chat:stash`), which Claude Code restores once the
-///    command is submitted; on an *empty* prompt Ctrl+S pops an older stash
-///    instead, so it is sent only when the screen shows a draft.
-/// 2. The dialog lists `❯ <description> (running) · <model>`, the label
-///    being the Agent call's `description`. Shells and monitors come first
-///    and their number is invisible from here, so the list is read off the
-///    screen and ↑/↓ step the `❯` onto the worker, one key at a time.
-/// 3. `f` (foreground) on it opens the worker's interactive view. With one
-///    agent alone the dialog may open on its detail card, where `f` works
-///    too and ← goes back to the list.
+/// 1. Under the prompt, Claude Code draws its agent strip: `● main`, then a
+///    row per agent, `◯ <agent type>  <description>  <time> · ↓ <tokens>`
+///    (the filled dot is the view on screen). ↓ at the prompt moves the
+///    focus down out of the prompt box — through the draft's lines, then
+///    the `N shells` pill when background shells exist — into the strip,
+///    which then shows `❯` on its selected row and an `↑/↓ to select` or
+///    `Enter to view` hint. A one-line draft stays where it is.
+/// 2. ↑/↓ step the `❯` along the strip onto the worker, read off the
+///    screen one key at a time; its label is the Agent call's description.
+/// 3. Enter opens that agent's view. The strip keeps the focus, and
+///    anything typed next goes to the view's prompt — which messages the
+///    worker. A draft in the main prompt comes along into it.
 ///
-/// Every key is its own write: sent as one burst, Claude Code took Ctrl+S,
-/// `/tasks` and CR as typed text and sent it as a message. Never sent: Esc
-/// (at the prompt it cancels the turn) and `x` (stops the selected agent).
+/// Every key is its own write. Never sent: Esc (at the prompt it cancels
+/// the turn) and `x` (stops the selected agent).
 pub mod cc_keys {
     use super::Keystroke;
 
-    /// Opens the Background dialog from the prompt.
-    pub const OPEN_LIST: &[Keystroke] = &[Keystroke::Text("/tasks"), Keystroke::Enter];
     /// `chat:stash`: sets a draft aside; restored after the next submit.
+    /// Revive stashes a draft before submitting its line.
     pub const STASH_DRAFT: Keystroke = Keystroke::Ctrl('s');
-    /// Moves the dialog's selection.
+    /// Moves the focus out of the prompt, and the strip's selection.
     pub const NEXT: Keystroke = Keystroke::Down;
     pub const PREVIOUS: Keystroke = Keystroke::Up;
-    /// From an agent's detail card back to the list.
-    pub const BACK: Keystroke = Keystroke::Left;
-    /// Foreground: the selected agent's interactive view.
-    pub const FOREGROUND: Keystroke = Keystroke::Text("f");
+    /// Opens the selected strip row's view.
+    pub const VIEW: Keystroke = Keystroke::Enter;
+    /// The strip's hint rows while it has the focus.
+    pub const STRIP_HINTS: &[&str] = &["↑/↓ to select", "Enter to view"];
 
-    /// The dialog's hint row in list mode, and the part only it has (the
-    /// footer's agent strip also says "↑/↓ to select").
+    /// The `/tasks` dialog's hint row in list mode, and the part only it
+    /// has (the strip's hint also says "↑/↓ to select"). The dialog is not
+    /// used any more; it is recognised so an attach never types into it.
     pub const LIST_HINT: &str = "↑/↓ to select";
     pub const LIST_HINT_CLOSE: &str = "Esc to close";
     /// The hint row of an agent's detail card.
@@ -283,12 +335,10 @@ pub fn viewing_worker(screen: &str) -> bool {
 /// One key Giverny types into the parent's Claude Code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keystroke {
-    Text(&'static str),
     Ctrl(char),
     Enter,
     Up,
     Down,
-    Left,
 }
 
 /// One item of the Background dialog's list.
@@ -303,7 +353,9 @@ pub struct Item {
 pub enum View {
     /// The prompt box; `draft` when it holds typed text.
     Prompt { draft: bool },
-    /// The Background dialog's list.
+    /// The agent strip under the prompt, with the focus (a `❯` row).
+    Strip(Vec<Item>),
+    /// The `/tasks` dialog's list.
     List(Vec<Item>),
     /// An agent's detail card, titled with its description.
     Detail(String),
@@ -347,6 +399,9 @@ pub fn read_view(screen: &str, undimmed: &str) -> View {
             .find_map(|r| r.split_once(DETAIL_TITLE_SEP).map(|(_, t)| t.trim()))
     {
         return View::Detail(title.to_string());
+    }
+    if let Some(items) = read_strip(&rows) {
+        return View::Strip(items);
     }
     // The prompt box: a rule, `❯ …` in the first column, maybe more lines
     // of draft, a rule. The last one on screen; the transcript above has
@@ -406,6 +461,78 @@ fn parse_item(row: &str) -> Option<Item> {
     None
 }
 
+/// The agent strip, when it has the focus: the rows under its hint row,
+/// one of them selected. `None` when no strip row is selected.
+fn read_strip(rows: &[&str]) -> Option<Vec<Item>> {
+    let h = rows.iter().rposition(|r| {
+        cc_keys::STRIP_HINTS.iter().any(|hint| r.contains(hint))
+            && !r.contains(cc_keys::LIST_HINT_CLOSE)
+    })?;
+    let items: Vec<Item> = rows[h + 1..]
+        .iter()
+        .map(|r| r.trim())
+        // Inside a worker's view a blank row sits under the hint.
+        .skip_while(|r| r.is_empty())
+        .take_while(|r| !r.is_empty())
+        .filter_map(parse_strip_item)
+        .collect();
+    items.iter().any(|it| it.selected).then_some(items)
+}
+
+/// `❯ ◯ general-purpose  eta worker     8s · ↓ 27.2k tokens` → `eta worker`
+/// (selected); `● main` → `main`. `↑ N more` rows are not items.
+fn parse_strip_item(row: &str) -> Option<Item> {
+    let (selected, rest) = match row.strip_prefix(cc_keys::PROMPT) {
+        Some(r) => (true, r.trim_start()),
+        None => (false, row),
+    };
+    // The dot: one symbol (`●`, `◯`, a spinner), or `( )` / `(*)` without
+    // Unicode.
+    let rest = if rest.len() >= 3 && rest.starts_with('(') && rest[2..].starts_with(')') {
+        &rest[3..]
+    } else {
+        let mut chars = rest.chars();
+        let dot = chars.next()?;
+        if dot.is_alphanumeric() || dot == '↑' || dot == '↓' {
+            return None;
+        }
+        chars.as_str()
+    };
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.trim();
+    // Columns are separated by runs of spaces: type, description, stats.
+    let cols: Vec<&str> = rest
+        .split("  ")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let label = match cols.as_slice() {
+        [] => return None,
+        [only] => *only,
+        [_, desc, ..] => *desc,
+    };
+    Some(Item {
+        label: label.to_string(),
+        selected,
+    })
+}
+
+/// Rows of the prompt box on screen (its draft's lines), else 1.
+fn prompt_rows(screen: &str) -> usize {
+    let rows: Vec<&str> = screen.lines().collect();
+    for i in (1..rows.len()).rev() {
+        if !rows[i].starts_with(cc_keys::PROMPT) || !is_rule(rows[i - 1]) {
+            continue;
+        }
+        if let Some(end) = (i + 1..rows.len().min(i + 40)).find(|&j| is_rule(rows[j])) {
+            return end - i;
+        }
+    }
+    1
+}
+
 /// Whether a label on Claude Code's screen names this description: equal
 /// but for spacing, or cut short with `…`.
 pub fn label_matches(label: &str, description: &str) -> bool {
@@ -430,14 +557,12 @@ pub fn keystroke_bytes(
     use egui::{Key, Modifiers};
     let special = |k: Key, m: Modifiers| encode(k, m).unwrap_or_default();
     match key {
-        Keystroke::Text(t) => t.as_bytes().to_vec(),
         Keystroke::Ctrl(c) => Key::from_name(&c.to_ascii_uppercase().to_string())
             .and_then(|k| encode(k, Modifiers::CTRL))
             .unwrap_or_else(|| vec![c as u8 & 0x1f]),
         Keystroke::Enter => special(Key::Enter, Modifiers::NONE),
         Keystroke::Up => special(Key::ArrowUp, Modifiers::NONE),
         Keystroke::Down => special(Key::ArrowDown, Modifiers::NONE),
-        Keystroke::Left => special(Key::ArrowLeft, Modifiers::NONE),
     }
 }
 
@@ -452,29 +577,36 @@ pub enum Stuck {
     Ambiguous,
     /// The screen never got where the keys should have taken it.
     TimedOut,
+    /// Claude Code shows a worker's view, not the main session's prompt.
+    WorkerView,
 }
 
 impl Stuck {
     /// What the overlay tells Ita.
     pub fn explain(&self, description: &str) -> String {
         match self {
-            Stuck::NoPrompt => "Opening a worker means typing into this tab's Claude Code, and \
-                                its prompt is not on screen (a permission question, or another \
-                                dialog, is up). Answer or close it, then click the row again."
+            Stuck::NoPrompt => "This means typing into this tab's Claude Code, and its prompt \
+                                is not on screen (a permission question, or another dialog, is \
+                                up). Answer or close it, then try again."
+                .to_string(),
+            Stuck::WorkerView => "This tab's Claude Code is showing a worker's view, so a line \
+                                  typed there would go to that worker, not to the session that \
+                                  can revive this one. Go back to main (the strip's `main`, or \
+                                  ←), then Revive again."
                 .to_string(),
             Stuck::NotListed => format!(
-                "Claude Code's background list (left open under this note) has no agent \
-                 called \u{201c}{description}\u{201d}. It may have just finished; its Done row \
-                 opens the transcript."
+                "The agent list under Claude Code's prompt has no agent called \
+                 \u{201c}{description}\u{201d}. It may have finished and left the list; its \
+                 row still shows the transcript."
             ),
             Stuck::Ambiguous => format!(
-                "More than one running agent is called \u{201c}{description}\u{201d}, so \
-                 Giverny cannot tell which is which. Claude Code's background list is left \
-                 open under this note: pick it with ↑/↓ and press f."
+                "More than one agent is called \u{201c}{description}\u{201d}, so Giverny \
+                 cannot tell which is which. The agent list under Claude Code's prompt is \
+                 left selected: pick it with ↑/↓ and press Enter."
             ),
             Stuck::TimedOut => "Claude Code did not answer the keys in time, so Giverny \
-                                stopped typing. Click the row again, or type /tasks in this \
-                                tab and press f on the worker."
+                                stopped. Try again, or press ↓ at this tab's prompt until the \
+                                agent list is selected, then Enter on the worker."
                 .to_string(),
         }
     }
@@ -485,6 +617,8 @@ impl Stuck {
 pub enum Tick {
     /// Write this key to the parent's pty.
     Send(Keystroke),
+    /// Write this text to the parent's pty, as typed.
+    Type(String),
     /// Nothing yet; look again next frame.
     Wait,
     /// The foreground key is sent: the worker's view is open.
@@ -499,15 +633,15 @@ pub const SETTLE: Duration = Duration::from_millis(700);
 /// The whole attach, start to finish.
 pub const DEADLINE: Duration = Duration::from_secs(5);
 
-/// Types the key path into a parent's Claude Code, reading its screen after
+/// Walks the key path into a parent's Claude Code, reading its screen after
 /// every step. Pure but for the clock and screen it is handed, so it is
 /// driven the same way in tests as in the app.
 #[derive(Debug, Clone)]
 pub struct Attach {
     pub description: String,
-    /// `/tasks` has been typed.
+    /// ↓ has been sent out of the prompt.
     opened: bool,
-    /// The foreground key is queued.
+    /// Enter on the worker is queued.
     finishing: bool,
     queue: VecDeque<Keystroke>,
     last_key: Option<Instant>,
@@ -564,6 +698,16 @@ impl Attach {
             return Tick::Stuck(Stuck::TimedOut);
         }
         let view = read_view(screen, undimmed);
+        // ↓ went out and the prompt is still all there is: the keys are
+        // still landing, or — once they have had time to — there is no
+        // strip to reach, so no agent is listed. However the prompt box
+        // redraws meanwhile (the placeholder, the footer) it is waited out.
+        if self.opened && matches!(view, View::Prompt { .. }) {
+            return match &self.settle {
+                Some((until, _)) if now < *until => Tick::Wait,
+                _ => Tick::Stuck(Stuck::NotListed),
+            };
+        }
         if let Some((until, before)) = &self.settle {
             if view == *before && now < *until {
                 return Tick::Wait;
@@ -571,7 +715,7 @@ impl Attach {
             self.settle = None;
         }
         match &view {
-            View::List(items) => {
+            View::Strip(items) => {
                 let hits: Vec<usize> = items
                     .iter()
                     .enumerate()
@@ -584,40 +728,96 @@ impl Attach {
                     _ => return Tick::Stuck(Stuck::Ambiguous),
                 };
                 let Some(at) = items.iter().position(|it| it.selected) else {
-                    // A frame drawn between two selections: look again.
                     return Tick::Wait;
                 };
                 let key = match target.cmp(&at) {
                     std::cmp::Ordering::Equal => {
                         self.finishing = true;
-                        cc_keys::FOREGROUND
+                        cc_keys::VIEW
                     }
                     std::cmp::Ordering::Greater => cc_keys::NEXT,
                     std::cmp::Ordering::Less => cc_keys::PREVIOUS,
                 };
                 self.push(&[key], view, now)
             }
-            View::Detail(title) => {
-                if label_matches(title, &self.description) {
-                    self.finishing = true;
-                    self.push(&[cc_keys::FOREGROUND], view, now)
-                } else {
-                    self.push(&[cc_keys::BACK], view, now)
-                }
-            }
-            // `/tasks` is typed and the dialog is on its way (the prompt
-            // clears a frame before it draws); DEADLINE bounds the wait.
-            View::Prompt { .. } | View::Other if self.opened => Tick::Wait,
-            View::Prompt { draft } => {
+            View::Prompt { .. } => {
                 self.opened = true;
-                let mut keys = Vec::new();
-                if *draft {
-                    keys.push(cc_keys::STASH_DRAFT);
-                }
-                keys.extend_from_slice(cc_keys::OPEN_LIST);
+                // Down through the draft's lines, past the shells pill,
+                // into the strip. A Down too many only moves the strip's
+                // selection, which the next look corrects.
+                let downs = prompt_rows(screen) + 1;
+                let keys = vec![cc_keys::NEXT; downs];
                 self.push(&keys, view, now)
             }
-            View::Other => Tick::Stuck(Stuck::NoPrompt),
+            View::List(_) | View::Detail(_) | View::Other => Tick::Stuck(Stuck::NoPrompt),
+        }
+    }
+}
+
+/// Submits one line at the parent's prompt (Revive, giverny#41): stash a
+/// draft if one is there, type the line, press Enter — each its own write,
+/// after reading the screen once. It types nothing unless the main
+/// session's prompt is on screen.
+#[derive(Debug, Clone)]
+pub struct Typer {
+    pub line: String,
+    started: bool,
+    queue: VecDeque<Step>,
+    last_key: Option<Instant>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum Step {
+    Key(Keystroke),
+    Text(String),
+}
+
+impl Typer {
+    pub fn new(line: impl Into<String>, now: Instant) -> Typer {
+        Typer {
+            line: line.into(),
+            started: false,
+            queue: VecDeque::new(),
+            last_key: None,
+            deadline: now + DEADLINE,
+        }
+    }
+
+    /// One frame: `screen` and `undimmed` are the parent's screen now.
+    pub fn tick(&mut self, now: Instant, screen: &str, undimmed: &str) -> Tick {
+        if self.started {
+            if self.last_key.is_some_and(|t| now < t + KEY_GAP) {
+                return Tick::Wait;
+            }
+            return match self.queue.pop_front() {
+                Some(step) => {
+                    self.last_key = Some(now);
+                    match step {
+                        Step::Key(k) => Tick::Send(k),
+                        Step::Text(t) => Tick::Type(t),
+                    }
+                }
+                None => Tick::Done,
+            };
+        }
+        if now >= self.deadline {
+            return Tick::Stuck(Stuck::TimedOut);
+        }
+        if viewing_worker(screen) {
+            return Tick::Stuck(Stuck::WorkerView);
+        }
+        match read_view(screen, undimmed) {
+            View::Prompt { draft } => {
+                self.started = true;
+                if draft {
+                    self.queue.push_back(Step::Key(cc_keys::STASH_DRAFT));
+                }
+                self.queue.push_back(Step::Text(self.line.clone()));
+                self.queue.push_back(Step::Key(Keystroke::Enter));
+                self.tick(now, screen, undimmed)
+            }
+            _ => Tick::Stuck(Stuck::NoPrompt),
         }
     }
 }
@@ -636,58 +836,89 @@ mod tests {
             open: None,
             brief: None,
             note: None,
+            facts: Vec::new(),
         }
     }
 
     #[test]
-    fn running_attaches_and_done_opens() {
+    fn running_and_done_watch_the_transcript() {
         let mut c = click(Stage::Running);
         c.transcript = Some("/t/agent-a93.jsonl".into());
         c.open = Some("claude --resume x".into());
         assert_eq!(
             plan(&c),
-            Plan::Attach {
+            Plan::Watch {
                 title: "coo#158 · Wren".into(),
+                transcript: "/t/agent-a93.jsonl".into(),
+                live: true,
+            }
+        );
+        assert_eq!(
+            offer(&c),
+            Offer::OpenInClaude {
                 agent_id: "a93".into()
             }
         );
-        // The fallback, and Done, open the old way: `open`, else the
-        // transcript.
-        for stage in [Stage::Running, Stage::Done] {
-            c.stage = stage;
-            c.open = None;
-            assert_eq!(
-                plan_open(&c),
-                Plan::Follow {
-                    title: "coo#158 · Wren".into(),
-                    transcript: "/t/agent-a93.jsonl".into()
-                }
-            );
-            c.open = Some("claude --resume x".into());
-            assert!(
-                matches!(plan_open(&c), Plan::Run { command, .. } if command == "claude --resume x")
-            );
-        }
+        // Done: the same overlay, not live, and never a new tab — even
+        // with an `open` command.
         c.stage = Stage::Done;
-        assert!(matches!(plan(&c), Plan::Run { .. }));
+        assert_eq!(
+            plan(&c),
+            Plan::Watch {
+                title: "coo#158 · Wren".into(),
+                transcript: "/t/agent-a93.jsonl".into(),
+                live: false,
+            }
+        );
+        assert_eq!(
+            offer(&c),
+            Offer::Revive {
+                agent_id: "a93".into()
+            }
+        );
+        c.agent_id = None;
+        assert_eq!(offer(&c), Offer::Nothing);
+        c.stage = Stage::Planned;
+        assert_eq!(offer(&c), Offer::Nothing);
     }
 
     #[test]
-    fn running_without_a_worker_id_opens_the_old_way() {
+    fn done_without_a_transcript_says_so_and_opens_no_tab() {
+        let mut c = click(Stage::Done);
+        c.open = Some("less /tmp/log".into());
+        let Plan::Show {
+            body: Body::Text(t),
+            ..
+        } = plan(&c)
+        else {
+            panic!("expected text");
+        };
+        assert!(t.contains("No transcript was found for worker a93"));
+        assert!(t.contains("less /tmp/log"));
+        c.agent_id = None;
+        assert!(matches!(plan(&c), Plan::Show { .. }));
+    }
+
+    #[test]
+    fn a_done_row_resuming_a_conversation_goes_to_it() {
+        let sid = "0b7c1c3e-8d7f-4c1e-9a55-2f6a1b0c9d11";
+        let mut c = click(Stage::Done);
+        c.open = Some(format!("claude --resume {sid}"));
+        assert_eq!(done_resumes(&c), Some(sid.to_string()));
+        c.stage = Stage::Running;
+        assert_eq!(done_resumes(&c), None);
+    }
+
+    #[test]
+    fn running_without_a_worker_id_runs_open() {
         let mut c = click(Stage::Running);
         c.agent_id = None;
         c.open = Some("claude --resume x".into());
         assert!(matches!(plan(&c), Plan::Run { .. }));
         c.agent_id = Some(String::new());
         assert!(matches!(plan(&c), Plan::Run { .. }));
-    }
-
-    #[test]
-    fn a_blank_open_falls_through_to_the_transcript() {
-        let mut c = click(Stage::Done);
         c.open = Some("   ".into());
-        c.transcript = Some("/t/a.jsonl".into());
-        assert!(matches!(plan(&c), Plan::Follow { .. }));
+        assert!(matches!(plan(&c), Plan::Show { .. }));
     }
 
     #[test]
@@ -696,11 +927,27 @@ mod tests {
         let Plan::Show {
             body: Body::Text(t),
             ..
-        } = plan_open(&c)
+        } = plan(&c)
         else {
             panic!("expected text");
         };
         assert!(t.contains("No transcript for worker a93"));
+    }
+
+    #[test]
+    fn the_revive_line() {
+        assert_eq!(
+            revive_line(Some("Work  giverny#41\n\"overlay\""), "a93"),
+            "revive worker \"Work giverny#41 'overlay'\" (agent a93): continue where you left off"
+        );
+        assert_eq!(
+            revive_line(Some("  "), "a93"),
+            "revive worker (agent a93): continue where you left off"
+        );
+        assert_eq!(
+            revive_line(None, "a93"),
+            "revive worker (agent a93): continue where you left off"
+        );
     }
 
     #[test]
@@ -770,17 +1017,12 @@ mod tests {
         let big = dir.join("big.md");
         std::fs::write(&big, vec![b'x'; BRIEF_MAX + 10]).unwrap();
         assert!(read_brief(&big).contains("… 10 more bytes"));
+        // A long brief is read whole.
+        let long = dir.join("long.md");
+        std::fs::write(&long, "y".repeat(300 * 1024)).unwrap();
+        assert_eq!(read_brief(&long).len(), 300 * 1024);
         assert!(read_brief(&dir.join("none.md")).starts_with("Could not read the brief"));
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn follow_command_quotes() {
-        assert_eq!(
-            follow_command(Path::new("/opt/giverny"), Path::new("/a b/agent-x.jsonl")),
-            "/opt/giverny transcript --follow '/a b/agent-x.jsonl'"
-        );
     }
 
     // ------------------------------------------------------ attach ----
@@ -959,89 +1201,185 @@ mod tests {
         }
     }
 
+    // Claude Code 2.1.281 (fullscreen tui), captured from a real `claude`
+    // in tmux during the giverny#44 check: two background agents, two
+    // background shells.
+
+    const STRIP_TOP: &str = "\
+● Theta worker is now also running its sleep 400 in the background.
+✻ Crunched for 18s · done 1:02 AM · 2 shells still running
+──────────────────────────────────────────────────────────────────
+";
+
+    fn strip_rows(selected: Option<usize>, hint: &str) -> String {
+        let rows = [
+            "● main",
+            "◯ general-purpose  eta worker                          8s · ↓ 27.2k tokens",
+            "◯ general-purpose  theta worker                        8s · ↓ 27.2k tokens",
+        ];
+        let mut out = format!("  {hint}\n");
+        for (i, r) in rows.iter().enumerate() {
+            let lead = if Some(i) == selected { "❯ " } else { "  " };
+            out.push_str(&format!("{lead}{r}\n"));
+        }
+        out
+    }
+
+    /// The main prompt with the strip under it, unfocused.
+    fn at_prompt(draft: &str) -> String {
+        format!(
+            "{STRIP_TOP}❯ {draft}\n──────────────────────────────────────────────────────────────────\n  \
+             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session 36.2k  ·  total: 90k\n{}",
+            strip_rows(None, "⏸ manual mode on · 2 shells · ← 2 agents")
+        )
+    }
+
+    /// The strip with the focus on row `at`.
+    fn in_strip(at: usize) -> String {
+        let hint = if at == 0 {
+            "↑/↓ to select"
+        } else {
+            "Enter to view · x to stop · ctrl+x ctrl+k to stop all agents"
+        };
+        format!(
+            "{STRIP_TOP}❯ \n──────────────────────────────────────────────────────────────────\n  \
+             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session 36.2k  ·  total: 90k\n{}",
+            strip_rows(Some(at), hint)
+        )
+    }
+
     #[test]
-    fn attach_opens_the_list_steps_to_the_worker_and_foregrounds_it() {
+    fn reads_the_agent_strip() {
+        assert_eq!(
+            read_view(&at_prompt(""), &at_prompt("")),
+            View::Prompt { draft: false }
+        );
+        let View::Strip(items) = read_view(&in_strip(1), &in_strip(1)) else {
+            panic!("expected the strip");
+        };
+        let labels: Vec<(&str, bool)> = items
+            .iter()
+            .map(|i| (i.label.as_str(), i.selected))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("main", false),
+                ("eta worker", true),
+                ("theta worker", false)
+            ]
+        );
+        // Without Unicode, and with a `↑ N more` row.
+        assert_eq!(
+            parse_strip_item("❯ ( ) general-purpose  iota worker   3s"),
+            Some(Item {
+                label: "iota worker".into(),
+                selected: true
+            })
+        );
+        assert_eq!(parse_strip_item("↑ 2 more"), None);
+        assert_eq!(parse_strip_item("Haiku 4.5  ·  5h 11%"), None);
+    }
+
+    /// A worker's view with the strip focused on `main`, verbatim.
+    const WORKER_VIEW_STRIP: &str = "\
+● The 400-second sleep is running in the background.
+───────────────────────────────────────────────────── eta worker ─
+❯ Message @general-purpose…
+──────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 12%  ·  wk 94%  ·  session 37.6k  ·  total: 117.9k
+  ↑/↓ to select · Enter to view
+
+❯ ◯ main
+  ● general-purpose  eta worker                          8s · ↓ 27.2k tokens
+  ◯ general-purpose  theta worker                        8s · ↓ 27.2k tokens
+";
+
+    #[test]
+    fn reads_the_strip_under_a_worker_view() {
+        let View::Strip(items) = read_view(WORKER_VIEW_STRIP, WORKER_VIEW_STRIP) else {
+            panic!("expected the strip");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(items[0].selected && items[0].label == "main");
+        assert!(viewing_worker(WORKER_VIEW_STRIP));
+    }
+
+    #[test]
+    fn attach_steps_down_the_strip_and_views_the_worker_typing_nothing() {
+        let mut t = Instant::now();
+        let mut a = Attach::new("theta worker", t);
+        let prompt = at_prompt("");
+        // ↓ out of the prompt box (one row) and past the shells pill.
+        assert_eq!(drive(&mut a, &mut t, &prompt), Tick::Send(Keystroke::Down));
+        assert_eq!(drive(&mut a, &mut t, &prompt), Tick::Send(Keystroke::Down));
+        // The strip has the focus on `main`; the worker is two rows down.
+        assert_eq!(
+            drive(&mut a, &mut t, &in_strip(0)),
+            Tick::Send(Keystroke::Down)
+        );
+        assert_eq!(
+            drive(&mut a, &mut t, &in_strip(1)),
+            Tick::Send(Keystroke::Down)
+        );
+        assert_eq!(
+            drive(&mut a, &mut t, &in_strip(2)),
+            Tick::Send(Keystroke::Enter)
+        );
+        assert_eq!(drive(&mut a, &mut t, &in_strip(2)), Tick::Done);
+        // A Down too many is walked back.
+        let mut b = Attach::new("eta worker", t);
+        b.opened = true;
+        assert_eq!(
+            drive(&mut b, &mut t, &in_strip(2)),
+            Tick::Send(Keystroke::Up)
+        );
+    }
+
+    #[test]
+    fn attach_goes_through_a_draft() {
         let mut t = Instant::now();
         let mut a = Attach::new("eta worker", t);
-        let empty = prompt_screen("");
-        assert_eq!(
-            drive(&mut a, &mut t, &empty),
-            Tick::Send(Keystroke::Text("/tasks"))
+        let draft = format!(
+            "{STRIP_TOP}❯ first line\n  second line\n  third\n──────────────────────────────\n{}",
+            strip_rows(None, "⏸ manual mode on")
         );
-        assert_eq!(drive(&mut a, &mut t, &empty), Tick::Send(Keystroke::Enter));
-        // The list opens on its first item; the worker is the last.
-        for at in 0..4 {
-            assert_eq!(
-                drive(&mut a, &mut t, &list_screen(at)),
-                Tick::Send(Keystroke::Down),
-                "from item {at}"
-            );
+        let mut downs = 0;
+        loop {
+            match drive(&mut a, &mut t, &draft) {
+                Tick::Send(Keystroke::Down) => downs += 1,
+                other => {
+                    assert_eq!(other, Tick::Stuck(Stuck::NotListed));
+                    break;
+                }
+            }
         }
-        assert_eq!(
-            drive(&mut a, &mut t, &list_screen(4)),
-            Tick::Send(Keystroke::Text("f"))
-        );
-        assert_eq!(drive(&mut a, &mut t, &list_screen(4)), Tick::Done);
+        // Three draft rows, then one more for the shells pill; never a
+        // stash, never text.
+        assert_eq!(downs, 4);
     }
 
     #[test]
     fn attach_waits_for_a_key_to_land_before_the_next() {
         let mut t = Instant::now();
-        let mut a = Attach::new("eta worker", t);
+        let mut a = Attach::new("theta worker", t);
         a.opened = true;
-        assert_eq!(a.tick(t, &list_screen(2), ""), Tick::Send(Keystroke::Down));
+        assert_eq!(a.tick(t, &in_strip(0), ""), Tick::Send(Keystroke::Down));
         // Same screen: the Down has not landed yet, so no second Down.
         t += Duration::from_millis(100);
-        assert_eq!(a.tick(t, &list_screen(2), ""), Tick::Wait);
+        assert_eq!(a.tick(t, &in_strip(0), ""), Tick::Wait);
         // Keys go out at least KEY_GAP apart.
         let mut b = Attach::new("x", t);
-        let empty = prompt_screen("");
+        let prompt = at_prompt("");
+        assert_eq!(b.tick(t, &prompt, &prompt), Tick::Send(Keystroke::Down));
         assert_eq!(
-            b.tick(t, &empty, &empty),
-            Tick::Send(Keystroke::Text("/tasks"))
-        );
-        assert_eq!(
-            b.tick(t + Duration::from_millis(5), &empty, &empty),
+            b.tick(t + Duration::from_millis(5), &prompt, &prompt),
             Tick::Wait
         );
         assert_eq!(
-            b.tick(t + KEY_GAP, &empty, &empty),
-            Tick::Send(Keystroke::Enter)
+            b.tick(t + KEY_GAP, &prompt, &prompt),
+            Tick::Send(Keystroke::Down)
         );
-    }
-
-    #[test]
-    fn attach_stashes_a_draft_first() {
-        let mut t = Instant::now();
-        let mut a = Attach::new("eta worker", t);
-        let draft = prompt_screen("half a thought");
-        assert_eq!(
-            drive(&mut a, &mut t, &draft),
-            Tick::Send(Keystroke::Ctrl('s'))
-        );
-        assert_eq!(
-            drive(&mut a, &mut t, &draft),
-            Tick::Send(Keystroke::Text("/tasks"))
-        );
-        assert_eq!(drive(&mut a, &mut t, &draft), Tick::Send(Keystroke::Enter));
-    }
-
-    #[test]
-    fn attach_moves_up_and_backs_out_of_the_wrong_card() {
-        let mut t = Instant::now();
-        let mut a = Attach::new("iota worker", t);
-        assert_eq!(
-            drive(&mut a, &mut t, &list_screen(4)),
-            Tick::Send(Keystroke::Up)
-        );
-        let mut b = Attach::new("eta worker", t);
-        assert_eq!(drive(&mut b, &mut t, DETAIL), Tick::Send(Keystroke::Left));
-        let mut c = Attach::new("theta worker", t);
-        assert_eq!(
-            drive(&mut c, &mut t, DETAIL),
-            Tick::Send(Keystroke::Text("f"))
-        );
-        assert_eq!(drive(&mut c, &mut t, DETAIL), Tick::Done);
     }
 
     #[test]
@@ -1052,23 +1390,82 @@ mod tests {
             drive(&mut a, &mut t, PERMISSION),
             Tick::Stuck(Stuck::NoPrompt)
         );
+        // The /tasks dialog is up: not the prompt, nothing is typed.
+        let mut l = Attach::new("eta worker", t);
+        assert_eq!(
+            drive(&mut l, &mut t, &list_screen(0)),
+            Tick::Stuck(Stuck::NoPrompt)
+        );
         let mut b = Attach::new("kappa worker", t);
         assert_eq!(
-            drive(&mut b, &mut t, &list_screen(0)),
+            drive(&mut b, &mut t, &in_strip(0)),
             Tick::Stuck(Stuck::NotListed)
         );
-        let twice = list_screen(0).replace("iota worker", "eta worker");
+        let twice = in_strip(0).replace("theta worker", "eta worker");
         let mut c = Attach::new("eta worker", t);
         assert_eq!(drive(&mut c, &mut t, &twice), Tick::Stuck(Stuck::Ambiguous));
-        // Typed `/tasks`, and the dialog never came.
+        // ↓ went out and no strip came: no agent to view.
         let mut d = Attach::new("eta worker", t);
+        let bare = prompt_screen("");
+        assert_eq!(drive(&mut d, &mut t, &bare), Tick::Send(Keystroke::Down));
+        assert_eq!(drive(&mut d, &mut t, &bare), Tick::Send(Keystroke::Down));
+        assert_eq!(drive(&mut d, &mut t, &bare), Tick::Stuck(Stuck::NotListed));
+    }
+
+    fn drive_typer(a: &mut Typer, t: &mut Instant, screen: &str) -> Tick {
+        *t += KEY_GAP;
+        let undimmed = screen.replace("Try \"fix lint errors\"", "");
+        a.tick(*t, screen, &undimmed)
+    }
+
+    #[test]
+    fn revive_types_the_line_and_submits_it() {
+        let mut t = Instant::now();
+        let mut a = Typer::new("revive worker (agent a93): continue where you left off", t);
         let empty = prompt_screen("");
         assert_eq!(
-            drive(&mut d, &mut t, &empty),
-            Tick::Send(Keystroke::Text("/tasks"))
+            drive_typer(&mut a, &mut t, &empty),
+            Tick::Type("revive worker (agent a93): continue where you left off".into())
         );
-        assert_eq!(drive(&mut d, &mut t, &empty), Tick::Send(Keystroke::Enter));
-        assert_eq!(drive(&mut d, &mut t, &empty), Tick::Stuck(Stuck::TimedOut));
+        // Too soon for the next key: each is its own write.
+        assert_eq!(a.tick(t, &empty, &empty), Tick::Wait);
+        assert_eq!(
+            drive_typer(&mut a, &mut t, &empty),
+            Tick::Send(Keystroke::Enter)
+        );
+        assert_eq!(drive_typer(&mut a, &mut t, &empty), Tick::Done);
+    }
+
+    #[test]
+    fn revive_stashes_a_draft_and_stops_rather_than_type_blind() {
+        let mut t = Instant::now();
+        let draft = prompt_screen("half a thought");
+        let mut a = Typer::new("revive", t);
+        assert_eq!(
+            drive_typer(&mut a, &mut t, &draft),
+            Tick::Send(Keystroke::Ctrl('s'))
+        );
+        assert_eq!(
+            drive_typer(&mut a, &mut t, &draft),
+            Tick::Type("revive".into())
+        );
+        let mut b = Typer::new("revive", t);
+        assert_eq!(
+            drive_typer(&mut b, &mut t, PERMISSION),
+            Tick::Stuck(Stuck::NoPrompt)
+        );
+        let mut c = Typer::new("revive", t);
+        assert_eq!(
+            drive_typer(&mut c, &mut t, &list_screen(0)),
+            Tick::Stuck(Stuck::NoPrompt)
+        );
+        // In a worker's view the line would go to that worker.
+        let mut d = Typer::new("revive", t);
+        let in_worker = format!("{}\n  ◯ main\n", prompt_screen(""));
+        assert_eq!(
+            drive_typer(&mut d, &mut t, &in_worker),
+            Tick::Stuck(Stuck::WorkerView)
+        );
     }
 
     #[test]
@@ -1076,10 +1473,103 @@ mod tests {
         let enc = |k: egui::Key, m: egui::Modifiers| -> Option<Vec<u8>> {
             Some(format!("{k:?}{}", if m.ctrl { "+ctrl" } else { "" }).into_bytes())
         };
-        assert_eq!(keystroke_bytes(Keystroke::Text("/tasks"), enc), b"/tasks");
         assert_eq!(keystroke_bytes(Keystroke::Ctrl('s'), enc), b"S+ctrl");
         assert_eq!(keystroke_bytes(Keystroke::Down, enc), b"ArrowDown");
         // With no encoder answer, Ctrl+S is still the control byte.
         assert_eq!(keystroke_bytes(Keystroke::Ctrl('s'), |_, _| None), [0x13]);
+    }
+
+    /// The keys and the revive line against a real Claude Code in tmux
+    /// (giverny#44): `GIVERNY_TMUX=<socket>:<target>`, a `claude` there with
+    /// the agent `GIVERNY_TMUX_AGENT` (a description) in its strip, and
+    /// `GIVERNY_TMUX_REVIVE` the revive line to submit afterwards, if any.
+    /// Run by hand: `cargo test -p giverny live_tmux -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_tmux() {
+        use std::process::Command;
+        let spec = std::env::var("GIVERNY_TMUX").expect("GIVERNY_TMUX=<socket>:<target>");
+        let (sock, target) = spec.split_once(':').unwrap();
+        let tmux = |args: &[&str]| {
+            let out = Command::new("tmux")
+                .args(["-L", sock])
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let screen = || tmux(&["capture-pane", "-p", "-t", target]);
+        let send = |bytes: &[u8]| {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let mut args = vec!["send-keys", "-t", target, "-H"];
+            args.extend(hex.iter().map(String::as_str));
+            tmux(&args);
+        };
+        let enc = |k: egui::Key, _m: egui::Modifiers| -> Option<Vec<u8>> {
+            Some(
+                match k {
+                    egui::Key::ArrowUp => "\x1b[A",
+                    egui::Key::ArrowDown => "\x1b[B",
+                    egui::Key::Enter => "\r",
+                    _ => return None,
+                }
+                .as_bytes()
+                .to_vec(),
+            )
+        };
+        let run = |tick: &mut dyn FnMut(Instant, &str) -> Tick| {
+            let started = Instant::now();
+            let mut sent = Vec::new();
+            loop {
+                let s = screen();
+                match tick(Instant::now(), &s) {
+                    Tick::Send(k) => {
+                        sent.push(format!("{k:?}"));
+                        send(&keystroke_bytes(k, enc));
+                    }
+                    Tick::Type(t) => {
+                        sent.push(format!("Type({t:?})"));
+                        send(t.as_bytes());
+                    }
+                    Tick::Wait => {}
+                    other => {
+                        println!("{other:?} after {:?}: {sent:?}", started.elapsed());
+                        return other;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        };
+        let agent = std::env::var("GIVERNY_TMUX_AGENT").unwrap();
+        let mut a = Attach::new(agent, Instant::now());
+        let done = run(&mut |now, s| a.tick(now, s, s));
+        println!("{}", screen());
+        assert_eq!(done, Tick::Done);
+        if let Ok(line) = std::env::var("GIVERNY_TMUX_REVIVE") {
+            // In the worker's view, Revive refuses.
+            let mut w = Typer::new(line.clone(), Instant::now());
+            let refused = run(&mut |now, s| w.tick(now, s, s));
+            assert_eq!(refused, Tick::Stuck(Stuck::WorkerView));
+            // Back to main by the same strip, then revive.
+            let mut m = Attach::new("main", Instant::now());
+            assert_eq!(run(&mut |now, s| m.tick(now, s, s)), Tick::Done);
+            // Up out of the strip (and the shells pill) to the prompt,
+            // whose footer then says `← N agents` again.
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(500));
+                let focused = screen()
+                    .lines()
+                    .any(|l| l.contains("← ") && l.contains("agent"));
+                if focused {
+                    break;
+                }
+                send(b"\x1b[A");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let mut r = Typer::new(line, Instant::now());
+            assert_eq!(run(&mut |now, s| r.tick(now, s, s)), Tick::Done);
+            std::thread::sleep(Duration::from_secs(2));
+            println!("{}", screen());
+        }
     }
 }
