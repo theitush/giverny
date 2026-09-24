@@ -61,6 +61,8 @@ Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI 
 
 On Windows, an account that lives inside WSL is treated as an account: it is discovered there, its usage is refreshed by running `claude` inside the distribution, and its hooks call back out to Giverny. Tabs for it open in the distribution it belongs to. `behavior.windows_shell` decides what everything else opens, and `giverny doctor` prints what was found in each distribution.
 
+Inside WSL itself (WSLg), Giverny draws on the GPU through Mesa's d3d12 driver, which needs a recent Windows GPU driver: an older one opens every window black. Giverny checks first and falls back to drawing on the CPU, which works but costs most of a core. If the log says to update the Windows GPU driver, do that from the GPU vendor's site or Windows Update. `GIVERNY_GPU=software` skips the GPU.
+
 ## The rail
 
 Two ways to read it, switched at the top and remembered between launches:
