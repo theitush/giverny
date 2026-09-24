@@ -78,7 +78,10 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `agent_id` | string | no | The Claude Code subagent id holding this row — **the join key** with the live rows (see **Merge**). It is Claude Code's id for the worker: `tasks[].id` in the `subagentStatusLine` input, and the `<id>` in `<config>/projects/<cwd>/<session>/subagents/agent-<id>.jsonl`. Several rows may carry the same `agent_id` (one worker holding several tasks). |
 | `started` | timestamp | no | When this row's work started. RFC 3339 string (`2026-09-23T10:00:00Z`, any offset) or integer epoch **milliseconds**. |
 | `ended` | timestamp | no | When a Done row landed. Same formats. |
-| `eta_s` | non-negative integer | no | The estimated total duration of the row, in seconds, measured from `started`. On Running and Planned rows it fills the ETA column (`~1h3m`); on Done rows it is what the landing is compared against. Making it usage-limit-aware is the writer's job. |
+| `spawned` | timestamp | no | The row's true start, when `started` has been moved on by the spans it was paused (coo#170). Informational. |
+| `paused_s` | non-negative integer | no | Seconds the row has spent paused, an open pause counted up to when the file was written. `started` is already moved on by them. Informational. |
+| `paused_since` | timestamp | no | Running rows only: the row is paused now, since this instant. Its ELAPSED and ETA hold at the values they had when the file was written (its mtime) — `started` is taken to be true as of then — and NOW reads `paused since 12:58`. |
+| `eta_s` | non-negative integer | no | The estimated total duration of the row, in seconds, measured from `started`. On Running and Planned rows it fills the ETA column (`~1h3m`); on Done rows it is what the landing is compared against. Giverny holds it through a usage limit itself (see **Usage limits**). |
 | `eta_delta_s` | integer (may be negative) | no | Done rows only: how late (positive) or early (negative) the row landed against its estimate, in seconds. Send it only when you know better than Giverny's own arithmetic — e.g. a usage-limit wait that should not count. See **The Done row's ETA cell**. |
 | `landing` | string | no | Where the row lands or landed — `Review — ita`, `Done`, `Blocked`. Drawn verbatim. |
 | `tokens` | non-negative integer | no | Tokens spent. A live worker's own count takes precedence; this is the fallback (a Planned row has none; a Done worker Claude Code has forgotten still has this). |
@@ -94,13 +97,17 @@ Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"
 Claude Code reports each live subagent itself (id, name, status, start time, tokens, what it is doing now), and Giverny keeps the ones that finished until the tab's `/clear`. Those are the **live rows**. The feed's rows are joined to them on **`agent_id` = the live row's subagent id**:
 
 1. **Every feed row is drawn**, in feed order, in the stage the feed gave it. The feed's stage wins over the live one: a worker that holds two tasks may have one Done and one still Running.
-2. **A feed row whose `agent_id` matches a live row carries both.** The feed supplies `key`, `title`, `eta_s`, `landing`, `brief`, `open`; the live row supplies ELAPSED (from its start time), tokens and the current activity. Where both have a value, the live row's start time and tokens win.
+2. **A feed row whose `agent_id` matches a live row carries both.** The feed supplies `key`, `title`, `started`, `eta_s`, `landing`, `brief`, `open`; the live row supplies tokens and the current activity, and its start time where the feed gives none. Where both have a value, the feed's `started` wins (it is per row, and moved on by the row's pauses) and the live row's tokens win.
 3. **A feed row with no `agent_id`, or one matching no live row, is drawn as the feed wrote it** — its clock from `started`, its tokens from `tokens`. This is how Planned rows and long-finished Done rows appear.
 4. **A live row no feed row names is drawn on its own**, as Running or Done by its own state, after that stage's feed rows. So a feed that describes only some workers leaves the rest visible.
 5. **Sections are drawn Running, then Planned, then Done**; order within a section is feed order, then unmatched live rows in Claude Code's order.
 6. **Dittos:** a row whose worker (`agent_id`) is the same as the row directly above it draws its per-worker cells — agent, ELAPSED, tokens, activity — as `"`. Give a worker's rows adjacent positions in `rows` to get that.
 
 `aliases` are not part of the row merge; they only decide which file belongs to a tab. Giverny looks for `<current session id>.json` first, and if there is none, for the most recently modified `*.json` whose `session` or `aliases` contains the current id.
+
+## Usage limits
+
+While the tab's account is out of a usage limit — Giverny's own meters show a window at 100% with a reset still to come, or the tab stopped on a limit message — nothing runs, so the pane holds every **Running** row's clock: ELAPSED stops, the ETA stays where it was instead of counting down past zero, and NOW reads `5h limit → 13:00` (`7d limit → Mon 08:00` for a reset on another day, `limit` when nothing says when). Once the limit clears both clocks carry on from where they stopped: the span out is taken off the row's ELAPSED for as long as the pane remembers it (while Giverny runs). Planned ETAs are durations and do not move. A Done row is measured history and is left as it landed. A writer does not need to do anything for this. A writer that pauses rows itself for the wait (moving `started` on, with `paused_s`/`paused_since`) may: a row carrying either field is taken to have its stops in `started` already, and the pane's own hold is not applied to it again.
 
 ## The Done row's ETA cell
 

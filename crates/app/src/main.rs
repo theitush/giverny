@@ -3582,6 +3582,12 @@ impl eframe::App for App {
                     &mut self.agent_views,
                     active,
                     self.claude.agents.tracker(active),
+                    agents_pane::limit_for(
+                        &self.claude,
+                        active,
+                        self.limited.get(&active).map(|w| w.reopens),
+                        jiff::Timestamp::now(),
+                    ),
                     &self.chrome,
                     &mut self.shared,
                     ui,

@@ -89,6 +89,13 @@ pub struct FeedRow {
     pub agent_id: Option<String>,
     pub started_ms: Option<u64>,
     pub ended_ms: Option<u64>,
+    /// The true spawn, when `started` was moved on by paused spans (coo#170).
+    pub spawned_ms: Option<u64>,
+    /// Seconds the row has spent paused, an open pause counted up to when
+    /// the feed was written; `started` is already moved on by them.
+    pub paused_s: Option<u64>,
+    /// When the row's still-open pause began: its clock is stopped.
+    pub paused_since_ms: Option<u64>,
     /// Estimated total duration, in seconds, from `started`.
     pub eta_s: Option<u64>,
     /// How late (`+`) or early (`-`) a Done row landed against `eta_s`, when
@@ -122,6 +129,10 @@ pub struct Feed {
     pub rows: Vec<FeedRow>,
     /// One line drawn under the table, verbatim.
     pub footer: Option<String>,
+    /// When the file was last written (its mtime), for the reader's own
+    /// arithmetic: a paused row's `started` is only true as of this instant.
+    /// `None` for a feed parsed from bytes.
+    pub written_ms: Option<u64>,
 }
 
 impl Feed {
@@ -213,6 +224,9 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         agent_id,
         started_ms: millis_field(v, "started"),
         ended_ms: millis_field(v, "ended"),
+        spawned_ms: millis_field(v, "spawned"),
+        paused_s: u64_field(v, "paused_s"),
+        paused_since_ms: millis_field(v, "paused_since"),
         eta_s: u64_field(v, "eta_s"),
         eta_delta_s: i64_field(v, "eta_delta_s"),
         landing: str_field(v, "landing"),
@@ -267,6 +281,7 @@ pub fn parse(bytes: &[u8]) -> Result<Feed, FeedError> {
         aliases,
         rows,
         footer,
+        written_ms: None,
     })
 }
 
@@ -274,8 +289,13 @@ pub fn parse(bytes: &[u8]) -> Result<Feed, FeedError> {
 /// feed — the pane then simply has no feed.
 pub fn read(path: &Path) -> Option<Feed> {
     let bytes = std::fs::read(path).ok()?;
+    let written_ms = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
     match parse(&bytes) {
-        Ok(f) => Some(f),
+        Ok(f) => Some(Feed { written_ms, ..f }),
         Err(e) => {
             tracing::debug!("agents feed {}: {e}", path.display());
             None
@@ -408,16 +428,24 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             .or_else(|| self.live.map(|l| l.agent_id()))
     }
 
-    /// Start of the row's clock: the live row's (Claude Code saw it start),
-    /// else the feed's.
+    /// Start of the row's clock: the feed's `started` where it gives one,
+    /// else the live row's (Claude Code saw the worker start). The feed's
+    /// wins because it is per row — a worker holding several rows started
+    /// each at a different time — and because it is moved on by the row's
+    /// paused spans, which Claude Code knows nothing of (giverny#12).
     pub fn started_ms(&self) -> Option<u64> {
-        self.live
-            .and_then(|l| l.started_ms())
-            .or_else(|| self.feed.and_then(|f| f.started_ms))
+        self.row_started_ms()
     }
 
-    /// The feed's `started` first here: a worker holding several rows started
-    /// each of them at a different time, and the delta is per row.
+    /// When this row's clock stopped, if it is paused right now: the feed's
+    /// `paused_since`, on a Running row only.
+    pub fn paused_since_ms(&self) -> Option<u64> {
+        if self.stage != Stage::Running {
+            return None;
+        }
+        self.feed.and_then(|f| f.paused_since_ms)
+    }
+
     fn row_started_ms(&self) -> Option<u64> {
         self.feed
             .and_then(|f| f.started_ms)
@@ -689,8 +717,11 @@ mod tests {
                 (Stage::Done, None, Some("gone"), false),
             ]
         );
-        // Native gives elapsed and tokens; the feed's are the fallback.
-        assert_eq!(rows[0].started_ms(), Some(1_000));
+        // The feed's `started` is the row's clock (giverny#12); a live-only
+        // row runs on the worker's own. Tokens: native first.
+        assert_eq!(rows[0].started_ms(), rows[0].feed.unwrap().started_ms);
+        assert_ne!(rows[0].started_ms(), Some(1_000));
+        assert_eq!(rows[1].started_ms(), Some(1_000));
         assert_eq!(rows[0].tokens(), Some(7));
         assert_eq!(rows[2].tokens(), None);
     }
@@ -759,6 +790,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(), None);
+    }
+
+    #[test]
+    fn a_paused_row_carries_its_pause() {
+        // What coo/orchestrate-status writes for a row paused at 10:30 and
+        // still paused when the feed was written (coo#170).
+        let f = parse(
+            br#"{"rows":[
+              {"key":"g#1","stage":"running","started":"2026-09-23T10:20:00Z",
+               "spawned":"2026-09-23T10:00:00Z","paused_s":1200,
+               "paused_since":"2026-09-23T10:30:00Z"},
+              {"key":"g#2","stage":"planned","paused_since":"2026-09-23T10:30:00Z"}
+            ]}"#,
+        )
+        .unwrap();
+        let r = &f.rows[0];
+        let ms = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_millisecond() as u64;
+        assert_eq!(r.spawned_ms, Some(ms("2026-09-23T10:00:00Z")));
+        assert_eq!(r.paused_s, Some(1200));
+        assert_eq!(r.paused_since_ms, Some(ms("2026-09-23T10:30:00Z")));
+        let rows = merge::<Live>(Some(&f), &[]);
+        assert_eq!(rows[0].paused_since_ms(), r.paused_since_ms);
+        // Only a Running row's clock can be stopped.
+        assert_eq!(rows[1].paused_since_ms(), None);
+        // A feed from bytes has no write time.
+        assert_eq!(f.written_ms, None);
+    }
+
+    #[test]
+    fn a_feed_read_from_disk_knows_when_it_was_written() {
+        let dir = scratch("written");
+        let p = feed_path(&dir, "s");
+        std::fs::write(&p, br#"{"session":"s","rows":[]}"#).unwrap();
+        let mtime = std::fs::metadata(&p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(read(&p).unwrap().written_ms, Some(mtime));
     }
 
     #[test]
