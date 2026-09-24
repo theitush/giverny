@@ -402,6 +402,8 @@ pub const SETTINGS: &[SettingDef] = &[
             "landings by writing a feed file (docs/agents-pane.md).",
             "Done rows stay until /clear. The pane appears only in a tab whose",
             "session has spawned a subagent; off, nothing is read or drawn.",
+            "On adds a subagentStatusLine (giverny relay --subagent-line) to each",
+            "account's settings.json, never over one of your own; off removes it.",
         ],
         needs_restart: false,
         kind: Kind::Bool { default: false },

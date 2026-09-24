@@ -129,7 +129,9 @@ With `claude.agents_pane` on, Giverny installs one key into each account's `sett
 Claude Code runs that command at least every five seconds while a session has live workers. It passes the worker list on stdin: `session_id` and `tasks[]`. The relay forwards that list to the app, tagged with the tab it ran in (`GIVERNY_TAB_ID`, which reaches this command). It then prints one `{"id":"<task id>","content":""}` line per task. An empty decoration hides that row of Claude Code's own subagent panel. With every row hidden, the whole panel is gone, `● main` included. A brand-new worker may show for one tick (~300 ms) before it is hidden.
 
 - **Outside a Giverny tab** (no `GIVERNY_TAB_ID`), the relay forwards nothing and prints nothing, so Claude Code draws its panel as usual.
+- **Only on opt-in.** The setting is off by default, and until someone turns it on Giverny writes nothing for the pane: following the setting at startup with it off is a no-op for a file that holds no line of ours.
 - **With the setting off**, Giverny removes the key again, and the relay prints nothing even where the key is still there.
+- **Uninstalling the hooks** (`hooks::uninstall_from`) removes the key too, since it is the same relay.
 - **An account whose `subagentStatusLine` is someone else's** is left alone: the installer never replaces a command it did not write. On that account the pane gets no live rows.
 - **Project settings override user settings.** A project that sets its own `subagentStatusLine` shadows Giverny's. To keep both, that command must pass through. Inside a Giverny tab (`GIVERNY_TAB_ID` set), pipe the stdin it received, byte for byte, into `giverny relay --subagent-line`, and print that command's stdout as its own. It must not add decorations of its own for ids the relay hid.
 

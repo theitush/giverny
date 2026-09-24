@@ -831,6 +831,11 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 }
 
 /// Remove our relay entries from one settings file.
+///
+/// The agents pane's `subagentStatusLine` goes with them when it is ours: it
+/// is `relay --subagent-line`, the same relay, and a relay left behind after
+/// an uninstall runs a binary nobody asked to keep. One the user configured
+/// themselves is never touched.
 pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
     let Ok(bytes) = std::fs::read(settings_path) else {
         return Ok(());
@@ -843,6 +848,15 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
             }
         }
         hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
+    }
+    if let Some(obj) = root.as_object_mut()
+        && obj
+            .get("subagentStatusLine")
+            .and_then(|s| s.get("command"))
+            .and_then(|c| c.as_str())
+            .is_some_and(is_our_subagent_line)
+    {
+        obj.remove("subagentStatusLine");
     }
     let tmp = settings_path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&root)?)?;
@@ -1163,6 +1177,53 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs, "untouched");
         assert!(!subagent_line_installed_in(&path));
+    }
+
+    /// Uninstalling takes the agents pane's line with the hooks — it is the
+    /// same relay — and leaves a user's own line where it was.
+    #[test]
+    fn uninstall_takes_our_subagent_line_and_leaves_theirs() {
+        let path = scratch("subline-uninstall");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+        install_into(&path).unwrap();
+        set_subagent_line(&path, true).unwrap();
+        uninstall_from(&path).unwrap();
+        assert!(!installed_in(&path));
+        assert!(!subagent_line_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("subagentStatusLine").is_none());
+        assert_eq!(root["model"], "opus", "the rest of the file survives");
+
+        let theirs = scratch("subline-uninstall-theirs");
+        std::fs::write(
+            &theirs,
+            r#"{"subagentStatusLine":{"type":"command","command":"~/bin/agents.sh"}}"#,
+        )
+        .unwrap();
+        install_into(&theirs).unwrap();
+        uninstall_from(&theirs).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&theirs).unwrap()).unwrap();
+        assert_eq!(root["subagentStatusLine"]["command"], "~/bin/agents.sh");
+    }
+
+    /// The pane is off by default, and Giverny follows the setting at every
+    /// start: for an account that never opted in, that must be a no-op down
+    /// to the byte and the mtime, not a rewrite that reorders the file.
+    #[test]
+    fn pane_off_leaves_a_file_without_our_line_untouched() {
+        let path = scratch("subline-off-untouched");
+        let text = "{\n  \"statusLine\": {\"type\": \"command\", \"command\": \"mine.sh\"},\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&path, text).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(!set_subagent_line(&path, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert!(
+            !path.with_extension("json.giverny-bak").exists(),
+            "no backup for a write that never happened"
+        );
     }
 
     #[test]
