@@ -461,6 +461,11 @@ fn format_row(
     // pauses), else the worker's.
     let row_start = row.started_ms();
     let paused = row.paused_since_ms();
+    // A feed row that carries its pauses has its stops taken off `started`
+    // already (coo#170, and coo#200 pauses rows for a limit itself): the
+    // pane's own holds would take them off twice.
+    let writer_pauses = f.is_some_and(|f| f.paused_s.is_some() || f.paused_since_ms.is_some());
+    let holds = if writer_pauses { &[][..] } else { clock.holds };
     // A Running row's work so far, in seconds: wall time up to where its
     // clock stands, less every span the account was out of its limit.
     let work_s = match (row.stage, row_start) {
@@ -468,7 +473,7 @@ fn format_row(
             let stop = clock_stop(paused, written, now_ms);
             Some(
                 stop.saturating_sub(s)
-                    .saturating_sub(held_ms(clock.holds, s, stop))
+                    .saturating_sub(held_ms(holds, s, stop))
                     / 1000,
             )
         }
@@ -500,9 +505,10 @@ fn format_row(
     };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
-        Stage::Running => match (paused, limit) {
-            (Some(p), _) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
-            (None, Some(limit)) => limit_note(limit, now_ms, &clock.tz),
+        // The limit first: a row the writer paused for it says why.
+        Stage::Running => match (limit, paused) {
+            (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
+            (None, Some(p)) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
             (None, None) => l
                 .filter(|l| l.running())
                 .and_then(|l| l.activity.clone())
@@ -1167,6 +1173,21 @@ mod tests {
             assert_eq!(t.lines[0].eta, "~20m");
             assert_eq!(t.lines[0].now, "paused since 14:13");
         }
+        // The writer paused it for a limit (coo#200): its `started` already
+        // leaves the wait out, so the pane's own hold must not take it off
+        // again; NOW names the limit.
+        let limit = Limit {
+            reopens_ms: Some(T0 + 60 * MIN),
+            window: Some("5h"),
+        };
+        let holds = [Hold {
+            since_ms: T0,
+            until_ms: None,
+            reopens_ms: limit.reopens_ms,
+        }];
+        let t = build_at(Some(&f), &rows, written + MIN, &utc(&holds, Some(&limit)));
+        assert_eq!(t.lines[0].elapsed, "10:00");
+        assert_eq!(t.lines[0].now, "5h limit → 15:13");
         // A feed with no write time stops at `paused_since`.
         f.written_ms = None;
         let t = build_at(Some(&f), &rows, T0 + 60 * MIN, &utc(&[], None));
