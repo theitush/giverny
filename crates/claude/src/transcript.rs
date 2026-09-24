@@ -306,6 +306,21 @@ pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
             }
             _ => {}
         },
+        // A message typed to a running worker in its own view (by hand, or
+        // from the overlay's talk box, giverny#71) is not a `user` line: it
+        // lands as a queued command attachment, origin human, when the
+        // worker takes it.
+        Some("attachment") => {
+            let att = v.get("attachment").unwrap_or(&Value::Null);
+            let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+            if att.get("type").and_then(Value::as_str) == Some("queued_command")
+                && human
+                && let Some(text) = att.get("prompt").and_then(Value::as_str)
+            {
+                out.push(head(Tone::Prompt, "▸ message".into()));
+                out.extend(folded(text, fold.prompt_lines, "  ", Tone::Plain));
+            }
+        }
         _ => {}
     }
     out
@@ -504,6 +519,15 @@ mod tests {
         assert!(render_line(meta, PLAIN).is_empty());
         let att = r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta"}}"#;
         assert!(render_line(att, PLAIN).is_empty());
+        // A line typed to the worker in its view (Claude Code 2.1.281, as
+        // the giverny#71 check wrote it) shows as a message.
+        let typed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"Hello sigma","source_uuid":"1b","origin":{"kind":"human"},"isMeta":true}}"#;
+        assert_eq!(
+            render_line(typed, PLAIN),
+            vec!["▸ message", "  Hello sigma"]
+        );
+        let relayed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"task-notification"}}}"#;
+        assert!(render_line(relayed, PLAIN).is_empty());
         assert!(render_line("not json", PLAIN).is_empty());
     }
 

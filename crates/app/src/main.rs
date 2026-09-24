@@ -647,6 +647,9 @@ pub enum Action {
     /// The worker overlay's Open in Claude Code (giverny#44): attach the
     /// row's running worker in its parent tab.
     OpenWorkerInClaude(TabId, Box<agents_pane::RowClick>),
+    /// The worker overlay's talk box (giverny#71): type this line to the
+    /// row's running worker, in its view in the parent tab's Claude Code.
+    TalkToWorker(TabId, Box<agents_pane::RowClick>, String),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -892,6 +895,9 @@ pub struct App {
     /// A Running agents-pane row being attached: keys typed into its parent
     /// tab's Claude Code, one per frame, to open the worker's view.
     attach: Option<AttachJob>,
+    /// A line from the worker overlay's talk box being typed to a worker
+    /// through its parent tab's Claude Code (giverny#71).
+    talk: Option<TalkJob>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -913,6 +919,22 @@ struct AttachJob {
     /// The row's title, for a note if the attach stops short.
     title: String,
     driver: agent_open::Attach,
+}
+
+/// A line on its way to a running worker: which tab is typed into, and the
+/// driver deciding each key from that tab's screen (`agent_open::Send`).
+struct TalkJob {
+    tab: TabId,
+    /// The worker, so the overlay showing it hears how the send went.
+    agent_id: String,
+    title: String,
+    driver: agent_open::Send,
+}
+
+/// The tab's id as its shell sees it (`GIVERNY_TAB_ID`, set where the
+/// session is spawned), and as the relay reports it back.
+fn tab_env_id(id: TabId) -> String {
+    format!("giverny-{}", id.0)
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -1323,6 +1345,7 @@ impl App {
             session_rect: None,
             worker_tabs: HashSet::new(),
             attach: None,
+            talk: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1490,6 +1513,7 @@ impl App {
             }
             Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
             Action::OpenWorkerInClaude(tab, click) => self.open_worker_in_claude(ctx, tab, &click),
+            Action::TalkToWorker(tab, click, text) => self.talk_to_worker(ctx, tab, &click, text),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -3041,6 +3065,165 @@ impl App {
         }
     }
 
+    /// The talk box's Enter (giverny#71): start typing `text` to the row's
+    /// worker in its parent tab, under the overlay — or say in the box why
+    /// not.
+    fn talk_to_worker(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &agents_pane::RowClick,
+        text: String,
+    ) {
+        let Some(agent_id) = click.agent_id.clone() else {
+            return;
+        };
+        let refuse = |app: &mut App, why: &str| {
+            app.set_talk_status(&agent_id, overlays::TalkStatus::Failed(why.to_string()));
+        };
+        if self.talk.is_some() || self.attach.is_some() {
+            return refuse(
+                self,
+                "Not sent: Giverny is already typing into a Claude Code tab.",
+            );
+        }
+        if !self.tab_is_live(parent) {
+            return refuse(
+                self,
+                "Not sent: this tab has no live terminal to type into.",
+            );
+        }
+        let Some(description) = self.worker_description(parent, &agent_id, click) else {
+            return refuse(
+                self,
+                "Not sent: Giverny cannot find this worker's description, which is how \
+                 Claude Code's view of it is found.",
+            );
+        };
+        let bracketed = self
+            .rt
+            .get(&parent)
+            .and_then(|rt| rt.session.as_ref())
+            .is_some_and(|s| {
+                giverny_term::input::encode_paste("", s.mode()).starts_with(b"\x1b[200~")
+            });
+        if agent_open::text_bytes(&text, bracketed).is_none() {
+            return refuse(
+                self,
+                "Not sent: this Claude Code takes no pasted text, so a line with line \
+                 breaks would go as several messages. Send it as one line.",
+            );
+        }
+        // What the strip calls the worker once it is working: its live label.
+        let aliases: Vec<String> = self
+            .claude
+            .agents
+            .tracker(parent)
+            .and_then(|t| t.get(&agent_id))
+            .and_then(|r| r.activity.clone())
+            .into_iter()
+            .collect();
+        // With the agents pane on, the relay hides Claude Code's own agent
+        // strip — the one keyboard path to a worker's view. Ask it to show
+        // the strip in this tab until the send is over.
+        if let Err(err) =
+            giverny_claude::hooks::show_strip(&self.paths.hook_spool(), &tab_env_id(parent), true)
+        {
+            tracing::warn!("agents pane: could not ask for the strip: {err}");
+        }
+        self.talk = Some(TalkJob {
+            tab: parent,
+            agent_id,
+            title: agent_open::title_of(click),
+            driver: agent_open::Send::new(description, aliases, text, Instant::now()),
+        });
+        ctx.request_repaint();
+    }
+
+    /// Tell the overlay showing worker `agent_id`, if one is open, how its
+    /// line went. False when no overlay shows it.
+    fn set_talk_status(&mut self, agent_id: &str, status: overlays::TalkStatus) -> bool {
+        let Some(ov) = self.brief.as_mut() else {
+            return false;
+        };
+        let shows = matches!(&ov.button, overlays::Button::Open { click, .. }
+            if click.agent_id.as_deref() == Some(agent_id));
+        let Some(talk) = ov.talk.as_mut().filter(|_| shows) else {
+            return false;
+        };
+        if status == overlays::TalkStatus::Sent {
+            talk.text.clear();
+        }
+        talk.status = status;
+        true
+    }
+
+    /// One frame of a send: read the parent's screen, maybe type into it.
+    /// It carries on under the overlay whichever tab is on screen: the keys
+    /// go to the parent's pty and every step is read off its own screen.
+    fn process_talk(&mut self, ctx: &egui::Context) {
+        use agent_open::Step;
+        let Some(job) = &mut self.talk else {
+            return;
+        };
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        let step = match session {
+            Some(session) => {
+                let screen = session.screen_text();
+                let undimmed = session.screen_text_undimmed();
+                let step = job.driver.tick(Instant::now(), &screen, &undimmed);
+                let mode = session.mode();
+                match &step {
+                    Step::Key(key) => {
+                        session.write(agent_open::keystroke_bytes(*key, |k, m| {
+                            giverny_term::input::encode_key(k, m, mode)
+                        }));
+                    }
+                    Step::Text(text) => {
+                        let bracketed =
+                            giverny_term::input::encode_paste("", mode).starts_with(b"\x1b[200~");
+                        if let Some(bytes) = agent_open::text_bytes(text, bracketed) {
+                            session.write(bytes);
+                        }
+                    }
+                    _ => {}
+                }
+                step
+            }
+            None => Step::Failed(agent_open::Failed {
+                why: agent_open::Why::NoPrompt,
+                sent: job.driver.sent(),
+            }),
+        };
+        let status = match step {
+            Step::Key(_) | Step::Text(_) | Step::Wait => {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            Step::Done => overlays::TalkStatus::Sent,
+            Step::Failed(failed) => {
+                tracing::info!("agents pane: send stopped: {failed:?}");
+                overlays::TalkStatus::Failed(failed.explain(&job.driver.description))
+            }
+        };
+        let Some(job) = self.talk.take() else {
+            return;
+        };
+        if let Err(err) =
+            giverny_claude::hooks::show_strip(&self.paths.hook_spool(), &tab_env_id(job.tab), false)
+        {
+            tracing::warn!("agents pane: could not hide the strip again: {err}");
+        }
+        // The overlay was closed meanwhile: a failure still gets said.
+        if !self.set_talk_status(&job.agent_id, status.clone())
+            && let overlays::TalkStatus::Failed(why) = status
+            && self.brief.is_none()
+        {
+            self.brief = Some(overlays::BriefOverlay::text(job.title, None, why));
+        }
+        ctx.request_repaint();
+    }
+
     /// Debug builds only: `GIVERNY_DEBUG_CLICK=<row key>[:button]` clicks
     /// the active tab's agents-pane row with that key a few seconds in, and
     /// with `:button` presses the overlay's footer button a few seconds
@@ -3100,6 +3283,71 @@ impl App {
                 self.apply(ctx, action);
             }
         }
+    }
+
+    /// Debug builds only: `GIVERNY_DEBUG_TALK=<file>`. When the file shows
+    /// up holding `<row>\t<line>`, it is taken: the tab whose agents pane has
+    /// row `<row>` (its key, worker id, or name) is selected and the row clicked, and two seconds
+    /// later the line goes through the overlay's talk box as if typed and
+    /// sent (giverny#71) — the path after the keyboard, driven in-process so
+    /// a real window can be watched without synthetic input events.
+    #[cfg(debug_assertions)]
+    fn debug_talk(&mut self, ctx: &egui::Context) {
+        use std::sync::Mutex;
+        static LINE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+        let Ok(file) = std::env::var("GIVERNY_DEBUG_TALK") else {
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let Ok(mut pending) = LINE.lock() else { return };
+        if let Some((at, line)) = pending.as_ref()
+            && Instant::now() >= *at
+        {
+            let action = self.brief.as_mut().and_then(|ov| {
+                ov.talk.as_mut()?.text = line.clone();
+                overlays::talk_action(ov)
+            });
+            tracing::info!("debug talk: send {}", action.is_some());
+            *pending = None;
+            if let Some(action) = action {
+                self.apply(ctx, action);
+            }
+            return;
+        }
+        let Ok(spec) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&file);
+        let Some((key, line)) = spec.trim_end_matches('\n').split_once('\t') else {
+            tracing::warn!("debug talk: want <row>\\t<line>");
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Whichever tab has the row: it is selected, then its row clicked.
+        let tabs: Vec<TabId> = self.ws.tabs.iter().map(|t| t.id).collect();
+        let hit = tabs.into_iter().find_map(|tab| {
+            let tracker = self.claude.agents.tracker(tab)?;
+            let table = agents_pane::build(None, tracker.rows(), now);
+            let line = table.lines.into_iter().find(|l| {
+                l.id == key
+                    || l.click.agent_id.as_deref() == Some(key)
+                    || l.click.name == key
+                    || l.click.key == key
+            })?;
+            Some((tab, line))
+        });
+        let Some((tab, row)) = hit else {
+            tracing::warn!("debug talk: no row {key}");
+            return;
+        };
+        tracing::info!("debug talk: {key} in {tab:?} ({:?})", row.stage);
+        *pending = Some((Instant::now() + Duration::from_secs(2), line.to_string()));
+        drop(pending);
+        self.apply(ctx, Action::Select(tab));
+        self.apply(ctx, Action::AgentRowClicked(tab, Box::new(row.click)));
     }
 
     /// Carry out an agents-pane plan: the overlay, or (a Running row with
@@ -3163,6 +3411,10 @@ impl App {
             }
         };
         overlay.facts = facts;
+        // A Running worker the parent tab can type to gets the talk box.
+        if matches!(button, overlays::Button::Open { .. }) {
+            overlay.talk = Some(overlays::Talk::default());
+        }
         overlay.button = button;
         overlay.review = review;
         self.settings = None;
@@ -3347,8 +3599,11 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
         self.process_attach(&ctx);
+        self.process_talk(&ctx);
         #[cfg(debug_assertions)]
         self.debug_click(&ctx);
+        #[cfg(debug_assertions)]
+        self.debug_talk(&ctx);
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
