@@ -226,6 +226,19 @@ fn is_typing(event: &egui::Event) -> bool {
     )
 }
 
+/// Input that says somebody is using the window, so output answering it is
+/// drawn without pacing.
+fn is_attention(event: &egui::Event) -> bool {
+    is_typing(event)
+        || matches!(
+            event,
+            egui::Event::PointerButton { .. }
+                | egui::Event::PointerMoved(_)
+                | egui::Event::MouseWheel { .. }
+                | egui::Event::Key { .. }
+        )
+}
+
 /// Home row first: the labels should be reachable without looking.
 const HINT_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
 
@@ -322,6 +335,13 @@ impl TabView {
         // would otherwise redraw forever (#35).
         let focused = response.has_focus();
         let now = ui.input(|i| i.time);
+        // Output pacing (`pace`): is anyone using the window right now?
+        let (window_focused, touched, predicted_dt) =
+            ui.input(|i| (i.focused, i.events.iter().any(is_attention), i.predicted_dt));
+        if touched {
+            crate::pace::note_input();
+        }
+        crate::pace::note_frame(window_focused, predicted_dt);
         if !focused {
             self.blink_from = None;
         } else if self.blink_from.is_none() || ui.input(|i| i.events.iter().any(is_typing)) {
@@ -332,6 +352,10 @@ impl TabView {
             None => (true, None),
         };
         if let Some(wait) = next_edge {
+            // Plus egui's predicted frame time, which it takes off every
+            // delayed repaint: without it the frame lands just before the
+            // edge and spins on it (`pace::LAND_PAST`, #43).
+            let wait = wait + f64::from(predicted_dt.clamp(0.0, 0.2));
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }

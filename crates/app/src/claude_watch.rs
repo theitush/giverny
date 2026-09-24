@@ -123,8 +123,6 @@ pub struct WatchEffects {
     pub captured: Vec<(TabId, Option<String>, Option<PathBuf>)>,
     /// Desktop notifications to fire: `(summary, body)`.
     pub notify: Vec<(String, String)>,
-    /// Any tab is animating (spinner/pulse) — keep repainting.
-    pub animating: bool,
 }
 
 pub struct ClaudeWatch {
@@ -628,14 +626,6 @@ impl ClaudeWatch {
             self.refresh_usage();
         }
 
-        effects.animating = self
-            .tabs
-            .values()
-            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou))
-            || self
-                .jobs
-                .iter()
-                .any(|j| j.live && j.state == jobs::JobState::Working);
         effects
     }
 

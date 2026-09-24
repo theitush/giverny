@@ -14,6 +14,35 @@ use crate::{Action, App, RenameTarget};
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// One step of the rail's glyph animations (spinner, pulse), in seconds.
+///
+/// Every step is a full-window repaint, and on a software renderer (WSLg's
+/// llvmpipe) a repaint is real CPU: the old per-frame 120 ms cadence cost
+/// ~95% of a core for one spinner (#43). Four steps a second still reads as
+/// moving; half that while the window is in the background. The clock is
+/// the terminal's output pacing clock, so a spinner and a working tab on
+/// screen share their frames.
+const ANIM_STEP: f64 = giverny_term::pace::STEP_FOCUSED.as_secs_f64();
+
+/// The animation clock, snapped to whole steps: every glyph drawn in one
+/// frame is on the same step, and a repaint that happens for some other
+/// reason (terminal output, the pointer) does not nudge them in between.
+fn anim_time() -> f64 {
+    giverny_term::pace::anim_time()
+}
+
+/// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
+/// but only while it is on screen. A row scrolled out of the rail, or a
+/// spinner nobody can see, costs nothing.
+fn keep_animating(ui: &Ui, rect: Rect) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
+    ui.ctx()
+        .request_repaint_after(giverny_term::pace::until_next_tick(focused, predicted_dt));
+}
 // Chrome colours come from the active theme (see `chrome`), reached through
 // `app.chrome`. Only geometry is constant here.
 
@@ -494,14 +523,14 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         }
     });
 
-    let now = ui.input(|i| i.time);
+    let now = anim_time();
     for job in &app.claude.jobs {
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
             JobState::Working if job.live => (
-                SPINNER[(now * 10.0) as usize % SPINNER.len()].to_string(),
+                SPINNER[(now / ANIM_STEP) as usize % SPINNER.len()].to_string(),
                 c.accent,
             ),
             JobState::Working => ("·".into(), dim),
@@ -551,6 +580,9 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 }
             });
         });
+        if job.live && job.state == JobState::Working {
+            keep_animating(ui, resp.response.rect);
+        }
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -707,8 +739,13 @@ fn category_header(
     );
     badge_x -= 20.0;
     if cat.busy > 0 {
-        let time = ui.input(|i| i.time);
-        spinner(&p, Pos2::new(badge_x, rect.center().y), time, cat.color);
+        spinner(
+            &p,
+            Pos2::new(badge_x, rect.center().y),
+            anim_time(),
+            cat.color,
+        );
+        keep_animating(ui, rect);
         p.text(
             Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -781,7 +818,10 @@ fn category_header(
 /// assumption that the font has braille in it.
 fn spinner(p: &egui::Painter, at: Pos2, time: f64, color: Color32) {
     const R: f32 = 5.0;
-    let head = (time * 4.0) as f32;
+    // Half a turn a second: at the animation step that is eight evenly
+    // spaced positions, 45° apart, which reads as turning rather than
+    // jumping.
+    let head = (time * std::f64::consts::PI) as f32;
     let mut points = Vec::with_capacity(14);
     for step in 0..14 {
         let angle = head + step as f32 * 0.36;
@@ -892,12 +932,17 @@ fn tab_row(
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
-    let time = ui.input(|i| i.time);
+    let time = anim_time();
     match row.claude {
-        ClaudeState::Busy => spinner(&p, dot, time, row.color),
+        ClaudeState::Busy => {
+            spinner(&p, dot, time, row.color);
+            keep_animating(ui, rect);
+        }
         ClaudeState::NeedsYou => {
-            let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
+            // One breath every two seconds, sampled at the animation step.
+            let pulse = ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
             flag(&p, dot, c.amber.gamma_multiply(pulse));
+            keep_animating(ui, rect);
         }
         // Green and still: finished, nothing owed. The amber flag above is
         // the one that wants something, and the two differ in colour, shape
@@ -1218,27 +1263,25 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         );
         let spinning = app.claude.refresh_in_flight();
         let label = if spinning {
-            let t = ui.input(|i| i.time);
-            SPINNER[(t * 10.0) as usize % SPINNER.len()].to_string()
+            SPINNER[(anim_time() / ANIM_STEP) as usize % SPINNER.len()].to_string()
         } else {
             "⟳".to_string()
         };
-        if ui
-            .add(egui::Button::new(
-                egui::RichText::new(label)
-                    .font(FontId::monospace(10.0))
-                    .color(if spinning { c.accent } else { dim }),
-            ))
+        let refresh = ui.add(egui::Button::new(
+            egui::RichText::new(label)
+                .font(FontId::monospace(10.0))
+                .color(if spinning { c.accent } else { dim }),
+        ));
+        if spinning {
+            keep_animating(ui, refresh.rect);
+        }
+        if refresh
             .on_hover_text(
                 "refresh usage now\n(asks Claude Code to update its own cache;\nGiverny makes no API call)",
             )
             .clicked()
         {
             actions.push(Action::RefreshUsage);
-        }
-        if spinning {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(120));
         }
         // The way in that does not require knowing a chord.
         if ui
