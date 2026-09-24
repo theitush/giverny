@@ -533,7 +533,8 @@ mod tests {
 
     #[test]
     fn follow_without_follow_renders_the_file_and_a_half_line() {
-        let dir = std::env::temp_dir().join(format!("giverny-transcript-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("giverny-transcript-follow-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent-x.jsonl");
         std::fs::write(

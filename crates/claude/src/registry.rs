@@ -417,7 +417,10 @@ mod tests {
 
     #[test]
     fn finds_transcript_and_its_cwd() {
-        let dir = std::env::temp_dir().join(format!("giverny-transcript-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "giverny-registry-transcript-{}",
+            std::process::id()
+        ));
         let proj = dir.join("projects").join("-home-u-Dev-myproj");
         std::fs::create_dir_all(&proj).unwrap();
         let sid = "b263c7bf-2cc6-4ee1-b00a-948a4152f6ab";
