@@ -275,6 +275,12 @@ fn humanize(d: std::time::Duration) -> String {
 /// row's action (Open in Claude Code) in its footer. While it is
 /// open it takes the keyboard: `Esc` closes it, the scroll keys scroll it,
 /// and nothing typed reaches the shell underneath.
+///
+/// A Running worker's overlay also has a box to type to the worker in
+/// (giverny#71, [`Talk`]): `t` or a click puts the cursor there, Enter
+/// sends the line — Giverny types it into the worker's own view in the
+/// parent's Claude Code and comes back ([`crate::agent_open::Send`]) —
+/// and the reply shows up in the live transcript above.
 pub struct BriefOverlay {
     pub title: String,
     /// Where the text came from, shown under the title when it is a file.
@@ -286,6 +292,8 @@ pub struct BriefOverlay {
     pub review: Option<crate::review::Slot>,
     pub content: Content,
     pub button: Button,
+    /// The box to type to a Running worker in; `None` for every other row.
+    pub talk: Option<Talk>,
     /// Bumped whenever the text changes; the laid-out text is cached on it.
     generation: u64,
     galley: Option<(u64, u32, std::sync::Arc<egui::Galley>)>,
@@ -328,6 +336,32 @@ pub enum Button {
     },
 }
 
+/// The overlay's box for typing to a Running worker (giverny#71).
+#[derive(Default)]
+pub struct Talk {
+    pub text: String,
+    pub status: TalkStatus,
+    /// Put the cursor in the box next frame.
+    focus: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TalkStatus {
+    #[default]
+    Idle,
+    /// Giverny is typing it into the parent's Claude Code.
+    Sending,
+    Sent,
+    Failed(String),
+}
+
+/// The talk box's widget id: the keyboard reads whether it has the focus.
+const TALK_ID: &str = "giverny-brief-talk";
+
+fn talk_id() -> egui::Id {
+    egui::Id::new(TALK_ID)
+}
+
 /// How often a live transcript is looked at.
 const POLL: Duration = Duration::from_millis(300);
 /// Space between the overlay and the session rect's edges.
@@ -361,6 +395,7 @@ impl BriefOverlay {
             review: None,
             content,
             button: Button::None,
+            talk: None,
             generation: 0,
             galley: None,
             // Open at the end: a transcript's final report, a live one's
@@ -460,10 +495,14 @@ pub fn brief_keys(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let Some(ov) = app.brief.as_mut() else {
         return actions;
     };
-    let (act, close) = overlay_keys(ov, ctx);
-    if act {
+    let keys = overlay_keys(ov, ctx);
+    if keys.send {
+        actions.extend(talk_action(ov));
+    }
+    if keys.act {
         actions.extend(button_action(ov));
     }
+    let (act, close) = (keys.act, keys.close);
     if act || close {
         app.brief = None;
         app.focus_terminal = true;
@@ -471,11 +510,55 @@ pub fn brief_keys(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     actions
 }
 
-/// [`brief_keys`] on the overlay alone: (the footer's key was pressed,
-/// the overlay closes).
-fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> (bool, bool) {
-    let mut close = false;
-    let mut act = false;
+/// What the keyboard asked of the overlay this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Keys {
+    /// The footer's key (`o`).
+    act: bool,
+    close: bool,
+    /// Enter in the talk box.
+    send: bool,
+}
+
+/// [`brief_keys`] on the overlay alone.
+///
+/// While the talk box has the focus it gets the keys instead — the terminal
+/// underneath has not got the focus, so nothing reaches the shell — save
+/// Enter, which sends (Shift+Enter is a new line), and Esc, which leaves
+/// the box with its text kept.
+fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> Keys {
+    let mut keys = Keys::default();
+    let typing = ov.talk.is_some() && ctx.memory(|m| m.has_focus(talk_id()));
+    if typing {
+        let mut leave = false;
+        ctx.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key {
+                    key: Key::Enter,
+                    pressed,
+                    modifiers,
+                    ..
+                } if !(modifiers.shift || modifiers.ctrl || modifiers.alt || modifiers.command) => {
+                    keys.send |= *pressed;
+                    false
+                }
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed,
+                    ..
+                } => {
+                    leave |= *pressed;
+                    false
+                }
+                _ => true,
+            });
+        });
+        if leave {
+            ctx.memory_mut(|m| m.surrender_focus(talk_id()));
+        }
+        return keys;
+    }
+    let (mut act, mut close) = (false, false);
     let line = 40.0;
     let page = (ov.page - 2.0 * line).max(line);
     ctx.input_mut(|i| {
@@ -496,6 +579,12 @@ fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> (bool, bool) {
                             act |= matches!(ov.button, Button::Open { .. });
                             None
                         }
+                        Key::T => {
+                            if let Some(talk) = &mut ov.talk {
+                                talk.focus = true;
+                            }
+                            None
+                        }
                         Key::ArrowUp => Some(ov.offset - line),
                         Key::ArrowDown => Some(ov.offset + line),
                         Key::PageUp => Some(ov.offset - page),
@@ -514,7 +603,25 @@ fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> (bool, bool) {
             _ => true,
         });
     });
-    (act, close)
+    keys.act = act;
+    keys.close = close;
+    keys
+}
+
+/// The talk box's line to send, as an action — once, while none is on its
+/// way, and never an empty one. Marks the box as sending.
+pub(crate) fn talk_action(ov: &mut BriefOverlay) -> Option<Action> {
+    let Button::Open { tab, click } = &ov.button else {
+        return None;
+    };
+    let talk = ov.talk.as_mut()?;
+    let text = talk.text.trim_end().trim_start_matches(['\n', '\r']);
+    if text.trim().is_empty() || talk.status == TalkStatus::Sending {
+        return None;
+    }
+    let action = Action::TalkToWorker(*tab, click.clone(), text.to_string());
+    talk.status = TalkStatus::Sending;
+    Some(action)
 }
 
 /// The footer button's action.
@@ -583,6 +690,9 @@ pub fn brief_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
         return actions;
     };
     let drawn = draw_overlay(ov, &app.chrome, app.session_rect, ctx);
+    if drawn.send {
+        actions.extend(talk_action(ov));
+    }
     if drawn.act {
         actions.extend(button_action(ov));
     }
@@ -598,6 +708,8 @@ pub fn brief_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
 struct Drawn {
     act: bool,
     close: bool,
+    /// The talk box's Send button.
+    send: bool,
     // The rects are read by the layout tests.
     #[cfg_attr(not(test), allow(dead_code))]
     frame: egui::Rect,
@@ -634,6 +746,87 @@ fn draw_review(ui: &mut egui::Ui, c: &crate::chrome::Chrome, line: &str) {
     ui.add_space(4.0);
 }
 
+/// The talk box's height: the text with the Send button beside it, and a
+/// status line under them — two, for a failure, which says why.
+fn talk_height(talk: &Talk) -> f32 {
+    match talk.status {
+        TalkStatus::Failed(_) => 76.0,
+        _ => 60.0,
+    }
+}
+
+/// The talk box: the text, a Send button, and how the last send went.
+/// True when Send was clicked.
+fn draw_talk(ui: &mut egui::Ui, c: &crate::chrome::Chrome, talk: &mut Talk) -> bool {
+    let busy = talk.status == TalkStatus::Sending;
+    let mut send = false;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 96.0).max(120.0);
+        // Never disabled while a line is on its way — that would take the
+        // cursor out of it; Enter just waits (`talk_action`).
+        let edit = ui.add(
+            egui::TextEdit::multiline(&mut talk.text)
+                .id(talk_id())
+                .hint_text("type to this worker — it gets it as your message, in its own view")
+                .desired_rows(2)
+                .desired_width(width)
+                .font(FontId::monospace(11.5))
+                .return_key(egui::KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter)),
+        );
+        // Esc is the overlay's (`overlay_keys`), so egui must not drop the
+        // focus on it first; the arrows move the cursor.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                talk_id(),
+                egui::EventFilter {
+                    tab: false,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
+        if talk.focus {
+            edit.request_focus();
+            talk.focus = false;
+        }
+        let can = !busy && !talk.text.trim().is_empty();
+        if ui
+            .add_enabled(
+                can,
+                egui::Button::new(RichText::new("Send  ⏎").font(FontId::monospace(11.0))),
+            )
+            .on_hover_text(
+                "type it into the worker's view in this tab's Claude Code, then come back",
+            )
+            .clicked()
+        {
+            send = true;
+        }
+    });
+    let (text, color) = match &talk.status {
+        TalkStatus::Idle => (String::new(), c.dim),
+        TalkStatus::Sending => (
+            "sending — typing it into the worker's view…".into(),
+            c.amber,
+        ),
+        TalkStatus::Sent => (
+            "sent — the worker takes it at its next step".into(),
+            c.green,
+        ),
+        TalkStatus::Failed(why) => (why.clone(), c.poppy),
+    };
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(FontId::monospace(10.5))
+                .color(color),
+        )
+        .wrap(),
+    );
+    send
+}
+
 fn draw_overlay(
     ov: &mut BriefOverlay,
     c: &crate::chrome::Chrome,
@@ -658,6 +851,7 @@ fn draw_overlay(
     }
 
     let mut act = false;
+    let mut send = false;
     let shown = egui::Area::new(egui::Id::new("giverny-brief"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -748,7 +942,8 @@ fn draw_overlay(
                     // Footer height is reserved first so the body fills the
                     // rest exactly.
                     let footer_h = 26.0;
-                    let body_h = (ui.available_height() - footer_h - 8.0).max(60.0);
+                    let talk_h = ov.talk.as_ref().map_or(0.0, talk_height);
+                    let body_h = (ui.available_height() - footer_h - talk_h - 8.0).max(60.0);
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("giverny-brief-body")
                         .max_height(body_h)
@@ -776,6 +971,10 @@ fn draw_overlay(
                     ov.page = out.inner_rect.height();
                     body_rect = out.inner_rect;
 
+                    if let Some(talk) = &mut ov.talk {
+                        ui.separator();
+                        send |= draw_talk(ui, &c, talk);
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
                         match &ov.button {
@@ -812,9 +1011,14 @@ fn draw_overlay(
                                 );
                             }
                         }
+                        let hint = if ov.talk.is_some() {
+                            "t type to the worker · ⏎ send · ⇧⏎ new line · esc close"
+                        } else {
+                            "read-only · ↑↓ PgUp PgDn scroll · esc close"
+                        };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                RichText::new("read-only · ↑↓ PgUp PgDn scroll · esc close")
+                                RichText::new(hint)
                                     .font(FontId::monospace(10.0))
                                     .color(c.dim),
                             );
@@ -826,6 +1030,7 @@ fn draw_overlay(
     Drawn {
         act,
         close,
+        send,
         frame: shown.response.rect,
         close_button,
         body: body_rect,
@@ -870,7 +1075,7 @@ mod tests {
             ..Default::default()
         };
         let c = chrome();
-        let mut keys = (false, false);
+        let mut keys = Keys::default();
         let mut drawn = None;
         let mut left = Vec::new();
         let _ = ctx.run_ui(input, |ui| {
@@ -880,7 +1085,7 @@ mod tests {
             left = ctx.input(|i| i.events.clone());
             drawn = Some(draw_overlay(ov, &c, Some(session), &ctx));
         });
-        (keys.0, keys.1, drawn, left)
+        (keys.act, keys.close, drawn, left)
     }
 
     fn key(k: Key) -> egui::Event {
@@ -1024,6 +1229,100 @@ mod tests {
         let (_, close, _, left) = frame(&ctx, &mut ov, session(), vec![key(Key::Escape)]);
         assert!(close);
         assert!(left.is_empty());
+    }
+
+    #[test]
+    fn the_talk_box_takes_a_line_and_sends_it_once() {
+        let ctx = egui::Context::default();
+        let mut ov = BriefOverlay::text("t".into(), None, long_text());
+        ov.button = Button::Open {
+            tab: TabId(3),
+            click: Box::new(RowClick {
+                stage: giverny_claude::feed::Stage::Running,
+                key: "giverny#71".into(),
+                agent_id: Some("a1".into()),
+                name: "talk".into(),
+                transcript: None,
+                open: None,
+                brief: None,
+                note: None,
+                facts: vec![],
+            }),
+        };
+        ov.talk = Some(Talk::default());
+        frame(&ctx, &mut ov, session(), vec![]);
+        // `t` puts the cursor in the box, and is not typed into it.
+        frame(
+            &ctx,
+            &mut ov,
+            session(),
+            vec![key(Key::T), egui::Event::Text("t".into())],
+        );
+        frame(&ctx, &mut ov, session(), vec![]);
+        assert!(ctx.memory(|m| m.has_focus(talk_id())));
+        assert_eq!(ov.talk.as_ref().unwrap().text, "");
+        // Typed text goes to the box; `o` is a letter now, not Open.
+        let (act, close, _, _) = frame(
+            &ctx,
+            &mut ov,
+            session(),
+            vec![egui::Event::Text("hello o".into())],
+        );
+        assert!(!act && !close);
+        assert_eq!(ov.talk.as_ref().unwrap().text, "hello o");
+        // Enter sends it, once; the box says it is sending.
+        let (keys, action) = send_frame(&ctx, &mut ov, key(Key::Enter));
+        assert!(keys.send);
+        assert!(matches!(
+            action,
+            Some(Action::TalkToWorker(TabId(3), c, t)) if c.agent_id.as_deref() == Some("a1") && t == "hello o"
+        ));
+        assert_eq!(ov.talk.as_ref().unwrap().status, TalkStatus::Sending);
+        let (_, again) = send_frame(&ctx, &mut ov, key(Key::Enter));
+        assert!(again.is_none(), "one line, one send");
+        assert_eq!(
+            ov.talk.as_ref().unwrap().text,
+            "hello o",
+            "Enter adds no newline"
+        );
+        // Esc leaves the box and keeps the text; the next Esc closes.
+        ov.talk.as_mut().unwrap().status = TalkStatus::Idle;
+        let (_, close, _, _) = frame(&ctx, &mut ov, session(), vec![key(Key::Escape)]);
+        assert!(!close);
+        assert!(!ctx.memory(|m| m.has_focus(talk_id())));
+        assert_eq!(ov.talk.as_ref().unwrap().text, "hello o");
+        let (_, close, _, _) = frame(&ctx, &mut ov, session(), vec![key(Key::Escape)]);
+        assert!(close);
+        // An empty box sends nothing.
+        ov.talk.as_mut().unwrap().text = "  \n".into();
+        assert!(talk_action(&mut ov).is_none());
+    }
+
+    /// One frame with `event`, then the talk action it asked for.
+    fn send_frame(
+        ctx: &egui::Context,
+        ov: &mut BriefOverlay,
+        event: egui::Event,
+    ) -> (Keys, Option<Action>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 820.0),
+            )),
+            events: vec![event],
+            ..Default::default()
+        };
+        let c = chrome();
+        let mut out = (Keys::default(), None);
+        let _ = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            out.0 = overlay_keys(ov, &ctx);
+            if out.0.send {
+                out.1 = talk_action(ov);
+            }
+            draw_overlay(ov, &c, Some(session()), &ctx);
+        });
+        out
     }
 
     #[test]

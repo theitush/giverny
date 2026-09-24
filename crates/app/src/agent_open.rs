@@ -15,6 +15,13 @@
 //!   interactive view. The keys, and what they were established from, are
 //!   [`cc_keys`]; the typing is driven by [`Attach`], which reads the
 //!   parent's screen after every key rather than typing blind.
+//! * A Running worker's overlay can also *talk* to it (giverny#71): a line
+//!   typed in the overlay's box is typed by [`Send`] into the worker's own
+//!   view in the parent's Claude Code — attach, type, Enter, back to the
+//!   main view — so the worker gets it as Ita's message. With the agents
+//!   pane on, the relay is asked to show Claude Code's agent strip for the
+//!   length of the send (`hooks::show_strip`), since the strip is the only
+//!   keyboard path to a worker's view.
 //! * A Done worker's overlay only reads: nothing is offered. Claude Code
 //!   keeps no view of a finished subagent (it leaves the agent strip and
 //!   `/tasks`, and its transcript is not a resumable session), and the one
@@ -294,17 +301,33 @@ pub mod cc_keys {
 /// unviewed `main`, save the pointer before it and a `↑ N more` after it,
 /// so a transcript line that merely mentions `◯ main` does not count.
 pub fn viewing_worker(screen: &str) -> bool {
-    screen.lines().any(|row| {
-        let row = row.trim();
-        let row = row
-            .strip_prefix(cc_keys::PROMPT)
-            .map_or(row, str::trim_start);
-        cc_keys::MAIN_UNVIEWED.iter().any(|m| {
-            row.strip_prefix(m).is_some_and(|rest| {
-                rest.is_empty() || (rest.starts_with("  ") && rest.trim_start().starts_with('↑'))
-            })
-        })
-    })
+    screen.lines().any(|row| main_row(row) == Some(false))
+}
+
+/// A strip's `main` row: `Some(true)` while main is the view on screen
+/// (`● main`), `Some(false)` while a worker's is (`◯ main`), `None` for any
+/// other row. The whole row is the dot and `main`, save the pointer before
+/// it and a `↑ N more` after it.
+fn main_row(row: &str) -> Option<bool> {
+    let row = row.trim();
+    let row = row
+        .strip_prefix(cc_keys::PROMPT)
+        .map_or(row, str::trim_start);
+    let rest = if let Some(r) = row.strip_prefix("( )").or_else(|| row.strip_prefix("(*)")) {
+        r
+    } else {
+        let mut chars = row.chars();
+        let dot = chars.next()?;
+        if dot.is_alphanumeric() {
+            return None;
+        }
+        chars.as_str()
+    };
+    let rest = rest.strip_prefix(" main")?;
+    if !(rest.is_empty() || (rest.starts_with("  ") && rest.trim_start().starts_with('↑'))) {
+        return None;
+    }
+    Some(!cc_keys::MAIN_UNVIEWED.iter().any(|m| row.starts_with(m)))
 }
 
 /// One key Giverny types into the parent's Claude Code.
@@ -346,7 +369,6 @@ fn is_rule(line: &str) -> bool {
 pub fn read_view(screen: &str, undimmed: &str) -> View {
     use cc_keys::*;
     let rows: Vec<&str> = screen.lines().collect();
-    let bright: Vec<&str> = undimmed.lines().collect();
 
     let hint = |needle: &str, also: Option<&str>| {
         rows.iter()
@@ -377,11 +399,31 @@ pub fn read_view(screen: &str, undimmed: &str) -> View {
     if let Some(items) = read_strip(&rows) {
         return View::Strip(items);
     }
-    // The prompt box: a rule, `❯ …` in the first column, maybe more lines
-    // of draft, a rule. The last one on screen; the transcript above has
-    // `❯ ` lines too, but never right under a rule.
+    match prompt_box(screen, undimmed) {
+        Some(b) => View::Prompt { draft: b.draft },
+        None => View::Other,
+    }
+}
+
+/// Claude Code's prompt box, as far as a send cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptBox {
+    /// The text on the box's top rule: a worker's view carries the worker's
+    /// description there (`─── eta worker ─`); the main view none.
+    pub label: Option<String>,
+    /// It holds typed text (not the dim placeholder).
+    pub draft: bool,
+}
+
+/// Read the prompt box off the screen, wherever the focus is: a rule,
+/// `❯ …` in the first column, maybe more lines of draft, a rule. The last
+/// one on screen; the transcript above has `❯ ` lines too, but never right
+/// under a rule. `undimmed` tells a draft from the placeholder.
+pub fn prompt_box(screen: &str, undimmed: &str) -> Option<PromptBox> {
+    let rows: Vec<&str> = screen.lines().collect();
+    let bright: Vec<&str> = undimmed.lines().collect();
     for i in (1..rows.len()).rev() {
-        if !rows[i].starts_with(PROMPT) || !is_rule(rows[i - 1]) {
+        if !rows[i].starts_with(cc_keys::PROMPT) || !is_rule(rows[i - 1]) {
             continue;
         }
         let Some(end) = (i + 1..rows.len().min(i + 40)).find(|&j| is_rule(rows[j])) else {
@@ -390,17 +432,26 @@ pub fn read_view(screen: &str, undimmed: &str) -> View {
         let typed = |j: usize| {
             let line = bright.get(j).copied().unwrap_or("");
             let line = if j == i {
-                line.trim_start().trim_start_matches(PROMPT)
+                line.trim_start().trim_start_matches(cc_keys::PROMPT)
             } else {
                 line
             };
             !line.trim().is_empty()
         };
-        return View::Prompt {
+        let label = rows[i - 1].trim().trim_matches('─').trim();
+        return Some(PromptBox {
+            label: (!label.is_empty()).then(|| label.to_string()),
             draft: (i..end).any(typed),
-        };
+        });
     }
-    View::Other
+    None
+}
+
+/// Whether Claude Code's agent strip is drawn under the prompt: its `main`
+/// row is on screen. With the agents pane on, Giverny's relay hides the
+/// strip (giverny#3) until asked to show it (giverny#71).
+pub fn strip_shown(screen: &str) -> bool {
+    screen.lines().any(|row| main_row(row).is_some())
 }
 
 /// `   ❯ <label> (running) · Opus 5.5` → the label, and whether it is
@@ -601,6 +652,12 @@ pub const DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct Attach {
     pub description: String,
+    /// Other labels the strip may show the worker by: Claude Code swaps the
+    /// description for the worker's live activity label once it is working.
+    aliases: Vec<String>,
+    /// With no row by any of its names, take the strip's only agent row:
+    /// for a caller that checks the view it lands on (`Send`).
+    only_agent: bool,
     /// ↓ has been sent out of the prompt.
     opened: bool,
     /// Enter on the worker is queued.
@@ -617,6 +674,8 @@ impl Attach {
     pub fn new(description: impl Into<String>, now: Instant) -> Attach {
         Attach {
             description: description.into(),
+            aliases: Vec::new(),
+            only_agent: false,
             opened: false,
             finishing: false,
             queue: VecDeque::new(),
@@ -624,6 +683,28 @@ impl Attach {
             settle: None,
             deadline: now + DEADLINE,
         }
+    }
+
+    /// An attach that also takes a strip row labelled with one of
+    /// `aliases` (empty ones are dropped) for the worker.
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = String>) -> Attach {
+        self.aliases = aliases
+            .into_iter()
+            .filter(|a| !a.trim().is_empty())
+            .collect();
+        self
+    }
+
+    /// With no row by any name, go to the strip's only agent row, if it
+    /// has exactly one. The caller must check the view it opens.
+    pub fn or_only_agent(mut self) -> Attach {
+        self.only_agent = true;
+        self
+    }
+
+    fn names(&self, label: &str) -> bool {
+        label_matches(label, &self.description)
+            || self.aliases.iter().any(|a| label_matches(label, a))
     }
 
     fn push(&mut self, keys: &[Keystroke], view: View, now: Instant) -> Tick {
@@ -681,12 +762,16 @@ impl Attach {
                 let hits: Vec<usize> = items
                     .iter()
                     .enumerate()
-                    .filter(|(_, it)| label_matches(&it.label, &self.description))
+                    .filter(|(_, it)| self.names(&it.label))
                     .map(|(i, _)| i)
                     .collect();
-                let target = match hits.as_slice() {
-                    [] => return Tick::Stuck(Stuck::NotListed),
-                    [one] => *one,
+                // The strip's first row is `main`; the rest are agents.
+                let only =
+                    (self.only_agent && items.len() == 2 && items[0].label == "main").then_some(1);
+                let target = match (hits.as_slice(), only) {
+                    ([], Some(one)) => one,
+                    ([], None) => return Tick::Stuck(Stuck::NotListed),
+                    ([one], _) => *one,
                     _ => return Tick::Stuck(Stuck::Ambiguous),
                 };
                 let Some(at) = items.iter().position(|it| it.selected) else {
@@ -712,6 +797,425 @@ impl Attach {
                 self.push(&keys, view, now)
             }
             View::List(_) | View::Detail(_) | View::Other => Tick::Stuck(Stuck::NoPrompt),
+        }
+    }
+}
+
+// -------------------------------------------------------------- send ----
+
+/// The bytes that type `text` at Claude Code's prompt: typed as-is when it
+/// is one line; bracketed as a paste when it has several, since a bare
+/// newline would be Enter and send the first line alone. `None` when it has
+/// several and the terminal takes no bracketed paste.
+pub fn text_bytes(text: &str, bracketed: bool) -> Option<Vec<u8>> {
+    let body = giverny_term::input::sanitize_text(text);
+    if !text.contains(['\n', '\r']) {
+        return Some(body);
+    }
+    if !bracketed {
+        return None;
+    }
+    let mut out = b"\x1b[200~".to_vec();
+    out.extend(body);
+    out.extend_from_slice(b"\x1b[201~");
+    Some(out)
+}
+
+/// How long the strip is waited for once the relay is asked to show it:
+/// Claude Code runs the relay about every five seconds.
+pub const STRIP_WAIT: Duration = Duration::from_secs(8);
+/// How long one step's effect is waited for on screen.
+pub const STEP_WAIT: Duration = Duration::from_secs(3);
+/// The whole send, start to finish.
+pub const SEND_DEADLINE: Duration = Duration::from_secs(30);
+/// The most `↑`s one step sends to put the focus back in the prompt.
+const MAX_UPS: u8 = 4;
+
+/// What a send does this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Write this key to the parent's pty.
+    Key(Keystroke),
+    /// Type this text at the prompt that has the focus ([`text_bytes`]).
+    Text(String),
+    /// Nothing yet; look again next frame.
+    Wait,
+    /// The line went to the worker and the tab is back where it was.
+    Done,
+    Failed(Failed),
+}
+
+/// Why a send stopped, and whether the line had gone by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failed {
+    pub why: Why,
+    /// The worker has the line (its prompt took it and cleared).
+    pub sent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    /// No Claude Code prompt on screen: a dialog or question is up.
+    NoPrompt,
+    /// The parent's prompt holds text of Ita's; it is never moved.
+    Draft,
+    /// The tab is showing some other worker's view.
+    OtherView,
+    /// The agent strip never came up under the prompt.
+    NoStrip,
+    /// The walk to the worker's view stopped.
+    Attach(Stuck),
+    /// Enter opened a view, but not this worker's (its rule says this).
+    WrongView(String),
+    /// The worker's own prompt already holds text.
+    WorkerDraft,
+    /// The line did not show up in the worker's prompt.
+    NotTyped,
+    /// Enter did not take the line out of the worker's prompt.
+    NotSent,
+    /// The line went, but the walk back to the main view stopped.
+    NoWayHome,
+    TimedOut,
+}
+
+impl Failed {
+    /// What the popup says.
+    pub fn explain(&self, description: &str) -> String {
+        let name = format!("\u{201c}{description}\u{201d}");
+        let why = match &self.why {
+            Why::NoPrompt => "This tab's Claude Code prompt is not on screen (a permission \
+                              question, or another dialog, is up). Answer or close it, then \
+                              send again."
+                .to_string(),
+            Why::Draft => "This tab's Claude Code prompt has text in it. Giverny will not \
+                           move or clear what you typed there: send or clear it, then send \
+                           again."
+                .to_string(),
+            Why::OtherView => "This tab is showing another worker's view. Go back to the main \
+                               view (the strip's `main`), then send again."
+                .to_string(),
+            Why::NoStrip => "Claude Code's agent list never came up under this tab's prompt, \
+                             so there was no way to the worker's view. It may have finished."
+                .to_string(),
+            Why::Attach(stuck) => stuck.explain(description),
+            Why::WrongView(other) => format!(
+                "Giverny opened the view of \u{201c}{other}\u{201d} instead of {name}, so it \
+                 typed nothing and went back."
+            ),
+            Why::WorkerDraft => format!(
+                "{name}'s own prompt already has text in it, so nothing was typed. The tab \
+                 is left on the worker's view."
+            ),
+            Why::NotTyped => format!(
+                "The line did not show up in {name}'s prompt. The tab is left on the \
+                 worker's view: check its prompt before sending again."
+            ),
+            Why::NotSent => format!(
+                "The line is in {name}'s prompt but Enter did not send it. The tab is left \
+                 on the worker's view."
+            ),
+            Why::NoWayHome => "Claude Code did not go back to the main view; press ↓ at \
+                               this tab's prompt and Enter on `main`."
+                .to_string(),
+            Why::TimedOut => "Claude Code did not answer the keys in time, so Giverny \
+                              stopped."
+                .to_string(),
+        };
+        if self.sent {
+            format!("Sent to {name}. {why}")
+        } else {
+            format!("Not sent. {why}")
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Phase {
+    Start,
+    /// Waiting for the strip to be drawn.
+    Strip,
+    Attach(Box<Attach>),
+    /// Enter went on the worker's row: waiting for its view.
+    Opened,
+    /// In the worker's view: the focus back to its prompt.
+    Focus,
+    /// The line is typed: waiting for it in the prompt.
+    Typed,
+    /// Enter is sent: waiting for the prompt to clear.
+    Submitted,
+    /// Back to the main view.
+    Home(Box<Attach>),
+    HomeCheck,
+    HomeFocus,
+    /// Nothing was typed but the focus may have moved: back to the main
+    /// view, then report `Why`.
+    Recover(Box<Attach>, Why),
+    RecoverFocus(Why),
+}
+
+/// Sends one line to a running worker through its parent's Claude Code
+/// (giverny#71): opens the worker's view with [`Attach`], types the line at
+/// its prompt, sends it, and walks back to the main view with the focus in
+/// the main prompt — reading the parent's screen before every key, never
+/// typing blind. The line reaches the worker as a message typed in its
+/// view, the way Ita would type it there himself.
+///
+/// It will not start over a draft in the parent's prompt (the view switch
+/// carries a draft along), from another worker's view, or with a dialog up.
+/// Already on the worker's own view, it types there and stays.
+///
+/// Pure but for the clock and screen it is handed, like [`Attach`].
+#[derive(Debug, Clone)]
+pub struct Send {
+    pub description: String,
+    aliases: Vec<String>,
+    text: String,
+    phase: Phase,
+    /// When the current phase began.
+    since: Instant,
+    /// The view on screen when the last key went, and when it went: the
+    /// next look waits until it changes, or `SETTLE` passes.
+    hold: Option<(Instant, (View, Option<PromptBox>))>,
+    ups: u8,
+    /// The label on the prompt's rule when the send began: what "back"
+    /// looks like.
+    home_label: Option<String>,
+    /// Stay on the worker's view afterwards (the send began there).
+    stay: bool,
+    sent: bool,
+    deadline: Instant,
+}
+
+impl Send {
+    pub fn new(
+        description: impl Into<String>,
+        aliases: Vec<String>,
+        text: impl Into<String>,
+        now: Instant,
+    ) -> Send {
+        Send {
+            description: description.into(),
+            aliases,
+            text: text.into(),
+            phase: Phase::Start,
+            since: now,
+            hold: None,
+            ups: 0,
+            home_label: None,
+            stay: false,
+            sent: false,
+            deadline: now + SEND_DEADLINE,
+        }
+    }
+
+    /// Whether the line has reached the worker.
+    pub fn sent(&self) -> bool {
+        self.sent
+    }
+
+    fn go(&mut self, phase: Phase, now: Instant) {
+        self.phase = phase;
+        self.since = now;
+        self.ups = 0;
+    }
+
+    fn fail(&self, why: Why) -> Step {
+        Step::Failed(Failed {
+            why,
+            sent: self.sent,
+        })
+    }
+
+    fn key(&mut self, k: Keystroke, look: (View, Option<PromptBox>), now: Instant) -> Step {
+        self.hold = Some((now, look));
+        Step::Key(k)
+    }
+
+    fn home_attach(&self, now: Instant) -> Box<Attach> {
+        Box::new(Attach::new("main", now))
+    }
+
+    fn is_worker(&self, label: Option<&str>) -> bool {
+        label.is_some_and(|l| label_matches(l, &self.description))
+    }
+
+    /// One frame: `screen` and `undimmed` are the parent's screen now.
+    pub fn tick(&mut self, now: Instant, screen: &str, undimmed: &str) -> Step {
+        let look = (read_view(screen, undimmed), prompt_box(screen, undimmed));
+        if let Some((at, before)) = &self.hold {
+            if now < *at + KEY_GAP || (look == *before && now < *at + SETTLE) {
+                return Step::Wait;
+            }
+            self.hold = None;
+        }
+        if now >= self.deadline {
+            return self.fail(Why::TimedOut);
+        }
+        let waited = now.duration_since(self.since);
+        let (view, prompt) = look.clone();
+        let label = prompt.as_ref().and_then(|p| p.label.clone());
+        match &mut self.phase {
+            Phase::Start => {
+                let Some(p) = &prompt else {
+                    return self.fail(Why::NoPrompt);
+                };
+                if matches!(view, View::List(_) | View::Detail(_) | View::Other) {
+                    return self.fail(Why::NoPrompt);
+                }
+                if p.draft {
+                    return self.fail(Why::Draft);
+                }
+                self.home_label = p.label.clone();
+                if self.is_worker(label.as_deref()) {
+                    self.stay = true;
+                    self.go(Phase::Focus, now);
+                } else {
+                    self.go(Phase::Strip, now);
+                }
+                Step::Wait
+            }
+            Phase::Strip => {
+                if !strip_shown(screen) {
+                    return if waited < STRIP_WAIT {
+                        Step::Wait
+                    } else {
+                        self.fail(Why::NoStrip)
+                    };
+                }
+                if viewing_worker(screen) {
+                    return self.fail(Why::OtherView);
+                }
+                let attach = Attach::new(self.description.clone(), now)
+                    .with_aliases(self.aliases.clone())
+                    .or_only_agent();
+                self.go(Phase::Attach(Box::new(attach)), now);
+                self.tick(now, screen, undimmed)
+            }
+            Phase::Attach(a) => match a.tick(now, screen, undimmed) {
+                Tick::Send(k) => Step::Key(k),
+                Tick::Wait => Step::Wait,
+                Tick::Done => {
+                    self.go(Phase::Opened, now);
+                    Step::Wait
+                }
+                Tick::Stuck(Stuck::NoPrompt) => self.fail(Why::Attach(Stuck::NoPrompt)),
+                Tick::Stuck(s) => {
+                    let home = self.home_attach(now);
+                    self.go(Phase::Recover(home, Why::Attach(s)), now);
+                    Step::Wait
+                }
+            },
+            Phase::Opened => {
+                if viewing_worker(screen) {
+                    match &label {
+                        Some(l) if label_matches(l, &self.description) => {
+                            self.go(Phase::Focus, now);
+                            return self.tick(now, screen, undimmed);
+                        }
+                        Some(l) if waited >= SETTLE => {
+                            let home = self.home_attach(now);
+                            let why = Why::WrongView(l.clone());
+                            self.go(Phase::Recover(home, why), now);
+                            return Step::Wait;
+                        }
+                        _ => {}
+                    }
+                }
+                if waited < STEP_WAIT {
+                    Step::Wait
+                } else {
+                    let home = self.home_attach(now);
+                    self.go(Phase::Recover(home, Why::TimedOut), now);
+                    Step::Wait
+                }
+            }
+            Phase::Focus => match (&view, &prompt) {
+                (View::Strip(_), _) if self.ups < MAX_UPS => {
+                    self.ups += 1;
+                    self.key(cc_keys::PREVIOUS, look, now)
+                }
+                (View::Prompt { draft: true }, _) => self.fail(Why::WorkerDraft),
+                (View::Prompt { draft: false }, Some(p)) if self.is_worker(p.label.as_deref()) => {
+                    let text = self.text.clone();
+                    self.go(Phase::Typed, now);
+                    self.hold = Some((now, look));
+                    Step::Text(text)
+                }
+                _ if waited < STEP_WAIT => Step::Wait,
+                _ => self.fail(Why::TimedOut),
+            },
+            Phase::Typed => match &prompt {
+                Some(p) if p.draft && self.is_worker(p.label.as_deref()) => {
+                    self.go(Phase::Submitted, now);
+                    self.key(cc_keys::VIEW, look, now)
+                }
+                _ if waited < STEP_WAIT => Step::Wait,
+                _ => self.fail(Why::NotTyped),
+            },
+            Phase::Submitted => match &prompt {
+                Some(p) if !p.draft => {
+                    self.sent = true;
+                    if self.stay {
+                        return Step::Done;
+                    }
+                    let home = self.home_attach(now);
+                    self.go(Phase::Home(home), now);
+                    self.tick(now, screen, undimmed)
+                }
+                _ if waited < STEP_WAIT => Step::Wait,
+                _ => self.fail(Why::NotSent),
+            },
+            Phase::Home(a) | Phase::Recover(a, _) => {
+                let tick = a.tick(now, screen, undimmed);
+                let recovering = match &self.phase {
+                    Phase::Recover(_, why) => Some(why.clone()),
+                    _ => None,
+                };
+                match tick {
+                    Tick::Send(k) => Step::Key(k),
+                    Tick::Wait => Step::Wait,
+                    Tick::Done => {
+                        match recovering {
+                            Some(why) => self.go(Phase::RecoverFocus(why), now),
+                            None => self.go(Phase::HomeCheck, now),
+                        }
+                        Step::Wait
+                    }
+                    Tick::Stuck(_) => self.fail(recovering.unwrap_or(Why::NoWayHome)),
+                }
+            }
+            Phase::HomeCheck => {
+                let home = !viewing_worker(screen)
+                    && prompt.is_some()
+                    && label == self.home_label
+                    && !self.is_worker(label.as_deref());
+                if home {
+                    self.go(Phase::HomeFocus, now);
+                    self.tick(now, screen, undimmed)
+                } else if waited < STEP_WAIT {
+                    Step::Wait
+                } else {
+                    self.fail(Why::NoWayHome)
+                }
+            }
+            Phase::HomeFocus | Phase::RecoverFocus(_) => {
+                let why = match &self.phase {
+                    Phase::RecoverFocus(why) => Some(why.clone()),
+                    _ => None,
+                };
+                match &view {
+                    View::Strip(_) if self.ups < MAX_UPS => {
+                        self.ups += 1;
+                        self.key(cc_keys::PREVIOUS, look, now)
+                    }
+                    View::Prompt { .. } => match why {
+                        Some(why) => self.fail(why),
+                        None => Step::Done,
+                    },
+                    _ if waited < STEP_WAIT => Step::Wait,
+                    _ => self.fail(why.unwrap_or(Why::NoWayHome)),
+                }
+            }
         }
     }
 }
@@ -1283,6 +1787,401 @@ mod tests {
         assert_eq!(drive(&mut d, &mut t, &bare), Tick::Stuck(Stuck::NotListed));
     }
 
+    // ------------------------------------------------------- send ----
+    //
+    // A fake Claude Code 2.1.281 that draws the screens the giverny#71 probe
+    // captured (a real `claude` in tmux: main view, a worker's view, the
+    // strip focused and not) and answers keys the way that one did.
+
+    struct Fake {
+        /// 0 is main; 1.. the agents.
+        view: usize,
+        strip_focus: bool,
+        sel: usize,
+        strip_shown: bool,
+        /// (description, strip label) per agent.
+        agents: Vec<(&'static str, &'static str)>,
+        drafts: Vec<String>,
+        sent: Vec<(usize, String)>,
+        /// Enter at a prompt does nothing (a stuck Claude Code).
+        deaf: bool,
+        dialog: bool,
+        keys: usize,
+    }
+
+    impl Fake {
+        fn new() -> Fake {
+            let agents = vec![
+                ("eta worker", "Starting Python sleep"),
+                ("theta worker", "theta worker"),
+            ];
+            Fake {
+                view: 0,
+                strip_focus: false,
+                sel: 0,
+                strip_shown: true,
+                drafts: vec![String::new(); agents.len() + 1],
+                agents,
+                sent: Vec::new(),
+                deaf: false,
+                dialog: false,
+                keys: 0,
+            }
+        }
+
+        /// The screen, and the same with the dim placeholder blanked.
+        fn screens(&self) -> (String, String) {
+            if self.dialog {
+                return (PERMISSION.to_string(), PERMISSION.to_string());
+            }
+            let rule = "─".repeat(60);
+            let top = match self.view {
+                0 => rule.clone(),
+                v => format!("{rule} {} ─", self.agents[v - 1].0),
+            };
+            let draft = &self.drafts[self.view];
+            let placeholder = if self.view == 0 {
+                String::new()
+            } else {
+                "Message @general-purpose…".to_string()
+            };
+            let mut prompt = String::new();
+            let mut bright = String::new();
+            for (i, line) in draft.split('\n').enumerate() {
+                let lead = if i == 0 { "❯ " } else { "  " };
+                prompt.push_str(&format!("{lead}{line}\n"));
+                bright.push_str(&format!("{lead}{line}\n"));
+            }
+            if draft.is_empty() {
+                prompt = format!("❯ {placeholder}\n");
+                bright = "❯ \n".to_string();
+            }
+            let hint = if self.strip_focus {
+                "↑/↓ to select · Enter to view"
+            } else {
+                "⏸ manual mode on · ← 2 agents"
+            };
+            let mut strip = String::new();
+            if self.strip_shown {
+                for i in 0..=self.agents.len() {
+                    let ptr = if self.strip_focus && self.sel == i {
+                        "❯ "
+                    } else {
+                        "  "
+                    };
+                    let dot = if self.view == i { "●" } else { "◯" };
+                    if i == 0 {
+                        strip.push_str(&format!("{ptr}{dot} main\n"));
+                    } else {
+                        let label = self.agents[i - 1].1;
+                        strip.push_str(&format!(
+                            "{ptr}{dot} general-purpose  {label}          8s · ↓ 2k tokens\n"
+                        ));
+                    }
+                }
+            }
+            let head = format!("● Launched.\n✻ Waiting for 2 background agents to finish\n{top}\n");
+            let foot = format!("{rule}\n  Haiku 4.5  ·  5h 84%\n  {hint}\n{strip}");
+            (
+                format!("{head}{prompt}{foot}"),
+                format!("{head}{bright}{foot}"),
+            )
+        }
+
+        fn key(&mut self, k: Keystroke) {
+            self.keys += 1;
+            let n = self.agents.len();
+            match (k, self.strip_focus) {
+                (Keystroke::Down, false) => {
+                    if self.strip_shown {
+                        self.strip_focus = true;
+                        self.sel = 0;
+                    }
+                }
+                (Keystroke::Down, true) => self.sel = (self.sel + 1).min(n),
+                (Keystroke::Up, true) if self.sel == 0 => self.strip_focus = false,
+                (Keystroke::Up, true) => self.sel -= 1,
+                // History: an ↑ at an empty prompt recalls the last prompt.
+                (Keystroke::Up, false) => {
+                    if self.drafts[self.view].is_empty() {
+                        self.drafts[self.view] = "an old prompt".into();
+                    }
+                }
+                (Keystroke::Enter, true) => {
+                    let draft = std::mem::take(&mut self.drafts[self.view]);
+                    self.view = self.sel;
+                    self.drafts[self.view].push_str(&draft);
+                }
+                (Keystroke::Enter, false) => {
+                    if !self.deaf && !self.drafts[self.view].is_empty() {
+                        let line = std::mem::take(&mut self.drafts[self.view]);
+                        self.sent.push((self.view, line));
+                    }
+                }
+            }
+        }
+
+        /// Typed text moves the focus to the prompt; a paste into a
+        /// focused strip is dropped, as the probe saw.
+        fn text(&mut self, text: &str) {
+            if self.strip_focus {
+                if text.contains('\n') {
+                    return;
+                }
+                self.strip_focus = false;
+            }
+            self.drafts[self.view].push_str(text);
+        }
+    }
+
+    /// Drive a send against the fake until it stops; `each` runs before
+    /// every frame (to change the fake mid-send).
+    fn run_send(s: &mut Send, fake: &mut Fake, mut each: impl FnMut(&mut Fake, Duration)) -> Step {
+        let start = Instant::now();
+        let mut t = start;
+        loop {
+            each(fake, t - start);
+            let (screen, undimmed) = fake.screens();
+            match s.tick(t, &screen, &undimmed) {
+                Step::Key(k) => fake.key(k),
+                Step::Text(text) => fake.text(&text),
+                Step::Wait => {}
+                other => return other,
+            }
+            t += Duration::from_millis(20);
+            assert!(t - start < Duration::from_secs(60), "the send never ended");
+        }
+    }
+
+    fn send(text: &str) -> Send {
+        Send::new(
+            "eta worker",
+            vec!["Starting Python sleep".into()],
+            text,
+            Instant::now(),
+        )
+    }
+
+    fn assert_home(fake: &Fake) {
+        assert_eq!(fake.view, 0, "back on main");
+        assert!(!fake.strip_focus, "the focus is back in the prompt");
+        assert!(
+            fake.drafts.iter().all(String::is_empty),
+            "{:?}",
+            fake.drafts
+        );
+    }
+
+    #[test]
+    fn a_send_types_in_the_worker_view_and_comes_back() {
+        let mut fake = Fake::new();
+        let mut s = send("hello from the popup");
+        assert_eq!(run_send(&mut s, &mut fake, |_, _| {}), Step::Done);
+        assert_eq!(fake.sent, vec![(1, "hello from the popup".to_string())]);
+        assert!(s.sent());
+        assert_home(&fake);
+        // By its description too, when the strip still shows that.
+        let mut fake = Fake::new();
+        let mut s = Send::new("theta worker", vec![], "hi", Instant::now());
+        assert_eq!(run_send(&mut s, &mut fake, |_, _| {}), Step::Done);
+        assert_eq!(fake.sent, vec![(2, "hi".to_string())]);
+        assert_home(&fake);
+    }
+
+    #[test]
+    fn a_lone_worker_under_a_label_nobody_knew_is_found_by_its_view() {
+        // The strip shows a fresh activity label the tracker has not heard:
+        // with one agent row, the view it opens is what is checked.
+        let mut fake = Fake::new();
+        fake.agents = vec![("eta worker", "Running second python3 sleep")];
+        fake.drafts.truncate(2);
+        let mut s = Send::new("eta worker", vec![], "hi", Instant::now());
+        assert_eq!(run_send(&mut s, &mut fake, |_, _| {}), Step::Done);
+        assert_eq!(fake.sent, vec![(1, "hi".to_string())]);
+        assert_home(&fake);
+        // The only row is someone else: its view says so, nothing is typed.
+        let mut fake = Fake::new();
+        fake.agents = vec![("theta worker", "Running second python3 sleep")];
+        fake.drafts.truncate(2);
+        let mut s = Send::new("eta worker", vec![], "hi", Instant::now());
+        let step = run_send(&mut s, &mut fake, |_, _| {});
+        assert_eq!(
+            step,
+            Step::Failed(Failed {
+                why: Why::WrongView("theta worker".into()),
+                sent: false
+            })
+        );
+        assert!(fake.sent.is_empty());
+        assert_home(&fake);
+    }
+
+    #[test]
+    fn a_send_waits_for_a_hidden_strip_to_be_shown() {
+        let mut fake = Fake::new();
+        fake.strip_shown = false;
+        let mut s = send("hi");
+        let step = run_send(&mut s, &mut fake, |f, at| {
+            if at >= Duration::from_secs(4) {
+                f.strip_shown = true;
+            }
+        });
+        assert_eq!(step, Step::Done);
+        assert_eq!(fake.sent, vec![(1, "hi".to_string())]);
+        assert_home(&fake);
+        // Never shown: nothing is pressed.
+        let mut fake = Fake::new();
+        fake.strip_shown = false;
+        let mut s = send("hi");
+        let step = run_send(&mut s, &mut fake, |_, _| {});
+        assert_eq!(
+            step,
+            Step::Failed(Failed {
+                why: Why::NoStrip,
+                sent: false
+            })
+        );
+        assert_eq!(fake.keys, 0);
+    }
+
+    #[test]
+    fn a_multi_line_send_goes_as_one_message() {
+        let mut fake = Fake::new();
+        let mut s = send("first line\nsecond line");
+        assert_eq!(run_send(&mut s, &mut fake, |_, _| {}), Step::Done);
+        assert_eq!(fake.sent, vec![(1, "first line\nsecond line".to_string())]);
+        assert_home(&fake);
+    }
+
+    #[test]
+    fn a_send_never_touches_a_draft_or_a_dialog() {
+        let mut fake = Fake::new();
+        fake.drafts[0] = "half a thought".into();
+        let mut s = send("hi");
+        let step = run_send(&mut s, &mut fake, |_, _| {});
+        assert!(matches!(
+            step,
+            Step::Failed(Failed {
+                why: Why::Draft,
+                sent: false
+            })
+        ));
+        assert_eq!(fake.keys, 0);
+        assert_eq!(fake.drafts[0], "half a thought");
+        let mut fake = Fake::new();
+        fake.dialog = true;
+        let step = run_send(&mut send("hi"), &mut fake, |_, _| {});
+        assert!(matches!(
+            step,
+            Step::Failed(Failed {
+                why: Why::NoPrompt,
+                ..
+            })
+        ));
+        assert_eq!(fake.keys, 0);
+    }
+
+    #[test]
+    fn a_send_from_the_worker_view_stays_there() {
+        let mut fake = Fake::new();
+        fake.view = 1;
+        let mut s = send("hi");
+        assert_eq!(run_send(&mut s, &mut fake, |_, _| {}), Step::Done);
+        assert_eq!(fake.sent, vec![(1, "hi".to_string())]);
+        assert_eq!(fake.view, 1);
+        // From another worker's view it will not start.
+        let mut fake = Fake::new();
+        fake.view = 2;
+        let step = run_send(&mut send("hi"), &mut fake, |_, _| {});
+        assert!(matches!(
+            step,
+            Step::Failed(Failed {
+                why: Why::OtherView,
+                ..
+            })
+        ));
+        assert_eq!(fake.keys, 0);
+    }
+
+    #[test]
+    fn a_worker_gone_from_the_strip_is_reported_and_the_tab_put_back() {
+        let mut fake = Fake::new();
+        let mut s = Send::new("kappa worker", vec![], "hi", Instant::now());
+        let step = run_send(&mut s, &mut fake, |_, _| {});
+        assert_eq!(
+            step,
+            Step::Failed(Failed {
+                why: Why::Attach(Stuck::NotListed),
+                sent: false
+            })
+        );
+        assert!(fake.sent.is_empty());
+        assert_home(&fake);
+    }
+
+    #[test]
+    fn a_line_enter_did_not_take_is_not_called_sent() {
+        let mut fake = Fake::new();
+        fake.deaf = true;
+        let mut s = send("hi");
+        let step = run_send(&mut s, &mut fake, |_, _| {});
+        assert_eq!(
+            step,
+            Step::Failed(Failed {
+                why: Why::NotSent,
+                sent: false
+            })
+        );
+        assert!(!s.sent());
+        let text = Failed {
+            why: Why::NoWayHome,
+            sent: true,
+        }
+        .explain("eta worker");
+        assert!(
+            text.starts_with("Sent to \u{201c}eta worker\u{201d}."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn text_is_typed_or_pasted() {
+        assert_eq!(text_bytes("hi there", false), Some(b"hi there".to_vec()));
+        assert_eq!(
+            text_bytes("a\nb", true),
+            Some(b"\x1b[200~a\rb\x1b[201~".to_vec())
+        );
+        assert_eq!(text_bytes("a\nb", false), None);
+        // An escape in the text cannot fake the paste's end.
+        assert_eq!(
+            text_bytes("a\x1b[201~b\nc", true),
+            Some(b"\x1b[200~a[201~b\rc\x1b[201~".to_vec())
+        );
+    }
+
+    #[test]
+    fn reads_the_prompt_box_rule_and_the_main_row() {
+        let (screen, undimmed) = Fake::new().screens();
+        assert_eq!(
+            prompt_box(&screen, &undimmed),
+            Some(PromptBox {
+                label: None,
+                draft: false
+            })
+        );
+        assert!(strip_shown(&screen));
+        assert!(!viewing_worker(&screen));
+        assert_eq!(
+            prompt_box(WORKER_VIEW_STRIP, WORKER_VIEW_STRIP)
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("eta worker")
+        );
+        assert!(strip_shown(WORKER_VIEW_STRIP));
+        assert!(!strip_shown(&prompt_screen("")));
+    }
+
     #[test]
     fn keystrokes_encode_like_typed_keys() {
         let enc = |k: egui::Key, m: egui::Modifiers| -> Option<Vec<u8>> {
@@ -1354,5 +2253,120 @@ mod tests {
         let done = run(&mut |now, s| a.tick(now, s, s));
         println!("{}", screen());
         assert_eq!(done, Tick::Done);
+    }
+
+    /// `tmux capture-pane -e` → (the text, the text with dim cells blank).
+    fn undim(ansi: &str) -> (String, String) {
+        let (mut plain, mut bright) = (String::new(), String::new());
+        let mut dim = false;
+        let mut chars = ansi.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                plain.push(c);
+                bright.push(if dim && c != '\n' { ' ' } else { c });
+                continue;
+            }
+            match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    for p in chars.by_ref() {
+                        if p.is_ascii_alphabetic() {
+                            if p == 'm' {
+                                let mut it = params.split(';');
+                                while let Some(n) = it.next() {
+                                    match n {
+                                        "" | "0" | "22" => dim = false,
+                                        "2" => dim = true,
+                                        "38" | "48" | "58" => {
+                                            if it.next() == Some("2") {
+                                                it.nth(2);
+                                            } else {
+                                                it.next();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        params.push(p);
+                    }
+                }
+                // OSC (hyperlinks): to BEL or ESC \.
+                Some(']') => {
+                    while let Some(p) = chars.next() {
+                        if p == '\x07' || (p == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (plain, bright)
+    }
+
+    /// A whole send against a real Claude Code in tmux (giverny#71):
+    /// `GIVERNY_TMUX=<socket>:<target>`, a `claude` there with the running
+    /// agent `GIVERNY_TMUX_AGENT` (its description), and the line to send in
+    /// `GIVERNY_TMUX_TEXT`. Run by hand:
+    /// `cargo test -p giverny live_tmux_send -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_tmux_send() {
+        use std::process::Command;
+        let spec = std::env::var("GIVERNY_TMUX").expect("GIVERNY_TMUX=<socket>:<target>");
+        let (sock, target) = spec.split_once(':').unwrap();
+        let tmux = |args: &[&str]| {
+            let out = Command::new("tmux")
+                .args(["-L", sock])
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let send = |bytes: &[u8]| {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let mut args = vec!["send-keys", "-t", target, "-H"];
+            args.extend(hex.iter().map(String::as_str));
+            tmux(&args);
+        };
+        let enc = |k: egui::Key, _m: egui::Modifiers| -> Option<Vec<u8>> {
+            Some(
+                match k {
+                    egui::Key::ArrowUp => "\x1b[A",
+                    egui::Key::ArrowDown => "\x1b[B",
+                    egui::Key::Enter => "\r",
+                    _ => return None,
+                }
+                .as_bytes()
+                .to_vec(),
+            )
+        };
+        let agent = std::env::var("GIVERNY_TMUX_AGENT").unwrap();
+        let text = std::env::var("GIVERNY_TMUX_TEXT").unwrap_or_else(|_| "hello".into());
+        let mut s = Send::new(agent, vec![], text, Instant::now());
+        let started = Instant::now();
+        let mut log = Vec::new();
+        let step = loop {
+            let (screen, undimmed) = undim(&tmux(&["capture-pane", "-p", "-e", "-t", target]));
+            match s.tick(Instant::now(), &screen, &undimmed) {
+                Step::Key(k) => {
+                    log.push(format!("{:?} {k:?}", started.elapsed()));
+                    send(&keystroke_bytes(k, enc));
+                }
+                Step::Text(t) => {
+                    log.push(format!("{:?} text {t:?}", started.elapsed()));
+                    send(&text_bytes(&t, true).unwrap());
+                }
+                Step::Wait => {}
+                other => break other,
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        };
+        println!("{step:?} after {:?}\n{}", started.elapsed(), log.join("\n"));
+        println!("{}", tmux(&["capture-pane", "-p", "-t", target]));
+        assert_eq!(step, Step::Done);
     }
 }

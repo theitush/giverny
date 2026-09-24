@@ -474,9 +474,50 @@ pub fn run_subagent_line(spool: &Path, pane_on: bool) {
     };
     let payload: serde_json::Value =
         serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let answer = subagent_line_output(&payload, pane_on);
+    let answer = subagent_line_output(&payload, pane_on && !strip_wanted(spool, &tab_id));
     deliver(&subagent_line_msg(payload, tab_id, account_dir()), spool);
     print!("{answer}");
+}
+
+/// How long a [`show_strip`] request holds without being renewed. An app
+/// that dies mid-request leaves the file behind; past this the relay hides
+/// the panel again as if it were not there.
+pub const STRIP_WANTED_FOR: Duration = Duration::from_secs(90);
+
+/// The file that asks the relay to leave Claude Code's own subagent panel
+/// drawn in tab `tab_id`, though the agents pane is on: beside the spool,
+/// one per tab.
+pub fn strip_flag(spool: &Path, tab_id: &str) -> PathBuf {
+    spool.with_file_name("show-strip").join(tab_id)
+}
+
+/// Ask the relay to draw Claude Code's subagent panel in `tab_id` (`on`),
+/// or to go back to hiding it. The panel is what Claude Code's keyboard
+/// path to a worker's view walks (giverny#71): hidden, `↓` has nothing to
+/// reach. Claude Code runs the relay about every five seconds, so the
+/// panel follows within one tick.
+pub fn show_strip(spool: &Path, tab_id: &str, on: bool) -> std::io::Result<()> {
+    let flag = strip_flag(spool, tab_id);
+    if on {
+        if let Some(dir) = flag.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&flag, b"")
+    } else {
+        match std::fs::remove_file(&flag) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether the app wants Claude Code's panel drawn in `tab_id` right now.
+pub fn strip_wanted(spool: &Path, tab_id: &str) -> bool {
+    std::fs::metadata(strip_flag(spool, tab_id))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < STRIP_WANTED_FOR)
 }
 
 /// Is the Giverny `subagentStatusLine` configured in this settings file?
@@ -1012,6 +1053,25 @@ mod tests {
         install_into(&path).unwrap();
         assert!(!needs_path_refresh(&path), "reinstalling repairs the path");
         assert!(installed_in(&path));
+    }
+
+    #[test]
+    fn strip_flag_comes_and_goes() {
+        let dir = std::env::temp_dir().join(format!("giverny-strip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spool = dir.join("hook-spool.jsonl");
+        assert!(!strip_wanted(&spool, "giverny-3"));
+        show_strip(&spool, "giverny-3", true).unwrap();
+        assert!(strip_wanted(&spool, "giverny-3"));
+        assert!(
+            !strip_wanted(&spool, "giverny-4"),
+            "one tab's request is its own"
+        );
+        show_strip(&spool, "giverny-3", false).unwrap();
+        assert!(!strip_wanted(&spool, "giverny-3"));
+        // Taking back a request that was never made is not an error.
+        show_strip(&spool, "giverny-3", false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
