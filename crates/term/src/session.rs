@@ -334,6 +334,33 @@ impl TermSession {
         out
     }
 
+    /// [`Session::screen_text`] with every dim cell blanked: what a program
+    /// drew at full strength. A prompt's placeholder is drawn dim, so this is
+    /// how "the prompt has a draft in it" is told from "the prompt shows its
+    /// hint" (the agents pane's attach, `agent_open`).
+    pub fn screen_text_undimmed(&self) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let mut out = String::new();
+        for line in 0..grid.screen_lines() {
+            let mut row = String::new();
+            for col in 0..grid.columns() {
+                let cell = &grid[Point::new(Line(line as i32), Column(col))];
+                row.push(if cell.flags.contains(Flags::DIM) {
+                    ' '
+                } else {
+                    cell.c
+                });
+            }
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
     /// Snap the viewport back to the live (bottom) position.
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);

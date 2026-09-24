@@ -112,6 +112,41 @@ impl RenderShared {
         }
     }
 
+    /// One terminal cell at the current font size, in logical points.
+    pub fn cell_size(&mut self, pixels_per_point: f32) -> Vec2 {
+        let m = self.metrics_for(self.font_size * pixels_per_point);
+        Vec2::new(m.cell_w as f32, m.cell_h as f32) / pixels_per_point
+    }
+
+    /// Paint one line of `text` in the terminal's own glyphs — same face,
+    /// size, hinting and cell grid as the session — with cell 0's top-left
+    /// at `top_left` (snapped to the pixel grid). One cell per `char`.
+    pub fn paint_text(
+        &mut self,
+        painter: &egui::Painter,
+        top_left: Pos2,
+        text: &str,
+        color: Color32,
+    ) {
+        let ctx = painter.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let metrics = self.metrics_for(self.font_size * ppp);
+        let origin_px = Vec2::new((top_left.x * ppp).round(), (top_left.y * ppp).round());
+        let meshes = mesh::text_line(
+            &ctx,
+            &self.fonts,
+            &mut self.atlas,
+            metrics,
+            origin_px,
+            ppp,
+            text,
+            color,
+        );
+        for m in meshes {
+            painter.add(Shape::Mesh(Arc::new(m)));
+        }
+    }
+
     /// Change the font size; invalidates every tab's cached meshes.
     pub fn set_font_size(&mut self, size: f32) {
         let size = size.clamp(7.0, 32.0);
@@ -141,6 +176,9 @@ pub struct TabView {
     hints: Option<Hints>,
     /// Uploaded image textures, keyed by graphics id.
     textures: std::collections::HashMap<u32, egui::TextureHandle>,
+    /// Paint the default background as the theme's worker background
+    /// ([`Theme::worker_bg`]): the app sets it while the tab shows a worker.
+    pub worker_bg: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -217,6 +255,7 @@ impl Default for TabView {
             hover_target: None,
             hints: None,
             textures: std::collections::HashMap::new(),
+            worker_bg: false,
         }
     }
 }
@@ -224,6 +263,7 @@ impl Default for TabView {
 struct CachedFrame {
     origin_px: Vec2,
     generation: u32,
+    bg: Color32,
     meshes: Vec<Arc<Mesh>>,
 }
 
@@ -322,26 +362,37 @@ impl TabView {
 
         // Paint.
         let origin_px = Vec2::new((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
+        let bg = if self.worker_bg {
+            shared.theme.worker_bg()
+        } else {
+            shared.theme.bg
+        };
         let dirty = session.take_dirty();
         let needs_rebuild = dirty
             || self.last_blink != cursor_visible
-            || self
-                .cached
-                .as_ref()
-                .is_none_or(|c| c.origin_px != origin_px || c.generation != shared.generation);
+            || self.cached.as_ref().is_none_or(|c| {
+                c.origin_px != origin_px || c.generation != shared.generation || c.bg != bg
+            });
         self.last_blink = cursor_visible;
         if needs_rebuild {
+            // A worker's tab resolves the default background to its tint,
+            // so it is elided and filled below like any default cell.
+            let tinted = (bg != shared.theme.bg).then(|| Theme {
+                bg,
+                ..shared.theme.clone()
+            });
+            let metrics = shared.metrics_for(shared.font_size * ppp);
+            let theme = tinted.as_ref().unwrap_or(&shared.theme);
             let snapshot = {
                 let term = session.term.lock();
-                Snapshot::capture(&term, &shared.theme)
+                Snapshot::capture(&term, theme)
             };
-            let metrics = shared.metrics_for(shared.font_size * ppp);
             let mut params = BuildParams {
                 ctx: ui.ctx(),
                 fonts: &shared.fonts,
                 atlas: &mut shared.atlas,
                 metrics,
-                theme: &shared.theme,
+                theme,
                 origin_px,
                 pixels_per_point: ppp,
                 cursor_visible,
@@ -354,12 +405,13 @@ impl TabView {
             self.cached = Some(CachedFrame {
                 origin_px,
                 generation: shared.generation,
+                bg,
                 meshes,
             });
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, shared.theme.bg);
+        painter.rect_filled(rect, 0.0, bg);
         if let Some(cached) = &self.cached {
             for mesh in &cached.meshes {
                 if !mesh.vertices.is_empty() {

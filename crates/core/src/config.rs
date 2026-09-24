@@ -29,6 +29,8 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
+    /// Show the tab's subagents in a table under the terminal.
+    pub agents_pane: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

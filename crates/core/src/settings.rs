@@ -392,6 +392,21 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "claude.agents_pane",
+        label: "agents pane",
+        section: Section::Claude,
+        doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
+        note: &[
+            "Running and Done come from Claude Code's own files and need no",
+            "setup. An orchestrator can add Planned rows, titles, ETAs and",
+            "landings by writing a feed file (docs/agents-pane.md).",
+            "Done rows stay until /clear. The pane appears only in a tab whose",
+            "session has spawned a subagent; off, nothing is read or drawn.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "claude.resume_after_limit",
         label: "resume after a limit",
         section: Section::Claude,
