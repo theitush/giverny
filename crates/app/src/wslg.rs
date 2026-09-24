@@ -94,6 +94,33 @@ fn avoid_wayland_for(wsl: bool, wslg: bool, wayland_asked_for: bool) -> bool {
     wsl && wslg && !wayland_asked_for
 }
 
+/// Windows' display scale, as WSLg's compositor last heard it (175% → 1.75).
+///
+/// WSLg hands X11 clients a display at scale 1 whose XRandR size is 0 mm, so
+/// winit has no DPI to derive a scale from and reports 1.0: on a 175% laptop
+/// panel every egui label comes out at little more than half its size (#62).
+/// The real figure is in the RDP monitor layout Weston logs at startup and
+/// on every display change; there is no X property or env var carrying it.
+pub fn desktop_scale() -> Option<f32> {
+    let log = std::fs::read_to_string("/mnt/wslg/weston.log").ok()?;
+    parse_desktop_scale(&log)
+}
+
+/// The last non-zero `desktopScaleFactor:<percent>` in a Weston log. Zero is
+/// what Weston logs before the client has told it anything.
+fn parse_desktop_scale(log: &str) -> Option<f32> {
+    log.lines()
+        .rev()
+        .filter_map(|line| {
+            let rest = line.split("desktopScaleFactor:").nth(1)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        })
+        .find(|&pct| pct != 0)
+        .filter(|pct| (100..=500).contains(pct))
+        .map(|pct| pct as f32 / 100.0)
+}
+
 /// Mesa's d3d12 renderer string is `D3D12 (<adapter name>)`.
 fn is_d3d12(renderer: &str) -> bool {
     renderer.starts_with("D3D12")
@@ -226,6 +253,24 @@ mod tests {
         assert!(!avoid_wayland_for(true, false, false));
         assert!(!avoid_wayland_for(false, true, false));
         assert!(!avoid_wayland_for(false, false, false));
+    }
+
+    #[test]
+    fn the_desktop_scale_is_the_last_one_weston_heard() {
+        // Lines as WSLg's weston.log has them: a zero before the RDP client
+        // reports, then the real figure, then a zero again on a relayout.
+        let log = "[14:27:59.045] \trdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:0\n\
+                   [14:27:59.863] \trdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180\n\
+                   [14:27:59.869] \trdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:180\n";
+        assert_eq!(parse_desktop_scale(log), Some(1.75));
+        let later = format!("{log}[15:00:00.000] \trdpMonitor[0]: desktopScaleFactor:125, x\n");
+        assert_eq!(parse_desktop_scale(&later), Some(1.25));
+        assert_eq!(parse_desktop_scale(""), None);
+        assert_eq!(
+            parse_desktop_scale("rdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:0\n"),
+            None
+        );
+        assert_eq!(parse_desktop_scale("desktopScaleFactor:9000\n"), None);
     }
 
     #[test]
