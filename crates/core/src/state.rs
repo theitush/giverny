@@ -51,6 +51,11 @@ pub struct Layout {
     /// exists to hold one.
     #[serde(default)]
     pub collapsed_repos: Vec<PathBuf>,
+    /// The interface zoom (Ctrl+± outside a terminal, and alongside the
+    /// terminal font inside one). `None` until the user has one, so a fresh
+    /// start can pick a default from the display instead.
+    #[serde(default)]
+    pub zoom: Option<f32>,
 }
 
 /// What the rail groups tabs by.
@@ -85,6 +90,12 @@ impl Layout {
             && w <= 20_000.0
             && h <= 20_000.0)
             .then_some([w, h])
+    }
+
+    /// Sanitized zoom, inside the range egui itself allows (0.2–5.0).
+    pub fn zoom(&self) -> Option<f32> {
+        let z = self.zoom?;
+        (z.is_finite() && (0.2..=5.0).contains(&z)).then_some(z)
     }
 
     pub fn rail_width_in(&self, range: std::ops::RangeInclusive<f32>) -> Option<f32> {
@@ -260,6 +271,7 @@ mod tests {
                 rail_width: Some(300.0),
                 rail_view: RailView::Repos,
                 collapsed_repos: vec![PathBuf::from("/home/x/proj")],
+                zoom: Some(1.7),
             },
         };
         save(&paths, &state).unwrap();
@@ -271,6 +283,8 @@ mod tests {
         // How the rail was arranged is part of where you left off.
         assert_eq!(back.layout.rail_view, RailView::Repos);
         assert_eq!(back.layout.collapsed_repos.len(), 1);
+        // So is the interface zoom (#62: it came back at 1.0 every restart).
+        assert_eq!(back.layout.zoom(), Some(1.7));
         // The pre-window read sees the same thing without a full load.
         assert_eq!(load_layout(&paths), back.layout);
     }
@@ -294,6 +308,16 @@ mod tests {
         assert_eq!(rail(9000.0).rail_width_in(180.0..=420.0), Some(420.0));
         assert_eq!(rail(0.0).rail_width_in(180.0..=420.0), Some(180.0));
         assert_eq!(rail(300.0).rail_width_in(180.0..=420.0), Some(300.0));
+
+        let zoom = |z| Layout {
+            zoom: Some(z),
+            ..Default::default()
+        };
+        assert_eq!(zoom(f32::NAN).zoom(), None);
+        assert_eq!(zoom(0.0).zoom(), None);
+        assert_eq!(zoom(40.0).zoom(), None);
+        assert_eq!(zoom(1.5).zoom(), Some(1.5));
+        assert_eq!(Layout::default().zoom(), None);
     }
 
     #[test]

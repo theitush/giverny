@@ -499,13 +499,30 @@ fn main() -> eframe::Result {
     let gpu_gl = gpu_opengl();
     let renderer = pick_renderer(gpu_gl);
     let layout = state::load_layout(&paths);
+    // The interface zoom the user last left, or — on a first run only — the
+    // display's own scale where the platform hides it from winit (#62). Not
+    // on a later run that simply predates saving the zoom: its terminal font
+    // was already sized to make up for the 1.0, and would come out huge.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    let display_zoom = (try_x11 && wslg_x11 && !paths.state_file().exists())
+        .then(wslg::desktop_scale)
+        .flatten();
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+    let display_zoom: Option<f32> = None;
+    if let Some(z) = display_zoom {
+        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
+    }
+    let zoom = layout.zoom().or(display_zoom);
+    // A first window scaled with its contents, so they have the room the
+    // default size was chosen for.
+    let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
     let options = eframe::NativeOptions {
         renderer,
         viewport: egui::ViewportBuilder::default()
             .with_app_id("giverny")
             .with_title("Giverny")
             .with_icon(icon::icon_data(16))
-            .with_inner_size(layout.window_size().unwrap_or([1280.0, 820.0]))
+            .with_inner_size(layout.window_size().unwrap_or(first_size))
             .with_maximized(layout.maximized)
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
@@ -533,7 +550,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Giverny",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom)))),
     );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
@@ -1149,7 +1166,7 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, zoom: Option<f32>) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
         remember_env_accounts(&paths, &mut cfg);
@@ -1314,6 +1331,10 @@ impl App {
             cfg,
             last_cfg_check: Instant::now(),
         };
+        if let Some(z) = zoom {
+            cc.egui_ctx.set_zoom_factor(z);
+            app.layout.zoom = Some(z);
+        }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         if app.cfg.claude.auto_mode {
@@ -2439,12 +2460,19 @@ impl App {
         if let Some(rail) = egui::PanelState::load(ctx, egui::Id::new("rail")) {
             self.layout.rail_width = Some(rail.size().x);
         }
+        // Ctrl+± is egui's own zoom; read it back rather than intercepting
+        // the chord, which the terminal widget also answers to.
+        let zoom = ctx.zoom_factor();
+        if self.layout.zoom.is_some() || (zoom - 1.0).abs() > 0.001 {
+            self.layout.zoom = Some(zoom);
+        }
 
         let moved = |a: Option<f32>, b: Option<f32>| match (a, b) {
             (Some(a), Some(b)) => (a - b).abs() >= 1.0,
             (a, b) => a.is_some() != b.is_some(),
         };
         let changed = self.layout.maximized != before.maximized
+            || self.layout.zoom != before.zoom
             || moved(self.layout.rail_width, before.rail_width)
             || moved(
                 self.layout.window.map(|w| w[0]),
