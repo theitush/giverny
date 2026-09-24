@@ -296,9 +296,9 @@ pub struct Clock<'a> {
     pub tz: jiff::tz::TimeZone,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Clock<'_> {
-    fn plain() -> Clock<'static> {
+    pub(crate) fn plain() -> Clock<'static> {
         Clock {
             holds: &[],
             limit: None,
@@ -373,7 +373,7 @@ impl Table {
 
 /// Merge and format with no limit ever seen. Pure: `now_ms` in, text
 /// out.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
     build_at(feed, live, now_ms, &Clock::plain())
 }
