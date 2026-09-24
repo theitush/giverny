@@ -431,7 +431,13 @@ fn main() -> eframe::Result {
     let paths = Paths::default_dirs();
     // `GIVERNY_NO_X11` is set by the fallback below, so a second attempt
     // cannot loop.
-    let try_x11 = config::load(paths.base()).behavior.prefer_x11
+    let prefer_x11 = config::load(paths.base()).behavior.prefer_x11;
+    // WSLg's compositor crashes under our Wayland window (see `wslg`).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    let wslg_x11 = !prefer_x11 && wslg::avoid_wayland();
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+    let wslg_x11 = false;
+    let try_x11 = (prefer_x11 || wslg_x11)
         && std::env::var_os("GIVERNY_NO_X11").is_none()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_some();
@@ -440,7 +446,14 @@ fn main() -> eframe::Result {
         wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
         // SAFETY: no threads yet — this runs before the event loop.
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
-        tracing::info!("prefer_x11: using X11/XWayland so file drops arrive");
+        if wslg_x11 {
+            tracing::info!(
+                "WSLg: using X11/XWayland, since WSLg's compositor crashes under \
+                 Wayland windows (GIVERNY_WAYLAND=1 to use Wayland anyway)"
+            );
+        } else {
+            tracing::info!("prefer_x11: using X11/XWayland so file drops arrive");
+        }
     }
 
     // Reopen at the size the user left it. Read before the window exists, so

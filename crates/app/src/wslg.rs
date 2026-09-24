@@ -72,6 +72,28 @@ pub fn enable_d3d12() -> Gpu {
     }
 }
 
+/// Whether to open on XWayland rather than WSLg's Wayland (#46).
+///
+/// WSLg's compositor is a weston 9 fork that segfaults under a Wayland client
+/// that grows a `wl_shm_pool` while buffers from it are on screen: it keeps
+/// pointers into the pool's old mapping, and the resize moves it. winit's
+/// client-side decorations (sctk-adwaita) and its cursor theme both keep
+/// their buffers in pools that grow that way, so a Giverny window took the
+/// whole WSLg session down with it seconds or minutes after it opened. Under
+/// XWayland none of those pools exist. `GIVERNY_WAYLAND=1` opens on Wayland
+/// anyway.
+pub fn avoid_wayland() -> bool {
+    avoid_wayland_for(
+        std::env::var_os("WSL_DISTRO_NAME").is_some(),
+        std::path::Path::new("/mnt/wslg").is_dir(),
+        std::env::var_os("GIVERNY_WAYLAND").is_some(),
+    )
+}
+
+fn avoid_wayland_for(wsl: bool, wslg: bool, wayland_asked_for: bool) -> bool {
+    wsl && wslg && !wayland_asked_for
+}
+
 /// Mesa's d3d12 renderer string is `D3D12 (<adapter name>)`.
 fn is_d3d12(renderer: &str) -> bool {
     renderer.starts_with("D3D12")
@@ -195,6 +217,16 @@ fn probe_renderer() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_wslg_leaves_wayland_and_only_when_not_told_otherwise() {
+        assert!(avoid_wayland_for(true, true, false));
+        assert!(!avoid_wayland_for(true, true, true));
+        // WSL without WSLg (an X server of its own, say), and not WSL at all.
+        assert!(!avoid_wayland_for(true, false, false));
+        assert!(!avoid_wayland_for(false, true, false));
+        assert!(!avoid_wayland_for(false, false, false));
+    }
 
     #[test]
     fn only_a_d3d12_renderer_switches_the_driver() {
