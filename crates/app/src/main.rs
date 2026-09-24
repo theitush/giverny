@@ -1,5 +1,8 @@
 //! Giverny — a native terminal built around Claude Code.
 
+mod agent_open;
+mod agents_live;
+mod agents_pane;
 mod capture;
 mod chrome;
 mod claude_watch;
@@ -9,6 +12,7 @@ mod keymap;
 mod oom;
 mod overlays;
 mod rail;
+mod review;
 mod settings_ui;
 mod splash;
 mod taskbar;
@@ -18,7 +22,7 @@ mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,12 +342,23 @@ fn scrub_inherited_claude_markers() {
 }
 
 fn main() -> eframe::Result {
-    scrub_inherited_claude_markers();
+    // The transcript follower runs inside a tab and starts no Claude, so it
+    // has no markers to clear — and no business announcing that it did.
+    if std::env::args().nth(1).as_deref() != Some("transcript") {
+        scrub_inherited_claude_markers();
+    }
 
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let cfg = config::load(paths.base());
+                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), agents_pane_on(&cfg));
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("statusline") => {
@@ -365,6 +380,25 @@ fn main() -> eframe::Result {
         }
         Some("doctor") => {
             doctor();
+            return Ok(());
+        }
+        // A worker's transcript, readable and live: what a Running or Done
+        // row of the agents pane opens.
+        Some("transcript") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+            let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+                eprintln!("usage: giverny transcript [--follow] <agent-<id>.jsonl>");
+                std::process::exit(2);
+            };
+            let stdout = std::io::stdout();
+            if let Err(err) =
+                giverny_claude::transcript::follow(Path::new(path), follow, &mut stdout.lock())
+                && err.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                eprintln!("giverny transcript: {path}: {err}");
+                std::process::exit(1);
+            }
             return Ok(());
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -394,11 +428,15 @@ fn main() -> eframe::Result {
                  giverny welcome [from-version]\n                     \
                  print the welcome screen\n  \
                  giverny update     check for a newer release\n  \
+                 giverny transcript [--follow] <agent jsonl>\n                     \
+                 print a worker's transcript, readable (and follow it)\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
                  giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+                 giverny statusline (internal) Claude Code statusline entrypoint\n  \
+                 giverny relay --subagent-line\n                     \
+                 (internal) Claude Code subagentStatusLine entrypoint\n\n\
                  FLAGS:\n  -V, --version  print the version\n  \
                  -h, --help     print this help"
             );
@@ -603,6 +641,12 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
+    /// A row of the agents pane was clicked: Running and Done open the
+    /// worker, Planned shows its brief (`agent_open`).
+    AgentRowClicked(TabId, Box<agents_pane::RowClick>),
+    /// The worker overlay's Open in Claude Code (giverny#44): attach the
+    /// row's running worker in its parent tab.
+    OpenWorkerInClaude(TabId, Box<agents_pane::RowClick>),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -644,7 +688,14 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// When the screen was last read for a worker's view (giverny#17).
+    worker_checked: Option<Instant>,
 }
+
+/// How often the active tab's screen is read for a worker's view: fast
+/// enough that the tint follows `main` and ← at a glance, rare enough to
+/// cost nothing.
+const WORKER_CHECK: Duration = Duration::from_millis(200);
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
 /// tab titles, and the clamp a restored width is held to.
@@ -677,6 +728,37 @@ const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 struct Snapshot {
     at: Instant,
     hash: u64,
+}
+
+/// Paint `rt` on the worker background while it is a worker's tab, or while
+/// its Claude Code shows a subagent's view (giverny#17). The screen is read
+/// at most every [`WORKER_CHECK`], and only for the tab on screen.
+fn update_worker_bg(ctx: &egui::Context, rt: &mut TabRuntime, worker_tab: bool) {
+    if worker_tab {
+        rt.view.worker_bg = true;
+        return;
+    }
+    let Some(session) = &rt.session else {
+        rt.view.worker_bg = false;
+        return;
+    };
+    let now = Instant::now();
+    if let Some(at) = rt.worker_checked
+        && now.duration_since(at) < WORKER_CHECK
+    {
+        // A burst of frames: look once more when it is over, so the last
+        // screen of it (the view just switched) is the one read.
+        //
+        // egui brings a delayed repaint forward by its predicted frame time,
+        // so without adding it back the frame lands inside the window, asks
+        // again with less than a frame to go — which is "now" — and spins
+        // until the window closes: ~10 frames per burst, measured (#43).
+        let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt).clamp(0.0, 0.2));
+        ctx.request_repaint_after(WORKER_CHECK - now.duration_since(at) + predicted);
+        return;
+    }
+    rt.worker_checked = Some(now);
+    rt.view.worker_bg = agent_open::viewing_worker(&session.screen_text());
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -796,6 +878,20 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
+    /// Each tab's agents pane view state (`claude.agents_pane`); the rows
+    /// are `claude.agents`'.
+    pub agent_views: agents_pane::Views,
+    /// The overlay an agents-pane row opens: a brief, or a worker's
+    /// transcript (`overlays::BriefOverlay`).
+    pub brief: Option<overlays::BriefOverlay>,
+    /// The terminal session's rect last frame: where that overlay goes.
+    pub session_rect: Option<egui::Rect>,
+    /// Tabs opened for a worker (a Done row's follower, a row's open
+    /// command): painted on the worker background, like a subagent view.
+    worker_tabs: HashSet<TabId>,
+    /// A Running agents-pane row being attached: keys typed into its parent
+    /// tab's Claude Code, one per frame, to open the worker's view.
+    attach: Option<AttachJob>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -808,6 +904,15 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+}
+
+/// A running worker being attached: which tab is typed into, and the
+/// driver deciding each key from that tab's screen (`agent_open::Attach`).
+struct AttachJob {
+    tab: TabId,
+    /// The row's title, for a note if the attach stops short.
+    title: String,
+    driver: agent_open::Attach,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -843,6 +948,21 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
+/// Is the agents pane on? Read by its settings key rather than a struct
+/// field, so the relay and the installer follow whatever the settings table
+/// declares — and read as off in a build that does not declare it.
+fn agents_pane_on(cfg: &config::Config) -> bool {
+    giverny_core::settings::by_key("claude.agents_pane")
+        .and_then(|def| giverny_core::settings::current(cfg, def))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// `GIVERNY_FEED_DIR` as `%WSLENV%` lists it: `/p` translates the Windows
+/// path into the distribution's terms going in (`C:\…` → `/mnt/c/…`), so a
+/// feed writer inside WSL writes where the app reads.
+const FEED_DIR_WSLENV: &str = "GIVERNY_FEED_DIR/p";
+
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if claude.skip_resume_summary {
@@ -1031,13 +1151,15 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
                 .collect()
         })
         .unwrap_or_default();
-    for name in ours.iter().copied() {
-        // An entry may carry a flag (`VAR/p`); the name before it is the key.
+    for entry in ours.iter().copied() {
+        // An entry may carry a flag (`VAR/p`), ours or theirs; the name
+        // before it is the key.
+        let name = entry.split('/').next().unwrap_or(entry);
         if !parts
             .iter()
             .any(|p| p.split('/').next().is_some_and(|n| n == name))
         {
-            parts.push(name.to_string());
+            parts.push(entry.to_string());
         }
     }
     parts.join(":")
@@ -1196,6 +1318,11 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
+            agent_views: agents_pane::Views::default(),
+            brief: None,
+            session_rect: None,
+            worker_tabs: HashSet::new(),
+            attach: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1213,6 +1340,7 @@ impl App {
         if app.cfg.claude.auto_mode {
             app.claude.ensure_auto_mode();
         }
+        app.claude.set_agents_pane(agents_pane_on(&app.cfg));
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1336,6 +1464,7 @@ impl App {
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
+                self.agent_views.forget(id);
                 self.focus_terminal = true;
             }
             Action::Select(id) => {
@@ -1359,6 +1488,8 @@ impl App {
                 self.layout.rail_view = view;
                 self.state_dirty = true;
             }
+            Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
+            Action::OpenWorkerInClaude(tab, click) => self.open_worker_in_claude(ctx, tab, &click),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -1716,6 +1847,7 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    worker_checked: None,
                 });
                 entry.session = Some(session);
                 // Startup rc files may `cd` away from the spawn dir; verify
@@ -2206,6 +2338,9 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
+        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg) {
+            self.claude.set_agents_pane(agents_pane_on(&cfg));
+        }
         self.cfg = cfg;
         tracing::info!("config reloaded");
     }
@@ -2621,6 +2756,12 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
+        // Where an orchestrator in this tab writes its agents-pane feed
+        // (`docs/agents-pane.md`) — the directory this app reads.
+        env.push((
+            giverny_claude::feed::DIR_ENV.into(),
+            giverny_claude::feed::feed_dir().display().to_string(),
+        ));
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
@@ -2688,6 +2829,14 @@ impl App {
             // only what we set, since listing a name we did not set is what
             // put an empty CLAUDE_CONFIG_DIR in front of Claude Code.
             .filter(|name| name.starts_with("GIVERNY_") || name.starts_with("CLAUDE_"))
+            // A path, so it crosses translated.
+            .map(|name| {
+                if name == giverny_claude::feed::DIR_ENV {
+                    FEED_DIR_WSLENV
+                } else {
+                    name
+                }
+            })
             // These two come from the spawn itself rather than from here.
             .chain(["GIVERNY_TAB_ID", "GIVERNY_NONCE"])
             .collect();
@@ -2707,6 +2856,352 @@ impl App {
         }
     }
 
+    /// A click on an agents-pane row of tab `parent`: the worker overlay
+    /// (Running live, Done at its end), or a Planned row's brief.
+    fn open_agent_row(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &agents_pane::RowClick,
+    ) {
+        // A Done row whose `open` resumes a conversation that is running in
+        // a Giverny tab goes to that tab (giverny#41).
+        if let Some(sid) = agent_open::done_resumes(click)
+            && let Some(id) = self.live_holder(&sid)
+        {
+            self.apply(ctx, Action::Select(id));
+            return;
+        }
+        let plan = agent_open::plan(click);
+        let button = self.overlay_button(parent, click);
+        // A Done row's task may have landed in Review: its Review line goes
+        // at the top of the overlay, fetched off the UI thread (giverny#60).
+        let review = (click.stage == giverny_claude::feed::Stage::Done)
+            .then(|| review::issue_of(&click.key))
+            .flatten()
+            .map(|issue| review::fetch(issue, ctx.clone()));
+        self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
+    }
+
+    /// The Giverny tab running conversation `sid`, when it is live.
+    fn live_holder(&self, sid: &str) -> Option<TabId> {
+        let dirs: Vec<PathBuf> = self
+            .claude
+            .profiles
+            .iter()
+            .map(|p| p.config_dir.clone())
+            .collect();
+        if !giverny_claude::registry::session_is_live(dirs, sid) {
+            return None;
+        }
+        self.ws
+            .tabs
+            .iter()
+            .find(|t| t.claude_session.as_deref() == Some(sid))
+            .map(|t| t.id)
+    }
+
+    /// Whether `tab` has a live terminal to type into.
+    fn tab_is_live(&self, tab: TabId) -> bool {
+        self.rt.get(&tab).is_some_and(|rt| rt.session.is_some())
+            && self.ws.tab(tab).is_some_and(|t| !t.exited)
+    }
+
+    /// The Agent call's description for a worker of `parent` — what Claude
+    /// Code's list shows, and what an attach finds it by.
+    fn worker_description(
+        &self,
+        parent: TabId,
+        agent_id: &str,
+        click: &agents_pane::RowClick,
+    ) -> Option<String> {
+        self.claude
+            .agents
+            .tracker(parent)
+            .and_then(|t| t.get(agent_id))
+            .and_then(|r| r.description.clone())
+            .or_else(|| {
+                let dir = click.transcript.as_deref()?.parent()?;
+                giverny_claude::subagents::read_meta(dir, agent_id).description
+            })
+            .filter(|d| !d.trim().is_empty())
+    }
+
+    /// The worker overlay's footer for this row.
+    fn overlay_button(&self, parent: TabId, click: &agents_pane::RowClick) -> overlays::Button {
+        use overlays::Button;
+        let no_tab = "This tab has no live terminal to type into.";
+        match agent_open::offer(click) {
+            agent_open::Offer::Nothing => Button::None,
+            agent_open::Offer::OpenInClaude { .. } if !self.tab_is_live(parent) => {
+                Button::Disabled {
+                    label: "Open in Claude Code",
+                    why: no_tab.into(),
+                }
+            }
+            agent_open::Offer::OpenInClaude { .. } => Button::Open {
+                tab: parent,
+                click: Box::new(click.clone()),
+            },
+        }
+    }
+
+    /// The overlay's Open in Claude Code: attach the worker, or say why not.
+    fn open_worker_in_claude(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        click: &agents_pane::RowClick,
+    ) {
+        let title = agent_open::title_of(click);
+        let Some(agent_id) = click.agent_id.clone() else {
+            return;
+        };
+        if !self.start_attach(ctx, parent, &title, &agent_id, click) {
+            self.brief = Some(overlays::BriefOverlay::text(
+                title,
+                None,
+                "Giverny cannot find this worker's description, which is what Claude Code \
+                 lists it by, so it cannot open it there. In this tab, type /tasks and press \
+                 f on the worker."
+                    .into(),
+            ));
+        }
+    }
+
+    /// Attach a running worker (giverny#23): show its parent tab and start
+    /// typing Claude Code's key path to the worker's view into it. False
+    /// when it cannot start — no live terminal in the tab, or no description
+    /// to find the worker by in Claude Code's list.
+    fn start_attach(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        agent_id: &str,
+        click: &agents_pane::RowClick,
+    ) -> bool {
+        if !self.tab_is_live(parent) {
+            return false;
+        }
+        // The Agent call's description is what Claude Code's list shows.
+        let Some(description) = self.worker_description(parent, agent_id, click) else {
+            tracing::info!("agents pane: no description for {agent_id}");
+            return false;
+        };
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        self.reveal_terminal();
+        self.attach = Some(AttachJob {
+            tab: parent,
+            title: title.to_string(),
+            driver: agent_open::Attach::new(description, Instant::now()),
+        });
+        ctx.request_repaint();
+        true
+    }
+
+    /// One frame of an attach: read the parent's screen, maybe type a key.
+    fn process_attach(&mut self, ctx: &egui::Context) {
+        use agent_open::Tick;
+        let Some(job) = &mut self.attach else {
+            return;
+        };
+        // Switched away: stop typing into a tab nobody is looking at.
+        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
+        let (Some(session), true) = (session, self.ws.active == Some(job.tab)) else {
+            self.attach = None;
+            return;
+        };
+        let screen = session.screen_text();
+        let undimmed = session.screen_text_undimmed();
+        match job.driver.tick(Instant::now(), &screen, &undimmed) {
+            Tick::Send(key) => {
+                let mode = session.mode();
+                let bytes = agent_open::keystroke_bytes(key, |k, m| {
+                    giverny_term::input::encode_key(k, m, mode)
+                });
+                session.write(bytes);
+            }
+            Tick::Wait => {}
+            Tick::Done => self.attach = None,
+            Tick::Stuck(why) => {
+                tracing::info!("agents pane: attach stopped: {why:?}");
+                let text = why.explain(&job.driver.description);
+                let title = job.title.clone();
+                self.attach = None;
+                self.settings = None;
+                self.keys_overlay = None;
+                self.brief = Some(overlays::BriefOverlay::text(title, None, text));
+            }
+        }
+        if self.attach.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    /// Debug builds only: `GIVERNY_DEBUG_CLICK=<row key>[:button]` clicks
+    /// the active tab's agents-pane row with that key a few seconds in, and
+    /// with `:button` presses the overlay's footer button a few seconds
+    /// later — the path after a pointer click, driven in-process, so it can
+    /// be watched with `GIVERNY_CAPTURE` without synthetic input events.
+    #[cfg(debug_assertions)]
+    fn debug_click(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FRAME: AtomicU32 = AtomicU32::new(0);
+        const CLICK_AT: u32 = 150;
+        const BUTTON_AT: u32 = 400;
+        let Ok(spec) = std::env::var("GIVERNY_DEBUG_CLICK") else {
+            return;
+        };
+        let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+        if frame <= BUTTON_AT {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        let (key, button) = match spec.split_once(":button") {
+            Some((k, _)) => (k, true),
+            None => (spec.as_str(), false),
+        };
+        if frame == CLICK_AT {
+            let Some(active) = self.ws.active else { return };
+            let Some(tracker) = self.claude.agents.tracker(active) else {
+                tracing::warn!("debug click: no agents for the active tab");
+                return;
+            };
+            let feed = tracker
+                .session_id
+                .as_deref()
+                .and_then(|sid| giverny_claude::feed::find(&giverny_claude::feed::feed_dir(), sid))
+                .map(|(_, f)| f);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let table = agents_pane::build(feed.as_ref(), tracker.rows(), now);
+            match table.lines.into_iter().find(|l| l.id == key) {
+                Some(line) => {
+                    tracing::info!("debug click: {key} ({:?})", line.stage);
+                    self.apply(ctx, Action::AgentRowClicked(active, Box::new(line.click)));
+                }
+                None => tracing::warn!("debug click: no row {key}"),
+            }
+        }
+        if frame == BUTTON_AT && button {
+            let action = self.brief.as_ref().and_then(|ov| match &ov.button {
+                overlays::Button::Open { tab, click } => {
+                    Some(Action::OpenWorkerInClaude(*tab, click.clone()))
+                }
+                _ => None,
+            });
+            tracing::info!("debug click: button {}", action.is_some());
+            if let Some(action) = action {
+                self.brief = None;
+                self.apply(ctx, action);
+            }
+        }
+    }
+
+    /// Carry out an agents-pane plan: the overlay, or (a Running row with
+    /// only an `open` command) a new tab.
+    fn carry_out_open(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        plan: agent_open::Plan,
+        facts: Vec<String>,
+        button: overlays::Button,
+        review: Option<review::Slot>,
+    ) {
+        use agent_open::{Body, Plan};
+        let mut overlay = match plan {
+            Plan::Watch {
+                title,
+                transcript,
+                live,
+            } => overlays::BriefOverlay::transcript(title, transcript, live),
+            Plan::Show { title, body } => match body {
+                Body::File(path) => {
+                    let text = agent_open::read_brief(&path);
+                    overlays::BriefOverlay::text(title, Some(path), text)
+                }
+                Body::Text(text) => overlays::BriefOverlay::text(title, None, text),
+            },
+            Plan::Run { title, command } => {
+                // The same guard a resume has: two claudes on one
+                // conversation interleave its transcript.
+                if let Some(sid) = agent_open::resumed_session(&command) {
+                    let dirs: Vec<PathBuf> = self
+                        .claude
+                        .profiles
+                        .iter()
+                        .map(|p| p.config_dir.clone())
+                        .collect();
+                    if giverny_claude::registry::session_is_live(dirs, &sid) {
+                        if let Some(id) = self.live_holder(&sid) {
+                            self.apply(ctx, Action::Select(id));
+                            return;
+                        }
+                        overlays::BriefOverlay::text(
+                            title,
+                            None,
+                            format!(
+                                "This worker's conversation is already running outside \
+                                 Giverny ({sid}). Resuming it here as well would put two \
+                                 claudes on one transcript, so nothing was opened.\n\n\
+                                 The row's open command:\n  {command}"
+                            ),
+                        )
+                    } else {
+                        self.open_worker_tab(ctx, parent, &title, command);
+                        return;
+                    }
+                } else {
+                    self.open_worker_tab(ctx, parent, &title, command);
+                    return;
+                }
+            }
+        };
+        overlay.facts = facts;
+        overlay.button = button;
+        overlay.review = review;
+        self.settings = None;
+        self.keys_overlay = None;
+        self.brief = Some(overlay);
+    }
+
+    /// A new tab beside `parent` — its category, its directory — titled for
+    /// a worker, that runs `command` once its shell is up.
+    fn open_worker_tab(
+        &mut self,
+        ctx: &egui::Context,
+        parent: TabId,
+        title: &str,
+        command: String,
+    ) -> TabId {
+        let cwd = self.ws.tab(parent).and_then(|t| t.cwd.clone());
+        let cat = match self.ws.tab(parent) {
+            Some(t) => t.category,
+            None => category_for_agent(&mut self.ws, cwd.as_deref()),
+        };
+        let id = self.ws.add_tab(cat);
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.cwd = cwd.or_else(dirs::home_dir);
+            tab.custom_title = Some(title.to_string());
+        }
+        self.worker_tabs.insert(id);
+        self.spawn_session(ctx, id, None);
+        // The deferred injection the other tab-opening paths use: give the
+        // shell time to be ready before typing into it.
+        self.pending_inject.push((
+            Instant::now() + Duration::from_millis(900),
+            id,
+            Inject::Raw(format!("{command}\r").into_bytes()),
+        ));
+        self.apply(ctx, Action::Select(id));
+        id
+    }
+
     /// Picking a tab means "show me that tab": the settings screen and the
     /// key list take the terminal's place, so a tab clicked in the rail while
     /// one of them is open used to look like a click that did nothing — the
@@ -2714,6 +3209,7 @@ impl App {
     fn reveal_terminal(&mut self) {
         self.settings = None;
         self.keys_overlay = None;
+        self.brief = None;
         self.focus_terminal = true;
     }
 
@@ -2732,6 +3228,9 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        // The worker overlay takes the keyboard while it is open: Esc and
+        // its own keys, and nothing typed reaches the shell underneath.
+        actions.extend(overlays::brief_keys(self, ctx));
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
@@ -2847,6 +3346,9 @@ impl eframe::App for App {
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
+        self.process_attach(&ctx);
+        #[cfg(debug_assertions)]
+        self.debug_click(&ctx);
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
@@ -3012,8 +3514,31 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
+            // The agents pane takes the bottom of the terminal's area.
+            if self.cfg.claude.agents_pane
+                && let Some(click) = agents_pane::show(
+                    &mut self.agent_views,
+                    active,
+                    self.claude.agents.tracker(active),
+                    agents_pane::limit_for(
+                        &self.claude,
+                        active,
+                        self.limited.get(&active).map(|w| w.reopens),
+                        jiff::Timestamp::now(),
+                    ),
+                    &self.chrome,
+                    &mut self.shared,
+                    ui,
+                )
+            {
+                actions.push(Action::AgentRowClicked(active, Box::new(click)));
+            }
+
             if let Some(rt) = self.rt.get_mut(&active) {
+                update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
                 if let Some(session) = &mut rt.session {
+                    // The worker overlay is laid out on this rect.
+                    self.session_rect = Some(ui.available_rect_before_wrap());
                     let response = rt.view.show(ui, &mut self.shared, session);
                     if self.focus_terminal {
                         response.request_focus();
@@ -3030,6 +3555,7 @@ impl eframe::App for App {
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
+        actions.extend(overlays::brief_ui(self, &ctx));
 
         for action in actions {
             self.apply(&ctx, action);
@@ -3682,6 +4208,13 @@ mod tests {
 
         // Windows Terminal exports a trailing colon; an empty entry there
         // would list a variable with no name.
+        // Ours may carry a flag too: the feed dir is a path, translated with
+        // `/p` — and a name they already share is still not listed twice.
+        let feed = wslenv(None, &[FEED_DIR_WSLENV, "GIVERNY_TAB_ID"]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR/p:GIVERNY_TAB_ID");
+        let feed = wslenv(Some("GIVERNY_FEED_DIR".into()), &[FEED_DIR_WSLENV]);
+        assert_eq!(feed, "GIVERNY_FEED_DIR", "theirs wins: {feed}");
+
         let theirs = wslenv(Some("WT_SESSION:WT_PROFILE_ID:".into()), &["GIVERNY_NONCE"]);
         assert_eq!(theirs, "WT_SESSION:WT_PROFILE_ID:GIVERNY_NONCE");
         assert!(!theirs.contains("::"), "{theirs}");
