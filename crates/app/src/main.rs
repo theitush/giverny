@@ -2747,8 +2747,37 @@ impl App {
     }
 }
 
+/// Frames drawn per second, logged every ten seconds at debug level
+/// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
+/// asked for the last one. On a software renderer every frame is CPU, so
+/// this is the number that explains a busy process (#43).
+fn count_frame(ctx: &egui::Context) {
+    use std::sync::Mutex;
+    static FRAMES: Mutex<Option<(Instant, u32, u32)>> = Mutex::new(None);
+    let Ok(mut slot) = FRAMES.lock() else { return };
+    let (since, frames, passes) = slot.get_or_insert((Instant::now(), 0, 0));
+    *passes += 1;
+    if ctx.current_pass_index() == 0 {
+        *frames += 1;
+    }
+    let elapsed = since.elapsed();
+    if elapsed >= Duration::from_secs(10) {
+        let secs = elapsed.as_secs_f64();
+        tracing::debug!(
+            "frames: {:.1}/s ({:.1} passes/s, predicted {:.0} ms each) over {secs:.0}s, \
+             the last asked for by {:?}",
+            *frames as f64 / secs,
+            *passes as f64 / secs,
+            ctx.input(|i| i.predicted_dt) * 1000.0,
+            ctx.repaint_causes()
+        );
+        *slot = Some((Instant::now(), 0, 0));
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        count_frame(ui.ctx());
         // Documentation capture (GIVERNY_CAPTURE); no-op otherwise.
         if let Some(cap) = &mut self.capture {
             cap.on_frame(ui.ctx());
@@ -2824,14 +2853,20 @@ impl eframe::App for App {
         for (summary, body) in effects.notify {
             desktop_notify(summary, body);
         }
-        if effects.animating {
-            ctx.request_repaint_after(Duration::from_millis(120));
-        } else {
-            // Heartbeat: egui only repaints on demand, so without this the
-            // registry scan (and therefore state transitions for tabs whose
-            // output isn't waking the UI) would stall while the window idles.
-            ctx.request_repaint_after(Duration::from_millis(700));
-        }
+        // Heartbeat: egui only repaints on demand, so without this the
+        // registry scan (and therefore state transitions for tabs whose
+        // output isn't waking the UI) would stall while the window idles.
+        //
+        // A working tab no longer shortens it. The spinners wake the window
+        // themselves, at their own step and only while they are on screen
+        // (`rail::keep_animating`); a timer here repainted everything at
+        // ~8 fps for as long as any tab worked, seen or not (#43). On the
+        // animation clock's grid, so it shares a frame with them when they
+        // run.
+        ctx.request_repaint_after(
+            giverny_term::pace::until_next_tick(true, ctx.input(|i| i.predicted_dt))
+                + Duration::from_millis(500),
+        );
 
         let mut actions = self.shortcuts(&ctx);
 
