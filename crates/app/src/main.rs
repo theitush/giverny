@@ -16,6 +16,7 @@ mod review;
 mod settings_ui;
 mod splash;
 mod taskbar;
+mod titlebar;
 mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
@@ -516,6 +517,11 @@ fn main() -> eframe::Result {
     // A first window scaled with its contents, so they have the room the
     // default size was chosen for.
     let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
+    // WSLg frames an X11 window with Weston's own caption — a 1x-scale strip
+    // with Windows-95 buttons inside a thick black band — and there is no way
+    // to have Windows draw one instead, so there Giverny draws its own (#69).
+    // `GIVERNY_WSLG_FRAME=1` keeps Weston's.
+    let frameless = try_x11 && wslg_x11 && std::env::var_os("GIVERNY_WSLG_FRAME").is_none();
     let options = eframe::NativeOptions {
         renderer,
         viewport: egui::ViewportBuilder::default()
@@ -524,7 +530,8 @@ fn main() -> eframe::Result {
             .with_icon(icon::icon_data(16))
             .with_inner_size(layout.window_size().unwrap_or(first_size))
             .with_maximized(layout.maximized)
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_decorations(!frameless),
         ..Default::default()
     };
     // A hook rather than `catch_unwind`: wgpu's failure panics, and then
@@ -550,7 +557,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Giverny",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom, frameless)))),
     );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
@@ -855,6 +862,8 @@ pub struct App {
     /// How many tabs wanted you at the last frame, so the taskbar is only
     /// told when that changes.
     attention: usize,
+    /// The window has no decorations and draws its own caption (#69).
+    frameless: bool,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -1166,7 +1175,7 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, zoom: Option<f32>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, zoom: Option<f32>, frameless: bool) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
         remember_env_accounts(&paths, &mut cfg);
@@ -1300,6 +1309,7 @@ impl App {
             row_rects: Vec::new(),
             stale_sessions: false,
             attention: 0,
+            frameless,
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -3412,6 +3422,22 @@ impl eframe::App for App {
         );
 
         let mut actions = self.shortcuts(&ctx);
+
+        if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            titlebar::resize_edges(&ctx);
+            titlebar::outline(&ctx, &self.chrome);
+            let title = if self.attention > 0 {
+                format!("Giverny ({})", self.attention)
+            } else {
+                "Giverny".to_string()
+            };
+            egui::Panel::top("titlebar")
+                .exact_size(titlebar::HEIGHT)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| titlebar::show(ui, &title, &self.chrome));
+        }
 
         egui::Panel::left("rail")
             .resizable(true)
