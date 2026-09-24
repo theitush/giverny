@@ -12,6 +12,7 @@ mod keymap;
 mod oom;
 mod overlays;
 mod rail;
+mod review;
 mod settings_ui;
 mod splash;
 mod taskbar;
@@ -2858,7 +2859,13 @@ impl App {
         }
         let plan = agent_open::plan(click);
         let button = self.overlay_button(parent, click);
-        self.carry_out_open(ctx, parent, plan, click.facts.clone(), button);
+        // A Done row's task may have landed in Review: its Review line goes
+        // at the top of the overlay, fetched off the UI thread (giverny#60).
+        let review = (click.stage == giverny_claude::feed::Stage::Done)
+            .then(|| review::issue_of(&click.key))
+            .flatten()
+            .map(|issue| review::fetch(issue, ctx.clone()));
+        self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
     }
 
     /// The Giverny tab running conversation `sid`, when it is live.
@@ -3174,6 +3181,7 @@ impl App {
         plan: agent_open::Plan,
         facts: Vec<String>,
         button: overlays::Button,
+        review: Option<review::Slot>,
     ) {
         use agent_open::{Body, Plan};
         let mut overlay = match plan {
@@ -3226,6 +3234,7 @@ impl App {
         };
         overlay.facts = facts;
         overlay.button = button;
+        overlay.review = review;
         self.settings = None;
         self.keys_overlay = None;
         self.brief = Some(overlay);

@@ -281,6 +281,9 @@ pub struct BriefOverlay {
     pub source: Option<PathBuf>,
     /// The row's state in words (landing, timing, tokens).
     pub facts: Vec<String>,
+    /// A Done row's task's Review line, once fetched (giverny#60): drawn at
+    /// the top, set apart, because it is what a person has to read.
+    pub review: Option<crate::review::Slot>,
     pub content: Content,
     pub button: Button,
     /// Bumped whenever the text changes; the laid-out text is cached on it.
@@ -360,6 +363,7 @@ impl BriefOverlay {
             title,
             source,
             facts: Vec::new(),
+            review: None,
             content,
             button: Button::None,
             generation: 0,
@@ -613,6 +617,33 @@ struct Drawn {
     body: egui::Rect,
 }
 
+/// The Review line, boxed in amber under the title: the first thing read.
+fn draw_review(ui: &mut egui::Ui, c: &crate::chrome::Chrome, line: &str) {
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(c.amber.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, c.amber))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                "Review  ",
+                0.0,
+                egui::TextFormat::simple(FontId::monospace(12.5), c.amber),
+            );
+            job.append(
+                line,
+                0.0,
+                egui::TextFormat::simple(FontId::monospace(12.5), c.fg),
+            );
+            job.wrap.max_width = ui.available_width();
+            ui.add(egui::Label::new(job).selectable(true).wrap());
+        });
+    ui.add_space(4.0);
+}
+
 fn draw_overlay(
     ov: &mut BriefOverlay,
     c: &crate::chrome::Chrome,
@@ -690,6 +721,13 @@ fn draw_overlay(
                             );
                         });
                     });
+                    let review = ov
+                        .review
+                        .as_ref()
+                        .and_then(|s| s.lock().ok().and_then(|g| g.clone()));
+                    if let Some(line) = review {
+                        draw_review(ui, &c, &line);
+                    }
                     let sub = match (&ov.source, &ov.content) {
                         (Some(src), _) => Some(src.display().to_string()),
                         (None, Content::Transcript(v)) => Some(v.path.display().to_string()),
