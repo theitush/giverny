@@ -251,6 +251,41 @@ fn wgpu_adapter() -> Option<eframe::wgpu::AdapterInfo> {
         .map(|adapter| adapter.get_info())
 }
 
+/// Does the window draw on a GPU? Asked of the renderer the window actually
+/// got, not the one we hoped for: the rail's spinners turn smoothly only
+/// where a frame is cheap (#70), and a software rasterizer is where it is not.
+fn draws_on_gpu(cc: &eframe::CreationContext<'_>) -> bool {
+    if let Some(gl) = &cc.gl {
+        use eframe::glow::HasContext;
+        let renderer = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+        let gpu = !is_software_gl(&renderer);
+        tracing::info!(
+            "frames {}: OpenGL renderer {renderer}",
+            if gpu { "cheap" } else { "on the CPU" }
+        );
+        return gpu;
+    }
+    if let Some(wgpu) = &cc.wgpu_render_state {
+        return wgpu.adapter.get_info().device_type != eframe::wgpu::DeviceType::Cpu;
+    }
+    false
+}
+
+/// Mesa's and Windows' CPU rasterizers, by the renderer string they report.
+fn is_software_gl(renderer: &str) -> bool {
+    let r = renderer.to_ascii_lowercase();
+    [
+        "llvmpipe",
+        "softpipe",
+        "lavapipe",
+        "swrast",
+        "software",
+        "gdi generic",
+    ]
+    .iter()
+    .any(|s| r.contains(s))
+}
+
 /// wgpu unless its adapter is missing or a software rasterizer, where OpenGL
 /// is the better bet: it either reaches a GPU wgpu could not, or is no slower.
 fn renderer_for(adapter: Option<&eframe::wgpu::AdapterInfo>) -> eframe::Renderer {
@@ -1179,6 +1214,7 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name));
 
@@ -3998,6 +4034,14 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_gl_renderers_are_told_from_gpus() {
+        assert!(is_software_gl("llvmpipe (LLVM 20.1.2, 256 bits)"));
+        assert!(is_software_gl("GDI Generic"));
+        assert!(!is_software_gl("D3D12 (Intel(R) Graphics)"));
+        assert!(!is_software_gl("Mesa Intel(R) Graphics (MTL)"));
+    }
 
     #[test]
     fn a_software_adapter_opens_on_opengl() {

@@ -35,6 +35,66 @@ pub const STEP_FOCUSED: Duration = Duration::from_millis(250);
 /// [`STEP_FOCUSED`], so both land on the same grid.
 pub const STEP_BACKGROUND: Duration = Duration::from_millis(500);
 
+/// A spinner's frames per [`STEP_FOCUSED`] tick while the window draws on a
+/// GPU: twelve a second, which reads as turning rather than ticking (#70).
+///
+/// [`STEP_FOCUSED`] is what a frame costs on a software renderer. On a GPU
+/// (WSLg's d3d12 driver, since #59) a frame is well under 1% of a core, so a
+/// spinner that has to hop a quarter second at a time saves almost nothing,
+/// and it looks broken: slow, and uneven, because its snapped clock turns
+/// only when a frame happens to land past the tick.
+///
+/// A whole number of frames per tick, so the spinner's frames fall on the
+/// shared clock's grid and every frame drawn for the terminal or the
+/// heartbeat is one of them rather than an extra one in between.
+pub const SPIN_PER_STEP: u64 = 3;
+/// [`SPIN_PER_STEP`] while the window is in the background: four a second,
+/// still even, at a third of the cost.
+pub const SPIN_PER_STEP_BACKGROUND: u64 = 1;
+
+/// Frames are cheap: the window draws on a GPU. Set once the renderer is
+/// known; until then, and on a software rasterizer, animations keep to the
+/// shared [`STEP_FOCUSED`] clock.
+static CHEAP_FRAMES: AtomicBool = AtomicBool::new(false);
+
+/// Say whether the window draws on a GPU (see [`CHEAP_FRAMES`]).
+pub fn set_cheap_frames(cheap: bool) {
+    CHEAP_FRAMES.store(cheap, Ordering::Relaxed);
+}
+
+/// Does the window draw on a GPU?
+pub fn cheap_frames() -> bool {
+    CHEAP_FRAMES.load(Ordering::Relaxed)
+}
+
+/// How long until a smooth animation's next frame: the next of
+/// [`SPIN_PER_STEP`] (or [`SPIN_PER_STEP_BACKGROUND`]) even slots in a
+/// [`STEP_FOCUSED`] tick, aimed [`LAND_PAST`] beyond it as [`until_next_tick`]
+/// is. The angle is read from the real clock, so a frame that lands late
+/// shows where the spinner is, not where it was.
+pub fn until_next_spin(focused: bool, predicted_dt: f32) -> Duration {
+    let per_step = if focused {
+        SPIN_PER_STEP
+    } else {
+        SPIN_PER_STEP_BACKGROUND
+    };
+    to_slot(
+        epoch().elapsed().as_micros() as u64 + 1000,
+        per_step,
+        dt_ms(predicted_dt),
+    )
+}
+
+/// [`until_next_spin`] over plain numbers: `now` in microseconds on the
+/// [`now_ms`] clock, `dt` in milliseconds.
+fn to_slot(now_us: u64, per_step: u64, dt: u64) -> Duration {
+    let step = STEP_FOCUSED.as_micros() as u64;
+    // Slot n starts at n * step / per_step, rounded up to the microsecond:
+    // no drift against the tick grid however long the spinner runs.
+    let next = ((now_us * per_step / step + 1) * step).div_ceil(per_step);
+    Duration::from_micros(next - now_us) + Duration::from_millis(dt + LAND_PAST)
+}
+
 /// Milliseconds since [`epoch`], plus one so that zero means "never".
 static LAST_INPUT: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +241,22 @@ mod tests {
         assert_eq!(to_tick(1_000, false, 25), MS(540));
         assert_eq!(to_tick(1_249, true, 25), MS(41));
         assert_eq!(to_tick(1_249, false, 25), MS(291));
+    }
+
+    #[test]
+    fn spinner_slots_share_the_tick_grid() {
+        // Where the frame asked for at `now` is aimed, minus the margin.
+        let slot =
+            |now: u64, per_step| now + to_slot(now, per_step, 25).as_micros() as u64 - 40_000;
+        // Three slots a tick, the third ending on the next tick exactly.
+        assert_eq!(slot(1_000_000, 3), 1_083_334);
+        assert_eq!(slot(1_083_334, 3), 1_166_667);
+        assert_eq!(slot(1_166_667, 3), 1_250_000);
+        assert_eq!(slot(1_249_999, 3), 1_250_000);
+        // Still on the grid an hour in.
+        assert_eq!(slot(3_600_000_000 - 1, 3), 3_600_000_000);
+        // In the background, one a tick: the tick itself.
+        assert_eq!(to_slot(1_000_000, 1, 25), to_tick(1_000, true, 25));
     }
 
     #[test]

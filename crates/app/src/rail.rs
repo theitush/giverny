@@ -43,6 +43,54 @@ fn keep_animating(ui: &Ui, rect: Rect) {
     ui.ctx()
         .request_repaint_after(giverny_term::pace::until_next_tick(focused, predicted_dt));
 }
+
+/// Where the rail's spinners point, in turns, and a request for their next
+/// frame while `rect` is on screen.
+///
+/// On a GPU they turn once a second on the real clock, twelve frames a
+/// second ([`giverny_term::pace::SPIN_PER_STEP`]): evenly, because the angle is where
+/// the clock is when the frame is drawn, not which snapped step it fell in
+/// (#70). On a software renderer every frame is CPU, so they keep to the
+/// shared four-a-second clock at half a turn a second, eight positions to a
+/// turn (#43).
+fn spin(ui: &Ui, rect: Rect) -> f64 {
+    keep_spinning(ui, rect);
+    spin_turns(ui)
+}
+
+/// [`spin`]'s angle alone, for a spinner whose rect is not known yet.
+fn spin_turns(ui: &Ui) -> f64 {
+    if giverny_term::pace::cheap_frames() {
+        ui.input(|i| i.time)
+    } else {
+        anim_time() / 2.0
+    }
+}
+
+/// [`spin`]'s next frame alone.
+fn keep_spinning(ui: &Ui, rect: Rect) {
+    if !giverny_term::pace::cheap_frames() {
+        return keep_animating(ui, rect);
+    }
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
+    ui.ctx()
+        .request_repaint_after(giverny_term::pace::until_next_spin(focused, predicted_dt));
+}
+
+/// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
+/// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
+fn braille(turns: f64) -> String {
+    let step = if giverny_term::pace::cheap_frames() {
+        (turns * SPINNER.len() as f64) as usize
+    } else {
+        (turns * 2.0 / ANIM_STEP) as usize
+    };
+    SPINNER[step % SPINNER.len()].to_string()
+}
+
 // Chrome colours come from the active theme (see `chrome`), reached through
 // `app.chrome`. Only geometry is constant here.
 
@@ -523,16 +571,13 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         }
     });
 
-    let now = anim_time();
+    let turns = spin_turns(ui);
     for job in &app.claude.jobs {
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
-            JobState::Working if job.live => (
-                SPINNER[(now / ANIM_STEP) as usize % SPINNER.len()].to_string(),
-                c.accent,
-            ),
+            JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
             JobState::Blocked => ("⚑".into(), c.amber),
             JobState::Done => ("✓".into(), c.accent),
@@ -581,7 +626,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
             });
         });
         if job.live && job.state == JobState::Working {
-            keep_animating(ui, resp.response.rect);
+            keep_spinning(ui, resp.response.rect);
         }
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
@@ -742,10 +787,9 @@ fn category_header(
         spinner(
             &p,
             Pos2::new(badge_x, rect.center().y),
-            anim_time(),
+            spin(ui, rect),
             cat.color,
         );
-        keep_animating(ui, rect);
         p.text(
             Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -814,14 +858,12 @@ fn category_header(
     rect
 }
 
-/// A ring with a gap, turning. What the braille spinner was for, minus the
-/// assumption that the font has braille in it.
-fn spinner(p: &egui::Painter, at: Pos2, time: f64, color: Color32) {
+/// A ring with a gap, turned `turns` of the way round (see [`spin`]). What
+/// the braille spinner was for, minus the assumption that the font has
+/// braille in it.
+fn spinner(p: &egui::Painter, at: Pos2, turns: f64, color: Color32) {
     const R: f32 = 5.0;
-    // Half a turn a second: at the animation step that is eight evenly
-    // spaced positions, 45° apart, which reads as turning rather than
-    // jumping.
-    let head = (time * std::f64::consts::PI) as f32;
+    let head = (turns.fract() * std::f64::consts::TAU) as f32;
     let mut points = Vec::with_capacity(14);
     for step in 0..14 {
         let angle = head + step as f32 * 0.36;
@@ -935,8 +977,7 @@ fn tab_row(
     let time = anim_time();
     match row.claude {
         ClaudeState::Busy => {
-            spinner(&p, dot, time, row.color);
-            keep_animating(ui, rect);
+            spinner(&p, dot, spin(ui, rect), row.color);
         }
         ClaudeState::NeedsYou => {
             // One breath every two seconds, sampled at the animation step.
@@ -1263,7 +1304,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         );
         let spinning = app.claude.refresh_in_flight();
         let label = if spinning {
-            SPINNER[(anim_time() / ANIM_STEP) as usize % SPINNER.len()].to_string()
+            braille(spin_turns(ui))
         } else {
             "⟳".to_string()
         };
@@ -1273,7 +1314,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                 .color(if spinning { c.accent } else { dim }),
         ));
         if spinning {
-            keep_animating(ui, refresh.rect);
+            keep_spinning(ui, refresh.rect);
         }
         if refresh
             .on_hover_text(
