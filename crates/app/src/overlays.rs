@@ -272,7 +272,7 @@ fn humanize(d: std::time::Duration) -> String {
 ///
 /// It sits inside the terminal session's rect — never over the rail — with
 /// a bare `✕` in its header, the whole text in a scroll area below, and the
-/// row's action (Revive, Open in Claude Code) in its footer. While it is
+/// row's action (Open in Claude Code) in its footer. While it is
 /// open it takes the keyboard: `Esc` closes it, the scroll keys scroll it,
 /// and nothing typed reaches the shell underneath.
 pub struct BriefOverlay {
@@ -320,11 +320,6 @@ pub enum Button {
     Open {
         tab: TabId,
         click: Box<RowClick>,
-    },
-    /// A Done worker: submit `line` at the parent's prompt.
-    Revive {
-        tab: TabId,
-        line: String,
     },
     /// The action this row would have, and why it cannot be taken.
     Disabled {
@@ -456,7 +451,7 @@ impl TranscriptView {
 }
 
 /// The overlay's keyboard, taken before the terminal sees it (called from
-/// `App::shortcuts`): `Esc` closes, `r` revives, `o` opens in Claude Code,
+/// `App::shortcuts`): `Esc` closes, `o` opens in Claude Code,
 /// the scroll keys scroll, and every other plain key or typed text is
 /// swallowed so it never reaches the shell under the overlay (giverny#20).
 /// Ctrl/Alt chords pass through to Giverny's own shortcuts.
@@ -497,12 +492,8 @@ fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> (bool, bool) {
                             close = true;
                             None
                         }
-                        Key::R | Key::O => {
-                            let wants_revive = *key == Key::R;
-                            act |= matches!(
-                                (&ov.button, wants_revive),
-                                (Button::Revive { .. }, true) | (Button::Open { .. }, false)
-                            );
+                        Key::O => {
+                            act |= matches!(ov.button, Button::Open { .. });
                             None
                         }
                         Key::ArrowUp => Some(ov.offset - line),
@@ -530,7 +521,6 @@ fn overlay_keys(ov: &mut BriefOverlay, ctx: &egui::Context) -> (bool, bool) {
 fn button_action(ov: &BriefOverlay) -> Option<Action> {
     match &ov.button {
         Button::Open { tab, click } => Some(Action::OpenWorkerInClaude(*tab, click.clone())),
-        Button::Revive { tab, line } => Some(Action::ReviveWorker(*tab, line.clone())),
         Button::None | Button::Disabled { .. } => None,
     }
 }
@@ -804,19 +794,6 @@ fn draw_overlay(
                                     act = true;
                                 }
                             }
-                            Button::Revive { line, .. } => {
-                                if ui
-                                    .button(
-                                        RichText::new("Revive  (r)").font(FontId::monospace(11.0)),
-                                    )
-                                    .on_hover_text(format!(
-                                        "send to this tab's Claude Code:\n{line}"
-                                    ))
-                                    .clicked()
-                                {
-                                    act = true;
-                                }
-                            }
                             Button::Disabled { label, why } => {
                                 ui.add_enabled(
                                     false,
@@ -981,9 +958,19 @@ mod tests {
     fn the_overlay_takes_the_keyboard() {
         let ctx = egui::Context::default();
         let mut ov = BriefOverlay::text("t".into(), None, long_text());
-        ov.button = Button::Revive {
+        ov.button = Button::Open {
             tab: TabId(3),
-            line: "revive worker (agent a1): continue where you left off".into(),
+            click: Box::new(RowClick {
+                stage: giverny_claude::feed::Stage::Running,
+                key: "giverny#23".into(),
+                agent_id: Some("a1".into()),
+                name: "attach".into(),
+                transcript: None,
+                open: None,
+                brief: None,
+                note: None,
+                facts: vec![],
+            }),
         };
         frame(&ctx, &mut ov, session(), vec![]);
         // Typing does not reach the terminal; Ctrl chords (Giverny's own
@@ -1011,12 +998,13 @@ mod tests {
         frame(&ctx, &mut ov, session(), vec![key(Key::Home)]);
         frame(&ctx, &mut ov, session(), vec![]);
         assert_eq!(ov.offset, 0.0);
-        // `o` is not this overlay's key; `r` is, and its text is eaten too.
+        // `r` is not this overlay's key (Revive is gone, giverny#61); `o`
+        // is, and its text is eaten too.
         let (act, _, _, left) = frame(
             &ctx,
             &mut ov,
             session(),
-            vec![key(Key::O), egui::Event::Text("o".into())],
+            vec![key(Key::R), egui::Event::Text("r".into())],
         );
         assert!(!act);
         assert!(left.is_empty());
@@ -1024,13 +1012,13 @@ mod tests {
             &ctx,
             &mut ov,
             session(),
-            vec![key(Key::R), egui::Event::Text("r".into())],
+            vec![key(Key::O), egui::Event::Text("o".into())],
         );
         assert!(act);
         assert!(left.is_empty());
         assert!(matches!(
             button_action(&ov),
-            Some(Action::ReviveWorker(TabId(3), l)) if l.starts_with("revive worker")
+            Some(Action::OpenWorkerInClaude(TabId(3), c)) if c.agent_id.as_deref() == Some("a1")
         ));
         // Esc closes.
         let (_, close, _, left) = frame(&ctx, &mut ov, session(), vec![key(Key::Escape)]);
@@ -1043,10 +1031,10 @@ mod tests {
         let ctx = egui::Context::default();
         let mut ov = BriefOverlay::text("t".into(), None, "x".into());
         ov.button = Button::Disabled {
-            label: "Revive",
-            why: "no worker id".into(),
+            label: "Open in Claude Code",
+            why: "no live terminal".into(),
         };
-        let (act, ..) = frame(&ctx, &mut ov, session(), vec![key(Key::R)]);
+        let (act, ..) = frame(&ctx, &mut ov, session(), vec![key(Key::O)]);
         assert!(!act);
         assert!(button_action(&ov).is_none());
     }

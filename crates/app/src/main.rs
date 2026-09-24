@@ -630,9 +630,6 @@ pub enum Action {
     /// The worker overlay's Open in Claude Code (giverny#44): attach the
     /// row's running worker in its parent tab.
     OpenWorkerInClaude(TabId, Box<agents_pane::RowClick>),
-    /// The worker overlay's Revive (giverny#41): submit this line at the
-    /// tab's Claude Code prompt.
-    ReviveWorker(TabId, String),
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -872,8 +869,6 @@ pub struct App {
     pub brief: Option<overlays::BriefOverlay>,
     /// The terminal session's rect last frame: where that overlay goes.
     pub session_rect: Option<egui::Rect>,
-    /// A Revive being typed into a tab's Claude Code (giverny#41).
-    revive: Option<ReviveJob>,
     /// Tabs opened for a worker (a Done row's follower, a row's open
     /// command): painted on the worker background, like a subagent view.
     worker_tabs: HashSet<TabId>,
@@ -892,12 +887,6 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
-}
-
-/// A Revive being typed: which tab, and the driver (`agent_open::Typer`).
-struct ReviveJob {
-    tab: TabId,
-    driver: agent_open::Typer,
 }
 
 /// A running worker being attached: which tab is typed into, and the
@@ -1315,7 +1304,6 @@ impl App {
             agent_views: agents_pane::Views::default(),
             brief: None,
             session_rect: None,
-            revive: None,
             worker_tabs: HashSet::new(),
             attach: None,
             closing: false,
@@ -1481,7 +1469,6 @@ impl App {
             }
             Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
             Action::OpenWorkerInClaude(tab, click) => self.open_worker_in_claude(ctx, tab, &click),
-            Action::ReviveWorker(tab, line) => self.start_revive(ctx, tab, line),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
                 match folded.iter().position(|p| *p == repo) {
@@ -2893,7 +2880,7 @@ impl App {
     }
 
     /// The Agent call's description for a worker of `parent` — what Claude
-    /// Code's list shows, and what Revive names it by.
+    /// Code's list shows, and what an attach finds it by.
     fn worker_description(
         &self,
         parent: TabId,
@@ -2917,12 +2904,6 @@ impl App {
         use overlays::Button;
         let no_tab = "This tab has no live terminal to type into.";
         match agent_open::offer(click) {
-            agent_open::Offer::Nothing if click.stage == giverny_claude::feed::Stage::Done => {
-                Button::Disabled {
-                    label: "Revive",
-                    why: "This row names no worker id, so there is nothing to revive.".into(),
-                }
-            }
             agent_open::Offer::Nothing => Button::None,
             agent_open::Offer::OpenInClaude { .. } if !self.tab_is_live(parent) => {
                 Button::Disabled {
@@ -2934,17 +2915,6 @@ impl App {
                 tab: parent,
                 click: Box::new(click.clone()),
             },
-            agent_open::Offer::Revive { .. } if !self.tab_is_live(parent) => Button::Disabled {
-                label: "Revive",
-                why: no_tab.into(),
-            },
-            agent_open::Offer::Revive { agent_id } => {
-                let description = self.worker_description(parent, &agent_id, click);
-                Button::Revive {
-                    tab: parent,
-                    line: agent_open::revive_line(description.as_deref(), &agent_id),
-                }
-            }
         }
     }
 
@@ -2968,69 +2938,6 @@ impl App {
                  f on the worker."
                     .into(),
             ));
-        }
-    }
-
-    /// The overlay's Revive: show the parent tab and submit the line at its
-    /// Claude Code prompt, reading the screen first (`agent_open::Typer`).
-    fn start_revive(&mut self, ctx: &egui::Context, parent: TabId, line: String) {
-        if !self.tab_is_live(parent) {
-            return;
-        }
-        if self.ws.active != Some(parent) {
-            self.apply(ctx, Action::Select(parent));
-        }
-        self.reveal_terminal();
-        self.attach = None;
-        self.revive = Some(ReviveJob {
-            tab: parent,
-            driver: agent_open::Typer::new(line, Instant::now()),
-        });
-        ctx.request_repaint();
-    }
-
-    /// One frame of a Revive: read the parent's screen, maybe type.
-    fn process_revive(&mut self, ctx: &egui::Context) {
-        use agent_open::Tick;
-        let Some(job) = &mut self.revive else {
-            return;
-        };
-        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
-        let (Some(session), true) = (session, self.ws.active == Some(job.tab)) else {
-            self.revive = None;
-            return;
-        };
-        let screen = session.screen_text();
-        let undimmed = session.screen_text_undimmed();
-        match job.driver.tick(Instant::now(), &screen, &undimmed) {
-            Tick::Send(key) => {
-                let mode = session.mode();
-                session.write(agent_open::keystroke_bytes(key, |k, m| {
-                    giverny_term::input::encode_key(k, m, mode)
-                }));
-            }
-            Tick::Type(text) => session.write(text.into_bytes()),
-            Tick::Wait => {}
-            Tick::Done => self.revive = None,
-            Tick::Stuck(why) => {
-                tracing::info!("agents pane: revive stopped: {why:?}");
-                let text = format!(
-                    "{}\n\nThe line Revive would send:\n  {}",
-                    why.explain(""),
-                    job.driver.line
-                );
-                self.revive = None;
-                self.settings = None;
-                self.keys_overlay = None;
-                self.brief = Some(overlays::BriefOverlay::text(
-                    "Revive stopped".into(),
-                    None,
-                    text,
-                ));
-            }
-        }
-        if self.revive.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -3058,7 +2965,6 @@ impl App {
             self.apply(ctx, Action::Select(parent));
         }
         self.reveal_terminal();
-        self.revive = None;
         self.attach = Some(AttachJob {
             tab: parent,
             title: title.to_string(),
@@ -3090,7 +2996,6 @@ impl App {
                 });
                 session.write(bytes);
             }
-            Tick::Type(text) => session.write(text.into_bytes()),
             Tick::Wait => {}
             Tick::Done => self.attach = None,
             Tick::Stuck(why) => {
@@ -3158,9 +3063,6 @@ impl App {
             let action = self.brief.as_ref().and_then(|ov| match &ov.button {
                 overlays::Button::Open { tab, click } => {
                     Some(Action::OpenWorkerInClaude(*tab, click.clone()))
-                }
-                overlays::Button::Revive { tab, line } => {
-                    Some(Action::ReviveWorker(*tab, line.clone()))
                 }
                 _ => None,
             });
@@ -3417,7 +3319,6 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
         self.process_attach(&ctx);
-        self.process_revive(&ctx);
         #[cfg(debug_assertions)]
         self.debug_click(&ctx);
 

@@ -15,10 +15,11 @@
 //!   interactive view. The keys, and what they were established from, are
 //!   [`cc_keys`]; the typing is driven by [`Attach`], which reads the
 //!   parent's screen after every key rather than typing blind.
-//! * A Done worker can be *revived* from it (**Revive**): only the parent
-//!   Claude Code can resume a finished subagent (`SendMessage` to its id),
-//!   so Giverny submits [`revive_line`] at the parent's prompt, driven by
-//!   [`Typer`] with the same screen checks.
+//! * A Done worker's overlay only reads: nothing is offered. Claude Code
+//!   keeps no view of a finished subagent (it leaves the agent strip and
+//!   `/tasks`, and its transcript is not a resumable session), and the one
+//!   way back in — the parent's `SendMessage` — speaks for Ita, so the old
+//!   **Revive** that typed a line at the parent's prompt is gone (giverny#61).
 //! * **Planned** shows the row's brief, or its note, in the same overlay.
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab — unless it resumes a conversation something is already
@@ -66,10 +67,6 @@ pub enum Offer {
     Nothing,
     /// A Running worker: open it in the parent's Claude Code (`Attach`).
     OpenInClaude {
-        agent_id: String,
-    },
-    /// A Done worker: have the parent's Claude Code resume it (`Typer`).
-    Revive {
         agent_id: String,
     },
 }
@@ -169,9 +166,6 @@ pub fn offer(click: &RowClick) -> Offer {
         (Stage::Running, Some(id)) => Offer::OpenInClaude {
             agent_id: id.to_string(),
         },
-        (Stage::Done, Some(id)) => Offer::Revive {
-            agent_id: id.to_string(),
-        },
         _ => Offer::Nothing,
     }
 }
@@ -184,22 +178,6 @@ pub fn done_resumes(click: &RowClick) -> Option<String> {
         return None;
     }
     resumed_session(click.open.as_deref()?)
-}
-
-/// The line Revive submits to the parent's Claude Code: its description
-/// (one line, quotes made single) and id, so the parent's `SendMessage`
-/// finds the worker, and the instruction to pick up where it stopped.
-pub fn revive_line(description: Option<&str>, agent_id: &str) -> String {
-    let desc = description
-        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
-        .map(|d| d.replace('"', "'"))
-        .filter(|d| !d.is_empty());
-    match desc {
-        Some(d) => {
-            format!("revive worker \"{d}\" (agent {agent_id}): continue where you left off")
-        }
-        None => format!("revive worker (agent {agent_id}): continue where you left off"),
-    }
 }
 
 fn note_then(click: &RowClick, text: &str) -> String {
@@ -279,9 +257,6 @@ pub fn resumed_session(command: &str) -> Option<String> {
 pub mod cc_keys {
     use super::Keystroke;
 
-    /// `chat:stash`: sets a draft aside; restored after the next submit.
-    /// Revive stashes a draft before submitting its line.
-    pub const STASH_DRAFT: Keystroke = Keystroke::Ctrl('s');
     /// Moves the focus out of the prompt, and the strip's selection.
     pub const NEXT: Keystroke = Keystroke::Down;
     pub const PREVIOUS: Keystroke = Keystroke::Up;
@@ -335,7 +310,6 @@ pub fn viewing_worker(screen: &str) -> bool {
 /// One key Giverny types into the parent's Claude Code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keystroke {
-    Ctrl(char),
     Enter,
     Up,
     Down,
@@ -557,9 +531,6 @@ pub fn keystroke_bytes(
     use egui::{Key, Modifiers};
     let special = |k: Key, m: Modifiers| encode(k, m).unwrap_or_default();
     match key {
-        Keystroke::Ctrl(c) => Key::from_name(&c.to_ascii_uppercase().to_string())
-            .and_then(|k| encode(k, Modifiers::CTRL))
-            .unwrap_or_else(|| vec![c as u8 & 0x1f]),
         Keystroke::Enter => special(Key::Enter, Modifiers::NONE),
         Keystroke::Up => special(Key::ArrowUp, Modifiers::NONE),
         Keystroke::Down => special(Key::ArrowDown, Modifiers::NONE),
@@ -577,8 +548,6 @@ pub enum Stuck {
     Ambiguous,
     /// The screen never got where the keys should have taken it.
     TimedOut,
-    /// Claude Code shows a worker's view, not the main session's prompt.
-    WorkerView,
 }
 
 impl Stuck {
@@ -588,11 +557,6 @@ impl Stuck {
             Stuck::NoPrompt => "This means typing into this tab's Claude Code, and its prompt \
                                 is not on screen (a permission question, or another dialog, is \
                                 up). Answer or close it, then try again."
-                .to_string(),
-            Stuck::WorkerView => "This tab's Claude Code is showing a worker's view, so a line \
-                                  typed there would go to that worker, not to the session that \
-                                  can revive this one. Go back to main (the strip's `main`, or \
-                                  ←), then Revive again."
                 .to_string(),
             Stuck::NotListed => format!(
                 "The agent list under Claude Code's prompt has no agent called \
@@ -617,8 +581,6 @@ impl Stuck {
 pub enum Tick {
     /// Write this key to the parent's pty.
     Send(Keystroke),
-    /// Write this text to the parent's pty, as typed.
-    Type(String),
     /// Nothing yet; look again next frame.
     Wait,
     /// The foreground key is sent: the worker's view is open.
@@ -754,74 +716,6 @@ impl Attach {
     }
 }
 
-/// Submits one line at the parent's prompt (Revive, giverny#41): stash a
-/// draft if one is there, type the line, press Enter — each its own write,
-/// after reading the screen once. It types nothing unless the main
-/// session's prompt is on screen.
-#[derive(Debug, Clone)]
-pub struct Typer {
-    pub line: String,
-    started: bool,
-    queue: VecDeque<Step>,
-    last_key: Option<Instant>,
-    deadline: Instant,
-}
-
-#[derive(Debug, Clone)]
-enum Step {
-    Key(Keystroke),
-    Text(String),
-}
-
-impl Typer {
-    pub fn new(line: impl Into<String>, now: Instant) -> Typer {
-        Typer {
-            line: line.into(),
-            started: false,
-            queue: VecDeque::new(),
-            last_key: None,
-            deadline: now + DEADLINE,
-        }
-    }
-
-    /// One frame: `screen` and `undimmed` are the parent's screen now.
-    pub fn tick(&mut self, now: Instant, screen: &str, undimmed: &str) -> Tick {
-        if self.started {
-            if self.last_key.is_some_and(|t| now < t + KEY_GAP) {
-                return Tick::Wait;
-            }
-            return match self.queue.pop_front() {
-                Some(step) => {
-                    self.last_key = Some(now);
-                    match step {
-                        Step::Key(k) => Tick::Send(k),
-                        Step::Text(t) => Tick::Type(t),
-                    }
-                }
-                None => Tick::Done,
-            };
-        }
-        if now >= self.deadline {
-            return Tick::Stuck(Stuck::TimedOut);
-        }
-        if viewing_worker(screen) {
-            return Tick::Stuck(Stuck::WorkerView);
-        }
-        match read_view(screen, undimmed) {
-            View::Prompt { draft } => {
-                self.started = true;
-                if draft {
-                    self.queue.push_back(Step::Key(cc_keys::STASH_DRAFT));
-                }
-                self.queue.push_back(Step::Text(self.line.clone()));
-                self.queue.push_back(Step::Key(Keystroke::Enter));
-                self.tick(now, screen, undimmed)
-            }
-            _ => Tick::Stuck(Stuck::NoPrompt),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,13 +764,6 @@ mod tests {
                 live: false,
             }
         );
-        assert_eq!(
-            offer(&c),
-            Offer::Revive {
-                agent_id: "a93".into()
-            }
-        );
-        c.agent_id = None;
         assert_eq!(offer(&c), Offer::Nothing);
         c.stage = Stage::Planned;
         assert_eq!(offer(&c), Offer::Nothing);
@@ -932,22 +819,6 @@ mod tests {
             panic!("expected text");
         };
         assert!(t.contains("No transcript for worker a93"));
-    }
-
-    #[test]
-    fn the_revive_line() {
-        assert_eq!(
-            revive_line(Some("Work  giverny#41\n\"overlay\""), "a93"),
-            "revive worker \"Work giverny#41 'overlay'\" (agent a93): continue where you left off"
-        );
-        assert_eq!(
-            revive_line(Some("  "), "a93"),
-            "revive worker (agent a93): continue where you left off"
-        );
-        assert_eq!(
-            revive_line(None, "a93"),
-            "revive worker (agent a93): continue where you left off"
-        );
     }
 
     #[test]
@@ -1412,77 +1283,19 @@ mod tests {
         assert_eq!(drive(&mut d, &mut t, &bare), Tick::Stuck(Stuck::NotListed));
     }
 
-    fn drive_typer(a: &mut Typer, t: &mut Instant, screen: &str) -> Tick {
-        *t += KEY_GAP;
-        let undimmed = screen.replace("Try \"fix lint errors\"", "");
-        a.tick(*t, screen, &undimmed)
-    }
-
-    #[test]
-    fn revive_types_the_line_and_submits_it() {
-        let mut t = Instant::now();
-        let mut a = Typer::new("revive worker (agent a93): continue where you left off", t);
-        let empty = prompt_screen("");
-        assert_eq!(
-            drive_typer(&mut a, &mut t, &empty),
-            Tick::Type("revive worker (agent a93): continue where you left off".into())
-        );
-        // Too soon for the next key: each is its own write.
-        assert_eq!(a.tick(t, &empty, &empty), Tick::Wait);
-        assert_eq!(
-            drive_typer(&mut a, &mut t, &empty),
-            Tick::Send(Keystroke::Enter)
-        );
-        assert_eq!(drive_typer(&mut a, &mut t, &empty), Tick::Done);
-    }
-
-    #[test]
-    fn revive_stashes_a_draft_and_stops_rather_than_type_blind() {
-        let mut t = Instant::now();
-        let draft = prompt_screen("half a thought");
-        let mut a = Typer::new("revive", t);
-        assert_eq!(
-            drive_typer(&mut a, &mut t, &draft),
-            Tick::Send(Keystroke::Ctrl('s'))
-        );
-        assert_eq!(
-            drive_typer(&mut a, &mut t, &draft),
-            Tick::Type("revive".into())
-        );
-        let mut b = Typer::new("revive", t);
-        assert_eq!(
-            drive_typer(&mut b, &mut t, PERMISSION),
-            Tick::Stuck(Stuck::NoPrompt)
-        );
-        let mut c = Typer::new("revive", t);
-        assert_eq!(
-            drive_typer(&mut c, &mut t, &list_screen(0)),
-            Tick::Stuck(Stuck::NoPrompt)
-        );
-        // In a worker's view the line would go to that worker.
-        let mut d = Typer::new("revive", t);
-        let in_worker = format!("{}\n  ◯ main\n", prompt_screen(""));
-        assert_eq!(
-            drive_typer(&mut d, &mut t, &in_worker),
-            Tick::Stuck(Stuck::WorkerView)
-        );
-    }
-
     #[test]
     fn keystrokes_encode_like_typed_keys() {
         let enc = |k: egui::Key, m: egui::Modifiers| -> Option<Vec<u8>> {
             Some(format!("{k:?}{}", if m.ctrl { "+ctrl" } else { "" }).into_bytes())
         };
-        assert_eq!(keystroke_bytes(Keystroke::Ctrl('s'), enc), b"S+ctrl");
         assert_eq!(keystroke_bytes(Keystroke::Down, enc), b"ArrowDown");
-        // With no encoder answer, Ctrl+S is still the control byte.
-        assert_eq!(keystroke_bytes(Keystroke::Ctrl('s'), |_, _| None), [0x13]);
+        assert_eq!(keystroke_bytes(Keystroke::Enter, enc), b"Enter");
+        assert!(keystroke_bytes(Keystroke::Up, |_, _| None).is_empty());
     }
 
-    /// The keys and the revive line against a real Claude Code in tmux
-    /// (giverny#44): `GIVERNY_TMUX=<socket>:<target>`, a `claude` there with
-    /// the agent `GIVERNY_TMUX_AGENT` (a description) in its strip, and
-    /// `GIVERNY_TMUX_REVIVE` the revive line to submit afterwards, if any.
+    /// The attach keys against a real Claude Code in tmux (giverny#44):
+    /// `GIVERNY_TMUX=<socket>:<target>`, a `claude` there with the agent
+    /// `GIVERNY_TMUX_AGENT` (a description) in its strip.
     /// Run by hand: `cargo test -p giverny live_tmux -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -1527,10 +1340,6 @@ mod tests {
                         sent.push(format!("{k:?}"));
                         send(&keystroke_bytes(k, enc));
                     }
-                    Tick::Type(t) => {
-                        sent.push(format!("Type({t:?})"));
-                        send(t.as_bytes());
-                    }
                     Tick::Wait => {}
                     other => {
                         println!("{other:?} after {:?}: {sent:?}", started.elapsed());
@@ -1545,31 +1354,5 @@ mod tests {
         let done = run(&mut |now, s| a.tick(now, s, s));
         println!("{}", screen());
         assert_eq!(done, Tick::Done);
-        if let Ok(line) = std::env::var("GIVERNY_TMUX_REVIVE") {
-            // In the worker's view, Revive refuses.
-            let mut w = Typer::new(line.clone(), Instant::now());
-            let refused = run(&mut |now, s| w.tick(now, s, s));
-            assert_eq!(refused, Tick::Stuck(Stuck::WorkerView));
-            // Back to main by the same strip, then revive.
-            let mut m = Attach::new("main", Instant::now());
-            assert_eq!(run(&mut |now, s| m.tick(now, s, s)), Tick::Done);
-            // Up out of the strip (and the shells pill) to the prompt,
-            // whose footer then says `← N agents` again.
-            for _ in 0..3 {
-                std::thread::sleep(Duration::from_millis(500));
-                let focused = screen()
-                    .lines()
-                    .any(|l| l.contains("← ") && l.contains("agent"));
-                if focused {
-                    break;
-                }
-                send(b"\x1b[A");
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            let mut r = Typer::new(line, Instant::now());
-            assert_eq!(run(&mut |now, s| r.tick(now, s, s)), Tick::Done);
-            std::thread::sleep(Duration::from_secs(2));
-            println!("{}", screen());
-        }
     }
 }
