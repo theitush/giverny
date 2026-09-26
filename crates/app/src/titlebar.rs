@@ -71,6 +71,15 @@ pub struct Maximize {
     /// A move held back until a shrink has landed (see [`Maximize::place`]):
     /// the corner and size in points, and when the shrink was asked for.
     deferred_move: Option<(egui::Pos2, egui::Vec2, Instant)>,
+    /// The window's own size, in physical pixels, when it opened maximised
+    /// and has no rect of its own to restore to yet.
+    restore_size: Option<egui::Vec2>,
+    /// The window's rect before the window manager maximised it (or as it
+    /// opened), in physical pixels: until the maximised rect differs from
+    /// it, the window manager has not got there yet.
+    before: Option<egui::Rect>,
+    /// When the window manager's maximise was first seen.
+    max_since: Option<Instant>,
     /// The last work area learned, from Windows or the window manager, in
     /// physical pixels; saved with the layout.
     learned: Option<egui::Rect>,
@@ -85,14 +94,23 @@ impl Maximize {
     /// Start with the work area saved last time, if any, and — when the
     /// window opened already laid over it — maximised, restoring to
     /// `restore_size` (physical pixels) centred on it.
-    pub fn new(learned: Option<[f32; 4]>, opened_on: bool, restore_size: egui::Vec2) -> Self {
+    ///
+    /// Opened maximised without a saved work area (a state file from before
+    /// #78), the window manager maximises it, and `restore_size` waits for
+    /// the work area that gives.
+    pub fn new(
+        learned: Option<[f32; 4]>,
+        opened_maximized: bool,
+        restore_size: egui::Vec2,
+    ) -> Self {
         let learned = learned
             .map(|[x, y, w, h]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
         let mut m = Maximize {
             learned,
+            restore_size: opened_maximized.then_some(restore_size),
             ..Default::default()
         };
-        if let (true, Some(area)) = (opened_on, learned) {
+        if let (true, Some(area)) = (opened_maximized, learned) {
             m.on = true;
             m.pending = Some((area, Instant::now()));
             m.restore = Some(egui::Rect::from_center_size(
@@ -140,25 +158,38 @@ impl Maximize {
             }
         }
         let now = px(inner, ppp);
+        let before = *self.before.get_or_insert(now);
         if maximized {
             // The window manager maximised it (no work area known yet, or
-            // Windows did it): its rect is the work area. Undo that, and
-            // once the undo has landed lay the window over the area by hand;
-            // placed before, the un-maximise would move it back.
-            self.learned = Some(now);
-            if !self.on {
-                self.restore.get_or_insert_with(|| {
-                    egui::Rect::from_center_size(now.center(), now.size() * 0.75)
-                });
-            }
+            // Windows did it). Undo that, and once the undo has landed lay
+            // the window over the work area by hand; placed before, the
+            // un-maximise would move it back.
             if self.unmaximizing.is_none() {
+                let Some(area) = self
+                    .work_area(ctx)
+                    .or_else(|| self.maximized_rect(ctx, now, before))
+                else {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                    return;
+                };
+                self.learned = Some(area);
+                if !self.on {
+                    let size = self.restore_size.take().map(|s| s.min(area.size()));
+                    self.restore.get_or_insert_with(|| {
+                        egui::Rect::from_center_size(
+                            area.center(),
+                            size.unwrap_or(area.size() * 0.75),
+                        )
+                    });
+                }
                 ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
-                self.unmaximizing = Some((now, Instant::now()));
+                self.unmaximizing = Some((area, Instant::now()));
             }
             self.on = true;
             ctx.request_repaint_after(Duration::from_millis(8));
             return;
         }
+        self.max_since = None;
         if let Some((area, since)) = self.unmaximizing {
             // The flag clears before the window is back at its own size.
             if near(now, area) && since.elapsed() < RESEND {
@@ -191,7 +222,32 @@ impl Maximize {
             }
         } else {
             self.restore = Some(now);
+            self.before = Some(now);
         }
+    }
+
+    /// The window manager's maximised rect, once it is one: `viewport()`
+    /// says maximised before the window is (at the first frame it still
+    /// carries the size the window was opened at, in the wrong units, #87),
+    /// and the window manager resizes before it moves. So it counts only
+    /// once it differs from the rect before and lies within the monitor —
+    /// or, failing that (a monitor not at the origin), after a while.
+    fn maximized_rect(
+        &mut self,
+        ctx: &egui::Context,
+        now: egui::Rect,
+        before: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let since = *self.max_since.get_or_insert_with(Instant::now);
+        let ppp = ctx.pixels_per_point();
+        let monitor = ctx.input(|i| i.viewport().monitor_size)? * ppp;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor).expand(1.0);
+        let settled = !near(now, before) && screen.contains_rect(now);
+        // Not the far-off rect an unmapped window reports, either.
+        let waited = since.elapsed() > GIVE_UP
+            && now.width() <= monitor.x + 1.0
+            && now.min.x > -monitor.x * 4.0;
+        (settled || waited).then_some(now)
     }
 
     /// Lay the window over `area` (physical pixels): one move, one resize.

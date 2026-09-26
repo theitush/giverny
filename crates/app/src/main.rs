@@ -574,7 +574,8 @@ fn main() -> eframe::Result {
     if let (true, Some([x, y, w, h])) = (open_laid, work_area) {
         viewport = viewport.with_position([x, y]).with_inner_size([w, h]);
     }
-    let maximize = titlebar::Maximize::new(work_area, open_laid, window_size.into());
+    let maximize =
+        titlebar::Maximize::new(work_area, frameless && layout.maximized, window_size.into());
     if frameless {
         titlebar::probe_work_areas();
     }
