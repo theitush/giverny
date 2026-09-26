@@ -56,6 +56,11 @@ pub struct Layout {
     /// start can pick a default from the display instead.
     #[serde(default)]
     pub zoom: Option<f32>,
+    /// The work area of the monitor the window was last maximised on,
+    /// `[x, y, w, h]` in physical pixels, where Giverny maximises the window
+    /// itself (WSLg, #78) and needs it before the window exists.
+    #[serde(default)]
+    pub work_area: Option<[f32; 4]>,
 }
 
 /// What the rail groups tabs by.
@@ -272,6 +277,7 @@ mod tests {
                 rail_view: RailView::Repos,
                 collapsed_repos: vec![PathBuf::from("/home/x/proj")],
                 zoom: Some(1.7),
+                work_area: Some([0.0, 0.0, 2880.0, 1716.0]),
             },
         };
         save(&paths, &state).unwrap();
