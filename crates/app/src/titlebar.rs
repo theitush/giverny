@@ -18,6 +18,8 @@
 
 use crate::chrome::Chrome;
 use eframe::egui::{self, Color32, CursorIcon, ResizeDirection, Sense, Stroke, ViewportCommand};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Caption height, in points: Windows 11's 32 px at 100 %.
 pub const HEIGHT: f32 = 32.0;
@@ -40,33 +42,73 @@ const CLOSE_RED: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 /// at the work area's corner — the margin's corner, not the window's — so a
 /// maximised Giverny sat 32 px down and to the right, its right and bottom
 /// 32 px past the screen. Weston's own frame drops the margin when
-/// maximised, which is why a decorated window never showed it.
+/// maximised, which is why a decorated window never showed it. The margin
+/// is keyed on nothing a client can set (not Motif hints, not the window
+/// type), so it cannot be asked away.
 ///
-/// So the window manager maximises once, which is how the work area of
-/// whichever monitor the window is on gets learned, and the window is then
-/// un-maximised and laid over that work area by hand. An ordinary window is
-/// placed exactly (its margin falls off-screen), so this one is flush.
-/// Windows-side maximising — Win+↑, dragging to the top — arrives the same
-/// way and is converted the same way.
+/// So the window is never left maximised: it is laid over the work area by
+/// hand, one move and one resize, which an ordinary window takes exactly
+/// (its margin falls off-screen). The work area comes from Windows, asked
+/// once in the background at startup ([`probe_work_areas`]), and is kept in
+/// the saved layout so the next launch has it before the window exists.
+/// Until either has it, and whenever Windows maximises the window itself
+/// (Win+↑, a drag to the top), the window manager's maximise is what gives
+/// the work area away, and it is undone and redone by hand.
 #[derive(Default)]
 pub struct Maximize {
     /// Laid over the work area by hand.
     on: bool,
-    /// The work area, in physical pixels, until the window is laid over it.
-    pending: Option<egui::Rect>,
-    /// Frames since the placement was asked for; the window manager takes a
-    /// few to act on it, and until then the window is not yet where it goes.
-    settling: u8,
-    /// The window manager's maximised rect as last seen: acted on only once
-    /// two frames agree, because it resizes before it moves.
-    seen: Option<egui::Rect>,
+    /// The work area, in physical pixels, until the window is laid over it,
+    /// and when that was asked for.
+    pending: Option<(egui::Rect, Instant)>,
     /// Where it was laid, in physical pixels, once it got there.
     placed: Option<egui::Rect>,
     /// The inner rect, in physical pixels, to go back to on restore.
     restore: Option<egui::Rect>,
+    /// The window manager's maximise being undone: the work area it gave
+    /// away, in physical pixels, and when.
+    unmaximizing: Option<(egui::Rect, Instant)>,
+    /// A move held back until a shrink has landed (see [`Maximize::place`]):
+    /// the corner and size in points, and when the shrink was asked for.
+    deferred_move: Option<(egui::Pos2, egui::Vec2, Instant)>,
+    /// The last work area learned, from Windows or the window manager, in
+    /// physical pixels; saved with the layout.
+    learned: Option<egui::Rect>,
 }
 
+/// How long the window manager gets to carry out a placement before it is
+/// asked again, and before it is given up on.
+const RESEND: Duration = Duration::from_millis(300);
+const GIVE_UP: Duration = Duration::from_millis(1500);
+
 impl Maximize {
+    /// Start with the work area saved last time, if any, and — when the
+    /// window opened already laid over it — maximised, restoring to
+    /// `restore_size` (physical pixels) centred on it.
+    pub fn new(learned: Option<[f32; 4]>, opened_on: bool, restore_size: egui::Vec2) -> Self {
+        let learned = learned
+            .map(|[x, y, w, h]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
+        let mut m = Maximize {
+            learned,
+            ..Default::default()
+        };
+        if let (true, Some(area)) = (opened_on, learned) {
+            m.on = true;
+            m.pending = Some((area, Instant::now()));
+            m.restore = Some(egui::Rect::from_center_size(
+                area.center(),
+                restore_size.min(area.size()),
+            ));
+        }
+        m
+    }
+
+    /// The work area to save, `[x, y, w, h]` in physical pixels.
+    pub fn learned(&self) -> Option<[f32; 4]> {
+        self.learned
+            .map(|r| [r.min.x, r.min.y, r.width(), r.height()])
+    }
+
     /// Whether the window is maximised, by the window manager or by hand.
     pub fn is_on(&self, ctx: &egui::Context) -> bool {
         self.on || ctx.input(|i| i.viewport().maximized.unwrap_or(false))
@@ -89,52 +131,99 @@ impl Maximize {
         if fullscreen {
             return;
         }
-        let px = |r: egui::Rect| egui::Rect::from_min_max(r.min * ppp, r.max * ppp);
-        if maximized {
-            // The window manager's maximise: its size is the work area's,
-            // and its position the work area's corner. Take both, and undo it.
-            let area = px(inner);
-            if !self.seen.is_some_and(|s| near(s, area)) {
-                self.seen = Some(area);
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
-                return;
+        if let Some((corner, size, since)) = self.deferred_move {
+            if (inner.size() - size).length() < 2.0 || since.elapsed() > GIVE_UP {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(corner));
+                self.deferred_move = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(8));
             }
-            self.seen = None;
-            // Opened maximised, it has no size of its own yet: give it
-            // one, as Windows would, rather than restore to the screen.
-            self.restore.get_or_insert_with(|| {
-                egui::Rect::from_center_size(area.center(), area.size() * 0.75)
-            });
-            self.pending = Some(area);
+        }
+        let now = px(inner, ppp);
+        if maximized {
+            // The window manager maximised it (no work area known yet, or
+            // Windows did it): its rect is the work area. Undo that, and
+            // once the undo has landed lay the window over the area by hand;
+            // placed before, the un-maximise would move it back.
+            self.learned = Some(now);
+            if !self.on {
+                self.restore.get_or_insert_with(|| {
+                    egui::Rect::from_center_size(now.center(), now.size() * 0.75)
+                });
+            }
+            if self.unmaximizing.is_none() {
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                self.unmaximizing = Some((now, Instant::now()));
+            }
             self.on = true;
-            self.settling = 0;
-            ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+            ctx.request_repaint_after(Duration::from_millis(8));
             return;
         }
-        if let Some(area) = self.pending {
-            // Asked once, and once more if the first was lost in the
-            // un-maximise; given up on after that, where it stands.
-            if self.settling == 0 || self.settling == 10 {
-                place(ctx, area.min / ppp, area.size() / ppp);
+        if let Some((area, since)) = self.unmaximizing {
+            // The flag clears before the window is back at its own size.
+            if near(now, area) && since.elapsed() < RESEND {
+                ctx.request_repaint_after(Duration::from_millis(8));
+                return;
             }
-            self.settling = self.settling.saturating_add(1);
-            if near(px(inner), area) || self.settling > 40 {
+            self.unmaximizing = None;
+            self.lay_over(ctx, area);
+            return;
+        }
+        if let Some((area, since)) = self.pending {
+            let waited = since.elapsed();
+            if near(now, area) || waited > GIVE_UP {
                 self.pending = None;
-                self.placed = Some(px(inner));
+                self.placed = Some(now);
+            } else {
+                if waited > RESEND && waited < RESEND + Duration::from_millis(50) {
+                    self.place(ctx, area.min / ppp, area.size() / ppp);
+                }
+                ctx.request_repaint_after(Duration::from_millis(16));
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return;
         }
         if self.on {
             // Moved or resized since (a Snap, a drag off the taskbar): not
             // maximised any more.
-            if self.placed.is_some_and(|p| !near(px(inner), p)) {
+            if self.placed.is_some_and(|p| !near(now, p)) {
                 self.on = false;
                 self.placed = None;
             }
         } else {
-            self.restore = Some(px(inner));
+            self.restore = Some(now);
         }
+    }
+
+    /// Lay the window over `area` (physical pixels): one move, one resize.
+    fn lay_over(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        let ppp = ctx.pixels_per_point();
+        self.on = true;
+        self.placed = None;
+        self.pending = Some((area, Instant::now()));
+        self.place(ctx, area.min / ppp, area.size() / ppp);
+        ctx.request_repaint();
+    }
+
+    /// The work area of the monitor the window is on, if it is known without
+    /// asking the window manager: from Windows, or from last time.
+    fn work_area(&self, ctx: &egui::Context) -> Option<egui::Rect> {
+        let ppp = ctx.pixels_per_point();
+        let (inner, monitor) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
+        let centre = px(inner?, ppp).center();
+        let monitor = monitor? * ppp;
+        let fits = |bounds: egui::Rect| (bounds.size() - monitor).length() < 3.0;
+        if let Some(areas) = WORK_AREAS.get() {
+            let on = areas
+                .iter()
+                .find(|(b, _)| b.contains(centre))
+                .or_else(|| areas.iter().find(|(b, _)| b.min == egui::Pos2::ZERO));
+            if let Some(&(_, work)) = on.filter(|(b, _)| fits(*b)) {
+                return Some(work);
+            }
+        }
+        // Last time's: only while it is still on a monitor this size.
+        self.learned
+            .filter(|a| a.width() <= monitor.x + 0.5 && a.height() <= monitor.y + 0.5)
     }
 
     /// The caption's □, or a double click on it.
@@ -143,9 +232,12 @@ impl Maximize {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
         } else if self.on {
             self.restore_to(ctx, None);
+        } else if let Some(area) = self.work_area(ctx) {
+            self.learned = Some(area);
+            self.lay_over(ctx, area);
         } else {
-            // Through the window manager, for the work area; `update` takes
-            // it from there.
+            // Not known yet: the window manager's maximise finds it, and
+            // `update` takes it from there.
             ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
         }
     }
@@ -159,7 +251,7 @@ impl Maximize {
             return;
         };
         let ppp = ctx.pixels_per_point();
-        place(ctx, corner.unwrap_or(r.min / ppp), r.size() / ppp);
+        self.place(ctx, corner.unwrap_or(r.min / ppp), r.size() / ppp);
     }
 
     /// A drag on the caption of a window maximised by hand: back to its own
@@ -176,17 +268,98 @@ impl Maximize {
         let along = (p.x / inner.width().max(1.0)).clamp(0.0, 1.0);
         let corner = egui::pos2(inner.min.x + p.x - w * along, inner.min.y);
         self.restore_to(ctx, Some(corner));
+        // The drag moves it from here: a move held back for the shrink
+        // would land in the middle of it.
+        if let Some((corner, _, _)) = self.deferred_move.take() {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(corner));
+        }
+    }
+
+    /// Put the window's inner area at `corner`, `size` big, both in points.
+    ///
+    /// `OuterPosition` though it is the *inner* corner: winit asks X to move
+    /// the client window there, and WSLg's Weston takes that as where the
+    /// window's content goes, whatever frame extents winit reports for it.
+    ///
+    /// A move shows at once but a resize only once Giverny has drawn a frame
+    /// at the new size, so the two are ordered to hide the gap. Growing, it
+    /// moves first: the frame between is the old size already in the corner
+    /// it grows from. Shrinking, the move waits until the shrink has landed,
+    /// or the frame between would be a screen-sized window pushed half off
+    /// the screen.
+    fn place(&mut self, ctx: &egui::Context, corner: egui::Pos2, size: egui::Vec2) {
+        let now = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        self.deferred_move = None;
+        if now.is_none_or(|now| size.x >= now.x && size.y >= now.y) {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(corner));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        } else {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+            self.deferred_move = Some((corner, size, Instant::now()));
+            ctx.request_repaint();
+        }
     }
 }
 
-/// Put the window's inner area at `corner`, `size` big, both in points.
-///
-/// `OuterPosition` though it is the *inner* corner: winit asks X to move
-/// the client window there, and WSLg's Weston takes that as where the
-/// window's content goes, whatever frame extents winit reports for it.
-fn place(ctx: &egui::Context, corner: egui::Pos2, size: egui::Vec2) {
-    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(corner));
+/// A rect in points as physical pixels.
+fn px(r: egui::Rect, ppp: f32) -> egui::Rect {
+    egui::Rect::from_min_max(r.min * ppp, r.max * ppp)
+}
+
+/// Each Windows monitor's bounds and work area, in physical pixels — which
+/// under WSLg are X's coordinates too — once the background probe has them.
+static WORK_AREAS: OnceLock<Vec<(egui::Rect, egui::Rect)>> = OnceLock::new();
+
+/// Ask Windows for its monitors' work areas, in the background. PowerShell
+/// takes seconds to start, so this is done once, at launch, and never
+/// waited for: until it answers, the saved or the window manager's work
+/// area stands in.
+pub fn probe_work_areas() {
+    std::thread::Builder::new()
+        .name("work-areas".into())
+        .spawn(|| {
+            let out = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", WORK_AREA_PS])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    let areas = parse_work_areas(&String::from_utf8_lossy(&out.stdout));
+                    tracing::debug!("WSLg work areas: {areas:?}");
+                    if !areas.is_empty() {
+                        let _ = WORK_AREAS.set(areas);
+                    }
+                }
+                Ok(out) => tracing::debug!("work-area probe failed: {}", out.status),
+                Err(e) => tracing::debug!("work-area probe failed: {e}"),
+            }
+        })
+        .ok();
+}
+
+/// Physical pixels (DPI-aware), one monitor a line: bounds, then work area,
+/// each `x y w h`.
+const WORK_AREA_PS: &str = r#"Add-Type -Namespace G -Name D -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'; [void][G.D]::SetProcessDPIAware(); Add-Type -AssemblyName System.Windows.Forms; foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $b = $s.Bounds; $w = $s.WorkingArea; "$($b.X) $($b.Y) $($b.Width) $($b.Height) $($w.X) $($w.Y) $($w.Width) $($w.Height)" }"#;
+
+fn parse_work_areas(out: &str) -> Vec<(egui::Rect, egui::Rect)> {
+    out.lines()
+        .filter_map(|line| {
+            let n: Vec<f32> = line
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let rect = |i: usize| {
+                egui::Rect::from_min_size(
+                    egui::pos2(n[i], n[i + 1]),
+                    egui::vec2(n[i + 2], n[i + 3]),
+                )
+            };
+            (n.len() == 8 && n[2] > 0.0 && n[3] > 0.0 && n[6] > 0.0 && n[7] > 0.0)
+                .then(|| (rect(0), rect(4)))
+        })
+        .collect()
 }
 
 /// Two rects within a pixel or two of each other.
@@ -438,6 +611,19 @@ mod tests {
             edge_at(r, egui::pos2(3.0, 595.0), 5.0),
             Some(ResizeDirection::SouthWest)
         );
+    }
+
+    #[test]
+    fn work_areas_are_read_a_monitor_a_line() {
+        let out = "0 0 2880 1800 0 0 2880 1716\r\n-1920 0 1920 1080 -1920 0 1920 1040\r\nnonsense\r\n0 0 0 0 0 0 0 0\r\n";
+        let areas = parse_work_areas(out);
+        assert_eq!(areas.len(), 2);
+        assert_eq!(
+            areas[0].1,
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2880.0, 1716.0))
+        );
+        assert_eq!(areas[1].0.min, egui::pos2(-1920.0, 0.0));
+        assert_eq!(areas[1].1.height(), 1040.0);
     }
 
     #[test]
