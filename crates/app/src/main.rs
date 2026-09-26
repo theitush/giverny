@@ -557,16 +557,30 @@ fn main() -> eframe::Result {
     // to have Windows draw one instead, so there Giverny draws its own (#69).
     // `GIVERNY_WSLG_FRAME=1` keeps Weston's.
     let frameless = try_x11 && wslg_x11 && std::env::var_os("GIVERNY_WSLG_FRAME").is_none();
+    // That window is maximised by hand (#78): straight over the work area
+    // saved last time when it opens maximised, rather than through the
+    // window manager, whose maximise lands it 32 px off.
+    let window_size = layout.window_size().unwrap_or(first_size);
+    let work_area = layout.work_area.filter(|_| frameless);
+    let open_laid = frameless && layout.maximized && work_area.is_some();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("giverny")
+        .with_title("Giverny")
+        .with_icon(icon::icon_data(16))
+        .with_inner_size(window_size)
+        .with_maximized(layout.maximized && !open_laid)
+        .with_min_inner_size([640.0, 400.0])
+        .with_decorations(!frameless);
+    if let (true, Some([x, y, w, h])) = (open_laid, work_area) {
+        viewport = viewport.with_position([x, y]).with_inner_size([w, h]);
+    }
+    let maximize = titlebar::Maximize::new(work_area, open_laid, window_size.into());
+    if frameless {
+        titlebar::probe_work_areas();
+    }
     let options = eframe::NativeOptions {
         renderer,
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id("giverny")
-            .with_title("Giverny")
-            .with_icon(icon::icon_data(16))
-            .with_inner_size(layout.window_size().unwrap_or(first_size))
-            .with_maximized(layout.maximized)
-            .with_min_inner_size([640.0, 400.0])
-            .with_decorations(!frameless),
+        viewport,
         ..Default::default()
     };
     // A hook rather than `catch_unwind`: wgpu's failure panics, and then
@@ -592,7 +606,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Giverny",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom, frameless)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom, frameless, maximize)))),
     );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
@@ -1234,7 +1248,12 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, zoom: Option<f32>, frameless: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        zoom: Option<f32>,
+        frameless: bool,
+        maximize: titlebar::Maximize,
+    ) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
         remember_env_accounts(&paths, &mut cfg);
@@ -1370,7 +1389,7 @@ impl App {
             stale_sessions: false,
             attention: 0,
             frameless,
-            maximize: titlebar::Maximize::default(),
+            maximize,
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -2546,7 +2565,11 @@ impl App {
             (Some(a), Some(b)) => (a - b).abs() >= 1.0,
             (a, b) => a.is_some() != b.is_some(),
         };
+        if self.frameless {
+            self.layout.work_area = self.maximize.learned();
+        }
         let changed = self.layout.maximized != before.maximized
+            || self.layout.work_area != before.work_area
             || self.layout.zoom != before.zoom
             || moved(self.layout.rail_width, before.rail_width)
             || moved(
