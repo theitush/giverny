@@ -18,6 +18,7 @@ mod splash;
 mod taskbar;
 mod titlebar;
 mod update;
+mod view_header;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -739,6 +740,13 @@ pub struct TabRuntime {
     /// The worker whose view the tab's Claude Code shows, by the label on
     /// its prompt's rule (the Agent call's description); `None` on main.
     viewed: Option<String>,
+    /// [`Self::viewed`] as of the picture on screen: it stays put while
+    /// the picture is held (giverny#82), so the header over the terminal
+    /// changes in the same frame as the view under it.
+    shown_viewed: Option<String>,
+    /// The worker view whose header was closed with its `×`; it stays
+    /// closed until the tab leaves that view.
+    header_closed: Option<String>,
 }
 
 /// How often the active tab's screen is read for a worker's view: fast
@@ -958,6 +966,8 @@ pub struct App {
     /// strip is the keyboard path into a worker's view, which the agents
     /// pane otherwise hides.
     strip_asks: HashMap<TabId, Instant>,
+    /// Where the worker header's `×` was drawn last frame, if it was.
+    header_close: Option<egui::Rect>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -980,7 +990,41 @@ struct AttachJob {
     /// The row's title, for a note if the walk stops short.
     title: String,
     driver: agent_open::Walk,
+    /// When the walk began: the tab's picture is held from here until the
+    /// view is final, and never longer than [`HOLD_MAX`] (giverny#82).
+    started: Instant,
+    /// Once the walk is done: waiting for the view's final screen.
+    settle: Option<agent_open::Settle>,
+    /// Brings the relay's next run forward while its answer is waited on.
+    nudge: agent_open::Nudge,
 }
+
+impl AttachJob {
+    fn new(tab: TabId, title: String, driver: agent_open::Walk) -> AttachJob {
+        AttachJob {
+            tab,
+            title,
+            driver,
+            started: Instant::now(),
+            settle: None,
+            nudge: agent_open::Nudge::default(),
+        }
+    }
+
+    /// Whether the tab's picture is still held.
+    fn holds(&self, now: Instant) -> bool {
+        now < self.started + HOLD_MAX
+    }
+
+    /// Whether the relay is asked to draw Claude Code's strip.
+    fn wants_strip(&self) -> bool {
+        self.settle.is_none() && self.driver.wants_strip()
+    }
+}
+
+/// The longest a tab's picture is held while a walk runs (giverny#82): a
+/// walk this slow is shown as it goes rather than as a frozen screen.
+const HOLD_MAX: Duration = Duration::from_secs(6);
 
 /// The tab's id as its shell sees it (`GIVERNY_TAB_ID`, set where the
 /// session is spawned), and as the relay reports it back.
@@ -1408,6 +1452,7 @@ impl App {
             worker_tabs: HashSet::new(),
             attach: None,
             strip_asks: HashMap::new(),
+            header_close: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -1935,6 +1980,8 @@ impl App {
                     view: TabView::default(),
                     worker_checked: None,
                     viewed: None,
+                    shown_viewed: None,
+                    header_closed: None,
                 });
                 entry.session = Some(session);
                 // Startup rc files may `cd` away from the spawn dir; verify
@@ -2961,6 +3008,21 @@ impl App {
             self.apply(ctx, Action::Select(id));
             return;
         }
+        // A Running worker opens straight into its view (giverny#82): no
+        // overlay. The overlay is what is left when that cannot start.
+        if let (giverny_claude::feed::Stage::Running, Some(agent_id)) =
+            (click.stage, click.agent_id.as_deref())
+            && matches!(
+                agent_open::offer(click),
+                agent_open::Offer::OpenInClaude { .. }
+            )
+        {
+            let title = agent_open::title_of(click);
+            let agent_id = agent_id.to_string();
+            if self.start_attach(ctx, parent, &title, &agent_id, click) {
+                return;
+            }
+        }
         let plan = agent_open::plan(click);
         let button = self.overlay_button(parent, click);
         // A Done row's task may have landed in Review: its Review line goes
@@ -3092,11 +3154,18 @@ impl App {
             self.apply(ctx, Action::Select(parent));
         }
         self.reveal_terminal();
-        self.attach = Some(AttachJob {
-            tab: parent,
-            title: title.to_string(),
-            driver: agent_open::Walk::open(description, aliases, Instant::now()),
-        });
+        // A walk under way gives way; its pty width goes back first.
+        if let Some(old) = self.attach.take()
+            && old.nudge.is_narrow()
+            && let Some(session) = self.rt.get(&old.tab).and_then(|rt| rt.session.as_ref())
+        {
+            session.nudge_width(false);
+        }
+        self.attach = Some(AttachJob::new(
+            parent,
+            title.to_string(),
+            agent_open::Walk::open(description, aliases, Instant::now()),
+        ));
         // Asked now, not next frame: every frame of the relay's tick counts.
         self.sync_strip_asks();
         ctx.request_repaint();
@@ -3110,33 +3179,28 @@ impl App {
         if self.attach.is_some() || !self.tab_is_live(tab) {
             return;
         }
-        self.attach = Some(AttachJob {
+        self.attach = Some(AttachJob::new(
             tab,
-            title: "Back to the orchestrator".into(),
-            driver: agent_open::Walk::home(Instant::now()),
-        });
+            "Back to the orchestrator".into(),
+            agent_open::Walk::home(Instant::now()),
+        ));
         ctx.request_repaint();
     }
 
     /// Keep the relay's asks to show Claude Code's agent strip (giverny#75)
     /// in step with what needs it: a walk on its way into a worker's view,
-    /// and a Running worker's overlay — asked while it is open, so the
-    /// strip is likely up by the time Open in Claude Code is pressed
-    /// (the relay runs about every five seconds). Everything else leaves the
-    /// strip to the agents pane.
+    /// until it is done. Everything else leaves the strip to the agents
+    /// pane — a Running worker opens straight into its view (giverny#82),
+    /// and the walk brings the relay's run forward itself (`Nudge`).
     fn sync_strip_asks(&mut self) {
         let mut want: HashSet<TabId> = HashSet::new();
         if !self.cfg.claude.agents_pane {
             // The relay hides nothing: there is nothing to ask for.
         } else {
             if let Some(job) = &self.attach
-                && job.driver.wants_strip()
+                && job.wants_strip()
             {
                 want.insert(job.tab);
-            }
-            if let Some(overlays::Button::Open { tab, .. }) = self.brief.as_ref().map(|b| &b.button)
-            {
-                want.insert(*tab);
             }
         }
         let spool = self.paths.hook_spool();
@@ -3169,54 +3233,111 @@ impl App {
         }
     }
 
-    /// One frame of an attach: read the parent's screen, maybe type a key.
+    /// One frame of an attach: read the parent's screen, maybe type a key;
+    /// once the walk is done, wait for the view's final screen before the
+    /// tab's picture is let go (giverny#82).
     fn process_attach(&mut self, ctx: &egui::Context) {
         use agent_open::Tick;
+        let pane_on = self.cfg.claude.agents_pane;
         let Some(job) = &mut self.attach else {
             return;
         };
         // Switched away: stop typing into a tab nobody is looking at.
         let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
         let (Some(session), true) = (session, self.ws.active == Some(job.tab)) else {
+            if let Some(session) = session
+                && job.nudge.is_narrow()
+            {
+                session.nudge_width(false);
+            }
             self.attach = None;
             return;
         };
+        let now = Instant::now();
         let screen = session.screen_text();
-        let undimmed = session.screen_text_undimmed();
-        let look = agent_open::Look {
-            screen: &screen,
-            undimmed: &undimmed,
-            cursor: session.cursor_row(),
-        };
-        match job.driver.tick(Instant::now(), look) {
-            Tick::Send(key) => {
-                let mode = session.mode();
-                let bytes = agent_open::keystroke_bytes(key, |k, m| {
-                    giverny_term::input::encode_key(k, m, mode)
-                });
-                session.write(bytes);
+        // The relay's answer still to come: the strip, on the way in; the
+        // strip's rows gone again, once in.
+        let to_worker = matches!(job.driver.goal, agent_open::Goal::Worker { .. });
+        let waiting = pane_on
+            && to_worker
+            && match &job.settle {
+                None => job.driver.waiting_for_strip(),
+                Some(settle) => !settle.is_final(&screen),
+            };
+        match job.nudge.tick(now, waiting) {
+            Some(agent_open::Width::Narrow) => session.nudge_width(true),
+            Some(agent_open::Width::Restore) => session.nudge_width(false),
+            None => {}
+        }
+        let mut finished = false;
+        if let Some(settle) = &mut job.settle {
+            finished = !job.nudge.is_narrow() && settle.done(now, &screen);
+        } else {
+            let undimmed = session.screen_text_undimmed();
+            let look = agent_open::Look {
+                screen: &screen,
+                undimmed: &undimmed,
+                cursor: session.cursor_row(),
+            };
+            match job.driver.tick(now, look) {
+                Tick::Send(key) => {
+                    let mode = session.mode();
+                    let bytes = agent_open::keystroke_bytes(key, |k, m| {
+                        giverny_term::input::encode_key(k, m, mode)
+                    });
+                    session.write(bytes);
+                }
+                Tick::Wait => {}
+                Tick::Done => {
+                    job.settle = Some(agent_open::Settle::new(&job.driver.goal, pane_on, now));
+                    job.nudge.ask();
+                }
+                Tick::Stuck(why) => {
+                    tracing::info!("agents pane: walk stopped: {why:?}");
+                    if job.nudge.is_narrow() {
+                        session.nudge_width(false);
+                    }
+                    let text = match job.driver.goal {
+                        agent_open::Goal::Main => format!(
+                            "Giverny could not walk this tab back to the orchestrator's view \
+                             ({why:?}). Press ↓ at the prompt until the agent list under it is \
+                             selected, then Enter on `main`."
+                        ),
+                        agent_open::Goal::Worker { .. } => why.explain(job.driver.target()),
+                    };
+                    let title = job.title.clone();
+                    let tab = job.tab;
+                    self.attach = None;
+                    self.settings = None;
+                    self.keys_overlay = None;
+                    self.brief = Some(overlays::BriefOverlay::text(title, None, text));
+                    self.release_picture(tab);
+                    return;
+                }
             }
-            Tick::Wait => {}
-            Tick::Done => self.attach = None,
-            Tick::Stuck(why) => {
-                tracing::info!("agents pane: walk stopped: {why:?}");
-                let text = match job.driver.goal {
-                    agent_open::Goal::Main => format!(
-                        "Giverny could not walk this tab back to the orchestrator's view \
-                         ({why:?}). Press ↓ at the prompt until the agent list under it is \
-                         selected, then Enter on `main`."
-                    ),
-                    agent_open::Goal::Worker { .. } => why.explain(job.driver.target()),
-                };
-                let title = job.title.clone();
-                self.attach = None;
-                self.settings = None;
-                self.keys_overlay = None;
-                self.brief = Some(overlays::BriefOverlay::text(title, None, text));
-            }
+        }
+        if finished {
+            let tab = job.tab;
+            tracing::info!(
+                "agents pane: walk to {} shown after {:?}",
+                job.driver.target(),
+                job.started.elapsed()
+            );
+            self.attach = None;
+            self.release_picture(tab);
         }
         if self.attach.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    /// A walk in `tab` is over: its screen is read afresh this frame, so the
+    /// pane, the header and the picture all change together.
+    fn release_picture(&mut self, tab: TabId) {
+        if let Some(rt) = self.rt.get_mut(&tab) {
+            rt.worker_checked = None;
         }
     }
 
@@ -3291,6 +3412,7 @@ impl App {
     /// * `open` — the overlay's Open in Claude Code;
     /// * `esc` — an Esc key press, into the terminal as typed;
     /// * `back` — a pointer click on the terminal's back button;
+    /// * `xheader` — a pointer click on the worker header's `×`;
     /// * `type <text>` — the text, written to the active tab (`\r` in it: Enter);
     /// * `key <enter|up|down>` — that key press, as typed;
     /// * `dump <file>` — the active tab's screen text into the file.
@@ -3364,12 +3486,15 @@ impl App {
                     feed(vec![key(true)]);
                     feed(vec![key(false)]);
                 }
-                "back" => {
-                    let rect = self
-                        .ws
-                        .active
-                        .and_then(|t| self.rt.get(&t))
-                        .and_then(|rt| rt.view.button_rect);
+                "back" | "xheader" => {
+                    let rect = if cmd == "xheader" {
+                        self.header_close
+                    } else {
+                        self.ws
+                            .active
+                            .and_then(|t| self.rt.get(&t))
+                            .and_then(|rt| rt.view.button_rect)
+                    };
                     match rect {
                         Some(r) => {
                             let pos = r.center();
@@ -3881,31 +4006,60 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
-            // The worker whose view the tab shows: its pane row is marked.
-            let viewed = self
+            // What the tab shows: read first, so the pane, the header and
+            // the picture below agree in every frame.
+            let now = Instant::now();
+            let job = self.attach.as_ref().filter(|j| j.tab == active);
+            let holding = job.is_some_and(|j| j.holds(now));
+            if let Some(rt) = self.rt.get_mut(&active) {
+                update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
+                // Held (giverny#82): the picture stays the view it was, and
+                // so does everything drawn about it.
+                if !holding {
+                    rt.shown_viewed = rt.viewed.clone();
+                }
+                if rt.shown_viewed.is_none() {
+                    rt.header_closed = None;
+                }
+            }
+            // The worker whose view the tab shows, or is on its way to: its
+            // pane row is marked, from the click on.
+            let pane_label = match job.map(|j| &j.driver.goal) {
+                Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
+                Some(agent_open::Goal::Main) => None,
+                None => self.rt.get(&active).and_then(|rt| rt.viewed.clone()),
+            };
+            // The worker the header over the terminal is about: the view
+            // in the picture, unless its `×` closed it.
+            let header_label = self
                 .rt
                 .get(&active)
-                .and_then(|rt| rt.viewed.as_deref())
-                .and_then(|label| {
-                    let rows = self.claude.agents.tracker(active)?.rows();
-                    let names = |r: &&giverny_claude::subagents::SubagentRow| {
-                        r.description
-                            .as_deref()
-                            .is_some_and(|d| agent_open::label_matches(label, d))
-                    };
-                    rows.iter()
-                        .filter(|r| r.running())
-                        .find(names)
-                        .or_else(|| rows.iter().find(names))
-                        .map(|r| r.id.clone())
-                });
+                .filter(|rt| rt.header_closed.is_none() || rt.header_closed != rt.shown_viewed)
+                .and_then(|rt| rt.shown_viewed.clone());
+            let worker_id = |label: &str| {
+                let rows = self.claude.agents.tracker(active)?.rows();
+                let names = |r: &&giverny_claude::subagents::SubagentRow| {
+                    r.description
+                        .as_deref()
+                        .is_some_and(|d| agent_open::label_matches(label, d))
+                };
+                rows.iter()
+                    .filter(|r| r.running())
+                    .find(names)
+                    .or_else(|| rows.iter().find(names))
+                    .map(|r| r.id.clone())
+            };
+            let viewed = pane_label.as_deref().and_then(worker_id);
+            let header_id = header_label.as_deref().and_then(worker_id);
             // The agents pane takes the bottom of the terminal's area.
-            if self.cfg.claude.agents_pane
-                && let Some(click) = agents_pane::show(
+            let mut header = None;
+            if self.cfg.claude.agents_pane {
+                let (click, line) = agents_pane::show(
                     &mut self.agent_views,
                     active,
                     self.claude.agents.tracker(active),
                     viewed.as_deref(),
+                    header_id.as_deref(),
                     agents_pane::limit_for(
                         &self.claude,
                         active,
@@ -3915,13 +4069,14 @@ impl eframe::App for App {
                     &self.chrome,
                     &mut self.shared,
                     ui,
-                )
-            {
-                actions.push(Action::AgentRowClicked(active, Box::new(click)));
+                );
+                if let Some(click) = click {
+                    actions.push(Action::AgentRowClicked(active, Box::new(click)));
+                }
+                header = line;
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
-                update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
                 // With the agents pane on, Giverny stands in for Claude
                 // Code's strip: its `main` row is not drawn, and a worker's
                 // view gets a way back (giverny#75).
@@ -3932,12 +4087,25 @@ impl eframe::App for App {
                     .then_some(agent_open::row_marks as fn(&str) -> _);
                 rt.view.button_labels = BACK_LABELS;
                 rt.view.button_fill = self.chrome.accent;
+                rt.view.hold = holding;
                 if let Some(session) = &mut rt.session {
                     // The worker overlay is laid out on this rect.
                     self.session_rect = Some(ui.available_rect_before_wrap());
                     let response = rt.view.show(ui, &mut self.shared, session);
                     if rt.view.button_pressed {
                         actions.push(Action::BackToMain(active));
+                    }
+                    // Over the top of the terminal, on the worker's view
+                    // (giverny#82): what it is working on, in full.
+                    self.header_close = None;
+                    if let Some(line) = &header {
+                        let (closed, close) =
+                            view_header::show(ui, response.rect, line, &self.chrome, active);
+                        self.header_close = Some(close);
+                        if closed {
+                            rt.header_closed = rt.shown_viewed.clone();
+                            self.focus_terminal = true;
+                        }
                     }
                     if self.focus_terminal {
                         response.request_focus();

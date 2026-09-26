@@ -193,6 +193,13 @@ pub struct TabView {
     pub button_pressed: bool,
     /// Where the row button was drawn last frame, if it was.
     pub button_rect: Option<Rect>,
+    /// Keep painting the last frame drawn, whatever the program writes
+    /// meanwhile (giverny#82): the app sets it while it walks Claude Code
+    /// from one view to another, so the steps between never reach the
+    /// screen and the view changes in one frame. Input still goes through.
+    pub hold: bool,
+    /// The frame on screen was held: the next frame is drawn afresh.
+    was_held: bool,
 }
 
 /// What the app paints over a tab's grid (giverny#75: the agents pane
@@ -290,6 +297,8 @@ impl Default for TabView {
             button_fill: Color32::from_rgb(0x8a, 0xb4, 0xf8),
             button_pressed: false,
             button_rect: None,
+            hold: false,
+            was_held: false,
         }
     }
 }
@@ -341,6 +350,13 @@ impl TabView {
         let live = session.term.lock().grid().display_offset() == 0;
         if !live {
             self.marks = RowMarks::default();
+        } else if self.was_held
+            && !self.hold
+            && let Some(marks_for) = self.marks_for
+        {
+            // The first frame after a hold: its marks now, so the button
+            // comes with the picture rather than a frame after it.
+            self.marks = marks_for(&session.screen_text());
         }
         let button = self.row_button(rect, ppp, metrics, cols);
         self.button_rect = button.map(|(r, _)| r);
@@ -420,13 +436,29 @@ impl TabView {
         } else {
             shared.theme.bg
         };
-        let dirty = session.take_dirty();
-        let needs_rebuild = dirty
-            || self.last_blink != cursor_visible
-            || self.cached.as_ref().is_none_or(|c| {
-                c.origin_px != origin_px || c.generation != shared.generation || c.bg != bg
-            });
-        self.last_blink = cursor_visible;
+        // Held: the last frame stays, with its background and marks, as
+        // long as it still fits where it is drawn. The program's output
+        // stays dirty, so the first frame after is drawn from it.
+        let held = self.hold
+            && self
+                .cached
+                .as_ref()
+                .is_some_and(|c| c.origin_px == origin_px && c.generation == shared.generation);
+        let bg = match (&self.cached, held) {
+            (Some(c), true) => c.bg,
+            _ => bg,
+        };
+        let released = std::mem::replace(&mut self.was_held, held) && !held;
+        let needs_rebuild = !held
+            && (session.take_dirty()
+                || released
+                || self.last_blink != cursor_visible
+                || self.cached.as_ref().is_none_or(|c| {
+                    c.origin_px != origin_px || c.generation != shared.generation || c.bg != bg
+                }));
+        if !held {
+            self.last_blink = cursor_visible;
+        }
         if needs_rebuild {
             // A worker's tab resolves the default background to its tint,
             // so it is elided and filled below like any default cell.
