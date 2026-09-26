@@ -668,19 +668,24 @@ fn cut(s: &str, max: usize) -> String {
 /// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
 /// while it is, the Running rows' clocks are held. `viewed` is the worker
 /// whose view the tab's Claude Code shows (its id): its row is lit as the
-/// selection (giverny#75).
+/// selection (giverny#75). `header` names the worker the terminal's
+/// header is about (giverny#82), whose row comes back with the click, as
+/// the pane drew it.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     views: &mut Views,
     tab: TabId,
     tracker: Option<&Tracker>,
     viewed: Option<&str>,
+    header: Option<&str>,
     limit: Option<Limit>,
     chrome: &Chrome,
     shared: &mut RenderShared,
     ui: &mut Ui,
-) -> Option<RowClick> {
-    let tracker = tracker?;
+) -> (Option<RowClick>, Option<Line>) {
+    let Some(tracker) = tracker else {
+        return (None, None);
+    };
     let view = views.tabs.entry(tab).or_default();
     view.poll_feed(tracker.session_id.as_deref());
     let now = now_ms();
@@ -692,8 +697,16 @@ pub fn show(
     };
     let table = build_at(view.feed_now.as_ref(), tracker.rows(), now, &clock);
     if table.is_empty() {
-        return None;
+        return (None, None);
     }
+    // The first of a worker's rows: the one with no ditto in it.
+    let header_line = header.and_then(|id| {
+        table
+            .lines
+            .iter()
+            .find(|l| l.click.agent_id.as_deref() == Some(id))
+            .cloned()
+    });
     if table.any_running() {
         // ELAPSED is a stopwatch.
         ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -736,7 +749,7 @@ pub fn show(
                     clicked = draw_table(ui, &table, viewed, chrome, shared, cell, row_h, cols);
                 });
         });
-    clicked
+    (clicked, header_line)
 }
 
 /// The pane's frame: the session's own background, not the rail's lifted

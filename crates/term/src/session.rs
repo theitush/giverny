@@ -176,6 +176,19 @@ impl TermSession {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Tell the program the terminal is one column narrower (`narrow`), or
+    /// its real size again, without touching the grid (giverny#82). A
+    /// width change is what makes Claude Code run its `subagentStatusLine`
+    /// at once rather than on its five-second tick; the grid is left alone
+    /// because the program repaints it when the real width comes back.
+    pub fn nudge_width(&self, narrow: bool) {
+        let mut size = self.size;
+        if narrow {
+            size.cols = size.cols.saturating_sub(1).max(2);
+        }
+        let _ = self.sender.send(Msg::Resize(size.into()));
+    }
+
     pub fn size(&self) -> GridSize {
         self.size
     }

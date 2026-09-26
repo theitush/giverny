@@ -4,21 +4,23 @@
 //! touching the app, what that click means — so the decision is tested here
 //! and `main.rs::apply` only carries it out:
 //!
-//! * **Running** and **Done** workers open an overlay over the current
-//!   terminal (giverny#41, #44) showing the worker's transcript, rendered as
-//!   `giverny transcript` renders it: a Running one live, following it as it
-//!   grows; a Done one opened at its end, on the final report. Nothing is
-//!   typed into Claude Code and no tab is opened.
-//! * From that overlay a Running worker can be *attached* (the overlay's
-//!   **Open in Claude Code**, giverny#23): Giverny types into the parent's
-//!   own terminal the keys that put Claude Code in that subagent's
-//!   interactive view. The keys, and what they were established from, are
-//!   [`cc_keys`]; the typing is driven by [`Attach`], which reads the
-//!   parent's screen after every key rather than typing blind.
-//!   With the agents pane on, the relay is asked to show Claude Code's
-//!   agent strip while the overlay is up and the walk runs
-//!   (`hooks::show_strip`), since the strip is the only keyboard path to a
-//!   worker's view; `/tasks` is never used.
+//! * A **Running** worker opens straight into its view in the parent's
+//!   Claude Code (giverny#82; the #23 attach): Giverny types the keys that
+//!   put Claude Code in that subagent's interactive view, driven by
+//!   [`Walk`], which reads the parent's screen after every key rather than
+//!   typing blind. With the agents pane on, the relay is asked to show
+//!   Claude Code's agent strip while the walk runs (`hooks::show_strip`),
+//!   since the strip is the only keyboard path to a worker's view; `/tasks`
+//!   is never used. The tab's picture is held from the click until the
+//!   view is final ([`Settle`]), so the steps between are never drawn, and
+//!   a one-column [`Nudge`] of the pty's width brings the relay's run
+//!   forward so the hold is short. Only when that cannot start does the
+//!   row open the overlay below.
+//! * **Done** workers (and a Running one that cannot be opened) open an
+//!   overlay over the current terminal (giverny#41, #44) showing the
+//!   worker's transcript, rendered as `giverny transcript` renders it: a
+//!   Running one live, following it as it grows; a Done one opened at its
+//!   end, on the final report. Nothing is typed into Claude Code.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
 //!   orchestrator" button walk it back to the main view ([`Walk::home`],
 //!   giverny#75), and the strip's own `main` row is not drawn
@@ -967,12 +969,18 @@ impl Walk {
         }
     }
 
-    /// Whether the walk still needs Claude Code's strip drawn: until the
-    /// row is entered. Going home needs no help: a worker's view keeps
-    /// `main` on the strip whatever the relay hides.
+    /// Whether the walk needs Claude Code's strip drawn: all the way into
+    /// a worker's view, focus and all — the strip's rows going away under
+    /// a focused strip would move its selection (giverny#82). Going home
+    /// needs no help: a worker's view keeps `main` on the strip whatever
+    /// the relay hides.
     pub fn wants_strip(&self) -> bool {
         matches!(self.goal, Goal::Worker { .. })
-            && matches!(self.phase, Phase::Start | Phase::Strip | Phase::Attach(_))
+    }
+
+    /// Whether the walk is waiting on the strip to come up.
+    pub fn waiting_for_strip(&self) -> bool {
+        matches!(self.phase, Phase::Start | Phase::Strip)
     }
 
     fn go(&mut self, phase: Phase, now: Instant) {
@@ -1112,6 +1120,121 @@ impl Walk {
                 }
             }
         }
+    }
+}
+
+// ----------------------------------------------------------- settle ----
+
+/// How long the final screen must hold before it is shown: Claude Code
+/// writes a frame in more than one read, and half of one is not it.
+pub const SETTLE_CALM: Duration = Duration::from_millis(60);
+/// The longest a finished walk waits for its final screen.
+pub const SETTLE_MAX: Duration = Duration::from_millis(2500);
+
+/// After a [`Walk`] lands: waits for the screen to be the view's final
+/// one, so the terminal can go from the view before to it in one frame
+/// (giverny#82). Into a worker's view with the agents pane on, final is
+/// the strip's agent rows gone again (only its `main` row stays, and that
+/// is not drawn); back on main, it is main's prompt.
+#[derive(Debug, Clone)]
+pub struct Settle {
+    main: bool,
+    pane_on: bool,
+    since: Instant,
+    good_since: Option<Instant>,
+}
+
+impl Settle {
+    pub fn new(goal: &Goal, pane_on: bool, now: Instant) -> Settle {
+        Settle {
+            main: matches!(goal, Goal::Main),
+            pane_on,
+            since: now,
+            good_since: None,
+        }
+    }
+
+    /// Whether `screen` is the view's final screen.
+    pub fn is_final(&self, screen: &str) -> bool {
+        if self.main {
+            !viewing_worker(screen)
+        } else {
+            viewing_worker(screen) && (!self.pane_on || strip_agents(screen).is_empty())
+        }
+    }
+
+    /// One frame: true once the final screen has held for [`SETTLE_CALM`],
+    /// or [`SETTLE_MAX`] has gone by regardless.
+    pub fn done(&mut self, now: Instant, screen: &str) -> bool {
+        if now >= self.since + SETTLE_MAX {
+            return true;
+        }
+        if !self.is_final(screen) {
+            self.good_since = None;
+            return false;
+        }
+        let since = *self.good_since.get_or_insert(now);
+        now >= since + SETTLE_CALM
+    }
+}
+
+/// How long the pty is left one column narrow: long enough for Claude Code
+/// to take the new width in before the real one comes back.
+pub const NUDGE_NARROW: Duration = Duration::from_millis(90);
+/// How long after a nudge the next is sent, while still waited on.
+pub const NUDGE_AGAIN: Duration = Duration::from_millis(1500);
+/// The most nudges one wait sends; after that the relay's own tick.
+const NUDGE_MAX: u8 = 3;
+
+/// What a [`Nudge`] wants done to the pty's width this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Width {
+    Narrow,
+    Restore,
+}
+
+/// Brings Claude Code's next `subagentStatusLine` run forward
+/// (giverny#82). Claude Code runs it every five seconds, and 300 ms after
+/// the terminal's width changes — so a width one column short for a moment
+/// makes the relay's answer to a new strip ask land within about half a
+/// second instead of up to five. The pty alone is narrowed, never the grid,
+/// and only while the tab's picture is held, so nothing of it is seen.
+#[derive(Debug, Clone, Default)]
+pub struct Nudge {
+    narrowed: Option<Instant>,
+    last: Option<Instant>,
+    sent: u8,
+}
+
+impl Nudge {
+    /// Start over: a new ask for the relay to answer.
+    pub fn ask(&mut self) {
+        self.last = None;
+        self.sent = 0;
+    }
+
+    /// One frame. `waiting`: the relay's answer is still not on screen.
+    pub fn tick(&mut self, now: Instant, waiting: bool) -> Option<Width> {
+        if let Some(at) = self.narrowed {
+            if now >= at + NUDGE_NARROW {
+                self.narrowed = None;
+                self.last = Some(now);
+                return Some(Width::Restore);
+            }
+            return None;
+        }
+        let due = self.last.is_none_or(|at| now >= at + NUDGE_AGAIN);
+        if waiting && due && self.sent < NUDGE_MAX {
+            self.sent += 1;
+            self.narrowed = Some(now);
+            return Some(Width::Narrow);
+        }
+        None
+    }
+
+    /// The pty is narrow right now and must be put back.
+    pub fn is_narrow(&self) -> bool {
+        self.narrowed.is_some()
     }
 }
 
@@ -1962,8 +2085,77 @@ mod tests {
         });
         assert_eq!(done, Tick::Done);
         assert_eq!(fake.view, 1, "on eta worker's view");
-        assert!(!w.wants_strip());
+        assert!(w.wants_strip(), "held until the walk is done with it");
+        assert!(!w.waiting_for_strip());
         assert_clean(&fake);
+    }
+
+    #[test]
+    fn settle_waits_for_the_strips_rows_to_go_then_for_calm() {
+        let t = Instant::now();
+        let goal = Goal::Worker {
+            description: "eta worker".into(),
+            aliases: vec![],
+        };
+        let mut s = Settle::new(&goal, true, t);
+        // In the view, the strip still showing its agent rows.
+        assert!(!s.done(t, WORKER_VIEW_STRIP));
+        assert!(!s.done(t + SETTLE_CALM * 3, WORKER_VIEW_STRIP));
+        // The relay hid them: only `main` is left.
+        let hidden: String = WORKER_VIEW_STRIP
+            .lines()
+            .filter(|l| !l.contains("general-purpose  "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let at = t + Duration::from_millis(400);
+        assert!(!s.done(at, &hidden), "not before it holds");
+        assert!(s.done(at + SETTLE_CALM, &hidden));
+        // With the pane off the strip is Claude Code's: the view is enough.
+        let mut off = Settle::new(&goal, false, t);
+        assert!(!off.done(t, WORKER_VIEW_STRIP));
+        assert!(off.done(t + SETTLE_CALM, WORKER_VIEW_STRIP));
+        // Never longer than SETTLE_MAX.
+        let mut late = Settle::new(&goal, true, t);
+        assert!(late.done(t + SETTLE_MAX, WORKER_VIEW_STRIP));
+    }
+
+    #[test]
+    fn settle_home_is_main_on_screen() {
+        let t = Instant::now();
+        let mut s = Settle::new(&Goal::Main, true, t);
+        assert!(!s.done(t, WORKER_VIEW_STRIP));
+        assert!(!s.done(t, &at_prompt("")));
+        assert!(s.done(t + SETTLE_CALM, &at_prompt("")));
+    }
+
+    #[test]
+    fn a_nudge_narrows_then_restores_and_gives_up_after_three() {
+        let t = Instant::now();
+        let mut n = Nudge::default();
+        assert_eq!(n.tick(t, false), None, "nothing waited on");
+        assert_eq!(n.tick(t, true), Some(Width::Narrow));
+        assert!(n.is_narrow());
+        assert_eq!(n.tick(t + NUDGE_NARROW / 2, true), None);
+        let back = t + NUDGE_NARROW;
+        assert_eq!(n.tick(back, true), Some(Width::Restore));
+        assert!(!n.is_narrow());
+        // Still waited on: again, but not at once.
+        assert_eq!(n.tick(back + NUDGE_AGAIN / 2, true), None);
+        let mut at = back + NUDGE_AGAIN;
+        assert_eq!(n.tick(at, true), Some(Width::Narrow));
+        at += NUDGE_NARROW;
+        assert_eq!(n.tick(at, true), Some(Width::Restore));
+        at += NUDGE_AGAIN;
+        assert_eq!(n.tick(at, true), Some(Width::Narrow));
+        at += NUDGE_NARROW;
+        assert_eq!(n.tick(at, true), Some(Width::Restore));
+        at += NUDGE_AGAIN;
+        assert_eq!(n.tick(at, true), None, "three is the most");
+        // A new ask starts over.
+        n.ask();
+        assert_eq!(n.tick(at, true), Some(Width::Narrow));
+        // A narrow pty always comes back, waited on or not.
+        assert_eq!(n.tick(at + NUDGE_NARROW, false), Some(Width::Restore));
     }
 
     #[test]
