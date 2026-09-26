@@ -334,6 +334,18 @@ impl TermSession {
         out
     }
 
+    /// The live screen row the cursor is on, while the program shows it
+    /// (`DECTCEM`); `None` while it is hidden. Claude Code shows it only
+    /// while its prompt has the keyboard, which is how a walk tells the
+    /// prompt's focus from the strip's or a footer pill's (giverny#75).
+    pub fn cursor_row(&self) -> Option<usize> {
+        let term = self.term.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) {
+            return None;
+        }
+        usize::try_from(term.grid().cursor.point.line.0).ok()
+    }
+
     /// [`Session::screen_text`] with every dim cell blanked: what a program
     /// drew at full strength. A prompt's placeholder is drawn dim, so this is
     /// how "the prompt has a draft in it" is told from "the prompt shows its

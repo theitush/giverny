@@ -179,6 +179,34 @@ pub struct TabView {
     /// Paint the default background as the theme's worker background
     /// ([`Theme::worker_bg`]): the app sets it while the tab shows a worker.
     pub worker_bg: bool,
+    /// Reads the screen's text (row per line) into [`RowMarks`] whenever the
+    /// grid is redrawn: rows the app wants painted over. `None`: none.
+    pub marks_for: Option<fn(&str) -> RowMarks>,
+    marks: RowMarks,
+    /// The row button's label, longest first: the first that fits the
+    /// row's blank cells is drawn, and none when none fits.
+    pub button_labels: &'static [&'static str],
+    /// The row button's fill; its text is drawn in the background colour.
+    pub button_fill: Color32,
+    /// Set by [`TabView::show`] for a frame in which the row button was
+    /// clicked, or Esc pressed for it ([`RowMarks::escape`]).
+    pub button_pressed: bool,
+    /// Where the row button was drawn last frame, if it was.
+    pub button_rect: Option<Rect>,
+}
+
+/// What the app paints over a tab's grid (giverny#75: the agents pane
+/// standing in for Claude Code's agent strip). Rows are screen rows of the
+/// live screen, and nothing is painted while the view is scrolled back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowMarks {
+    /// Rows drawn as blank background.
+    pub hidden: Vec<u16>,
+    /// `(row, used)`: a button at the right end of `row`, on its blank
+    /// cells from column `used` on.
+    pub button: Option<(u16, u16)>,
+    /// Esc presses the button instead of reaching the program.
+    pub escape: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -256,6 +284,12 @@ impl Default for TabView {
             hints: None,
             textures: std::collections::HashMap::new(),
             worker_bg: false,
+            marks_for: None,
+            marks: RowMarks::default(),
+            button_labels: &[],
+            button_fill: Color32::from_rgb(0x8a, 0xb4, 0xf8),
+            button_pressed: false,
+            button_rect: None,
         }
     }
 }
@@ -300,6 +334,24 @@ impl TabView {
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mouse_reporting = mode.intersects(TermMode::MOUSE_MODE) && !shift_held;
 
+        // The row button, where the last redraw found its row. Registered
+        // after the grid's response, so it is on top of it and a click on
+        // it goes to it alone.
+        self.button_pressed = false;
+        let live = session.term.lock().grid().display_offset() == 0;
+        if !live {
+            self.marks = RowMarks::default();
+        }
+        let button = self.row_button(rect, ppp, metrics, cols);
+        self.button_rect = button.map(|(r, _)| r);
+        let button_resp = button.map(|(r, _)| {
+            ui.interact(r, response.id.with("row-button"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+        });
+        if button_resp.as_ref().is_some_and(|r| r.clicked()) {
+            self.button_pressed = true;
+        }
+
         self.handle_search(ui, session, rect, ppp, metrics);
         self.handle_hints(ui, session, rect, ppp, metrics);
         self.handle_click_targets(ui, session, &response, rect, ppp, metrics);
@@ -307,7 +359,8 @@ impl TabView {
         // under it, so the click must not also reach the program. Claude Code
         // opens hyperlinks itself (`onHyperlinkClick` → `xdg-open`), and a
         // forwarded click opened the same link a second time.
-        let pointer_is_ours = self.hover_target.is_some();
+        let pointer_is_ours =
+            self.hover_target.is_some() || button_resp.as_ref().is_some_and(|r| r.hovered());
         self.handle_keyboard(ui, shared, session, &response, mode);
         if pointer_is_ours {
             // Neither reported nor treated as a selection drag.
@@ -383,6 +436,11 @@ impl TabView {
             });
             let metrics = shared.metrics_for(shared.font_size * ppp);
             let theme = tinted.as_ref().unwrap_or(&shared.theme);
+            if let (Some(marks_for), true) = (self.marks_for, live) {
+                self.marks = marks_for(&session.screen_text());
+            } else if self.marks_for.is_none() {
+                self.marks = RowMarks::default();
+            }
             let snapshot = {
                 let term = session.term.lock();
                 Snapshot::capture(&term, theme)
@@ -418,6 +476,34 @@ impl TabView {
                     painter.add(Shape::Mesh(mesh.clone()));
                 }
             }
+        }
+
+        // The rows the app blanks, and its row button, over the grid.
+        let row_band = |row: u16| {
+            Rect::from_min_size(
+                Pos2::new(
+                    rect.min.x,
+                    rect.min.y + (row as f32 * metrics.cell_h as f32) / ppp,
+                ),
+                Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
+            )
+        };
+        for &row in &self.marks.hidden {
+            if i32::from(row) < rows_now(rect, ppp, metrics) {
+                painter.rect_filled(row_band(row), 0.0, bg);
+            }
+        }
+        if let (Some((r, label)), Some(resp)) = (button, &button_resp) {
+            let hot = resp.hovered() || resp.is_pointer_button_down_on();
+            let fill = if hot {
+                self.button_fill
+            } else {
+                self.button_fill.gamma_multiply(0.85)
+            };
+            painter.rect_filled(r, 3.0, bg);
+            painter.rect_filled(r.shrink2(Vec2::new(0.0, 1.0)), 4.0, fill);
+            let text_at = Pos2::new(r.min.x + cw_pt, r.min.y);
+            shared.paint_text(&painter, text_at, label, bg);
         }
 
         // Search match highlight + hovered link underline, over the grid.
@@ -493,6 +579,35 @@ impl TabView {
         response
     }
 
+    /// The row button's rect and label, when the marks ask for one and a
+    /// label fits the row's blank cells with a cell to spare each side.
+    fn row_button(
+        &self,
+        rect: Rect,
+        ppp: f32,
+        m: CellMetrics,
+        cols: u16,
+    ) -> Option<(Rect, &'static str)> {
+        let (row, used) = self.marks.button?;
+        if i32::from(row) >= rows_now(rect, ppp, m) {
+            return None;
+        }
+        let free = cols.saturating_sub(used);
+        let label = self
+            .button_labels
+            .iter()
+            .find(|l| (l.chars().count() as u16) + 4 <= free)?;
+        // One cell of padding inside each end; the right end one cell in.
+        let width = label.chars().count() as u16 + 2;
+        let start = cols - 1 - width;
+        let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
+        let r = Rect::from_min_size(
+            Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),
+            Vec2::new(width as f32 * cw, ch),
+        );
+        Some((r, *label))
+    }
+
     fn handle_keyboard(
         &mut self,
         ui: &mut Ui,
@@ -551,6 +666,11 @@ impl TabView {
                         }
                         if modifiers.ctrl && *key == Key::Num0 {
                             zoom_reset = true;
+                            continue;
+                        }
+                        // Esc is the row button's while it asks for it.
+                        if *key == Key::Escape && modifiers.is_none() && self.marks.escape {
+                            self.button_pressed = true;
                             continue;
                         }
                         if let Some(seq) = input::encode_key(*key, *modifiers, mode) {

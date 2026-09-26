@@ -306,10 +306,10 @@ pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
             }
             _ => {}
         },
-        // A message typed to a running worker in its own view (by hand, or
-        // from the overlay's talk box, giverny#71) is not a `user` line: it
-        // lands as a queued command attachment, origin human, when the
-        // worker takes it.
+        // A message typed to a running worker in its own view (the view
+        // Open in Claude Code puts the tab on, giverny#75) is not a `user`
+        // line: it lands as a queued command attachment, origin human, when
+        // the worker takes it.
         Some("attachment") => {
             let att = v.get("attachment").unwrap_or(&Value::Null);
             let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");

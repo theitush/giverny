@@ -666,11 +666,15 @@ fn cut(s: &str, max: usize) -> String {
 /// clicked this frame.
 ///
 /// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
-/// while it is, the Running rows' clocks are held.
+/// while it is, the Running rows' clocks are held. `viewed` is the worker
+/// whose view the tab's Claude Code shows (its id): its row is lit as the
+/// selection (giverny#75).
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     views: &mut Views,
     tab: TabId,
     tracker: Option<&Tracker>,
+    viewed: Option<&str>,
     limit: Option<Limit>,
     chrome: &Chrome,
     shared: &mut RenderShared,
@@ -729,7 +733,7 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked = draw_table(ui, &table, chrome, shared, cell, row_h, cols);
+                    clicked = draw_table(ui, &table, viewed, chrome, shared, cell, row_h, cols);
                 });
         });
     clicked
@@ -778,6 +782,10 @@ fn follow_rows(ctx: &egui::Context, id: egui::Id, fit: &mut Option<f32>, want: f
 /// A row's background tint, from the pointer alone: a deeper one while it is
 /// pressed, a light one while hovered, none otherwise. There is no third
 /// input — a click leaves nothing behind to highlight (giverny#40).
+/// How strongly the row of the worker on view is lit: past a hover's, so
+/// it reads as the selection even under the pointer.
+const VIEWED_TINT: f32 = 0.26;
+
 fn row_tint(hovered: bool, pressed: bool) -> Option<f32> {
     if pressed {
         Some(0.22)
@@ -803,9 +811,11 @@ fn table_cols(width: f32, cell_w: f32, bar_lane: f32) -> usize {
     ((usable / cw).floor() as usize).max(40)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_table(
     ui: &mut Ui,
     table: &Table,
+    viewed: Option<&str>,
     chrome: &Chrome,
     shared: &mut RenderShared,
     cell: egui::Vec2,
@@ -833,6 +843,19 @@ fn draw_table(
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
         let color = stage_color(line.stage);
+        // The worker whose view the terminal above shows (giverny#75):
+        // held lit, with a bar at its left edge, as a selection.
+        let on_view = viewed.is_some() && line.click.agent_id.as_deref() == viewed;
+        if on_view {
+            ui.painter()
+                .rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
+            // In the pane's left margin, clear of the text.
+            let bar = egui::Rect::from_min_size(
+                rect.min - egui::vec2(6.0, 0.0),
+                egui::vec2(3.0, rect.height()),
+            );
+            ui.painter().rect_filled(bar, 1.0, color);
+        }
         if let Some(alpha) = row_tint(resp.hovered(), resp.is_pointer_button_down_on()) {
             ui.painter()
                 .rect_filled(rect, 2.0, color.gamma_multiply(alpha));
