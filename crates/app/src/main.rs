@@ -914,6 +914,8 @@ pub struct App {
     attention: usize,
     /// The window has no decorations and draws its own caption (#69).
     frameless: bool,
+    /// How that window is maximised (#78).
+    maximize: titlebar::Maximize,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -1381,6 +1383,7 @@ impl App {
             stale_sessions: false,
             attention: 0,
             frameless,
+            maximize: titlebar::Maximize::default(),
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -2529,6 +2532,8 @@ impl App {
                 i.viewport_rect(),
             )
         });
+        // Maximised by hand on WSLg (#78) is maximised all the same.
+        let maximized = maximized || (self.frameless && self.maximize.is_on(ctx));
         // Deliberately not `viewport().inner_rect`: it is derived from the
         // window's *position*, which Wayland never reports, so it is None on
         // the primary platform. The egui surface is the window's inner area
@@ -3756,8 +3761,10 @@ impl eframe::App for App {
         let mut actions = self.shortcuts(&ctx);
 
         if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
-            titlebar::resize_edges(&ctx);
-            titlebar::outline(&ctx, &self.chrome);
+            self.maximize.update(&ctx);
+            let maximized = self.maximize.is_on(&ctx);
+            titlebar::resize_edges(&ctx, maximized);
+            titlebar::outline(&ctx, &self.chrome, maximized);
             let title = if self.attention > 0 {
                 format!("Giverny ({})", self.attention)
             } else {
@@ -3768,7 +3775,9 @@ impl eframe::App for App {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| titlebar::show(ui, &title, &self.chrome));
+                .show(ui, |ui| {
+                    titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
+                });
         }
 
         egui::Panel::left("rail")
