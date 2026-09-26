@@ -1072,6 +1072,80 @@ mod tests {
         assert_eq!(t.lines[0].eta, "");
     }
 
+    /// giverny#83: a feed written at `start` (no `agent_id`, no tokens) and
+    /// never refreshed, and the worker Claude Code runs for it. One row,
+    /// with the feed's id and ETA and the worker's tokens and activity,
+    /// which move with its transcript at every refresh.
+    #[test]
+    fn a_stale_feed_row_and_its_worker_are_one_row_that_ticks() {
+        let config = std::env::temp_dir().join(format!("giverny-pane-83-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config.join("projects/-w/s/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(config.join("projects/-w/s.jsonl"), "{}\n").unwrap();
+        let transcript = subs.join("agent-w82.jsonl");
+        let turn = |ctx: u64, file: &str| {
+            serde_json::json!({"type": "assistant", "timestamp": "2026-09-26T12:00:00Z",
+                "message": {"model": "m", "usage": {"input_tokens": 1, "cache_read_input_tokens": ctx - 1},
+                    "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": file}}]}})
+            .to_string()
+                + "\n"
+        };
+        let add = |text: String| {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&transcript)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        add(turn(50_000, "/a.rs"));
+
+        let mut tr = Tracker::new(Some(config.clone()));
+        tr.apply_live(
+            &LiveSnapshot::parse(
+                r#"{"session_id":"s","tasks":[{"id":"w82","status":"running",
+                    "description":"Work giverny#82 open direct","startTime":1789999400000,
+                    "tokenCount":49000}]}"#,
+            ),
+            T0,
+        );
+        let f = feed(
+            r#"{"session":"s","rows":[
+              {"key":"giverny#82","stage":"running","title":"FEATURE: open direct",
+               "started":1789999400000,"eta_s":3600},
+              {"key":"giverny#84","stage":"planned","title":"FEATURE: selectable","eta_s":1800}
+            ]}"#,
+        );
+        let mut seen = Vec::new();
+        for (i, (ctx, file)) in [(50_000, "/a.rs"), (61_200, "/b.rs"), (74_900, "/c.rs")]
+            .into_iter()
+            .enumerate()
+        {
+            if i > 0 {
+                add(turn(ctx, file));
+            }
+            tr.refresh();
+            let t = build(Some(&f), tr.rows(), T0 + i as u64 * 1000);
+            assert_eq!(
+                t.lines.len(),
+                2,
+                "one row for the task and its worker: {t:?}"
+            );
+            let l = &t.lines[0];
+            assert_eq!(l.id, "giverny#82");
+            assert_eq!(l.title, "FEATURE: open direct");
+            assert_eq!(l.eta, "~50m");
+            assert_eq!(l.click.agent_id.as_deref(), Some("w82"));
+            assert_eq!(l.now, format!("Edit: {file}"));
+            seen.push(l.tokens.clone());
+        }
+        assert_eq!(seen, ["50k", "61.2k", "74.9k"]);
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
     #[test]
     fn nothing_to_show_is_no_pane() {
         assert!(build(None, &[], T0).is_empty());

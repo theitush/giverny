@@ -285,94 +285,203 @@ pub struct Activity {
     /// land a notification line in its transcript after it has finished,
     /// and that is not the worker working (seen on real transcripts).
     pub last_turn_ms: Option<u64>,
-    /// Context size at the last assistant turn (input + cache + output).
+    /// The context the worker carries now: input + cache creation + cache
+    /// read of its *last* API response, assigned, never summed — the count
+    /// `coo/tools/orchestrate-status` writes (`tokens_of`, "WHAT A TOKEN
+    /// COUNT IS"), so the pane and the orchestrator agree (giverny#83).
     pub tokens: Option<u64>,
     /// The model the last assistant turn ran on.
     pub model: Option<String>,
 }
 
-/// How far back from the end [`read_activity`] looks. A tool result can be
+/// How far back from the end a first read starts. A tool result can be
 /// large, so this is generous; a transcript whose last tool call is further
 /// back than this reports no activity, which is honest enough.
 const TAIL_BYTES: u64 = 512 * 1024;
 
-/// Read the tail of an agent transcript.
+/// Read the tail of an agent transcript once. A worker that is still
+/// running is followed with a [`TranscriptTail`] instead.
 pub fn read_activity(path: &Path) -> Activity {
-    let Ok(buf) = read_tail(path, TAIL_BYTES) else {
-        return Activity::default();
-    };
-    activity_from_lines(buf.lines())
+    let mut tail = TranscriptTail::new(path);
+    tail.poll();
+    tail.act
 }
 
-fn read_tail(path: &Path, max: u64) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let start = len.saturating_sub(max);
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.take(max).read_to_end(&mut bytes)?;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if start > 0 {
-        // The first line is cut; drop it rather than half-parse it.
-        match text.find('\n') {
-            Some(i) => {
-                text.drain(..=i);
-            }
-            None => text.clear(),
+/// Follows one worker's transcript: the first [`poll`] reads its last
+/// [`TAIL_BYTES`], every later one only the bytes appended since, so
+/// keeping a running worker's tokens and activity current every second
+/// costs a `stat` while it is thinking and a few lines' parse when it
+/// writes (giverny#83).
+///
+/// [`poll`]: TranscriptTail::poll
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptTail {
+    path: PathBuf,
+    /// Bytes consumed; `None` before the first read.
+    offset: Option<u64>,
+    /// A line not yet ended by `\n`.
+    partial: Vec<u8>,
+    act: Activity,
+}
+
+impl TranscriptTail {
+    pub fn new(path: impl Into<PathBuf>) -> TranscriptTail {
+        TranscriptTail {
+            path: path.into(),
+            ..TranscriptTail::default()
         }
     }
-    Ok(text)
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn activity(&self) -> &Activity {
+        &self.act
+    }
+
+    /// Read what was appended. Returns true when the activity changed. A
+    /// file that shrank (rewritten) is read again as new.
+    pub fn poll(&mut self) -> bool {
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return false;
+        };
+        let (from, fresh) = match self.offset {
+            Some(o) if len >= o => (o, false),
+            _ => (len.saturating_sub(TAIL_BYTES), true),
+        };
+        if fresh {
+            self.partial.clear();
+            self.act = Activity::default();
+        }
+        if len == from && !fresh {
+            return false;
+        }
+        if file.seek(SeekFrom::Start(from)).is_err() {
+            return false;
+        }
+        let mut bytes = Vec::new();
+        if file.take(len - from).read_to_end(&mut bytes).is_err() {
+            return false;
+        }
+        self.offset = Some(from + bytes.len() as u64);
+        let mut chunk = std::mem::take(&mut self.partial);
+        chunk.extend_from_slice(&bytes);
+        let mut lines = &chunk[..];
+        if fresh && from > 0 {
+            // The first line is cut; drop it rather than half-parse it.
+            match lines.iter().position(|&b| b == b'\n') {
+                Some(i) => lines = &lines[i + 1..],
+                None => lines = &[],
+            }
+        }
+        let cut = lines.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let before = self.act.clone();
+        for line in lines[..cut].split(|&b| b == b'\n') {
+            fold_line(&mut self.act, line);
+        }
+        self.partial = lines[cut..].to_vec();
+        self.act != before
+    }
 }
 
-fn activity_from_lines<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -> Activity {
-    let mut act = Activity::default();
-    for line in lines.rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if act.last_turn_ms.is_none() {
-            act.last_turn_ms = as_millis(&v, "timestamp");
-        }
-        let Some(msg) = v.get("message") else {
-            continue;
-        };
-        if act.tokens.is_none()
-            && let Some(u) = msg.get("usage")
-        {
-            let t: u64 = [
-                "input_tokens",
-                "cache_creation_input_tokens",
-                "cache_read_input_tokens",
-                "output_tokens",
-            ]
-            .iter()
-            .filter_map(|k| as_u64(u, k))
-            .sum();
-            act.tokens = (t > 0).then_some(t);
-        }
-        if act.model.is_none() {
-            act.model = as_str(msg, "model");
-        }
-        if act.doing.is_none()
-            && let Some(items) = msg.get("content").and_then(Value::as_array)
-            && let Some(tu) = items
+/// Fold one transcript line into `act`, oldest line first.
+fn fold_line(act: &mut Activity, line: &[u8]) {
+    // Only an assistant line says anything, and most lines are not one:
+    // skip the parse for those.
+    const ASSISTANT: &[u8] = b"\"assistant\"";
+    if line.len() < ASSISTANT.len() || !line.windows(ASSISTANT.len()).any(|w| w == ASSISTANT) {
+        return;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    if let Some(ms) = as_millis(&v, "timestamp") {
+        act.last_turn_ms = Some(ms);
+    }
+    let Some(msg) = v.get("message") else {
+        return;
+    };
+    // Claude Code's own messages (an interrupt, an API error) are not a
+    // reply anything was billed for, and say nothing about the context.
+    if msg.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+        return;
+    }
+    if let Some(m) = as_str(msg, "model") {
+        act.model = Some(m);
+    }
+    if let Some(ctx) = msg.get("usage").map(context_tokens)
+        && ctx > 0
+    {
+        act.tokens = Some(ctx);
+    }
+    if let Some(tu) = msg
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
                 .iter()
                 .rev()
                 .find(|c| c.get("type").and_then(Value::as_str) == Some("tool_use"))
-        {
-            act.doing = Some(describe_tool_use(tu));
-        }
-        if act.doing.is_some() && act.tokens.is_some() && act.model.is_some() {
-            break;
+        })
+    {
+        act.doing = Some(describe_tool_use(tu));
+    }
+}
+
+/// The context one `usage` says the worker carries: input, cache creation
+/// and cache read, added. Claude Code measures a turn that ran several API
+/// iterations by the last real one (not an `advisor_message` or a
+/// `compaction`), and falls back to the top level on anything unexpected;
+/// `usage_numbers` in `orchestrate-status` is the same rule.
+fn context_tokens(u: &Value) -> u64 {
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let top = n(u, "input_tokens")
+        + n(u, "cache_creation_input_tokens")
+        + n(u, "cache_read_input_tokens");
+    let Some(its) = u.get("iterations").and_then(Value::as_array) else {
+        return top;
+    };
+    if top == 0 {
+        return top;
+    }
+    let last = its.iter().rfind(|it| {
+        it.is_object()
+            && !matches!(
+                it.get("type").and_then(Value::as_str),
+                Some("advisor_message" | "compaction")
+            )
+    });
+    let Some(last) = last else { return top };
+    if !matches!(
+        last.get("type").and_then(Value::as_str),
+        Some("message" | "fallback_message")
+    ) {
+        return top;
+    }
+    let mut sum = 0u64;
+    for k in [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ] {
+        match last.get(k).and_then(Value::as_f64) {
+            Some(x) if x >= 0.0 => {
+                if k != "output_tokens" {
+                    sum += x as u64;
+                }
+            }
+            _ => return top,
         }
     }
-    act
+    if sum == 0 { top } else { sum }
 }
 
 /// Longest `doing` line, in characters.
@@ -753,6 +862,9 @@ impl crate::feed::LiveAgent for SubagentRow {
     fn tokens(&self) -> Option<u64> {
         self.tokens
     }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 }
 
 /// The subagents of one tab's Claude session, Running and Done.
@@ -786,6 +898,9 @@ pub struct Tracker {
     /// Sessions whose `subagents/` dir has been found.
     #[serde(skip)]
     resolved: Vec<String>,
+    /// A follower per Running worker's transcript, by agent id.
+    #[serde(skip)]
+    followers: HashMap<String, TranscriptTail>,
 }
 
 impl Tracker {
@@ -862,7 +977,10 @@ impl Tracker {
             if t.start_ms.is_some() {
                 row.started_ms = t.start_ms;
             }
-            if t.tokens.is_some() {
+            // The transcript's count is the one the pane keeps once there
+            // is one (it moves every second, and agrees with the
+            // orchestrator's); the live list's stands in until then.
+            if t.tokens.is_some() && (row.transcript.is_none() || row.tokens.is_none()) {
                 row.tokens = t.tokens;
             }
             match Outcome::parse(&t.status) {
@@ -870,7 +988,11 @@ impl Tracker {
                     if row.stage == Stage::Done {
                         row.revive();
                     }
-                    if t.label.is_some() {
+                    // The transcript's last tool call is kept once there
+                    // is one: it is re-read every second, where the label
+                    // comes every few and often just repeats the
+                    // description. The label stands in until then.
+                    if t.label.is_some() && (row.transcript.is_none() || row.activity.is_none()) {
                         row.activity = t.label.clone();
                     }
                 }
@@ -890,8 +1012,9 @@ impl Tracker {
     /// transcript path, and add Done rows for workers that finished while
     /// nothing was watching (Giverny closed, or the pane just switched on).
     ///
-    /// Cheap enough for once a second: one `read_dir`, an appended-bytes read
-    /// of the parent transcript, and a tail read per Running row.
+    /// Cheap enough for once a second: one `read_dir`, and an appended-bytes
+    /// read of the parent transcript and of each Running worker's
+    /// ([`TranscriptTail`]) — a `stat` each while nothing was written.
     pub fn refresh(&mut self) {
         let Some(config) = self.config_dir.clone() else {
             return;
@@ -949,7 +1072,16 @@ impl Tracker {
                     .rows
                     .iter()
                     .any(|r| r.id == id && r.stage == Stage::Running);
-                let act = if needs_read || row_is_running {
+                // A Running worker is followed: only what it appended since
+                // the last second is read. Anything else is read once.
+                let act = if row_is_running {
+                    let f = self
+                        .followers
+                        .entry(id.clone())
+                        .or_insert_with(|| TranscriptTail::new(&path));
+                    f.poll();
+                    Some(f.activity().clone())
+                } else if needs_read {
                     Some(read_activity(&path))
                 } else {
                     None
@@ -976,12 +1108,12 @@ impl Tracker {
                         row.model = act.model;
                     }
                     if row.stage == Stage::Running {
-                        // Live label wins when it said something; the
-                        // transcript's last tool call otherwise.
+                        // The transcript's last tool call; the live label
+                        // stands until the worker has made one.
                         if act.doing.is_some() {
                             row.activity = act.doing;
                         }
-                        if row.tokens.is_none() {
+                        if act.tokens.is_some() {
                             row.tokens = act.tokens;
                         }
                     } else if row.tokens.is_none() {
@@ -999,6 +1131,11 @@ impl Tracker {
                 }
             }
         }
+        let rows = &self.rows;
+        self.followers.retain(|id, _| {
+            rows.iter()
+                .any(|r| &r.id == id && r.stage == Stage::Running)
+        });
         self.sort();
     }
 
@@ -1179,11 +1316,191 @@ mod tests {
             Some(T0 + 3000),
             "attachments are not turns"
         );
-        assert_eq!(act.tokens, Some(120));
+        // Context carried (2 + 100 + 8), not the output on top (coo#118).
+        assert_eq!(act.tokens, Some(110));
         assert_eq!(act.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(
             read_activity(&subs.join("missing.jsonl")),
             Activity::default()
+        );
+    }
+
+    fn usage_line(ms: u64, model: &str, usage: Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "timestamp": iso(ms),
+            "message": {"model": model, "content": [], "usage": usage}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_transcript_is_followed_by_what_was_appended() {
+        let (_c, subs, _p) = layout("follow", "s1");
+        let path = agent_transcript(&subs, "a1");
+        let mut tail = TranscriptTail::new(&path);
+        assert!(!tail.poll(), "no file yet");
+        append(
+            &path,
+            &(assistant_line(T0, Some(("Read", serde_json::json!({"file_path": "/x"})))) + "\n"),
+        );
+        assert!(tail.poll());
+        assert_eq!(tail.activity().doing.as_deref(), Some("Read: /x"));
+        assert_eq!(tail.activity().tokens, Some(110));
+        assert!(!tail.poll(), "nothing appended, nothing changes");
+
+        // Half a line waits for its end.
+        let next = assistant_line(
+            T0 + 1000,
+            Some(("Bash", serde_json::json!({"command": "ls"}))),
+        );
+        let (head, rest) = next.split_at(30);
+        append(&path, head);
+        assert!(!tail.poll());
+        append(&path, &format!("{rest}\n"));
+        assert!(tail.poll());
+        assert_eq!(tail.activity().doing.as_deref(), Some("Bash: ls"));
+        assert_eq!(tail.activity().last_turn_ms, Some(T0 + 1000));
+
+        // A synthetic message and an all-zero usage say nothing; a later
+        // turn's context replaces the earlier one, never adds to it.
+        append(
+            &path,
+            &[
+                usage_line(
+                    T0 + 2000,
+                    "<synthetic>",
+                    serde_json::json!({"input_tokens": 1}),
+                ),
+                usage_line(T0 + 2100, "m", serde_json::json!({"input_tokens": 0})),
+            ]
+            .join("\n"),
+        );
+        append(&path, "\n");
+        tail.poll();
+        assert_eq!(tail.activity().tokens, Some(110));
+        append(
+            &path,
+            &(usage_line(
+                T0 + 3000,
+                "m",
+                serde_json::json!({"input_tokens": 5, "cache_read_input_tokens": 5000,
+                                   "cache_creation_input_tokens": 300, "output_tokens": 900}),
+            ) + "\n"),
+        );
+        assert!(tail.poll());
+        assert_eq!(tail.activity().tokens, Some(5305));
+        assert_eq!(tail.activity().doing.as_deref(), Some("Bash: ls"), "kept");
+
+        // Rewritten shorter: read afresh.
+        std::fs::write(&path, assistant_line(T0, None) + "\n").unwrap();
+        tail.poll();
+        assert_eq!(tail.activity().doing, None);
+    }
+
+    #[test]
+    fn a_first_read_starts_near_the_end() {
+        let (_c, subs, _p) = layout("bigtail", "s1");
+        let path = agent_transcript(&subs, "a1");
+        let old = assistant_line(T0, Some(("Read", serde_json::json!({"file_path": "/old"}))));
+        let filler = serde_json::json!({"type": "user", "pad": "x".repeat(4000)}).to_string();
+        let mut text = old + "\n";
+        while (text.len() as u64) < TAIL_BYTES + 10_000 {
+            text += &filler;
+            text += "\n";
+        }
+        text += &assistant_line(T0 + 5, None);
+        text += "\n";
+        std::fs::write(&path, text).unwrap();
+        let act = read_activity(&path);
+        assert_eq!(act.doing, None, "the old call is past the tail");
+        assert_eq!(act.last_turn_ms, Some(T0 + 5));
+    }
+
+    #[test]
+    fn iterations_measure_a_turn_by_its_last_real_one() {
+        // orchestrate-status `usage_numbers`, case for case.
+        let u = serde_json::json!({"input_tokens": 1, "cache_read_input_tokens": 1000,
+        "iterations": [
+            {"type": "message", "input_tokens": 1, "cache_read_input_tokens": 400},
+            {"type": "message", "input_tokens": 2, "cache_read_input_tokens": 700,
+             "cache_creation_input_tokens": 9, "output_tokens": 50},
+            {"type": "compaction", "input_tokens": 99999}
+        ]});
+        assert_eq!(context_tokens(&u), 711);
+        let odd = serde_json::json!({"input_tokens": 3, "iterations": [{"type": "other", "input_tokens": 9}]});
+        assert_eq!(
+            context_tokens(&odd),
+            3,
+            "anything unexpected: the top level"
+        );
+        let missing = serde_json::json!({"input_tokens": 3,
+            "iterations": [{"type": "message", "input_tokens": 9}]});
+        assert_eq!(context_tokens(&missing), 3);
+        assert_eq!(context_tokens(&serde_json::json!({"input_tokens": 4})), 4);
+    }
+
+    #[test]
+    fn a_running_workers_tokens_and_activity_move_every_refresh() {
+        let (config, subs, _parent) = layout("tick", "s1");
+        let path = agent_transcript(&subs, "a1");
+        append(
+            &path,
+            &(assistant_line(T0, Some(("Grep", serde_json::json!({"pattern": "x"})))) + "\n"),
+        );
+        let mut t = Tracker::new(Some(config));
+        // The live list says 1000; the transcript is what is kept once read.
+        t.apply_live(&live("s1", &[("a1", "running", T0)]), T0);
+        assert_eq!(t.get("a1").unwrap().tokens, Some(1000));
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!(
+            (a1.tokens, a1.activity.as_deref()),
+            (Some(110), Some("Grep: x"))
+        );
+        // The next tick of the live list puts back neither its own count
+        // nor its label.
+        let mut snap = live("s1", &[("a1", "running", T0)]);
+        snap.tasks[0].label = Some("Work a1".into());
+        t.apply_live(&snap, T0 + 5000);
+        let a1 = t.get("a1").unwrap();
+        assert_eq!(
+            (a1.tokens, a1.activity.as_deref()),
+            (Some(110), Some("Grep: x"))
+        );
+        for (i, n) in [(1u64, 2000u64), (2, 3500)] {
+            append(
+                &path,
+                &(usage_line(
+                    T0 + i * 1000,
+                    "m",
+                    serde_json::json!({"cache_read_input_tokens": n}),
+                ) + "\n"),
+            );
+            append(
+                &path,
+                &(assistant_line(
+                    T0 + i * 1000 + 1,
+                    Some(("Edit", serde_json::json!({"file_path": format!("/f{i}")}))),
+                )
+                .replace(
+                    "\"cache_read_input_tokens\":100",
+                    &format!("\"cache_read_input_tokens\":{n}"),
+                ) + "\n"),
+            );
+            t.refresh();
+            let a1 = t.get("a1").unwrap();
+            assert_eq!(a1.tokens, Some(n + 10));
+            assert_eq!(
+                a1.activity.as_deref(),
+                Some(format!("Edit: /f{i}").as_str())
+            );
+        }
+        assert_eq!(t.followers.len(), 1);
+        t.apply_live(&live("s1", &[]), T0 + 9000);
+        t.refresh();
+        assert!(
+            t.followers.is_empty(),
+            "a Done worker is no longer followed"
         );
     }
 

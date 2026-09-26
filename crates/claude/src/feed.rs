@@ -408,6 +408,27 @@ pub trait LiveAgent {
     fn running(&self) -> bool;
     fn started_ms(&self) -> Option<u64>;
     fn tokens(&self) -> Option<u64>;
+    /// What the spawn said the worker is for (the Agent tool's
+    /// `description`, e.g. `Work giverny#82 …`): the second join key, for a
+    /// feed row that carries no `agent_id` (giverny#83).
+    fn description(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Does `text` name `key` as a whole word? `giverny#82` is named by
+/// `Work giverny#82 pane` and by `theitush/giverny#82`, never by
+/// `giverny#820` nor `xgiverny#82`.
+pub fn names_key(text: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(key).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + key.len()..].chars().next();
+        before.is_none_or(|c| !word(c) && c != '#') && after.is_none_or(|c| !word(c))
+    })
 }
 
 /// One row of the pane: a feed row, a live row, or both joined.
@@ -478,30 +499,52 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 
 /// Merge the feed with the live rows.
 ///
-/// - Every feed row is a row, in feed order, in the stage the feed gave it;
-///   one with an `agent_id` matching a live row carries that live row too.
-///   The feed's stage wins: one worker may hold a Done row and a Running
-///   one at once.
-/// - A live row no feed row names is a row of its own, Running or Done by
-///   its own state, after the feed's rows of that stage.
+/// - Every feed row is a row, in feed order, in the stage the feed gave it.
+///   It carries the live row its `agent_id` names; failing that (no
+///   `agent_id`, or one Claude Code no longer lists), the live row whose
+///   description names the row's key — `Work giverny#82 …` holds
+///   `giverny#82`, and one naming several keys holds each of them
+///   (giverny#83). The feed's stage wins: one worker may hold a Done row and
+///   a Running one at once.
+/// - A live row that no feed row carries, and whose description names no
+///   feed key, is a row of its own, Running or Done by its own state, after
+///   the feed's rows of that stage. One that names a key is that row's
+///   worker and is never drawn twice.
 /// - Rows are grouped Running, Planned, Done; order within a stage is kept.
 /// - A row whose worker is the one directly above it is a ditto.
 pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<PaneRow<'a, L>> {
     let feed_rows: &[FeedRow] = feed.map(|f| f.rows.as_slice()).unwrap_or(&[]);
     let find_live = |id: &str| live.iter().find(|l| l.agent_id() == id);
+    let names = |l: &L, key: &str| l.description().is_some_and(|d| names_key(d, key));
+    // A Running row wants the worker still running; any other the one that
+    // finished. Either takes the other when that is all there is.
+    let by_description = |f: &FeedRow| -> Option<&'a L> {
+        let want_running = f.stage() == Stage::Running;
+        let mut named = live.iter().filter(|l| names(l, &f.key));
+        let first = named.clone().next()?;
+        Some(named.find(|l| l.running() == want_running).unwrap_or(first))
+    };
     let mut out: Vec<PaneRow<'a, L>> = feed_rows
         .iter()
         .map(|f| PaneRow {
             stage: f.stage(),
             feed: Some(f),
-            live: f.agent_id.as_deref().and_then(find_live),
+            live: f
+                .agent_id
+                .as_deref()
+                .and_then(find_live)
+                .or_else(|| by_description(f)),
             ditto: false,
         })
         .collect();
     for l in live {
-        let named = feed_rows
+        let carried = out
             .iter()
-            .any(|f| f.agent_id.as_deref() == Some(l.agent_id()));
+            .any(|r| r.live.is_some_and(|c| c.agent_id() == l.agent_id()));
+        let named = carried
+            || feed_rows
+                .iter()
+                .any(|f| f.agent_id.as_deref() == Some(l.agent_id()) || names(l, &f.key));
         if !named {
             out.push(PaneRow {
                 stage: if l.running() {
@@ -581,6 +624,7 @@ mod tests {
         running: bool,
         started: Option<u64>,
         tokens: Option<u64>,
+        desc: Option<&'static str>,
     }
 
     impl LiveAgent for Live {
@@ -596,6 +640,9 @@ mod tests {
         fn tokens(&self) -> Option<u64> {
             self.tokens
         }
+        fn description(&self) -> Option<&str> {
+            self.desc
+        }
     }
 
     fn live(id: &'static str, running: bool) -> Live {
@@ -604,7 +651,128 @@ mod tests {
             running,
             started: Some(1_000),
             tokens: Some(7),
+            desc: None,
         }
+    }
+
+    fn described(id: &'static str, running: bool, desc: &'static str) -> Live {
+        Live {
+            desc: Some(desc),
+            ..live(id, running)
+        }
+    }
+
+    fn shape<'a>(
+        rows: &[PaneRow<'a, Live>],
+    ) -> Vec<(Stage, Option<&'a str>, Option<&'static str>, bool)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r.stage,
+                    r.feed.map(|f| f.key.as_str()),
+                    r.live.map(|l| l.id),
+                    r.ditto,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keys_are_named_as_whole_words() {
+        assert!(names_key("Work giverny#82 pane link", "giverny#82"));
+        assert!(names_key("giverny#82", "giverny#82"));
+        assert!(names_key("Work theitush/giverny#82: x", "giverny#82"));
+        assert!(names_key("Work giverny#82+giverny#84", "giverny#84"));
+        assert!(!names_key("Work giverny#820", "giverny#82"));
+        assert!(!names_key("Work xgiverny#82", "giverny#82"));
+        assert!(!names_key("Work coo#giverny#82", "giverny#82"));
+        assert!(!names_key("anything", ""));
+    }
+
+    /// giverny#83: the feed was written at `start`, before the worker's id
+    /// was known, and nothing refreshed it. The worker Claude Code lists
+    /// names the row's key in its description: one row, carrying both.
+    #[test]
+    fn a_stale_row_is_joined_to_the_worker_its_description_names() {
+        let mut stale = row("giverny#82", Stage::Running, None);
+        stale.started_ms = Some(500);
+        stale.eta_s = Some(3600);
+        let f = Feed {
+            rows: vec![stale, row("giverny#84", Stage::Planned, None)],
+            ..Default::default()
+        };
+        let lives = [
+            described("w82", true, "Work giverny#82 open direct"),
+            described("other", true, "Explore the relay"),
+        ];
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            shape(&rows),
+            [
+                (Stage::Running, Some("giverny#82"), Some("w82"), false),
+                (Stage::Running, None, Some("other"), false),
+                (Stage::Planned, Some("giverny#84"), None, false),
+            ]
+        );
+        assert_eq!(rows[0].agent_id(), Some("w82"));
+        assert_eq!(rows[0].tokens(), Some(7), "the worker's tokens");
+        assert_eq!(rows[0].started_ms(), Some(500), "the feed's clock");
+    }
+
+    #[test]
+    fn one_worker_naming_several_keys_holds_each_row() {
+        let f = Feed {
+            rows: vec![
+                row("g#1", Stage::Running, None),
+                row("g#2", Stage::Running, None),
+            ],
+            ..Default::default()
+        };
+        let lives = [described("w", true, "Work g#1 and g#2 together")];
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            shape(&rows),
+            [
+                (Stage::Running, Some("g#1"), Some("w"), false),
+                (Stage::Running, Some("g#2"), Some("w"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_running_row_takes_the_running_worker_and_a_gone_id_falls_back() {
+        // An earlier worker on the same task finished; the feed still names
+        // it, and Claude Code no longer lists that id at all.
+        let f = Feed {
+            rows: vec![row("g#5", Stage::Running, Some("vanished"))],
+            ..Default::default()
+        };
+        let lives = [
+            described("old", false, "Work g#5 first try"),
+            described("new", true, "Work g#5 again"),
+        ];
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            shape(&rows),
+            [(Stage::Running, Some("g#5"), Some("new"), false)],
+            "neither worker naming the key is drawn on its own"
+        );
+        // A Done row prefers the finished one.
+        let f = Feed {
+            rows: vec![row("g#5", Stage::Done, None)],
+            ..Default::default()
+        };
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            shape(&rows),
+            [(Stage::Done, Some("g#5"), Some("old"), false)]
+        );
+        // An agent_id that is listed still wins over any description.
+        let f = Feed {
+            rows: vec![row("g#5", Stage::Running, Some("old"))],
+            ..Default::default()
+        };
+        assert_eq!(merge(Some(&f), &lives)[0].live.map(|l| l.id), Some("old"));
     }
 
     fn row(key: &str, stage: Stage, agent: Option<&str>) -> FeedRow {
