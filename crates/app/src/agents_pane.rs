@@ -627,7 +627,7 @@ pub fn fmt_tokens(n: u64) -> String {
 fn stage_word(s: Stage) -> &'static str {
     match s {
         Stage::Running => "Running",
-        Stage::Planned => "Planned",
+        Stage::Planned => "NextUp",
         Stage::Done => "Done",
     }
 }
