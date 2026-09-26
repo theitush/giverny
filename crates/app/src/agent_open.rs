@@ -1246,8 +1246,9 @@ impl Nudge {
 /// * the strip's `main` row is not drawn — the pane shows which worker the
 ///   tab is on, and the way back is Giverny's button;
 /// * while a worker's view is on screen, a "back to orchestrator" button
-///   sits at the right end of the status line under the prompt (the row
-///   with the session's token counts), on its blank cells;
+///   sits where that `◯ main` was, left-aligned under the terminal's other
+///   text (giverny#89); with no such row, at the right end of the status
+///   line under the prompt (the row with the session's token counts);
 /// * and Esc presses that button rather than reaching Claude Code, while
 ///   the prompt or the strip has the keyboard (not over a dialog, whose Esc
 ///   is its own).
@@ -1267,6 +1268,26 @@ pub fn row_marks(screen: &str) -> giverny_term::widget::RowMarks {
     if !viewing_worker(screen) {
         return marks;
     }
+    marks.escape = matches!(
+        read_view(screen, screen),
+        View::Prompt { .. } | View::Strip(_)
+    );
+    // Where the strip's `◯ main` was: its dot's column, pointer skipped.
+    if let Some(i) = rows.iter().rposition(|r| main_row(r) == Some(false)) {
+        let row = rows[i];
+        let lead = row.chars().take_while(|c| c.is_whitespace()).count();
+        let rest = row.trim_start();
+        let dot = match rest.strip_prefix(cc_keys::PROMPT) {
+            Some(after) => {
+                let gap = after.chars().take_while(|c| c.is_whitespace()).count();
+                lead + 1 + gap
+            }
+            None => lead,
+        };
+        marks.button = as_row(i).map(|r| (r, 0));
+        marks.button_left = as_row(dot);
+        return marks;
+    }
     let Some(prompt) = prompt_box(screen, screen) else {
         return marks;
     };
@@ -1280,10 +1301,6 @@ pub fn row_marks(screen: &str) -> giverny_term::widget::RowMarks {
         .find(|&i| rows[i].contains("total:") || rows[i].contains("session "))
         .or_else(|| near.clone().find(|&i| !rows[i].trim().is_empty()));
     marks.button = status.and_then(|i| Some((as_row(i)?, as_row(rows[i].chars().count())?)));
-    marks.escape = matches!(
-        read_view(screen, screen),
-        View::Prompt { .. } | View::Strip(_)
-    );
     marks
 }
 
@@ -2284,15 +2301,19 @@ mod tests {
     }
 
     #[test]
-    fn marks_hide_main_and_put_the_way_back_on_the_status_line() {
+    fn marks_hide_main_and_put_the_way_back_where_it_was() {
         let marks = row_marks(WORKER_VIEW_STRIP);
         let rows: Vec<&str> = WORKER_VIEW_STRIP.lines().collect();
         assert_eq!(marks.hidden, vec![7], "the `❯ ◯ main` row");
         assert!(rows[7].contains("◯ main"));
         let (row, used) = marks.button.expect("a worker's view has the button");
-        assert!(rows[row as usize].contains("total: 117.9k"));
-        assert_eq!(used as usize, rows[row as usize].chars().count());
+        assert_eq!((row, used), (7, 0), "on the hidden `main` row");
+        assert_eq!(marks.button_left, Some(2), "at the dot, under the text");
         assert!(marks.escape);
+        // Not pointed at: the dot is where it is all the same.
+        let unpointed = WORKER_VIEW_STRIP.replace("❯ ◯ main", "  ◯ main");
+        let marks = row_marks(&unpointed);
+        assert_eq!((marks.button, marks.button_left), (Some((7, 0)), Some(2)));
         // On main: `main` still hidden, no button, Esc is Claude Code's.
         let main = at_prompt("");
         let marks = row_marks(&main);

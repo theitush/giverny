@@ -209,9 +209,13 @@ pub struct TabView {
 pub struct RowMarks {
     /// Rows drawn as blank background.
     pub hidden: Vec<u16>,
-    /// `(row, used)`: a button at the right end of `row`, on its blank
-    /// cells from column `used` on.
+    /// `(row, used)`: a button on `row`, on its blank cells from column
+    /// `used` on: at the row's right end, or at [`Self::button_left`].
     pub button: Option<(u16, u16)>,
+    /// The button's label starts at this column instead of the button
+    /// sitting at the row's right end (giverny#89: where the strip's
+    /// `main` was, under the terminal's other text).
+    pub button_left: Option<u16>,
     /// Esc presses the button instead of reaching the program.
     pub escape: bool,
 }
@@ -624,14 +628,21 @@ impl TabView {
         if i32::from(row) >= rows_now(rect, ppp, m) {
             return None;
         }
-        let free = cols.saturating_sub(used);
+        // One cell of padding inside each end; at the right, the end one
+        // cell in; at the left, the label on the column asked for.
+        let (free, left) = match self.marks.button_left {
+            Some(at) => {
+                let start = at.saturating_sub(1).max(used);
+                (cols.saturating_sub(start), Some(start))
+            }
+            None => (cols.saturating_sub(used), None),
+        };
         let label = self
             .button_labels
             .iter()
             .find(|l| (l.chars().count() as u16) + 4 <= free)?;
-        // One cell of padding inside each end; the right end one cell in.
         let width = label.chars().count() as u16 + 2;
-        let start = cols - 1 - width;
+        let start = left.unwrap_or(cols - 1 - width);
         let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
         let r = Rect::from_min_size(
             Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),

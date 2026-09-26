@@ -1052,7 +1052,7 @@ fn tab_env_id(id: TabId) -> String {
 const STRIP_ASK_RENEW: Duration = Duration::from_secs(30);
 
 /// The terminal's back button (giverny#75), longest first: the first that
-/// fits the status line's blank cells is drawn.
+/// fits the blank cells where the strip's `main` was is drawn.
 const BACK_LABELS: &[&str] = &["↺ back to orchestrator", "↺ orchestrator", "↺ back"];
 
 /// Automated per-tab injections. All stand down once the user has typed.
