@@ -453,6 +453,14 @@ impl ClaudeWatch {
             }
             return;
         }
+        // `giverny pass clear-done`: the tab's Done rows, cleared by hand.
+        if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
+            if let Some(tab_id) = Self::tab_id_of(msg) {
+                let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
+                self.agents.clear_done(tab_id, at);
+            }
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -1312,6 +1320,36 @@ mod tests {
             w.agents.tracker(TAB).unwrap().is_empty(),
             "/clear empties it"
         );
+    }
+
+    #[test]
+    fn clear_done_empties_the_tabs_done_rows_only() {
+        let mut w = ClaudeWatch::for_tests();
+        let tick = |ids: &str| {
+            msg(&format!(
+                r#"{{"tab_id":"giverny-7","config_dir":"/tmp/giverny-nowhere",
+                    "event":{{"hook_event_name":"{}","session_id":"s-1","tasks":[{ids}]}}}}"#,
+                hooks::SUBAGENT_LINE_EVENT
+            ))
+        };
+        let a = r#"{"id":"a1","status":"running","startTime":1790000000000}"#;
+        let b = r#"{"id":"a2","status":"running","startTime":1790000000000}"#;
+        feed(&mut w, &tick(&format!("{a},{b}")), Some(TAB));
+        feed(&mut w, &tick(a), Some(TAB));
+        assert_eq!(w.agents.tracker(TAB).unwrap().rows().len(), 2);
+        feed(
+            &mut w,
+            &hook(hooks::CLEAR_DONE_EVENT, r#","at_ms":1790000100000"#),
+            Some(TAB),
+        );
+        let t = w.agents.tracker(TAB).unwrap();
+        assert_eq!(
+            t.rows().len(),
+            1,
+            "the Done row went, the running one stayed"
+        );
+        assert_eq!(t.done_cleared_ms, Some(1_790_000_100_000));
+        assert_eq!(w.state_of(TAB), ClaudeState::None, "no state change");
     }
 
     fn hook(event: &str, extra: &str) -> RelayMsg {

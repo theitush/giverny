@@ -141,6 +141,16 @@ pub struct Feed {
 }
 
 impl Feed {
+    /// The feed without the Done rows that landed by `cutoff_ms` (or never
+    /// said when): what the pane shows after its Done rows were cleared by
+    /// hand, whoever wrote the file (giverny#112).
+    pub fn without_done_by(&self, cutoff_ms: u64) -> Feed {
+        let mut f = self.clone();
+        f.rows
+            .retain(|r| r.stage() != Stage::Done || r.ended_ms.is_some_and(|e| e > cutoff_ms));
+        f
+    }
+
     /// Is this feed about `session` — by its own id or by an alias?
     pub fn names(&self, session: &str) -> bool {
         self.session.as_deref() == Some(session) || self.aliases.iter().any(|a| a == session)
@@ -613,6 +623,26 @@ pub fn fmt_delta(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_rows_cleared_by_hand_are_the_ones_landed_by_then() {
+        let f = parse(
+            br#"{"rows":[
+                {"key":"a","stage":"done","ended":1000},
+                {"key":"b","stage":"done","ended":3000},
+                {"key":"c","stage":"done"},
+                {"key":"d","stage":"running","started":500},
+                {"key":"e","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        let keys: Vec<String> = f
+            .without_done_by(2000)
+            .rows
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["b", "d", "e"]);
+    }
 
     const FULL: &str = r#"{"version":1,"session":"s-new","aliases":["s-old"],
       "rows":[

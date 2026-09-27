@@ -43,6 +43,8 @@ usage: giverny pass <command> [args] [--session <id>]
   drop  <task>                remove the task's row
   show                        print the rows
   path                        print the feed file's path
+  clear-done                  clear the Done rows: from this session's feed,
+                              and from the agents pane of the Giverny tab it runs in
   clear                       delete this session's feed
 
 <task> is any short name (`auth-fix`, `#12`); name it, as a whole word, in the
@@ -62,6 +64,7 @@ pub enum Cmd {
     Drop(String),
     Show,
     Path,
+    ClearDone,
     Clear,
 }
 
@@ -164,6 +167,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "drop" => Cmd::Drop(task()?),
         "show" => Cmd::Show,
         "path" => Cmd::Path,
+        "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
         "clear" => Cmd::Clear,
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     };
@@ -258,7 +262,7 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
 }
 
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
-/// line to print. `Show`, `Path` and `Clear` are the caller's.
+/// line to print. `Show`, `Path`, `Clear` and `ClearDone` are the caller's.
 pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, String> {
     let rows = rows_mut(doc)?;
     let key = match cmd {
@@ -269,7 +273,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Pause(k)
         | Cmd::Resume(k)
         | Cmd::Drop(k) => k.clone(),
-        Cmd::Show | Cmd::Path | Cmd::Clear => return Ok(String::new()),
+        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone => return Ok(String::new()),
     };
     let at = find(rows, &key);
     let stage = at.and_then(|i| rows[i].as_object().and_then(stage_of));
@@ -405,7 +409,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             rows.remove(i);
             Ok(format!("dropped {key}"))
         }
-        Cmd::Show | Cmd::Path | Cmd::Clear => unreachable!(),
+        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone => unreachable!(),
     }
 }
 
@@ -564,6 +568,9 @@ pub fn run_in(
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .filter(Value::is_object);
+    if *cmd == Cmd::ClearDone {
+        return Ok(clear_done(&file, existing));
+    }
     if let Some(doc) = &existing
         && let Some(w) = writer_of(doc)
         && w != WRITER
@@ -594,6 +601,34 @@ pub fn run_in(
     }
 }
 
+/// `clear-done` on the file: drop its Done rows when this writer owns it.
+/// Another writer's feed is left as it is — the pane hides its Done rows
+/// itself once asked ([`main`] asks it) — and so is a missing one.
+fn clear_done(file: &Path, existing: Option<Value>) -> String {
+    let Some(mut doc) = existing else {
+        return "no feed for this session".into();
+    };
+    if let Some(w) = writer_of(&doc).filter(|w| *w != WRITER) {
+        return format!("the feed is {w}'s: left as it is");
+    }
+    let Ok(rows) = rows_mut(&mut doc) else {
+        return "the feed is not a JSON object: left as it is".into();
+    };
+    let before = rows.len();
+    rows.retain(|r| r.as_object().and_then(stage_of) != Some(feed::Stage::Done));
+    let gone = before - rows.len();
+    if gone == 0 {
+        return "no Done rows in the feed".into();
+    }
+    match write(file, &doc) {
+        Ok(()) => format!(
+            "cleared {gone} Done row{} from the feed",
+            if gone == 1 { "" } else { "s" }
+        ),
+        Err(e) => format!("{}: {e}", file.display()),
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -601,8 +636,10 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The `giverny pass` entrypoint. Returns the process exit code.
-pub fn main(args: &[String]) -> i32 {
+/// The `giverny pass` entrypoint. Returns the process exit code. `spool` is
+/// where a message to the app goes when its socket is not there
+/// (`clear-done`).
+pub fn main(args: &[String], spool: &Path) -> i32 {
     let (cmd, flags) = match parse_args(args) {
         Ok(x) => x,
         Err(e) => {
@@ -623,7 +660,17 @@ pub fn main(args: &[String]) -> i32 {
         );
         return 2;
     };
-    match run_in(&feed::feed_dir(), &session, &cmd, &flags, now_ms()) {
+    let now = now_ms();
+    match run_in(&feed::feed_dir(), &session, &cmd, &flags, now) {
+        Ok(msg) if cmd == Cmd::ClearDone => {
+            let pane = if crate::hooks::send_clear_done(spool, Some(&session), now) {
+                "asked Giverny to clear the agents pane's Done rows in this tab"
+            } else {
+                "not in a Giverny tab, so no pane to clear"
+            };
+            println!("{msg}; {pane}");
+            0
+        }
         Ok(msg) => {
             if !msg.is_empty() {
                 println!("{}", msg.trim_end());
@@ -831,6 +878,37 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(read_feed(&dir).rows.len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_done_drops_our_done_rows_and_leaves_anyone_elses() {
+        let dir = scratch("clear-done");
+        assert!(run(&dir, "clear-done", T0).unwrap().contains("no feed"));
+        run(&dir, "start a --eta 5", T0).unwrap();
+        run(&dir, "start b --eta 5", T0).unwrap();
+        run(&dir, "plan c --eta 5", T0).unwrap();
+        run(&dir, "land a", T0 + MIN).unwrap();
+        run(&dir, "land b", T0 + MIN).unwrap();
+        let msg = run(&dir, "clear-done", T0 + 2 * MIN).unwrap();
+        assert_eq!(msg, "cleared 2 Done rows from the feed");
+        let keys: Vec<String> = read_feed(&dir).rows.into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, ["c"]);
+        assert!(
+            run(&dir, "clear-done", T0)
+                .unwrap()
+                .contains("no Done rows")
+        );
+
+        let theirs = br#"{"version":1,"session":"s1","writer":"coo/orchestrate-status","rows":[{"key":"x","stage":"done"}]}"#;
+        std::fs::write(feed::feed_path(&dir, "s1"), theirs).unwrap();
+        let msg = run(&dir, "clear-done", T0).unwrap();
+        assert!(msg.contains("coo/orchestrate-status"), "{msg}");
+        assert_eq!(
+            std::fs::read(feed::feed_path(&dir, "s1")).unwrap(),
+            theirs.to_vec()
+        );
+        assert_eq!(parse_args(&args("clear-done")).unwrap().0, Cmd::ClearDone);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
