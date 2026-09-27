@@ -1,4 +1,5 @@
-//! Token counts for the status line: `session <n>  ·  total: <n>`.
+//! Token counts for the status line:
+//! `session: <n>  ·  subagents: <n>  ·  total: <n>`.
 //!
 //! The count is the one Claude Code's agents view prints beside a subagent —
 //! `latestInputTokens`: input + cache creation + cache read of the **last**
@@ -229,16 +230,20 @@ pub fn subagent_transcripts(dirs: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// `(session, total)`: the session's count, and that plus every subagent's.
-/// `None` for both when nothing could be counted.
-pub fn session_and_total(
+/// `(session, subagents, total)`: the session's count, the sum of every
+/// subagent's, and the two added — so the three always add up (giverny#95).
+/// `None` for all three when nothing could be counted; `subagents` is `Some(0)`
+/// when the session has none.
+pub fn session_subagents_total(
     session: Option<u64>,
     subagents: &[PathBuf],
-) -> (Option<u64>, Option<u64>) {
+) -> (Option<u64>, Option<u64>, Option<u64>) {
     let workers: Vec<u64> = subagents.iter().filter_map(|p| tokens_of(p)).collect();
-    let total = (session.is_some() || !workers.is_empty())
-        .then(|| session.unwrap_or(0) + workers.iter().sum::<u64>());
-    (session, total)
+    if session.is_none() && workers.is_empty() {
+        return (None, None, None);
+    }
+    let sub: u64 = workers.iter().sum();
+    (session, Some(sub), Some(session.unwrap_or(0) + sub))
 }
 
 /// Claude Code's compact count — `842`, `13.5k`, `124.8k`, `1.2M` — with a
@@ -258,15 +263,18 @@ pub fn fmt_tokens(n: u64) -> String {
     n.to_string()
 }
 
-/// The status-line segments: `session <n>` and `total: <n>`, either left out
-/// when it has no number.
-pub fn segments(session: Option<u64>, total: Option<u64>) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(s) = session {
-        out.push(format!("session {}", fmt_tokens(s)));
+/// The status-line segments: `session: <n>` always once anything was counted,
+/// then `subagents: <n>` and `total: <n>` only when the subagents have tokens
+/// (giverny#95) — with none, the total would only repeat the session.
+pub fn segments(session: Option<u64>, subagents: Option<u64>, total: Option<u64>) -> Vec<String> {
+    let sub = subagents.unwrap_or(0);
+    if session.is_none() && sub == 0 {
+        return Vec::new();
     }
-    if let Some(t) = total {
-        out.push(format!("total: {}", fmt_tokens(t)));
+    let mut out = vec![format!("session: {}", fmt_tokens(session.unwrap_or(0)))];
+    if sub > 0 {
+        out.push(format!("subagents: {}", fmt_tokens(sub)));
+        out.push(format!("total: {}", fmt_tokens(total.unwrap_or(0))));
     }
     out
 }
@@ -400,15 +408,23 @@ mod tests {
         let dirs = session_subagent_dirs(Some(&t), Some(&cfg), Some("sid1"));
         let files = subagent_transcripts(&dirs);
         assert_eq!(files.len(), 2);
-        let (s, total) = session_and_total(session_tokens(&json!({}), Some(&t)), &files);
-        assert_eq!((s, total), (Some(1000), Some(1230)));
+        let (s, sub, total) = session_subagents_total(session_tokens(&json!({}), Some(&t)), &files);
+        assert_eq!((s, sub, total), (Some(1000), Some(230), Some(1230)));
         assert_eq!(
-            segments(s, total),
-            vec!["session 1k".to_string(), "total: 1.2k".to_string()]
+            segments(s, sub, total),
+            vec![
+                "session: 1k".to_string(),
+                "subagents: 230".to_string(),
+                "total: 1.2k".to_string()
+            ]
         );
+        // A session with no subagent tokens shows only its own count.
+        let (s, sub, total) = session_subagents_total(Some(1000), &[]);
+        assert_eq!((s, sub, total), (Some(1000), Some(0), Some(1000)));
+        assert_eq!(segments(s, sub, total), vec!["session: 1k".to_string()]);
         // No session and no subagents: nothing to say.
-        assert_eq!(session_and_total(None, &[]), (None, None));
-        assert!(segments(None, None).is_empty());
+        assert_eq!(session_subagents_total(None, &[]), (None, None, None));
+        assert!(segments(None, None, None).is_empty());
     }
 
     #[test]

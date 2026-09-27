@@ -358,9 +358,10 @@ pub fn run_statusline(spool: &Path) {
     println!("{}", parts.join("  ·  "));
 }
 
-/// `session <n>` and `total: <n>` for the status line (giverny#22): this
-/// conversation's own tokens, then that plus every subagent's, counted the way
-/// coo's `orchestrate-status` counts them (see [`crate::tokens`]).
+/// `session: <n>`, `subagents: <n>` and `total: <n>` for the status line
+/// (giverny#22, giverny#95): this conversation's own tokens, every subagent's
+/// summed, and the two added, counted the way coo's `orchestrate-status`
+/// counts them (see [`crate::tokens`]).
 fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
     use crate::tokens;
     let transcript = payload
@@ -385,8 +386,9 @@ fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
     let dirs =
         tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
     let session = tokens::session_tokens(payload, transcript.as_deref());
-    let (session, total) = tokens::session_and_total(session, &tokens::subagent_transcripts(&dirs));
-    tokens::segments(session, total)
+    let (session, subagents, total) =
+        tokens::session_subagents_total(session, &tokens::subagent_transcripts(&dirs));
+    tokens::segments(session, subagents, total)
 }
 
 /// Is the Giverny statusline configured in this settings file?
