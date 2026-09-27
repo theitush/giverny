@@ -763,6 +763,13 @@ pub struct SubagentRow {
     /// Summary line of its last notification.
     #[serde(default)]
     pub summary: Option<String>,
+    /// `tokens` came from its transcript, not the live list. Once it has,
+    /// the live list's `tokenCount` never replaces it: that count is the
+    /// context *plus* output so far, and an API error zeroes the context
+    /// part, so a failed worker lists at its output alone — the `764`
+    /// of giverny#92.
+    #[serde(default)]
+    pub tokens_from_transcript: bool,
 }
 
 impl SubagentRow {
@@ -782,6 +789,7 @@ impl SubagentRow {
             transcript: None,
             last_turn_ms: None,
             summary: None,
+            tokens_from_transcript: false,
         }
     }
 
@@ -901,6 +909,11 @@ pub struct Tracker {
     /// A follower per Running worker's transcript, by agent id.
     #[serde(skip)]
     followers: HashMap<String, TranscriptTail>,
+    /// Finished workers whose transcript this process has read once: a row
+    /// restored with the live list's count (or none) is set right from its
+    /// transcript after a restart, and then left alone (giverny#92).
+    #[serde(skip)]
+    checked: std::collections::HashSet<String>,
 }
 
 impl Tracker {
@@ -979,8 +992,10 @@ impl Tracker {
             }
             // The transcript's count is the one the pane keeps once there
             // is one (it moves every second, and agrees with the
-            // orchestrator's); the live list's stands in until then.
-            if t.tokens.is_some() && (row.transcript.is_none() || row.tokens.is_none()) {
+            // orchestrator's); the live list's stands in until then. It is
+            // never taken back: after an API error the live count is the
+            // output alone (giverny#92).
+            if t.tokens.is_some() && !row.tokens_from_transcript {
                 row.tokens = t.tokens;
             }
             match Outcome::parse(&t.status) {
@@ -1060,9 +1075,13 @@ impl Tracker {
                     // Either way not ours to invent.
                     continue;
                 }
+                let unchecked = !self.checked.contains(&id);
                 let needs_read = !known
                     || self.rows.iter().any(|r| {
-                        r.id == id && (r.stage == Stage::Running || r.transcript.is_none())
+                        r.id == id
+                            && (r.stage == Stage::Running
+                                || r.transcript.is_none()
+                                || (unchecked && !r.tokens_from_transcript))
                     });
                 if !needs_read && completion.is_none() {
                     continue;
@@ -1082,6 +1101,7 @@ impl Tracker {
                     f.poll();
                     Some(f.activity().clone())
                 } else if needs_read {
+                    self.checked.insert(id.clone());
                     Some(read_activity(&path))
                 } else {
                     None
@@ -1107,17 +1127,17 @@ impl Tracker {
                     if row.model.is_none() {
                         row.model = act.model;
                     }
-                    if row.stage == Stage::Running {
-                        // The transcript's last tool call; the live label
-                        // stands until the worker has made one.
-                        if act.doing.is_some() {
-                            row.activity = act.doing;
-                        }
-                        if act.tokens.is_some() {
-                            row.tokens = act.tokens;
-                        }
-                    } else if row.tokens.is_none() {
+                    // The transcript's count wins at every stage: a Done row
+                    // holding the live list's (the output alone, after an API
+                    // error) is set right the first time it is read.
+                    if act.tokens.is_some() {
                         row.tokens = act.tokens;
+                        row.tokens_from_transcript = true;
+                    }
+                    // The transcript's last tool call; the live label
+                    // stands until the worker has made one.
+                    if row.stage == Stage::Running && act.doing.is_some() {
+                        row.activity = act.doing;
                     }
                 }
                 if !known && row.started_ms.is_none() {
@@ -1741,6 +1761,118 @@ mod tests {
         t.set_session("new");
         t.refresh();
         assert_eq!(t.get("a1").map(|r| r.stage), Some(Stage::Done));
+    }
+
+    /// A real worker's transcript (giverny#84's, trimmed to its usage,
+    /// tool names and timestamps): cut off by `EAI_AGAIN` at 17:38:46 and
+    /// continued the next morning. `orchestrate-status`' `tokens_of()`
+    /// reads 131752 on the first 143 lines and 134773 on all 175.
+    const REAL: &str = include_str!("../testdata/agent-api-error-resume.jsonl");
+    const REAL_BEFORE_LINES: usize = 143;
+    const REAL_BEFORE: u64 = 2 + 2_509 + 129_241;
+    const REAL_AFTER: u64 = 2 + 1_225 + 133_546;
+    /// 2026-09-26T17:38:46.816Z, the API error line.
+    const REAL_ERROR_MS: u64 = 1_790_444_326_816;
+    /// 2026-09-27T07:35:01.869Z, its first real turn after the continue.
+    const REAL_BACK_MS: u64 = 1_790_494_501_869;
+
+    fn real_before() -> String {
+        REAL.lines()
+            .take(REAL_BEFORE_LINES)
+            .map(|l| l.to_string() + "\n")
+            .collect()
+    }
+
+    fn real_after() -> String {
+        REAL.lines()
+            .skip(REAL_BEFORE_LINES)
+            .map(|l| l.to_string() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn the_real_transcript_counts_as_orchestrate_status_does() {
+        let dir = scratch("real92");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a.jsonl");
+        std::fs::write(&path, real_before()).unwrap();
+        let act = read_activity(&path);
+        assert_eq!(act.tokens, Some(REAL_BEFORE), "the error line is skipped");
+        // Followed across the continue, and read afresh after it.
+        let mut tail = TranscriptTail::new(&path);
+        tail.poll();
+        append(&path, &real_after());
+        tail.poll();
+        for act in [tail.activity().clone(), read_activity(&path)] {
+            assert_eq!(act.tokens, Some(REAL_AFTER));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#92: the live list's count for a worker an API error stopped
+    /// is its output alone (764 on the real one), and a row that took it —
+    /// new to a tracker, or restored from a save written before the
+    /// transcript was read — must show the transcript's count instead,
+    /// before the continue, after it, and across a restart.
+    #[test]
+    fn a_failed_workers_count_is_its_transcripts() {
+        let (config, subs, parent) = layout("real92t", "s1");
+        let path = agent_transcript(&subs, "a1");
+        std::fs::write(&path, real_before()).unwrap();
+        append(
+            &parent,
+            &notification_lines("a1", "failed", REAL_ERROR_MS + 50),
+        );
+        let failed = |start: u64| {
+            LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "failed", "startTime": start, "tokenCount": 764}]}))
+        };
+        let start = REAL_ERROR_MS - 1_700_000;
+
+        // A tracker that first hears of it from the live list.
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(&failed(start), REAL_ERROR_MS + 100);
+        assert_eq!(t.get("a1").unwrap().tokens, Some(764));
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.stage, a1.tokens), (Stage::Done, Some(REAL_BEFORE)));
+        t.apply_live(&failed(start), REAL_ERROR_MS + 5_000);
+        assert_eq!(
+            t.get("a1").unwrap().tokens,
+            Some(REAL_BEFORE),
+            "not taken back"
+        );
+
+        // A save from before any of this: 764 on a Done row, no new fields.
+        let saved = serde_json::json!({
+            "session_id": "s1", "config_dir": config,
+            "rows": [{"id": "a1", "stage": "done", "outcome": "failed",
+                      "started_ms": start, "ended_ms": REAL_ERROR_MS + 50, "tokens": 764,
+                      "transcript": path}]});
+        let mut t: Tracker = serde_json::from_value(saved).unwrap();
+        t.refresh();
+        assert_eq!(t.get("a1").unwrap().tokens, Some(REAL_BEFORE));
+        let restarted: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        let mut t = restarted;
+        t.apply_live(&failed(start), REAL_ERROR_MS + 9_000);
+        t.refresh();
+        assert_eq!(
+            t.get("a1").unwrap().tokens,
+            Some(REAL_BEFORE),
+            "across a restart"
+        );
+
+        // Continued: listed running from the continue, with a small count.
+        append(&path, &real_after());
+        t.apply_live(
+            &LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "running", "startTime": REAL_BACK_MS - 3_146, "tokenCount": 812}]})),
+            REAL_BACK_MS + 60_000,
+        );
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.stage, a1.tokens), (Stage::Running, Some(REAL_AFTER)));
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// Against the real transcripts on this machine — read-only, and skipped

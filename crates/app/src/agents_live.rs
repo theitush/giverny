@@ -174,11 +174,12 @@ impl AgentsLive {
     }
 }
 
-/// What a refresh can change that is worth saving.
-fn signature(t: &Tracker) -> Vec<(String, Stage, Option<u64>)> {
+/// What a refresh can change that is worth saving: a corrected token count
+/// among them (giverny#92), so a restart comes back to it.
+fn signature(t: &Tracker) -> Vec<(String, Stage, Option<u64>, Option<u64>)> {
     t.rows()
         .iter()
-        .map(|r| (r.id.clone(), r.stage, r.ended_ms))
+        .map(|r| (r.id.clone(), r.stage, r.ended_ms, r.tokens))
         .collect()
 }
 
