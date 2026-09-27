@@ -617,7 +617,7 @@ mod tests {
          "started":"2026-09-23T09:00:00Z","ended":"2026-09-23T09:45:00Z","eta_s":2400},
         {"key":"coo#160","stage":"planned","title":"later","eta_s":600}
       ],
-      "footer":{"text":"session 3 · total: 1.2M"}}"#;
+      "footer":{"text":"session: 3 · subagents: 1.2M · total: 1.2M"}}"#;
 
     struct Live {
         id: &'static str,
@@ -790,7 +790,10 @@ mod tests {
         assert_eq!(f.version, 1);
         assert_eq!(f.session.as_deref(), Some("s-new"));
         assert_eq!(f.aliases, vec!["s-old".to_string()]);
-        assert_eq!(f.footer.as_deref(), Some("session 3 · total: 1.2M"));
+        assert_eq!(
+            f.footer.as_deref(),
+            Some("session: 3 · subagents: 1.2M · total: 1.2M")
+        );
         assert_eq!(f.rows.len(), 3);
         let r = &f.rows[0];
         assert_eq!(r.key, "coo#158");

@@ -1292,13 +1292,13 @@ pub fn row_marks(screen: &str) -> giverny_term::widget::RowMarks {
         return marks;
     };
     // The status line: under the prompt's bottom rule, the row with the
-    // token counts (Giverny's `… · session … · total: …`); else the first
-    // row there with anything on it.
+    // token counts (Giverny's `… · session: … · subagents: … · total: …`);
+    // else the first row there with anything on it.
     let below = prompt.rows.end + 1;
     let near = below..rows.len().min(below + 3);
     let status = near
         .clone()
-        .find(|&i| rows[i].contains("total:") || rows[i].contains("session "))
+        .find(|&i| rows[i].contains("total:") || rows[i].contains("session:"))
         .or_else(|| near.clone().find(|&i| !rows[i].trim().is_empty()));
     marks.button = status.and_then(|i| Some((as_row(i)?, as_row(rows[i].chars().count())?)));
     marks
@@ -1688,7 +1688,7 @@ mod tests {
     fn at_prompt(draft: &str) -> String {
         format!(
             "{STRIP_TOP}❯ {draft}\n──────────────────────────────────────────────────────────────────\n  \
-             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session 36.2k  ·  total: 90k\n{}",
+             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session: 36.2k  ·  subagents: 53.8k  ·  total: 90k\n{}",
             strip_rows(None, "⏸ manual mode on · 2 shells · ← 2 agents")
         )
     }
@@ -1702,7 +1702,7 @@ mod tests {
         };
         format!(
             "{STRIP_TOP}❯ \n──────────────────────────────────────────────────────────────────\n  \
-             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session 36.2k  ·  total: 90k\n{}",
+             Haiku 4.5  ·  5h 11%  ·  wk 94%  ·  session: 36.2k  ·  subagents: 53.8k  ·  total: 90k\n{}",
             strip_rows(Some(at), hint)
         )
     }
@@ -1746,7 +1746,7 @@ mod tests {
 ───────────────────────────────────────────────────── eta worker ─
 ❯ Message @general-purpose…
 ──────────────────────────────────────────────────────────────────
-  Haiku 4.5  ·  5h 12%  ·  wk 94%  ·  session 37.6k  ·  total: 117.9k
+  Haiku 4.5  ·  5h 12%  ·  wk 94%  ·  session: 37.6k  ·  subagents: 80.3k  ·  total: 117.9k
   ↑/↓ to select · Enter to view
 
 ❯ ◯ main
@@ -2007,7 +2007,7 @@ mod tests {
             }
             let head = "● Launched.\n✻ Waiting for 2 background agents to finish\n";
             let foot = format!(
-                "{rule}\n  Haiku 4.5  ·  5h 84%  ·  session 36.2k  ·  total: 90k\n  {hint}\n{strip}"
+                "{rule}\n  Haiku 4.5  ·  5h 84%  ·  session: 36.2k  ·  subagents: 53.8k  ·  total: 90k\n  {hint}\n{strip}"
             );
             let screen = format!("{head}{top}\n❯ {prompt}\n{foot}");
             let undimmed = format!("{head}{top}\n❯ {bright}\n{foot}");
