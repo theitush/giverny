@@ -168,7 +168,39 @@ pub struct ClaudeWatch {
     /// Each tab's subagents, from relayed `subagentStatusLine` ticks — what
     /// the agents pane draws. See [`AgentsLive::tracker`].
     pub agents: AgentsLive,
+    /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
+    /// write them. See [`leaves_accounts_alone`].
+    leave_accounts: bool,
 }
+
+/// The environment variable that makes this a side instance.
+pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
+
+/// Is this a side instance that must leave every account's Claude config
+/// alone (giverny#113)?
+///
+/// Each account's `settings.json` names one Giverny binary for its hooks,
+/// status lines and plugin, and every Giverny adopts the accounts it finds:
+/// it points those entries at *its own* executable and follows *its own*
+/// `agents_pane` setting. A second Giverny started to test a build — even
+/// with a config and runtime dir of its own — therefore re-points the live
+/// instance's sessions at the test binary, or strips the subagent line and
+/// the plugin (and `plugins/known_marketplaces.json`) out from under it.
+///
+/// `GIVERNY_NO_ACCOUNT_SETUP=1` turns all of that off: hooks, status lines,
+/// auto mode, the subagent line and the plugin are read but never written,
+/// at startup or from the UI. Set and not empty or `0` counts as on.
+///
+/// An explicit switch rather than a guess: a test build differs from the
+/// installed one only in its path, which is exactly what a real reinstall
+/// (`cargo install`, a moved build) also changes, and the path refresh
+/// exists to follow that.
+pub fn leaves_accounts_alone(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// What a write refused by a side instance reports, for the UI's log line.
+const LEFT_ALONE: &str = "side instance (GIVERNY_NO_ACCOUNT_SETUP): account settings left alone";
 
 /// How often the on-disk usage caches are re-read. The numbers inside them
 /// only move when Claude Code fetches (minutes apart), and anything faster —
@@ -309,7 +341,12 @@ impl ClaudeWatch {
             }
         };
 
-        Self::adopt_statusline_where_hooked(&profiles);
+        let leave_accounts =
+            leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref());
+        if leave_accounts {
+            tracing::info!("{LEFT_ALONE}");
+        }
+        Self::adopt_statusline_where_hooked(&profiles, leave_accounts);
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
@@ -339,6 +376,7 @@ impl ClaudeWatch {
                     .unwrap_or_else(|| Path::new("."))
                     .join("agents.json"),
             ),
+            leave_accounts,
         };
         watch.refresh_usage();
         (watch, spooled)
@@ -352,6 +390,9 @@ impl ClaudeWatch {
     }
 
     pub fn install_hooks(&mut self) -> Result<usize, String> {
+        if self.leave_accounts {
+            return Err(LEFT_ALONE.into());
+        }
         let mut ok = 0;
         let mut errs = Vec::new();
         for p in &self.profiles {
@@ -379,7 +420,10 @@ impl ClaudeWatch {
     /// Profiles that already have our hooks get the live-usage statusline
     /// too: installing hooks is the consent boundary, and without this the
     /// usage panel silently shows day-old numbers.
-    fn adopt_statusline_where_hooked(profiles: &[Profile]) {
+    fn adopt_statusline_where_hooked(profiles: &[Profile], leave_accounts: bool) {
+        if leave_accounts {
+            return;
+        }
         for p in profiles {
             let settings = p.config_dir.join("settings.json");
             if !hooks::installed_in(&settings) {
@@ -453,6 +497,14 @@ impl ClaudeWatch {
             }
             return;
         }
+        // `giverny pass clear-done`: the tab's Done rows, cleared by hand.
+        if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
+            if let Some(tab_id) = Self::tab_id_of(msg) {
+                let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
+                self.agents.clear_done(tab_id, at);
+            }
+            return;
+        }
         let Some(tab_id) = Self::tab_id_of(msg) else {
             return;
         };
@@ -518,6 +570,7 @@ impl ClaudeWatch {
                 }
             }
             Some("SessionEnd") => {
+                self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
                 entry.session_id = None;
                 entry.session_name = None;
@@ -962,6 +1015,9 @@ impl ClaudeWatch {
     /// Claude Code reads `settings.json` when a session starts, so this
     /// changes the next `claude`, not the ones already running.
     pub fn set_auto_mode(&mut self, enable: bool) {
+        if self.leave_accounts {
+            return;
+        }
         for p in &self.profiles {
             let settings = p.config_dir.join("settings.json");
             match hooks::set_auto_mode(&settings, enable) {
@@ -980,6 +1036,9 @@ impl ClaudeWatch {
     /// whose settings.json was rewritten. A mode set by hand is never
     /// overridden here; only the explicit toggle does that.
     pub fn ensure_auto_mode(&mut self) {
+        if self.leave_accounts {
+            return;
+        }
         let missing: Vec<PathBuf> = self
             .profiles
             .iter()
@@ -1004,6 +1063,9 @@ impl ClaudeWatch {
 
     /// Turn the live-usage statusline on/off for every profile.
     pub fn set_statusline(&mut self, enable: bool) -> Result<(), String> {
+        if self.leave_accounts {
+            return Err(LEFT_ALONE.into());
+        }
         let mut errs = Vec::new();
         for p in &self.profiles {
             if let Err(e) = hooks::set_statusline(&p.config_dir.join("settings.json"), enable) {
@@ -1033,6 +1095,9 @@ impl ClaudeWatch {
     /// account's `settings.json` gains the two keys that load it; off, the
     /// keys go and so does the directory.
     pub fn set_agents_pane(&mut self, enable: bool, base: &Path) {
+        if self.leave_accounts {
+            return;
+        }
         let dir = giverny_claude::plugin::marketplace_dir(base);
         if enable {
             match giverny_claude::plugin::sync(&dir, &giverny_claude::plugin::exe_candidates()) {
@@ -1267,6 +1332,7 @@ impl ClaudeWatch {
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),
             agents: AgentsLive::in_memory(),
+            leave_accounts: false,
         }
     }
 
@@ -1312,6 +1378,36 @@ mod tests {
             w.agents.tracker(TAB).unwrap().is_empty(),
             "/clear empties it"
         );
+    }
+
+    #[test]
+    fn clear_done_empties_the_tabs_done_rows_only() {
+        let mut w = ClaudeWatch::for_tests();
+        let tick = |ids: &str| {
+            msg(&format!(
+                r#"{{"tab_id":"giverny-7","config_dir":"/tmp/giverny-nowhere",
+                    "event":{{"hook_event_name":"{}","session_id":"s-1","tasks":[{ids}]}}}}"#,
+                hooks::SUBAGENT_LINE_EVENT
+            ))
+        };
+        let a = r#"{"id":"a1","status":"running","startTime":1790000000000}"#;
+        let b = r#"{"id":"a2","status":"running","startTime":1790000000000}"#;
+        feed(&mut w, &tick(&format!("{a},{b}")), Some(TAB));
+        feed(&mut w, &tick(a), Some(TAB));
+        assert_eq!(w.agents.tracker(TAB).unwrap().rows().len(), 2);
+        feed(
+            &mut w,
+            &hook(hooks::CLEAR_DONE_EVENT, r#","at_ms":1790000100000"#),
+            Some(TAB),
+        );
+        let t = w.agents.tracker(TAB).unwrap();
+        assert_eq!(
+            t.rows().len(),
+            1,
+            "the Done row went, the running one stayed"
+        );
+        assert_eq!(t.done_cleared_ms, Some(1_790_000_100_000));
+        assert_eq!(w.state_of(TAB), ClaudeState::None, "no state change");
     }
 
     fn hook(event: &str, extra: &str) -> RelayMsg {
@@ -1869,5 +1965,77 @@ mod tests {
             Some(Duration::from_secs(600)),
             10
         ));
+    }
+
+    /// giverny#113: a side instance writes nothing into an account — not at
+    /// startup, not from the UI — while the same calls on the installed
+    /// instance do rewrite it (so this test would see a write).
+    #[test]
+    fn a_side_instance_leaves_the_account_alone() {
+        use std::ffi::OsStr;
+        assert!(!leaves_accounts_alone(None));
+        assert!(!leaves_accounts_alone(Some(OsStr::new(""))));
+        assert!(!leaves_accounts_alone(Some(OsStr::new("0"))));
+        assert!(leaves_accounts_alone(Some(OsStr::new("1"))));
+        assert!(leaves_accounts_alone(Some(OsStr::new("yes"))));
+
+        let root = std::env::temp_dir().join(format!(
+            "giverny-side-instance-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        let base = root.join("giverny");
+        std::fs::create_dir_all(account.join("plugins")).unwrap();
+        let settings = account.join("settings.json");
+        let known = account.join("plugins/known_marketplaces.json");
+        // Hooks that point at some other Giverny: exactly what a side
+        // instance would otherwise "refresh" to its own executable.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/elsewhere/giverny relay"}]}]},"statusLine":{"type":"command","command":"/elsewhere/giverny relay --statusline"},"extraKnownMarketplaces":{"giverny":{"source":{"source":"directory","path":"/elsewhere/plugin"}}},"enabledPlugins":{"giverny@giverny":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &known,
+            r#"{"giverny":{"source":{"source":"directory","path":"/elsewhere/plugin"}}}"#,
+        )
+        .unwrap();
+        let before = (
+            std::fs::read(&settings).unwrap(),
+            std::fs::read(&known).unwrap(),
+        );
+        let profile = Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        };
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![profile.clone()];
+        w.leave_accounts = true;
+        ClaudeWatch::adopt_statusline_where_hooked(&w.profiles, true);
+        assert!(w.install_hooks().is_err());
+        assert!(w.set_statusline(true).is_err());
+        assert!(w.set_statusline(false).is_err());
+        w.set_auto_mode(true);
+        w.ensure_auto_mode();
+        w.set_agents_pane(true, &base);
+        w.set_agents_pane(false, &base);
+        let after = (
+            std::fs::read(&settings).unwrap(),
+            std::fs::read(&known).unwrap(),
+        );
+        assert!(before == after, "a side instance rewrote the account");
+        assert!(!base.exists(), "a side instance wrote a plugin dir");
+
+        // The installed instance, same calls: the account does change.
+        w.leave_accounts = false;
+        w.set_agents_pane(false, &base);
+        w.set_auto_mode(true);
+        assert_ne!(std::fs::read(&settings).unwrap(), before.0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

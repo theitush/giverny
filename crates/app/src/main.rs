@@ -387,7 +387,10 @@ fn main() -> eframe::Result {
     // exported, so it goes before the markers are scrubbed.
     if std::env::args().nth(1).as_deref() == Some("pass") {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(giverny_claude::pass::main(&args));
+        std::process::exit(giverny_claude::pass::main(
+            &args,
+            &Paths::default_dirs().hook_spool(),
+        ));
     }
     // The transcript follower runs inside a tab and starts no Claude, so it
     // has no markers to clear — and no business announcing that it did.
@@ -477,7 +480,7 @@ fn main() -> eframe::Result {
                  giverny update     check for a newer release\n  \
                  giverny transcript [--follow] <agent jsonl>\n                     \
                  print a worker's transcript, readable (and follow it)\n  \
-                 giverny pass plan|start|eta|land|pause|resume|drop|show ...\n                     \
+                 giverny pass plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
                  write the agents pane's feed (see `giverny pass --help`)\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
@@ -983,6 +986,9 @@ pub struct App {
     /// The overlay an agents-pane row opens: a brief, or a worker's
     /// transcript (`overlays::BriefOverlay`).
     pub brief: Option<overlays::BriefOverlay>,
+    /// The tab and row that opened `brief`, when a row did: a second click
+    /// on that row closes it (giverny#121).
+    brief_row: Option<(TabId, agents_pane::RowClick)>,
     /// The terminal session's rect last frame: where that overlay goes.
     pub session_rect: Option<egui::Rect>,
     /// Tabs opened for a worker (a Done row's follower, a row's open
@@ -1490,6 +1496,7 @@ impl App {
             snapshots: HashMap::new(),
             agent_views: agents_pane::Views::default(),
             brief: None,
+            brief_row: None,
             session_rect: None,
             worker_tabs: HashSet::new(),
             attach: None,
@@ -3048,6 +3055,30 @@ impl App {
         parent: TabId,
         click: &agents_pane::RowClick,
     ) {
+        // The row the tab already shows, clicked again, is the way back to
+        // the orchestrator (giverny#121).
+        let overlay = self
+            .brief
+            .as_ref()
+            .and(self.brief_row.as_ref())
+            .filter(|(tab, _)| *tab == parent)
+            .map(|(_, row)| row);
+        let viewed = self.viewed_worker(parent);
+        let toggle = agents_pane::toggle(click, viewed.as_deref(), overlay);
+        tracing::info!("agents pane: row {} clicked: {toggle:?}", click.name);
+        match toggle {
+            agents_pane::Toggle::Open => {}
+            agents_pane::Toggle::Close => {
+                self.brief = None;
+                self.brief_row = None;
+                self.focus_terminal = true;
+                return;
+            }
+            agents_pane::Toggle::Home => {
+                self.walk_home(ctx, parent);
+                return;
+            }
+        }
         // A Done row whose `open` resumes a conversation that is running in
         // a Giverny tab goes to that tab (giverny#41).
         if let Some(sid) = agent_open::done_resumes(click)
@@ -3084,6 +3115,60 @@ impl App {
             })
             .flatten();
         self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
+        if self.brief.is_some() {
+            self.brief_row = Some((parent, click.clone()));
+        }
+    }
+
+    /// The worker whose view `tab` shows, or is on its way to: its id in the
+    /// tab's tracker. What its pane row is marked for, and what a second
+    /// click on that row walks away from (giverny#121).
+    fn viewed_worker(&self, tab: TabId) -> Option<String> {
+        let job = self.attach.as_ref().filter(|j| j.tab == tab);
+        let label = match job.map(|j| &j.driver.goal) {
+            Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
+            Some(agent_open::Goal::Main) => None,
+            None => self.rt.get(&tab).and_then(|rt| rt.viewed.clone()),
+        };
+        self.worker_id(tab, label.as_deref()?)
+    }
+
+    /// The id of `tab`'s worker that Claude Code's view `label` names: a
+    /// running one first.
+    fn worker_id(&self, tab: TabId, label: &str) -> Option<String> {
+        let rows = self.claude.agents.tracker(tab)?.rows();
+        let names = |r: &&giverny_claude::subagents::SubagentRow| {
+            r.description
+                .as_deref()
+                .is_some_and(|d| agent_open::label_matches(label, d))
+        };
+        rows.iter()
+            .filter(|r| r.running())
+            .find(names)
+            .or_else(|| rows.iter().find(names))
+            .map(|r| r.id.clone())
+    }
+
+    /// A second click on the viewed worker's row: walk the tab home. A walk
+    /// still on its way into that worker gives way first.
+    fn walk_home(&mut self, ctx: &egui::Context, tab: TabId) {
+        if let Some(job) = &self.attach
+            && job.tab == tab
+            && matches!(job.driver.goal, agent_open::Goal::Worker { .. })
+        {
+            let old = self.attach.take().expect("checked above");
+            if old.nudge.is_narrow()
+                && let Some(session) = self.rt.get(&tab).and_then(|rt| rt.session.as_ref())
+            {
+                session.nudge_width(false);
+            }
+            self.release_picture(tab);
+            self.sync_strip_asks();
+        }
+        if self.ws.active != Some(tab) {
+            self.apply(ctx, Action::Select(tab));
+        }
+        self.back_to_main(ctx, tab);
     }
 
     /// The Giverny tab running conversation `sid`, when it is live.
@@ -3161,6 +3246,7 @@ impl App {
             return;
         };
         if !self.start_attach(ctx, parent, &title, &agent_id, click) {
+            self.brief_row = None;
             self.brief = Some(overlays::BriefOverlay::text(
                 title,
                 None,
@@ -3380,6 +3466,7 @@ impl App {
                     self.attach = None;
                     self.settings = None;
                     self.keys_overlay = None;
+                    self.brief_row = None;
                     self.brief = Some(overlays::BriefOverlay::text(title, None, text));
                     self.release_picture(tab);
                     return;
@@ -3877,6 +3964,13 @@ fn count_frame(ctx: &egui::Context) {
 }
 
 /// Input queued by `debug_cmd`, one frame's worth per entry.
+/// The terminal `id` has lost the keyboard to something that is not meant
+/// to hold it, and should take it back (giverny#109): anything but a text
+/// field, while no `overlay` reading keys of its own is open.
+fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
+    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
+}
+
 #[cfg(debug_assertions)]
 static DEBUG_INPUT: std::sync::Mutex<Vec<Vec<egui::Event>>> = std::sync::Mutex::new(Vec::new());
 
@@ -4138,11 +4232,6 @@ impl eframe::App for App {
             }
             // The worker whose view the tab shows, or is on its way to: its
             // pane row is marked, from the click on.
-            let pane_label = match job.map(|j| &j.driver.goal) {
-                Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
-                Some(agent_open::Goal::Main) => None,
-                None => self.rt.get(&active).and_then(|rt| rt.viewed.clone()),
-            };
             // The worker the header over the terminal is about: the view
             // in the picture, unless its `×` closed it.
             let header_label = self
@@ -4150,28 +4239,18 @@ impl eframe::App for App {
                 .get(&active)
                 .filter(|rt| rt.header_closed.is_none() || rt.header_closed != rt.shown_viewed)
                 .and_then(|rt| rt.shown_viewed.clone());
-            let worker_id = |label: &str| {
-                let rows = self.claude.agents.tracker(active)?.rows();
-                let names = |r: &&giverny_claude::subagents::SubagentRow| {
-                    r.description
-                        .as_deref()
-                        .is_some_and(|d| agent_open::label_matches(label, d))
-                };
-                rows.iter()
-                    .filter(|r| r.running())
-                    .find(names)
-                    .or_else(|| rows.iter().find(names))
-                    .map(|r| r.id.clone())
-            };
-            let viewed = pane_label.as_deref().and_then(worker_id);
-            let header_id = header_label.as_deref().and_then(worker_id);
+            let viewed = self.viewed_worker(active);
+            let header_id = header_label
+                .as_deref()
+                .and_then(|l| self.worker_id(active, l));
             // The agents pane takes the bottom of the terminal's area.
             let mut header = None;
             if self.cfg.claude.agents_pane {
                 let (click, line) = agents_pane::show(
                     &mut self.agent_views,
                     active,
-                    self.claude.agents.tracker(active),
+                    // Only once the tab's session is up (giverny#111).
+                    self.claude.agents.shown(active),
                     viewed.as_deref(),
                     header_id.as_deref(),
                     agents_pane::limit_for(
@@ -4221,7 +4300,20 @@ impl eframe::App for App {
                             self.focus_terminal = true;
                         }
                     }
-                    if self.focus_terminal {
+                    // Typing goes to the terminal (giverny#109). egui drops
+                    // a widget's focus on any press outside it — a pane
+                    // row, the rail, the taskbar, a header button — and
+                    // the keys typed after that went nowhere until the
+                    // terminal was clicked again. So it takes the keyboard
+                    // back whenever nothing else is meant to hold it: a
+                    // text field (the search bar, a settings input) or an
+                    // overlay that reads keys of its own. Only when it has
+                    // lost it, since each request interrupts IME input.
+                    let overlay = self.palette.is_some()
+                        || self.session_picker.is_some()
+                        || self.keys_overlay.is_some()
+                        || self.rename.is_some();
+                    if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
                     }
@@ -4684,6 +4776,63 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// giverny#109: a press on anything else — here a button, as a pane
+    /// row or the rail would be — takes egui's focus off the terminal, and
+    /// the terminal is then told to take it back; a text field keeps it.
+    #[test]
+    fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
+        let ctx = egui::Context::default();
+        let button_at = egui::pos2(20.0, 10.0);
+        let mut text = String::new();
+        let frame = |events: Vec<egui::Event>, with_field: bool, text: &mut String| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut lost = false;
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = ui.button("row");
+                if with_field {
+                    ui.add(egui::TextEdit::singleline(text)).request_focus();
+                }
+                let (_, resp) =
+                    ui.allocate_exact_size(egui::vec2(400.0, 300.0), egui::Sense::click_and_drag());
+                lost = terminal_lost_keys(ui.ctx(), resp.id, false);
+                if lost {
+                    resp.request_focus();
+                }
+            });
+            lost
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: button_at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Unfocused at first: taken.
+        assert!(frame(vec![], false, &mut text));
+        assert!(!frame(vec![], false, &mut text));
+        // A click on the button: lost, and taken back.
+        let lost = frame(
+            vec![egui::Event::PointerMoved(button_at), press(true)],
+            false,
+            &mut text,
+        ) | frame(vec![press(false)], false, &mut text);
+        assert!(lost);
+        assert!(!frame(vec![], false, &mut text));
+        // A text field holding the keyboard keeps it.
+        frame(vec![], true, &mut text);
+        assert!(!frame(vec![], true, &mut text));
+        assert!(ctx.text_edit_focused());
+        // An overlay reading its own keys: left alone.
+        assert!(!terminal_lost_keys(&ctx, egui::Id::new("term"), true));
+    }
 
     #[test]
     fn software_gl_renderers_are_told_from_gpus() {

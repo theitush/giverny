@@ -17,6 +17,7 @@ giverny pass eta   <task> <dur left> [--note N]                              # r
 giverny pass land  <task> [--outcome Done|Blocked|…] [--review TEXT] [--note N]  # Done now
 giverny pass pause <task> [--note N]  /  giverny pass resume <task>          # stop / restart its clock
 giverny pass drop  <task>  ·  giverny pass show  ·  giverny pass path  ·  giverny pass clear
+giverny pass clear-done                                                        # clear the Done rows
 ```
 
 - **A task is any short name** (`auth-fix`, `12`). It is the row's `key`. The worker's spawn `description` should name it as a whole word (`auth-fix: fix the refresh race`), which is how the row finds its worker (see **Merge**, rule 3).
@@ -26,6 +27,7 @@ giverny pass drop  <task>  ·  giverny pass show  ·  giverny pass path  ·  giv
 - **`pause`/`resume`** write `paused_since`, then move `started` on by the span and add it to `paused_s`, with the true start kept in `spawned`, as **Schema** describes.
 - **The session** is `--session <id>`, else `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets in every Bash command it runs and a subagent inherits from its dispatcher. So a worker that re-estimates its own row writes into its dispatcher's file.
 - **The file is the state.** Each command reads the feed, changes one row and writes it back atomically, under a lock (`<session>.json.lock`) so a dispatcher and its workers never lose each other's writes. A file whose bytes would not change is not rewritten.
+- **`clear-done` clears the Done rows** (giverny#112): from this session's feed when `giverny pass` wrote it, and from the agents pane of the Giverny tab it runs in, whoever wrote the feed. The pane drops its own Done rows, keeps them from coming back from disk, and hides the feed's Done rows that landed before the clear. Running and Next up rows stay. In a Claude session the plugin's `/giverny:clear-done` runs it.
 - **It never touches another writer's feed.** It marks its files `"writer": "giverny/pass"` and refuses any file whose `writer` names someone else.
 
 ## Where the file goes
@@ -119,10 +121,10 @@ Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"
 
 ## Merge with the live rows
 
-Claude Code reports each live subagent itself (id, name, status, start time, tokens, what it is doing now), and Giverny keeps the ones that finished until the tab's `/clear`. Those are the **live rows**. The feed's rows are joined to them on **`agent_id` = the live row's subagent id**:
+Claude Code reports each live subagent itself (id, name, status, start time, tokens, what it is doing now), and Giverny keeps the ones that finished until the tab's `/clear`, a `giverny pass clear-done`, a fresh `claude` started in the tab (giverny#117), or a `/resume` into another conversation, which shows that conversation's own workers instead (giverny#112). A re-id of the same conversation — the agents view's ← →, the move into a background host, a compact — keeps them (giverny#105). Those are the **live rows**. The feed's rows are joined to them on **`agent_id` = the live row's subagent id**:
 
 1. **Every feed row is drawn**, in feed order, in the stage the feed gave it. The feed's stage wins over the live one: a worker that holds two tasks may have one Done and one still Running.
-2. **A feed row whose `agent_id` matches a live row carries both.** The feed supplies `key`, `title`, `started`, `eta_s`, `landing`, `brief`, `open`; the live row supplies tokens and the current activity (read from the worker's transcript every second: the context it carries now, the count `orchestrate-status` writes; once the transcript has given one, Claude Code's own `tokenCount` never replaces it, since after an API error that count is the worker's output alone), and its start time where the feed gives none. Where both have a value, the feed's `started` wins (it is per row, and moved on by the row's pauses) and the live row's tokens win.
+2. **A feed row whose `agent_id` matches a live row carries both.** The feed supplies `key`, `title`, `started`, `eta_s`, `landing`, `brief`, `open`; the live row supplies the clock's start, tokens and the current activity — the first two exactly as Claude Code's own agents view has them, so the two agree (giverny#116). The clock counts from the worker's `startTime`, not from `started`, which a writer stamps a little before the spawn; `started` counts only for a row that began more than five minutes after its worker did (a later task given to the same worker), and a row's pauses move the worker's start on by as much as they moved `started` on (`started − spawned`, else `paused_s`). Tokens are Claude Code's `tokenCount` — the context of the worker's last turn plus all its output so far — read from each tick, with the transcript's context (re-read every second; the count `orchestrate-status` writes) as the floor: Claude Code's count is only ever below it when it is wrong, as after an API error, where it is the worker's output alone (giverny#92). Where both have a value, the live row's tokens win over the feed's `tokens`.
 3. **A feed row with no `agent_id`, or one Claude Code no longer lists, is joined by its `key` instead**: to the live row whose spawn `description` names the key as a whole word (`Work giverny#82 open direct` names `giverny#82`, never `giverny#820`). A description naming several keys is one worker holding each of them. A Running row takes a worker still running where there is one, any other row a finished one. So a writer that could not know the worker's id when it wrote the row — it wrote at spawn time and nothing has rewritten it since — still gets one row with the worker's tokens and activity. Only a row that matches nothing either way is drawn as the feed wrote it: its clock from `started`, its tokens from `tokens`. This is how Planned rows and long-finished Done rows appear.
 4. **A live row no feed row carries is drawn on its own** — unless its description names a feed row's key, in which case it is that row's worker and is never drawn a second time. It is drawn as Running or Done by its own state, after that stage's feed rows. So a feed that describes only some workers leaves the rest visible.
 5. **Sections are drawn Running, then Planned, then Done**; order within a section is feed order, then unmatched live rows in Claude Code's order.
@@ -143,7 +145,7 @@ A worker that stops on an API error — no network (`EAI_AGAIN`), a usage limit,
 A Done row has nothing left to estimate, so its ETA cell says how the landing compared with the estimate: **`(+5m)`** landed five minutes late, **`(-1h20m)`** landed an hour twenty early, **`(±0m)`** on the minute. It is blank when there is no estimate.
 
 - If the row has **`eta_delta_s`**, that is the value.
-- Otherwise it is **`(ended − started) − eta_s`**, in seconds — `started` from the feed row, else the live worker's start time. If `ended` or `eta_s` or both start times are missing, the cell is blank.
+- Otherwise it is **`(ended − started) − eta_s`**, in seconds — the row's clock start as above (the worker's start, else `started`). If `ended` or `eta_s` or both start times are missing, the cell is blank.
 
 Durations everywhere in the pane are written the way the ETA column writes them: whole minutes (rounded), units that are zero left out — `5m`, `1h3m`, `1h`, `1d3h12m` — with `~` in front of an estimate and none on a measured span.
 

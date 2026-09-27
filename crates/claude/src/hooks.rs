@@ -150,6 +150,35 @@ fn deliver(msg: &RelayMsg, spool: &Path) {
     }
 }
 
+/// Synthetic event name for `giverny pass clear-done` (not a Claude hook
+/// event): clear the agents pane's Done rows in the tab it ran in
+/// (giverny#112). The event carries `session_id` and `at_ms`, the moment the
+/// command ran.
+pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
+
+/// Ask the app to clear the agents pane's Done rows in the tab this process
+/// runs in (`$GIVERNY_TAB_ID`). `false` outside a Giverny tab, where there is
+/// no pane to clear. A closed app gets it from the spool at its next launch.
+pub fn send_clear_done(spool: &Path, session: Option<&str>, at_ms: u64) -> bool {
+    let Some(tab_id) = std::env::var("GIVERNY_TAB_ID")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    else {
+        return false;
+    };
+    let msg = RelayMsg {
+        tab_id: Some(tab_id),
+        config_dir: account_dir(),
+        event: serde_json::json!({
+            "hook_event_name": CLEAR_DONE_EVENT,
+            "session_id": session,
+            "at_ms": at_ms,
+        }),
+    };
+    deliver(&msg, spool);
+    true
+}
+
 /// Drain and clear the spool file, returning whatever it held.
 fn drain_spool(spool: &Path) -> Vec<RelayMsg> {
     let mut out = Vec::new();

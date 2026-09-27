@@ -141,6 +141,16 @@ pub struct Feed {
 }
 
 impl Feed {
+    /// The feed without the Done rows that landed by `cutoff_ms` (or never
+    /// said when): what the pane shows after its Done rows were cleared by
+    /// hand, whoever wrote the file (giverny#112).
+    pub fn without_done_by(&self, cutoff_ms: u64) -> Feed {
+        let mut f = self.clone();
+        f.rows
+            .retain(|r| r.stage() != Stage::Done || r.ended_ms.is_some_and(|e| e > cutoff_ms));
+        f
+    }
+
     /// Is this feed about `session` — by its own id or by an alias?
     pub fn names(&self, session: &str) -> bool {
         self.session.as_deref() == Some(session) || self.aliases.iter().any(|a| a == session)
@@ -437,6 +447,13 @@ pub fn names_key(text: &str, key: &str) -> bool {
     })
 }
 
+/// How long after its worker a feed row must have begun to be a later task
+/// of that worker, keeping its own clock, rather than the spawn the writer
+/// stamped a little early (giverny#116). A writer stamps `started` seconds
+/// to a minute or two before the spawn; a second task sent to a worker that
+/// finished its first comes a task's length later.
+pub const LATER_TASK_MS: u64 = 5 * 60 * 1000;
+
 /// One row of the pane: a feed row, a live row, or both joined.
 #[derive(Debug)]
 pub struct PaneRow<'a, L> {
@@ -455,11 +472,19 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             .or_else(|| self.live.map(|l| l.agent_id()))
     }
 
-    /// Start of the row's clock: the feed's `started` where it gives one,
-    /// else the live row's (Claude Code saw the worker start). The feed's
-    /// wins because it is per row — a worker holding several rows started
-    /// each at a different time — and because it is moved on by the row's
-    /// paused spans, which Claude Code knows nothing of (giverny#12).
+    /// Start of the row's clock. With a worker, the worker's own start —
+    /// Claude Code's `startTime`, the clock its agents view counts from —
+    /// so the two agree (giverny#116): a writer stamps `started` when it
+    /// is about to spawn, a little before the worker exists. The feed's
+    /// `started` still counts where it is the truer one:
+    ///
+    /// - a row with no worker, or whose worker gave no start;
+    /// - a row that began well after its worker did
+    ///   ([`LATER_TASK_MS`]): one worker given a second task later holds a
+    ///   row per task, each started at its own time;
+    /// - the row's paused spans, which Claude Code knows nothing of: the
+    ///   worker's start is moved on by the same amount the writer moved
+    ///   `started` on by (`started − spawned`, else `paused_s`, coo#170).
     pub fn started_ms(&self) -> Option<u64> {
         self.row_started_ms()
     }
@@ -474,12 +499,28 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     }
 
     fn row_started_ms(&self) -> Option<u64> {
-        self.feed
-            .and_then(|f| f.started_ms)
-            .or_else(|| self.live.and_then(|l| l.started_ms()))
+        let worker = self.live.and_then(|l| l.started_ms());
+        let Some(f) = self.feed else { return worker };
+        let Some(worker) = worker else {
+            return f.started_ms;
+        };
+        let Some(started) = f.started_ms else {
+            return Some(worker);
+        };
+        let moved = match f.spawned_ms {
+            Some(spawned) => started.saturating_sub(spawned),
+            None => f.paused_s.unwrap_or(0).saturating_mul(1000),
+        };
+        let began = started.saturating_sub(moved);
+        if began > worker.saturating_add(LATER_TASK_MS) {
+            Some(started)
+        } else {
+            Some(worker.saturating_add(moved))
+        }
     }
 
-    /// Tokens: the live count, else what the feed wrote.
+    /// Tokens: the worker's count (Claude Code's own, as its agents view
+    /// shows it), else what the feed wrote.
     pub fn tokens(&self) -> Option<u64> {
         self.live
             .and_then(|l| l.tokens())
@@ -614,6 +655,26 @@ pub fn fmt_delta(secs: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn done_rows_cleared_by_hand_are_the_ones_landed_by_then() {
+        let f = parse(
+            br#"{"rows":[
+                {"key":"a","stage":"done","ended":1000},
+                {"key":"b","stage":"done","ended":3000},
+                {"key":"c","stage":"done"},
+                {"key":"d","stage":"running","started":500},
+                {"key":"e","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        let keys: Vec<String> = f
+            .without_done_by(2000)
+            .rows
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["b", "d", "e"]);
+    }
+
     const FULL: &str = r#"{"version":1,"session":"s-new","aliases":["s-old"],
       "rows":[
         {"key":"coo#158","stage":"running","title":"FEATURE: pane","agent_id":"a1",
@@ -722,7 +783,59 @@ mod tests {
         );
         assert_eq!(rows[0].agent_id(), Some("w82"));
         assert_eq!(rows[0].tokens(), Some(7), "the worker's tokens");
-        assert_eq!(rows[0].started_ms(), Some(500), "the feed's clock");
+        assert_eq!(
+            rows[0].started_ms(),
+            Some(1_000),
+            "the worker's clock, not the stamp written before it spawned"
+        );
+    }
+
+    /// giverny#116: Claude Code's agents view counts a worker from its own
+    /// `startTime`; the pane counts the same row from the same instant,
+    /// whenever `start` was stamped before the spawn — and still keeps a
+    /// later task's own start, and a paused row's pauses.
+    #[test]
+    fn a_worked_rows_clock_is_the_workers_start() {
+        const SPAWN: u64 = 1_790_500_000_000;
+        let w = [Live {
+            started: Some(SPAWN),
+            ..live("w", true)
+        }];
+        let at = |started: u64, spawned: Option<u64>, paused_s: Option<u64>| {
+            let mut r = row("giverny#116", Stage::Running, Some("w"));
+            r.started_ms = Some(started);
+            r.spawned_ms = spawned;
+            r.paused_s = paused_s;
+            let f = Feed {
+                rows: vec![r],
+                ..Default::default()
+            };
+            merge(Some(&f), &w)[0].started_ms()
+        };
+        // Stamped 40 s early, or a few seconds late: the spawn.
+        assert_eq!(at(SPAWN - 40_000, None, None), Some(SPAWN));
+        assert_eq!(at(SPAWN + 3_000, None, None), Some(SPAWN));
+        // A second task sent to the worker an hour on: its own start.
+        assert_eq!(at(SPAWN + 3_600_000, None, None), Some(SPAWN + 3_600_000));
+        // Paused 10 min: `started` moved on by it, and so is the spawn.
+        let early = SPAWN - 40_000;
+        assert_eq!(
+            at(early + 600_000, Some(early), Some(600)),
+            Some(SPAWN + 600_000)
+        );
+        assert_eq!(at(early + 600_000, None, Some(600)), Some(SPAWN + 600_000));
+        // No worker start: the feed's.
+        let bare = [Live {
+            started: None,
+            ..live("w", true)
+        }];
+        let mut r = row("k", Stage::Running, Some("w"));
+        r.started_ms = Some(early);
+        let f = Feed {
+            rows: vec![r],
+            ..Default::default()
+        };
+        assert_eq!(merge(Some(&f), &bare)[0].started_ms(), Some(early));
     }
 
     #[test]
@@ -894,8 +1007,9 @@ mod tests {
                 (Stage::Done, None, Some("gone"), false),
             ]
         );
-        // The feed's `started` is the row's clock (giverny#12); a live-only
-        // row runs on the worker's own. Tokens: native first.
+        // A row begun long after its worker keeps the feed's `started`
+        // (giverny#12, #116); a live-only row runs on the worker's own.
+        // Tokens: native first.
         assert_eq!(rows[0].started_ms(), rows[0].feed.unwrap().started_ms);
         assert_ne!(rows[0].started_ms(), Some(1_000));
         assert_eq!(rows[1].started_ms(), Some(1_000));

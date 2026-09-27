@@ -228,6 +228,57 @@ pub fn subagents_dir(config_dir: &Path, parent_session: &str) -> Option<PathBuf>
     None
 }
 
+/// A parent session's own transcript: `projects/<munged cwd>/<session>.jsonl`,
+/// found by scanning project dirs as [`subagents_dir`] does.
+pub fn session_transcript(config_dir: &Path, session: &str) -> Option<PathBuf> {
+    std::fs::read_dir(config_dir.join("projects"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(format!("{session}.jsonl")))
+        .find(|p| p.is_file())
+}
+
+/// Lines of a transcript's head the conversation's root can hide in.
+const ROOT_SCAN: usize = 500;
+
+/// The conversation a transcript holds: the `uuid` of its first parentless
+/// user or assistant turn. Claude Code copies a conversation's records
+/// forward when it re-ids a session, so this is the same before and after
+/// where the session id is not; `/clear` starts a new root, and a different
+/// conversation has its own (the key `orchestrate-status` files passes by,
+/// coo#92). `None` for a transcript with no turn of its own yet — a session
+/// just switched to in the agents view holds only headers until its next
+/// turn (coo#198).
+pub fn conversation_root(transcript: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(transcript).ok()?;
+    for line in std::io::BufReader::new(file).lines().take(ROOT_SCAN) {
+        let Ok(line) = line else { break };
+        if !line.contains("\"uuid\"") || !line.contains("\"parentUuid\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if !matches!(
+            v.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
+            continue;
+        }
+        let parent = v.get("parentUuid").and_then(Value::as_str);
+        if parent.is_none_or(str::is_empty)
+            && let Some(uuid) = as_str(&v, "uuid")
+        {
+            return Some(uuid);
+        }
+    }
+    None
+}
+
 /// `agent-<id>.jsonl` inside a `subagents/` dir.
 pub fn agent_transcript(subagents_dir: &Path, id: &str) -> PathBuf {
     subagents_dir.join(format!("agent-{id}.jsonl"))
@@ -845,6 +896,12 @@ pub struct SubagentRow {
     /// of giverny#92.
     #[serde(default)]
     pub tokens_from_transcript: bool,
+    /// Claude Code's own count, the live list's `tokenCount`: the context of
+    /// its last turn *plus* every output token of the run so far (and an
+    /// estimate of a reply still streaming) — the number its agents view
+    /// shows. [`SubagentRow::shown_tokens`] is the one the pane draws.
+    #[serde(default)]
+    pub live_tokens: Option<u64>,
     /// Spans it stood stopped on an API error ([`Stop`]), oldest first.
     #[serde(default)]
     pub stops: Vec<Stop>,
@@ -868,6 +925,7 @@ impl SubagentRow {
             last_turn_ms: None,
             summary: None,
             tokens_from_transcript: false,
+            live_tokens: None,
             stops: Vec::new(),
         }
     }
@@ -964,6 +1022,20 @@ impl SubagentRow {
             .unwrap_or(&self.id)
     }
 
+    /// The count the pane draws: Claude Code's own (`tokenCount`, what its
+    /// agents view shows, giverny#116), unless the transcript's context is
+    /// larger. By construction Claude Code's is the context plus output, so
+    /// it is only ever smaller when it is wrong: after an API error it is
+    /// the output alone (giverny#92), and just after a continue it is a
+    /// count the next turn replaces. Then the transcript's stands in, as it
+    /// does while no live list has named one.
+    pub fn shown_tokens(&self) -> Option<u64> {
+        match (self.live_tokens, self.tokens) {
+            (Some(live), Some(ctx)) => Some(live.max(ctx)),
+            (live, ctx) => live.or(ctx),
+        }
+    }
+
     /// Wall time so far (Running) or taken (Done), in ms.
     pub fn elapsed_ms(&self, now_ms: u64) -> Option<u64> {
         let start = self.started_ms?;
@@ -1018,7 +1090,7 @@ impl crate::feed::LiveAgent for SubagentRow {
         self.started_ms
     }
     fn tokens(&self) -> Option<u64> {
-        self.tokens
+        self.shown_tokens()
     }
     fn description(&self) -> Option<&str> {
         self.description.as_deref()
@@ -1064,6 +1136,14 @@ pub struct Tracker {
     /// transcript after a restart, and then left alone (giverny#92).
     #[serde(skip)]
     checked: std::collections::HashSet<String>,
+    /// Workers whose Done rows were cleared by hand ([`Tracker::clear_done`]):
+    /// not brought back by the disk or the live list unless they run again.
+    #[serde(default)]
+    dismissed: Vec<String>,
+    /// When the Done rows were last cleared by hand: the pane hides the
+    /// feed's Done rows that landed before it too.
+    #[serde(default)]
+    pub done_cleared_ms: Option<u64>,
 }
 
 impl Tracker {
@@ -1092,6 +1172,54 @@ impl Tracker {
     /// Forget every row (the tab's `/clear`). Keeps the session binding.
     pub fn clear(&mut self) {
         self.rows.clear();
+    }
+
+    /// Clear the Done rows by hand (`giverny pass clear-done`, giverny#112),
+    /// keeping the Running ones. A cleared worker stays gone — the next
+    /// refresh finds its transcript and notification still on disk — unless
+    /// it runs again. Returns how many rows went.
+    pub fn clear_done(&mut self, now_ms: u64) -> usize {
+        let before = self.rows.len();
+        for r in &self.rows {
+            if r.stage == Stage::Done && !self.dismissed.contains(&r.id) {
+                self.dismissed.push(r.id.clone());
+            }
+        }
+        self.rows.retain(|r| r.stage != Stage::Done);
+        self.done_cleared_ms = Some(now_ms);
+        before - self.rows.len()
+    }
+
+    /// Has anything worth keeping over a restart: rows, or a clear that has
+    /// to keep holding.
+    pub fn worth_saving(&self) -> bool {
+        !self.rows.is_empty() || !self.dismissed.is_empty()
+    }
+
+    /// Is `session` the conversation these rows belong to? `Some(true)` for
+    /// the bound id or an alias, or a transcript with the same root
+    /// ([`conversation_root`]) as one of them; `Some(false)` for one whose
+    /// root is another; `None` when either side has no root to compare
+    /// (no transcript yet, or only headers).
+    pub fn continues(&self, session: &str) -> Option<bool> {
+        if self.session_id.as_deref() == Some(session) || self.aliases.iter().any(|a| a == session)
+        {
+            return Some(true);
+        }
+        let config = self.config_dir.as_deref()?;
+        let theirs = conversation_root(&session_transcript(config, session)?)?;
+        let mut any = false;
+        for sid in self.session_id.iter().chain(self.aliases.iter()) {
+            let Some(root) = session_transcript(config, sid).and_then(|p| conversation_root(&p))
+            else {
+                continue;
+            };
+            if root == theirs {
+                return Some(true);
+            }
+            any = true;
+        }
+        any.then_some(false)
     }
 
     /// Bind to a session. A different id keeps the rows and records the old
@@ -1127,6 +1255,14 @@ impl Tracker {
             self.set_session(sid);
         }
         for t in &snap.tasks {
+            if let Some(i) = self.dismissed.iter().position(|d| *d == t.id) {
+                // Cleared by hand: still listed finished for a while, which
+                // must not bring it back; running again, it is a row again.
+                if Outcome::parse(&t.status).is_some() {
+                    continue;
+                }
+                self.dismissed.remove(i);
+            }
             let row = self.row_mut(&t.id, Stage::Running);
             if t.name.is_some() {
                 row.name = t.name.clone();
@@ -1151,6 +1287,10 @@ impl Tracker {
             // output alone (giverny#92).
             if t.tokens.is_some() && !row.tokens_from_transcript {
                 row.tokens = t.tokens;
+            }
+            // Claude Code writes 0 for a worker with no progress yet.
+            if let Some(n) = t.tokens.filter(|&n| n > 0) {
+                row.live_tokens = Some(n);
             }
             match Outcome::parse(&t.status) {
                 None => {
@@ -1222,6 +1362,10 @@ impl Tracker {
         for dir in &dirs {
             for id in list_agent_ids(dir) {
                 let known = self.rows.iter().any(|r| r.id == id);
+                if !known && self.dismissed.contains(&id) {
+                    // Cleared by hand; the live list says if it runs again.
+                    continue;
+                }
                 let completion = completions.get(&id);
                 if !known && completion.is_none() {
                     // Not in the live list and never notified: a worker the
@@ -1918,6 +2062,111 @@ mod tests {
         assert_eq!(t.get("a1").map(|r| r.stage), Some(Stage::Done));
     }
 
+    /// A turn with no parent: the root a conversation is known by.
+    fn root_line(uuid: &str) -> String {
+        serde_json::json!({"type": "user", "parentUuid": null, "isSidechain": false,
+                           "uuid": uuid, "sessionId": "x"})
+        .to_string()
+            + "\n"
+    }
+
+    /// One finished worker `id` in session `sid` under `config`, and the
+    /// session's transcript opening on `root` (none: only headers).
+    fn finished_worker(config: &Path, sid: &str, id: &str, root: Option<&str>) {
+        let proj = config.join("projects").join("-w");
+        let subs = proj.join(sid).join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let parent = proj.join(format!("{sid}.jsonl"));
+        let head = match root {
+            Some(r) => root_line(r),
+            None => "{\"type\":\"file-history-snapshot\",\"messageId\":\"m\"}\n".into(),
+        };
+        std::fs::write(&parent, head).unwrap();
+        std::fs::write(agent_transcript(&subs, id), assistant_line(T0, None) + "\n").unwrap();
+        append(&parent, &notification_lines(id, "completed", T0 + 10));
+    }
+
+    #[test]
+    fn the_root_is_the_first_parentless_turn() {
+        let dir = scratch("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let side = serde_json::json!({"type": "user", "parentUuid": null,
+                                      "isSidechain": true, "uuid": "side"});
+        let meta = serde_json::json!({"type": "system", "parentUuid": null, "uuid": "sys"});
+        let child = serde_json::json!({"type": "assistant", "parentUuid": "r1", "uuid": "c"});
+        std::fs::write(
+            &p,
+            format!("{{\"type\":\"mode\"}}\n{side}\n{meta}\n")
+                + &root_line("r1")
+                + &format!("{child}\n"),
+        )
+        .unwrap();
+        assert_eq!(conversation_root(&p).as_deref(), Some("r1"));
+        std::fs::write(&p, format!("{child}\n")).unwrap();
+        assert_eq!(conversation_root(&p), None, "a continuation has no root");
+        assert_eq!(conversation_root(&dir.join("missing.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_continues_the_rows_only_on_the_same_root() {
+        let config = scratch("continues");
+        finished_worker(&config, "a", "wa", Some("root-a"));
+        finished_worker(&config, "a2", "wa2", Some("root-a")); // a re-id, records copied
+        finished_worker(&config, "b", "wb", Some("root-b"));
+        finished_worker(&config, "switched", "ws", None); // headers only (coo#198)
+        let mut t = Tracker::new(Some(config.clone()));
+        t.set_session("a");
+        assert_eq!(t.continues("a"), Some(true));
+        assert_eq!(t.continues("a2"), Some(true));
+        assert_eq!(t.continues("b"), Some(false));
+        assert_eq!(t.continues("switched"), None, "no root yet: cannot tell");
+        assert_eq!(t.continues("nowhere"), None);
+        t.set_session("switched");
+        assert_eq!(t.continues("a"), Some(true), "an alias is ours");
+        assert_eq!(t.continues("b"), Some(false), "the alias's root decides");
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn cleared_done_rows_stay_gone_until_their_worker_runs_again() {
+        let config = scratch("clear-done");
+        finished_worker(&config, "s1", "a1", Some("r"));
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(&live("s1", &[("a2", "running", T0)]), T0 + 1000);
+        t.refresh();
+        assert_eq!(t.get("a1").map(|r| r.stage), Some(Stage::Done));
+
+        assert_eq!(t.clear_done(T0 + 2000), 1);
+        assert!(t.get("a1").is_none());
+        assert_eq!(t.get("a2").map(|r| r.stage), Some(Stage::Running));
+        assert_eq!(t.done_cleared_ms, Some(T0 + 2000));
+        // The disk still says a1 finished; the live list still lists it.
+        t.refresh();
+        t.apply_live(
+            &live("s1", &[("a1", "completed", T0), ("a2", "running", T0)]),
+            T0 + 3000,
+        );
+        t.refresh();
+        assert!(t.get("a1").is_none(), "cleared stays cleared");
+        assert!(t.worth_saving());
+
+        // Over a restart, too.
+        let mut back: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        back.refresh();
+        assert!(back.get("a1").is_none());
+        assert_eq!(back.done_cleared_ms, Some(T0 + 2000));
+
+        // Messaged again, it runs: a row once more.
+        back.apply_live(
+            &live("s1", &[("a1", "running", T0 + 5000), ("a2", "running", T0)]),
+            T0 + 6000,
+        );
+        assert_eq!(back.get("a1").map(|r| r.stage), Some(Stage::Running));
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
     /// A real worker's transcript (giverny#84's, trimmed to its usage,
     /// tool names and timestamps): cut off by `EAI_AGAIN` at 17:38:46 and
     /// continued the next morning. `orchestrate-status`' `tokens_of()`
@@ -2001,6 +2250,39 @@ mod tests {
         ] {
             assert_eq!(stop_reason(&line(error, text)), want, "{text}");
         }
+    }
+
+    /// giverny#116: Claude Code's agents view shows the live list's
+    /// `tokenCount` — the context plus the output so far — and so does the
+    /// pane, while the transcript's context stays on the row as the floor.
+    #[test]
+    fn the_shown_count_is_claude_codes() {
+        let (config, subs, _parent) = layout("shown116", "s1");
+        let path = agent_transcript(&subs, "a1");
+        append(&path, &(assistant_line(T0, None) + "\n"));
+        let tick = |n: u64| {
+            LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "running", "startTime": T0, "tokenCount": n}]}))
+        };
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(&tick(0), T0);
+        assert_eq!(t.get("a1").unwrap().live_tokens, None, "0 is no count yet");
+        t.refresh();
+        assert_eq!(t.get("a1").unwrap().shown_tokens(), Some(110));
+        // 110 of context and 10 of output: Claude Code's 120.
+        t.apply_live(&tick(120), T0 + 5_000);
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.tokens, a1.shown_tokens()), (Some(110), Some(120)));
+        assert_eq!(crate::feed::LiveAgent::tokens(a1), Some(120));
+        // A count under the context is never Claude Code's real one.
+        t.apply_live(&tick(40), T0 + 10_000);
+        assert_eq!(t.get("a1").unwrap().shown_tokens(), Some(110));
+        // Kept across a restart.
+        t.apply_live(&tick(120), T0 + 15_000);
+        let back: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.get("a1").unwrap().shown_tokens(), Some(120));
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// giverny#92: the live list's count for a worker an API error stopped
