@@ -3164,8 +3164,11 @@ impl App {
             tracing::info!("agents pane: no description for {agent_id}");
             return false;
         };
-        // What the strip calls the worker once it is working: its live
-        // activity label, not its description.
+        // What the strip may call the worker when its rows are not tagged
+        // with ids (an older relay): the found row is checked against the
+        // view's prompt rule, which names the description. With the agents
+        // pane on, the relay tags each row with its agent id while the
+        // walk asks for the strip, and the id finds it (giverny#94).
         let aliases: Vec<String> = self
             .claude
             .agents
@@ -3188,7 +3191,7 @@ impl App {
         self.attach = Some(AttachJob::new(
             parent,
             title.to_string(),
-            agent_open::Walk::open(description, aliases, Instant::now()),
+            agent_open::Walk::open(description, aliases, Instant::now()).by_id(agent_id),
         ));
         // Asked now, not next frame: every frame of the relay's tick counts.
         self.sync_strip_asks();

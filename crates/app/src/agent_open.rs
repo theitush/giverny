@@ -341,11 +341,14 @@ pub enum Keystroke {
     Down,
 }
 
-/// One item of the Background dialog's list.
+/// One item of the Background dialog's list, or a row of the agent strip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub label: String,
     pub selected: bool,
+    /// The agent id a strip row is tagged with, while the relay tags them
+    /// (`hooks::tag_strip_row`, giverny#94).
+    pub id: Option<String>,
 }
 
 /// What the parent's screen shows, as far as the attach cares.
@@ -485,6 +488,7 @@ fn parse_item(row: &str) -> Option<Item> {
                 return (!label.is_empty()).then(|| Item {
                     label: label.to_string(),
                     selected,
+                    id: None,
                 });
             }
         }
@@ -512,7 +516,9 @@ fn read_strip(rows: &[&str]) -> Option<Vec<Item>> {
 }
 
 /// `❯ ◯ general-purpose  eta worker     8s · ↓ 27.2k tokens` → `eta worker`
-/// (selected); `● main` → `main`. `↑ N more` rows are not items.
+/// (selected); `● main` → `main`; a row the relay tagged,
+/// `◯ [a95d7f3452a3597df] Reading main.rs`, → `Reading main.rs` with that
+/// id. `↑ N more` rows are not items.
 fn parse_strip_item(row: &str) -> Option<Item> {
     let (selected, rest) = match row.strip_prefix(cc_keys::PROMPT) {
         Some(r) => (true, r.trim_start()),
@@ -534,6 +540,13 @@ fn parse_strip_item(row: &str) -> Option<Item> {
         return None;
     }
     let rest = rest.trim();
+    if let Some((id, label)) = giverny_claude::hooks::strip_row_tag(rest) {
+        return Some(Item {
+            label: label.to_string(),
+            selected,
+            id: Some(id.to_string()),
+        });
+    }
     // Columns are separated by runs of spaces: type, description, stats.
     let cols: Vec<&str> = rest
         .split("  ")
@@ -548,6 +561,7 @@ fn parse_strip_item(row: &str) -> Option<Item> {
     Some(Item {
         label: label.to_string(),
         selected,
+        id: None,
     })
 }
 
@@ -680,6 +694,10 @@ pub struct Attach {
     /// With no row by any of its names, take the strip's only agent row:
     /// for a caller that checks the view it lands on ([`Walk`]).
     only_agent: bool,
+    /// The worker's agent id: on a strip whose rows carry ids (the relay
+    /// tags them while a walk asks for the strip, giverny#94) the row is
+    /// found by it alone, whatever Claude Code labels it.
+    id: Option<String>,
     /// ↓ has been sent out of the prompt.
     opened: bool,
     /// Enter on the worker is queued.
@@ -698,6 +716,7 @@ impl Attach {
             description: description.into(),
             aliases: Vec::new(),
             only_agent: false,
+            id: None,
             opened: false,
             finishing: false,
             queue: VecDeque::new(),
@@ -721,6 +740,12 @@ impl Attach {
     /// has exactly one. The caller must check the view it opens.
     pub fn or_only_agent(mut self) -> Attach {
         self.only_agent = true;
+        self
+    }
+
+    /// Find the row by agent id `id` when the strip's rows carry ids.
+    pub fn with_id(mut self, id: Option<String>) -> Attach {
+        self.id = id.filter(|i| !i.is_empty());
         self
     }
 
@@ -781,15 +806,28 @@ impl Attach {
         }
         match &view {
             View::Strip(items) => {
+                // Rows tagged with ids: the id alone says which is the
+                // worker's (giverny#94). A busy worker's label is Claude
+                // Code's summary of what it is doing, never its description.
+                let by_id = self
+                    .id
+                    .as_deref()
+                    .filter(|_| items.iter().any(|it| it.id.is_some()));
                 let hits: Vec<usize> = items
                     .iter()
                     .enumerate()
-                    .filter(|(_, it)| self.names(&it.label))
+                    .filter(|(_, it)| match by_id {
+                        Some(id) => it.id.as_deref() == Some(id),
+                        None => self.names(&it.label),
+                    })
                     .map(|(i, _)| i)
                     .collect();
                 // The strip's first row is `main`; the rest are agents.
-                let only =
-                    (self.only_agent && items.len() == 2 && items[0].label == "main").then_some(1);
+                let only = (by_id.is_none()
+                    && self.only_agent
+                    && items.len() == 2
+                    && items[0].label == "main")
+                    .then_some(1);
                 let target = match (hits.as_slice(), only) {
                     ([], Some(one)) => one,
                     ([], None) => return Tick::Stuck(Stuck::NotListed),
@@ -874,6 +912,9 @@ pub enum Goal {
     Worker {
         description: String,
         aliases: Vec<String>,
+        /// Its agent id, which the relay tags the strip's rows with while
+        /// the strip is asked for (giverny#94): found by that first.
+        agent_id: Option<String>,
     },
     /// The main session's view: the orchestrator.
     Main,
@@ -939,9 +980,19 @@ impl Walk {
             Goal::Worker {
                 description: description.into(),
                 aliases,
+                agent_id: None,
             },
             now,
         )
+    }
+
+    /// Find the worker's strip row by its agent id `id` wherever the rows
+    /// carry ids; its labels stay the way in where they do not.
+    pub fn by_id(mut self, id: impl Into<String>) -> Walk {
+        if let Goal::Worker { agent_id, .. } = &mut self.goal {
+            *agent_id = Some(id.into()).filter(|i: &String| !i.is_empty());
+        }
+        self
     }
 
     /// Back to the main view.
@@ -1051,8 +1102,10 @@ impl Walk {
                     Goal::Worker {
                         description,
                         aliases,
+                        agent_id,
                     } => Attach::new(description.clone(), now)
                         .with_aliases(aliases.clone())
+                        .with_id(agent_id.clone())
                         .or_only_agent(),
                 };
                 self.go(Phase::Attach(Box::new(attach)), now);
@@ -1631,7 +1684,8 @@ mod tests {
             parse_item("   ❯ fix (the) pane (running) · Opus 5.5"),
             Some(Item {
                 label: "fix (the) pane".into(),
-                selected: true
+                selected: true,
+                id: None,
             })
         );
         assert_eq!(parse_item("     Local agents (3)"), None);
@@ -1733,7 +1787,8 @@ mod tests {
             parse_strip_item("❯ ( ) general-purpose  iota worker   3s"),
             Some(Item {
                 label: "iota worker".into(),
-                selected: true
+                selected: true,
+                id: None,
             })
         );
         assert_eq!(parse_strip_item("↑ 2 more"), None);
@@ -1894,6 +1949,9 @@ mod tests {
         pane: bool,
         /// The relay has been asked to show the strip anyway.
         asked: bool,
+        /// The relay tags each row it shows on an ask with the agent's id
+        /// (giverny#94): `◯ [<id>] <label>`.
+        tagged: bool,
         /// A background shell: the footer's `1 shell` pill.
         shells: bool,
         /// (description, strip label) per agent.
@@ -1914,6 +1972,7 @@ mod tests {
                 focus: Focus::Prompt,
                 pane: true,
                 asked: false,
+                tagged: false,
                 shells: true,
                 agents: vec![
                     ("eta worker", "Starting Python sleep"),
@@ -1998,6 +2057,10 @@ mod tests {
                 let dot = if self.view == v { "●" } else { "◯" };
                 if v == 0 {
                     strip.push_str(&format!("{ptr}{dot} main\n"));
+                } else if self.tagged && self.pane && self.asked {
+                    let label = self.agents[v - 1].1;
+                    let id = fake_id(v);
+                    strip.push_str(&format!("{ptr}{dot} [{id}] {label}\n"));
                 } else {
                     let label = self.agents[v - 1].1;
                     strip.push_str(&format!(
@@ -2048,6 +2111,11 @@ mod tests {
             };
             self.settle();
         }
+    }
+
+    /// The fake's agent id for view `v`.
+    fn fake_id(v: usize) -> String {
+        format!("a{v:016x}")
     }
 
     /// Drive a walk against the fake until it stops; `each` runs before
@@ -2113,6 +2181,7 @@ mod tests {
         let goal = Goal::Worker {
             description: "eta worker".into(),
             aliases: vec![],
+            agent_id: None,
         };
         let mut s = Settle::new(&goal, true, t);
         // In the view, the strip still showing its agent rows.
@@ -2216,6 +2285,127 @@ mod tests {
             run_walk(&mut w, &mut fake, |_, _| {}),
             Tick::Stuck(Stuck::WrongView("theta worker".into()))
         );
+        assert_eq!(fake.view, 2);
+    }
+
+    /// The strip in a parent whose workers are busy, one of them resumed
+    /// with SendMessage, as Claude Code 2.1.283 drew it in tmux
+    /// (giverny#94): each row is labelled with the worker's progress
+    /// summary, never its description (`gamma busy worker`, `beta resumed
+    /// worker`), and the summary moves on every thirty seconds.
+    const STRIP_SUMMARIES: &str = "\
+✻ Waiting for 2 background agents to finish
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 8%  ·  wk 39%  ·  session 39.3k  ·  total: 106.2k
+  Enter to view · x to stop · ctrl+x ctrl+k to stop all agents
+
+  ● main
+  ◯ general-purpose  Running foreground timeout command                          6m 24s · ↓ 22.7k tokens
+❯ ◯ general-purpose  Running hold-beta timeout commands                          6m 24s · ↓ 22.7k tokens
+";
+
+    #[test]
+    fn a_busy_or_resumed_workers_row_is_its_summary_and_no_name_finds_it() {
+        let View::Strip(items) = read_view(STRIP_SUMMARIES, STRIP_SUMMARIES) else {
+            panic!("expected the strip");
+        };
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "main",
+                "Running foreground timeout command",
+                "Running hold-beta timeout commands"
+            ]
+        );
+        assert!(items.iter().all(|i| i.id.is_none()));
+        // What #94 hit: by description (and the pane's own activity) the
+        // worker is not on the strip, and with two rows no guess is made.
+        let t = Instant::now();
+        let mut a = Attach::new("beta resumed worker", t)
+            .with_aliases(["Bash: Hold beta for thirty seconds".to_string()])
+            .or_only_agent()
+            .with_id(Some("a2d06f3ac3b6e7671".into()));
+        assert_eq!(
+            a.tick(t, STRIP_SUMMARIES, STRIP_SUMMARIES),
+            Tick::Stuck(Stuck::NotListed)
+        );
+    }
+
+    /// The same strip once the relay tags its rows (giverny#94).
+    const STRIP_TAGGED: &str = "\
+✻ Waiting for 2 background agents to finish
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 8%  ·  wk 39%  ·  session 39.3k  ·  total: 106.2k
+  Enter to view · x to stop · ctrl+x ctrl+k to stop all agents
+
+  ● main
+❯ ◯ [a95d7f3452a3597df] Running foreground timeout command
+  ◯ [a2d06f3ac3b6e7671] Running hold-beta timeout commands
+";
+
+    #[test]
+    fn a_tagged_strip_is_walked_by_agent_id() {
+        let View::Strip(items) = read_view(STRIP_TAGGED, STRIP_TAGGED) else {
+            panic!("expected the strip");
+        };
+        let ids: Vec<Option<&str>> = items.iter().map(|i| i.id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            [None, Some("a95d7f3452a3597df"), Some("a2d06f3ac3b6e7671")]
+        );
+        assert_eq!(items[2].label, "Running hold-beta timeout commands");
+        assert_eq!(strip_agents(STRIP_TAGGED).len(), 2);
+        let t = Instant::now();
+        let mut a = Attach::new("beta resumed worker", t)
+            .or_only_agent()
+            .with_id(Some("a2d06f3ac3b6e7671".into()));
+        assert_eq!(
+            a.tick(t, STRIP_TAGGED, STRIP_TAGGED),
+            Tick::Send(Keystroke::Down)
+        );
+        // An id the strip does not carry is not there, whatever the labels.
+        let mut gone = Attach::new("Running hold-beta timeout commands", t)
+            .or_only_agent()
+            .with_id(Some("a0000000000000000".into()));
+        assert_eq!(
+            gone.tick(t, STRIP_TAGGED, STRIP_TAGGED),
+            Tick::Stuck(Stuck::NotListed)
+        );
+    }
+
+    #[test]
+    fn open_finds_a_busy_worker_by_id_on_the_tagged_strip() {
+        let mut fake = Fake::new();
+        fake.tagged = true;
+        fake.agents = vec![
+            ("eta worker", "Reading agent_open.rs"),
+            ("theta worker", "Running cargo test"),
+            ("iota worker", "Reading agent_open.rs"),
+        ];
+        for (v, name) in [(2, "theta worker"), (3, "iota worker"), (1, "eta worker")] {
+            fake.view = 0;
+            fake.asked = false;
+            let mut w = Walk::open(name, vec![], Instant::now()).by_id(fake_id(v));
+            let done = run_walk(&mut w, &mut fake, |f, at| {
+                if at >= Duration::from_secs(1) {
+                    f.asked = true;
+                }
+            });
+            assert_eq!(done, Tick::Done, "{name}");
+            assert_eq!(fake.view, v, "on {name}'s view");
+            assert_clean(&fake);
+        }
+        // An untagged strip (an older relay, or the pane off): the labels
+        // are still the way in.
+        let mut fake = Fake::new();
+        fake.pane = false;
+        let mut w = Walk::open("theta worker", vec![], Instant::now()).by_id(fake_id(2));
+        assert_eq!(run_walk(&mut w, &mut fake, |_, _| {}), Tick::Done);
         assert_eq!(fake.view, 2);
     }
 
@@ -2483,7 +2673,8 @@ mod tests {
     /// strip's label for it, if different, in `GIVERNY_TMUX_ALIAS`). With
     /// the agents pane on, `GIVERNY_TMUX_ASK` names the relay's ask file
     /// (`<state>/show-strip/<tab id>`): it is written for the way in and
-    /// removed once the view is open, as the app does. Run by hand:
+    /// removed once the view is open, as the app does; `GIVERNY_TMUX_ID`
+    /// is the worker's agent id. Run by hand:
     /// `cargo test -p giverny live_tmux_walk -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -2557,6 +2748,10 @@ mod tests {
         let agent = std::env::var("GIVERNY_TMUX_AGENT").unwrap();
         let aliases = std::env::var("GIVERNY_TMUX_ALIAS").into_iter().collect();
         let mut open = Walk::open(agent, aliases, Instant::now());
+        // Its agent id (`GIVERNY_TMUX_ID`), which a tagging relay's rows carry.
+        if let Ok(id) = std::env::var("GIVERNY_TMUX_ID") {
+            open = open.by_id(id);
+        }
         assert_eq!(run(&mut open), Tick::Done);
         if let Some(ask) = &ask {
             let _ = std::fs::remove_file(ask);
