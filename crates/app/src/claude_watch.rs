@@ -526,6 +526,7 @@ impl ClaudeWatch {
                 }
             }
             Some("SessionEnd") => {
+                self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
                 entry.session_id = None;
                 entry.session_name = None;

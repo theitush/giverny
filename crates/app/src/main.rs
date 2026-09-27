@@ -4163,7 +4163,8 @@ impl eframe::App for App {
                 let (click, line) = agents_pane::show(
                     &mut self.agent_views,
                     active,
-                    self.claude.agents.tracker(active),
+                    // Only once the tab's session is up (giverny#111).
+                    self.claude.agents.shown(active),
                     viewed.as_deref(),
                     header_id.as_deref(),
                     agents_pane::limit_for(
