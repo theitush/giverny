@@ -1033,17 +1033,28 @@ struct AttachJob {
     settle: Option<agent_open::Settle>,
     /// Brings the relay's next run forward while its answer is waited on.
     nudge: agent_open::Nudge,
+    /// The walk's phase last frame, for the timing log (giverny#108).
+    phase: &'static str,
+    /// The relay has been told it may hide the strip's rows again, and
+    /// the nudge set on bringing that forward.
+    hide_asked: bool,
 }
 
 impl AttachJob {
     fn new(tab: TabId, title: String, driver: agent_open::Walk) -> AttachJob {
+        // The way in waits on the strip: the pty stays narrow until it is
+        // drawn, so Claude Code's timer runs from the first frame on.
+        let mut nudge = agent_open::Nudge::default();
+        nudge.ask_held();
         AttachJob {
             tab,
             title,
             driver,
             started: Instant::now(),
             settle: None,
-            nudge: agent_open::Nudge::default(),
+            nudge,
+            phase: "start",
+            hide_asked: false,
         }
     }
 
@@ -3306,6 +3317,15 @@ impl App {
         ));
         // Asked now, not next frame: every frame of the relay's tick counts.
         self.sync_strip_asks();
+        // And nudged now, for the same reason.
+        if self.cfg.claude.agents_pane
+            && let Some(job) = &mut self.attach
+            && let Some(session) = self.rt.get(&parent).and_then(|rt| rt.session.as_ref())
+            && job.nudge.tick(Instant::now(), true) == Some(agent_open::Width::Narrow)
+        {
+            tracing::debug!("walk +{:?}: nudge narrow", job.started.elapsed());
+            session.nudge_width(true);
+        }
         ctx.request_repaint();
         true
     }
@@ -3394,17 +3414,29 @@ impl App {
         let now = Instant::now();
         let screen = session.screen_text();
         // The relay's answer still to come: the strip, on the way in; the
-        // strip's rows gone again, once in.
+        // strip's rows gone again, once the focus is off them. The way in
+        // keeps the pty narrow until Enter is on the worker's row
+        // (`ask_held`): Claude Code's next run is 300 ms after the width
+        // comes back, so it comes just after the walk lets the strip go,
+        // and answers that with no second nudge (giverny#108).
         let to_worker = matches!(job.driver.goal, agent_open::Goal::Worker { .. });
         let waiting = pane_on
             && to_worker
             && match &job.settle {
-                None => job.driver.waiting_for_strip(),
+                None if !job.hide_asked && job.driver.entering() => true,
+                None => job.hide_asked && !agent_open::strip_agents(&screen).is_empty(),
                 Some(settle) => !settle.is_final(&screen),
             };
+        let at = job.started.elapsed();
         match job.nudge.tick(now, waiting) {
-            Some(agent_open::Width::Narrow) => session.nudge_width(true),
-            Some(agent_open::Width::Restore) => session.nudge_width(false),
+            Some(agent_open::Width::Narrow) => {
+                tracing::debug!("walk +{at:?}: nudge narrow");
+                session.nudge_width(true)
+            }
+            Some(agent_open::Width::Restore) => {
+                tracing::debug!("walk +{at:?}: nudge restore");
+                session.nudge_width(false)
+            }
             None => {}
         }
         let mut finished = false;
@@ -3417,8 +3449,22 @@ impl App {
                 undimmed: &undimmed,
                 cursor: session.cursor_row(),
             };
-            match job.driver.tick(now, look) {
+            let tick = job.driver.tick(now, look);
+            let phase = job.driver.phase_name();
+            if phase != job.phase {
+                tracing::debug!("walk +{at:?}: {} -> {phase}", job.phase);
+                job.phase = phase;
+            }
+            // The focus is off the strip: the relay may hide its rows now
+            // (`sync_strip_asks`, this frame), while the walk finishes.
+            if to_worker && !job.hide_asked && !job.driver.wants_strip() {
+                tracing::debug!("walk +{at:?}: strip may go");
+                job.hide_asked = true;
+                job.nudge.ask(now);
+            }
+            match tick {
                 Tick::Send(key) => {
+                    tracing::debug!("walk +{at:?}: key {key:?}");
                     let mode = session.mode();
                     let bytes = agent_open::keystroke_bytes(key, |k, m| {
                         giverny_term::input::encode_key(k, m, mode)
@@ -3427,8 +3473,12 @@ impl App {
                 }
                 Tick::Wait => {}
                 Tick::Done => {
+                    tracing::debug!("walk +{at:?}: done, settling");
                     job.settle = Some(agent_open::Settle::new(&job.driver.goal, pane_on, now));
-                    job.nudge.ask();
+                    if !job.hide_asked {
+                        job.hide_asked = true;
+                        job.nudge.ask(now);
+                    }
                 }
                 Tick::Stuck(why) => {
                     tracing::info!("agents pane: walk stopped: {why:?}");
