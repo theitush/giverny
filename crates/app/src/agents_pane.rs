@@ -362,6 +362,45 @@ pub struct RowClick {
     pub facts: Vec<String>,
 }
 
+impl RowClick {
+    /// Whether `other` is a click on the same row: the feed's key when
+    /// there is one, else the worker's id, else its name. The stage is left
+    /// out — a row viewed while Running is still that row once Done.
+    pub fn same_row(&self, other: &RowClick) -> bool {
+        if !self.key.is_empty() || !other.key.is_empty() {
+            return self.key == other.key;
+        }
+        if self.agent_id.is_some() || other.agent_id.is_some() {
+            return self.agent_id == other.agent_id;
+        }
+        self.name == other.name
+    }
+}
+
+/// What a row click does (giverny#121): a click on the row the tab is
+/// already showing takes it back to the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    /// Open the row: its worker's view, its overlay, its brief.
+    Open,
+    /// The tab shows (or is walking to) this row's worker: walk it home.
+    Home,
+    /// This row's overlay is up over the tab: close it.
+    Close,
+}
+
+/// Decide a click on `click`, given the worker id the tab shows or is on
+/// its way to (`viewed`) and the row whose overlay is up (`overlay`).
+pub fn toggle(click: &RowClick, viewed: Option<&str>, overlay: Option<&RowClick>) -> Toggle {
+    if overlay.is_some_and(|o| o.same_row(click)) {
+        return Toggle::Close;
+    }
+    if viewed.is_some() && click.agent_id.as_deref() == viewed {
+        return Toggle::Home;
+    }
+    Toggle::Open
+}
+
 // -------------------------------------------------------------- table ----
 
 /// One drawn row, every cell already formatted.
@@ -1214,6 +1253,71 @@ mod tests {
         let mut t = Tracker::new(None);
         t.apply_live(&LiveSnapshot::parse(json), T0);
         t.rows().to_vec()
+    }
+
+    fn row(key: &str, agent: Option<&str>, stage: Stage) -> RowClick {
+        RowClick {
+            stage,
+            key: key.into(),
+            agent_id: agent.map(Into::into),
+            name: "w".into(),
+            transcript: None,
+            open: None,
+            brief: None,
+            note: None,
+            review: None,
+            facts: vec![],
+        }
+    }
+
+    #[test]
+    fn clicking_the_viewed_workers_row_goes_home() {
+        let r = row("giverny#1", Some("a1"), Stage::Running);
+        assert_eq!(toggle(&r, Some("a1"), None), Toggle::Home);
+        // The worker finished while it was viewed: still its row.
+        let done = row("giverny#1", Some("a1"), Stage::Done);
+        assert_eq!(toggle(&done, Some("a1"), None), Toggle::Home);
+    }
+
+    #[test]
+    fn clicking_another_row_while_viewing_opens_it() {
+        let r = row("giverny#2", Some("b2"), Stage::Running);
+        assert_eq!(toggle(&r, Some("a1"), None), Toggle::Open);
+        let planned = row("giverny#3", None, Stage::Planned);
+        assert_eq!(toggle(&planned, Some("a1"), None), Toggle::Open);
+    }
+
+    #[test]
+    fn clicking_with_nothing_viewed_opens() {
+        let r = row("giverny#1", Some("a1"), Stage::Running);
+        assert_eq!(toggle(&r, None, None), Toggle::Open);
+        let keyless = row("", None, Stage::Done);
+        assert_eq!(toggle(&keyless, None, None), Toggle::Open);
+    }
+
+    #[test]
+    fn clicking_the_row_whose_overlay_is_up_closes_it() {
+        let done = row("giverny#1", Some("a1"), Stage::Done);
+        assert_eq!(toggle(&done, None, Some(&done)), Toggle::Close);
+        // The overlay was opened while the row was Running.
+        let was = row("giverny#1", Some("a1"), Stage::Running);
+        assert_eq!(toggle(&done, None, Some(&was)), Toggle::Close);
+        let other = row("giverny#2", Some("b2"), Stage::Done);
+        assert_eq!(toggle(&other, None, Some(&done)), Toggle::Open);
+    }
+
+    #[test]
+    fn rows_without_keys_are_told_apart_by_id_then_name() {
+        let a = row("", Some("a1"), Stage::Done);
+        let b = row("", Some("b2"), Stage::Done);
+        assert!(a.same_row(&a.clone()));
+        assert!(!a.same_row(&b));
+        let mut n1 = row("", None, Stage::Done);
+        let mut n2 = n1.clone();
+        n1.name = "one".into();
+        n2.name = "two".into();
+        assert!(!n1.same_row(&n2));
+        assert!(!row("k", None, Stage::Done).same_row(&row("", None, Stage::Done)));
     }
 
     #[test]

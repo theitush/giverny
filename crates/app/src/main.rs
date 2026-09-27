@@ -986,6 +986,9 @@ pub struct App {
     /// The overlay an agents-pane row opens: a brief, or a worker's
     /// transcript (`overlays::BriefOverlay`).
     pub brief: Option<overlays::BriefOverlay>,
+    /// The tab and row that opened `brief`, when a row did: a second click
+    /// on that row closes it (giverny#121).
+    brief_row: Option<(TabId, agents_pane::RowClick)>,
     /// The terminal session's rect last frame: where that overlay goes.
     pub session_rect: Option<egui::Rect>,
     /// Tabs opened for a worker (a Done row's follower, a row's open
@@ -1490,6 +1493,7 @@ impl App {
             snapshots: HashMap::new(),
             agent_views: agents_pane::Views::default(),
             brief: None,
+            brief_row: None,
             session_rect: None,
             worker_tabs: HashSet::new(),
             attach: None,
@@ -3048,6 +3052,30 @@ impl App {
         parent: TabId,
         click: &agents_pane::RowClick,
     ) {
+        // The row the tab already shows, clicked again, is the way back to
+        // the orchestrator (giverny#121).
+        let overlay = self
+            .brief
+            .as_ref()
+            .and(self.brief_row.as_ref())
+            .filter(|(tab, _)| *tab == parent)
+            .map(|(_, row)| row);
+        let viewed = self.viewed_worker(parent);
+        let toggle = agents_pane::toggle(click, viewed.as_deref(), overlay);
+        tracing::info!("agents pane: row {} clicked: {toggle:?}", click.name);
+        match toggle {
+            agents_pane::Toggle::Open => {}
+            agents_pane::Toggle::Close => {
+                self.brief = None;
+                self.brief_row = None;
+                self.focus_terminal = true;
+                return;
+            }
+            agents_pane::Toggle::Home => {
+                self.walk_home(ctx, parent);
+                return;
+            }
+        }
         // A Done row whose `open` resumes a conversation that is running in
         // a Giverny tab goes to that tab (giverny#41).
         if let Some(sid) = agent_open::done_resumes(click)
@@ -3084,6 +3112,60 @@ impl App {
             })
             .flatten();
         self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
+        if self.brief.is_some() {
+            self.brief_row = Some((parent, click.clone()));
+        }
+    }
+
+    /// The worker whose view `tab` shows, or is on its way to: its id in the
+    /// tab's tracker. What its pane row is marked for, and what a second
+    /// click on that row walks away from (giverny#121).
+    fn viewed_worker(&self, tab: TabId) -> Option<String> {
+        let job = self.attach.as_ref().filter(|j| j.tab == tab);
+        let label = match job.map(|j| &j.driver.goal) {
+            Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
+            Some(agent_open::Goal::Main) => None,
+            None => self.rt.get(&tab).and_then(|rt| rt.viewed.clone()),
+        };
+        self.worker_id(tab, label.as_deref()?)
+    }
+
+    /// The id of `tab`'s worker that Claude Code's view `label` names: a
+    /// running one first.
+    fn worker_id(&self, tab: TabId, label: &str) -> Option<String> {
+        let rows = self.claude.agents.tracker(tab)?.rows();
+        let names = |r: &&giverny_claude::subagents::SubagentRow| {
+            r.description
+                .as_deref()
+                .is_some_and(|d| agent_open::label_matches(label, d))
+        };
+        rows.iter()
+            .filter(|r| r.running())
+            .find(names)
+            .or_else(|| rows.iter().find(names))
+            .map(|r| r.id.clone())
+    }
+
+    /// A second click on the viewed worker's row: walk the tab home. A walk
+    /// still on its way into that worker gives way first.
+    fn walk_home(&mut self, ctx: &egui::Context, tab: TabId) {
+        if let Some(job) = &self.attach
+            && job.tab == tab
+            && matches!(job.driver.goal, agent_open::Goal::Worker { .. })
+        {
+            let old = self.attach.take().expect("checked above");
+            if old.nudge.is_narrow()
+                && let Some(session) = self.rt.get(&tab).and_then(|rt| rt.session.as_ref())
+            {
+                session.nudge_width(false);
+            }
+            self.release_picture(tab);
+            self.sync_strip_asks();
+        }
+        if self.ws.active != Some(tab) {
+            self.apply(ctx, Action::Select(tab));
+        }
+        self.back_to_main(ctx, tab);
     }
 
     /// The Giverny tab running conversation `sid`, when it is live.
@@ -3161,6 +3243,7 @@ impl App {
             return;
         };
         if !self.start_attach(ctx, parent, &title, &agent_id, click) {
+            self.brief_row = None;
             self.brief = Some(overlays::BriefOverlay::text(
                 title,
                 None,
@@ -3365,6 +3448,7 @@ impl App {
                     self.attach = None;
                     self.settings = None;
                     self.keys_overlay = None;
+                    self.brief_row = None;
                     self.brief = Some(overlays::BriefOverlay::text(title, None, text));
                     self.release_picture(tab);
                     return;
@@ -4130,11 +4214,6 @@ impl eframe::App for App {
             }
             // The worker whose view the tab shows, or is on its way to: its
             // pane row is marked, from the click on.
-            let pane_label = match job.map(|j| &j.driver.goal) {
-                Some(agent_open::Goal::Worker { description, .. }) => Some(description.clone()),
-                Some(agent_open::Goal::Main) => None,
-                None => self.rt.get(&active).and_then(|rt| rt.viewed.clone()),
-            };
             // The worker the header over the terminal is about: the view
             // in the picture, unless its `×` closed it.
             let header_label = self
@@ -4142,21 +4221,10 @@ impl eframe::App for App {
                 .get(&active)
                 .filter(|rt| rt.header_closed.is_none() || rt.header_closed != rt.shown_viewed)
                 .and_then(|rt| rt.shown_viewed.clone());
-            let worker_id = |label: &str| {
-                let rows = self.claude.agents.tracker(active)?.rows();
-                let names = |r: &&giverny_claude::subagents::SubagentRow| {
-                    r.description
-                        .as_deref()
-                        .is_some_and(|d| agent_open::label_matches(label, d))
-                };
-                rows.iter()
-                    .filter(|r| r.running())
-                    .find(names)
-                    .or_else(|| rows.iter().find(names))
-                    .map(|r| r.id.clone())
-            };
-            let viewed = pane_label.as_deref().and_then(worker_id);
-            let header_id = header_label.as_deref().and_then(worker_id);
+            let viewed = self.viewed_worker(active);
+            let header_id = header_label
+                .as_deref()
+                .and_then(|l| self.worker_id(active, l));
             // The agents pane takes the bottom of the terminal's area.
             let mut header = None;
             if self.cfg.claude.agents_pane {
