@@ -355,6 +355,8 @@ pub struct RowClick {
     pub brief: Option<PathBuf>,
     /// The feed's `note`.
     pub note: Option<String>,
+    /// The feed's `review` line (Done): shown at the overlay's top as is.
+    pub review: Option<String>,
     /// The row's state in words, for the overlay's header: how it landed,
     /// how long it took against its estimate, its tokens (giverny#41).
     pub facts: Vec<String>,
@@ -582,6 +584,7 @@ fn format_row(
             open: f.and_then(|f| f.open.clone()),
             brief: f.and_then(|f| f.brief.clone()),
             note: f.and_then(|f| f.note.clone()),
+            review: f.and_then(|f| f.review.clone()),
             facts,
         },
     }

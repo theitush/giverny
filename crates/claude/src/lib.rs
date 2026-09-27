@@ -8,6 +8,8 @@
 pub mod feed;
 pub mod hooks;
 pub mod jobs;
+pub mod pass;
+pub mod plugin;
 pub mod profiles;
 pub mod registry;
 pub mod subagents;

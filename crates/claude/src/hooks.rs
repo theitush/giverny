@@ -936,6 +936,8 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 
 /// Remove our relay entries from one settings file.
 pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
+    // The `giverny` plugin's keys, where they are ours (giverny#101).
+    let _ = crate::plugin::set_plugin(settings_path, Path::new(""), false);
     let Ok(bytes) = std::fs::read(settings_path) else {
         return Ok(());
     };

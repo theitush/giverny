@@ -1027,7 +1027,20 @@ impl ClaudeWatch {
     ///
     /// Claude Code watches its settings files, so this reaches running
     /// sessions without a restart.
-    pub fn set_agents_pane(&mut self, enable: bool) {
+    ///
+    /// The same switch carries the `giverny` plugin (giverny#101): on, its
+    /// marketplace is written under `base` (Giverny's config dir) and each
+    /// account's `settings.json` gains the two keys that load it; off, the
+    /// keys go and so does the directory.
+    pub fn set_agents_pane(&mut self, enable: bool, base: &Path) {
+        let dir = giverny_claude::plugin::marketplace_dir(base);
+        if enable {
+            match giverny_claude::plugin::sync(&dir, &giverny_claude::plugin::exe_candidates()) {
+                Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("giverny plugin not written: {err}"),
+            }
+        }
         for p in &self.profiles {
             let settings = p.config_dir.join("settings.json");
             match hooks::set_subagent_line(&settings, enable) {
@@ -1038,6 +1051,22 @@ impl ClaudeWatch {
                 ),
                 Ok(false) => {}
                 Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
+            }
+            match giverny_claude::plugin::set_plugin(&settings, &dir, enable) {
+                Ok(true) => tracing::info!(
+                    "giverny plugin {} for {}",
+                    if enable { "enabled" } else { "removed" },
+                    p.name
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::info!("giverny plugin skipped for {}: {err}", p.name),
+            }
+        }
+        if !enable {
+            match giverny_claude::plugin::remove_dir(&dir) {
+                Ok(true) => tracing::info!("giverny plugin removed from {}", dir.display()),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("giverny plugin dir not removed: {err}"),
             }
         }
     }
