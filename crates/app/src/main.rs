@@ -3439,7 +3439,11 @@ impl App {
     /// * `xheader` — a pointer click on the worker header's `×`;
     /// * `type <text>` — the text, written to the active tab (`\r` in it: Enter);
     /// * `key <enter|up|down>` — that key press, as typed;
-    /// * `dump <file>` — the active tab's screen text into the file.
+    /// * `dump <file>` — the active tab's screen text into the file;
+    /// * `drag <row> <col> <row> <col>` — a pointer drag over the active
+    ///   tab's agents pane, cell to cell (giverny#84); the same cell twice
+    ///   is a click;
+    /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points.
     #[cfg(debug_assertions)]
     fn debug_cmd(&mut self, ctx: &egui::Context) {
         let Ok(file) = std::env::var("GIVERNY_DEBUG_CMD") else {
@@ -3561,6 +3565,42 @@ impl App {
                     };
                     feed(vec![ev(true)]);
                     feed(vec![ev(false)]);
+                }
+                "drag" | "dragxy" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let ends = match (cmd, n.as_slice(), self.ws.active) {
+                        ("drag", [r0, c0, r1, c1], Some(tab)) => self
+                            .agent_views
+                            .cell_point(tab, *r0 as usize, *c0 as usize)
+                            .zip(self.agent_views.cell_point(tab, *r1 as usize, *c1 as usize)),
+                        ("dragxy", [x0, y0, x1, y1], _) => {
+                            Some((egui::pos2(*x0, *y0), egui::pos2(*x1, *y1)))
+                        }
+                        _ => None,
+                    };
+                    let Some((from, to)) = ends else {
+                        tracing::warn!("debug cmd: no such drag {arg}");
+                        continue;
+                    };
+                    let button = |pos, pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    feed(vec![egui::Event::PointerMoved(from)]);
+                    feed(vec![button(from, true)]);
+                    // The same cell twice is a plain click: press, release.
+                    let steps = if from == to { 0 } else { 8 };
+                    for k in 1..=steps {
+                        feed(vec![egui::Event::PointerMoved(
+                            from + (to - from) * (k as f32 / 8.0),
+                        )]);
+                    }
+                    feed(vec![button(to, false)]);
                 }
                 "dump" => {
                     let session = self

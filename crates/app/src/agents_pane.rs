@@ -34,6 +34,11 @@
 //! `Action::AgentRowClicked`. What a click *does* is not decided here, and
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click (giverny#40).
+//!
+//! **Text is selectable** (giverny#84): a drag — never a click — selects
+//! the pane's text the way the terminal does, as a stream of cells across
+//! rows, copies it as plain text line by line when the drag ends, and
+//! `Ctrl+Shift+C` copies it again. The next press anywhere lets it go.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -70,9 +75,9 @@ const MIN_TITLE: usize = 12;
 
 // --------------------------------------------------------- view state ----
 
-/// What the pane itself keeps per tab: the feed it last read. Never the
-/// rows — those are the tracker's — and no selection: a click acts and
-/// leaves no mark (giverny#40).
+/// What the pane itself keeps per tab: the feed it last read and the text
+/// dragged over. Never the rows — those are the tracker's — and no row
+/// selection: a click acts and leaves no mark (giverny#40).
 #[derive(Default)]
 struct View {
     feed: FeedCache,
@@ -84,6 +89,12 @@ struct View {
     fit: Option<f32>,
     /// Every usage-limit span this tab's clocks were held through.
     holds: Vec<Hold>,
+    /// The text dragged over, until the next press (giverny#84).
+    sel: Option<Selection>,
+    /// Where the rows were drawn last frame, and the cell width: what the
+    /// debug `drag` command aims at.
+    rows_at: Vec<egui::Rect>,
+    cell_w: f32,
 }
 
 impl View {
@@ -110,6 +121,15 @@ impl Views {
     /// Forget a closed tab.
     pub fn forget(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
+    }
+
+    /// Debug builds: the point on `tab`'s pane at `row`'s `col`-th cell
+    /// boundary, as drawn last frame, vertically centred on the row.
+    #[cfg(debug_assertions)]
+    pub fn cell_point(&self, tab: TabId, row: usize, col: usize) -> Option<egui::Pos2> {
+        let v = self.tabs.get(&tab)?;
+        let r = v.rows_at.get(row)?;
+        Some(egui::pos2(r.left() + col as f32 * v.cell_w, r.center().y))
     }
 }
 
@@ -746,7 +766,21 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    clicked = draw_table(ui, &table, viewed, chrome, shared, cell, row_h, cols);
+                    let (click, rects) = draw_table(
+                        ui,
+                        id.with("rows"),
+                        &table,
+                        viewed,
+                        chrome,
+                        shared,
+                        cell,
+                        row_h,
+                        cols,
+                        &mut view.sel,
+                    );
+                    clicked = click;
+                    view.rows_at = rects;
+                    view.cell_w = cell.x.max(1.0);
                 });
         });
     (clicked, header_line)
@@ -824,9 +858,246 @@ fn table_cols(width: f32, cell_w: f32, bar_lane: f32) -> usize {
     ((usable / cw).floor() as usize).max(40)
 }
 
+/// Where each column of a row starts or ends, in characters, for a table
+/// laid out in `cols` columns.
+struct Cols {
+    idw: usize,
+    taskw: usize,
+    x_task: usize,
+    x_el_end: usize,
+    x_eta_end: usize,
+    x_now: usize,
+    x_tok_end: usize,
+}
+
+impl Cols {
+    fn new(table: &Table, cols: usize) -> Self {
+        let idw = table
+            .lines
+            .iter()
+            .map(|l| l.id.chars().count())
+            .max()
+            .unwrap_or(0);
+        let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W;
+        let taskw = cols.saturating_sub(fixed).max(MIN_TITLE);
+        let x_task = STAGE_W + GAP;
+        let x_el_end = x_task + taskw + GAP + EL_W;
+        let x_eta_end = x_el_end + GAP + ETA_W;
+        let x_now = x_eta_end + GAP;
+        let x_tok_end = x_now + NOW_W + GAP + TOK_W;
+        Cols {
+            idw,
+            taskw,
+            x_task,
+            x_el_end,
+            x_eta_end,
+            x_now,
+            x_tok_end,
+        }
+    }
+
+    /// A row's cells as drawn: each one's text and the column it starts at.
+    fn segments(&self, line: &Line) -> Vec<(usize, String)> {
+        let idw = self.idw;
+        // The id is never cut; the title takes what is left.
+        let task = if idw > 0 {
+            let title_w = self.taskw.saturating_sub(idw + 1);
+            format!("{:<idw$} {}", line.id, cut(&line.title, title_w))
+        } else {
+            cut(&line.title, self.taskw)
+        };
+        vec![
+            (0, stage_word(line.stage).to_string()),
+            (self.x_task, task),
+            // Right-aligned: the text ends at the column's last cell.
+            (right_at(self.x_el_end, &line.elapsed), line.elapsed.clone()),
+            (right_at(self.x_eta_end, &line.eta), line.eta.clone()),
+            (self.x_now, cut(&line.now, NOW_W)),
+            (right_at(self.x_tok_end, &line.tokens), line.tokens.clone()),
+        ]
+    }
+}
+
+/// A row's text as it reads on screen, one character a cell: what a
+/// selection over it copies (giverny#84).
+fn compose(segments: &[(usize, String)]) -> String {
+    let mut buf: Vec<char> = Vec::new();
+    for (at, s) in segments {
+        for (i, ch) in s.chars().enumerate() {
+            let k = at + i;
+            if buf.len() <= k {
+                buf.resize(k + 1, ' ');
+            }
+            buf[k] = ch;
+        }
+    }
+    let s: String = buf.into_iter().collect();
+    s.trim_end().to_string()
+}
+
+// ---------------------------------------------------------- selection ----
+
+/// A drag over the pane's text (giverny#84), in `(row, column)` cells —
+/// rows count the table's lines, then its footer. The terminal's own model:
+/// a stream from where the drag began to where the pointer is, copied when
+/// the drag ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl Selection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// The columns selected on `row`, a row `len` characters long; `None`
+    /// when none are.
+    fn span(&self, row: usize, len: usize) -> Option<(usize, usize)> {
+        let ((r0, c0), (r1, c1)) = self.ordered();
+        if row < r0 || row > r1 {
+            return None;
+        }
+        let a = if row == r0 { c0.min(len) } else { 0 };
+        let b = if row == r1 { c1.min(len) } else { len };
+        (a < b).then_some((a, b))
+    }
+}
+
+/// The text `sel` covers in `rows`, line by line, each line's trailing
+/// blanks dropped: plain text, as it pastes.
+pub fn selected_text(rows: &[String], sel: &Selection) -> String {
+    let ((r0, _), (r1, _)) = sel.ordered();
+    let mut out: Vec<String> = Vec::new();
+    for (r, row) in rows.iter().enumerate().take(r1 + 1).skip(r0) {
+        let len = row.chars().count();
+        let piece: String = match sel.span(r, len) {
+            Some((a, b)) => row.chars().skip(a).take(b - a).collect(),
+            None => String::new(),
+        };
+        out.push(piece.trim_end().to_string());
+    }
+    out.join("\n")
+}
+
+/// What the pointer did to the rows this frame.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RowsInput {
+    /// A plain click: the row it landed on.
+    clicked: Option<usize>,
+    /// The row under the pointer, while it is not dragging.
+    hovered: Option<usize>,
+    /// The pointer is held on a row, not (yet) dragging.
+    pressed: bool,
+    dragging: bool,
+    /// Text put on the clipboard this frame.
+    copied: Option<String>,
+}
+
+/// The cell under `p`, for rows at `rects` in cells `cw` wide: a point
+/// above the first row or below the last is on that row, and a column
+/// is the cell boundary nearest to it.
+fn cell_at(rects: &[egui::Rect], cw: f32, p: egui::Pos2) -> Option<(usize, usize)> {
+    let first = rects.first()?;
+    let row = rects
+        .iter()
+        .position(|r| p.y < r.max.y)
+        .unwrap_or(rects.len() - 1);
+    let col = ((p.x - first.left()) / cw.max(1.0)).round().max(0.0) as usize;
+    Some((row, col))
+}
+
+/// The pane's pointer handling over rows at `rects` reading `texts`: a
+/// click (press and release in place) opens a row, a drag selects text and
+/// copies it as it ends, the terminal's copy-on-select; `Ctrl+Shift+C` copies
+/// the selection again. Only a drag selects, and a drag is never a click.
+fn rows_input(
+    ui: &mut Ui,
+    id: egui::Id,
+    rects: &[egui::Rect],
+    texts: &[String],
+    cw: f32,
+    sel: &mut Option<Selection>,
+) -> Option<(RowsInput, egui::Response)> {
+    let mut out = RowsInput::default();
+    let area = rects.iter().copied().reduce(|a, b| a.union(b))?;
+    // Any new press ends the last selection: it becomes a click, or a new
+    // drag, or it is somewhere else entirely — as in the terminal.
+    if ui.input(|i| i.pointer.primary_pressed()) {
+        *sel = None;
+    }
+    let resp = ui.interact(area, id, Sense::click_and_drag());
+    let at = |p: Option<egui::Pos2>| p.and_then(|p| cell_at(rects, cw, p));
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        let origin = ui.input(|i| i.pointer.press_origin());
+        if let (Some(a), Some(h)) = (at(origin), at(resp.interact_pointer_pos())) {
+            *sel = Some(Selection { anchor: a, head: h });
+        }
+    } else if resp.dragged_by(egui::PointerButton::Primary)
+        && let (Some(s), Some(h)) = (sel.as_mut(), at(resp.interact_pointer_pos()))
+    {
+        s.head = h;
+    }
+    out.dragging = resp.dragged();
+    let mut copy = false;
+    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+        copy = true;
+    }
+    // Ctrl+Shift+C (Cmd+C on macOS) with a selection here is the pane's,
+    // taken before the terminal can read it; plain Ctrl+C stays an
+    // interrupt, as it is in the terminal.
+    if sel.is_some() {
+        let chord = ui.input_mut(|i| {
+            let shift = i.modifiers.shift;
+            let mut hit = false;
+            i.events.retain(|e| {
+                let ours = matches!(e, egui::Event::Copy | egui::Event::Cut)
+                    && giverny_term::input::clipboard_chord(
+                        matches!(e, egui::Event::Cut),
+                        shift,
+                        cfg!(target_os = "macos"),
+                    ) == giverny_term::input::ClipboardChord::CopySelection;
+                hit |= ours;
+                !ours
+            });
+            hit
+        });
+        copy |= chord;
+    }
+    if copy && let Some(s) = sel.as_ref() {
+        let text = selected_text(texts, s);
+        if !text.is_empty() {
+            ui.ctx().copy_text(text.clone());
+            out.copied = Some(text);
+        }
+    }
+    if resp.clicked() {
+        *sel = None;
+        out.clicked = at(resp.interact_pointer_pos()).map(|(r, _)| r);
+    }
+    if !out.dragging {
+        out.hovered = resp
+            .hover_pos()
+            .filter(|p| area.contains(*p))
+            .and_then(|p| at(Some(p)))
+            .map(|(r, _)| r);
+        out.pressed = resp.is_pointer_button_down_on();
+    }
+    if out.dragging {
+        ui.ctx().set_cursor_icon(CursorIcon::Text);
+    }
+    Some((out, resp))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_table(
     ui: &mut Ui,
+    id: egui::Id,
     table: &Table,
     viewed: Option<&str>,
     chrome: &Chrome,
@@ -834,89 +1105,79 @@ fn draw_table(
     cell: egui::Vec2,
     row_h: f32,
     cols: usize,
-) -> Option<RowClick> {
+    sel: &mut Option<Selection>,
+) -> (Option<RowClick>, Vec<egui::Rect>) {
     let cw = cell.x.max(1.0);
-    let idw = table
-        .lines
-        .iter()
-        .map(|l| l.id.chars().count())
-        .max()
-        .unwrap_or(0);
-    let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W;
-    let taskw = cols.saturating_sub(fixed).max(MIN_TITLE);
-    // Character offsets of each column.
-    let x_task = STAGE_W + GAP;
-    let x_el_end = x_task + taskw + GAP + EL_W;
-    let x_eta_end = x_el_end + GAP + ETA_W;
-    let x_now = x_eta_end + GAP;
-    let x_tok_end = x_now + NOW_W + GAP + TOK_W;
-
-    let mut clicked = None;
-    for line in &table.lines {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
-        let color = stage_color(line.stage);
-        // The worker whose view the terminal above shows (giverny#75):
-        // held lit, with a bar at its left edge, as a selection.
-        let on_view = viewed.is_some() && line.click.agent_id.as_deref() == viewed;
-        if on_view {
-            ui.painter()
-                .rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
-            // In the pane's left margin, clear of the text.
-            let bar = egui::Rect::from_min_size(
-                rect.min - egui::vec2(6.0, 0.0),
-                egui::vec2(3.0, rect.height()),
-            );
-            ui.painter().rect_filled(bar, 1.0, color);
-        }
-        if let Some(alpha) = row_tint(resp.hovered(), resp.is_pointer_button_down_on()) {
-            ui.painter()
-                .rect_filled(rect, 2.0, color.gamma_multiply(alpha));
-        }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        let top = rect.center().y - cell.y / 2.0;
-        let p = ui.painter().clone();
-        let mut left = |at: usize, s: &str| {
-            let at = egui::pos2(rect.left() + at as f32 * cw, top);
-            shared.paint_text(&p, at, s, color);
-        };
-        left(0, stage_word(line.stage));
-        // The id is never cut; the title takes what is left.
-        let task = if idw > 0 {
-            let title_w = taskw.saturating_sub(idw + 1);
-            format!("{:<idw$} {}", line.id, cut(&line.title, title_w))
-        } else {
-            cut(&line.title, taskw)
-        };
-        left(x_task, &task);
-        // Right-aligned: the text ends at the column's last cell.
-        left(right_at(x_el_end, &line.elapsed), &line.elapsed);
-        left(right_at(x_eta_end, &line.eta), &line.eta);
-        left(x_now, &cut(&line.now, NOW_W));
-        left(right_at(x_tok_end, &line.tokens), &line.tokens);
-
-        let resp = match &line.click.note {
-            Some(note) => resp.on_hover_text(note),
-            None => resp,
-        };
-        if resp.clicked() {
-            clicked = Some(line.click.clone());
-        }
-    }
+    let layout = Cols::new(table, cols);
+    let mut segs: Vec<Vec<(usize, String)>> =
+        table.lines.iter().map(|l| layout.segments(l)).collect();
     if let Some(footer) = &table.footer {
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::hover());
-        let top = rect.center().y - cell.y / 2.0;
-        shared.paint_text(
-            ui.painter(),
-            egui::pos2(rect.left(), top),
-            &cut(footer, cols),
-            chrome.dim,
-        );
+        segs.push(vec![(0, cut(footer, cols))]);
     }
-    clicked
+    let texts: Vec<String> = segs.iter().map(|s| compose(s)).collect();
+    let rects: Vec<egui::Rect> = segs
+        .iter()
+        .map(|_| {
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::hover())
+                .0
+        })
+        .collect();
+    let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
+        return (None, rects);
+    };
+    let n = table.lines.len();
+    let hovered_line = input.hovered.filter(|&r| r < n);
+    if hovered_line.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let sel_fill = ui.visuals().selection.bg_fill;
+    let p = ui.painter().clone();
+
+    for (i, rect) in rects.iter().copied().enumerate() {
+        let line = table.lines.get(i);
+        let color = line.map_or(chrome.dim, |l| stage_color(l.stage));
+        if let Some(line) = line {
+            // The worker whose view the terminal above shows (giverny#75):
+            // held lit, with a bar at its left edge, as a selection.
+            let on_view = viewed.is_some() && line.click.agent_id.as_deref() == viewed;
+            if on_view {
+                p.rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
+                // In the pane's left margin, clear of the text.
+                let bar = egui::Rect::from_min_size(
+                    rect.min - egui::vec2(6.0, 0.0),
+                    egui::vec2(3.0, rect.height()),
+                );
+                p.rect_filled(bar, 1.0, color);
+            }
+            let here = hovered_line == Some(i);
+            if let Some(alpha) = row_tint(here, here && input.pressed) {
+                p.rect_filled(rect, 2.0, color.gamma_multiply(alpha));
+            }
+        }
+        // The selected text, behind the glyphs.
+        if let Some(s) = sel.as_ref()
+            && let Some((a, b)) = s.span(i, texts[i].chars().count())
+        {
+            let r = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + a as f32 * cw, rect.top()),
+                egui::pos2(rect.left() + b as f32 * cw, rect.bottom()),
+            );
+            p.rect_filled(r, 0.0, sel_fill);
+        }
+        let top = rect.center().y - cell.y / 2.0;
+        for (at, s) in &segs[i] {
+            let at = egui::pos2(rect.left() + *at as f32 * cw, top);
+            shared.paint_text(&p, at, s, color);
+        }
+    }
+    if let Some(note) = hovered_line.and_then(|i| table.lines[i].click.note.as_ref()) {
+        resp.on_hover_text(note);
+    }
+    let clicked = input
+        .clicked
+        .and_then(|i| table.lines.get(i))
+        .map(|l| l.click.clone());
+    (clicked, rects)
 }
 
 #[cfg(test)]
@@ -1552,6 +1813,198 @@ mod tests {
         ];
         assert_eq!(held_ms(&holds, 5, 30), 5 + 10);
         assert_eq!(held_ms(&holds, 12, 18), 0);
+    }
+
+    // ------------------------------------- giverny#84: selectable text ----
+
+    fn rows_text() -> Vec<String> {
+        vec![
+            "Running  giverny#84 FEATURE: selectable      1:02".into(),
+            "NextUp   giverny#85 BUG: something".into(),
+            "session 3".into(),
+        ]
+    }
+
+    #[test]
+    fn a_selection_copies_its_rows_line_by_line() {
+        let rows = rows_text();
+        // Backwards drag, from the middle of row 1 to the id on row 0.
+        let sel = Selection {
+            anchor: (1, 12),
+            head: (0, 9),
+        };
+        assert_eq!(
+            selected_text(&rows, &sel),
+            "giverny#84 FEATURE: selectable      1:02\nNextUp   giv"
+        );
+        // Past the row's end is the row's end, and blanks are not copied.
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (2, 99),
+        };
+        assert_eq!(selected_text(&rows, &sel), rows.join("\n"));
+        let one = Selection {
+            anchor: (0, 9),
+            head: (0, 19),
+        };
+        assert_eq!(selected_text(&rows, &one), "giverny#84");
+        assert_eq!(one.span(1, 30), None);
+    }
+
+    #[test]
+    fn a_row_reads_as_it_is_drawn() {
+        let segs = vec![
+            (0, "Done".to_string()),
+            (9, "g#1 title".to_string()),
+            (26, "5:00".to_string()),
+            (40, String::new()),
+        ];
+        assert_eq!(compose(&segs), "Done     g#1 title        5:00");
+    }
+
+    /// Three 20pt rows of 8pt cells from the origin, driven by a pointer
+    /// in a headless egui: one frame per event list.
+    struct Rows {
+        ctx: egui::Context,
+        sel: Option<Selection>,
+        time: f64,
+    }
+
+    impl Rows {
+        fn new() -> Self {
+            Rows {
+                ctx: egui::Context::default(),
+                sel: None,
+                time: 0.0,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> (RowsInput, Vec<String>) {
+            self.frame_mods(events, egui::Modifiers::NONE)
+        }
+
+        fn frame_mods(
+            &mut self,
+            events: Vec<egui::Event>,
+            modifiers: egui::Modifiers,
+        ) -> (RowsInput, Vec<String>) {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                time: Some(self.time),
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let texts = rows_text();
+            let mut got = RowsInput::default();
+            let sel = &mut self.sel;
+            let out = self.ctx.run_ui(input, |ui| {
+                let rects: Vec<egui::Rect> = (0..3)
+                    .map(|i| {
+                        egui::Rect::from_min_size(
+                            egui::pos2(0.0, 20.0 * i as f32),
+                            egui::vec2(400.0, 20.0),
+                        )
+                    })
+                    .collect();
+                if let Some((o, _)) = rows_input(ui, egui::Id::new("t"), &rects, &texts, 8.0, sel) {
+                    got = o;
+                }
+            });
+            let copied = out
+                .platform_output
+                .commands
+                .into_iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            (got, copied)
+        }
+
+        fn press(&mut self, at: egui::Pos2) -> (RowsInput, Vec<String>) {
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![button(at, true)])
+        }
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_plain_click_opens_the_row_and_selects_nothing() {
+        let mut r = Rows::new();
+        let at = egui::pos2(100.0, 30.0);
+        r.press(at);
+        let (input, copied) = r.frame(vec![button(at, false)]);
+        assert_eq!(input.clicked, Some(1));
+        assert_eq!(r.sel, None);
+        assert!(copied.is_empty());
+    }
+
+    #[test]
+    fn a_drag_selects_and_copies_and_is_never_a_click() {
+        let mut r = Rows::new();
+        // From cell 9 of row 0 to cell 12 of row 1.
+        let (from, to) = (egui::pos2(72.0, 10.0), egui::pos2(96.0, 30.0));
+        r.press(from);
+        let mut seen = Vec::new();
+        for k in 1..=4 {
+            let p = from + (to - from) * (k as f32 / 4.0);
+            let (input, copied) = r.frame(vec![egui::Event::PointerMoved(p)]);
+            assert_eq!(input.clicked, None);
+            assert!(copied.is_empty(), "copied before the drag ended");
+            seen.push(input.dragging);
+        }
+        assert!(seen.iter().any(|d| *d), "never dragging: {seen:?}");
+        assert_eq!(
+            r.sel,
+            Some(Selection {
+                anchor: (0, 9),
+                head: (1, 12),
+            })
+        );
+        let (input, copied) = r.frame(vec![button(to, false)]);
+        assert_eq!(input.clicked, None, "a drag is not a click");
+        let want = "giverny#84 FEATURE: selectable      1:02\nNextUp   giv";
+        assert_eq!(copied, [want]);
+        assert_eq!(input.copied.as_deref(), Some(want));
+        // The selection stays lit until the next press, which lets it go.
+        let (_, copied) = r.frame(vec![]);
+        assert!(copied.is_empty());
+        assert!(r.sel.is_some());
+
+        // Ctrl+Shift+C copies it again, and the terminal never sees it.
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let (_, copied) = r.frame_mods(vec![egui::Event::Copy], ctrl_shift);
+        assert_eq!(copied, [want]);
+        // Plain Ctrl+C is the terminal's interrupt: left alone.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let (_, copied) = r.frame_mods(vec![egui::Event::Copy], ctrl);
+        assert!(copied.is_empty());
+
+        r.press(egui::pos2(10.0, 50.0));
+        assert_eq!(r.sel, None);
     }
 
     #[test]

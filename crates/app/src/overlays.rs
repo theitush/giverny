@@ -607,6 +607,67 @@ struct Drawn {
     body: egui::Rect,
 }
 
+/// The width kept at the header's right for the ✕.
+const CLOSE_LANE: f32 = 28.0;
+
+/// The overlay's title line: `● live` for a transcript still being
+/// written, then the title, wrapped at `width`.
+fn title_job(
+    title: &str,
+    live: bool,
+    c: &crate::chrome::Chrome,
+    width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    if live {
+        job.append(
+            "● live  ",
+            0.0,
+            egui::TextFormat::simple(FontId::monospace(10.5), c.green),
+        );
+    }
+    job.append(
+        title,
+        0.0,
+        egui::TextFormat::simple(FontId::monospace(12.5), c.accent),
+    );
+    job.wrap.max_width = width;
+    job
+}
+
+/// Copy-on-select for egui's own labels (giverny#84), the terminal's
+/// behaviour: when a drag that began in `rect` ends with label text
+/// selected, the frame gets a `Copy` event, so the labels drawn after this
+/// call put their selection on the clipboard as the pointer comes up. Call
+/// after the terminal has read the frame's input and before the labels.
+/// `key` names the surface; its press origin is kept under it.
+pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
+    let (pressed_at, released, dragging) = ctx.input(|i| {
+        (
+            i.pointer
+                .primary_pressed()
+                .then(|| i.pointer.press_origin())
+                .flatten(),
+            i.pointer.primary_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+    let id = key.with("copy-on-release");
+    if let Some(p) = pressed_at {
+        ctx.data_mut(|d| d.insert_temp(id, p));
+    }
+    if !released {
+        return;
+    }
+    let origin: Option<egui::Pos2> = ctx.data_mut(|d| d.remove_temp(id));
+    let selected = ctx
+        .plugin_opt::<egui::text_selection::LabelSelectionState>()
+        .is_some_and(|p| p.lock().has_selection());
+    if dragging && selected && origin.is_some_and(|o| rect.contains(o)) {
+        ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+    }
+}
+
 /// The Review line, boxed in amber under the title: the first thing read.
 fn draw_review(ui: &mut egui::Ui, c: &crate::chrome::Chrome, line: &str) {
     ui.add_space(4.0);
@@ -658,6 +719,7 @@ fn draw_overlay(
     }
 
     let mut act = false;
+    copy_on_release(ctx, egui::Id::new("giverny-brief"), rect);
     let shown = egui::Area::new(egui::Id::new("giverny-brief"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -671,10 +733,19 @@ fn draw_overlay(
                     ui.set_min_size(inner);
                     ui.set_max_size(inner);
 
-                    // Header: the ✕ first, at the right, then the title in
-                    // what is left — so it can never sit over text.
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Header: the title in full, wrapped over as many lines
+                    // as it takes and selectable (giverny#84), in all the
+                    // width but the ✕'s lane at the right — so the ✕ can
+                    // never sit over text.
+                    ui.horizontal_top(|ui| {
+                        let text_w = (ui.available_width() - CLOSE_LANE).max(40.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(text_w);
+                            let live = matches!(&ov.content, Content::Transcript(v) if v.live);
+                            let job = title_job(&ov.title, live, &c, text_w);
+                            ui.add(egui::Label::new(job).selectable(true).wrap());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             let x = ui
                                 .add(
                                     egui::Button::new(
@@ -687,28 +758,6 @@ fn draw_overlay(
                             if x.clicked() {
                                 close = true;
                             }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    let live =
-                                        matches!(&ov.content, Content::Transcript(v) if v.live);
-                                    if live {
-                                        ui.label(
-                                            RichText::new("● live")
-                                                .font(FontId::monospace(10.5))
-                                                .color(c.green),
-                                        );
-                                    }
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&ov.title)
-                                                .font(FontId::monospace(12.5))
-                                                .color(c.accent),
-                                        )
-                                        .truncate(),
-                                    );
-                                },
-                            );
                         });
                     });
                     let review = ov
@@ -730,7 +779,8 @@ fn draw_overlay(
                                     .font(FontId::monospace(11.0))
                                     .color(c.fg),
                             )
-                            .truncate(),
+                            .selectable(true)
+                            .wrap(),
                         );
                     }
                     if let Some(sub) = sub {
@@ -952,6 +1002,113 @@ mod tests {
             "{:?} not in {small:?}",
             d.frame
         );
+    }
+
+    /// giverny#84: frames of the overlay with `events`, and what each put
+    /// on the clipboard and drew as text.
+    fn run_overlay(
+        ctx: &egui::Context,
+        ov: &mut BriefOverlay,
+        session: egui::Rect,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (Drawn, Vec<String>, Vec<std::sync::Arc<egui::Galley>>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 820.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let c = chrome();
+        let mut drawn = None;
+        let out = ctx.run_ui(input, |ui| {
+            drawn = Some(draw_overlay(ov, &c, Some(session), ui.ctx()));
+        });
+        let copied = out
+            .platform_output
+            .commands
+            .into_iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let galleys = out
+            .shapes
+            .into_iter()
+            .filter_map(|s| match s.shape {
+                egui::Shape::Text(t) => Some(t.galley),
+                _ => None,
+            })
+            .collect();
+        (drawn.unwrap(), copied, galleys)
+    }
+
+    const LONG_TITLE: &str = "giverny#83 · BUG: agents pane: a running task splits into two rows \
+         when the feed row has no agent_id and the worker's own row carries the tokens, so the \
+         pane shows one row with no tokens and one with no task number";
+
+    #[test]
+    fn a_long_title_is_shown_whole_wrapped_clear_of_the_x() {
+        let ctx = egui::Context::default();
+        let mut ov = BriefOverlay::text(LONG_TITLE.into(), None, long_text());
+        let small = egui::Rect::from_min_max(egui::pos2(300.0, 20.0), egui::pos2(900.0, 500.0));
+        let mut last = None;
+        for k in 0..3 {
+            last = Some(run_overlay(&ctx, &mut ov, small, k as f64 / 60.0, vec![]));
+        }
+        let (d, _, galleys) = last.unwrap();
+        let title = galleys
+            .iter()
+            .find(|g| g.text().contains("giverny#83"))
+            .expect("the title is drawn");
+        assert_eq!(title.text(), LONG_TITLE, "whole, never cut");
+        assert!(!title.text().contains('…'));
+        assert!(title.rows.len() > 1, "wrapped: {} rows", title.rows.len());
+        assert!(title.size().x < d.close_button.min.x - d.frame.min.x);
+        assert!(d.close_button.max.y <= d.body.min.y);
+    }
+
+    #[test]
+    fn dragging_over_the_title_copies_it_as_the_drag_ends() {
+        let ctx = egui::Context::default();
+        let mut ov = BriefOverlay::text(LONG_TITLE.into(), None, long_text());
+        let s = session();
+        let mut t = 0.0;
+        let mut step = |ov: &mut BriefOverlay, events| {
+            t += 1.0 / 60.0;
+            run_overlay(&ctx, ov, s, t, events)
+        };
+        let (d, ..) = step(&mut ov, vec![]);
+        step(&mut ov, vec![]);
+        // Along the title's first line, from its first character.
+        let from = d.frame.min + egui::vec2(11.0, 18.0);
+        let to = from + egui::vec2(160.0, 0.0);
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(&mut ov, vec![egui::Event::PointerMoved(from)]);
+        step(&mut ov, vec![press(from, true)]);
+        for k in 1..=4 {
+            let p = from + (to - from) * (k as f32 / 4.0);
+            let (_, copied, _) = step(&mut ov, vec![egui::Event::PointerMoved(p)]);
+            assert!(copied.is_empty());
+        }
+        let (_, copied, _) = step(&mut ov, vec![press(to, false)]);
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        assert!(copied[0].len() > 5, "{copied:?}");
+        assert!(LONG_TITLE.starts_with(&copied[0]), "{copied:?}");
+        // A plain click copies nothing.
+        let (_, copied, _) = step(&mut ov, vec![press(to, true)]);
+        assert!(copied.is_empty());
+        let (_, copied, _) = step(&mut ov, vec![press(to, false)]);
+        assert!(copied.is_empty());
     }
 
     #[test]

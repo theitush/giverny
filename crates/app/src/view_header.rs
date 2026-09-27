@@ -95,13 +95,36 @@ pub fn show(ui: &mut Ui, term: Rect, line: &Line, chrome: &Chrome, tab: TabId) -
         band.max.y - 0.5,
         egui::Stroke::new(1.0, chrome.dim.gamma_multiply(0.4)),
     );
+    // The text is selectable, as a label's is, and copied as a drag over
+    // it ends (giverny#84); registered after the band, so a drag is the
+    // text's.
+    crate::overlays::copy_on_release(ui.ctx(), id, band);
     let text_at = egui::pos2(band.min.x + PAD_X, band.min.y + PAD_Y);
-    painter.galley(text_at, title.clone(), chrome.fg);
+    let title_h = title.size().y;
+    let mut texts = vec![(text_at, title, chrome.fg, "title")];
     if let Some(g) = facts {
-        painter.galley(
-            text_at + egui::vec2(0.0, title.size().y + GAP_Y),
+        texts.push((
+            text_at + egui::vec2(0.0, title_h + GAP_Y),
             g,
             chrome.dim,
+            "facts",
+        ));
+    }
+    // Clipped to the band, as its painter is.
+    let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(band));
+    text_ui.set_clip_rect(band);
+    for (at, galley, color, name) in texts {
+        let rect = Rect::from_min_size(at, galley.size()).intersect(band);
+        let resp = text_ui
+            .interact(rect, id.with(name), Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::Text);
+        egui::text_selection::LabelSelectionState::label_text_selection(
+            &text_ui,
+            &resp,
+            at,
+            galley,
+            color,
+            egui::Stroke::NONE,
         );
     }
     if close_resp.hovered() {
