@@ -13,14 +13,21 @@
 //!   (see `titlebar::Maximize`), and WSLg hands the margin to Windows as part
 //!   of the window. The pointer crosses it on its way off any edge.
 //!
-//! Both of those show the cursor Weston put on the root window: a grey arrow
+//! - on the window's own outer rows, and whenever XWayland loses the pointer
+//!   to the Windows side of the window, the X pointer is on the root window
+//!   and nothing of Giverny's is under it at all.
+//!
+//! All three show the cursor Weston put on the root window: a grey arrow
 //! from another theme, 24 px where Windows' own arrow is drawn in 48. So a
 //! pointer that crossed a resize edge came back tiny and grey, and a fresh
 //! window started that way.
 //!
 //! Here the display's cursor size is set from the display scale (unless the
-//! user chose one), and the theme's default cursor is put on the window and
-//! on the frame Weston wrapped it in. The theme is whatever libXcursor
+//! user chose one), and the theme's default cursor is put on the window, on
+//! the frame Weston wrapped it in, and on the root window. The root is
+//! shared by every X program under WSLg, and is only ever seen in those
+//! gaps: they get this arrow there too instead of Weston's, including after
+//! Giverny quits (the X server keeps a cursor while a window uses it). The theme is whatever libXcursor
 //! finds: `XCURSOR_THEME` when set, the system's default theme otherwise.
 //!
 //! Nothing is set in the environment, so the shells in the tabs, and the X
@@ -142,6 +149,7 @@ impl Cursors {
                 .find(|&c| c != 0)
                 .ok_or("the cursor theme has no default cursor")?;
             (xlib.XDefineCursor)(display, window.window, arrow);
+            (xlib.XDefineCursor)(display, (xlib.XDefaultRootWindow)(display), arrow);
             (xlib.XFlush)(display);
             let mut cursors = Cursors {
                 xlib,
