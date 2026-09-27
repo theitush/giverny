@@ -896,6 +896,12 @@ pub struct SubagentRow {
     /// of giverny#92.
     #[serde(default)]
     pub tokens_from_transcript: bool,
+    /// Claude Code's own count, the live list's `tokenCount`: the context of
+    /// its last turn *plus* every output token of the run so far (and an
+    /// estimate of a reply still streaming) — the number its agents view
+    /// shows. [`SubagentRow::shown_tokens`] is the one the pane draws.
+    #[serde(default)]
+    pub live_tokens: Option<u64>,
     /// Spans it stood stopped on an API error ([`Stop`]), oldest first.
     #[serde(default)]
     pub stops: Vec<Stop>,
@@ -919,6 +925,7 @@ impl SubagentRow {
             last_turn_ms: None,
             summary: None,
             tokens_from_transcript: false,
+            live_tokens: None,
             stops: Vec::new(),
         }
     }
@@ -1015,6 +1022,20 @@ impl SubagentRow {
             .unwrap_or(&self.id)
     }
 
+    /// The count the pane draws: Claude Code's own (`tokenCount`, what its
+    /// agents view shows, giverny#116), unless the transcript's context is
+    /// larger. By construction Claude Code's is the context plus output, so
+    /// it is only ever smaller when it is wrong: after an API error it is
+    /// the output alone (giverny#92), and just after a continue it is a
+    /// count the next turn replaces. Then the transcript's stands in, as it
+    /// does while no live list has named one.
+    pub fn shown_tokens(&self) -> Option<u64> {
+        match (self.live_tokens, self.tokens) {
+            (Some(live), Some(ctx)) => Some(live.max(ctx)),
+            (live, ctx) => live.or(ctx),
+        }
+    }
+
     /// Wall time so far (Running) or taken (Done), in ms.
     pub fn elapsed_ms(&self, now_ms: u64) -> Option<u64> {
         let start = self.started_ms?;
@@ -1069,7 +1090,7 @@ impl crate::feed::LiveAgent for SubagentRow {
         self.started_ms
     }
     fn tokens(&self) -> Option<u64> {
-        self.tokens
+        self.shown_tokens()
     }
     fn description(&self) -> Option<&str> {
         self.description.as_deref()
@@ -1266,6 +1287,10 @@ impl Tracker {
             // output alone (giverny#92).
             if t.tokens.is_some() && !row.tokens_from_transcript {
                 row.tokens = t.tokens;
+            }
+            // Claude Code writes 0 for a worker with no progress yet.
+            if let Some(n) = t.tokens.filter(|&n| n > 0) {
+                row.live_tokens = Some(n);
             }
             match Outcome::parse(&t.status) {
                 None => {
@@ -2225,6 +2250,39 @@ mod tests {
         ] {
             assert_eq!(stop_reason(&line(error, text)), want, "{text}");
         }
+    }
+
+    /// giverny#116: Claude Code's agents view shows the live list's
+    /// `tokenCount` — the context plus the output so far — and so does the
+    /// pane, while the transcript's context stays on the row as the floor.
+    #[test]
+    fn the_shown_count_is_claude_codes() {
+        let (config, subs, _parent) = layout("shown116", "s1");
+        let path = agent_transcript(&subs, "a1");
+        append(&path, &(assistant_line(T0, None) + "\n"));
+        let tick = |n: u64| {
+            LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "running", "startTime": T0, "tokenCount": n}]}))
+        };
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(&tick(0), T0);
+        assert_eq!(t.get("a1").unwrap().live_tokens, None, "0 is no count yet");
+        t.refresh();
+        assert_eq!(t.get("a1").unwrap().shown_tokens(), Some(110));
+        // 110 of context and 10 of output: Claude Code's 120.
+        t.apply_live(&tick(120), T0 + 5_000);
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.tokens, a1.shown_tokens()), (Some(110), Some(120)));
+        assert_eq!(crate::feed::LiveAgent::tokens(a1), Some(120));
+        // A count under the context is never Claude Code's real one.
+        t.apply_live(&tick(40), T0 + 10_000);
+        assert_eq!(t.get("a1").unwrap().shown_tokens(), Some(110));
+        // Kept across a restart.
+        t.apply_live(&tick(120), T0 + 15_000);
+        let back: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.get("a1").unwrap().shown_tokens(), Some(120));
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// giverny#92: the live list's count for a worker an API error stopped

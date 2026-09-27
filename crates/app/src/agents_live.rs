@@ -419,6 +419,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// giverny#116, on giverny#84's real transcript (its first 120 lines,
+    /// still working): the pane's row reads what Claude Code's agents view
+    /// reads. Claude Code counts ELAPSED from the tick's `startTime` and
+    /// shows the tick's `tokenCount` — the last turn's context (123,200
+    /// here) plus every output token so far (734). The feed's `started`
+    /// was stamped 75 s before the spawn, as `orchestrate-status start`
+    /// does, and is not the clock.
+    #[test]
+    fn a_worked_row_reads_as_claude_codes_agents_view() {
+        use crate::agents_pane::{build, fmt_tokens, stopwatch};
+        use giverny_claude::subagents::LiveSnapshot;
+        const REAL: &str = include_str!("../../claude/testdata/agent-api-error-resume.jsonl");
+        /// 2026-09-26T17:10:37.249Z, its first line.
+        const SPAWN_MS: u64 = 1_790_442_637_249;
+        const CLAUDE_CODES: u64 = 123_200 + 734;
+        let config =
+            std::env::temp_dir().join(format!("giverny-agents-live-116-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config.join("projects/-w/s/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(config.join("projects/-w/s.jsonl"), "{}\n").unwrap();
+        let text: String = REAL.lines().take(120).map(|l| format!("{l}\n")).collect();
+        std::fs::write(subs.join("agent-a84.jsonl"), text).unwrap();
+        let feed = giverny_claude::feed::parse(
+            format!(
+                r#"{{"session":"s","rows":[{{"key":"giverny#84","stage":"running",
+                   "title":"FEATURE: selectable","started":{},"eta_s":3600}}]}}"#,
+                SPAWN_MS - 75_000
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut t = Tracker::new(Some(config.clone()));
+        let now = SPAWN_MS + 705_229;
+        t.apply_live(
+            &LiveSnapshot::from_value(&serde_json::json!({"session_id": "s", "tasks": [
+                {"id": "a84", "type": "local_agent", "status": "running",
+                 "description": "Work giverny#84 select", "startTime": SPAWN_MS,
+                 "tokenCount": CLAUDE_CODES}]})),
+            now,
+        );
+        t.refresh();
+        let a84 = t.get("a84").unwrap();
+        assert_eq!(a84.tokens, Some(123_200), "the transcript's context");
+        let l = build(Some(&feed), t.rows(), now).lines[0].clone();
+        assert_eq!(l.id, "giverny#84");
+        assert_eq!(l.elapsed, stopwatch(705), "11:45, from the spawn");
+        assert_eq!(l.tokens, fmt_tokens(CLAUDE_CODES));
+        assert_eq!(l.tokens, "123.9k");
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
     /// giverny#91, on giverny#84's real transcript (trimmed): cut off by
     /// `EAI_AGAIN` at 17:38:46, continued at 07:34:58 the next morning. Its
     /// row stands still with the reason while it is stopped, whatever the
