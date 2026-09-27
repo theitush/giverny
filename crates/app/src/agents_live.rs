@@ -174,11 +174,29 @@ impl AgentsLive {
     }
 }
 
-/// What a refresh can change that is worth saving.
-fn signature(t: &Tracker) -> Vec<(String, Stage, Option<u64>)> {
+/// What a refresh can change that is worth saving: a corrected token count
+/// (giverny#92) and a stop opening or closing (giverny#91) among them, so a
+/// restart comes back to them.
+type Signature = (
+    String,
+    Stage,
+    Option<u64>,
+    Option<u64>,
+    Option<(u64, Option<u64>)>,
+);
+
+fn signature(t: &Tracker) -> Vec<Signature> {
     t.rows()
         .iter()
-        .map(|r| (r.id.clone(), r.stage, r.ended_ms))
+        .map(|r| {
+            (
+                r.id.clone(),
+                r.stage,
+                r.ended_ms,
+                r.tokens,
+                r.stops.last().map(|s| (s.from_ms, s.to_ms)),
+            )
+        })
         .collect()
 }
 
@@ -295,5 +313,87 @@ mod tests {
         assert_eq!(t.rows().len(), 1);
         assert!(!t.rows()[0].running(), "the Done row came back Done");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// giverny#91, on giverny#84's real transcript (trimmed): cut off by
+    /// `EAI_AGAIN` at 17:38:46, continued at 07:34:58 the next morning. Its
+    /// row stands still with the reason while it is stopped, whatever the
+    /// live list says and however long that lasts, and counts on from where
+    /// it stood once it is continued.
+    #[test]
+    fn a_worker_stopped_by_an_api_error_freezes_its_row() {
+        use crate::agents_pane::build;
+        use giverny_claude::subagents::LiveSnapshot;
+        const REAL: &str = include_str!("../../claude/testdata/agent-api-error-resume.jsonl");
+        const ERROR_MS: u64 = 1_790_444_326_816;
+        const BACK_MS: u64 = 1_790_494_501_869;
+        let resume_ms = BACK_MS - 3_146;
+        let start = ERROR_MS - 1_700_000;
+        let (before, after): (Vec<&str>, Vec<&str>) = {
+            let lines: Vec<&str> = REAL.lines().collect();
+            (lines[..143].to_vec(), lines[143..].to_vec())
+        };
+        let text = |ls: &[&str]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
+
+        let config =
+            std::env::temp_dir().join(format!("giverny-agents-live-91-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config.join("projects/-w/s/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(config.join("projects/-w/s.jsonl"), "{}\n").unwrap();
+        let path = subs.join("agent-a84.jsonl");
+        std::fs::write(&path, text(&before)).unwrap();
+
+        let tick = |status: &str, start: u64, tokens: u64| {
+            LiveSnapshot::from_value(&serde_json::json!({"session_id": "s", "tasks": [
+                {"id": "a84", "status": status, "description": "Work giverny#84 select",
+                 "startTime": start, "tokenCount": tokens}]}))
+        };
+        let feed = giverny_claude::feed::parse(
+            format!(
+                r#"{{"session":"s","rows":[{{"key":"giverny#84","stage":"running",
+                   "title":"FEATURE: selectable","started":{start},"eta_s":3600}}]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let worked = |ms: u64| crate::agents_pane::stopwatch(ms / 1000);
+
+        let mut t = Tracker::new(Some(config.clone()));
+        // Still listed running for a moment, then failed; the pane is looked
+        // at ten seconds, an hour and fourteen hours on.
+        t.apply_live(&tick("running", start, 131_000), ERROR_MS + 1_000);
+        t.refresh();
+        let mut seen = Vec::new();
+        for (status, later) in [
+            ("running", 10_000),
+            ("failed", 3_600_000),
+            ("failed", 50_000_000),
+        ] {
+            t.apply_live(&tick(status, start, 764), ERROR_MS + later);
+            t.refresh();
+            let l = build(Some(&feed), t.rows(), ERROR_MS + later).lines[0].clone();
+            seen.push((l.elapsed, l.eta, l.now, l.tokens));
+        }
+        let frozen = (
+            worked(ERROR_MS - start),
+            "~32m".to_string(),
+            "stopped: no network".to_string(),
+            "131.8k".to_string(),
+        );
+        assert_eq!(seen, vec![frozen.clone(), frozen.clone(), frozen]);
+
+        // Continued: counting on from 28:20, less the night it stood.
+        std::fs::write(&path, text(&before) + &text(&after)).unwrap();
+        t.apply_live(&tick("running", resume_ms, 812), BACK_MS + 60_000);
+        t.refresh();
+        let l = build(Some(&feed), t.rows(), BACK_MS + 60_000).lines[0].clone();
+        assert_eq!(
+            l.elapsed,
+            worked((ERROR_MS - start) + (BACK_MS + 60_000 - resume_ms))
+        );
+        assert!(!l.now.starts_with("stopped"), "{}", l.now);
+        assert_eq!(l.tokens, "134.8k");
+        let _ = std::fs::remove_dir_all(&config);
     }
 }

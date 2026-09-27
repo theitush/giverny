@@ -292,6 +292,62 @@ pub struct Activity {
     pub tokens: Option<u64>,
     /// The model the last assistant turn ran on.
     pub model: Option<String>,
+    /// Spans the worker stood stopped on an API error, oldest first: from
+    /// Claude Code's `<synthetic>` `isApiErrorMessage` line to its next real
+    /// turn, the last one open while nothing came after it (giverny#91).
+    pub stops: Vec<Stop>,
+}
+
+/// A span a worker stood stopped on an API error — no network, a usage
+/// limit, an expired login — and its clocks with it (giverny#91).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stop {
+    /// The error line's timestamp.
+    pub from_ms: u64,
+    /// Its next real turn (or its revival in the live list); `None` while
+    /// it is still stopped.
+    #[serde(default)]
+    pub to_ms: Option<u64>,
+    /// `no network`, `usage limit`, `login expired`, `timed out`,
+    /// `API error`.
+    pub reason: String,
+}
+
+/// How many stop spans a row keeps; older ones are long before any clock.
+const MAX_STOPS: usize = 32;
+
+/// The words for an API error line: its `error` code first, else its text.
+fn stop_reason(v: &Value) -> String {
+    let text = v
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let has = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+    match v.get("error").and_then(Value::as_str) {
+        Some("rate_limit") => "usage limit",
+        Some("authentication_failed") => "login expired",
+        _ if has(&[
+            "EAI_AGAIN",
+            "ENOTFOUND",
+            "ECONNREFUSED",
+            "ECONNRESET",
+            "Can't reach",
+            "Connection lost",
+            "Connection error",
+        ]) =>
+        {
+            "no network"
+        }
+        _ if has(&["timed out", "Timed out", "timeout"]) => "timed out",
+        _ if has(&["limit"]) => "usage limit",
+        _ if has(&["/login", "authenticate"]) => "login expired",
+        _ => "API error",
+    }
+    .to_string()
 }
 
 /// How far back from the end a first read starts. A tool result can be
@@ -402,7 +458,8 @@ fn fold_line(act: &mut Activity, line: &[u8]) {
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return;
     }
-    if let Some(ms) = as_millis(&v, "timestamp") {
+    let ts = as_millis(&v, "timestamp");
+    if let Some(ms) = ts {
         act.last_turn_ms = Some(ms);
     }
     let Some(msg) = v.get("message") else {
@@ -411,7 +468,25 @@ fn fold_line(act: &mut Activity, line: &[u8]) {
     // Claude Code's own messages (an interrupt, an API error) are not a
     // reply anything was billed for, and say nothing about the context.
     if msg.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+        // An API error is the worker stopping, until its next real turn.
+        let open = act.stops.last().is_some_and(|s| s.to_ms.is_none());
+        if v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+            && !open
+            && let Some(from_ms) = ts
+        {
+            act.stops.push(Stop {
+                from_ms,
+                to_ms: None,
+                reason: stop_reason(&v),
+            });
+            if act.stops.len() > MAX_STOPS {
+                act.stops.remove(0);
+            }
+        }
         return;
+    }
+    if let Some(open) = act.stops.last_mut().filter(|s| s.to_ms.is_none()) {
+        open.to_ms = Some(ts.unwrap_or(open.from_ms).max(open.from_ms));
     }
     if let Some(m) = as_str(msg, "model") {
         act.model = Some(m);
@@ -763,6 +838,16 @@ pub struct SubagentRow {
     /// Summary line of its last notification.
     #[serde(default)]
     pub summary: Option<String>,
+    /// `tokens` came from its transcript, not the live list. Once it has,
+    /// the live list's `tokenCount` never replaces it: that count is the
+    /// context *plus* output so far, and an API error zeroes the context
+    /// part, so a failed worker lists at its output alone — the `764`
+    /// of giverny#92.
+    #[serde(default)]
+    pub tokens_from_transcript: bool,
+    /// Spans it stood stopped on an API error ([`Stop`]), oldest first.
+    #[serde(default)]
+    pub stops: Vec<Stop>,
 }
 
 impl SubagentRow {
@@ -782,6 +867,79 @@ impl SubagentRow {
             transcript: None,
             last_turn_ms: None,
             summary: None,
+            tokens_from_transcript: false,
+            stops: Vec::new(),
+        }
+    }
+
+    /// Why its clocks stand still, and since when: an API error it has not
+    /// written past, else a failed, killed or stopped end. `None` while it
+    /// is working — or finished cleanly, where the orchestrator's landing is
+    /// still time on the task (giverny#91).
+    pub fn stopped(&self) -> Option<(u64, String)> {
+        if let Some(s) = self.stops.last().filter(|s| s.to_ms.is_none()) {
+            return Some((s.from_ms, format!("stopped: {}", s.reason)));
+        }
+        if self.stage != Stage::Done {
+            return None;
+        }
+        let word = match self.outcome? {
+            Outcome::Failed => "failed",
+            Outcome::Killed => "killed",
+            Outcome::Stopped => "stopped",
+            Outcome::Completed | Outcome::Unknown => return None,
+        };
+        Some((self.ended_ms?, format!("stopped: {word}")))
+    }
+
+    /// How much of `[start, upto)` it stood stopped on API errors, in ms —
+    /// taken off its clocks the way a usage-limit hold is.
+    pub fn stopped_ms(&self, start: u64, upto: u64) -> u64 {
+        self.stops
+            .iter()
+            .map(|s| {
+                let a = s.from_ms.max(start);
+                let b = s.to_ms.unwrap_or(upto).min(upto);
+                b.saturating_sub(a)
+            })
+            .sum()
+    }
+
+    /// Fold in the spans a transcript read found: a known span (same
+    /// start) that is still open takes the read's end — one the live list
+    /// already closed at the continue keeps that — and a new one is added.
+    fn merge_stops(&mut self, found: &[Stop]) {
+        for f in found {
+            match self.stops.iter_mut().find(|s| s.from_ms == f.from_ms) {
+                Some(s) => {
+                    if s.to_ms.is_none() {
+                        s.to_ms = f.to_ms;
+                    }
+                }
+                None => self.stops.push(f.clone()),
+            }
+        }
+        self.stops.sort_by_key(|s| s.from_ms);
+        // Only the newest may be open: an older one the read no longer
+        // reached ended when a later error began, at the latest.
+        for i in 1..self.stops.len() {
+            if self.stops[i - 1].to_ms.is_none() {
+                self.stops[i - 1].to_ms = Some(self.stops[i].from_ms);
+            }
+        }
+        let over = self.stops.len().saturating_sub(MAX_STOPS);
+        self.stops.drain(..over);
+    }
+
+    /// The live list lists it running again from `start_ms`: an open stop
+    /// ends there. True when one did — a resume, not a new run.
+    fn resume_at(&mut self, start_ms: Option<u64>) -> bool {
+        match (self.stops.last_mut(), start_ms) {
+            (Some(s), Some(at)) if s.to_ms.is_none() && at > s.from_ms => {
+                s.to_ms = Some(at);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -901,6 +1059,11 @@ pub struct Tracker {
     /// A follower per Running worker's transcript, by agent id.
     #[serde(skip)]
     followers: HashMap<String, TranscriptTail>,
+    /// Finished workers whose transcript this process has read once: a row
+    /// restored with the live list's count (or none) is set right from its
+    /// transcript after a restart, and then left alone (giverny#92).
+    #[serde(skip)]
+    checked: std::collections::HashSet<String>,
 }
 
 impl Tracker {
@@ -974,13 +1137,19 @@ impl Tracker {
             if t.model.is_some() {
                 row.model = t.model.clone();
             }
-            if t.start_ms.is_some() {
+            // A worker continued after an API error is listed afresh, its
+            // start moved to the continue: the stop ends there and the
+            // clock carries on from where it stood (giverny#91).
+            let resumed = Outcome::parse(&t.status).is_none() && row.resume_at(t.start_ms);
+            if t.start_ms.is_some() && !(resumed && row.started_ms.is_some()) {
                 row.started_ms = t.start_ms;
             }
             // The transcript's count is the one the pane keeps once there
             // is one (it moves every second, and agrees with the
-            // orchestrator's); the live list's stands in until then.
-            if t.tokens.is_some() && (row.transcript.is_none() || row.tokens.is_none()) {
+            // orchestrator's); the live list's stands in until then. It is
+            // never taken back: after an API error the live count is the
+            // output alone (giverny#92).
+            if t.tokens.is_some() && !row.tokens_from_transcript {
                 row.tokens = t.tokens;
             }
             match Outcome::parse(&t.status) {
@@ -1060,9 +1229,13 @@ impl Tracker {
                     // Either way not ours to invent.
                     continue;
                 }
+                let unchecked = !self.checked.contains(&id);
                 let needs_read = !known
                     || self.rows.iter().any(|r| {
-                        r.id == id && (r.stage == Stage::Running || r.transcript.is_none())
+                        r.id == id
+                            && (r.stage == Stage::Running
+                                || r.transcript.is_none()
+                                || (unchecked && !r.tokens_from_transcript))
                     });
                 if !needs_read && completion.is_none() {
                     continue;
@@ -1082,6 +1255,7 @@ impl Tracker {
                     f.poll();
                     Some(f.activity().clone())
                 } else if needs_read {
+                    self.checked.insert(id.clone());
                     Some(read_activity(&path))
                 } else {
                     None
@@ -1107,17 +1281,18 @@ impl Tracker {
                     if row.model.is_none() {
                         row.model = act.model;
                     }
-                    if row.stage == Stage::Running {
-                        // The transcript's last tool call; the live label
-                        // stands until the worker has made one.
-                        if act.doing.is_some() {
-                            row.activity = act.doing;
-                        }
-                        if act.tokens.is_some() {
-                            row.tokens = act.tokens;
-                        }
-                    } else if row.tokens.is_none() {
+                    // The transcript's count wins at every stage: a Done row
+                    // holding the live list's (the output alone, after an API
+                    // error) is set right the first time it is read.
+                    if act.tokens.is_some() {
                         row.tokens = act.tokens;
+                        row.tokens_from_transcript = true;
+                    }
+                    row.merge_stops(&act.stops);
+                    // The transcript's last tool call; the live label
+                    // stands until the worker has made one.
+                    if row.stage == Stage::Running && act.doing.is_some() {
+                        row.activity = act.doing;
                     }
                 }
                 if !known && row.started_ms.is_none() {
@@ -1741,6 +1916,168 @@ mod tests {
         t.set_session("new");
         t.refresh();
         assert_eq!(t.get("a1").map(|r| r.stage), Some(Stage::Done));
+    }
+
+    /// A real worker's transcript (giverny#84's, trimmed to its usage,
+    /// tool names and timestamps): cut off by `EAI_AGAIN` at 17:38:46 and
+    /// continued the next morning. `orchestrate-status`' `tokens_of()`
+    /// reads 131752 on the first 143 lines and 134773 on all 175.
+    const REAL: &str = include_str!("../testdata/agent-api-error-resume.jsonl");
+    const REAL_BEFORE_LINES: usize = 143;
+    const REAL_BEFORE: u64 = 2 + 2_509 + 129_241;
+    const REAL_AFTER: u64 = 2 + 1_225 + 133_546;
+    /// 2026-09-26T17:38:46.816Z, the API error line.
+    const REAL_ERROR_MS: u64 = 1_790_444_326_816;
+    /// 2026-09-27T07:35:01.869Z, its first real turn after the continue.
+    const REAL_BACK_MS: u64 = 1_790_494_501_869;
+
+    fn real_before() -> String {
+        REAL.lines()
+            .take(REAL_BEFORE_LINES)
+            .map(|l| l.to_string() + "\n")
+            .collect()
+    }
+
+    fn real_after() -> String {
+        REAL.lines()
+            .skip(REAL_BEFORE_LINES)
+            .map(|l| l.to_string() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn the_real_transcript_counts_as_orchestrate_status_does() {
+        let dir = scratch("real92");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a.jsonl");
+        std::fs::write(&path, real_before()).unwrap();
+        let act = read_activity(&path);
+        assert_eq!(act.tokens, Some(REAL_BEFORE), "the error line is skipped");
+        assert_eq!(
+            act.stops,
+            vec![Stop {
+                from_ms: REAL_ERROR_MS,
+                to_ms: None,
+                reason: "no network".into()
+            }]
+        );
+        // Followed across the continue, and read afresh after it.
+        let mut tail = TranscriptTail::new(&path);
+        tail.poll();
+        append(&path, &real_after());
+        tail.poll();
+        for act in [tail.activity().clone(), read_activity(&path)] {
+            assert_eq!(act.tokens, Some(REAL_AFTER));
+            assert_eq!(act.stops.len(), 1);
+            assert_eq!(act.stops[0].to_ms, Some(REAL_BACK_MS));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_errors_read_as_their_reason() {
+        let line = |error: &str, text: &str| {
+            serde_json::json!({"type": "assistant", "error": error, "isApiErrorMessage": true,
+                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}})
+        };
+        for (error, text, want) in [
+            (
+                "rate_limit",
+                "You've hit your session limit · resets 6pm",
+                "usage limit",
+            ),
+            (
+                "authentication_failed",
+                "Login expired · Please run /login",
+                "login expired",
+            ),
+            (
+                "server_error",
+                "API Error: Can't reach the API server (EAI_AGAIN)",
+                "no network",
+            ),
+            ("server_error", "Request timed out", "timed out"),
+            ("server_error", "API Error: 500 overloaded", "API error"),
+        ] {
+            assert_eq!(stop_reason(&line(error, text)), want, "{text}");
+        }
+    }
+
+    /// giverny#92: the live list's count for a worker an API error stopped
+    /// is its output alone (764 on the real one), and a row that took it —
+    /// new to a tracker, or restored from a save written before the
+    /// transcript was read — must show the transcript's count instead,
+    /// before the continue, after it, and across a restart.
+    #[test]
+    fn a_failed_workers_count_is_its_transcripts() {
+        let (config, subs, parent) = layout("real92t", "s1");
+        let path = agent_transcript(&subs, "a1");
+        std::fs::write(&path, real_before()).unwrap();
+        append(
+            &parent,
+            &notification_lines("a1", "failed", REAL_ERROR_MS + 50),
+        );
+        let failed = |start: u64| {
+            LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "failed", "startTime": start, "tokenCount": 764}]}))
+        };
+        let start = REAL_ERROR_MS - 1_700_000;
+
+        // A tracker that first hears of it from the live list.
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(&failed(start), REAL_ERROR_MS + 100);
+        assert_eq!(t.get("a1").unwrap().tokens, Some(764));
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.stage, a1.tokens), (Stage::Done, Some(REAL_BEFORE)));
+        assert_eq!(
+            a1.stopped(),
+            Some((REAL_ERROR_MS, "stopped: no network".into()))
+        );
+        t.apply_live(&failed(start), REAL_ERROR_MS + 5_000);
+        assert_eq!(
+            t.get("a1").unwrap().tokens,
+            Some(REAL_BEFORE),
+            "not taken back"
+        );
+
+        // A save from before any of this: 764 on a Done row, no new fields.
+        let saved = serde_json::json!({
+            "session_id": "s1", "config_dir": config,
+            "rows": [{"id": "a1", "stage": "done", "outcome": "failed",
+                      "started_ms": start, "ended_ms": REAL_ERROR_MS + 50, "tokens": 764,
+                      "transcript": path}]});
+        let mut t: Tracker = serde_json::from_value(saved).unwrap();
+        t.refresh();
+        assert_eq!(t.get("a1").unwrap().tokens, Some(REAL_BEFORE));
+        let restarted: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        let mut t = restarted;
+        t.apply_live(&failed(start), REAL_ERROR_MS + 9_000);
+        t.refresh();
+        assert_eq!(
+            t.get("a1").unwrap().tokens,
+            Some(REAL_BEFORE),
+            "across a restart"
+        );
+
+        // Continued: listed running from the continue, with a small count.
+        let resume_ms = REAL_BACK_MS - 3_146;
+        append(&path, &real_after());
+        t.apply_live(
+            &LiveSnapshot::from_value(&serde_json::json!({"session_id": "s1", "tasks": [
+                {"id": "a1", "status": "running", "startTime": resume_ms, "tokenCount": 812}]})),
+            REAL_BACK_MS + 60_000,
+        );
+        t.refresh();
+        let a1 = t.get("a1").unwrap();
+        assert_eq!((a1.stage, a1.tokens), (Stage::Running, Some(REAL_AFTER)));
+        assert_eq!(a1.started_ms, Some(start), "a continue is not a new start");
+        assert_eq!(a1.stopped(), None);
+        assert_eq!(
+            a1.stopped_ms(start, REAL_BACK_MS + 60_000),
+            resume_ms - REAL_ERROR_MS
+        );
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// Against the real transcripts on this machine — read-only, and skipped
