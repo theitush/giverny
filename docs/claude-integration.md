@@ -12,7 +12,7 @@ Verified against Claude Code **2.1.220**. Claude Code's internals change between
 | `<config>/.claude.json` (or `~/.claude.json`) | read | account identity + `cachedUsageUtilization` |
 | `~/.config/giverny/**` | write | Giverny's own state |
 
-`<config>` is each account's `CLAUDE_CONFIG_DIR`. **Credential files are never read, and Giverny makes no network requests.**
+`<config>` is each account's `CLAUDE_CONFIG_DIR`. `GIVERNY_NO_ACCOUNT_SETUP=1` makes every `<config>` read-only to Giverny — for a second, test instance that must not re-point the accounts at itself (see CONTRIBUTING). **Credential files are never read, and Giverny makes no network requests.**
 
 ## Two state sources, merged
 
