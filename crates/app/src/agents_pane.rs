@@ -1139,7 +1139,7 @@ fn draw_table(
                 .0
         })
         .collect();
-    let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
+    let Some((input, _)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
         return (None, rects);
     };
     let n = table.lines.len();
@@ -1186,9 +1186,6 @@ fn draw_table(
             let at = egui::pos2(rect.left() + *at as f32 * cw, top);
             shared.paint_text(&p, at, s, color);
         }
-    }
-    if let Some(note) = hovered_line.and_then(|i| table.lines[i].click.note.as_ref()) {
-        resp.on_hover_text(note);
     }
     let clicked = input
         .clicked
