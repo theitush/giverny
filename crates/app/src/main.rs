@@ -18,6 +18,8 @@ mod update;
 mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg_cursor;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -834,6 +836,9 @@ pub struct App {
     frameless: bool,
     /// How that window is maximised (#78).
     maximize: titlebar::Maximize,
+    /// That window's cursors, sized to the display (#100).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    cursors: Option<wslg_cursor::Cursors>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -1247,6 +1252,10 @@ impl App {
             attention: 0,
             frameless,
             maximize,
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            cursors: frameless
+                .then(|| wslg_cursor::Cursors::new(cc, wslg::desktop_scale()))
+                .flatten(),
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -2986,6 +2995,10 @@ impl eframe::App for App {
 
         let mut actions = self.shortcuts(&ctx);
 
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        if let Some(cursors) = &mut self.cursors {
+            cursors.keep();
+        }
         if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
             self.maximize.update(&ctx);
             let maximized = self.maximize.is_on(&ctx);
