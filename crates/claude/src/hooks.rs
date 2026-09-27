@@ -410,15 +410,31 @@ fn is_our_subagent_line(command: &str) -> bool {
     command.contains("giverny") && command.trim_end().ends_with(SUBAGENT_LINE_FLAG)
 }
 
-/// What the relay prints back to Claude Code for one tick: one
-/// `{"id":…,"content":""}` line per task when `hide`, else nothing.
+/// How the relay has Claude Code draw its own subagent panel this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripRows {
+    /// Every row as Claude Code draws it (the agents pane is off).
+    Native,
+    /// No row at all: the agents pane stands in for the panel.
+    Hidden,
+    /// Every row drawn, each opened by its agent id in brackets
+    /// ([`tag_strip_row`]), for a walk to a worker's view (giverny#94).
+    Tagged,
+}
+
+/// What the relay prints back to Claude Code for one tick: nothing for
+/// [`StripRows::Native`], else one `{"id":…,"content":…}` line per task —
+/// `""` for [`StripRows::Hidden`], the tagged label for
+/// [`StripRows::Tagged`].
 ///
 /// Claude Code 2.1.280 drops any row whose decoration is the empty string
 /// from its subagent panel, and with every row dropped the panel — `● main`
 /// included — is not drawn at all (verified in a live session, giverny#3).
 /// Printing nothing leaves every row undecorated, which draws it natively.
-pub fn subagent_line_output(payload: &serde_json::Value, hide: bool) -> String {
-    if !hide {
+/// A non-empty decoration takes the place of the row's type, label and
+/// stats, after its pointer and dot (2.1.283).
+pub fn subagent_line_output(payload: &serde_json::Value, rows: StripRows) -> String {
+    if rows == StripRows::Native {
         return String::new();
     }
     let mut out = String::new();
@@ -428,12 +444,51 @@ pub fn subagent_line_output(payload: &serde_json::Value, hide: bool) -> String {
         .into_iter()
         .flatten()
     {
-        if let Some(id) = task.get("id").and_then(|v| v.as_str()) {
-            out.push_str(&serde_json::json!({ "id": id, "content": "" }).to_string());
-            out.push('\n');
-        }
+        let Some(id) = task.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let content = match rows {
+            StripRows::Tagged => {
+                let text = |k: &str| task.get(k).and_then(|v| v.as_str()).map(str::trim);
+                let label = text("label")
+                    .filter(|l| !l.is_empty())
+                    .or_else(|| text("description"))
+                    .unwrap_or("");
+                tag_strip_row(id, label)
+            }
+            _ => String::new(),
+        };
+        out.push_str(&serde_json::json!({ "id": id, "content": content }).to_string());
+        out.push('\n');
     }
     out
+}
+
+/// A strip row's text while a walk looks for a worker (giverny#94):
+/// `[<agent id>] <label>`. Claude Code labels a busy worker's row with a
+/// model-written summary of what it is doing (`Reading runAgent.ts`),
+/// which changes every thirty seconds and is never its description, so
+/// the id is the one stable thing to find the row by.
+pub fn tag_strip_row(id: &str, label: &str) -> String {
+    if label.is_empty() {
+        format!("[{id}]")
+    } else {
+        format!("[{id}] {label}")
+    }
+}
+
+/// The agent id a [`tag_strip_row`] text opens with, and the rest.
+pub fn strip_row_tag(text: &str) -> Option<(&str, &str)> {
+    let (id, rest) = text.strip_prefix('[')?.split_once(']')?;
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok || !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    Some((id, rest.trim()))
 }
 
 /// The message the relay forwards for one `subagentStatusLine` tick.
@@ -461,7 +516,8 @@ pub fn subagent_line_msg(
 /// least every five seconds while a session has live workers, with the list
 /// on stdin. Inside a Giverny tab it forwards that list to the app (the
 /// agents pane's Running rows) and, when `pane_on`, hides every row of Claude
-/// Code's own panel. Outside a tab it does nothing and prints nothing, so an
+/// Code's own panel — or, while the app has asked for the panel
+/// ([`show_strip`]), draws each row tagged with its agent id. Outside a tab it does nothing and prints nothing, so an
 /// account-wide install never changes a session Giverny is not showing.
 ///
 /// Like `relay`, it never fails: Claude Code logs a non-zero exit and drops
@@ -474,7 +530,12 @@ pub fn run_subagent_line(spool: &Path, pane_on: bool) {
     };
     let payload: serde_json::Value =
         serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let answer = subagent_line_output(&payload, pane_on && !strip_wanted(spool, &tab_id));
+    let rows = match (pane_on, strip_wanted(spool, &tab_id)) {
+        (false, _) => StripRows::Native,
+        (true, false) => StripRows::Hidden,
+        (true, true) => StripRows::Tagged,
+    };
+    let answer = subagent_line_output(&payload, rows);
     deliver(&subagent_line_msg(payload, tab_id, account_dir()), spool);
     print!("{answer}");
 }
@@ -1127,12 +1188,12 @@ mod tests {
     fn subagent_line_hides_every_row_only_when_asked() {
         let payload: serde_json::Value = serde_json::from_str(SUBAGENT_STDIN).unwrap();
         assert_eq!(
-            subagent_line_output(&payload, false),
+            subagent_line_output(&payload, StripRows::Native),
             "",
             "off: native rows"
         );
 
-        let out = subagent_line_output(&payload, true);
+        let out = subagent_line_output(&payload, StripRows::Hidden);
         let lines: Vec<serde_json::Value> = out
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -1142,7 +1203,53 @@ mod tests {
         assert_eq!(lines[1], serde_json::json!({"id":"b7","content":""}));
 
         // Garbage in: nothing to hide, and no panic.
-        assert_eq!(subagent_line_output(&serde_json::Value::Null, true), "");
+        assert_eq!(
+            subagent_line_output(&serde_json::Value::Null, StripRows::Hidden),
+            ""
+        );
+    }
+
+    /// A busy worker's row as Claude Code 2.1.283 sent it (giverny#94): the
+    /// label is its progress summary, not its description.
+    #[test]
+    fn subagent_line_tags_every_row_with_its_id_when_the_strip_is_asked_for() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"tasks":[
+                {"id":"a95d7f3452a3597df","type":"local_agent","status":"running",
+                 "description":"gamma busy worker","label":"Executing sequential timeout commands"},
+                {"id":"a2d06f3ac3b6e7671","type":"local_agent","status":"running",
+                 "description":"beta resumed worker","label":""},
+                {"id":"b7","type":"local_agent","status":"running"}]}"#,
+        )
+        .unwrap();
+        let out = subagent_line_output(&payload, StripRows::Tagged);
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                serde_json::json!({"id":"a95d7f3452a3597df",
+                    "content":"[a95d7f3452a3597df] Executing sequential timeout commands"}),
+                serde_json::json!({"id":"a2d06f3ac3b6e7671",
+                    "content":"[a2d06f3ac3b6e7671] beta resumed worker"}),
+                serde_json::json!({"id":"b7","content":"[b7]"}),
+            ]
+        );
+        for l in &lines {
+            let content = l["content"].as_str().unwrap();
+            let (id, _) = strip_row_tag(content).expect("reads back");
+            assert_eq!(id, l["id"].as_str().unwrap());
+        }
+        assert_eq!(
+            strip_row_tag("[a95d7f3452a3597df] Executing sequential timeout commands"),
+            Some(("a95d7f3452a3597df", "Executing sequential timeout commands"))
+        );
+        assert_eq!(strip_row_tag("[x y] z"), None);
+        assert_eq!(strip_row_tag("[] z"), None);
+        assert_eq!(strip_row_tag("[ab]c"), None);
+        assert_eq!(strip_row_tag("general-purpose  eta worker"), None);
     }
 
     /// What the app receives is the stdin verbatim plus the event name, so
