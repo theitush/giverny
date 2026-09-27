@@ -474,12 +474,23 @@ fn format_row(
     let holds = if writer_pauses { &[][..] } else { clock.holds };
     // A Running row's work so far, in seconds: wall time up to where its
     // clock stands, less every span the account was out of its limit.
+    // A worker stopped on an API error, or ended badly under a Running
+    // row, stands still from then, and its error spans are off its clock
+    // (giverny#91).
+    let stopped = l
+        .filter(|_| row.stage == Stage::Running)
+        .and_then(|l| l.stopped());
+    let error_ms = |s: u64, e: u64| l.map_or(0, |l| l.stopped_ms(s, e));
     let work_s = match (row.stage, row_start) {
         (Stage::Running, Some(s)) => {
-            let stop = clock_stop(paused, written, now_ms);
+            let mut stop = clock_stop(paused, written, now_ms);
+            if let Some((since, _)) = &stopped {
+                stop = stop.min((*since).max(s));
+            }
             Some(
                 stop.saturating_sub(s)
                     .saturating_sub(held_ms(holds, s, stop))
+                    .saturating_sub(error_ms(s, stop))
                     / 1000,
             )
         }
@@ -493,7 +504,9 @@ fn format_row(
                 .and_then(|f| f.ended_ms)
                 .or_else(|| l.filter(|l| !l.running()).and_then(|l| l.ended_ms));
             match (row_start, end) {
-                (Some(s), Some(e)) => stopwatch(e.saturating_sub(s) / 1000),
+                (Some(s), Some(e)) => {
+                    stopwatch(e.saturating_sub(s).saturating_sub(error_ms(s, e)) / 1000)
+                }
                 _ => String::new(),
             }
         }
@@ -515,6 +528,7 @@ fn format_row(
         Stage::Running => match (limit, paused) {
             (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
             (None, Some(p)) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
+            (None, None) if stopped.is_some() => stopped.map(|(_, why)| why).unwrap_or_default(),
             (None, None) => l
                 .filter(|l| l.running())
                 .and_then(|l| l.activity.clone())
