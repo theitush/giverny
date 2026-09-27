@@ -1027,6 +1027,8 @@ struct AttachJob {
     settle: Option<agent_open::Settle>,
     /// Brings the relay's next run forward while its answer is waited on.
     nudge: agent_open::Nudge,
+    /// The walk's phase last frame, for the timing log (giverny#108).
+    phase: &'static str,
 }
 
 impl AttachJob {
@@ -1038,6 +1040,7 @@ impl AttachJob {
             started: Instant::now(),
             settle: None,
             nudge: agent_open::Nudge::default(),
+            phase: "start",
         }
     }
 
@@ -3316,9 +3319,16 @@ impl App {
                 None => job.driver.waiting_for_strip(),
                 Some(settle) => !settle.is_final(&screen),
             };
+        let at = job.started.elapsed();
         match job.nudge.tick(now, waiting) {
-            Some(agent_open::Width::Narrow) => session.nudge_width(true),
-            Some(agent_open::Width::Restore) => session.nudge_width(false),
+            Some(agent_open::Width::Narrow) => {
+                tracing::debug!("walk +{at:?}: nudge narrow");
+                session.nudge_width(true)
+            }
+            Some(agent_open::Width::Restore) => {
+                tracing::debug!("walk +{at:?}: nudge restore");
+                session.nudge_width(false)
+            }
             None => {}
         }
         let mut finished = false;
@@ -3331,8 +3341,15 @@ impl App {
                 undimmed: &undimmed,
                 cursor: session.cursor_row(),
             };
-            match job.driver.tick(now, look) {
+            let tick = job.driver.tick(now, look);
+            let phase = job.driver.phase_name();
+            if phase != job.phase {
+                tracing::debug!("walk +{at:?}: {} -> {phase}", job.phase);
+                job.phase = phase;
+            }
+            match tick {
                 Tick::Send(key) => {
+                    tracing::debug!("walk +{at:?}: key {key:?}");
                     let mode = session.mode();
                     let bytes = agent_open::keystroke_bytes(key, |k, m| {
                         giverny_term::input::encode_key(k, m, mode)
@@ -3341,6 +3358,7 @@ impl App {
                 }
                 Tick::Wait => {}
                 Tick::Done => {
+                    tracing::debug!("walk +{at:?}: done, settling");
                     job.settle = Some(agent_open::Settle::new(&job.driver.goal, pane_on, now));
                     job.nudge.ask();
                 }

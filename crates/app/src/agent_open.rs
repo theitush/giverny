@@ -1029,6 +1029,17 @@ impl Walk {
         matches!(self.goal, Goal::Worker { .. })
     }
 
+    /// The phase the walk is in, for the timing log (giverny#108).
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase {
+            Phase::Start => "start",
+            Phase::Strip => "strip",
+            Phase::Attach(_) => "attach",
+            Phase::Landing => "landing",
+            Phase::Focus { .. } => "focus",
+        }
+    }
+
     /// Whether the walk is waiting on the strip to come up.
     pub fn waiting_for_strip(&self) -> bool {
         matches!(self.phase, Phase::Start | Phase::Strip)
