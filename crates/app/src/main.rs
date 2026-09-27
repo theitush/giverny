@@ -387,7 +387,10 @@ fn main() -> eframe::Result {
     // exported, so it goes before the markers are scrubbed.
     if std::env::args().nth(1).as_deref() == Some("pass") {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(giverny_claude::pass::main(&args));
+        std::process::exit(giverny_claude::pass::main(
+            &args,
+            &Paths::default_dirs().hook_spool(),
+        ));
     }
     // The transcript follower runs inside a tab and starts no Claude, so it
     // has no markers to clear — and no business announcing that it did.
@@ -477,7 +480,7 @@ fn main() -> eframe::Result {
                  giverny update     check for a newer release\n  \
                  giverny transcript [--follow] <agent jsonl>\n                     \
                  print a worker's transcript, readable (and follow it)\n  \
-                 giverny pass plan|start|eta|land|pause|resume|drop|show ...\n                     \
+                 giverny pass plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
                  write the agents pane's feed (see `giverny pass --help`)\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \

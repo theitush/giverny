@@ -117,13 +117,20 @@ impl AgentsLive {
     /// A `SessionStart` in `tab`. `/clear` (`source: "clear"`) starts the
     /// table over, bound to the new session — its old ids are not aliases,
     /// or their finished workers would come back as Done rows on the next
-    /// refresh. Any other start (resume, compact, a new `claude`) keeps the
-    /// rows and records the new id beside the old.
+    /// refresh. So does a start in *another* conversation — `/resume` of an
+    /// older one, whose transcript has a root of its own
+    /// ([`Tracker::continues`]): the table is that conversation's, rebuilt
+    /// from its own `subagents/` on the next refresh, and nothing of what the
+    /// tab ran before (giverny#112). Any other start — the same conversation
+    /// re-id'd (compact, the agents view's switch, coo#198), or one whose
+    /// root cannot be read yet — keeps the rows and records the new id beside
+    /// the old (giverny#105).
     pub fn session_started(&mut self, tab: TabId, source: Option<&str>, session_id: Option<&str>) {
         let Some(tracker) = self.trackers.get_mut(&tab) else {
             return;
         };
-        if source == Some("clear") {
+        let elsewhere = session_id.is_some_and(|sid| tracker.continues(sid) == Some(false));
+        if source == Some("clear") || elsewhere {
             let mut fresh = Tracker::new(tracker.config_dir.clone());
             if let Some(sid) = session_id {
                 fresh.set_session(sid);
@@ -132,6 +139,19 @@ impl AgentsLive {
         } else if let Some(sid) = session_id {
             tracker.set_session(sid);
         }
+        self.dirty = true;
+    }
+
+    /// `giverny pass clear-done` in `tab`: drop its Done rows (and hide the
+    /// feed's that landed by then), keeping what runs. `at_ms` is when the
+    /// command ran, else now.
+    pub fn clear_done(&mut self, tab: TabId, at_ms: Option<u64>) {
+        let now = now_ms();
+        let Some(tracker) = self.trackers.get_mut(&tab) else {
+            return;
+        };
+        let gone = tracker.clear_done(at_ms.unwrap_or(now).min(now));
+        tracing::info!("tab {tab:?}: {gone} Done row(s) cleared from the agents pane");
         self.dirty = true;
     }
 
@@ -164,7 +184,7 @@ impl AgentsLive {
             tabs: self
                 .trackers
                 .iter()
-                .filter(|(_, t)| !t.is_empty())
+                .filter(|(_, t)| t.worth_saving())
                 .map(|(id, t)| (id.0, t.clone()))
                 .collect(),
         };
@@ -287,6 +307,90 @@ mod tests {
         // A session start in a tab with no workers creates nothing.
         live.session_started(TabId(9), Some("clear"), Some("x"));
         assert!(live.tracker(TabId(9)).is_none());
+    }
+
+    /// giverny#112: a tab resumed into A, then B, then A again shows each
+    /// conversation's own finished workers, and nothing of the others'.
+    #[test]
+    fn a_resume_into_another_conversation_shows_only_its_rows() {
+        let config =
+            std::env::temp_dir().join(format!("giverny-agents-live-112-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let proj = config.join("projects/-w");
+        let finished = |sid: &str, root: &str, id: &str| {
+            let subs = proj.join(sid).join("subagents");
+            std::fs::create_dir_all(&subs).unwrap();
+            let note = format!(
+                "<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n</task-notification>"
+            );
+            let lines = [
+                serde_json::json!({"type": "user", "parentUuid": null, "uuid": root}),
+                serde_json::json!({"type": "user", "parentUuid": root, "uuid": format!("{root}-n"),
+                                   "timestamp": "2026-09-27T10:00:00Z",
+                                   "message": {"role": "user", "content": note}}),
+            ];
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            std::fs::write(proj.join(format!("{sid}.jsonl")), text).unwrap();
+            std::fs::write(
+                subs.join(format!("agent-{id}.jsonl")),
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-09-27T09:59:00Z\"}\n",
+            )
+            .unwrap();
+        };
+        finished("A", "root-a", "wa");
+        finished("B", "root-b", "wb");
+        let ids = |live: &AgentsLive| -> Vec<String> {
+            let mut v: Vec<String> = live
+                .tracker(TAB)
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        let mut live = AgentsLive::in_memory();
+        live.apply_live(TAB, Some(config.clone()), &tick_json("A", &["ra"]));
+        live.tick(|_| true);
+        assert_eq!(ids(&live), ["ra", "wa"]);
+
+        live.session_started(TAB, Some("resume"), Some("B"));
+        live.last_refresh -= REFRESH_INTERVAL;
+        live.tick(|_| true);
+        assert_eq!(ids(&live), ["wb"], "B's own history, nothing of A's");
+        assert!(live.tracker(TAB).unwrap().aliases.is_empty());
+
+        live.session_started(TAB, Some("resume"), Some("A"));
+        live.last_refresh -= REFRESH_INTERVAL;
+        live.tick(|_| true);
+        assert_eq!(ids(&live), ["wa"], "back in A: A's again");
+
+        // A session with no root of its own yet (the agents view's switch)
+        // is the same pass: the rows stay and A becomes an alias.
+        std::fs::create_dir_all(proj.join("A2")).unwrap();
+        std::fs::write(proj.join("A2.jsonl"), "{\"type\":\"mode\"}\n").unwrap();
+        live.session_started(TAB, Some("resume"), Some("A2"));
+        assert_eq!(ids(&live), ["wa"]);
+        assert_eq!(live.tracker(TAB).unwrap().aliases, ["A".to_string()]);
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn clear_done_keeps_what_runs() {
+        let mut live = AgentsLive::in_memory();
+        live.apply_live(
+            TAB,
+            Some("/nowhere".into()),
+            &tick_json("s1", &["a1", "a2"]),
+        );
+        live.apply_live(TAB, None, &tick_json("s1", &["a1"]));
+        live.clear_done(TAB, Some(1_790_000_100_000));
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.rows().len(), 1);
+        assert!(t.rows()[0].running());
+        assert_eq!(t.done_cleared_ms, Some(1_790_000_100_000));
+        live.clear_done(TabId(99), None); // no tracker: nothing happens
     }
 
     #[test]

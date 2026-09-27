@@ -18,7 +18,8 @@
 //! - Its `bin/` is on the Bash tool's `PATH`, so `giverny-pass` works in any
 //!   session and in its subagents without Giverny on `PATH`.
 //! - It coexists with a project's own `/orchestrate` skill: plugin skills are
-//!   namespaced.
+//!   namespaced. Its one command, `/giverny:clear-done`, runs
+//!   `giverny-pass clear-done` to clear the agents pane's Done rows.
 //! - Removing the keys unloads it; a missing directory makes Claude Code skip
 //!   it silently.
 //!
@@ -40,6 +41,8 @@ pub const DIR_NAME: &str = "claude-plugin";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SKILL: &str = include_str!("../plugin/skills/orchestrate/SKILL.md");
+/// `/giverny:clear-done`: the agents pane's Done rows, cleared (giverny#112).
+const CLEAR_DONE: &str = include_str!("../plugin/commands/clear-done.md");
 
 /// Where the marketplace lives: `<giverny config base>/claude-plugin`.
 pub fn marketplace_dir(base: &Path) -> PathBuf {
@@ -102,6 +105,11 @@ pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
         (
             "plugins/giverny/skills/orchestrate/SKILL.md",
             SKILL.to_string(),
+            false,
+        ),
+        (
+            "plugins/giverny/commands/clear-done.md",
+            CLEAR_DONE.to_string(),
             false,
         ),
         ("plugins/giverny/bin/giverny-pass", wrapper(exes), true),

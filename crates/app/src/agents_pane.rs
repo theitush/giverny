@@ -732,7 +732,12 @@ pub fn show(
         limit: limit.as_ref(),
         tz: jiff::tz::TimeZone::system(),
     };
-    let table = build_at(view.feed_now.as_ref(), tracker.rows(), now, &clock);
+    // Done rows cleared by hand go from the feed too, whoever wrote it.
+    let cleared = tracker
+        .done_cleared_ms
+        .and_then(|c| view.feed_now.as_ref().map(|f| f.without_done_by(c)));
+    let feed = cleared.as_ref().or(view.feed_now.as_ref());
+    let table = build_at(feed, tracker.rows(), now, &clock);
     if table.is_empty() {
         return (None, None);
     }

@@ -17,6 +17,7 @@ giverny pass eta   <task> <dur left> [--note N]                              # r
 giverny pass land  <task> [--outcome Done|Blocked|…] [--review TEXT] [--note N]  # Done now
 giverny pass pause <task> [--note N]  /  giverny pass resume <task>          # stop / restart its clock
 giverny pass drop  <task>  ·  giverny pass show  ·  giverny pass path  ·  giverny pass clear
+giverny pass clear-done                                                        # clear the Done rows
 ```
 
 - **A task is any short name** (`auth-fix`, `12`). It is the row's `key`. The worker's spawn `description` should name it as a whole word (`auth-fix: fix the refresh race`), which is how the row finds its worker (see **Merge**, rule 3).
@@ -26,6 +27,7 @@ giverny pass drop  <task>  ·  giverny pass show  ·  giverny pass path  ·  giv
 - **`pause`/`resume`** write `paused_since`, then move `started` on by the span and add it to `paused_s`, with the true start kept in `spawned`, as **Schema** describes.
 - **The session** is `--session <id>`, else `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets in every Bash command it runs and a subagent inherits from its dispatcher. So a worker that re-estimates its own row writes into its dispatcher's file.
 - **The file is the state.** Each command reads the feed, changes one row and writes it back atomically, under a lock (`<session>.json.lock`) so a dispatcher and its workers never lose each other's writes. A file whose bytes would not change is not rewritten.
+- **`clear-done` clears the Done rows** (giverny#112): from this session's feed when `giverny pass` wrote it, and from the agents pane of the Giverny tab it runs in, whoever wrote the feed. The pane drops its own Done rows, keeps them from coming back from disk, and hides the feed's Done rows that landed before the clear. Running and Next up rows stay. In a Claude session the plugin's `/giverny:clear-done` runs it.
 - **It never touches another writer's feed.** It marks its files `"writer": "giverny/pass"` and refuses any file whose `writer` names someone else.
 
 ## Where the file goes
@@ -119,7 +121,7 @@ Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"
 
 ## Merge with the live rows
 
-Claude Code reports each live subagent itself (id, name, status, start time, tokens, what it is doing now), and Giverny keeps the ones that finished until the tab's `/clear`. Those are the **live rows**. The feed's rows are joined to them on **`agent_id` = the live row's subagent id**:
+Claude Code reports each live subagent itself (id, name, status, start time, tokens, what it is doing now), and Giverny keeps the ones that finished until the tab's `/clear`, a `giverny pass clear-done`, or a `/resume` into another conversation, which shows that conversation's own workers instead (giverny#112). Those are the **live rows**. The feed's rows are joined to them on **`agent_id` = the live row's subagent id**:
 
 1. **Every feed row is drawn**, in feed order, in the stage the feed gave it. The feed's stage wins over the live one: a worker that holds two tasks may have one Done and one still Running.
 2. **A feed row whose `agent_id` matches a live row carries both.** The feed supplies `key`, `title`, `started`, `eta_s`, `landing`, `brief`, `open`; the live row supplies tokens and the current activity (read from the worker's transcript every second: the context it carries now, the count `orchestrate-status` writes; once the transcript has given one, Claude Code's own `tokenCount` never replaces it, since after an API error that count is the worker's output alone), and its start time where the feed gives none. Where both have a value, the feed's `started` wins (it is per row, and moved on by the row's pauses) and the live row's tokens win.
