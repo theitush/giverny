@@ -11,11 +11,14 @@
 //! Rows are kept until the tab's conversation is cleared (`/clear`, which
 //! Claude Code reports as `SessionStart` with `source: "clear"`) or the tab is
 //! closed, and they are saved to disk so a Giverny restart keeps the Done
-//! rows.
+//! rows. They are part of the tab's session, though: after a restart they are
+//! not shown until that session is back up — its `SessionStart`, or a tick
+//! from it — and they go again when it ends ([`AgentsLive::shown`],
+//! giverny#111).
 //!
 //! [`ClaudeWatch`]: crate::claude_watch::ClaudeWatch
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +33,10 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct AgentsLive {
     trackers: HashMap<TabId, Tracker>,
+    /// Tabs whose Claude session has been heard from in this run and not
+    /// ended since: the ones whose rows are shown. Not saved — a restart
+    /// starts every tab's session over.
+    up: HashSet<TabId>,
     /// Where the trackers are saved; `None` keeps them in memory only.
     path: Option<PathBuf>,
     dirty: bool,
@@ -53,6 +60,7 @@ impl AgentsLive {
             .unwrap_or_default();
         AgentsLive {
             trackers,
+            up: HashSet::new(),
             path: Some(path),
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -65,6 +73,7 @@ impl AgentsLive {
     pub fn in_memory() -> AgentsLive {
         AgentsLive {
             trackers: HashMap::new(),
+            up: HashSet::new(),
             path: None,
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -79,6 +88,19 @@ impl AgentsLive {
     /// [`Tracker::aliases`] name the feed file to merge with it.
     pub fn tracker(&self, tab: TabId) -> Option<&Tracker> {
         self.trackers.get(&tab)
+    }
+
+    /// [`AgentsLive::tracker`], but only while `tab`'s session is up: what
+    /// the pane draws. Rows restored from disk wait for the session they
+    /// belong to, so the pane does not show before it (giverny#111).
+    pub fn shown(&self, tab: TabId) -> Option<&Tracker> {
+        self.tracker(tab).filter(|_| self.up.contains(&tab))
+    }
+
+    /// `tab`'s session ended (`SessionEnd`): its pane goes with it; the rows
+    /// are kept for the next start.
+    pub fn session_ended(&mut self, tab: TabId) {
+        self.up.remove(&tab);
     }
 
     /// The same, for the pane's own edits (a manual clear). Marks the store
@@ -99,6 +121,7 @@ impl AgentsLive {
         event: &serde_json::Value,
     ) {
         let snap = LiveSnapshot::from_value(event);
+        self.up.insert(tab);
         let tracker = self
             .trackers
             .entry(tab)
@@ -120,6 +143,7 @@ impl AgentsLive {
     /// refresh. Any other start (resume, compact, a new `claude`) keeps the
     /// rows and records the new id beside the old.
     pub fn session_started(&mut self, tab: TabId, source: Option<&str>, session_id: Option<&str>) {
+        self.up.insert(tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
             return;
         };
@@ -140,6 +164,7 @@ impl AgentsLive {
     pub fn tick(&mut self, tab_exists: impl Fn(TabId) -> bool) {
         let before = self.trackers.len();
         self.trackers.retain(|id, _| tab_exists(*id));
+        self.up.retain(|id| tab_exists(*id));
         self.dirty |= self.trackers.len() != before;
 
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -287,6 +312,30 @@ mod tests {
         // A session start in a tab with no workers creates nothing.
         live.session_started(TabId(9), Some("clear"), Some("x"));
         assert!(live.tracker(TabId(9)).is_none());
+    }
+
+    /// giverny#111: rows restored from disk are the session's; the pane
+    /// waits for that session, and goes when it ends.
+    #[test]
+    fn restored_rows_wait_for_their_session() {
+        let path = scratch_dir().join("shown").join("agents.json");
+        let mut live = AgentsLive::load(path.clone());
+        live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
+        assert!(live.shown(TAB).is_some(), "a tick is its session, up");
+        live.save();
+
+        let mut back = AgentsLive::load(path.clone());
+        assert!(back.tracker(TAB).is_some(), "the rows came back");
+        assert!(back.shown(TAB).is_none(), "but not before the session");
+        back.session_started(TAB, Some("resume"), Some("s2"));
+        assert_eq!(back.shown(TAB).map(|t| t.rows().len()), Some(1));
+
+        back.session_ended(TAB);
+        assert!(back.shown(TAB).is_none(), "gone with the session");
+        assert!(back.tracker(TAB).is_some(), "rows kept for the next start");
+        back.apply_live(TAB, None, &tick_json("s2", &["a1"]));
+        assert!(back.shown(TAB).is_some(), "a tick brings it back");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
