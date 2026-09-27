@@ -42,6 +42,10 @@ smithay-clipboard = "0.7.3"
 # process tries it on a windowless EGL context first. The version and feature
 # wgpu's GL backend already uses, so no new tree.
 khronos-egl = { version = "6", features = ["dynamic"] }
+# Sizing WSLg's cursors to the display (src/wslg_cursor.rs), through the
+# libX11/libXcursor winit already loads. The version winit uses, so no new
+# tree.
+x11-dl = "2.21"
 
 # Shutting down on a signal, so a logout or a `kill` gets the same
 # scrollback-and-state write that closing the window does.
