@@ -9,8 +9,8 @@
 //! them through [`AgentsLive::tracker`]; nothing here draws anything.
 //!
 //! Rows are kept until the tab's conversation is cleared (`/clear`, which
-//! Claude Code reports as `SessionStart` with `source: "clear"`) or the tab is
-//! closed, and they are saved to disk so a Giverny restart keeps the Done
+//! Claude Code reports as `SessionStart` with `source: "clear"`), a fresh
+//! `claude` starts in it (`source: "startup"`), or the tab is closed, and they are saved to disk so a Giverny restart keeps the Done
 //! rows. They are part of the tab's session, though: after a restart they are
 //! not shown until that session is back up — its `SessionStart`, or a tick
 //! from it — and they go again when it ends ([`AgentsLive::shown`],
@@ -140,21 +140,31 @@ impl AgentsLive {
     /// A `SessionStart` in `tab`. `/clear` (`source: "clear"`) starts the
     /// table over, bound to the new session — its old ids are not aliases,
     /// or their finished workers would come back as Done rows on the next
-    /// refresh. So does a start in *another* conversation — `/resume` of an
-    /// older one, whose transcript has a root of its own
+    /// refresh. So does a fresh `claude` (`source: "startup"`), whose
+    /// conversation has no transcript yet to compare roots with
+    /// (giverny#117), and a start in *another* conversation — `/resume` of
+    /// an older one, whose transcript has a root of its own
     /// ([`Tracker::continues`]): the table is that conversation's, rebuilt
     /// from its own `subagents/` on the next refresh, and nothing of what the
     /// tab ran before (giverny#112). Any other start — the same conversation
-    /// re-id'd (compact, the agents view's switch, coo#198), or one whose
-    /// root cannot be read yet — keeps the rows and records the new id beside
-    /// the old (giverny#105).
+    /// re-id'd (`compact`, or `fork`/`resume` for the agents view's switch
+    /// and the move into a background host, coo#198), or one whose root
+    /// cannot be read yet — keeps the rows and records the new id beside the
+    /// old (giverny#105).
+    ///
+    /// `startup` is safe to take as new because Claude Code (2.1.283) raises
+    /// it only where no conversation is carried in: a launch without
+    /// `--resume`/`--continue`, and the claim of a spare that has not run a
+    /// turn. Every path that loads an existing conversation raises `resume`,
+    /// or `fork` when the id changes — the switch recorded in real
+    /// transcripts as `SessionStart:fork` (giverny#117).
     pub fn session_started(&mut self, tab: TabId, source: Option<&str>, session_id: Option<&str>) {
         self.up.insert(tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
             return;
         };
         let elsewhere = session_id.is_some_and(|sid| tracker.continues(sid) == Some(false));
-        if source == Some("clear") || elsewhere {
+        if matches!(source, Some("clear" | "startup")) || elsewhere {
             let mut fresh = Tracker::new(tracker.config_dir.clone());
             if let Some(sid) = session_id {
                 fresh.set_session(sid);
@@ -284,8 +294,11 @@ mod tests {
         })
     }
 
-    fn scratch_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("giverny-agents-live-{}", std::process::id()));
+    /// A directory of the test's own: tests run in parallel, and one that
+    /// removed another's directory mid-save made the restart tests flaky.
+    fn scratch_dir(test: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("giverny-agents-live-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -332,6 +345,34 @@ mod tests {
         // A session start in a tab with no workers creates nothing.
         live.session_started(TabId(9), Some("clear"), Some("x"));
         assert!(live.tracker(TabId(9)).is_none());
+    }
+
+    /// giverny#117: quitting claude and starting a fresh one in the tab
+    /// empties the pane, though the new transcript is not on disk yet; a
+    /// re-id of the same conversation (`fork`, `resume`, `compact`, no root
+    /// to compare) keeps the rows, as #105 needs.
+    #[test]
+    fn a_fresh_claude_starts_over_and_a_re_id_does_not() {
+        let mut live = AgentsLive::in_memory();
+        live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
+        live.apply_live(TAB, None, &tick_json("s1", &[]));
+        assert_eq!(live.tracker(TAB).unwrap().rows().len(), 1, "a Done row");
+
+        for (source, sid) in [("fork", "s2"), ("resume", "s3"), ("compact", "s4")] {
+            live.session_started(TAB, Some(source), Some(sid));
+            let t = live.tracker(TAB).unwrap();
+            assert_eq!(t.rows().len(), 1, "{source} keeps the rows");
+            assert_eq!(t.session_id.as_deref(), Some(sid));
+        }
+        assert_eq!(live.tracker(TAB).unwrap().aliases, ["s1", "s2", "s3"]);
+
+        live.session_ended(TAB);
+        live.session_started(TAB, Some("startup"), Some("n1"));
+        let t = live.shown(TAB).expect("the new session is up");
+        assert!(t.is_empty(), "a fresh claude shows an empty pane");
+        assert_eq!(t.session_id.as_deref(), Some("n1"));
+        assert!(t.aliases.is_empty(), "and none of the old ids");
+        assert_eq!(t.config_dir.as_deref(), Some(Path::new("/nowhere")));
     }
 
     /// giverny#112: a tab resumed into A, then B, then A again shows each
@@ -398,6 +439,17 @@ mod tests {
         live.session_started(TAB, Some("resume"), Some("A2"));
         assert_eq!(ids(&live), ["wa"]);
         assert_eq!(live.tracker(TAB).unwrap().aliases, ["A".to_string()]);
+
+        // giverny#117: a plain `claude` (startup, nothing on disk yet) is
+        // empty; `/resume` from there back into A brings A's rows back
+        // from disk. Claude Code sends startup, then resume, in that order.
+        live.session_ended(TAB);
+        live.session_started(TAB, Some("startup"), Some("N"));
+        assert!(ids(&live).is_empty(), "a fresh claude starts empty");
+        live.session_started(TAB, Some("resume"), Some("A"));
+        live.last_refresh -= REFRESH_INTERVAL;
+        live.tick(|_| true);
+        assert_eq!(ids(&live), ["wa"], "resumed into A: A's rows again");
         let _ = std::fs::remove_dir_all(&config);
     }
 
@@ -422,7 +474,7 @@ mod tests {
     /// waits for that session, and goes when it ends.
     #[test]
     fn restored_rows_wait_for_their_session() {
-        let path = scratch_dir().join("shown").join("agents.json");
+        let path = scratch_dir("shown").join("agents.json");
         let mut live = AgentsLive::load(path.clone());
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
         assert!(live.shown(TAB).is_some(), "a tick is its session, up");
@@ -454,7 +506,7 @@ mod tests {
 
     #[test]
     fn rows_survive_a_restart() {
-        let path = scratch_dir().join("agents.json");
+        let path = scratch_dir("restart").join("agents.json");
         let mut live = AgentsLive::load(path.clone());
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
         live.apply_live(TAB, None, &tick_json("s1", &[]));
