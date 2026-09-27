@@ -398,8 +398,10 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
         note: &[
             "Running and Done come from Claude Code's own files and need no",
-            "setup. An orchestrator can add Planned rows, titles, ETAs and",
-            "landings by writing a feed file (docs/agents-pane.md).",
+            "setup. On, it also installs the giverny Claude Code plugin:",
+            "/giverny:orchestrate runs a pass of subagents and adds Planned",
+            "rows, titles, ETAs and landings (docs/agents-pane.md). Off",
+            "removes the plugin again.",
             "Done rows stay until /clear. The pane appears only in a tab whose",
             "session has spawned a subagent; off, nothing is read or drawn.",
         ],

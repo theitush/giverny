@@ -6,6 +6,10 @@
 //! row's key names the issue (`giverny#60`, or `owner/repo#60`); the body is
 //! one REST read through `gh`, made off the UI thread, and a row whose issue
 //! has no such line (or no issue, or no `gh`) opens exactly as before.
+//!
+//! A feed row may carry the line itself (`review`, giverny#101): then that
+//! text is shown and `gh` is never run, which is how a pass with no GitHub
+//! behind it gets the same box.
 
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -60,6 +64,12 @@ pub fn review_line(body: &str) -> Option<String> {
 
 /// Where a fetched Review line lands; the overlay reads it every frame.
 pub type Slot = Arc<Mutex<Option<String>>>;
+
+/// A slot already holding `text`: the feed row carried its own Review line,
+/// so nothing is fetched.
+pub fn ready(text: &str) -> Slot {
+    Arc::new(Mutex::new(Some(text.trim().to_string())))
+}
 
 /// Fetch `issue`'s Review line on a thread; it appears in the returned slot
 /// (and a repaint is asked for) if there is one.

@@ -1126,6 +1126,7 @@ mod tests {
                 open: None,
                 brief: None,
                 note: None,
+                review: None,
                 facts: vec![],
             }),
         };

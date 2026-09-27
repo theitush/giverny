@@ -2,7 +2,31 @@
 
 The agents pane is a table under a tab's terminal listing that tab's Claude Code subagents: **Running**, **Planned** and **Done**. It works with no setup — Running and Done come from Claude Code's own data. An orchestrator that knows more (which task each worker holds, what is queued next, when each is due to land, who reviews it) can add that by writing a **feed**: one JSON file per Claude session, described here.
 
+Giverny ships that orchestrator itself. With `claude.agents_pane` on, every Claude session gets a `/giverny:orchestrate` skill (see **The orchestrator plugin**) and a `giverny-pass` command that writes the feed, so Running, Next up with ETAs, and Done need nothing but Giverny and Claude Code: no issue tracker, no `gh`, no scripts of your own. Any other writer that follows this page works the same way, next to it.
+
 This document is the whole contract for writing a feed. The reader is `crates/claude/src/feed.rs`; anything this page promises, that module's tests pin.
+
+## Writing it with `giverny pass`
+
+`giverny pass` is the feed writer that comes with Giverny. The plugin puts it on the Bash tool's `PATH` as `giverny-pass`, so a session and its subagents can run it without Giverny being on `PATH`.
+
+```
+giverny pass plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE]   # a Next up row
+giverny pass start <task> [--eta <dur>] [--title T] [--agent <id>]           # Running from now
+giverny pass eta   <task> <dur left> [--note N]                              # re-estimate from now
+giverny pass land  <task> [--outcome Done|Blocked|…] [--review TEXT] [--note N]  # Done now
+giverny pass pause <task> [--note N]  /  giverny pass resume <task>          # stop / restart its clock
+giverny pass drop  <task>  ·  giverny pass show  ·  giverny pass path  ·  giverny pass clear
+```
+
+- **A task is any short name** (`auth-fix`, `12`). It is the row's `key`. The worker's spawn `description` should name it as a whole word (`auth-fix: fix the refresh race`), which is how the row finds its worker (see **Merge**, rule 3).
+- **Every time is measured.** `start` stamps `started`, `land` stamps `ended`, both from the machine's clock when the command runs. `<dur>` is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
+- **`eta` takes the time left**, not a total. On a Running row it sets `eta_s` to the time worked so far plus that, so the pane's countdown shows it; the first estimate is kept as `eta_first_s`. On a Planned row it is the new estimate.
+- **`land --review "<who> — <what> — <where>"`** writes the row's `review` line and a `landing` of `Review — <who>`. `--outcome` sets the landing word; `--note` is added after it.
+- **`pause`/`resume`** write `paused_since`, then move `started` on by the span and add it to `paused_s`, with the true start kept in `spawned`, as **Schema** describes.
+- **The session** is `--session <id>`, else `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets in every Bash command it runs and a subagent inherits from its dispatcher. So a worker that re-estimates its own row writes into its dispatcher's file.
+- **The file is the state.** Each command reads the feed, changes one row and writes it back atomically, under a lock (`<session>.json.lock`) so a dispatcher and its workers never lose each other's writes. A file whose bytes would not change is not rewritten.
+- **It never touches another writer's feed.** It marks its files `"writer": "giverny/pass"` and refuses any file whose `writer` names someone else.
 
 ## Where the file goes
 
@@ -89,6 +113,7 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `brief` | string (absolute path) | no | A file shown read-only when a **Planned** row is clicked. |
 | `open` | string (shell command) | no | Run in a new tab when a **Running** or **Done** row is clicked, in place of Giverny's own transcript view (`giverny transcript --follow <agent jsonl>`) — e.g. `claude --resume <id>`. A command that resumes a conversation something is already running is not run: Giverny switches to the tab holding it, or says so. |
 | `note` | string | no | Free text; shown for a Planned row with no `brief`, and as a tooltip otherwise. |
+| `review` | string | no | Done rows: the one line a person has to read before the row counts (`<who> — <what> — <where>`). It is shown at the top of the row's overlay, verbatim, and nothing is fetched. See **The Review line**. |
 
 Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"`) is read, a fractional number is truncated, a negative `eta_s` or `tokens` reads as absent. `null` is the same as leaving the field out.
 
@@ -122,6 +147,36 @@ A Done row has nothing left to estimate, so its ETA cell says how the landing co
 
 Durations everywhere in the pane are written the way the ETA column writes them: whole minutes (rounded), units that are zero left out — `5m`, `1h3m`, `1h`, `1d3h12m` — with `~` in front of an estimate and none on a measured span.
 
+## The Review line
+
+When a **Done** row is clicked, the top of its overlay can carry one line saying what a person has to look at before the work counts.
+
+- **The row's `review` field** is that line. It is shown as written. This is what `giverny pass land --review` writes, and it needs nothing else.
+- **Without one, a `key` naming a GitHub issue** (`repo#12` or `owner/repo#12`) has the line read from the issue: one REST call through `gh` (`gh api repos/<owner>/<repo>/issues/<n>`), off the UI thread, taking the body's first `**Review:**` line above its first `---`. This only works where `gh` is installed and logged in. Where it is not, or the issue has no such line, the overlay opens without it.
+
+## The orchestrator plugin
+
+With `claude.agents_pane` on, Giverny carries a Claude Code plugin, `giverny`, whose one skill is `orchestrate`. Invoke it as `/giverny:orchestrate`. It is a generic dispatcher. It plans the tasks with estimates (`giverny-pass plan`), spawns one subagent per task with the task's name in the spawn description, stamps `start` and `land`, and has each worker re-estimate its own row. It does not rely on an issue tracker. It sits beside a project's own `/orchestrate` skill, if the project has one, because plugin skills are namespaced.
+
+**How it is installed** (verified against Claude Code 2.1.283):
+
+- The plugin is written as a local **directory marketplace** at `<config dir>/giverny/claude-plugin/` (next to `feeds/`). Its files are the marketplace manifest, the plugin manifest, `skills/orchestrate/SKILL.md`, and `bin/giverny-pass`, a small `sh` wrapper that runs `<this giverny binary> pass`. Only files whose bytes changed are rewritten, and it happens at each start with the pane on, so a moved or upgraded binary is picked up.
+- Each account's `settings.json` gets two keys:
+  ```json
+  "extraKnownMarketplaces": { "giverny": { "source": { "source": "directory", "path": "<config dir>/giverny/claude-plugin" } } },
+  "enabledPlugins": { "giverny@giverny": true }
+  ```
+  That is all Claude Code needs. There is no `claude plugin install` and no network. A directory marketplace is loaded straight from its directory at session start, not from a cache, so the next session runs what this binary wrote. The plugin's version is Giverny's own, so a Giverny upgrade updates the plugin. Sessions that were already running keep the skill they started with.
+- `bin/` of an enabled plugin is on the `PATH` of the Bash tool, in the session and in its subagents, which is how `giverny-pass` is found.
+
+**The house rules**, the same ones `subagentStatusLine` follows:
+
+- **Opt-in.** Nothing is written until the pane is turned on.
+- **Never over someone else's.** A marketplace called `giverny` that does not point at a `giverny/claude-plugin` directory is left alone. The plugin is then not installed on that account, and the settings log says so.
+- **A user's `disable` stands.** If `enabledPlugins["giverny@giverny"]` is already `false` (`claude plugin disable`), it stays `false`.
+- **Removed when the pane goes off.** Both keys go, and a map we emptied goes with them. Claude Code's own record of the marketplace (`plugins/known_marketplaces.json`) loses its `giverny` entry, as `claude plugin marketplace remove` would do. The `claude-plugin` directory is deleted. `uninstall_from` takes the keys too.
+- **A no-op writes nothing.** If Giverny is deleted without turning the pane off, Claude Code finds the directory missing and skips the plugin silently.
+
 ## Where the live rows come from: the relay
 
 With `claude.agents_pane` on, Giverny installs one key into each account's `settings.json`:
@@ -145,6 +200,8 @@ Claude Code runs that command at least every five seconds while a session has li
 - The only things that make Giverny ignore a whole file are: it is not JSON, it is not a JSON object, or its `version` is too new. Anything smaller costs that field (a wrong type reads as absent) or that row (no usable `stage`, or neither `key` nor `agent_id`).
 
 ## Checklist for a writer
+
+(`giverny pass` does all of this. The list is for writers of your own.)
 
 - [ ] Path: `${GIVERNY_FEED_DIR:-<config>/giverny/feeds}/<parent session id>.json`, directory created if missing.
 - [ ] Write to a non-`.json` temp name in the same directory, then rename.

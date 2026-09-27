@@ -107,6 +107,11 @@ pub struct FeedRow {
     pub brief: Option<PathBuf>,
     pub open: Option<String>,
     pub note: Option<String>,
+    /// What a person has to look at before a Done row counts
+    /// (`<who> — <what> — <where>`): the top line of the row's overlay. With
+    /// it, nothing is fetched; without it, a key naming a GitHub issue has
+    /// the line read from the issue where `gh` works (giverny#60, #101).
+    pub review: Option<String>,
 }
 
 impl FeedRow {
@@ -235,6 +240,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         brief: str_field(v, "brief").map(PathBuf::from),
         open: str_field(v, "open"),
         note: str_field(v, "note"),
+        review: str_field(v, "review"),
     })
 }
 

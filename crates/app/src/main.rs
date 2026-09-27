@@ -381,6 +381,14 @@ fn scrub_inherited_claude_markers() {
 }
 
 fn main() -> eframe::Result {
+    // The agents pane's feed writer: what the `giverny` plugin's orchestrate
+    // skill runs (as `giverny-pass`) to plan, start, re-estimate and land a
+    // pass's tasks. It runs inside Claude Code and reads the session id Claude
+    // exported, so it goes before the markers are scrubbed.
+    if std::env::args().nth(1).as_deref() == Some("pass") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(giverny_claude::pass::main(&args));
+    }
     // The transcript follower runs inside a tab and starts no Claude, so it
     // has no markers to clear — and no business announcing that it did.
     if std::env::args().nth(1).as_deref() != Some("transcript") {
@@ -469,6 +477,8 @@ fn main() -> eframe::Result {
                  giverny update     check for a newer release\n  \
                  giverny transcript [--follow] <agent jsonl>\n                     \
                  print a worker's transcript, readable (and follow it)\n  \
+                 giverny pass plan|start|eta|land|pause|resume|drop|show ...\n                     \
+                 write the agents pane's feed (see `giverny pass --help`)\n  \
                  giverny install-desktop [--remove]\n                     \
                  install the desktop entry + icons (needed for the\n                     \
                  taskbar icon on Wayland)\n  \
@@ -1499,7 +1509,8 @@ impl App {
         if app.cfg.claude.auto_mode {
             app.claude.ensure_auto_mode();
         }
-        app.claude.set_agents_pane(agents_pane_on(&app.cfg));
+        app.claude
+            .set_agents_pane(agents_pane_on(&app.cfg), app.paths.base());
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -2502,7 +2513,8 @@ impl App {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
         if agents_pane_on(&cfg) != agents_pane_on(&self.cfg) {
-            self.claude.set_agents_pane(agents_pane_on(&cfg));
+            self.claude
+                .set_agents_pane(agents_pane_on(&cfg), self.paths.base());
         }
         self.cfg = cfg;
         tracing::info!("config reloaded");
@@ -3059,11 +3071,15 @@ impl App {
         let plan = agent_open::plan(click);
         let button = self.overlay_button(parent, click);
         // A Done row's task may have landed in Review: its Review line goes
-        // at the top of the overlay, fetched off the UI thread (giverny#60).
+        // at the top of the overlay. The feed's own `review` text is used as
+        // is; else a key naming a GitHub issue has it fetched through `gh`
+        // off the UI thread (giverny#60, #101).
         let review = (click.stage == giverny_claude::feed::Stage::Done)
-            .then(|| review::issue_of(&click.key))
-            .flatten()
-            .map(|issue| review::fetch(issue, ctx.clone()));
+            .then(|| match &click.review {
+                Some(text) => Some(review::ready(text)),
+                None => review::issue_of(&click.key).map(|issue| review::fetch(issue, ctx.clone())),
+            })
+            .flatten();
         self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
     }
 
