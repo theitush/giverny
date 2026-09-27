@@ -679,6 +679,13 @@ pub enum Tick {
 pub const KEY_GAP: Duration = Duration::from_millis(40);
 /// How long a key's effect is waited for before the screen is read afresh.
 pub const SETTLE: Duration = Duration::from_millis(700);
+/// How long a worker's view must hold still, prompt drawn but cursor not in
+/// it, before the walk takes the footer's shells pill to have the focus.
+/// Claude Code draws the frame and puts its cursor back in one write, so
+/// this only has to outlast a frame split across reads; the full [`SETTLE`]
+/// here cost every open ~0.7 s whenever a background shell was running
+/// (giverny#108).
+pub const FOCUS_CALM: Duration = Duration::from_millis(150);
 /// The whole attach, start to finish.
 pub const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -949,6 +956,25 @@ enum Phase {
 /// What was on screen when the last key went.
 type Seen = (View, Option<PromptBox>, Option<usize>);
 
+/// What the focus walk waits to hold still: the view, the prompt box's
+/// label and draft, and the cursor's row within the box — not where on
+/// screen the box is, which moves when the relay hides the strip's rows
+/// under it and says nothing about the focus (giverny#108).
+type Held = (View, Option<(Option<String>, bool)>, Option<isize>);
+
+fn held(seen: &Seen) -> Held {
+    let (view, prompt, cursor) = seen;
+    let at = |c: usize| {
+        let top = prompt.as_ref().map_or(0, |p| p.rows.start);
+        c as isize - top as isize
+    };
+    (
+        view.clone(),
+        prompt.as_ref().map(|p| (p.label.clone(), p.draft)),
+        cursor.map(at),
+    )
+}
+
 /// Moves a tab's Claude Code between the main view and a worker's view
 /// through the agent strip (giverny#23, #75): wait for the strip, step to
 /// the row with [`Attach`], Enter, check the view that opened, then put the
@@ -967,8 +993,10 @@ pub struct Walk {
     /// until it changes, or `SETTLE` passes.
     hold: Option<(Instant, Seen)>,
     /// The screen, and since when it has looked like that.
-    calm: Option<(Instant, Seen)>,
+    calm: Option<(Instant, Held)>,
     ups: u8,
+    /// In the worker's view with the focus off the strip: its rows may go.
+    off_strip: bool,
     deadline: Instant,
 }
 
@@ -1008,6 +1036,7 @@ impl Walk {
             hold: None,
             calm: None,
             ups: 0,
+            off_strip: false,
             deadline: now + WALK_DEADLINE,
         }
     }
@@ -1020,13 +1049,15 @@ impl Walk {
         }
     }
 
-    /// Whether the walk needs Claude Code's strip drawn: all the way into
-    /// a worker's view, focus and all — the strip's rows going away under
-    /// a focused strip would move its selection (giverny#82). Going home
+    /// Whether the walk needs Claude Code's strip drawn: into a worker's
+    /// view until the focus is off the strip — its rows going away under a
+    /// focused strip would move its selection (giverny#82). From there the
+    /// relay can hide them again while the focus walk finishes, so its
+    /// answer is not waited for only after it (giverny#108). Going home
     /// needs no help: a worker's view keeps `main` on the strip whatever
     /// the relay hides.
     pub fn wants_strip(&self) -> bool {
-        matches!(self.goal, Goal::Worker { .. })
+        matches!(self.goal, Goal::Worker { .. }) && !self.off_strip
     }
 
     /// The phase the walk is in, for the timing log (giverny#108).
@@ -1040,9 +1071,10 @@ impl Walk {
         }
     }
 
-    /// Whether the walk is waiting on the strip to come up.
-    pub fn waiting_for_strip(&self) -> bool {
-        matches!(self.phase, Phase::Start | Phase::Strip)
+    /// Whether the walk is still on its way to the goal's Enter: waiting
+    /// for the strip, or stepping along it.
+    pub fn entering(&self) -> bool {
+        matches!(self.phase, Phase::Start | Phase::Strip | Phase::Attach(_))
     }
 
     fn go(&mut self, phase: Phase, now: Instant) {
@@ -1148,12 +1180,13 @@ impl Walk {
             }
             Phase::Focus { pill_up } => {
                 let pill_up = *pill_up;
-                // The screen held still for SETTLE: a key's effect has
-                // landed, cursor and all.
+                // The screen held still: a key's effect has landed, cursor
+                // and all.
+                let still = held(&seen);
                 let calm = match &self.calm {
-                    Some((since, before)) if *before == seen => now >= *since + SETTLE,
+                    Some((since, before)) if *before == still => now >= *since + FOCUS_CALM,
                     _ => {
-                        self.calm = Some((now, seen.clone()));
+                        self.calm = Some((now, still));
                         false
                     }
                 };
@@ -1164,6 +1197,10 @@ impl Walk {
                     View::Strip(_) if self.ups < MAX_UPS => {
                         self.ups += 1;
                         self.key(cc_keys::PREVIOUS, seen, now)
+                    }
+                    View::Prompt { .. } if !self.off_strip && viewing_worker(screen) => {
+                        self.off_strip = true;
+                        self.tick(now, look)
                     }
                     View::Prompt { .. } if prompt_focused(screen, look.cursor) => Tick::Done,
                     // The prompt is drawn but has not got the cursor, and
@@ -1245,10 +1282,20 @@ impl Settle {
 /// How long the pty is left one column narrow: long enough for Claude Code
 /// to take the new width in before the real one comes back.
 pub const NUDGE_NARROW: Duration = Duration::from_millis(90);
-/// How long after a nudge the next is sent, while still waited on.
-pub const NUDGE_AGAIN: Duration = Duration::from_millis(1500);
+/// How long after a nudge the next is sent, while still waited on. Claude
+/// Code answers a nudge about 0.4 s after the width comes back; one sent
+/// while its relay run is in flight throws that run's answer away, so the
+/// next waits well past it (giverny#108).
+pub const NUDGE_AGAIN: Duration = Duration::from_millis(800);
+/// The longest a [`Nudge::ask_held`] keeps the pty narrow waiting for the
+/// answer: long enough that it never cuts off a relay run in flight.
+pub const NUDGE_HOLD: Duration = Duration::from_millis(1200);
 /// The most nudges one wait sends; after that the relay's own tick.
-const NUDGE_MAX: u8 = 3;
+const NUDGE_MAX: u8 = 5;
+/// Claude Code runs the relay this long after the last width change
+/// (`subagentStatusLine`'s 300 ms), less a little for the relay to start
+/// and read the ask: a new ask made before then is answered by that run.
+const CC_TICK_AFTER_RESIZE: Duration = Duration::from_millis(280);
 
 /// What a [`Nudge`] wants done to the pty's width this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1263,24 +1310,55 @@ pub enum Width {
 /// makes the relay's answer to a new strip ask land within about half a
 /// second instead of up to five. The pty alone is narrowed, never the grid,
 /// and only while the tab's picture is held, so nothing of it is seen.
+///
+/// Claude Code's timer starts over at every width change, so the answer
+/// comes about 300 ms after the *last* one. [`Nudge::ask_held`] leaves the
+/// pty narrow until the answer is on screen, which starts that timer at the
+/// narrowing rather than at the restore; it is for a wait whose screens are
+/// read but never shown as final (the strip on the way in), since Claude
+/// Code draws them one column short until the width is back.
 #[derive(Debug, Clone, Default)]
 pub struct Nudge {
     narrowed: Option<Instant>,
     last: Option<Instant>,
     sent: u8,
+    /// Keep the pty narrow until the answer is in ([`Nudge::ask_held`]).
+    held: bool,
 }
 
 impl Nudge {
-    /// Start over: a new ask for the relay to answer.
-    pub fn ask(&mut self) {
+    /// Start over: a new ask for the relay to answer. When the last nudge
+    /// came back so recently that Claude Code's run is still to come, that
+    /// run answers it, and nudging now would only put it off: the next
+    /// nudge waits its usual [`NUDGE_AGAIN`] after that one.
+    pub fn ask(&mut self, now: Instant) {
+        if self
+            .last
+            .is_some_and(|back| now >= back + CC_TICK_AFTER_RESIZE)
+        {
+            self.last = None;
+        }
+        self.sent = 0;
+        self.held = false;
+    }
+
+    /// Start over, keeping the pty narrow until the answer is on screen
+    /// (or [`NUDGE_HOLD`] passes).
+    pub fn ask_held(&mut self) {
         self.last = None;
         self.sent = 0;
+        self.held = true;
     }
 
     /// One frame. `waiting`: the relay's answer is still not on screen.
     pub fn tick(&mut self, now: Instant, waiting: bool) -> Option<Width> {
         if let Some(at) = self.narrowed {
-            if now >= at + NUDGE_NARROW {
+            let back = if self.held {
+                !waiting || now >= at + NUDGE_HOLD
+            } else {
+                now >= at + NUDGE_NARROW
+            };
+            if back {
                 self.narrowed = None;
                 self.last = Some(now);
                 return Some(Width::Restore);
@@ -2182,9 +2260,54 @@ mod tests {
         });
         assert_eq!(done, Tick::Done);
         assert_eq!(fake.view, 1, "on eta worker's view");
-        assert!(w.wants_strip(), "held until the walk is done with it");
-        assert!(!w.waiting_for_strip());
+        assert!(!w.wants_strip(), "let go once the focus is off the strip");
+        assert!(!w.entering());
         assert_clean(&fake);
+    }
+
+    #[test]
+    fn the_strip_goes_as_soon_as_the_focus_is_off_it_and_the_pill_costs_no_settle() {
+        // The relay answers every ask at once, both ways: the rows go the
+        // frame the walk lets them, and nothing is typed into a strip
+        // that is going away (giverny#108).
+        for shells in [true, false] {
+            let mut fake = Fake::new();
+            fake.shells = shells;
+            fake.tagged = true;
+            let mut w = open_eta().by_id(fake_id(1));
+            let start = Instant::now();
+            let mut t = start;
+            let done = loop {
+                fake.asked = w.wants_strip();
+                let (screen, undimmed, cursor) = fake.look();
+                let look = Look {
+                    screen: &screen,
+                    undimmed: &undimmed,
+                    cursor,
+                };
+                match w.tick(t, look) {
+                    Tick::Send(k) => {
+                        assert!(
+                            !(k == Keystroke::Up
+                                && !w.wants_strip()
+                                && fake.focus == Focus::Prompt),
+                            "an ↑ went to the prompt"
+                        );
+                        fake.key(k);
+                    }
+                    Tick::Wait => {}
+                    other => break other,
+                }
+                t += Duration::from_millis(20);
+                assert!(t - start < Duration::from_secs(20), "the walk never ended");
+            };
+            assert_eq!(done, Tick::Done, "shells: {shells}");
+            assert_eq!(fake.view, 1);
+            assert_clean(&fake);
+            assert!(!w.wants_strip());
+            // The shells pill is left after FOCUS_CALM, not a full SETTLE.
+            assert!(t - start < SETTLE, "shells: {shells}: took {:?}", t - start);
+        }
     }
 
     #[test]
@@ -2227,7 +2350,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nudge_narrows_then_restores_and_gives_up_after_three() {
+    fn a_nudge_narrows_then_restores_and_gives_up_after_nudge_max() {
         let t = Instant::now();
         let mut n = Nudge::default();
         assert_eq!(n.tick(t, false), None, "nothing waited on");
@@ -2240,20 +2363,66 @@ mod tests {
         // Still waited on: again, but not at once.
         assert_eq!(n.tick(back + NUDGE_AGAIN / 2, true), None);
         let mut at = back + NUDGE_AGAIN;
-        assert_eq!(n.tick(at, true), Some(Width::Narrow));
-        at += NUDGE_NARROW;
-        assert_eq!(n.tick(at, true), Some(Width::Restore));
-        at += NUDGE_AGAIN;
-        assert_eq!(n.tick(at, true), Some(Width::Narrow));
-        at += NUDGE_NARROW;
-        assert_eq!(n.tick(at, true), Some(Width::Restore));
-        at += NUDGE_AGAIN;
-        assert_eq!(n.tick(at, true), None, "three is the most");
+        for _ in 1..NUDGE_MAX {
+            assert_eq!(n.tick(at, true), Some(Width::Narrow));
+            at += NUDGE_NARROW;
+            assert_eq!(n.tick(at, true), Some(Width::Restore));
+            at += NUDGE_AGAIN;
+        }
+        assert_eq!(n.tick(at, true), None, "NUDGE_MAX is the most");
         // A new ask starts over.
-        n.ask();
+        n.ask(at);
         assert_eq!(n.tick(at, true), Some(Width::Narrow));
         // A narrow pty always comes back, waited on or not.
         assert_eq!(n.tick(at + NUDGE_NARROW, false), Some(Width::Restore));
+    }
+
+    #[test]
+    fn a_held_nudge_stays_narrow_until_the_answer_is_in() {
+        let t = Instant::now();
+        let mut n = Nudge::default();
+        n.ask_held();
+        assert_eq!(n.tick(t, true), Some(Width::Narrow));
+        assert_eq!(n.tick(t + NUDGE_NARROW * 3, true), None, "still narrow");
+        let answer = t + Duration::from_millis(350);
+        assert_eq!(n.tick(answer, false), Some(Width::Restore));
+        assert!(!n.is_narrow());
+        // No answer at all: it comes back after NUDGE_HOLD, and tries again.
+        n.ask_held();
+        assert_eq!(n.tick(t, true), Some(Width::Narrow));
+        assert_eq!(n.tick(t + NUDGE_HOLD, true), Some(Width::Restore));
+        let again = t + NUDGE_HOLD + NUDGE_AGAIN;
+        assert_eq!(n.tick(again, true), Some(Width::Narrow));
+        // A plain ask is back to the short narrowing.
+        n.ask(again);
+        assert_eq!(n.tick(again + NUDGE_NARROW, true), Some(Width::Restore));
+    }
+
+    #[test]
+    fn an_ask_right_after_a_nudge_is_left_to_the_run_already_coming() {
+        let t = Instant::now();
+        let mut n = Nudge::default();
+        n.ask_held();
+        assert_eq!(n.tick(t, true), Some(Width::Narrow));
+        let back = t + Duration::from_millis(340);
+        assert_eq!(n.tick(back, false), Some(Width::Restore));
+        // Asked again 0.2 s later: Claude Code's run after that restore
+        // has not happened yet, and will read the new ask.
+        let soon = back + Duration::from_millis(200);
+        n.ask(soon);
+        assert_eq!(n.tick(soon, true), None);
+        assert_eq!(
+            n.tick(back + NUDGE_AGAIN, true),
+            Some(Width::Narrow),
+            "unless it misses"
+        );
+        // Asked once that run is past: nudged at once.
+        let mut m = Nudge::default();
+        assert_eq!(m.tick(t, true), Some(Width::Narrow));
+        assert_eq!(m.tick(t + NUDGE_NARROW, false), Some(Width::Restore));
+        let late = t + NUDGE_NARROW + CC_TICK_AFTER_RESIZE;
+        m.ask(late);
+        assert_eq!(m.tick(late, true), Some(Width::Narrow));
     }
 
     #[test]
