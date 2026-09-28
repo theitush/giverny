@@ -14,6 +14,83 @@ use crate::{Action, App, RenameTarget};
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// One step of the rail's glyph animations (spinner, pulse), in seconds.
+///
+/// Every step is a full-window repaint, and on a software renderer (WSLg's
+/// llvmpipe) a repaint is real CPU: the old per-frame 120 ms cadence cost
+/// ~95% of a core for one spinner (#43). Four steps a second still reads as
+/// moving; half that while the window is in the background. The clock is
+/// the terminal's output pacing clock, so a spinner and a working tab on
+/// screen share their frames.
+const ANIM_STEP: f64 = giverny_term::pace::STEP_FOCUSED.as_secs_f64();
+
+/// The animation clock, snapped to whole steps: every glyph drawn in one
+/// frame is on the same step, and a repaint that happens for some other
+/// reason (terminal output, the pointer) does not nudge them in between.
+fn anim_time() -> f64 {
+    giverny_term::pace::anim_time()
+}
+
+/// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
+/// but only while it is on screen. A row scrolled out of the rail, or a
+/// spinner nobody can see, costs nothing.
+fn keep_animating(ui: &Ui, rect: Rect) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
+    ui.ctx()
+        .request_repaint_after(giverny_term::pace::until_next_tick(focused, predicted_dt));
+}
+
+/// Where the rail's spinners point, in turns, and a request for their next
+/// frame while `rect` is on screen.
+///
+/// On a GPU they turn once a second on the real clock, twelve frames a
+/// second ([`giverny_term::pace::SPIN_PER_STEP`]): evenly, because the angle is where
+/// the clock is when the frame is drawn, not which snapped step it fell in
+/// (#70). On a software renderer every frame is CPU, so they keep to the
+/// shared four-a-second clock at half a turn a second, eight positions to a
+/// turn (#43).
+fn spin(ui: &Ui, rect: Rect) -> f64 {
+    keep_spinning(ui, rect);
+    spin_turns(ui)
+}
+
+/// [`spin`]'s angle alone, for a spinner whose rect is not known yet.
+fn spin_turns(ui: &Ui) -> f64 {
+    if giverny_term::pace::cheap_frames() {
+        ui.input(|i| i.time)
+    } else {
+        anim_time() / 2.0
+    }
+}
+
+/// [`spin`]'s next frame alone.
+fn keep_spinning(ui: &Ui, rect: Rect) {
+    if !giverny_term::pace::cheap_frames() {
+        return keep_animating(ui, rect);
+    }
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
+    ui.ctx()
+        .request_repaint_after(giverny_term::pace::until_next_spin(focused, predicted_dt));
+}
+
+/// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
+/// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
+fn braille(turns: f64) -> String {
+    let step = if giverny_term::pace::cheap_frames() {
+        (turns * SPINNER.len() as f64) as usize
+    } else {
+        (turns * 2.0 / ANIM_STEP) as usize
+    };
+    SPINNER[step % SPINNER.len()].to_string()
+}
+
 // Chrome colours come from the active theme (see `chrome`), reached through
 // `app.chrome`. Only geometry is constant here.
 
@@ -494,16 +571,13 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         }
     });
 
-    let now = ui.input(|i| i.time);
+    let turns = spin_turns(ui);
     for job in &app.claude.jobs {
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
-            JobState::Working if job.live => (
-                SPINNER[(now * 10.0) as usize % SPINNER.len()].to_string(),
-                c.accent,
-            ),
+            JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
             JobState::Blocked => ("⚑".into(), c.amber),
             JobState::Done => ("✓".into(), c.accent),
@@ -551,6 +625,9 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 }
             });
         });
+        if job.live && job.state == JobState::Working {
+            keep_spinning(ui, resp.response.rect);
+        }
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -707,8 +784,12 @@ fn category_header(
     );
     badge_x -= 20.0;
     if cat.busy > 0 {
-        let time = ui.input(|i| i.time);
-        spinner(&p, Pos2::new(badge_x, rect.center().y), time, cat.color);
+        spinner(
+            &p,
+            Pos2::new(badge_x, rect.center().y),
+            spin(ui, rect),
+            cat.color,
+        );
         p.text(
             Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -777,11 +858,12 @@ fn category_header(
     rect
 }
 
-/// A ring with a gap, turning. What the braille spinner was for, minus the
-/// assumption that the font has braille in it.
-fn spinner(p: &egui::Painter, at: Pos2, time: f64, color: Color32) {
+/// A ring with a gap, turned `turns` of the way round (see [`spin`]). What
+/// the braille spinner was for, minus the assumption that the font has
+/// braille in it.
+fn spinner(p: &egui::Painter, at: Pos2, turns: f64, color: Color32) {
     const R: f32 = 5.0;
-    let head = (time * 4.0) as f32;
+    let head = (turns.fract() * std::f64::consts::TAU) as f32;
     let mut points = Vec::with_capacity(14);
     for step in 0..14 {
         let angle = head + step as f32 * 0.36;
@@ -892,12 +974,16 @@ fn tab_row(
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
-    let time = ui.input(|i| i.time);
+    let time = anim_time();
     match row.claude {
-        ClaudeState::Busy => spinner(&p, dot, time, row.color),
+        ClaudeState::Busy => {
+            spinner(&p, dot, spin(ui, rect), row.color);
+        }
         ClaudeState::NeedsYou => {
-            let pulse = ((time * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
+            // One breath every two seconds, sampled at the animation step.
+            let pulse = ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
             flag(&p, dot, c.amber.gamma_multiply(pulse));
+            keep_animating(ui, rect);
         }
         // Green and still: finished, nothing owed. The amber flag above is
         // the one that wants something, and the two differ in colour, shape
@@ -1218,27 +1304,25 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         );
         let spinning = app.claude.refresh_in_flight();
         let label = if spinning {
-            let t = ui.input(|i| i.time);
-            SPINNER[(t * 10.0) as usize % SPINNER.len()].to_string()
+            braille(spin_turns(ui))
         } else {
             "⟳".to_string()
         };
-        if ui
-            .add(egui::Button::new(
-                egui::RichText::new(label)
-                    .font(FontId::monospace(10.0))
-                    .color(if spinning { c.accent } else { dim }),
-            ))
+        let refresh = ui.add(egui::Button::new(
+            egui::RichText::new(label)
+                .font(FontId::monospace(10.0))
+                .color(if spinning { c.accent } else { dim }),
+        ));
+        if spinning {
+            keep_spinning(ui, refresh.rect);
+        }
+        if refresh
             .on_hover_text(
                 "refresh usage now\n(asks Claude Code to update its own cache;\nGiverny makes no API call)",
             )
             .clicked()
         {
             actions.push(Action::RefreshUsage);
-        }
-        if spinning {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(120));
         }
         // The way in that does not require knowing a chord.
         if ui

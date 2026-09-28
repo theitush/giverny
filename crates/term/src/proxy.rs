@@ -64,9 +64,18 @@ impl EventProxy {
     }
 
     fn wake(&self) {
-        // Coalesce: only the false→true edge requests a repaint.
+        // Coalesce: only the false→true edge requests a repaint. The flag
+        // stays set until the widget draws this tab, so a tab that is not on
+        // screen wakes the window once, not once per burst.
         if !self.dirty.swap(true, Ordering::AcqRel) {
-            self.ctx.request_repaint();
+            // Paced: at once while someone is using the window, otherwise
+            // no sooner than the output step (`pace`, #43).
+            let wait = crate::pace::output_delay();
+            if wait.is_zero() {
+                self.ctx.request_repaint();
+            } else {
+                self.ctx.request_repaint_after(wait);
+            }
         }
     }
 

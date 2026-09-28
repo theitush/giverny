@@ -12,9 +12,14 @@ mod rail;
 mod settings_ui;
 mod splash;
 mod taskbar;
+mod titlebar;
 mod update;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg_cursor;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -171,15 +176,121 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 /// fallback, and nothing in this app knows the difference: every pixel is an
 /// egui mesh or texture either way.
 ///
+/// The same goes for a machine where wgpu *would* work but only on a CPU
+/// adapter (lavapipe, llvmpipe, WARP): WSLg with no GPU Vulkan driver is the
+/// common case, where OpenGL reaches the real GPU through Mesa's d3d12 driver
+/// and wgpu draws every frame in software at several cores' worth of CPU. So
+/// unless told otherwise, ask wgpu which adapter it would pick first.
+///
 /// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
 /// below re-launches itself.
-fn pick_renderer() -> eframe::Renderer {
+fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
     match std::env::var("GIVERNY_RENDERER").as_deref() {
         Ok("glow" | "gl" | "opengl") => {
-            tracing::info!("renderer: OpenGL");
+            tracing::info!("renderer: OpenGL (GIVERNY_RENDERER)");
             eframe::Renderer::Glow
         }
-        _ => eframe::Renderer::Wgpu,
+        Ok("wgpu") => eframe::Renderer::Wgpu,
+        // OpenGL is known to reach the GPU; wgpu is not asked, because on
+        // WSLg its only Vulkan driver is lavapipe (see `wslg`).
+        _ if gpu_gl => eframe::Renderer::Glow,
+        _ => {
+            let adapter = wgpu_adapter();
+            let renderer = renderer_for(adapter.as_ref());
+            match (&adapter, renderer) {
+                (None, _) => tracing::info!("renderer: OpenGL, wgpu found no adapter"),
+                (Some(info), eframe::Renderer::Glow) => tracing::info!(
+                    "renderer: OpenGL, wgpu would draw on the CPU ({}, {:?})",
+                    info.name,
+                    info.backend
+                ),
+                (Some(info), _) => tracing::debug!(
+                    "renderer: wgpu on {} ({:?}, {:?})",
+                    info.name,
+                    info.backend,
+                    info.device_type
+                ),
+            }
+            renderer
+        }
+    }
+}
+
+/// Whether OpenGL has been pointed at a GPU that wgpu cannot reach: WSLg's
+/// d3d12 driver. Logs the outcome either way, since it decides the CPU cost.
+fn gpu_opengl() -> bool {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    match wslg::enable_d3d12() {
+        wslg::Gpu::NotApplicable => {}
+        wslg::Gpu::D3d12(renderer) => {
+            tracing::info!("renderer: OpenGL on the GPU through WSLg's d3d12 driver ({renderer})");
+            return true;
+        }
+        wslg::Gpu::Unavailable(why) => {
+            tracing::warn!(
+                "WSLg's d3d12 GL driver is unavailable, drawing may fall back to the CPU: {why}"
+            );
+        }
+    }
+    false
+}
+
+/// The adapter eframe's default wgpu setup would choose, asked for the same
+/// way (same backends, same power preference) but without a window yet.
+fn wgpu_adapter() -> Option<eframe::wgpu::AdapterInfo> {
+    let setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    let instance = eframe::wgpu::Instance::new(setup.instance_descriptor);
+    let options = eframe::wgpu::RequestAdapterOptions {
+        power_preference: setup.power_preference,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    };
+    pollster::block_on(instance.request_adapter(&options))
+        .ok()
+        .map(|adapter| adapter.get_info())
+}
+
+/// Does the window draw on a GPU? Asked of the renderer the window actually
+/// got, not the one we hoped for: the rail's spinners turn smoothly only
+/// where a frame is cheap (#70), and a software rasterizer is where it is not.
+fn draws_on_gpu(cc: &eframe::CreationContext<'_>) -> bool {
+    if let Some(gl) = &cc.gl {
+        use eframe::glow::HasContext;
+        let renderer = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+        let gpu = !is_software_gl(&renderer);
+        tracing::info!(
+            "frames {}: OpenGL renderer {renderer}",
+            if gpu { "cheap" } else { "on the CPU" }
+        );
+        return gpu;
+    }
+    if let Some(wgpu) = &cc.wgpu_render_state {
+        return wgpu.adapter.get_info().device_type != eframe::wgpu::DeviceType::Cpu;
+    }
+    false
+}
+
+/// Mesa's and Windows' CPU rasterizers, by the renderer string they report.
+fn is_software_gl(renderer: &str) -> bool {
+    let r = renderer.to_ascii_lowercase();
+    [
+        "llvmpipe",
+        "softpipe",
+        "lavapipe",
+        "swrast",
+        "software",
+        "gdi generic",
+    ]
+    .iter()
+    .any(|s| r.contains(s))
+}
+
+/// wgpu unless its adapter is missing or a software rasterizer, where OpenGL
+/// is the better bet: it either reaches a GPU wgpu could not, or is no slower.
+fn renderer_for(adapter: Option<&eframe::wgpu::AdapterInfo>) -> eframe::Renderer {
+    match adapter {
+        Some(info) if info.device_type != eframe::wgpu::DeviceType::Cpu => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
     }
 }
 
@@ -294,6 +405,8 @@ fn main() -> eframe::Result {
             doctor();
             return Ok(());
         }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        Some(wslg::PROBE_ARG) => std::process::exit(wslg::probe()),
         Some("update") => {
             update_cli();
             return Ok(());
@@ -356,7 +469,13 @@ fn main() -> eframe::Result {
     let paths = Paths::default_dirs();
     // `GIVERNY_NO_X11` is set by the fallback below, so a second attempt
     // cannot loop.
-    let try_x11 = config::load(paths.base()).behavior.prefer_x11
+    let prefer_x11 = config::load(paths.base()).behavior.prefer_x11;
+    // WSLg's compositor crashes under our Wayland window (see `wslg`).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    let wslg_x11 = !prefer_x11 && wslg::avoid_wayland();
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+    let wslg_x11 = false;
+    let try_x11 = (prefer_x11 || wslg_x11)
         && std::env::var_os("GIVERNY_NO_X11").is_none()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_some();
@@ -365,22 +484,68 @@ fn main() -> eframe::Result {
         wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
         // SAFETY: no threads yet — this runs before the event loop.
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
-        tracing::info!("prefer_x11: using X11/XWayland so file drops arrive");
+        if wslg_x11 {
+            tracing::info!(
+                "WSLg: using X11/XWayland, since WSLg's compositor crashes under \
+                 Wayland windows (GIVERNY_WAYLAND=1 to use Wayland anyway)"
+            );
+        } else {
+            tracing::info!("prefer_x11: using X11/XWayland so file drops arrive");
+        }
     }
 
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
-    let renderer = pick_renderer();
+    let gpu_gl = gpu_opengl();
+    let renderer = pick_renderer(gpu_gl);
     let layout = state::load_layout(&paths);
+    // The interface zoom the user last left, or — on a first run only — the
+    // display's own scale where the platform hides it from winit (#62). Not
+    // on a later run that simply predates saving the zoom: its terminal font
+    // was already sized to make up for the 1.0, and would come out huge.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    let display_zoom = (try_x11 && wslg_x11 && !paths.state_file().exists())
+        .then(wslg::desktop_scale)
+        .flatten();
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+    let display_zoom: Option<f32> = None;
+    if let Some(z) = display_zoom {
+        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
+    }
+    let zoom = layout.zoom().or(display_zoom);
+    // A first window scaled with its contents, so they have the room the
+    // default size was chosen for.
+    let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
+    // WSLg frames an X11 window with Weston's own caption — a 1x-scale strip
+    // with Windows-95 buttons inside a thick black band — and there is no way
+    // to have Windows draw one instead, so there Giverny draws its own (#69).
+    // `GIVERNY_WSLG_FRAME=1` keeps Weston's.
+    let frameless = try_x11 && wslg_x11 && std::env::var_os("GIVERNY_WSLG_FRAME").is_none();
+    // That window is maximised by hand (#78): straight over the work area
+    // saved last time when it opens maximised, rather than through the
+    // window manager, whose maximise lands it 32 px off.
+    let window_size = layout.window_size().unwrap_or(first_size);
+    let work_area = layout.work_area.filter(|_| frameless);
+    let open_laid = frameless && layout.maximized && work_area.is_some();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("giverny")
+        .with_title("Giverny")
+        .with_icon(icon::icon_data(16))
+        .with_inner_size(window_size)
+        .with_maximized(layout.maximized && !open_laid)
+        .with_min_inner_size([640.0, 400.0])
+        .with_decorations(!frameless);
+    if let (true, Some([x, y, w, h])) = (open_laid, work_area) {
+        viewport = viewport.with_position([x, y]).with_inner_size([w, h]);
+    }
+    let maximize =
+        titlebar::Maximize::new(work_area, frameless && layout.maximized, window_size.into());
+    if frameless {
+        titlebar::probe_work_areas();
+    }
     let options = eframe::NativeOptions {
         renderer,
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id("giverny")
-            .with_title("Giverny")
-            .with_icon(icon::icon_data(16))
-            .with_inner_size(layout.window_size().unwrap_or([1280.0, 820.0]))
-            .with_maximized(layout.maximized)
-            .with_min_inner_size([640.0, 400.0]),
+        viewport,
         ..Default::default()
     };
     // A hook rather than `catch_unwind`: wgpu's failure panics, and then
@@ -406,7 +571,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Giverny",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom, frameless, maximize)))),
     );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
@@ -667,6 +832,13 @@ pub struct App {
     /// How many tabs wanted you at the last frame, so the taskbar is only
     /// told when that changes.
     attention: usize,
+    /// The window has no decorations and draws its own caption (#69).
+    frameless: bool,
+    /// How that window is maximised (#78).
+    maximize: titlebar::Maximize,
+    /// That window's cursors, sized to the display (#100).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    cursors: Option<wslg_cursor::Cursors>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -938,7 +1110,12 @@ fn wslenv(inherited: Option<String>, ours: &[&str]) -> String {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        zoom: Option<f32>,
+        frameless: bool,
+        maximize: titlebar::Maximize,
+    ) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
         remember_env_accounts(&paths, &mut cfg);
@@ -951,6 +1128,7 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name));
 
@@ -1072,6 +1250,12 @@ impl App {
             row_rects: Vec::new(),
             stale_sessions: false,
             attention: 0,
+            frameless,
+            maximize,
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            cursors: frameless
+                .then(|| wslg_cursor::Cursors::new(cc, wslg::desktop_scale()))
+                .flatten(),
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -1098,6 +1282,10 @@ impl App {
             cfg,
             last_cfg_check: Instant::now(),
         };
+        if let Some(z) = zoom {
+            cc.egui_ctx.set_zoom_factor(z);
+            app.layout.zoom = Some(z);
+        }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         if app.cfg.claude.auto_mode {
@@ -2200,6 +2388,8 @@ impl App {
                 i.viewport_rect(),
             )
         });
+        // Maximised by hand on WSLg (#78) is maximised all the same.
+        let maximized = maximized || (self.frameless && self.maximize.is_on(ctx));
         // Deliberately not `viewport().inner_rect`: it is derived from the
         // window's *position*, which Wayland never reports, so it is None on
         // the primary platform. The egui surface is the window's inner area
@@ -2215,12 +2405,23 @@ impl App {
         if let Some(rail) = egui::PanelState::load(ctx, egui::Id::new("rail")) {
             self.layout.rail_width = Some(rail.size().x);
         }
+        // Ctrl+± is egui's own zoom; read it back rather than intercepting
+        // the chord, which the terminal widget also answers to.
+        let zoom = ctx.zoom_factor();
+        if self.layout.zoom.is_some() || (zoom - 1.0).abs() > 0.001 {
+            self.layout.zoom = Some(zoom);
+        }
 
         let moved = |a: Option<f32>, b: Option<f32>| match (a, b) {
             (Some(a), Some(b)) => (a - b).abs() >= 1.0,
             (a, b) => a.is_some() != b.is_some(),
         };
+        if self.frameless {
+            self.layout.work_area = self.maximize.learned();
+        }
         let changed = self.layout.maximized != before.maximized
+            || self.layout.work_area != before.work_area
+            || self.layout.zoom != before.zoom
             || moved(self.layout.rail_width, before.rail_width)
             || moved(
                 self.layout.window.map(|w| w[0]),
@@ -2671,8 +2872,37 @@ impl App {
     }
 }
 
+/// Frames drawn per second, logged every ten seconds at debug level
+/// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
+/// asked for the last one. On a software renderer every frame is CPU, so
+/// this is the number that explains a busy process (#43).
+fn count_frame(ctx: &egui::Context) {
+    use std::sync::Mutex;
+    static FRAMES: Mutex<Option<(Instant, u32, u32)>> = Mutex::new(None);
+    let Ok(mut slot) = FRAMES.lock() else { return };
+    let (since, frames, passes) = slot.get_or_insert((Instant::now(), 0, 0));
+    *passes += 1;
+    if ctx.current_pass_index() == 0 {
+        *frames += 1;
+    }
+    let elapsed = since.elapsed();
+    if elapsed >= Duration::from_secs(10) {
+        let secs = elapsed.as_secs_f64();
+        tracing::debug!(
+            "frames: {:.1}/s ({:.1} passes/s, predicted {:.0} ms each) over {secs:.0}s, \
+             the last asked for by {:?}",
+            *frames as f64 / secs,
+            *passes as f64 / secs,
+            ctx.input(|i| i.predicted_dt) * 1000.0,
+            ctx.repaint_causes()
+        );
+        *slot = Some((Instant::now(), 0, 0));
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        count_frame(ui.ctx());
         // Documentation capture (GIVERNY_CAPTURE); no-op otherwise.
         if let Some(cap) = &mut self.capture {
             cap.on_frame(ui.ctx());
@@ -2748,16 +2978,46 @@ impl eframe::App for App {
         for (summary, body) in effects.notify {
             desktop_notify(summary, body);
         }
-        if effects.animating {
-            ctx.request_repaint_after(Duration::from_millis(120));
-        } else {
-            // Heartbeat: egui only repaints on demand, so without this the
-            // registry scan (and therefore state transitions for tabs whose
-            // output isn't waking the UI) would stall while the window idles.
-            ctx.request_repaint_after(Duration::from_millis(700));
-        }
+        // Heartbeat: egui only repaints on demand, so without this the
+        // registry scan (and therefore state transitions for tabs whose
+        // output isn't waking the UI) would stall while the window idles.
+        //
+        // A working tab no longer shortens it. The spinners wake the window
+        // themselves, at their own step and only while they are on screen
+        // (`rail::keep_animating`); a timer here repainted everything at
+        // ~8 fps for as long as any tab worked, seen or not (#43). On the
+        // animation clock's grid, so it shares a frame with them when they
+        // run.
+        ctx.request_repaint_after(
+            giverny_term::pace::until_next_tick(true, ctx.input(|i| i.predicted_dt))
+                + Duration::from_millis(500),
+        );
 
         let mut actions = self.shortcuts(&ctx);
+
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        if let Some(cursors) = &mut self.cursors {
+            cursors.keep();
+        }
+        if self.frameless && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            self.maximize.update(&ctx);
+            let maximized = self.maximize.is_on(&ctx);
+            titlebar::resize_edges(&ctx, maximized);
+            titlebar::outline(&ctx, &self.chrome, maximized);
+            let title = if self.attention > 0 {
+                format!("Giverny ({})", self.attention)
+            } else {
+                "Giverny".to_string()
+            };
+            egui::Panel::top("titlebar")
+                .exact_size(titlebar::HEIGHT)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
+                });
+        }
 
         egui::Panel::left("rail")
             .resizable(true)
@@ -3320,6 +3580,49 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_gl_renderers_are_told_from_gpus() {
+        assert!(is_software_gl("llvmpipe (LLVM 20.1.2, 256 bits)"));
+        assert!(is_software_gl("GDI Generic"));
+        assert!(!is_software_gl("D3D12 (Intel(R) Graphics)"));
+        assert!(!is_software_gl("Mesa Intel(R) Graphics (MTL)"));
+    }
+
+    #[test]
+    fn a_software_adapter_opens_on_opengl() {
+        use eframe::wgpu::DeviceType;
+        let adapter = |device_type| eframe::wgpu::AdapterInfo {
+            name: "llvmpipe (LLVM 19.1.1, 256 bits)".into(),
+            vendor: 0x10005,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: "llvmpipe".into(),
+            driver_info: "Mesa 25.0.7".into(),
+            backend: eframe::wgpu::Backend::Vulkan,
+            subgroup_min_size: 8,
+            subgroup_max_size: 8,
+            transient_saves_memory: false,
+        };
+        assert_eq!(renderer_for(None), eframe::Renderer::Glow);
+        assert_eq!(
+            renderer_for(Some(&adapter(DeviceType::Cpu))),
+            eframe::Renderer::Glow
+        );
+        for gpu in [
+            DeviceType::DiscreteGpu,
+            DeviceType::IntegratedGpu,
+            DeviceType::VirtualGpu,
+            DeviceType::Other,
+        ] {
+            assert_eq!(
+                renderer_for(Some(&adapter(gpu))),
+                eframe::Renderer::Wgpu,
+                "{gpu:?}"
+            );
+        }
+    }
 
     #[test]
     fn resume_thresholds_are_set_only_when_asked() {

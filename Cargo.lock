@@ -1410,10 +1410,12 @@ dependencies = [
  "giverny-core",
  "giverny-term",
  "jiff",
+ "khronos-egl",
  "notify-rust",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "pollster",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -1426,6 +1428,7 @@ dependencies = [
  "windows 0.62.2",
  "windows-sys 0.61.2",
  "winresource",
+ "x11-dl",
 ]
 
 [[package]]

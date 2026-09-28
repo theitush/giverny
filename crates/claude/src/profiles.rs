@@ -267,8 +267,15 @@ pub fn find<'a>(profiles: &'a [Profile], config_dir: &Path) -> Option<&'a Profil
 mod tests {
     use super::*;
 
+    /// A fresh directory for one test. The counter makes every call unique
+    /// even when two tests pass the same name, since tests run in parallel
+    /// and each one starts by wiping its directory.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("giverny-prof-{name}-{}", std::process::id()));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("giverny-prof-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -382,7 +389,7 @@ mod tests {
     /// conversation it was told to resume.
     #[test]
     fn a_default_account_must_not_be_named() {
-        let root = scratch("naming");
+        let root = scratch("naming-default");
         let home = root.join("home").join("itay");
         let default = home.join(".claude");
         std::fs::create_dir_all(&default).unwrap();
@@ -411,8 +418,7 @@ mod tests {
 
     #[test]
     fn profile_name_from_email() {
-        let dir = std::env::temp_dir().join(format!("giverny-prof-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("email");
         std::fs::write(
             dir.join(".claude.json"),
             r#"{"oauthAccount":{"emailAddress":"yoav@example.com","accountUuid":"u-1"}}"#,
