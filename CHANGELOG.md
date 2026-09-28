@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.1.0 — 2026-09-28
+
+Most of this release is [@theitush](https://github.com/theitush)'s, from running
+Giverny all day under WSLg.
+
+- Giverny asks for far fewer frames. A focused terminal repainted the whole
+  window five times a second forever just to blink the cursor, and any working
+  Claude tab repainted it eight times a second whether or not that tab was on
+  screen. Now the cursor wakes only at the blink's edges and stops blinking
+  after 15 seconds, each animation asks for its own frames and only while it is
+  on screen, and terminal output is drawn at once for a second and a half after
+  you type and paced after that. An idle window stops repainting altogether. On
+  a software renderer a busy tab in the background went from 80% of a core to
+  35%.
+
+- Under WSLg, Giverny draws on the GPU. WSL's GPU has no DRM render node, so
+  Mesa falls back to drawing every frame on the CPU. Mesa's `d3d12` driver
+  reaches the Windows GPU through `/dev/dxg`, but only when named, and naming a
+  driver that cannot start takes EGL down with it. So a child process tries it
+  first on a windowless context, clears a framebuffer to a known colour and
+  reads every pixel back — some Windows GPU drivers start fine and then return
+  black. Only then does the window open on it. `GIVERNY_GPU=software` keeps
+  Mesa's own choice.
+
+- Under WSLg, Giverny no longer takes the session down with it. WSLg's
+  compositor segfaults when a Wayland client grows a buffer pool while its
+  buffers are on screen, which is what window decorations do on a resize. The
+  window opens on XWayland there instead, and draws its own Windows 11 style
+  caption, since Weston frames X11 windows with a caption at the wrong scale.
+  Maximise lays the window over the monitor's real work area.
+
+- The interface zoom (Ctrl +/-) is remembered between runs. Only the terminal
+  font size ever was, so every restart put the rail back to 1.0.
+
+- The usage bar stops cycling. v1.0.4 was meant to fix this and did not: it
+  decided two readings were the same window by comparing reset times exactly,
+  when the status line writes whole seconds and the cache writes microseconds.
+  A window is now recognised across both spellings, and a reading from a
+  session that has been idle — every `claude` pushes the percentage its own
+  last request was answered with — no longer reads as a new window.
+
+- Claude Code's status line shows what the session has spent: `session`, and
+  `subagents` and `total` when there are subagents.
+
 ## v1.0.4 — 2026-09-17
 
 - A usage bar stops jumping backwards. The percentage has two sources: the
