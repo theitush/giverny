@@ -121,14 +121,37 @@ impl ClickTarget {
     /// Open with the platform handler; files honor `$EDITOR` when it is a
     /// terminal editor the user can see (else the desktop handler).
     pub fn open(&self) {
-        match self {
-            ClickTarget::Url(url) => {
-                let _ = open::that_detached(url);
-            }
-            ClickTarget::File(path, _) => {
-                let _ = open::that_detached(path);
-            }
+        let target: &std::ffi::OsStr = match self {
+            ClickTarget::Url(url) => url.as_ref(),
+            ClickTarget::File(path, _) => path.as_ref(),
+        };
+        let wslenv = wslenv_with_target(std::env::var("WSLENV").ok().as_deref());
+        let mut launchers = open::commands(target);
+        for cmd in &mut launchers {
+            // open's WSL launcher hands the target to powershell.exe in
+            // OPEN_RS_TARGET, which WSL only forwards when WSLENV names it.
+            cmd.env("WSLENV", &wslenv)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
         }
+        // Wait on each launcher (reaping it, so no zombie) and fall back to
+        // the next when it fails to spawn or exits nonzero.
+        std::thread::spawn(move || {
+            for mut cmd in launchers {
+                if cmd.status().is_ok_and(|s| s.success()) {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// `WSLENV` with `OPEN_RS_TARGET` appended so WSL passes it to Windows.
+fn wslenv_with_target(existing: Option<&str>) -> String {
+    match existing {
+        Some(v) if !v.is_empty() => format!("{v}:OPEN_RS_TARGET"),
+        _ => "OPEN_RS_TARGET".to_owned(),
     }
 }
 
@@ -234,6 +257,16 @@ pub fn targets_in_row(text: &str, cwd: &std::path::Path) -> Vec<RowTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wslenv_forwards_the_open_target() {
+        assert_eq!(wslenv_with_target(None), "OPEN_RS_TARGET");
+        assert_eq!(wslenv_with_target(Some("")), "OPEN_RS_TARGET");
+        assert_eq!(
+            wslenv_with_target(Some("USERPROFILE/p")),
+            "USERPROFILE/p:OPEN_RS_TARGET"
+        );
+    }
 
     #[test]
     fn a_row_yields_every_target_left_to_right() {
