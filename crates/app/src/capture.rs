@@ -21,6 +21,8 @@ pub struct Capture {
     saved: u32,
     /// Skip the first frames so fonts and the first PTY output settle.
     warmup: u32,
+    /// Close the window after the last frame (a documentation run).
+    close: bool,
 }
 
 impl Capture {
@@ -43,6 +45,24 @@ impl Capture {
             tick: 0,
             saved: 0,
             warmup: 90,
+            close: true,
+        })
+    }
+
+    /// Debug builds: `frames` frames into `dir`, every `stride`th, from
+    /// the next frame on, leaving the window open after (the debug
+    /// command `shots`, giverny#132).
+    #[cfg(debug_assertions)]
+    pub fn burst(dir: PathBuf, frames: u32, stride: u32) -> Option<Self> {
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Capture {
+            dir,
+            remaining: frames,
+            stride: stride.max(1),
+            tick: 0,
+            saved: 0,
+            warmup: 0,
+            close: false,
         })
     }
 
@@ -70,7 +90,9 @@ impl Capture {
             self.remaining = self.remaining.saturating_sub(1);
             if self.remaining == 0 {
                 tracing::info!("capture complete: {} frame(s)", self.saved);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if self.close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 return;
             }
         }

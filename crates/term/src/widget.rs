@@ -315,6 +315,13 @@ struct CachedFrame {
 }
 
 impl TabView {
+    /// Whether the cursor is blinking at egui time `now`: a held picture
+    /// ([`TabView::hold`]) would stop it mid-blink, so a hold nothing asked
+    /// for is not started while it does (giverny#132).
+    pub fn cursor_blinking(&self, now: f64) -> bool {
+        self.blink_from.is_some_and(|from| now - from < BLINK_FOR)
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,

@@ -366,7 +366,7 @@ pub enum View {
     Other,
 }
 
-fn is_rule(line: &str) -> bool {
+pub(crate) fn is_rule(line: &str) -> bool {
     line.trim_start().starts_with("───")
 }
 
