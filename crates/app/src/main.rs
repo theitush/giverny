@@ -1124,7 +1124,17 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 /// field, so the relay and the installer follow whatever the settings table
 /// declares — and read as off in a build that does not declare it.
 fn agents_pane_on(cfg: &config::Config) -> bool {
-    giverny_core::settings::by_key("claude.agents_pane")
+    bool_setting(cfg, "claude.agents_pane")
+}
+
+/// Is `claude.orchestrate_by_default` on (giverny#130)? Read the same way,
+/// and only acted on with the agents pane on — the plugin carries it.
+fn orchestrate_on(cfg: &config::Config) -> bool {
+    bool_setting(cfg, "claude.orchestrate_by_default")
+}
+
+fn bool_setting(cfg: &config::Config, key: &str) -> bool {
+    giverny_core::settings::by_key(key)
         .and_then(|def| giverny_core::settings::current(cfg, def))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
@@ -1527,8 +1537,11 @@ impl App {
         if app.cfg.claude.auto_mode {
             app.claude.ensure_auto_mode();
         }
-        app.claude
-            .set_agents_pane(agents_pane_on(&app.cfg), app.paths.base());
+        app.claude.set_agents_pane(
+            agents_pane_on(&app.cfg),
+            orchestrate_on(&app.cfg),
+            app.paths.base(),
+        );
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -2530,9 +2543,14 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
-        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg) {
-            self.claude
-                .set_agents_pane(agents_pane_on(&cfg), self.paths.base());
+        if (agents_pane_on(&cfg), orchestrate_on(&cfg))
+            != (agents_pane_on(&self.cfg), orchestrate_on(&self.cfg))
+        {
+            self.claude.set_agents_pane(
+                agents_pane_on(&cfg),
+                orchestrate_on(&cfg),
+                self.paths.base(),
+            );
         }
         self.cfg = cfg;
         tracing::info!("config reloaded");

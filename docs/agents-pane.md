@@ -170,6 +170,7 @@ With `claude.agents_pane` on, Giverny carries a Claude Code plugin, `giverny`, w
   ```
   That is all Claude Code needs. There is no `claude plugin install` and no network. A directory marketplace is loaded straight from its directory at session start, not from a cache, so the next session runs what this binary wrote. The plugin's version is Giverny's own, so a Giverny upgrade updates the plugin. Sessions that were already running keep the skill they started with.
 - `bin/` of an enabled plugin is on the `PATH` of the Bash tool, in the session and in its subagents, which is how `giverny-pass` is found.
+- **Orchestrate by default** (`claude.orchestrate_by_default`, off by default, giverny#130). With it on as well as the pane, the plugin also carries `hooks/hooks.json`: a `SessionStart` hook (matcher `startup|clear|compact`) whose command `cat`s `hooks/orchestrate-by-default.json`, a `hookSpecificOutput.additionalContext` telling the session to run any task it expects to take more than about a minute as a `/giverny:orchestrate` pass, one subagent per task, and to keep quick questions and reads inline. The text is `crates/claude/plugin/hooks/orchestrate-by-default.md`. Only sessions started, cleared or compacted after it is turned on get it. Off, both hook files are pruned with the rest of the stale files.
 
 **The house rules**, the same ones `subagentStatusLine` follows:
 

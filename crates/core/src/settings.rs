@@ -410,6 +410,21 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "claude.orchestrate_by_default",
+        label: "orchestrate by default",
+        section: Section::Claude,
+        doc: "Have Claude hand any task longer than about a minute to subagents, via /giverny:orchestrate.",
+        note: &[
+            "Needs the agents pane on: it adds a SessionStart hook to the",
+            "giverny plugin that tells each new session to run such work as a",
+            "pass, one subagent per task, shown in the agents pane. Quick",
+            "questions and reads stay in the main thread. Reaches sessions",
+            "started after the change; off removes the hook.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "claude.resume_after_limit",
         label: "resume after a limit",
         section: Section::Claude,

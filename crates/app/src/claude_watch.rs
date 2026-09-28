@@ -1148,14 +1148,20 @@ impl ClaudeWatch {
     /// The same switch carries the `giverny` plugin (giverny#101): on, its
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
-    /// keys go and so does the directory.
-    pub fn set_agents_pane(&mut self, enable: bool, base: &Path) {
+    /// keys go and so does the directory. `orchestrate`
+    /// (`claude.orchestrate_by_default`, giverny#130) adds the plugin's
+    /// `SessionStart` hook; it means nothing with the pane off.
+    pub fn set_agents_pane(&mut self, enable: bool, orchestrate: bool, base: &Path) {
         if self.leave_accounts {
             return;
         }
         let dir = giverny_claude::plugin::marketplace_dir(base);
         if enable {
-            match giverny_claude::plugin::sync(&dir, &giverny_claude::plugin::exe_candidates()) {
+            match giverny_claude::plugin::sync(
+                &dir,
+                &giverny_claude::plugin::exe_candidates(),
+                orchestrate,
+            ) {
                 Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
                 Ok(false) => {}
                 Err(err) => tracing::warn!("giverny plugin not written: {err}"),
@@ -2174,8 +2180,8 @@ mod tests {
         assert!(w.set_statusline(false).is_err());
         w.set_auto_mode(true);
         w.ensure_auto_mode();
-        w.set_agents_pane(true, &base);
-        w.set_agents_pane(false, &base);
+        w.set_agents_pane(true, true, &base);
+        w.set_agents_pane(false, false, &base);
         let after = (
             std::fs::read(&settings).unwrap(),
             std::fs::read(&known).unwrap(),
@@ -2185,7 +2191,7 @@ mod tests {
 
         // The installed instance, same calls: the account does change.
         w.leave_accounts = false;
-        w.set_agents_pane(false, &base);
+        w.set_agents_pane(false, false, &base);
         w.set_auto_mode(true);
         assert_ne!(std::fs::read(&settings).unwrap(), before.0);
 

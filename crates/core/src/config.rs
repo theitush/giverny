@@ -31,6 +31,9 @@ pub struct ClaudeConfig {
     pub resume_after_limit: bool,
     /// Show the tab's subagents in a table under the terminal.
     pub agents_pane: bool,
+    /// Tell every new Claude session to run work longer than about a minute
+    /// as an orchestrator pass of subagents (needs `agents_pane`).
+    pub orchestrate_by_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
