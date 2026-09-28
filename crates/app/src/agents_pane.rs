@@ -95,6 +95,13 @@ struct View {
     /// debug `drag` command aims at.
     rows_at: Vec<egui::Rect>,
     cell_w: f32,
+    /// The rows' clicks as drawn last frame: what the debug `hover`
+    /// command finds a row by.
+    #[cfg(debug_assertions)]
+    clicks: Vec<RowClick>,
+    /// The pointer over the rows last frame: `Some(None)` on the pane but
+    /// not on a worker's row, `Some(Some(row))` on that row (giverny#132).
+    hover: Option<Option<RowClick>>,
 }
 
 impl View {
@@ -121,6 +128,24 @@ impl Views {
     /// Forget a closed tab.
     pub fn forget(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
+    }
+
+    /// Where the pointer was over `tab`'s rows when the pane was last drawn,
+    /// taken so it is never read twice: `None` off the pane (or when the
+    /// pane was not drawn), `Some(None)` on it but off every row,
+    /// `Some(Some(row))` on a row (giverny#132).
+    pub fn take_hover(&mut self, tab: TabId) -> Option<Option<RowClick>> {
+        self.tabs.get_mut(&tab)?.hover.take()
+    }
+
+    /// Debug builds: the row of `tab`'s pane that `pick` names (its feed
+    /// key, agent id or name), as drawn last frame.
+    #[cfg(debug_assertions)]
+    pub fn row_named(&self, tab: TabId, pick: &str) -> Option<usize> {
+        let v = self.tabs.get(&tab)?;
+        v.clicks
+            .iter()
+            .position(|c| c.key == pick || c.agent_id.as_deref() == Some(pick) || c.name == pick)
     }
 
     /// Debug builds: the point on `tab`'s pane at `row`'s `col`-th cell
@@ -827,7 +852,7 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let (click, rects) = draw_table(
+                    let (click, rects, hover) = draw_table(
                         ui,
                         id.with("rows"),
                         &table,
@@ -840,6 +865,11 @@ pub fn show(
                         &mut view.sel,
                     );
                     clicked = click;
+                    view.hover = hover;
+                    #[cfg(debug_assertions)]
+                    {
+                        view.clicks = table.lines.iter().map(|l| l.click.clone()).collect();
+                    }
                     view.rows_at = rects;
                     view.cell_w = cell.x.max(1.0);
                 });
@@ -1167,7 +1197,7 @@ fn draw_table(
     row_h: f32,
     cols: usize,
     sel: &mut Option<Selection>,
-) -> (Option<RowClick>, Vec<egui::Rect>) {
+) -> (Option<RowClick>, Vec<egui::Rect>, Option<Option<RowClick>>) {
     let cw = cell.x.max(1.0);
     let layout = Cols::new(table, cols);
     let mut segs: Vec<Vec<(usize, String)>> =
@@ -1184,7 +1214,7 @@ fn draw_table(
         })
         .collect();
     let Some((input, _)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
-        return (None, rects);
+        return (None, rects, None);
     };
     let n = table.lines.len();
     let hovered_line = input.hovered.filter(|&r| r < n);
@@ -1235,7 +1265,10 @@ fn draw_table(
         .clicked
         .and_then(|i| table.lines.get(i))
         .map(|l| l.click.clone());
-    (clicked, rects)
+    let hover = input
+        .hovered
+        .map(|i| table.lines.get(i).map(|l| l.click.clone()));
+    (clicked, rects, hover)
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ mod capture;
 mod chrome;
 mod claude_watch;
 mod desktop;
+mod hover_open;
 mod icon;
 mod keymap;
 mod oom;
@@ -1002,6 +1003,15 @@ pub struct App {
     /// strip is the keyboard path into a worker's view, which the agents
     /// pane otherwise hides.
     strip_asks: HashMap<TabId, Instant>,
+    /// The pointer over the active tab's agents pane, as the pane saw it
+    /// last frame (`Views::take_hover`), and the watch deciding when a
+    /// rest on a Running row starts its open early (giverny#132).
+    hover: Option<(TabId, Option<agents_pane::RowClick>)>,
+    hover_watch: Option<(TabId, hover_open::Watch)>,
+    /// Since when the active tab's screen has held still (giverny#132).
+    screen_still: Option<(TabId, hover_open::Still)>,
+    /// A hover's early strip ask, holding its tab's picture (giverny#132).
+    prearm: Option<PrearmJob>,
     /// Where the worker header's `×` was drawn last frame, if it was.
     header_close: Option<egui::Rect>,
     /// Whether this process is on its way out on purpose, which is the
@@ -1067,6 +1077,14 @@ impl AttachJob {
     fn wants_strip(&self) -> bool {
         self.settle.is_none() && self.driver.wants_strip()
     }
+}
+
+/// A Running row's open started on the hover (giverny#132): which tab's
+/// strip is asked for, and the pre-arm holding that tab's picture.
+struct PrearmJob {
+    tab: TabId,
+    arm: hover_open::Prearm,
+    started: Instant,
 }
 
 /// The longest a tab's picture is held while a walk runs (giverny#82): a
@@ -1519,6 +1537,10 @@ impl App {
             worker_tabs: HashSet::new(),
             attach: None,
             strip_asks: HashMap::new(),
+            hover: None,
+            hover_watch: None,
+            screen_still: None,
+            prearm: None,
             header_close: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
@@ -3321,6 +3343,24 @@ impl App {
             self.apply(ctx, Action::Select(parent));
         }
         self.reveal_terminal();
+        // A hover's early ask is the click's now: the strip it asked for
+        // is the one the walk waits on, and the picture it held stays held
+        // (giverny#132). Its narrow pty is left narrow; the walk's own
+        // nudge keeps it so until the strip is drawn.
+        if let Some(pre) = self.prearm.take() {
+            tracing::debug!(
+                "hover open: clicked +{:?} after arming, strip drawn {:?}, letting go {:?}",
+                pre.started.elapsed(),
+                pre.arm.drawn,
+                pre.arm.letting_go()
+            );
+            if pre.tab != parent
+                && pre.arm.is_narrow()
+                && let Some(session) = self.rt.get(&pre.tab).and_then(|rt| rt.session.as_ref())
+            {
+                session.nudge_width(false);
+            }
+        }
         // A walk under way gives way; its pty width goes back first.
         if let Some(old) = self.attach.take()
             && old.nudge.is_narrow()
@@ -3377,6 +3417,11 @@ impl App {
                 && job.wants_strip()
             {
                 want.insert(job.tab);
+            }
+            if let Some(pre) = &self.prearm
+                && pre.arm.wants_strip()
+            {
+                want.insert(pre.tab);
             }
         }
         let spool = self.paths.hook_spool();
@@ -3537,6 +3582,156 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint();
+        }
+    }
+
+    /// One frame of the hover pre-arm (giverny#132): while the pointer
+    /// rests on a Running row of the active tab's pane, on a screen that
+    /// has held still, ask for the strip and nudge now, holding the tab's
+    /// picture, so a click finds the strip already drawn. Off the row, the
+    /// ask is withdrawn and the picture let go once the screen is back to
+    /// the one it held; a click hands both to the walk (`start_attach`).
+    fn process_hover(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let hover = self.hover.take();
+        let active = self.ws.active;
+        // The Running row under the pointer, if its click would walk into
+        // the worker's view: not the worker already on view (that click
+        // goes home), not with a walk or an overlay up.
+        // Debug builds: `GIVERNY_NO_HOVER_OPEN=1` turns it off, for timing
+        // the click alone.
+        let off = cfg!(debug_assertions) && std::env::var_os("GIVERNY_NO_HOVER_OPEN").is_some();
+        let free =
+            !off && self.cfg.claude.agents_pane && self.attach.is_none() && self.brief.is_none();
+        let on_pane = hover
+            .as_ref()
+            .filter(|(tab, _)| Some(*tab) == active && self.tab_is_live(*tab))
+            .map(|(tab, row)| (*tab, row.clone()));
+        let row_id = on_pane.as_ref().filter(|_| free).and_then(|(tab, row)| {
+            let row = row.as_ref()?;
+            let id = row.agent_id.as_deref()?;
+            (row.stage == giverny_claude::feed::Stage::Running
+                && matches!(
+                    agent_open::offer(row),
+                    agent_open::Offer::OpenInClaude { .. }
+                )
+                && self.viewed_worker(*tab).as_deref() != Some(id))
+            .then(|| id.to_string())
+        });
+        // The watch lasts while the pointer is on the pane, a walk and all:
+        // a row clicked and still under the pointer is not armed again.
+        match (&on_pane, &self.hover_watch) {
+            (None, _) => self.hover_watch = None,
+            (Some((tab, _)), Some((t, _))) if t == tab => {}
+            (Some((tab, _)), _) => self.hover_watch = Some((*tab, hover_open::Watch::default())),
+        }
+
+        // Since when the active tab's screen has held still: read every
+        // frame, pointer or not, so a rest on a row can arm at once. A walk
+        // or a pre-arm changes the screen itself; the count starts after.
+        let tracked = active.filter(|_| {
+            self.cfg.claude.agents_pane && self.attach.is_none() && self.prearm.is_none()
+        });
+        let session = tracked.and_then(|t| self.rt.get(&t)?.session.as_ref());
+        let (Some(tab), Some(session)) = (tracked, session) else {
+            self.screen_still = None;
+            return self.tick_prearm(ctx, now, row_id, on_pane);
+        };
+        let screen = session.screen_text();
+        let key = hover_open::screen_key(&screen);
+        let still = match &mut self.screen_still {
+            Some((t, still)) if *t == tab => still.look(now, key),
+            _ => {
+                let still = hover_open::Still::new(now, key);
+                let since = still.look_since();
+                self.screen_still = Some((tab, still));
+                since
+            }
+        };
+
+        // Arm.
+        if let Some((t, watch)) = &mut self.hover_watch
+            && *t == tab
+            && !watch.spent()
+        {
+            // A blinking cursor would stop mid-blink under a held picture.
+            let blinking = self
+                .rt
+                .get(&tab)
+                .is_some_and(|rt| rt.view.cursor_blinking(ctx.input(|i| i.time)));
+            let still = still.filter(|_| !blinking);
+            if watch.ready(now, still, row_id.as_deref()) {
+                watch.spend();
+                if let Some(arm) = hover_open::Prearm::new(now, &screen) {
+                    tracing::debug!(
+                        "hover open: armed on {:?}, screen still {:?}",
+                        row_id,
+                        still.map(|s| now - s)
+                    );
+                    self.prearm = Some(PrearmJob {
+                        tab,
+                        arm,
+                        started: now,
+                    });
+                }
+            } else if let Some(wait) = watch.wake(now, still) {
+                ctx.request_repaint_after(wait.max(Duration::from_millis(16)));
+            }
+        }
+        self.tick_prearm(ctx, now, row_id, on_pane);
+    }
+
+    /// One frame of a pre-arm under way (`process_hover`).
+    fn tick_prearm(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        row_id: Option<String>,
+        on_pane: Option<(TabId, Option<agents_pane::RowClick>)>,
+    ) {
+        let Some(pre) = &mut self.prearm else {
+            return;
+        };
+        let session = self.rt.get(&pre.tab).and_then(|rt| rt.session.as_ref());
+        let Some(session) = session else {
+            self.prearm = None;
+            return;
+        };
+        // The pointer left the tab's Running rows, or something else took
+        // the tab: let go.
+        let still_on = row_id.is_some() && on_pane.as_ref().is_some_and(|(t, _)| *t == pre.tab);
+        if !still_on {
+            pre.arm.leave(now, hover_open::LetGo::Left);
+        }
+        let screen = session.screen_text();
+        let at = pre.started.elapsed();
+        let (width, over) = pre.arm.tick(now, &screen);
+        match width {
+            Some(agent_open::Width::Narrow) => {
+                tracing::debug!("hover open +{at:?}: nudge narrow");
+                session.nudge_width(true);
+            }
+            Some(agent_open::Width::Restore) => {
+                tracing::debug!("hover open +{at:?}: nudge restore");
+                session.nudge_width(false);
+            }
+            None => {}
+        }
+        if over {
+            if pre.arm.is_narrow() {
+                session.nudge_width(false);
+            }
+            tracing::debug!(
+                "hover open +{at:?}: let go ({:?}), strip drawn {:?}",
+                pre.arm.letting_go(),
+                pre.arm.drawn
+            );
+            let tab = pre.tab;
+            self.prearm = None;
+            self.release_picture(tab);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -3722,6 +3917,37 @@ impl App {
                         None => tracing::warn!("debug cmd: no back button on screen"),
                     }
                 }
+                // `hover <row>`: the pointer onto that agents-pane row (its
+                // feed key, agent id or name) and left there; `press <row>`
+                // clicks it there; `unhover` moves it onto the terminal
+                // (giverny#132).
+                "hover" | "press" | "unhover" => {
+                    let tab = self.ws.active;
+                    let pos = if cmd == "unhover" {
+                        self.session_rect.map(|r| r.center())
+                    } else {
+                        tab.and_then(|t| {
+                            let row = self.agent_views.row_named(t, arg)?;
+                            self.agent_views.cell_point(t, row, 6)
+                        })
+                    };
+                    match pos {
+                        Some(pos) => {
+                            feed(vec![egui::Event::PointerMoved(pos)]);
+                            if cmd == "press" {
+                                let button = |pressed| egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                };
+                                feed(vec![button(true)]);
+                                feed(vec![button(false)]);
+                            }
+                        }
+                        None => tracing::warn!("debug cmd: no row {arg}"),
+                    }
+                }
                 "type" => {
                     let session = self
                         .ws
@@ -3784,6 +4010,15 @@ impl App {
                         )]);
                     }
                     feed(vec![button(to, false)]);
+                }
+                // `shots <dir> <frames> <stride>`: photograph the window's
+                // next frames, leaving it open (giverny#132).
+                "shots" => {
+                    let mut it = arg.split_whitespace();
+                    let dir = it.next().unwrap_or("/tmp/giverny-shots");
+                    let frames = it.next().and_then(|n| n.parse().ok()).unwrap_or(30);
+                    let stride = it.next().and_then(|n| n.parse().ok()).unwrap_or(2);
+                    self.capture = capture::Capture::burst(dir.into(), frames, stride);
                 }
                 "dump" => {
                     let session = self
@@ -4030,11 +4265,18 @@ impl eframe::App for App {
         if let Ok(mut q) = DEBUG_INPUT.lock()
             && !q.is_empty()
         {
-            raw_input.events.extend(q.remove(0));
+            let events = q.remove(0);
+            let keys = events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+            raw_input.events.extend(events);
             // As if the window had the keyboard: egui drops a widget's
-            // focus while it has not, and the input is meant for it.
+            // focus while it has not, and the input is meant for it. The
+            // pointer alone moves no focus, as a real one does not.
             raw_input.focused = true;
-            self.focus_terminal = true;
+            if keys {
+                self.focus_terminal = true;
+            }
             ctx.request_repaint();
         }
     }
@@ -4070,6 +4312,7 @@ impl eframe::App for App {
         self.handle_dropped_files(&ctx);
         self.process_pending(&ctx);
         self.process_attach(&ctx);
+        self.process_hover(&ctx);
         self.sync_strip_asks();
         #[cfg(debug_assertions)]
         self.debug_click(&ctx);
@@ -4268,7 +4511,8 @@ impl eframe::App for App {
             // the picture below agree in every frame.
             let now = Instant::now();
             let job = self.attach.as_ref().filter(|j| j.tab == active);
-            let holding = job.is_some_and(|j| j.holds(now));
+            let holding = job.is_some_and(|j| j.holds(now))
+                || self.prearm.as_ref().is_some_and(|p| p.tab == active);
             if let Some(rt) = self.rt.get_mut(&active) {
                 update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
                 // Held (giverny#82): the picture stays the view it was, and
@@ -4316,6 +4560,7 @@ impl eframe::App for App {
                 if let Some(click) = click {
                     actions.push(Action::AgentRowClicked(active, Box::new(click)));
                 }
+                self.hover = self.agent_views.take_hover(active).map(|row| (active, row));
                 header = line;
             }
 
