@@ -387,8 +387,8 @@ pub fn run_statusline(spool: &Path) {
     println!("{}", parts.join("  ·  "));
 }
 
-/// `session: <n>`, `subagents: <n>` and `total: <n>` for the status line
-/// (giverny#22, giverny#95): this conversation's own tokens, every subagent's
+/// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the
+/// status line (giverny#22, giverny#95, giverny#133): this conversation's own tokens, every subagent's
 /// summed, and the two added, counted the way coo's `orchestrate-status`
 /// counts them (see [`crate::tokens`]).
 fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
@@ -415,9 +415,14 @@ fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
     let dirs =
         tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
     let session = tokens::session_tokens(payload, transcript.as_deref());
+    // What the session spent before its compactions: `(+<n>)` beside its own
+    // count, and in the total (giverny#133).
+    let compacted = transcript.as_deref().map_or(0, |t| {
+        tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
+    });
     let (session, subagents, total) =
-        tokens::session_subagents_total(session, &tokens::subagent_transcripts(&dirs));
-    tokens::segments(session, subagents, total)
+        tokens::session_subagents_total(session, compacted, &tokens::subagent_transcripts(&dirs));
+    tokens::segments(session, compacted, subagents, total)
 }
 
 // ---- subagentStatusLine: the agents pane's live rows ----------------------
