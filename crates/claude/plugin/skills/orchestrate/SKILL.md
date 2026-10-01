@@ -25,8 +25,11 @@ choose:
 - a **task name**: short, unique in this pass, letters, digits and `-` (`auth-fix`,
   `docs-api`, `12`). It is the row's name in the pane, and the link between the
   row and its worker.
-- a **title**: one line saying what the task is.
-- an **estimate** in minutes for how long its worker will take.
+- a **title**: one line saying what the task is. If the project types its
+  tasks, start the title with the type word and a colon (`BUG: …`,
+  `FEATURE: …`): estimates are corrected per type.
+- an **estimate** in minutes for how long its worker will take: your honest
+  guess, not one you have already adjusted.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another.
@@ -37,6 +40,23 @@ Record every task, in the order you mean to run it:
 giverny-pass plan auth-fix --eta 25 --title "Fix the token refresh race"
 giverny-pass plan docs-api --eta 15 --title "Document the new endpoints"
 ```
+
+Each `plan` (and `start --eta`) prints what the pane will count down from.
+Giverny keeps a history of every task that landed: its estimate, its wall time
+and its working time (wall time less pauses and waits). Once there are enough
+landed tasks like this one (same project and type, else same project, else
+all), your guess is scaled by how long such tasks really took against their
+estimates:
+
+```
+planned auth-fix: ~12m (you said 25m; ×0.48 from the last 9 BUG tasks in myapp)
+```
+
+The pane shows the corrected figure and the row keeps your guess, so the
+guess's own bias stays measurable. Use the corrected figure when you tell the
+user the plan. With too little history it says `as given`. Pass
+`--repo <name>` when the task belongs to a project other than the directory
+you run in.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
@@ -59,10 +79,18 @@ Then spawn **one subagent for this task** with the Agent tool:
   conversation. Include these lines, with the task name filled in:
 
   > You are the worker for task `<task>`. Work only on this task and only in the
-  > files it needs. If your estimate turns out wrong, say how many minutes are
-  > left: `giverny-pass eta <task> <minutes> --note "<why>"`. Do not run
+  > files it needs. Once you have read the code (Giverny will ask you about
+  > five minutes in), re-estimate once with how many minutes are left, even
+  > if the figure stands: `giverny-pass eta <task> <minutes> --note "<why>"`.
+  > Do the same whenever the estimate turns out wrong. When you are waiting on
+  > something that is not the work (a build slot, a lock, a person), say so
+  > with `--why wait`; your next `eta` without it ends the wait. Do not run
   > `giverny-pass start` or `giverny-pass land`; the dispatcher does. End with a
   > short report: what you did, how you checked it, and anything left undone.
+
+  About five minutes into the task, Giverny's plugin puts a request for that
+  re-estimate into the worker's context, once, unless it has re-estimated
+  already. Its answer is the `eta` command.
 
 ## 3. While it runs
 
@@ -70,7 +98,9 @@ Then spawn **one subagent for this task** with the Agent tool:
   `giverny-pass eta <task> <minutes left>`.
 - If a worker has to wait on something outside the work (a person, a quota, a
   build slot), stop its clock with `giverny-pass pause <task> --note "<why>"`
-  and restart it with `giverny-pass resume <task>`.
+  and restart it with `giverny-pass resume <task>`. Paused spans, and spans a
+  worker marked with `eta --why wait`, are left out of the working time the
+  history learns from; the pane still shows the wall time.
 - A task you decide not to do comes out of the plan: `giverny-pass drop <task>`.
 - `giverny-pass show` prints the pass as it stands.
 
