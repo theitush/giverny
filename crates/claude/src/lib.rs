@@ -16,4 +16,5 @@ pub mod subagents;
 pub mod tokens;
 pub mod transcript;
 pub mod usage;
+pub mod worker_log;
 pub mod wsl;

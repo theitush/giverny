@@ -74,6 +74,21 @@ Then spawn **one subagent for this task** with the Agent tool:
 - A task you decide not to do comes out of the plan: `giverny-pass drop <task>`.
 - `giverny-pass show` prints the pass as it stands.
 
+### Giving a worker its next task
+
+To hand a worker that knows the code its next task with `SendMessage` instead
+of spawning a new one, record the hand-off in the same breath as the message:
+
+```bash
+giverny-pass start <next task> --agent <worker's agent id>
+```
+
+That lands the worker's earlier task now, with its own measured time, and
+starts the new one with its own clock; the pane shows each task as its own row,
+and each finished row counts only the tokens spent on that task. Begin the
+message with `New task for you: <next task>`, so the pane can tell the hand-off
+apart from a mid-task note even where the `start` was missed.
+
 ## 4. Land a task
 
 When a worker reports, check its work yourself before you call it done (read

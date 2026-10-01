@@ -47,6 +47,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, PaneRow, Stage};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
+use giverny_claude::worker_log::WorkerLog;
 use giverny_core::tabs::TabId;
 use giverny_term::widget::RenderShared;
 
@@ -109,6 +110,12 @@ struct View {
     /// The pointer over the rows last frame: `Some(None)` on the pane but
     /// not on a worker's row, `Some(Some(row))` on that row (giverny#132).
     hover: Option<Option<RowClick>>,
+    /// The transcripts are due a poll (with the feed, once a [`POLL`]).
+    logs_due: bool,
+    /// Each worker's whole transcript, by agent id: its turns' tokens and
+    /// its dispatcher's messages, to split a worker that took tasks one
+    /// after another into a row per task (giverny#141).
+    logs: Logs,
 }
 
 impl View {
@@ -122,6 +129,27 @@ impl View {
         self.last_poll = Some(Instant::now());
         self.feed_session = session.map(str::to_string);
         self.feed_now = session.and_then(|sid| self.feed.poll(&feed::feed_dir(), sid).cloned());
+        self.logs_due = true;
+    }
+}
+
+/// Every worker's [`WorkerLog`], by agent id.
+pub type Logs = HashMap<String, WorkerLog>;
+
+/// Follow each worker's transcript: a new one is read whole once, a known
+/// one only for what was appended (a `stat` when nothing was). Workers no
+/// longer listed are forgotten.
+pub fn poll_logs(logs: &mut Logs, live: &[SubagentRow]) {
+    logs.retain(|id, _| live.iter().any(|l| &l.id == id));
+    for l in live {
+        let Some(path) = &l.transcript else { continue };
+        let log = logs
+            .entry(l.id.clone())
+            .or_insert_with(|| WorkerLog::new(path));
+        if log.path() != path {
+            *log = WorkerLog::new(path);
+        }
+        log.poll();
     }
 }
 
@@ -471,12 +499,23 @@ impl Table {
 /// out.
 #[cfg(any(test, debug_assertions))]
 pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
-    build_at(feed, live, now_ms, &Clock::plain())
+    build_at(feed, live, now_ms, &Clock::plain(), &Logs::new())
 }
 
-/// [`build`], with the clocks held through `clock`'s usage-limit spans.
-pub fn build_at(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64, clock: &Clock) -> Table {
-    let rows = feed::merge(feed, live);
+/// [`build`], with the clocks held through `clock`'s usage-limit spans and
+/// each worker's transcript ([`Logs`]) to give a worker that took tasks one
+/// after another a row per task (giverny#141).
+pub fn build_at(
+    feed: Option<&Feed>,
+    live: &[SubagentRow],
+    now_ms: u64,
+    clock: &Clock,
+    logs: &Logs,
+) -> Table {
+    let log = |id: &str| logs.get(id);
+    let handed = feed::with_handoffs(feed, live, log);
+    let feed = handed.as_ref().or(feed);
+    let rows = feed::merge_with(feed, live, log);
     let written = feed.and_then(|f| f.written_ms);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -596,9 +635,7 @@ fn format_row(
         Stage::Planned => String::new(),
         Stage::Running => work_s.map(stopwatch).unwrap_or_default(),
         Stage::Done => {
-            let end = f
-                .and_then(|f| f.ended_ms)
-                .or_else(|| l.filter(|l| !l.running()).and_then(|l| l.ended_ms));
+            let end = row.ended_ms();
             match (row_start, end) {
                 (Some(s), Some(e)) => {
                     stopwatch(e.saturating_sub(s).saturating_sub(error_ms(s, e)) / 1000)
@@ -631,9 +668,15 @@ fn format_row(
                 .and_then(|l| l.activity.clone())
                 .unwrap_or_default(),
         },
-        Stage::Planned => String::new(),
+        // Queued on a worker busy with another task (giverny#141).
+        Stage::Planned => row
+            .after_key
+            .as_ref()
+            .map(|k| format!("after {k}"))
+            .unwrap_or_default(),
         Stage::Done => f
             .and_then(|f| f.landing.clone())
+            .or_else(|| row.next_key.as_ref().map(|k| format!("→ {k}")))
             .or_else(|| l.and_then(|l| l.outcome).map(outcome_word))
             .unwrap_or_default(),
     };
@@ -855,7 +898,10 @@ pub fn show(
         .done_cleared_ms
         .and_then(|c| view.feed_now.as_ref().map(|f| f.without_done_by(c)));
     let feed = cleared.as_ref().or(view.feed_now.as_ref());
-    let table = build_at(feed, tracker.rows(), now, &clock);
+    if std::mem::take(&mut view.logs_due) {
+        poll_logs(&mut view.logs, tracker.rows());
+    }
+    let table = build_at(feed, tracker.rows(), now, &clock, &view.logs);
     if table.is_empty() {
         return (None, None);
     }
@@ -1689,6 +1735,218 @@ mod tests {
         let _ = std::fs::remove_dir_all(&config);
     }
 
+    // ------------------------------------------- one worker, tasks in turn ----
+
+    fn ts(ms: u64) -> String {
+        jiff::Timestamp::from_millisecond(ms as i64)
+            .unwrap()
+            .to_string()
+    }
+
+    /// A billed reply at `at`: `fresh` read new, `read` carried, `out`
+    /// written. Written in Claude Code's own key order, `type` first.
+    fn reply(id: &str, at: u64, fresh: u64, read: u64, out: u64) -> String {
+        let usage = serde_json::json!({"input_tokens": 1,
+            "cache_creation_input_tokens": fresh - 1, "cache_read_input_tokens": read,
+            "output_tokens": out});
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{id}","model":"m","usage":{usage}}}}}"#,
+            ts(at)
+        )
+    }
+
+    /// The dispatcher's `SendMessage`, as the worker's transcript has it.
+    fn sent(at: u64, body: &str) -> String {
+        serde_json::json!({"type": "user", "timestamp": ts(at), "isMeta": true,
+            "origin": {"kind": "coordinator"},
+            "message": {"role": "user", "content":
+                format!("The coordinator sent a message while you were working:\n{body}")}})
+        .to_string()
+    }
+
+    /// A worker `w` spawned at `T0 - 60m` for inbar#613, and its transcript.
+    fn reused_worker(
+        name: &str,
+        lines: &[String],
+        running: bool,
+    ) -> (PathBuf, Vec<SubagentRow>, Logs) {
+        let dir =
+            std::env::temp_dir().join(format!("giverny-pane-141-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-w.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let status = if running { "running" } else { "completed" };
+        let mut rows = live(&format!(
+            r#"{{"session_id":"s","tasks":[{{"id":"w","status":"{status}",
+                "description":"inbar#613 market SD graph","startTime":{},
+                "tokenCount":156313}}]}}"#,
+            T0 - 60 * MIN
+        ));
+        rows[0].transcript = Some(path.clone());
+        if !running {
+            rows[0].ended_ms = Some(T0 - 5 * MIN);
+        }
+        let mut logs = Logs::new();
+        poll_logs(&mut logs, &rows);
+        (dir, rows, logs)
+    }
+
+    /// The inbar#613 → #614 case as coo's feed wrote it (giverny#141): #613
+    /// landed late with no span, #614 started eight minutes after the
+    /// message, and both rows carried the worker's whole count.
+    #[test]
+    fn a_worker_handed_its_next_task_has_a_row_clock_and_count_per_task() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            reply("m2", T0 - 40 * MIN, 5_000, 20_000, 2_000),
+            sent(
+                T0 - 50 * MIN,
+                "Dispatcher note: the build is warm (coo#211).",
+            ),
+            sent(
+                T0 - 30 * MIN,
+                "New task for you, Wren Tilbury: inbar#614, the follow-up to #613.",
+            ),
+            reply("m3", T0 - 20 * MIN, 8_000, 27_000, 3_000),
+        ];
+        let (dir, rows, logs) = reused_worker("feed", &lines, true);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"inbar#614","stage":"running","agent_id":"w","started":{s614},
+                "eta_s":3600,"tokens":156313}},
+              {{"key":"inbar#616","stage":"planned","agent_id":"w","eta_s":900}},
+              {{"key":"inbar#613","stage":"done","agent_id":"w","started":{late},"ended":{late},
+                "eta_s":1200,"tokens":156313,"landing":"Review — ita"}}
+            ]}}"#,
+            s614 = T0 - 22 * MIN,
+            late = T0 - 22 * MIN - 7_000,
+        ));
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["inbar#614", "inbar#616", "inbar#613"]);
+        let (run, next, done) = (&t.lines[0], &t.lines[1], &t.lines[2]);
+        // Running: timed from the message, the worker's live count.
+        assert_eq!(run.stage, Stage::Running);
+        assert_eq!(run.elapsed, "30:00");
+        assert_eq!(run.eta, "~30m");
+        assert_eq!(run.tokens, "156.3k");
+        // Queued behind it on the same worker.
+        assert_eq!(next.stage, Stage::Planned);
+        assert_eq!(next.now, "after inbar#614");
+        // Done: from the spawn to the hand-off, and only what it added.
+        assert_eq!(done.stage, Stage::Done);
+        assert_eq!(done.elapsed, "30:00");
+        assert_eq!(done.eta, "(+10m)");
+        assert_eq!(done.now, "Review — ita");
+        assert_eq!(
+            done.tokens,
+            fmt_tokens(21_000 + 7_000),
+            "not the worker's 156.3k again"
+        );
+        for l in &t.lines {
+            assert_eq!(
+                l.click.agent_id.as_deref(),
+                Some("w"),
+                "every row opens the worker"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No feed at all: the dispatcher sent `New task for you: …` twice and
+    /// recorded nothing. Each task still gets its row, the earlier ones Done
+    /// with their own span, and the Done counts add up to what the worker
+    /// added before its current task, each turn once.
+    #[test]
+    fn hand_offs_nobody_recorded_are_read_from_the_transcript() {
+        let lines = [
+            reply("m1", T0 - 55 * MIN, 10_000, 0, 1_000),
+            sent(
+                T0 - 45 * MIN,
+                "One more thing on inbar#613: keep the old axis.",
+            ),
+            reply("m2", T0 - 44 * MIN, 2_000, 10_000, 500),
+            sent(T0 - 40 * MIN, "New task for you: inbar#614, same template."),
+            reply("m3", T0 - 30 * MIN, 4_000, 12_000, 600),
+            reply("m3", T0 - 30 * MIN, 4_000, 12_000, 900),
+            sent(T0 - 20 * MIN, "Next task: inbar#616 (the legend)."),
+            reply("m4", T0 - 10 * MIN, 3_000, 16_000, 700),
+        ];
+        let (dir, rows, logs) = reused_worker("derived", &lines, true);
+        let t = build_at(None, &rows, T0, &Clock::plain(), &logs);
+        let got: Vec<(Stage, &str, &str, &str, &str)> = t
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.stage,
+                    l.id.as_str(),
+                    l.elapsed.as_str(),
+                    l.now.as_str(),
+                    l.tokens.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Stage::Running, "inbar#616", "20:00", "", "156.3k"),
+                (Stage::Done, "inbar#613", "20:00", "→ inbar#614", "13.5k"),
+                (Stage::Done, "inbar#614", "20:00", "→ inbar#616", "4.9k"),
+            ]
+        );
+        assert!(
+            t.lines[0].no_eta,
+            "a hand-off nobody recorded has no estimate"
+        );
+        assert!(t.lines[0].title.starts_with("Next task: inbar#616"));
+        assert_eq!(
+            logs["w"].added(0, Some(T0 - 20 * MIN)),
+            11_000 + 2_500 + 4_900
+        );
+
+        // Once the worker has finished, its last task is Done too, with the rest.
+        let (dir2, rows, logs) = reused_worker("derived-done", &lines, false);
+        let t = build_at(None, &rows, T0, &Clock::plain(), &logs);
+        let last = t.lines.iter().find(|l| l.id == "inbar#616").unwrap();
+        assert_eq!((last.stage, last.elapsed.as_str()), (Stage::Done, "15:00"));
+        assert_eq!(last.tokens, "3.7k");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The top line's `subagents` and `total` are per agent, each transcript
+    /// read once: splitting a reused worker into a row per task changes
+    /// neither, and they are never the rows added up.
+    #[test]
+    fn splitting_a_reused_workers_rows_leaves_the_total_alone() {
+        use giverny_claude::tokens;
+        let lines = [
+            reply("m1", T0 - 55 * MIN, 10_000, 0, 1_000),
+            sent(T0 - 40 * MIN, "New task for you: inbar#614."),
+            reply("m2", T0 - 30 * MIN, 4_000, 10_000, 600),
+        ];
+        let (dir, rows, logs) = reused_worker("total", &lines, true);
+        let other = dir.join("agent-o.jsonl");
+        std::fs::write(&other, reply("o1", T0 - 5 * MIN, 30_000, 0, 10) + "\n").unwrap();
+        let subs = [dir.join("agent-w.jsonl"), other];
+        let before = tokens::session_subagents_total(Some(50_000), 0, &subs);
+        let one = build_at(None, &rows, T0, &Clock::plain(), &Logs::new());
+        let split = build_at(None, &rows, T0, &Clock::plain(), &logs);
+        assert_eq!(one.lines.len(), 1);
+        assert_eq!(split.lines.len(), 2, "a row per task");
+        let after = tokens::session_subagents_total(Some(50_000), 0, &subs);
+        assert_eq!(before, after);
+        // Per agent, each once: the worker's last context, the other's.
+        let w = 4_000 + 10_000;
+        assert_eq!(
+            after,
+            (Some(50_000), Some(w + 30_000), Some(50_000 + w + 30_000))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn nothing_to_show_is_no_pane() {
         assert!(build(None, &[], T0).is_empty());
@@ -1930,7 +2188,13 @@ mod tests {
         for later in [0, 20 * MIN, 59 * MIN] {
             let now = T0 + later;
             track(&mut holds, Some(&limit), now);
-            let t = build_at(Some(&f), &rows, now, &utc(&holds, Some(&limit)));
+            let t = build_at(
+                Some(&f),
+                &rows,
+                now,
+                &utc(&holds, Some(&limit)),
+                &Logs::new(),
+            );
             let l = &t.lines[0];
             assert_eq!(l.elapsed, "10:00", "{later}");
             assert_eq!(l.eta, "~20m", "{later}");
@@ -1956,13 +2220,19 @@ mod tests {
         let now = T0 + 65 * MIN;
         track(&mut holds, None, now);
         assert_eq!(holds[0].until_ms, Some(T0 + 60 * MIN));
-        let t = build_at(Some(&f), &rows, now, &utc(&holds, None));
+        let t = build_at(Some(&f), &rows, now, &utc(&holds, None), &Logs::new());
         // 10 minutes before, 5 after: the hour out is not work.
         assert_eq!(t.lines[0].elapsed, "15:00");
         assert_eq!(t.lines[0].eta, "~15m");
         assert_eq!(t.lines[0].now, "Editing");
         // A meter still showing the lapsed limit is no limit: it lets go.
-        let t = build_at(Some(&f), &rows, now, &utc(&holds, Some(&limit)));
+        let t = build_at(
+            Some(&f),
+            &rows,
+            now,
+            &utc(&holds, Some(&limit)),
+            &Logs::new(),
+        );
         assert_eq!(t.lines[0].now, "Editing");
         let mut again = holds.clone();
         track(&mut again, Some(&limit), now);
@@ -1978,7 +2248,13 @@ mod tests {
         };
         let mut holds = Vec::new();
         track(&mut holds, Some(&limit), T0);
-        let t = build_at(Some(&f), &rows, T0 + 90 * MIN, &utc(&holds, Some(&limit)));
+        let t = build_at(
+            Some(&f),
+            &rows,
+            T0 + 90 * MIN,
+            &utc(&holds, Some(&limit)),
+            &Logs::new(),
+        );
         assert_eq!(t.lines[0].elapsed, "10:00");
         assert_eq!(t.lines[0].now, "limit");
         track(&mut holds, None, T0 + 90 * MIN);
@@ -2000,7 +2276,7 @@ mod tests {
         // The live worker's own start is the true spawn; the feed's wins.
         let (rows, _) = ten_minutes_in();
         for now in [written, written + 30 * MIN, written + 3 * 60 * MIN] {
-            let t = build_at(Some(&f), &rows, now, &utc(&[], None));
+            let t = build_at(Some(&f), &rows, now, &utc(&[], None), &Logs::new());
             assert_eq!(t.lines[0].elapsed, "10:00", "{now}");
             assert_eq!(t.lines[0].eta, "~20m");
             assert_eq!(t.lines[0].now, "paused since 14:13");
@@ -2017,12 +2293,24 @@ mod tests {
             until_ms: None,
             reopens_ms: limit.reopens_ms,
         }];
-        let t = build_at(Some(&f), &rows, written + MIN, &utc(&holds, Some(&limit)));
+        let t = build_at(
+            Some(&f),
+            &rows,
+            written + MIN,
+            &utc(&holds, Some(&limit)),
+            &Logs::new(),
+        );
         assert_eq!(t.lines[0].elapsed, "10:00");
         assert_eq!(t.lines[0].now, "5h limit → 15:13");
         // A feed with no write time stops at `paused_since`.
         f.written_ms = None;
-        let t = build_at(Some(&f), &rows, T0 + 60 * MIN, &utc(&[], None));
+        let t = build_at(
+            Some(&f),
+            &rows,
+            T0 + 60 * MIN,
+            &utc(&[], None),
+            &Logs::new(),
+        );
         assert_eq!(t.lines[0].elapsed, "5:00");
     }
 
@@ -2036,7 +2324,7 @@ mod tests {
         let mut holds = Vec::new();
         track(&mut holds, Some(&limit), T0);
         for now in [T0, T0 + 45 * MIN] {
-            let t = build_at(Some(&f), &[], now, &utc(&holds, Some(&limit)));
+            let t = build_at(Some(&f), &[], now, &utc(&holds, Some(&limit)), &Logs::new());
             assert_eq!(t.lines[0].eta, "~1h3m");
             assert_eq!(t.lines[0].elapsed, "");
             assert_eq!(t.lines[0].now, "");

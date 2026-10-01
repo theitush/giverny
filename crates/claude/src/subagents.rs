@@ -1095,6 +1095,9 @@ impl crate::feed::LiveAgent for SubagentRow {
     fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
+    fn ended_ms(&self) -> Option<u64> {
+        self.ended_ms
+    }
 }
 
 /// The subagents of one tab's Claude session, Running and Done.

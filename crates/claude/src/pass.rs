@@ -261,6 +261,37 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
     row.insert("paused_s".into(), json!(total));
 }
 
+/// `start <task> --agent <worker>` on a worker already running another
+/// task: the dispatcher has handed it the next one (giverny#141), so the
+/// worker's earlier Running rows land now, each with its own measured span,
+/// and the pane gives the new task its own clock and its own tokens. A row
+/// started less than [`feed::LATER_TASK_MS`] before is not an earlier task
+/// but one of a batch the worker was spawned with (`Work #144 #145`), and
+/// keeps running. Returns the keys landed.
+fn hand_off(rows: &mut [Value], new: usize, agent: &str, now: u64) -> Vec<String> {
+    let mut landed = Vec::new();
+    for (i, row) in rows.iter_mut().enumerate() {
+        let Some(row) = row.as_object_mut() else {
+            continue;
+        };
+        let earlier = i != new
+            && row.get("agent_id").and_then(Value::as_str) == Some(agent)
+            && stage_of(row) == Some(feed::Stage::Running)
+            && ms_of(row, "started").is_some_and(|s| s.saturating_add(feed::LATER_TASK_MS) <= now);
+        if !earlier {
+            continue;
+        }
+        close_pause(row, now);
+        row.insert("stage".into(), json!("done"));
+        row.insert("ended".into(), json!(stamp(now)));
+        row.entry("landing").or_insert(json!("Done"));
+        if let Some(k) = row.get("key").and_then(Value::as_str) {
+            landed.push(k.to_string());
+        }
+    }
+    landed
+}
+
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
 /// line to print. `Show`, `Path`, `Clear` and `ClearDone` are the caller's.
 pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, String> {
@@ -327,7 +358,18 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             set_str(row, "title", &f.title);
             set_str(row, "agent_id", &f.agent);
             set_str(row, "note", &f.note);
-            Ok(msg)
+            let handed = match &f.agent {
+                Some(agent) => hand_off(rows, i, agent, now),
+                None => Vec::new(),
+            };
+            Ok(match handed.as_slice() {
+                [] => msg,
+                done => format!(
+                    "{msg}; {agent} handed on from {}",
+                    done.join(", "),
+                    agent = f.agent.as_deref().unwrap_or("")
+                ),
+            })
         }
         Cmd::Eta(_, left) => {
             let i = at.ok_or_else(missing)?;
@@ -777,6 +819,35 @@ mod tests {
         let shown = run(&dir, "show", T0 + 61 * MIN).unwrap();
         assert!(shown.contains("auth-fix"), "{shown}");
         assert!(shown.contains("(+5m)"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starting_a_workers_next_task_lands_the_one_before() {
+        let dir = scratch("handoff");
+        // Spawned with a batch of two: both run, neither closes the other.
+        run(&dir, "start a1 --agent w1", T0).unwrap();
+        run(&dir, "start a2 --agent w1", T0 + MIN).unwrap();
+        run(&dir, "start other --agent w2", T0).unwrap();
+        let f = read_feed(&dir);
+        assert!(f.rows.iter().all(|r| r.stage() == feed::Stage::Running));
+        // Forty minutes on, the dispatcher hands w1 its next task.
+        let said = run(&dir, "start b --agent w1 --eta 20", T0 + 40 * MIN).unwrap();
+        assert!(said.contains("handed on from a1, a2"), "{said}");
+        let f = read_feed(&dir);
+        let row = |k: &str| f.rows.iter().find(|r| r.key == k).unwrap();
+        for k in ["a1", "a2"] {
+            assert_eq!(row(k).stage(), feed::Stage::Done, "{k}");
+            assert_eq!(row(k).ended_ms, Some(T0 + 40 * MIN), "{k}");
+            assert_eq!(row(k).landing.as_deref(), Some("Done"));
+        }
+        assert_eq!(row("b").stage(), feed::Stage::Running);
+        assert_eq!(row("b").started_ms, Some(T0 + 40 * MIN));
+        assert_eq!(
+            row("other").stage(),
+            feed::Stage::Running,
+            "another worker's task runs on"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
