@@ -33,6 +33,8 @@ pub fn facts(line: &Line) -> String {
     }
     if !line.eta.is_empty() {
         out.push(format!("ETA {}", line.eta));
+    } else if line.no_eta {
+        out.push(crate::agents_pane::NO_ETA.to_string());
     }
     if !line.now.is_empty() {
         out.push(line.now.clone());
@@ -157,6 +159,7 @@ mod tests {
             title: "a title".into(),
             elapsed: elapsed.into(),
             eta: eta.into(),
+            no_eta: false,
             now: now.into(),
             tokens: tokens.into(),
             click: RowClick {
@@ -182,5 +185,8 @@ mod tests {
         );
         assert_eq!(facts(&line("0:04", "", "", "")), "0:04 elapsed");
         assert_eq!(facts(&line("", "", "", "")), "");
+        let mut unestimated = line("0:04", "", "", "");
+        unestimated.no_eta = true;
+        assert_eq!(facts(&unestimated), "0:04 elapsed  ·  no ETA");
     }
 }

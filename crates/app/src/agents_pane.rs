@@ -73,6 +73,13 @@ const TOK_W: usize = 6;
 const GAP: usize = 2;
 const MIN_TITLE: usize = 12;
 
+/// What a Running row's ETA cell says when nobody gave it an estimate —
+/// drawn dim, so a row the dispatcher forgot to estimate reads as missing
+/// one rather than as a blank (giverny#140).
+pub const NO_ETA: &str = "no ETA";
+/// Where in [`Cols::segments`] the ETA cell sits.
+const ETA_SEG: usize = 3;
+
 // --------------------------------------------------------- view state ----
 
 /// What the pane itself keeps per tab: the feed it last read and the text
@@ -436,6 +443,9 @@ pub struct Line {
     pub title: String,
     pub elapsed: String,
     pub eta: String,
+    /// A Running row with no estimate: `eta` is empty, and the cell is
+    /// drawn as a dim [`NO_ETA`] (giverny#140).
+    pub no_eta: bool,
     pub now: String,
     pub tokens: String,
     pub click: RowClick,
@@ -608,6 +618,7 @@ fn format_row(
             .unwrap_or_default(),
         Stage::Done => row.eta_delta_s().map(feed::fmt_delta).unwrap_or_default(),
     };
+    let no_eta = row.stage == Stage::Running && eta_s.is_none();
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
         // The limit first: a row the writer paused for it says why.
@@ -627,13 +638,20 @@ fn format_row(
             .unwrap_or_default(),
     };
     let tokens = row.tokens().map(fmt_tokens).unwrap_or_default();
-    let facts = row_facts(row.stage, &elapsed, &eta, &now, &tokens);
+    let mut facts = row_facts(row.stage, &elapsed, &eta, &now, &tokens);
+    if no_eta {
+        facts.insert(
+            1.min(facts.len()),
+            no_eta_hint(&key, l.map(|l| l.agent_id()), &title),
+        );
+    }
     Line {
         stage: row.stage,
         id,
         title,
         elapsed,
         eta,
+        no_eta,
         now,
         tokens,
         click: RowClick {
@@ -673,6 +691,42 @@ fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) ->
         Stage::Planned => [some(eta).map(|e| format!("est {e}")), None, None, None],
     };
     v.into_iter().flatten().collect()
+}
+
+/// How the dispatcher gives a Running row with no estimate one, as the
+/// overlay header says it (giverny#140): a feed row is re-estimated in
+/// place; a worker with no feed row at all needs one planned and started
+/// first, since `orchestrate-status eta` answers "nothing to re-estimate"
+/// when there is no pass.
+fn no_eta_hint(key: &str, agent_id: Option<&str>, title: &str) -> String {
+    if !key.is_empty() {
+        return format!("no ETA — add one: orchestrate-status eta {key} <min> --why scope");
+    }
+    let id = task_key(title).unwrap_or("<task>");
+    let agent = agent_id
+        .map(|a| format!(" --agent {a}"))
+        .unwrap_or_default();
+    format!(
+        "no ETA — add one: echo '{id} | <title> | 1 | <min>' | orchestrate-status plan \
+         && orchestrate-status start {id} --eta <min>{agent}"
+    )
+}
+
+/// The first `repo#n` a worker's description names (`inbar#613 market SD
+/// graph` → `inbar#613`), the id its row would be planned under.
+fn task_key(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .find(|w| {
+            w.split_once('#').is_some_and(|(repo, n)| {
+                !repo.is_empty()
+                    && repo
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "-_./".contains(c))
+                    && !n.is_empty()
+                    && n.chars().all(|c| c.is_ascii_digit())
+            })
+        })
 }
 
 fn outcome_word(o: Outcome) -> String {
@@ -1002,11 +1056,20 @@ impl Cols {
             (self.x_task, task),
             // Right-aligned: the text ends at the column's last cell.
             (right_at(self.x_el_end, &line.elapsed), line.elapsed.clone()),
-            (right_at(self.x_eta_end, &line.eta), line.eta.clone()),
+            (
+                right_at(self.x_eta_end, eta_cell(line)),
+                eta_cell(line).into(),
+            ),
             (self.x_now, cut(&line.now, NOW_W)),
             (right_at(self.x_tok_end, &line.tokens), line.tokens.clone()),
         ]
     }
+}
+
+/// The ETA cell's text: the row's own, or [`NO_ETA`] for a Running row
+/// nobody estimated.
+fn eta_cell(line: &Line) -> &str {
+    if line.no_eta { NO_ETA } else { &line.eta }
 }
 
 /// A row's text as it reads on screen, one character a cell: what a
@@ -1256,9 +1319,10 @@ fn draw_table(
             p.rect_filled(r, 0.0, sel_fill);
         }
         let top = rect.center().y - cell.y / 2.0;
-        for (at, s) in &segs[i] {
+        for (k, (at, s)) in segs[i].iter().enumerate() {
             let at = egui::pos2(rect.left() + *at as f32 * cw, top);
-            shared.paint_text(&p, at, s, color);
+            let missing = k == ETA_SEG && line.is_some_and(|l| l.no_eta);
+            shared.paint_text(&p, at, s, if missing { chrome.dim } else { color });
         }
     }
     let clicked = input
@@ -1396,6 +1460,68 @@ mod tests {
         assert_eq!(l.tokens, "64.1k");
         assert_eq!(l.eta, "");
         assert_eq!(l.click.agent_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn a_running_row_with_no_estimate_says_so() {
+        // A worker spawned outside a pass (giverny#140): a row, but no ETA.
+        let rows = live(
+            r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
+                "description":"inbar#613 market SD graph","startTime":1789999958000}]}"#,
+        );
+        let t = build(None, &rows, T0);
+        let l = &t.lines[0];
+        assert_eq!(l.eta, "", "nothing to count down");
+        assert!(l.no_eta);
+        assert_eq!(eta_cell(l), NO_ETA);
+        let drawn = compose(&Cols::new(&t, 100).segments(l));
+        assert!(drawn.contains(NO_ETA), "{drawn}");
+        assert_eq!(Cols::new(&t, 100).segments(l)[ETA_SEG].1, NO_ETA);
+        let hint = &l.click.facts[1];
+        assert!(hint.starts_with("no ETA — add one:"), "{hint}");
+        assert!(
+            hint.contains("orchestrate-status start inbar#613 --eta <min> --agent a1"),
+            "{hint}"
+        );
+        assert!(hint.contains("echo 'inbar#613 | <title> | 1 | <min>' | orchestrate-status plan"));
+
+        // A feed row with no estimate is re-estimated in place.
+        let f = feed(
+            r#"{"rows":[{"key":"g#3","stage":"running","agent_id":"a1",
+               "started":1789999400000}]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        assert!(t.lines[0].no_eta);
+        assert!(
+            t.lines[0]
+                .click
+                .facts
+                .contains(&"no ETA — add one: orchestrate-status eta g#3 <min> --why scope".into())
+        );
+    }
+
+    #[test]
+    fn only_a_running_row_misses_an_estimate() {
+        let f = feed(
+            r#"{"rows":[
+              {"key":"g#1","stage":"running","started":1789999400000,"eta_s":1800},
+              {"key":"g#2","stage":"planned"},
+              {"key":"g#3","stage":"done","started":1789990000000,"ended":1789993900000}]}"#,
+        );
+        let t = build(Some(&f), &[], T0);
+        assert!(t.lines.iter().all(|l| !l.no_eta));
+        assert!(t.lines[0].click.facts.iter().all(|x| !x.contains(NO_ETA)));
+    }
+
+    #[test]
+    fn a_task_key_is_the_first_repo_and_number_named() {
+        assert_eq!(task_key("inbar#613 market SD graph"), Some("inbar#613"));
+        assert_eq!(
+            task_key("Work theitush/giverny#82: x"),
+            Some("theitush/giverny#82")
+        );
+        assert_eq!(task_key("fix #12 and coo#3"), Some("coo#3"));
+        assert_eq!(task_key("Fix the board"), None);
     }
 
     #[test]
