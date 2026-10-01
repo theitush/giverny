@@ -1834,6 +1834,7 @@ mod tests {
         // Queued behind it on the same worker.
         assert_eq!(next.stage, Stage::Planned);
         assert_eq!(next.now, "after inbar#614");
+        assert_eq!(next.tokens, "", "nothing spent on a task before it starts");
         // Done: from the spawn to the hand-off, and only what it added.
         assert_eq!(done.stage, Stage::Done);
         assert_eq!(done.elapsed, "30:00");
@@ -1851,7 +1852,38 @@ mod tests {
                 "every row opens the worker"
             );
         }
+
+        // The next task is sent and nobody runs `start`: the queued row is
+        // the worker's from the message, and #614 is Done there.
+        let more = [sent(
+            T0 - 10 * MIN,
+            "New task for you: inbar#616, the legend.",
+        )];
+        let (dir2, rows, logs) =
+            reused_worker("feed-next", &[&lines[..], &more[..]].concat(), true);
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got: Vec<(Stage, &str, &str, &str)> = t
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.stage,
+                    l.id.as_str(),
+                    l.elapsed.as_str(),
+                    l.tokens.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Stage::Running, "inbar#616", "10:00", "156.3k"),
+                (Stage::Done, "inbar#614", "20:00", "11k"),
+                (Stage::Done, "inbar#613", "30:00", "28k"),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// No feed at all: the dispatcher sent `New task for you: …` twice and

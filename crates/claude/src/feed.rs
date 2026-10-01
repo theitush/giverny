@@ -605,6 +605,11 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         if let Some(t) = self.task_tokens {
             return t;
         }
+        // Nothing is spent on a task before it starts, whoever it is
+        // queued on (giverny#141).
+        if self.stage == Stage::Planned {
+            return None;
+        }
         self.live
             .and_then(|l| l.tokens())
             .or_else(|| self.feed.and_then(|f| f.tokens))
@@ -865,8 +870,10 @@ pub fn with_handoffs<'w, L: LiveAgent>(
         let id = l.agent_id();
         let is_held = |doc: &Feed| {
             let rows = merge(Some(doc), live);
+            // A Planned row is waiting, not held: the hand-off is what
+            // starts it.
             rows.iter()
-                .filter(|r| r.live.is_some_and(|x| x.agent_id() == id))
+                .filter(|r| r.stage != Stage::Planned && r.live.is_some_and(|x| x.agent_id() == id))
                 .filter_map(|r| r.feed.map(|f| f.key.clone()))
                 .collect::<Vec<_>>()
         };
