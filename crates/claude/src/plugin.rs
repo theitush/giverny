@@ -27,7 +27,12 @@
 //!   carries a `SessionStart` hook (`hooks/hooks.json`) whose command prints
 //!   `hooks/orchestrate-by-default.json`: an `additionalContext` telling the
 //!   session to run anything longer than about a minute as a pass of
-//!   subagents. Off, both files are pruned like any other stale file.
+//!   subagents. Off, that hook and its reply are pruned like any other
+//!   stale file.
+//! - Always, `hooks/hooks.json` also carries a `PostToolUse` hook running
+//!   `giverny-pass nudge` (giverny#143): five minutes into a worker's task it
+//!   asks that worker, once, for a fresh estimate. It returns at once for
+//!   any call that is not a subagent's.
 //!
 //! The settings keys follow the house rules the other agents-pane key does
 //! (giverny#68): written only with `claude.agents_pane` on, never over a
@@ -79,22 +84,36 @@ fn wrapper(exes: &[String]) -> String {
     )
 }
 
-/// `hooks/hooks.json`: on `SessionStart` (a new session, `/clear`, and after
-/// a compaction, which is when the context is fresh), print the reply that
-/// carries [`ORCHESTRATE_BY_DEFAULT`]. `cat` of a file Claude Code parses
-/// itself, so nothing is escaped by a shell.
-fn session_hooks() -> Value {
-    json!({
-        "description": "Giverny: orchestrate by default (claude.orchestrate_by_default)",
-        "hooks": {
-            "SessionStart": [{
-                "matcher": "startup|clear|compact",
-                "hooks": [{
-                    "type": "command",
-                    "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/orchestrate-by-default.json\""
-                }]
+/// `hooks/hooks.json`. Always a `PostToolUse` hook, `giverny-pass nudge`,
+/// which asks a worker five minutes into its task for a fresh estimate
+/// (giverny#143); quiet and exit 0 whatever happens. With `orchestrate`,
+/// also on `SessionStart` (a new session, `/clear`, and after a compaction,
+/// which is when the context is fresh) print the reply that carries
+/// [`ORCHESTRATE_BY_DEFAULT`]: `cat` of a file Claude Code parses itself, so
+/// nothing is escaped by a shell.
+fn session_hooks(orchestrate: bool) -> Value {
+    let mut hooks = json!({
+        "PostToolUse": [{
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-pass\" nudge 2>/dev/null || true"
             }]
-        }
+        }]
+    });
+    if orchestrate {
+        hooks["SessionStart"] = json!([{
+            "matcher": "startup|clear|compact",
+            "hooks": [{
+                "type": "command",
+                "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/orchestrate-by-default.json\""
+            }]
+        }]);
+    }
+    json!({
+        "description": "Giverny: re-estimate prompts for workers, and orchestrate by default \
+                        (claude.orchestrate_by_default)",
+        "hooks": hooks
     })
 }
 
@@ -152,13 +171,13 @@ pub fn files(exes: &[String], orchestrate: bool) -> Vec<(&'static str, String, b
             false,
         ),
         ("plugins/giverny/bin/giverny-pass", wrapper(exes), true),
+        (
+            "plugins/giverny/hooks/hooks.json",
+            pretty(&session_hooks(orchestrate)),
+            false,
+        ),
     ];
     if orchestrate {
-        out.push((
-            "plugins/giverny/hooks/hooks.json",
-            pretty(&session_hooks()),
-            false,
-        ));
         out.push((
             "plugins/giverny/hooks/orchestrate-by-default.json",
             pretty(&session_reply()),
@@ -487,7 +506,12 @@ mod tests {
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
         let reply = d.join("plugins/giverny/hooks/orchestrate-by-default.json");
         assert!(sync(&d, &exes, false).unwrap());
-        assert!(!hooks.exists() && !reply.exists(), "off, no hook at all");
+        assert!(!reply.exists(), "off, no SessionStart reply");
+        let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
+        assert!(
+            h["hooks"].get("SessionStart").is_none(),
+            "off, no SessionStart hook"
+        );
         assert!(sync(&d, &exes, true).unwrap());
         assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
 
@@ -517,8 +541,41 @@ mod tests {
         }
 
         assert!(sync(&d, &exes, false).unwrap());
-        assert!(!hooks.exists() && !reply.exists(), "off prunes the hook");
-        assert!(!d.join("plugins/giverny/hooks").exists());
+        assert!(!reply.exists(), "off prunes the reply");
+        let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
+        assert!(
+            h["hooks"].get("SessionStart").is_none(),
+            "and the SessionStart hook"
+        );
+        assert!(remove_dir(&d).unwrap());
+    }
+
+    #[test]
+    fn the_re_estimate_hook_is_always_there_and_quiet() {
+        let d = scratch("nudge").join(DIR_NAME);
+        // A wrapper naming no binary at all: the hook still exits 0, silent.
+        assert!(sync(&d, &["/nonexistent/giverny".into()], false).unwrap());
+        let h: Value = serde_json::from_slice(
+            &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let post = &h["hooks"]["PostToolUse"][0];
+        assert_eq!(post["matcher"], "*");
+        let cmd = post["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("giverny-pass\" nudge"), "{cmd}");
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("CLAUDE_PLUGIN_ROOT", d.join("plugins/giverny"))
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+        }
         assert!(remove_dir(&d).unwrap());
     }
 

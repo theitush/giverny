@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
-use crate::feed;
+use crate::{feed, pass_history};
 
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/pass";
@@ -31,12 +31,14 @@ pub const SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 pub const USAGE: &str = "\
 usage: giverny pass <command> [args] [--session <id>]
 
-  plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE]
+  plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE] [--repo R]
                               queue a task (a Next up row) with its estimate
-  start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N]
+  start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N] [--repo R]
                               the task's worker is starting now (Running)
-  eta   <task> <dur left> [--note N]
-                              re-estimate: this much is left from now
+  eta   <task> <dur left> [--note N] [--why wait|blocked|scope|load|ready]
+                              re-estimate: this much is left from now;
+                              --why wait (or blocked) marks the worker waiting
+                              until its next eta, and that span is not work
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
@@ -50,7 +52,15 @@ usage: giverny pass <command> [args] [--session <id>]
 <task> is any short name (`auth-fix`, `#12`); name it, as a whole word, in the
 worker's spawn description too. <dur> is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
 The session is --session, else $CLAUDE_CODE_SESSION_ID (set inside Claude Code).
-The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.";
+The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.
+
+Estimates learn (giverny#143): every landed task appends its estimate, wall time
+and working time (wall minus pauses and waits) to history.jsonl beside the feeds
+($GIVERNY_PASS_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
+scale N by the median working-time/estimate ratio of recent tasks of the same
+kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
+pane counts down from that, and both figures are printed. `nudge` is the
+plugin's hook: it asks a worker to re-estimate five minutes into its task.";
 
 /// One `giverny pass` command, parsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +76,8 @@ pub enum Cmd {
     Path,
     ClearDone,
     Clear,
+    /// The plugin's `PostToolUse` hook: a hook payload on stdin.
+    Nudge,
 }
 
 /// The flags any command may carry.
@@ -79,6 +91,14 @@ pub struct Flags {
     pub outcome: Option<String>,
     pub review: Option<String>,
     pub session: Option<String>,
+    /// `eta --why`: `wait` / `blocked` open a waiting span.
+    pub why: Option<String>,
+    /// The repo the task is from, when the key and directory do not say.
+    pub repo: Option<String>,
+    /// Set by [`run_in`], not parsed: the guess as given, before correction,
+    /// and where the correction came from.
+    pub guess_s: Option<u64>,
+    pub basis: Option<String>,
 }
 
 /// `25` (minutes), `25m`, `90s`, `1h30m`, `1.5h` → seconds.
@@ -134,6 +154,8 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--outcome" => flags.outcome = Some(val("--outcome")?),
             "--review" => flags.review = Some(val("--review")?),
             "--session" => flags.session = Some(val("--session")?),
+            "--why" => flags.why = Some(val("--why")?),
+            "--repo" => flags.repo = Some(val("--repo")?),
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => pos.push(a.clone()),
@@ -169,6 +191,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "path" => Cmd::Path,
         "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
         "clear" => Cmd::Clear,
+        "nudge" => Cmd::Nudge,
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     if matches!(cmd, Cmd::Plan(_)) && flags.eta_s.is_none() {
@@ -177,13 +200,13 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
     Ok((cmd, flags))
 }
 
-fn stamp(ms: u64) -> String {
+pub(crate) fn stamp(ms: u64) -> String {
     jiff::Timestamp::from_second((ms / 1000) as i64)
         .map(|t| t.to_string())
         .unwrap_or_default()
 }
 
-fn ms_of(row: &Map<String, Value>, key: &str) -> Option<u64> {
+pub(crate) fn ms_of(row: &Map<String, Value>, key: &str) -> Option<u64> {
     match row.get(key)? {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s
@@ -195,11 +218,11 @@ fn ms_of(row: &Map<String, Value>, key: &str) -> Option<u64> {
     }
 }
 
-fn u64_of(row: &Map<String, Value>, key: &str) -> Option<u64> {
+pub(crate) fn u64_of(row: &Map<String, Value>, key: &str) -> Option<u64> {
     row.get(key).and_then(Value::as_u64)
 }
 
-fn stage_of(row: &Map<String, Value>) -> Option<feed::Stage> {
+pub(crate) fn stage_of(row: &Map<String, Value>) -> Option<feed::Stage> {
     row.get("stage")
         .and_then(Value::as_str)
         .and_then(feed::Stage::parse)
@@ -261,6 +284,36 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
     row.insert("paused_s".into(), json!(total));
 }
 
+/// Is this `--why` the worker saying it is waiting rather than working?
+fn is_wait(why: Option<&str>) -> bool {
+    why.is_some_and(|w| {
+        let w = w.trim().to_ascii_lowercase();
+        w == "wait" || w == "waiting" || w == "blocked"
+    })
+}
+
+/// Close an open waiting span at `now`: its length goes to `wait_s`, which
+/// the history takes off the task's working time (giverny#143). The pane's
+/// clock is not moved: a wait is still wall time.
+fn close_wait(row: &mut Map<String, Value>, now: u64) {
+    let Some(since) = ms_of(row, "waiting_since") else {
+        return;
+    };
+    row.remove("waiting_since");
+    let total = u64_of(row, "wait_s").unwrap_or(0) + now.saturating_sub(since) / 1000;
+    row.insert("wait_s".into(), json!(total));
+}
+
+/// Record the guess as given beside the (perhaps corrected) `eta_s`.
+fn set_guess(row: &mut Map<String, Value>, f: &Flags) {
+    let Some(eta) = f.eta_s else { return };
+    row.insert("eta_guess_s".into(), json!(f.guess_s.unwrap_or(eta)));
+    match &f.basis {
+        Some(b) => row.insert("eta_basis".into(), json!(b)),
+        None => row.remove("eta_basis"),
+    };
+}
+
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
 /// line to print. `Show`, `Path`, `Clear` and `ClearDone` are the caller's.
 pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, String> {
@@ -273,7 +326,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Pause(k)
         | Cmd::Resume(k)
         | Cmd::Drop(k) => k.clone(),
-        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone => return Ok(String::new()),
+        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone | Cmd::Nudge => {
+            return Ok(String::new());
+        }
     };
     let at = find(rows, &key);
     let stage = at.and_then(|i| rows[i].as_object().and_then(stage_of));
@@ -294,9 +349,11 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
             row.insert("stage".into(), json!("planned"));
             row.insert("eta_s".into(), json!(f.eta_s.unwrap_or(0)));
+            set_guess(row, f);
             set_str(row, "title", &f.title);
             set_str(row, "note", &f.note);
             set_str(row, "brief", &f.brief);
+            set_str(row, "repo", &f.repo);
             Ok(format!("planned {key}"))
         }
         Cmd::Start(_) => {
@@ -316,7 +373,15 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             } else {
                 row.insert("stage".into(), json!("running"));
                 row.insert("started".into(), json!(stamp(now)));
-                for k in ["ended", "paused_since", "paused_s", "spawned"] {
+                for k in [
+                    "ended",
+                    "paused_since",
+                    "paused_s",
+                    "spawned",
+                    "waiting_since",
+                    "wait_s",
+                    "reestimate_asked",
+                ] {
                     row.remove(k);
                 }
                 format!("started {key}")
@@ -324,6 +389,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             if let Some(eta) = f.eta_s {
                 row.insert("eta_s".into(), json!(eta));
             }
+            set_guess(row, f);
+            set_str(row, "repo", &f.repo);
             set_str(row, "title", &f.title);
             set_str(row, "agent_id", &f.agent);
             set_str(row, "note", &f.note);
@@ -349,12 +416,22 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             }
             row.insert("eta_s".into(), json!(eta));
             set_str(row, "note", &f.note);
+            if stage == Some(feed::Stage::Running) {
+                if is_wait(f.why.as_deref()) {
+                    if !row.contains_key("waiting_since") && !row.contains_key("paused_since") {
+                        row.insert("waiting_since".into(), json!(stamp(now)));
+                    }
+                } else {
+                    close_wait(row, now);
+                }
+            }
             Ok(format!("{key}: ~{} left", feed::fmt_span(*left as i64)))
         }
         Cmd::Land(_) => {
             let i = at.ok_or_else(missing)?;
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
             close_pause(row, now);
+            close_wait(row, now);
             if !row.contains_key("started") {
                 // Landed without ever being started: its span is unknown, so
                 // it gets no delta rather than a made-up one.
@@ -390,6 +467,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                 return Err(format!("`{key}` is not running"));
             }
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+            // A pause supersedes a wait: the span is counted once, as paused.
+            close_wait(row, now);
             if !row.contains_key("paused_since") {
                 row.insert("paused_since".into(), json!(stamp(now)));
                 row.entry("paused_s").or_insert(json!(0));
@@ -409,7 +488,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             rows.remove(i);
             Ok(format!("dropped {key}"))
         }
-        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone => unreachable!(),
+        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone | Cmd::Nudge => unreachable!(),
     }
 }
 
@@ -451,9 +530,14 @@ pub fn show(doc: &Value, now: u64) -> String {
                         }
                     )
                 }
-                feed::Stage::Planned => eta
-                    .map(|e| format!("~{}", feed::fmt_span(e as i64)))
-                    .unwrap_or_default(),
+                feed::Stage::Planned => {
+                    let guess = u64_of(r, "eta_guess_s")
+                        .filter(|g| Some(*g) != eta)
+                        .map(|g| format!(" (said {})", feed::fmt_span(g as i64)))
+                        .unwrap_or_default();
+                    eta.map(|e| format!("~{}{guess}", feed::fmt_span(e as i64)))
+                        .unwrap_or_default()
+                }
                 feed::Stage::Done => {
                     let took = started
                         .zip(ms_of(r, "ended"))
@@ -485,10 +569,10 @@ pub fn show(doc: &Value, now: u64) -> String {
 /// A lock beside the feed, so concurrent `giverny pass` runs (a dispatcher
 /// and its workers) never lose each other's rows. Taken with `create_new`;
 /// one left behind by a killed run is broken after ten seconds.
-struct Lock(PathBuf);
+pub(crate) struct Lock(PathBuf);
 
 impl Lock {
-    fn take(file: &Path) -> Result<Lock, String> {
+    pub(crate) fn take(file: &Path) -> Result<Lock, String> {
         let lock = file.with_extension("json.lock");
         for _ in 0..100 {
             match std::fs::OpenOptions::new()
@@ -594,11 +678,140 @@ pub fn run_in(
             obj.insert("writer".into(), json!(WRITER));
             obj.entry("version").or_insert(json!(feed::FEED_VERSION));
             obj.entry("session").or_insert(json!(session));
-            let msg = apply(&mut doc, cmd, flags, now)?;
+            let history = pass_history::path(dir);
+            let mut flags = flags.clone();
+            let said = correct_estimate(&doc, cmd, &mut flags, history.as_deref());
+            let before = done_keys(&doc);
+            let msg = apply(&mut doc, cmd, &flags, now)?;
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
-            Ok(msg)
+            if let Some(h) = &history {
+                learn(&doc, &before, session, h);
+            }
+            Ok(match said {
+                Some(said) => format!("{msg}: {said}"),
+                None => msg,
+            })
         }
     }
+}
+
+/// `plan`/`start` with `--eta N`: scale N from the history (giverny#143).
+/// Sets `flags.eta_s` to the corrected figure, keeping N as `guess_s`, and
+/// fills in the repo the row will remember. Returns the line telling the
+/// dispatcher both numbers, or `None` for a command with no estimate.
+fn correct_estimate(
+    doc: &Value,
+    cmd: &Cmd,
+    flags: &mut Flags,
+    history: Option<&Path>,
+) -> Option<String> {
+    let (Cmd::Plan(key) | Cmd::Start(key)) = cmd else {
+        return None;
+    };
+    let guess = flags.eta_s?;
+    let row = doc
+        .get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| find(rows, key).map(|i| &rows[i]))
+        .and_then(Value::as_object);
+    let row_str = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
+    if flags.repo.is_none() {
+        flags.repo = row_str("repo").map(String::from).or_else(|| {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            pass_history::repo_of(key, &cwd)
+        });
+    }
+    let title = flags.title.as_deref().or(row_str("title")).unwrap_or("");
+    let kind = pass_history::kind_of(title);
+    let past = history.map(pass_history::load).unwrap_or_default();
+    let fix = pass_history::correct(&past, flags.repo.as_deref(), kind.as_deref(), guess);
+    flags.guess_s = Some(guess);
+    let span = |s: u64| feed::fmt_span(s as i64);
+    Some(match fix {
+        Some(c) => {
+            flags.eta_s = Some(c.eta_s);
+            flags.basis = Some(c.describe());
+            format!(
+                "~{} (you said {}; {})",
+                span(c.eta_s),
+                span(guess),
+                c.describe()
+            )
+        }
+        None => {
+            flags.basis = None;
+            let n = past.len();
+            format!(
+                "~{} as given ({} landed task{} in the history, too few to correct it)",
+                span(guess),
+                n,
+                if n == 1 { "" } else { "s" }
+            )
+        }
+    })
+}
+
+/// The keys of the Done rows in a feed document.
+fn done_keys(doc: &Value) -> Vec<String> {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter(|r| stage_of(r) == Some(feed::Stage::Done))
+        .filter_map(|r| r.get("key").and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
+/// Append every row that landed in this command (Done now, not before) to
+/// the history. A row that never started has no span and teaches nothing.
+fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
+    let rows = doc.get("rows").and_then(Value::as_array);
+    for r in rows.into_iter().flatten().filter_map(Value::as_object) {
+        let Some(key) = r.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        if stage_of(r) != Some(feed::Stage::Done) || before.iter().any(|k| k == key) {
+            continue;
+        }
+        if let Some(rec) = record_of(r, session)
+            && let Err(e) = pass_history::append(history, &rec)
+        {
+            eprintln!("giverny pass: {}: {e}", history.display());
+        }
+    }
+}
+
+/// A landed row as a history record: wall time from its true start
+/// (`spawned` when a pause moved `started` on), working time that less its
+/// paused and waiting spans.
+pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<pass_history::Record> {
+    let started = ms_of(r, "spawned").or_else(|| ms_of(r, "started"))?;
+    let ended = ms_of(r, "ended")?;
+    let wall_s = ended.saturating_sub(started) / 1000;
+    let paused_s = u64_of(r, "paused_s").unwrap_or(0);
+    let wait_s = u64_of(r, "wait_s").unwrap_or(0);
+    let s = |k: &str| r.get(k).and_then(Value::as_str).map(String::from);
+    let title = s("title");
+    Some(pass_history::Record {
+        key: s("key").unwrap_or_default(),
+        kind: title.as_deref().and_then(pass_history::kind_of),
+        title,
+        repo: s("repo"),
+        session: Some(session.to_string()),
+        estimate_s: u64_of(r, "eta_guess_s")
+            .or_else(|| u64_of(r, "eta_first_s"))
+            .or_else(|| u64_of(r, "eta_s")),
+        eta_s: u64_of(r, "eta_first_s").or_else(|| u64_of(r, "eta_s")),
+        eta_final_s: u64_of(r, "eta_s"),
+        wall_s,
+        paused_s,
+        wait_s,
+        work_s: wall_s.saturating_sub(paused_s + wait_s),
+        started: Some(stamp(started)),
+        ended: Some(stamp(ended)),
+        outcome: s("landing"),
+    })
 }
 
 /// `clear-done` on the file: drop its Done rows when this writer owns it.
@@ -647,6 +860,17 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
             return 2;
         }
     };
+    if cmd == Cmd::Nudge {
+        // A hook: whatever happens, it never fails the tool call it rides on.
+        let mut input = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+        if let Ok(payload) = serde_json::from_str::<Value>(&input)
+            && let Some(out) = crate::pass_nudge::run(&payload, &feed::feed_dir(), now_ms())
+        {
+            println!("{out}");
+        }
+        return 0;
+    }
     let session = flags
         .session
         .clone()
@@ -910,6 +1134,139 @@ mod tests {
         );
         assert_eq!(parse_args(&args("clear-done")).unwrap().0, Cmd::ClearDone);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn history(dir: &Path) -> Vec<pass_history::Record> {
+        pass_history::load(&dir.join(pass_history::FILE))
+    }
+
+    #[test]
+    fn plan_and_start_correct_the_guess_from_history_and_keep_it() {
+        let dir = scratch("correct");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = dir.join(pass_history::FILE);
+        // Five landed giverny BUGs that took half their guess, and five
+        // FEATUREs that took a quarter.
+        for (kind, work) in [("BUG", 15), ("FEATURE", 10)] {
+            for _ in 0..pass_history::MIN_SAMPLES {
+                let rec = pass_history::Record {
+                    key: "x".into(),
+                    repo: Some("giverny".into()),
+                    kind: Some(kind.into()),
+                    estimate_s: Some(if kind == "BUG" { 1800 } else { 2400 }),
+                    wall_s: work * 60,
+                    work_s: work * 60,
+                    outcome: Some("Done".into()),
+                    ..Default::default()
+                };
+                pass_history::append(&h, &rec).unwrap();
+            }
+        }
+        let (cmd, mut flags) = parse_args(&args("plan giverny#1 --eta 40")).unwrap();
+        flags.title = Some("BUG: pane flickers".into());
+        let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
+        assert_eq!(
+            said,
+            "planned giverny#1: ~20m (you said 40m; ×0.50 from the last 5 BUG tasks in giverny)"
+        );
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
+        let row = &doc["rows"][0];
+        assert_eq!(
+            row["eta_s"], 1200,
+            "the pane counts down from the corrected figure"
+        );
+        assert_eq!(row["eta_guess_s"], 2400, "the raw guess is kept");
+        assert_eq!(row["repo"], "giverny");
+        assert!(run(&dir, "show", T0).unwrap().contains("~20m (said 40m)"));
+
+        // `start --eta` re-corrects; a FEATURE title picks its own level.
+        let (cmd, mut flags) = parse_args(&args("start giverny#2 --eta 40")).unwrap();
+        flags.title = Some("FEATURE: estimates".into());
+        let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
+        assert!(
+            said.ends_with("~10m (you said 40m; ×0.25 from the last 5 FEATURE tasks in giverny)"),
+            "{said}"
+        );
+
+        // Another repo: everything (0.25 ×5, 0.5 ×5 → 0.375).
+        let said = run(&dir, "plan inbar#3 --eta 40", T0).unwrap();
+        assert!(
+            said.ends_with("~15m (you said 40m; ×0.38 from the last 10 tasks)"),
+            "{said}"
+        );
+
+        // No history: the guess stands, and says so.
+        let empty = scratch("correct-empty");
+        let said = run(&empty, "plan a --eta 40", T0).unwrap();
+        assert!(said.contains("~40m as given (0 landed tasks"), "{said}");
+        let r = &read_feed(&empty).rows[0];
+        assert_eq!(r.eta_s, Some(2400));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn land_appends_wall_and_working_time_without_waits_or_pauses() {
+        let dir = scratch("learn");
+        let (cmd, mut flags) = parse_args(&args("start giverny#9 --eta 30")).unwrap();
+        flags.title = Some("FEATURE: x".into());
+        run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
+        // 10m work, then 20m waiting on a build slot, then 5m work…
+        run(
+            &dir,
+            "eta giverny#9 30 --why wait --note slot",
+            T0 + 10 * MIN,
+        )
+        .unwrap();
+        run(&dir, "eta giverny#9 20 --why ready", T0 + 30 * MIN).unwrap();
+        // …a 15m pause (a wait open across it is closed by the pause)…
+        run(&dir, "eta giverny#9 15 --why blocked", T0 + 35 * MIN).unwrap();
+        run(&dir, "pause giverny#9", T0 + 40 * MIN).unwrap();
+        run(&dir, "resume giverny#9", T0 + 55 * MIN).unwrap();
+        // …and 5m more work.
+        run(&dir, "land giverny#9", T0 + 60 * MIN).unwrap();
+        let h = history(&dir);
+        assert_eq!(h.len(), 1);
+        let r = &h[0];
+        assert_eq!(r.key, "giverny#9");
+        assert_eq!(r.repo.as_deref(), Some("giverny"));
+        assert_eq!(r.kind.as_deref(), Some("FEATURE"));
+        assert_eq!(r.estimate_s, Some(1800), "the guess as given");
+        assert_eq!(r.eta_s, Some(1800), "the first figure the pane showed");
+        assert_eq!(r.wall_s, 60 * 60, "wall time runs from the true start");
+        assert_eq!(r.paused_s, 15 * 60);
+        assert_eq!(r.wait_s, 25 * 60, "20m waiting, then 5m blocked");
+        assert_eq!(r.work_s, 20 * 60);
+        assert_eq!(r.outcome.as_deref(), Some("Done"));
+
+        // A wait left open at landing ends there; a row never started, and a
+        // second `land`, append nothing.
+        run(&dir, "start b --eta 10", T0).unwrap();
+        run(&dir, "eta b 5 --why wait", T0 + 4 * MIN).unwrap();
+        run(&dir, "land b", T0 + 10 * MIN).unwrap();
+        run(&dir, "plan c --eta 10", T0).unwrap();
+        run(&dir, "land c", T0 + 10 * MIN).unwrap();
+        run(&dir, "land b", T0 + 11 * MIN).unwrap();
+        let h = history(&dir);
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            (h[1].key.as_str(), h[1].wait_s, h[1].work_s),
+            ("b", 360, 240)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_history_variable_turns_learning_off() {
+        // Only the pure parts: the env var is process-wide, so the path is
+        // checked through `pass_history::path` rather than by running.
+        assert_eq!(
+            pass_history::path(Path::new("/f")),
+            std::env::var_os(pass_history::ENV)
+                .map(|v| (!v.is_empty()).then(|| PathBuf::from(v)))
+                .unwrap_or(Some(PathBuf::from("/f/history.jsonl")))
+        );
     }
 
     #[test]
