@@ -50,7 +50,7 @@
     ]
   },
   "statusLine": {
-    "command": "/home/ita/coo/tools/orchestrate-status statusline",
+    "command": "/home/ita/giverny/.claude/statusline",
     "type": "command",
     "refreshInterval": 5
   }

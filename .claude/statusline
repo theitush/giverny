@@ -1,0 +1,18 @@
+#!/bin/sh
+# This repo's status line (giverny#153). In a Giverny tab it is Giverny's own
+# `statusline` and nothing else: no Python, no orchestrate-status. That
+# wrapper only passed the bytes through to Giverny there (coo#209) and then
+# refreshed a coo pass's feed, which this repo no longer runs in a Giverny
+# tab — `giverny pass` writes the pane's feed and the pane counts tokens
+# itself (coo#212). Its render cost ~2.5-4.5 s, mostly Python recompiling a
+# 7800-line script; this costs what `giverny statusline` costs.
+#
+# Outside a Giverny tab, or with ORCHESTRATE_GIVERNY=0, the coo panel is
+# unchanged. The binary is integ's release build, the one path CLAUDE.md says
+# never moves (giverny#148); without it we fall back to the coo wrapper rather
+# than guess at a `giverny` on PATH.
+if [ -n "$GIVERNY_TAB_ID" ] && [ "${ORCHESTRATE_GIVERNY:-}" != 0 ]; then
+  g=/home/ita/giverny/.claude/worktrees/integ/target/release/giverny
+  if [ -x "$g" ]; then exec "$g" statusline 2>/dev/null; fi
+fi
+exec /home/ita/coo/tools/orchestrate-status statusline
