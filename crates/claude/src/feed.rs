@@ -18,6 +18,8 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::worker_log::{self, WorkerLog};
+
 /// The feed format this build reads. Bumped only by an *incompatible* change;
 /// new fields are added without a bump, and readers ignore what they do not
 /// know.
@@ -430,6 +432,10 @@ pub trait LiveAgent {
     fn description(&self) -> Option<&str> {
         None
     }
+    /// When it finished, if it has.
+    fn ended_ms(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Does `text` name `key` as a whole word? `giverny#82` is named by
@@ -463,6 +469,52 @@ pub struct PaneRow<'a, L> {
     /// Same worker as the row directly above: draw its per-worker cells
     /// (agent, elapsed, tokens, activity) as `"`.
     pub ditto: bool,
+    /// When this row's task reached its worker, where the worker's own
+    /// transcript says so: the dispatcher's message naming it, if that came
+    /// before the feed's `started` (giverny#141).
+    pub handed_ms: Option<u64>,
+    /// The start of the same worker's next task, and its key: this row's
+    /// task ended there at the latest (giverny#141).
+    pub next_ms: Option<u64>,
+    pub next_key: Option<String>,
+    /// One of a worker's tasks taken one after another: what this task
+    /// spent, the turns from its hand-off to the next one's. `Some(None)`
+    /// when the transcript could not be read: never the worker's whole
+    /// count, which every such row would repeat (giverny#141).
+    pub task_tokens: Option<Option<u64>>,
+    /// A Planned row queued on a worker busy with another task: that task.
+    pub after_key: Option<String>,
+    /// Which of its worker's tasks-in-turn this row is (`0` for a worker
+    /// that took its tasks at once): rows of one batch share the worker's
+    /// cells and are dittoed, rows of different ones never are.
+    pub batch: usize,
+}
+
+impl<L> PaneRow<'_, L> {
+    /// A row with nothing in it, for `..PaneRow::bare()`.
+    fn bare() -> Self {
+        PaneRow {
+            stage: Stage::Planned,
+            feed: None,
+            live: None,
+            ditto: false,
+            handed_ms: None,
+            next_ms: None,
+            next_key: None,
+            task_tokens: None,
+            after_key: None,
+            batch: 0,
+        }
+    }
+}
+
+/// How far a writer moved a row's `started` on for its pauses
+/// (`started − spawned`, else `paused_s`, coo#170).
+fn moved_ms(f: &FeedRow) -> u64 {
+    match (f.spawned_ms, f.started_ms) {
+        (Some(spawned), Some(started)) => started.saturating_sub(spawned),
+        _ => f.paused_s.unwrap_or(0).saturating_mul(1000),
+    }
 }
 
 impl<L: LiveAgent> PaneRow<'_, L> {
@@ -501,27 +553,63 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     fn row_started_ms(&self) -> Option<u64> {
         let worker = self.live.and_then(|l| l.started_ms());
         let Some(f) = self.feed else { return worker };
+        let moved = moved_ms(f);
+        if let Some(h) = self.handed_ms {
+            return Some(h.saturating_add(moved));
+        }
         let Some(worker) = worker else {
             return f.started_ms;
         };
         let Some(started) = f.started_ms else {
             return Some(worker);
         };
-        let moved = match f.spawned_ms {
-            Some(spawned) => started.saturating_sub(spawned),
-            None => f.paused_s.unwrap_or(0).saturating_mul(1000),
-        };
         let began = started.saturating_sub(moved);
-        if began > worker.saturating_add(LATER_TASK_MS) {
+        // A task the spawn named is the worker's first, whenever the writer
+        // stamped it (giverny#141).
+        if began > worker.saturating_add(LATER_TASK_MS) && !self.spawn_task() {
             Some(started)
         } else {
             Some(worker.saturating_add(moved))
         }
     }
 
-    /// Tokens: the worker's count (Claude Code's own, as its agents view
-    /// shows it), else what the feed wrote.
+    /// Was this row's task given at the spawn: the worker's description
+    /// names its key.
+    fn spawn_task(&self) -> bool {
+        match (self.feed, self.live.and_then(|l| l.description())) {
+            (Some(f), Some(d)) => names_key(d, &f.key),
+            _ => false,
+        }
+    }
+
+    /// When the row's task ended: the feed's `ended`, else its finished
+    /// worker's end — and no later than the same worker's next task began
+    /// (giverny#141).
+    pub fn ended_ms(&self) -> Option<u64> {
+        let own = self.feed.and_then(|f| f.ended_ms).or_else(|| {
+            self.live
+                .filter(|l| !l.running())
+                .and_then(|l| l.ended_ms())
+        });
+        match (own, self.next_ms) {
+            (Some(e), Some(n)) => Some(e.min(n)),
+            (e, n) => e.or(n),
+        }
+    }
+
+    /// Tokens: for one of a worker's tasks taken one after another, what
+    /// that task spent ([`PaneRow::task_tokens`]); else the worker's count
+    /// (Claude Code's own, as its agents view shows it), else what the feed
+    /// wrote.
     pub fn tokens(&self) -> Option<u64> {
+        if let Some(t) = self.task_tokens {
+            return t;
+        }
+        // Nothing is spent on a task before it starts, whoever it is
+        // queued on (giverny#141).
+        if self.stage == Stage::Planned {
+            return None;
+        }
         self.live
             .and_then(|l| l.tokens())
             .or_else(|| self.feed.and_then(|f| f.tokens))
@@ -539,7 +627,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             return Some(d);
         }
         let eta = f.eta_s? as i64;
-        let took_ms = f.ended_ms? as i64 - self.row_started_ms()? as i64;
+        let took_ms = self.ended_ms()? as i64 - self.row_started_ms()? as i64;
         Some(took_ms.div_euclid(1000) - eta)
     }
 }
@@ -560,6 +648,17 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 /// - Rows are grouped Running, Planned, Done; order within a stage is kept.
 /// - A row whose worker is the one directly above it is a ditto.
 pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<PaneRow<'a, L>> {
+    merge_with(feed, live, |_| None)
+}
+
+/// [`merge`], with each worker's transcript ([`WorkerLog`], by agent id) to
+/// split a worker that took tasks one after another into a row per task
+/// ([`queue`], giverny#141).
+pub fn merge_with<'a, 'w, L: LiveAgent>(
+    feed: Option<&'a Feed>,
+    live: &'a [L],
+    log: impl Fn(&str) -> Option<&'w WorkerLog>,
+) -> Vec<PaneRow<'a, L>> {
     let feed_rows: &[FeedRow] = feed.map(|f| f.rows.as_slice()).unwrap_or(&[]);
     let find_live = |id: &str| live.iter().find(|l| l.agent_id() == id);
     let names = |l: &L, key: &str| l.description().is_some_and(|d| names_key(d, key));
@@ -581,7 +680,7 @@ pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<Pan
                 .as_deref()
                 .and_then(find_live)
                 .or_else(|| by_description(f)),
-            ditto: false,
+            ..PaneRow::bare()
         })
         .collect();
     for l in live {
@@ -601,17 +700,258 @@ pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<Pan
                 },
                 feed: None,
                 live: Some(l),
-                ditto: false,
+                ..PaneRow::bare()
             });
         }
     }
+    queue(&mut out, &log);
     out.sort_by_key(|r| r.stage); // stable: feed order, then live order
     for i in 1..out.len() {
         let same = match (out[i - 1].agent_id(), out[i].agent_id()) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) => a == b && out[i - 1].batch == out[i].batch,
             _ => false,
         };
         out[i].ditto = same;
+    }
+    out
+}
+
+/// One worker, tasks one after another (giverny#141). Rows are already
+/// joined to their workers; this works out which of a worker's rows came
+/// after which.
+///
+/// - **When a task reached the worker.** A row the spawn did not name, whose
+///   worker's dispatcher sent a message naming its key first, began at that
+///   message if it came before the feed's `started` — a hand-off recorded
+///   late is still timed from the moment it was sent.
+/// - **Tasks at once, tasks in turn.** A worker's Running and Done rows are
+///   grouped by start: rows that began within [`LATER_TASK_MS`] of each other
+///   are one batch (`Work #144 #145`, one count dittoed), and each later
+///   batch is the next task.
+/// - **The next task closes the one before.** A row of an earlier batch ends
+///   when the next batch began, at the latest; still Running in the feed, it
+///   is Done there — `start <next> --agent <worker>` is the whole hand-off.
+/// - **Tokens per task.** Each Done batch shows what its turns added, from
+///   its start (the first from the worker's first turn) to the next batch's;
+///   a Running row keeps the worker's live count. The Done rows of a worker
+///   add up to everything it added, and nothing is counted twice.
+/// - **Queued on a worker.** A Planned row whose `agent_id` names a worker
+///   running another task is queued after it.
+fn queue<'w, L: LiveAgent>(
+    rows: &mut [PaneRow<'_, L>],
+    log: &impl Fn(&str) -> Option<&'w WorkerLog>,
+) {
+    for r in rows.iter_mut() {
+        let (Some(f), Some(l)) = (r.feed, r.live) else {
+            continue;
+        };
+        if r.stage == Stage::Planned || r.spawn_task() {
+            continue;
+        }
+        let Some(w) = log(l.agent_id()) else { continue };
+        let worker = l.started_ms().unwrap_or(0);
+        let Some(m) = w
+            .messages()
+            .iter()
+            .find(|m| m.at_ms > worker && m.hands_off(&f.key))
+        else {
+            continue;
+        };
+        let began = f.started_ms.map(|s| s.saturating_sub(moved_ms(f)));
+        if began.is_none_or(|b| m.at_ms < b) {
+            r.handed_ms = Some(m.at_ms);
+        }
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for r in rows.iter() {
+        if let Some(id) = r.agent_id()
+            && !ids.iter().any(|x| x == id)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    for id in &ids {
+        let mut held: Vec<(usize, u64)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.stage != Stage::Planned && r.agent_id() == Some(id))
+            .filter_map(|(i, r)| Some((i, r.started_ms()?)))
+            .collect();
+        held.sort_by_key(|&(i, s)| (s, i));
+        // Batches: (first start, rows).
+        let mut batches: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, s) in held {
+            match batches.last_mut() {
+                Some((first, b)) if s < first.saturating_add(LATER_TASK_MS) => b.push(i),
+                _ => batches.push((s, vec![i])),
+            }
+        }
+        let n = batches.len();
+        if n >= 2 {
+            let w = rows
+                .iter()
+                .find(|r| r.agent_id() == Some(id))
+                .and_then(|r| r.live)
+                .and_then(|l| log(l.agent_id()));
+            for (k, (start, batch)) in batches.iter().enumerate() {
+                let next = batches.get(k + 1);
+                let from = if k == 0 { 0 } else { *start };
+                let to = next.map(|(s, _)| *s);
+                let next_key = next
+                    .and_then(|(_, b)| rows[b[0]].feed)
+                    .map(|f| f.key.clone())
+                    .filter(|k| !k.is_empty());
+                for &i in batch {
+                    let r = &mut rows[i];
+                    r.batch = k;
+                    if let Some(to) = to {
+                        r.next_ms = Some(to);
+                        r.next_key = next_key.clone();
+                        r.stage = Stage::Done;
+                    }
+                    if r.stage == Stage::Done {
+                        r.task_tokens = Some(w.map(|w| w.added(from, to)));
+                    }
+                }
+            }
+        }
+        let running = rows
+            .iter()
+            .find(|r| r.stage == Stage::Running && r.agent_id() == Some(id))
+            .and_then(|r| r.feed)
+            .map(|f| f.key.clone())
+            .filter(|k| !k.is_empty());
+        if let Some(key) = running {
+            for r in rows.iter_mut() {
+                if r.stage == Stage::Planned
+                    && r.feed.and_then(|f| f.agent_id.as_deref()) == Some(id)
+                {
+                    r.after_key = Some(key.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The feed with the hand-offs nothing recorded (giverny#141): a worker
+/// whose dispatcher sent it a message saying it is a **new task** and naming
+/// one (`New task for you: inbar#614, …`) holds that task from then, though
+/// the dispatcher never ran `start <task> --agent <worker>`.
+///
+/// - A feed row with that key still waiting (Planned, or Running with no
+///   worker) is that worker's from the message on: Running, with its
+///   `agent_id` and `started` filled in.
+/// - A key the feed does not have becomes a row of its own, right after the
+///   worker's other rows; and a worker the feed never described gets a row
+///   for the task it was spawned with too, so each task has its own.
+/// - A key another worker holds, or one already Done, is left alone.
+///
+/// [`queue`] then closes each earlier task at the next one's start. `None`
+/// when there is nothing to add: the feed is drawn as it is.
+pub fn with_handoffs<'w, L: LiveAgent>(
+    feed: Option<&Feed>,
+    live: &[L],
+    log: impl Fn(&str) -> Option<&'w WorkerLog>,
+) -> Option<Feed> {
+    let mut out: Option<Feed> = None;
+    for l in live {
+        let Some(w) = log(l.agent_id()) else { continue };
+        let worker = l.started_ms().unwrap_or(0);
+        let handed: Vec<(u64, String)> = w
+            .messages()
+            .iter()
+            .filter(|m| m.new_task && m.at_ms > worker)
+            .filter_map(|m| Some((m.at_ms, m.key.clone()?)))
+            .collect();
+        if handed.is_empty() {
+            continue;
+        }
+        let doc = out.get_or_insert_with(|| feed.cloned().unwrap_or_default());
+        let id = l.agent_id();
+        let is_held = |doc: &Feed| {
+            let rows = merge(Some(doc), live);
+            // A Planned row is waiting, not held: the hand-off is what
+            // starts it.
+            rows.iter()
+                .filter(|r| r.stage != Stage::Planned && r.live.is_some_and(|x| x.agent_id() == id))
+                .filter_map(|r| r.feed.map(|f| f.key.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut held = is_held(doc);
+        let last_of = |doc: &Feed| {
+            doc.rows
+                .iter()
+                .rposition(|f| f.agent_id.as_deref() == Some(id))
+                .map_or(doc.rows.len(), |i| i + 1)
+        };
+        if held.is_empty() {
+            let key = l
+                .description()
+                .and_then(worker_log::first_key)
+                .unwrap_or_default();
+            doc.rows.push(FeedRow {
+                key: key.clone(),
+                stage: Some(Stage::Running),
+                title: l.description().map(str::to_string),
+                agent_id: Some(id.to_string()),
+                started_ms: l.started_ms(),
+                ..FeedRow::default()
+            });
+            held.push(key);
+        }
+        for (at, key) in handed {
+            if held
+                .iter()
+                .any(|k| names_key(&key, k) || names_key(k, &key))
+            {
+                continue;
+            }
+            let title = w
+                .messages()
+                .iter()
+                .find(|m| m.at_ms == at)
+                .and_then(|m| m.title.clone());
+            match doc.rows.iter_mut().find(|f| names_key(&key, &f.key)) {
+                Some(f) => {
+                    let waiting = matches!(f.stage(), Stage::Planned | Stage::Running)
+                        && f.agent_id.as_deref().is_none_or(|a| a == id);
+                    if !waiting {
+                        continue;
+                    }
+                    f.stage = Some(Stage::Running);
+                    f.agent_id = Some(id.to_string());
+                    f.started_ms = Some(f.started_ms.map_or(at, |s| s.min(at)));
+                }
+                None => {
+                    let at_row = last_of(doc);
+                    doc.rows.insert(
+                        at_row,
+                        FeedRow {
+                            key: key.clone(),
+                            stage: Some(Stage::Running),
+                            title,
+                            agent_id: Some(id.to_string()),
+                            started_ms: Some(at),
+                            ..FeedRow::default()
+                        },
+                    );
+                }
+            }
+            held.push(key);
+        }
+        // A worker that has finished finished its last task.
+        if !l.running()
+            && let Some(last) = doc
+                .rows
+                .iter_mut()
+                .filter(|f| f.agent_id.as_deref() == Some(id) && f.stage() == Stage::Running)
+                .max_by_key(|f| f.started_ms)
+        {
+            last.stage = Some(Stage::Done);
+            if last.ended_ms.is_none() {
+                last.ended_ms = l.ended_ms();
+            }
+        }
     }
     out
 }
