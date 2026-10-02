@@ -23,6 +23,7 @@ use crate::pty::GridSize;
 use crate::render::atlas::Atlas;
 use crate::render::mesh::{self, BuildParams, Snapshot};
 use crate::render::metrics::{CellMetrics, FontSet};
+use crate::render::opacity::see_through;
 use crate::render::theme::Theme;
 use crate::search::{ClickTarget, Search};
 use crate::session::TermSession;
@@ -37,6 +38,9 @@ pub struct RenderShared {
     pub theme: Theme,
     /// Font size in logical points.
     pub font_size: f32,
+    /// `window.opacity`, as far as the window can show it: 1.0 wherever
+    /// the window was not made see-through.
+    pub opacity: f32,
     metrics: Option<(u32, CellMetrics)>,
     generation: u32,
 }
@@ -53,6 +57,7 @@ impl RenderShared {
             atlas: Atlas::default(),
             theme,
             font_size,
+            opacity: 1.0,
             metrics: None,
             generation: 0,
         })
@@ -512,7 +517,34 @@ impl TabView {
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, bg);
+        painter.rect_filled(rect, 0.0, see_through(bg, shared.opacity));
+        // Search match rows, as bands across the grid.
+        let search_bands: Vec<Rect> = self
+            .search
+            .as_ref()
+            .and_then(|search| {
+                let term = session.term.lock();
+                search.highlight_rows(&term)
+            })
+            .into_iter()
+            .flatten()
+            .filter(|&row| row >= 0 && row < rows_now(rect, ppp, metrics))
+            .map(|row| {
+                let y = rect.min.y + (row as f32 * metrics.cell_h as f32) / ppp;
+                Rect::from_min_size(
+                    Pos2::new(rect.min.x, y),
+                    Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
+                )
+            })
+            .collect();
+        // A see-through window keeps a match as solid as a selection: the
+        // highlight is a tint over the background, and over the desktop it
+        // would be a tint over whatever the wallpaper is.
+        if shared.opacity < 1.0 {
+            for band in &search_bands {
+                painter.rect_filled(*band, 0.0, bg);
+            }
+        }
         if let Some(cached) = &self.cached {
             for mesh in &cached.meshes {
                 if !mesh.vertices.is_empty() {
@@ -550,23 +582,8 @@ impl TabView {
         }
 
         // Search match highlight + hovered link underline, over the grid.
-        if let Some(search) = &self.search
-            && let Some(rows) = {
-                let term = session.term.lock();
-                search.highlight_rows(&term)
-            }
-        {
-            for row in rows {
-                if row < 0 || row >= rows_now(rect, ppp, metrics) {
-                    continue;
-                }
-                let y = rect.min.y + (row as f32 * metrics.cell_h as f32) / ppp;
-                let band = Rect::from_min_size(
-                    Pos2::new(rect.min.x, y),
-                    Vec2::new(rect.width(), metrics.cell_h as f32 / ppp),
-                );
-                painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(217, 181, 95, 40));
-            }
+        for band in search_bands {
+            painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(217, 181, 95, 40));
         }
         // Images from the kitty graphics protocol, drawn over the grid at the
         // cells they were placed on, scrolling with the text.

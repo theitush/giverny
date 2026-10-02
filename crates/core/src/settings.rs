@@ -258,6 +258,7 @@ pub const SETTINGS: &[SettingDef] = &[
                 "gruvbox",
                 "nord",
                 "catppuccin",
+                "catppuccin-mauve",
                 "rouen",
                 "phosphor",
                 "abyss",
@@ -265,6 +266,28 @@ pub const SETTINGS: &[SettingDef] = &[
                 "workbench",
                 "riso",
             ],
+        },
+    },
+    SettingDef {
+        key: "window.opacity",
+        label: "window opacity",
+        section: Section::Appearance,
+        doc: "How solid the window's background is; below 1.0 the desktop shows through.",
+        note: &[
+            "Only backgrounds: text, the cursor, selections, images and cells",
+            "a program colours itself stay solid, and so do menus and the",
+            "settings screen. 0.90-0.95 keeps text readable over a busy",
+            "wallpaper on a desktop that does not blur behind windows (GNOME).",
+            "Moving between 1.0 and anything lower needs a restart, since the",
+            "window is created see-through or not; between values below 1.0",
+            "it changes live. Stays solid on WSLg and on X11 without a",
+            "compositor.",
+        ],
+        needs_restart: true,
+        kind: Kind::Float {
+            default: 1.0,
+            min: 0.5,
+            max: 1.0,
         },
     },
     SettingDef {
@@ -806,6 +829,7 @@ mod tests {
         assert_eq!(parsed.font.size, defaults.font.size);
         assert_eq!(parsed.font.family, defaults.font.family);
         assert_eq!(parsed.theme.name, defaults.theme.name);
+        assert_eq!(parsed.window.opacity, defaults.window.opacity);
         assert_eq!(
             parsed.behavior.restore_claude,
             defaults.behavior.restore_claude
@@ -884,6 +908,33 @@ mod tests {
                 tables.push(def.table());
             }
         }
+    }
+
+    #[test]
+    fn opacity_is_an_opt_in_appearance_float() {
+        let def = by_key("window.opacity").expect("window.opacity is declared");
+        assert_eq!(def.section, Section::Appearance);
+        match def.kind {
+            Kind::Float { default, min, max } => {
+                assert_eq!(default, 1.0, "solid unless asked for");
+                assert_eq!(min, f64::from(config::WindowConfig::MIN_OPACITY));
+                assert_eq!(max, 1.0);
+            }
+            ref other => panic!("window.opacity is {other:?}"),
+        }
+        assert!(is_default(&Config::default(), def));
+    }
+
+    #[test]
+    fn opacity_round_trips_through_the_file() {
+        let dir = scratch("opacity");
+        std::fs::write(config::config_path(&dir), template()).unwrap();
+        write(&dir, by_key("window.opacity").unwrap(), &Value::Float(0.92)).unwrap();
+        let cfg: Config =
+            toml::from_str(&std::fs::read_to_string(config::config_path(&dir)).unwrap()).unwrap();
+        assert_eq!(cfg.window.opacity, 0.92);
+        assert_eq!(cfg.theme.name, "monet-dark");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

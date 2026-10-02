@@ -18,6 +18,7 @@ mod settings_ui;
 mod splash;
 mod taskbar;
 mod titlebar;
+mod translucency;
 mod update;
 mod view_header;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -87,6 +88,34 @@ fn theme_for(name: &str) -> Theme {
         return Theme::rouen_at(now.hour() as f32 + now.minute() as f32 / 60.0);
     }
     Theme::by_name(name)
+}
+
+/// `outer` less `hole`, as up to four rects that tile it without overlapping:
+/// full-width bands above and below, and the sides between them.
+fn around(outer: egui::Rect, hole: Option<egui::Rect>) -> Vec<egui::Rect> {
+    let Some(hole) = hole.map(|h| h.intersect(outer)).filter(|h| h.is_positive()) else {
+        return vec![outer];
+    };
+    let x = outer.x_range();
+    [
+        egui::Rect::from_x_y_ranges(x, outer.top()..=hole.top()),
+        egui::Rect::from_x_y_ranges(x, hole.bottom()..=outer.bottom()),
+        egui::Rect::from_x_y_ranges(outer.left()..=hole.left(), hole.y_range()),
+        egui::Rect::from_x_y_ranges(hole.right()..=outer.right(), hole.y_range()),
+    ]
+    .into_iter()
+    .filter(|r| r.is_positive())
+    .collect()
+}
+
+/// The opacity backgrounds are painted at: the configured one in a window
+/// that can show it, solid in any other.
+fn opacity_for(see_through: bool, cfg: &config::Config) -> f32 {
+    if see_through {
+        cfg.window.opacity()
+    } else {
+        1.0
+    }
 }
 
 /// Remember accounts that only the environment knew about.
@@ -522,7 +551,8 @@ fn main() -> eframe::Result {
     let paths = Paths::default_dirs();
     // `GIVERNY_NO_X11` is set by the fallback below, so a second attempt
     // cannot loop.
-    let prefer_x11 = config::load(paths.base()).behavior.prefer_x11;
+    let launch_cfg = config::load(paths.base());
+    let prefer_x11 = launch_cfg.behavior.prefer_x11;
     // WSLg's compositor crashes under our Wayland window (see `wslg`).
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     let wslg_x11 = !prefer_x11 && wslg::avoid_wayland();
@@ -588,6 +618,12 @@ fn main() -> eframe::Result {
         .with_maximized(layout.maximized && !open_laid)
         .with_min_inner_size([640.0, 400.0])
         .with_decorations(!frameless);
+    // Only when asked for: a transparent surface costs a compositor blend
+    // every frame, and a solid window should be exactly what it was.
+    let see_through = translucency::request(&launch_cfg.window);
+    if see_through {
+        viewport = viewport.with_transparent(true);
+    }
     if let (true, Some([x, y, w, h])) = (open_laid, work_area) {
         viewport = viewport.with_position([x, y]).with_inner_size([w, h]);
     }
@@ -624,7 +660,15 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "Giverny",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, zoom, frameless, maximize)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                cc,
+                zoom,
+                frameless,
+                maximize,
+                see_through,
+            )))
+        }),
     );
 
     // No X server after all — no XWayland, or no XAUTHORITY. Preferring
@@ -953,6 +997,9 @@ pub struct App {
     attention: usize,
     /// The window has no decorations and draws its own caption (#69).
     frameless: bool,
+    /// The window was opened see-through and can show it, so
+    /// `window.opacity` applies (see `translucency`).
+    see_through: bool,
     /// How that window is maximised (#78).
     maximize: titlebar::Maximize,
     /// That window's cursors, sized to the display (#100).
@@ -1371,6 +1418,7 @@ impl App {
         zoom: Option<f32>,
         frameless: bool,
         maximize: titlebar::Maximize,
+        see_through: bool,
     ) -> Self {
         let paths = Paths::default_dirs();
         let mut cfg = config::load(paths.base());
@@ -1385,8 +1433,10 @@ impl App {
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
         giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
+        let see_through = see_through && translucency::confirm(cc);
+        shared.opacity = opacity_for(see_through, &cfg);
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
-        chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name));
+        chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name), shared.opacity);
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -1507,6 +1557,7 @@ impl App {
             stale_sessions: false,
             attention: 0,
             frameless,
+            see_through,
             maximize,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             cursors: frameless
@@ -2548,7 +2599,7 @@ impl App {
         // The chrome is themed too, so the rail does not stay Monet-blue
         // around a Gruvbox grid.
         self.chrome = chrome::Chrome::from_theme(&theme);
-        self.chrome.apply(ctx, &theme);
+        self.chrome.apply(ctx, &theme, self.shared.opacity);
     }
 
     /// Adopt a freshly loaded config, applying what can be applied live.
@@ -2573,6 +2624,16 @@ impl App {
                 orchestrate_on(&cfg),
                 self.paths.base(),
             );
+        }
+        let opacity = opacity_for(self.see_through, &cfg);
+        if opacity != self.shared.opacity {
+            self.shared.opacity = opacity;
+            self.chrome.apply(ctx, &self.shared.theme.clone(), opacity);
+        } else if cfg.window.opacity != self.cfg.window.opacity
+            && cfg.window.translucent()
+            && !self.see_through
+        {
+            tracing::info!("window.opacity: restart Giverny to make the window see-through");
         }
         self.cfg = cfg;
         tracing::info!("config reloaded");
@@ -4281,6 +4342,10 @@ impl eframe::App for App {
         }
     }
 
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        translucency::clear_color(self.see_through)
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         count_frame(ui.ctx());
         // Documentation capture (GIVERNY_CAPTURE); no-op otherwise.
@@ -4423,11 +4488,29 @@ impl eframe::App for App {
             self.apply(&ctx, action);
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // A see-through window paints the area around the grid itself, so
+        // that no pixel has two translucent layers on it: the panel's fill
+        // under the grid's would show the desktop through both at once.
+        let opacity = self.shared.opacity;
+        let mut central = egui::CentralPanel::default();
+        if opacity < 1.0 {
+            central =
+                central.frame(egui::Frame::central_panel(ui.style()).fill(Color32::TRANSPARENT));
+        }
+        let mut backdrop = None;
+        let mut grid_rect = None;
+        let mut solid = false;
+        let panel = central.show(ui, |ui| {
+            if opacity < 1.0 {
+                backdrop = Some((ui.painter().add(egui::Shape::Noop), ui.painter().clone()));
+            }
             // Settings take the terminal's place, so the rail stays visible
             // and changes to it can be watched landing. The shell behind is
             // untouched and keeps running.
             if self.settings.is_some() {
+                // Solid: a screen of text and controls read against the
+                // wallpaper would be the hardest thing in the app to read.
+                solid = true;
                 let acts = settings_ui::settings_ui(self, ui);
                 actions.extend(acts);
                 return;
@@ -4580,6 +4663,7 @@ impl eframe::App for App {
                     // The worker overlay is laid out on this rect.
                     self.session_rect = Some(ui.available_rect_before_wrap());
                     let response = rt.view.show(ui, &mut self.shared, session);
+                    grid_rect = Some(response.rect);
                     if rt.view.button_pressed {
                         actions.push(Action::BackToMain(active));
                     }
@@ -4619,6 +4703,21 @@ impl eframe::App for App {
                 }
             }
         });
+        if let Some((slot, painter)) = backdrop {
+            let outer = panel.response.rect;
+            let shape = if solid {
+                egui::Shape::rect_filled(outer, 0.0, self.chrome.panel)
+            } else {
+                let fill = giverny_term::render::opacity::see_through(self.chrome.panel, opacity);
+                egui::Shape::Vec(
+                    around(outer, grid_rect)
+                        .into_iter()
+                        .map(|r| egui::Shape::rect_filled(r, 0.0, fill))
+                        .collect(),
+                )
+            };
+            painter.with_clip_rect(outer).set(slot, shape);
+        }
 
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
@@ -5170,6 +5269,23 @@ mod tests {
                 "{gpu:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_backdrop_tiles_around_the_grid_exactly() {
+        let outer = egui::Rect::from_min_max(egui::pos2(240.0, 0.0), egui::pos2(1280.0, 820.0));
+        let grid = egui::Rect::from_min_max(egui::pos2(248.0, 14.0), egui::pos2(1272.0, 812.0));
+        let parts = around(outer, Some(grid));
+        assert_eq!(parts.len(), 4);
+        let area: f32 = parts.iter().map(|r| r.area()).sum();
+        assert_eq!(area, outer.area() - grid.area(), "gaps or overlaps");
+        for (i, a) in parts.iter().enumerate() {
+            assert!(!a.intersects(grid.shrink(0.01)), "part {i} covers the grid");
+            for b in &parts[i + 1..] {
+                assert!(!a.shrink(0.01).intersects(b.shrink(0.01)), "parts overlap");
+            }
+        }
+        assert_eq!(around(outer, None), vec![outer]);
     }
 
     #[test]
