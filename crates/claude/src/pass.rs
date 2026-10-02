@@ -62,7 +62,8 @@ and working time (wall minus pauses and waits) to history.jsonl beside the feeds
 scale N by the median working-time/estimate ratio of recent tasks of the same
 kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
 pane counts down from that, and both figures are printed. `nudge` is the
-plugin's hook: it asks a worker to re-estimate five minutes into its task.";
+plugin's hook: it asks a worker to re-estimate five minutes into its task, and
+a subagent with no row, on its first call, for a first estimate.";
 
 /// One `giverny pass` command, parsed.
 #[derive(Debug, Clone, PartialEq)]

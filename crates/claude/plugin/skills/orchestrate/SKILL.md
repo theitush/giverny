@@ -102,10 +102,12 @@ When you spawn one:
 
 The same goes for *any* worker you spawn for a task, even one-off, mid-conversation,
 with no plan behind it: run `giverny-pass start <task> --eta <minutes> --title "<title>"`
-before the spawn (and `--agent <id>` once you know it). Without it the pane still shows
-the worker, but with `no ETA`. If you forgot, `giverny-pass eta <task> <minutes left>`
-on a task with no row starts its row now with that estimate; the time already spent
-before it is not counted, and the figure is not corrected from the history.
+before the spawn (and `--agent <id>` once you know it). That row has the worker's
+whole time and an estimate corrected from the history. If you forgot, Giverny asks
+the worker itself on its first tool call for a first estimate, which it reports
+with `giverny-pass eta <task> <minutes> --agent <id>`. Any subagent gets that ask,
+pass or no pass, so the pane shows no worker without an ETA for long; but the time
+before the ask is not counted, and the figure is not corrected from the history.
 
 ## 3. While it runs
 

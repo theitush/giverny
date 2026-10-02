@@ -31,8 +31,10 @@
 //!   stale file.
 //! - Always, `hooks/hooks.json` also carries a `PostToolUse` hook running
 //!   `giverny-pass nudge` (giverny#143): five minutes into a worker's task it
-//!   asks that worker, once, for a fresh estimate. It returns at once for
-//!   any call that is not a subagent's.
+//!   asks that worker, once, for a fresh estimate; and a subagent that holds
+//!   no row at all is asked on its first call for a first one (giverny#158),
+//!   so every subagent gets an ETA. It returns at once for any call that is
+//!   not a subagent's.
 //!
 //! The settings keys follow the house rules the other agents-pane key does
 //! (giverny#68): written only with `claude.agents_pane` on, never over a
@@ -86,7 +88,7 @@ fn wrapper(exes: &[String]) -> String {
 
 /// `hooks/hooks.json`. Always a `PostToolUse` hook, `giverny-pass nudge`,
 /// which asks a worker five minutes into its task for a fresh estimate
-/// (giverny#143); quiet and exit 0 whatever happens. With `orchestrate`,
+/// (giverny#143), and a subagent with no row for a first one (giverny#158); quiet and exit 0 whatever happens. With `orchestrate`,
 /// also on `SessionStart` (a new session, `/clear`, and after a compaction,
 /// which is when the context is fresh) print the reply that carries
 /// [`ORCHESTRATE_BY_DEFAULT`]: `cat` of a file Claude Code parses itself, so
