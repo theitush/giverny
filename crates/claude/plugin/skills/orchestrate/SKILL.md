@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Run a piece of work as a pass of subagents, one per task, several at once where their files do not overlap, and show it in Giverny's agents pane as Running, Next up with ETAs, and Done. Use when asked to orchestrate, fan work out to subagents, or work through a list of tasks in parallel.
+description: Run a piece of work as a pass of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's agents pane as Running, Next up with ETAs, and Done. Use when asked to orchestrate, fan work out to subagents, or work through a list of tasks in parallel.
 ---
 
 # Orchestrate a pass
@@ -68,7 +68,13 @@ For each task you start, stamp it and spawn its worker in the same breath:
 giverny-pass start auth-fix
 ```
 
-Then spawn **one subagent for this task** with the Agent tool:
+Then spawn **one subagent for this task** with the Agent tool. One task, one
+agent is the default. Reuse a worker instead when that saves tokens or simply
+makes sense: the next task is in code it has already read, or follows on from
+what it just did. Hand it over as in [Giving a worker its next task](#giving-a-worker-its-next-task),
+never as a second task folded into the first.
+
+When you spawn one:
 
 - Its `description` must contain the task name as a whole word, e.g.
   `auth-fix: fix the token refresh race`. The pane joins the row to its worker
