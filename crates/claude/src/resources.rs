@@ -85,7 +85,7 @@ pub fn ram_headroom(machine: &Machine) -> Mem {
 }
 
 /// Epoch milliseconds, written as RFC 3339 like the feed's stamps.
-mod ts {
+pub(crate) mod ts {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(ms: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -596,6 +596,43 @@ impl Ledger {
         }
     }
 
+    /// Shrink `session`'s lease for `task` in place to the figures given
+    /// (`None` keeps that one), when at least one is smaller than held and
+    /// none larger: the orchestrator asked to make room (giverny#162). The
+    /// lease before and after; `None` when there is no such lease or the
+    /// figures do not shrink it. A lease is never grown here: what it gives
+    /// up may already be granted to another.
+    pub fn shrink(
+        &mut self,
+        session: &str,
+        task: &str,
+        cpu: Option<u32>,
+        ram_mb: Option<u64>,
+        vram_mb: Option<u64>,
+        now: u64,
+    ) -> Option<(Lease, Lease)> {
+        let l = self
+            .leases
+            .iter_mut()
+            .find(|l| l.session == session && l.task == task)?;
+        let vram_mb = vram_mb.filter(|_| !l.gpus.is_empty());
+        let larger = cpu.is_some_and(|c| c > l.cpu)
+            || ram_mb.is_some_and(|r| r > l.ram_mb)
+            || vram_mb.is_some_and(|v| v > l.vram_mb);
+        let smaller = cpu.is_some_and(|c| c < l.cpu)
+            || ram_mb.is_some_and(|r| r < l.ram_mb)
+            || vram_mb.is_some_and(|v| v < l.vram_mb);
+        if larger || !smaller {
+            return None;
+        }
+        let before = l.clone();
+        l.cpu = cpu.unwrap_or(l.cpu);
+        l.ram_mb = ram_mb.unwrap_or(l.ram_mb);
+        l.vram_mb = vram_mb.unwrap_or(l.vram_mb);
+        l.heartbeat_at = l.heartbeat_at.max(now);
+        Some((before, l.clone()))
+    }
+
     /// Release `session`'s `task`: its lease and any place in the queue.
     /// The lease released, if there was one.
     pub fn release(&mut self, session: &str, task: &str, now: u64) -> Option<Lease> {
@@ -677,6 +714,50 @@ pub fn eta_left_s(feed_dir: &Path, session: &str, task: &str, now: u64) -> Optio
     let upto = r.paused_since_ms.unwrap_or(now);
     let el = upto.saturating_sub(r.started_ms?) / 1000;
     Some(r.eta_s? as i64 - el as i64)
+}
+
+/// `session`'s `task`'s time by its feed row: left on a Running row (as
+/// [`eta_left_s`]), the estimate of a Planned one — the asker's own figure
+/// when weighing a wait (giverny#162).
+pub fn eta_or_estimate_s(feed_dir: &Path, session: &str, task: &str, now: u64) -> Option<i64> {
+    let (_, f) = feed::find(feed_dir, session)?;
+    let r = f.rows.iter().find(|r| r.key == task)?;
+    match r.stage() {
+        feed::Stage::Running => eta_left_s(feed_dir, session, task, now),
+        feed::Stage::Planned => r.eta_s.map(|e| e as i64),
+        feed::Stage::Done => None,
+    }
+}
+
+/// When a queued claim should talk rather than wait (giverny#162): the
+/// soonest any holder in `blockers` expects to finish is longer than the
+/// asker's own `own_s`, or no holder can say. The holder to ask and the
+/// line to print.
+pub fn ask_hint(
+    task: &str,
+    blockers: &[Lease],
+    own_s: Option<i64>,
+    eta: &dyn Fn(&str, &str) -> Option<i64>,
+) -> Option<String> {
+    let mut held: Vec<(&Lease, Option<i64>)> = blockers
+        .iter()
+        .map(|l| (l, eta(&l.session, &l.task)))
+        .collect();
+    held.sort_by_key(|(_, e)| e.unwrap_or(i64::MAX));
+    let (first, wait) = held.first().copied()?;
+    let why = match (wait, own_s) {
+        (Some(w), Some(o)) if w > o => format!(
+            "that wait (~{}) is longer than {task} itself (~{})",
+            feed::fmt_span(w.max(0)),
+            feed::fmt_span(o.max(0))
+        ),
+        (None, _) => format!("{} has no ETA to wait out", first.task),
+        _ => return None,
+    };
+    Some(format!(
+        "{why}: ask its holder, `giverny pass ask {} \"<why you need it now>\"`",
+        first.task
+    ))
 }
 
 /// The line `claim` prints.
