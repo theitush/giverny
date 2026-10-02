@@ -784,7 +784,8 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 ///   feed key, is a row of its own, Running or Done by its own state, after
 ///   the feed's rows of that stage. One that names a key is that row's
 ///   worker and is never drawn twice.
-/// - Rows are grouped Running, Planned, Done; order within a stage is kept.
+/// - Rows are grouped Running, Planned, Done; order within Running and
+///   Planned is kept, Done is newest landed first (undated rows last).
 /// - A row whose worker is the one directly above it is a ditto.
 pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<PaneRow<'a, L>> {
     merge_with(feed, live, |_| None)
@@ -848,7 +849,34 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
         }
     }
     queue(&mut out, &log);
-    out.sort_by_key(|r| r.stage); // stable: feed order, then live order
+    // Running and Next up keep feed order, then live order. Done is newest
+    // landed first (giverny#170); a worker's batch is kept together and
+    // sorts by its latest end, and rows with no end time go after the dated
+    // ones, in their old order.
+    let group_end = |r: &PaneRow<'a, L>| {
+        let id = r.agent_id()?;
+        out.iter()
+            .filter(|o| o.stage == Stage::Done && o.agent_id() == Some(id) && o.batch == r.batch)
+            .filter_map(|o| o.ended_ms())
+            .max()
+    };
+    let keys: Vec<_> = out
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let end = if r.stage == Stage::Done {
+                group_end(r).or_else(|| r.ended_ms())
+            } else {
+                None
+            };
+            // Newest first; undated last.
+            (r.stage, end.is_none(), std::cmp::Reverse(end), i)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..out.len()).collect();
+    order.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+    let mut slots: Vec<Option<PaneRow<'a, L>>> = out.into_iter().map(Some).collect();
+    let mut out: Vec<PaneRow<'a, L>> = order.into_iter().filter_map(|i| slots[i].take()).collect();
     for i in 1..out.len() {
         let same = match (out[i - 1].agent_id(), out[i].agent_id()) {
             (Some(a), Some(b)) => a == b && out[i - 1].batch == out[i].batch,
@@ -1596,6 +1624,25 @@ mod tests {
         let rows = merge(None, &lives);
         let ids: Vec<_> = rows.iter().map(|r| (r.stage, r.agent_id())).collect();
         assert_eq!(ids, [(Stage::Running, Some("y")), (Stage::Done, Some("x"))]);
+    }
+
+    #[test]
+    fn done_rows_newest_landed_first() {
+        let f = parse(
+            br#"{"rows":[
+                {"key":"old","stage":"done","ended":1000},
+                {"key":"none","stage":"done"},
+                {"key":"new","stage":"done","ended":3000},
+                {"key":"mid","stage":"done","ended":2000},
+                {"key":"p1","stage":"planned"},
+                {"key":"p2","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        let keys: Vec<&str> = merge::<Live>(Some(&f), &[])
+            .iter()
+            .map(|r| r.feed.unwrap().key.as_str())
+            .collect();
+        assert_eq!(keys, ["p1", "p2", "new", "mid", "old", "none"]);
     }
 
     #[test]
