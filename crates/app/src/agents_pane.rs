@@ -35,6 +35,12 @@
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click (giverny#40).
 //!
+//! **Resources** (giverny#164): a row's lease from the machine ledger in a
+//! quiet column, a Next up row's place in the ledger's queue in NOW, and the
+//! machine's leases against its limits on a dim bottom line. The ledger is
+//! read off the UI thread ([`LedgerWatch`]) and wins over a row's own copy
+//! ([`with_ledger`]).
+//!
 //! **Text is selectable** (giverny#84): a drag — never a click — selects
 //! the pane's text the way the terminal does, as a stream of cells across
 //! rows, copies it as plain text line by line when the drag ends, and
@@ -42,12 +48,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
-use giverny_claude::feed::{self, Feed, FeedCache, PaneRow, Stage};
+use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, Stage};
+use giverny_claude::resources::{self, Ledger};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
+use giverny_core::limits::{Limits, Machine, Mem, Resolved};
 use giverny_core::tabs::TabId;
 use giverny_term::widget::RenderShared;
 
@@ -80,6 +90,12 @@ const MIN_TITLE: usize = 12;
 pub const NO_ETA: &str = "no ETA";
 /// Where in [`Cols::segments`] the ETA cell sits.
 const ETA_SEG: usize = 3;
+/// Where in [`Cols::segments`] the lease cell sits (giverny#164).
+const LEASE_SEG: usize = 6;
+/// How strongly a lease cell is inked, against its row's colour.
+const LEASE_INK: f32 = 0.75;
+/// The widest a lease cell is drawn; a longer one is cut.
+const LEASE_MAX: usize = 22;
 
 // --------------------------------------------------------- view state ----
 
@@ -157,6 +173,9 @@ pub fn poll_logs(logs: &mut Logs, live: &[SubagentRow]) {
 #[derive(Default)]
 pub struct Views {
     tabs: HashMap<TabId, View>,
+    /// The machine ledger, read off the UI thread: one for every tab, as
+    /// there is one ledger for the whole machine (giverny#164).
+    ledger: LedgerWatch,
 }
 
 impl Views {
@@ -394,6 +413,320 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// --------------------------------------------------------- resources ----
+
+/// How often the ledger is re-read while a pane is up.
+const LEDGER_POLL: Duration = Duration::from_secs(2);
+/// No pane drawn for this long: the reader stops reading until one is.
+const LEDGER_IDLE_MS: u64 = 10_000;
+/// How often the machine itself (cores, RAM, `nvidia-smi`) is re-detected.
+const MACHINE_EVERY: Duration = Duration::from_secs(300);
+
+/// What the machine ledger said when it was last read: its live leases and
+/// queue (expired entries dropped, nothing written back) and the limits
+/// they count against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerView {
+    pub ledger: Ledger,
+    /// `[orchestrator.limits]` resolved for this machine; `None` when the
+    /// config could not be read.
+    pub limits: Option<Resolved>,
+}
+
+/// The ledger, read by a thread of its own (giverny#164): the read takes the
+/// ledger's `flock`, which a writer may hold, and resolving the limits runs
+/// `nvidia-smi` — neither belongs on the UI thread (giverny#150). The pane
+/// only ever takes the last snapshot.
+#[derive(Default)]
+struct LedgerWatch {
+    shared: Option<Arc<LedgerShared>>,
+}
+
+#[derive(Default)]
+struct LedgerShared {
+    snap: Mutex<Option<Arc<LedgerView>>>,
+    /// When a pane last asked: the reader idles once nothing has for
+    /// [`LEDGER_IDLE_MS`].
+    wanted_ms: AtomicU64,
+}
+
+impl LedgerWatch {
+    /// The last snapshot, starting the reader on first use. `None` until
+    /// its first read.
+    fn get(&mut self, ctx: &egui::Context) -> Option<Arc<LedgerView>> {
+        let shared = self.shared.get_or_insert_with(|| {
+            let shared = Arc::new(LedgerShared::default());
+            let (s, ctx) = (shared.clone(), ctx.clone());
+            if let Err(err) = std::thread::Builder::new()
+                .name("agents-pane-ledger".into())
+                .spawn(move || read_ledger_loop(&s, &ctx))
+            {
+                tracing::warn!("agents pane: the ledger reader did not start: {err}");
+            }
+            shared
+        });
+        shared.wanted_ms.store(now_ms(), Ordering::Relaxed);
+        shared.snap.lock().ok().and_then(|s| s.clone())
+    }
+}
+
+fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
+    let mut machine: Option<(Machine, Instant)> = None;
+    loop {
+        let now = now_ms();
+        if now.saturating_sub(shared.wanted_ms.load(Ordering::Relaxed)) <= LEDGER_IDLE_MS {
+            let m = match &machine {
+                Some((m, at)) if at.elapsed() < MACHINE_EVERY => m.clone(),
+                _ => {
+                    let m = Machine::detect();
+                    machine = Some((m.clone(), Instant::now()));
+                    m
+                }
+            };
+            if let Some(view) = read_ledger(&m, now) {
+                let mut snap = match shared.snap.lock() {
+                    Ok(s) => s,
+                    Err(p) => p.into_inner(),
+                };
+                if snap.as_deref() != Some(&view) {
+                    *snap = Some(Arc::new(view));
+                    drop(snap);
+                    ctx.request_repaint();
+                }
+            }
+        }
+        std::thread::sleep(LEDGER_POLL);
+    }
+}
+
+/// One read of the ledger, under its lock, changing nothing on disk. No
+/// ledger is an empty one; an unreadable one is `None` (the last good read
+/// stays).
+fn read_ledger(machine: &Machine, now: u64) -> Option<LedgerView> {
+    let path = resources::ledger_path(&feed::feed_dir());
+    let mut ledger = if path.exists() {
+        let _lock = resources::LedgerLock::take(&path).ok()?;
+        Ledger::parse(&std::fs::read(&path).ok()?).ok()?
+    } else {
+        Ledger::default()
+    };
+    ledger.expire(now);
+    let limits = Limits::load().ok().map(|l| l.resolve(machine));
+    Some(LedgerView { ledger, limits })
+}
+
+/// `feed` with every row's `lease` taken from the ledger rather than the
+/// row's own copy, which is only as fresh as its session's last `claim`: a
+/// lease another session released, or one that expired, is not pushed back
+/// to rows (giverny#160). A row's lease is the ledger's entry for its key
+/// under any of `sessions` (the feed's and the tab's ids); a row with none
+/// holds nothing. A queued row's place is its place now, and it waits
+/// behind the task its copy named while that one still holds or waits
+/// ahead, else behind whoever holds a slot it asks for, else the request
+/// queued before it.
+pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
+    let mut f = feed.clone();
+    let mine = |s: &str| sessions.contains(&s);
+    let queue = ledger.ordered_queue();
+    for row in &mut f.rows {
+        let copy = row.lease.take();
+        if let Some(l) = ledger
+            .leases
+            .iter()
+            .find(|l| l.task == row.key && mine(&l.session))
+        {
+            // Smaller is only on the copy: the ledger keeps what was granted.
+            let smaller = copy
+                .as_ref()
+                .filter(|c| c.state == LeaseState::Smaller && c.id.as_deref() == Some(&l.id));
+            row.lease = Some(RowLease {
+                state: if smaller.is_some() {
+                    LeaseState::Smaller
+                } else {
+                    LeaseState::Granted
+                },
+                id: Some(l.id.clone()),
+                cpu: l.cpu,
+                ram_mb: l.ram_mb,
+                gpus: l.gpus.clone(),
+                vram_mb: l.vram_mb,
+                slots: l.slots.clone(),
+                granted_ms: Some(l.granted_at),
+                wanted_ram_mb: smaller.and_then(|c| c.wanted_ram_mb),
+                position: None,
+                behind: None,
+            });
+        } else if let Some(i) = queue
+            .iter()
+            .position(|w| w.task == row.key && mine(&w.session))
+        {
+            let w = queue[i];
+            let ahead = &queue[..i];
+            let still = |t: &str| {
+                ledger.leases.iter().any(|l| l.task == t) || ahead.iter().any(|a| a.task == t)
+            };
+            let behind = copy
+                .as_ref()
+                .and_then(|c| c.behind.clone())
+                .filter(|b| still(b))
+                .or_else(|| {
+                    ledger
+                        .leases
+                        .iter()
+                        .find(|l| l.slots.iter().any(|s| w.request.slots.contains(s)))
+                        .map(|l| l.task.clone())
+                })
+                .or_else(|| ahead.last().map(|a| a.task.clone()));
+            row.lease = Some(RowLease {
+                state: LeaseState::Queued,
+                id: None,
+                cpu: w.request.cpu,
+                ram_mb: w.request.ram_mb,
+                gpus: Vec::new(),
+                vram_mb: w.request.vram_mb,
+                slots: w.request.slots.clone(),
+                granted_ms: None,
+                wanted_ram_mb: None,
+                position: Some(i as u64 + 1),
+                behind,
+            });
+        }
+    }
+    f
+}
+
+/// A size the way the pane writes it: `3G`, `1.5G`, `512M`, and `0` for
+/// nothing.
+fn mem(mb: u64) -> String {
+    if mb == 0 {
+        "0".into()
+    } else {
+        Mem(mb).to_string()
+    }
+}
+
+/// A row's lease in its cell, compactly: `3G · 3c`, `+slot`, `gpu0 8G`; a
+/// smaller grant as got/asked (`2.5G/3G · 3c`); one still queued under a
+/// Running row as `wait 3G · 3c`. Empty for a lease of nothing.
+///
+/// giverny#161's peak use belongs at its end (`· peak 2.1G`) once feed rows
+/// carry it; they do not yet.
+pub fn lease_cell(l: &RowLease) -> String {
+    let mut parts = Vec::new();
+    if l.ram_mb > 0 {
+        parts.push(match l.wanted_ram_mb {
+            Some(w) if l.state == LeaseState::Smaller && w > l.ram_mb => {
+                format!("{}/{}", mem(l.ram_mb), mem(w))
+            }
+            _ => mem(l.ram_mb),
+        });
+    }
+    if l.cpu > 0 {
+        parts.push(format!("{}c", l.cpu));
+    }
+    for g in &l.gpus {
+        parts.push(format!("gpu{g} {}", mem(l.vram_mb)));
+    }
+    if l.gpus.is_empty() && l.vram_mb > 0 {
+        parts.push(format!("gpu {}", mem(l.vram_mb)));
+    }
+    let mut s = parts.join(" · ");
+    let slots = match l.slots.len() {
+        0 => String::new(),
+        1 => "+slot".into(),
+        n => format!("+{n} slots"),
+    };
+    if !slots.is_empty() {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(&slots);
+    }
+    if l.state == LeaseState::Queued && !s.is_empty() {
+        s = format!("wait {s}");
+    }
+    s
+}
+
+/// A Next up row waiting in the ledger, in its NOW cell: `queued for 3G
+/// behind giverny#12` — what it waits for (its RAM, else VRAM, cores, a
+/// slot) and on whom.
+pub fn queued_note(l: &RowLease) -> String {
+    let need = if l.ram_mb > 0 {
+        mem(l.ram_mb)
+    } else if l.vram_mb > 0 {
+        format!("gpu {}", mem(l.vram_mb))
+    } else if l.cpu > 0 {
+        format!("{}c", l.cpu)
+    } else if !l.slots.is_empty() {
+        "a slot".into()
+    } else {
+        String::new()
+    };
+    let mut s = "queued".to_string();
+    if !need.is_empty() {
+        s.push_str(&format!(" for {need}"));
+    }
+    if let Some(b) = &l.behind {
+        s.push_str(&format!(" behind {b}"));
+    }
+    s
+}
+
+/// The lease in full for the row's overlay header: `holds 3 cpu, 3G, slot
+/// cargo:/x`, or `queued #2 for …`.
+fn lease_fact(l: &RowLease) -> String {
+    match l.state {
+        LeaseState::Queued => {
+            let note = queued_note(l);
+            match l.position {
+                Some(p) => note.replacen("queued", &format!("queued #{p}"), 1),
+                None => note,
+            }
+        }
+        _ => {
+            let mut s = format!(
+                "holds {}",
+                resources::describe_held(l.cpu, l.ram_mb, &l.gpus, l.vram_mb, &l.slots)
+            );
+            if let Some(w) = l.wanted_ram_mb.filter(|_| l.state == LeaseState::Smaller) {
+                s.push_str(&format!(" (asked {})", mem(w)));
+            }
+            s
+        }
+    }
+}
+
+/// The machine's leases against its limits, one quiet line: `leased 6G/22G
+/// RAM · 5/10 cores`, each GPU when there is one, and how many wait. `None`
+/// while nothing is leased or queued anywhere on the machine.
+pub fn capacity_line(ledger: &Ledger, limits: &Resolved) -> Option<String> {
+    if ledger.leases.is_empty() && ledger.queue.is_empty() {
+        return None;
+    }
+    let cpu: u32 = ledger.leases.iter().map(|l| l.cpu).sum();
+    let ram: u64 = ledger.leases.iter().map(|l| l.ram_mb).sum();
+    let mut s = format!(
+        "leased {}/{} RAM · {cpu}/{} cores",
+        mem(ram),
+        limits.ram,
+        limits.cpu_cores
+    );
+    for g in &limits.gpus {
+        let used: u64 = ledger
+            .leases
+            .iter()
+            .filter(|l| l.gpus.contains(&g.index))
+            .map(|l| l.vram_mb)
+            .sum();
+        s.push_str(&format!(" · gpu{} {}/{}", g.index, mem(used), g.vram));
+    }
+    if !ledger.queue.is_empty() {
+        s.push_str(&format!(" · {} queued", ledger.queue.len()));
+    }
+    Some(s)
+}
+
 // ------------------------------------------------------------- clicks ----
 
 /// What a click on a row names — everything the action behind it (build
@@ -476,6 +809,9 @@ pub struct Line {
     pub no_eta: bool,
     pub now: String,
     pub tokens: String,
+    /// What the row's task holds in the machine ledger ([`lease_cell`]),
+    /// empty when nothing (giverny#164).
+    pub lease: String,
     pub click: RowClick,
 }
 
@@ -484,6 +820,9 @@ pub struct Line {
 pub struct Table {
     pub lines: Vec<Line>,
     pub footer: Option<String>,
+    /// The machine's leases against its limits ([`capacity_line`]), drawn
+    /// dim at the bottom right; `None` while nothing is leased.
+    pub capacity: Option<String>,
 }
 
 impl Table {
@@ -525,6 +864,7 @@ pub fn build_at(
     Table {
         lines,
         footer: feed.and_then(|f| f.footer.clone()),
+        capacity: None,
     }
 }
 
@@ -656,6 +996,16 @@ fn format_row(
         Stage::Done => row.eta_delta_s().map(feed::fmt_delta).unwrap_or_default(),
     };
     let no_eta = row.stage == Stage::Running && eta_s.is_none();
+    // What the task holds in the machine ledger: a cell of its own, but a
+    // Next up row that waits for it says so in NOW instead (giverny#164).
+    let held = f
+        .and_then(|f| f.lease.as_ref())
+        .filter(|_| row.stage != Stage::Done);
+    let queued = held.filter(|l| row.stage == Stage::Planned && l.state == LeaseState::Queued);
+    let lease = match held {
+        Some(l) if queued.is_none() => lease_cell(l),
+        _ => String::new(),
+    };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
         // The limit first: a row the writer paused for it says why.
@@ -668,11 +1018,11 @@ fn format_row(
                 .and_then(|l| l.activity.clone())
                 .unwrap_or_default(),
         },
-        // Queued on a worker busy with another task (giverny#141).
-        Stage::Planned => row
-            .after_key
-            .as_ref()
-            .map(|k| format!("after {k}"))
+        // Waiting in the machine ledger (giverny#164), else queued on a
+        // worker busy with another task (giverny#141).
+        Stage::Planned => queued
+            .map(queued_note)
+            .or_else(|| row.after_key.as_ref().map(|k| format!("after {k}")))
             .unwrap_or_default(),
         Stage::Done => f
             .and_then(|f| f.landing.clone())
@@ -688,6 +1038,9 @@ fn format_row(
             no_eta_hint(&key, l.map(|l| l.agent_id()), &title),
         );
     }
+    if let Some(h) = held {
+        facts.push(lease_fact(h));
+    }
     Line {
         stage: row.stage,
         id,
@@ -697,6 +1050,7 @@ fn format_row(
         no_eta,
         now,
         tokens,
+        lease,
         click: RowClick {
             stage: row.stage,
             key,
@@ -898,10 +1252,27 @@ pub fn show(
         .done_cleared_ms
         .and_then(|c| view.feed_now.as_ref().map(|f| f.without_done_by(c)));
     let feed = cleared.as_ref().or(view.feed_now.as_ref());
+    // The ledger is the truth about leases; a row's copy is as of its
+    // session's last claim (giverny#160, #164).
+    let ledger = views.ledger.get(ui.ctx());
+    let leased = match (feed, ledger.as_deref()) {
+        (Some(f), Some(l)) => {
+            let mut sessions: Vec<&str> = f.session.iter().map(String::as_str).collect();
+            sessions.extend(f.aliases.iter().map(String::as_str));
+            sessions.extend(tracker.session_id.as_deref());
+            sessions.extend(tracker.aliases.iter().map(String::as_str));
+            Some(with_ledger(f, &sessions, &l.ledger))
+        }
+        _ => None,
+    };
+    let feed = leased.as_ref().or(feed);
     if std::mem::take(&mut view.logs_due) {
         poll_logs(&mut view.logs, tracker.rows());
     }
-    let table = build_at(feed, tracker.rows(), now, &clock, &view.logs);
+    let mut table = build_at(feed, tracker.rows(), now, &clock, &view.logs);
+    table.capacity = ledger
+        .as_deref()
+        .and_then(|l| capacity_line(&l.ledger, l.limits.as_ref()?));
     if table.is_empty() {
         return (None, None);
     }
@@ -923,7 +1294,9 @@ pub fn show(
     let cell = shared.cell_size(ui.ctx().pixels_per_point());
     // A little air around each row; a table, not a wall of grid.
     let row_h = (cell.y * 1.2).round().max(cell.y);
-    let rows = table.lines.len() + usize::from(table.footer.is_some());
+    let rows = table.lines.len()
+        + usize::from(table.footer.is_some())
+        + usize::from(table.capacity.is_some());
     let frame = pane_frame(shared.theme.bg);
     let want = pane_height(
         rows,
@@ -1055,6 +1428,10 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
+    /// The lease column (giverny#164), between TASK and ELAPSED: as wide as
+    /// its widest cell, and not there at all while no row holds anything.
+    leasew: usize,
+    x_lease: usize,
     x_el_end: usize,
     x_eta_end: usize,
     x_now: usize,
@@ -1069,10 +1446,18 @@ impl Cols {
             .map(|l| l.id.chars().count())
             .max()
             .unwrap_or(0);
-        let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W;
+        let leasew = table
+            .lines
+            .iter()
+            .map(|l| l.lease.chars().count().min(LEASE_MAX))
+            .max()
+            .unwrap_or(0);
+        let lease_cols = if leasew > 0 { leasew + GAP } else { 0 };
+        let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W + lease_cols;
         let taskw = cols.saturating_sub(fixed).max(MIN_TITLE);
         let x_task = STAGE_W + GAP;
-        let x_el_end = x_task + taskw + GAP + EL_W;
+        let x_lease = x_task + taskw + GAP;
+        let x_el_end = x_task + taskw + lease_cols + GAP + EL_W;
         let x_eta_end = x_el_end + GAP + ETA_W;
         let x_now = x_eta_end + GAP;
         let x_tok_end = x_now + NOW_W + GAP + TOK_W;
@@ -1080,6 +1465,8 @@ impl Cols {
             idw,
             taskw,
             x_task,
+            leasew,
+            x_lease,
             x_el_end,
             x_eta_end,
             x_now,
@@ -1106,8 +1493,21 @@ impl Cols {
                 right_at(self.x_eta_end, eta_cell(line)),
                 eta_cell(line).into(),
             ),
-            (self.x_now, cut(&line.now, NOW_W)),
+            // A row with no tokens (Next up) lends NOW the TOKENS column:
+            // `queued for 3G behind giverny#12` is longer than NOW.
+            (
+                self.x_now,
+                cut(
+                    &line.now,
+                    if line.tokens.is_empty() {
+                        NOW_W + GAP + TOK_W
+                    } else {
+                        NOW_W
+                    },
+                ),
+            ),
             (right_at(self.x_tok_end, &line.tokens), line.tokens.clone()),
+            (self.x_lease, cut(&line.lease, self.leasew)),
         ]
     }
 }
@@ -1314,6 +1714,11 @@ fn draw_table(
     if let Some(footer) = &table.footer {
         segs.push(vec![(0, cut(footer, cols))]);
     }
+    // The machine's capacity, right-aligned under TOKENS (giverny#164).
+    if let Some(cap) = &table.capacity {
+        let cap = cut(cap, layout.x_tok_end);
+        segs.push(vec![(right_at(layout.x_tok_end, &cap), cap)]);
+    }
     let texts: Vec<String> = segs.iter().map(|s| compose(s)).collect();
     let rects: Vec<egui::Rect> = segs
         .iter()
@@ -1368,7 +1773,16 @@ fn draw_table(
         for (k, (at, s)) in segs[i].iter().enumerate() {
             let at = egui::pos2(rect.left() + *at as f32 * cw, top);
             let missing = k == ETA_SEG && line.is_some_and(|l| l.no_eta);
-            shared.paint_text(&p, at, s, if missing { chrome.dim } else { color });
+            // The lease is the row's, but quieter than its clock and task.
+            let quiet = k == LEASE_SEG && line.is_some();
+            let ink = if missing {
+                chrome.dim
+            } else if quiet {
+                color.gamma_multiply(LEASE_INK)
+            } else {
+                color
+            };
+            shared.paint_text(&p, at, s, ink);
         }
     }
     let clicked = input
@@ -1982,6 +2396,166 @@ mod tests {
     #[test]
     fn nothing_to_show_is_no_pane() {
         assert!(build(None, &[], T0).is_empty());
+    }
+
+    // ------------------------------------------------- resources (#164) ----
+
+    /// A feed with a granted Running row and a queued Next up row, as
+    /// `giverny pass claim` leaves them.
+    const LEASED: &str = r#"{"session":"s","rows":[
+        {"key":"giverny#12","stage":"running","eta_s":1800,"started":1790000000000,
+         "lease":{"state":"granted","id":"s:giverny#12","cpu":3,"ram_mb":3072,
+                  "slots":["cargo:/x/target"],"granted_at":1790000000000}},
+        {"key":"giverny#13","stage":"planned","eta_s":600,
+         "lease":{"state":"queued","position":1,"behind":"giverny#12","cpu":2,"ram_mb":3072}}]}"#;
+
+    fn ledger(json: &str) -> Ledger {
+        Ledger::parse(json.as_bytes()).expect("test ledger parses")
+    }
+
+    #[test]
+    fn a_lease_reads_compactly() {
+        let f = feed(LEASED);
+        assert_eq!(
+            lease_cell(f.rows[0].lease.as_ref().unwrap()),
+            "3G · 3c +slot"
+        );
+        let mut l = f.rows[0].lease.clone().unwrap();
+        l.slots.clear();
+        l.cpu = 0;
+        l.gpus = vec![0];
+        l.vram_mb = 8192;
+        assert_eq!(lease_cell(&l), "3G · gpu0 8G");
+        l.state = LeaseState::Smaller;
+        l.ram_mb = 2560;
+        l.wanted_ram_mb = Some(3072);
+        l.gpus.clear();
+        l.vram_mb = 0;
+        l.cpu = 3;
+        l.slots = vec!["a".into(), "b".into()];
+        assert_eq!(lease_cell(&l), "2.5G/3G · 3c +2 slots");
+        l.state = LeaseState::Queued;
+        l.position = Some(2);
+        assert!(lease_cell(&l).starts_with("wait "));
+        assert_eq!(lease_fact(&l), "queued #2 for 2.5G");
+    }
+
+    #[test]
+    fn a_running_row_shows_its_lease_and_a_queued_next_up_row_says_what_it_waits_for() {
+        let t = build(Some(&feed(LEASED)), &[], T0 + 60_000);
+        let (run, next) = (&t.lines[0], &t.lines[1]);
+        assert_eq!(run.lease, "3G · 3c +slot");
+        assert!(
+            run.click
+                .facts
+                .iter()
+                .any(|f| f == "holds 3 cpu, 3G, slot cargo:/x/target"),
+            "{:?}",
+            run.click.facts
+        );
+        assert_eq!(next.now, "queued for 3G behind giverny#12");
+        assert_eq!(next.lease, "", "said in NOW, not twice");
+        // Drawn whole: a Next up row lends NOW the TOKENS column.
+        let cols = Cols::new(&t, 100);
+        let drawn = compose(&cols.segments(next));
+        assert!(
+            drawn.ends_with("queued for 3G behind giverny#12"),
+            "{drawn}"
+        );
+        let drawn = compose(&cols.segments(run));
+        assert!(drawn.contains("3G · 3c +slot"), "{drawn}");
+        // No lease anywhere: no lease column, the title keeps its width.
+        let bare = build(
+            Some(&feed(r#"{"rows":[{"key":"k","stage":"planned"}]}"#)),
+            &[],
+            T0,
+        );
+        assert_eq!(Cols::new(&bare, 100).leasew, 0);
+        assert!(Cols::new(&t, 100).taskw < Cols::new(&bare, 100).taskw);
+    }
+
+    /// giverny#160's note: a row's copy is only as fresh as its session's
+    /// last claim. The ledger decides.
+    #[test]
+    fn the_ledger_wins_over_a_rows_stale_copy() {
+        let f = feed(LEASED);
+        // Both gone from the ledger (released, expired): nothing is held.
+        let empty = with_ledger(&f, &["s"], &Ledger::default());
+        assert!(empty.rows.iter().all(|r| r.lease.is_none()));
+
+        // giverny#12 released; giverny#13 still waits, now first, behind
+        // another session's task holding nothing it named: behind nobody.
+        let l = ledger(
+            r#"{"version":1,"leases":[
+              {"id":"o:inbar#5","session":"o","task":"inbar#5","cpu":4,"ram_mb":8192,
+               "granted_at":1790000000000,"heartbeat_at":1790000000000}],
+             "queue":[
+              {"id":"s:giverny#13","session":"s","task":"giverny#13","cpu":2,"ram_mb":3072,
+               "queued_at":1790000000000,"heartbeat_at":1790000000000}]}"#,
+        );
+        let g = with_ledger(&f, &["s"], &l);
+        assert!(g.rows[0].lease.is_none(), "the released lease is gone");
+        let q = g.rows[1].lease.as_ref().unwrap();
+        assert_eq!(q.state, LeaseState::Queued);
+        assert_eq!(q.position, Some(1));
+        assert_eq!(q.behind, None, "giverny#12 holds nothing now");
+
+        // A lease in the ledger the row never got a copy of (another
+        // writer, or the tab's older session id) is drawn.
+        let l = ledger(
+            r#"{"version":1,"leases":[
+              {"id":"old:giverny#12","session":"old","task":"giverny#12","cpu":1,"ram_mb":1024,
+               "slots":["cargo:/x/target"],"granted_at":1790000000000,"heartbeat_at":1790000000000}],
+             "queue":[
+              {"id":"s:giverny#13","session":"s","task":"giverny#13","cpu":1,"ram_mb":0,
+               "slots":["cargo:/x/target"],"queued_at":1790000000000,"heartbeat_at":1790000000000}]}"#,
+        );
+        let bare = feed(r#"{"session":"s","rows":[{"key":"giverny#12","stage":"running"}]}"#);
+        let g = with_ledger(&bare, &["s", "old"], &l);
+        assert_eq!(
+            lease_cell(g.rows[0].lease.as_ref().unwrap()),
+            "1G · 1c +slot"
+        );
+        assert!(
+            with_ledger(&bare, &["s"], &l).rows[0].lease.is_none(),
+            "not our session"
+        );
+        // Queued with no copy: behind the holder of the slot it asks for.
+        let g = with_ledger(
+            &feed(r#"{"session":"s","rows":[{"key":"giverny#13","stage":"planned"}]}"#),
+            &["s"],
+            &l,
+        );
+        let q = g.rows[0].lease.as_ref().unwrap();
+        assert_eq!(queued_note(q), "queued for 1c behind giverny#12");
+    }
+
+    #[test]
+    fn the_capacity_line_is_leases_against_limits_and_quiet_when_idle() {
+        let limits = Resolved {
+            cpu_cores: 10,
+            ram: Mem(22 * 1024),
+            gpus: Vec::new(),
+        };
+        assert_eq!(capacity_line(&Ledger::default(), &limits), None);
+        let l = ledger(
+            r#"{"version":1,"leases":[
+              {"id":"a","session":"s","task":"a","cpu":3,"ram_mb":3072,"granted_at":0,"heartbeat_at":0},
+              {"id":"b","session":"s","task":"b","cpu":2,"ram_mb":3072,"granted_at":0,"heartbeat_at":0}],
+             "queue":[{"id":"c","session":"s","task":"c","cpu":1,"queued_at":0,"heartbeat_at":0}]}"#,
+        );
+        assert_eq!(
+            capacity_line(&l, &limits).as_deref(),
+            Some("leased 6G/22G RAM · 5/10 cores · 1 queued")
+        );
+        let gpu = Resolved {
+            gpus: vec![giverny_core::limits::GpuLimit {
+                index: 0,
+                vram: Mem(20 * 1024),
+            }],
+            ..limits
+        };
+        assert!(capacity_line(&l, &gpu).unwrap().contains("gpu0 0/20G"));
     }
 
     #[test]
