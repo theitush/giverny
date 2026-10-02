@@ -102,6 +102,15 @@ pub fn avoid_wayland() -> bool {
     )
 }
 
+/// Running under WSLg, on whichever of its two display servers.
+pub fn is_wslg() -> bool {
+    avoid_wayland_for(
+        std::env::var_os("WSL_DISTRO_NAME").is_some(),
+        std::path::Path::new("/mnt/wslg").is_dir(),
+        false,
+    )
+}
+
 fn avoid_wayland_for(wsl: bool, wslg: bool, wayland_asked_for: bool) -> bool {
     wsl && wslg && !wayland_asked_for
 }
