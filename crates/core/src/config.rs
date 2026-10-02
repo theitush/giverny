@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
+    pub window: WindowConfig,
     pub titles: TitlesConfig,
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
@@ -182,6 +183,41 @@ pub struct FontConfig {
 pub struct ThemeConfig {
     /// Built-in theme name: `monet-dark`, `monet-light`, `ink`.
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowConfig {
+    /// How much of the window's background is painted: 1.0 is solid, lower
+    /// lets the desktop show through. Text and anything a program colours
+    /// stay solid either way.
+    pub opacity: f32,
+}
+
+impl WindowConfig {
+    /// The lowest opacity the app will paint at. Below it, text over a busy
+    /// wallpaper stops being readable on a compositor that does not blur.
+    pub const MIN_OPACITY: f32 = 0.5;
+
+    /// `opacity` as the app uses it: inside the supported range whatever the
+    /// file says, and solid when it says nothing a number can be made of.
+    pub fn opacity(&self) -> f32 {
+        if self.opacity.is_nan() {
+            return 1.0;
+        }
+        self.opacity.clamp(Self::MIN_OPACITY, 1.0)
+    }
+
+    /// Whether the window has to be see-through at all.
+    pub fn translucent(&self) -> bool {
+        self.opacity() < 1.0
+    }
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        WindowConfig { opacity: 1.0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +438,30 @@ mod tests {
         // Short paths and non-paths are not worth mangling.
         assert_eq!(display_title("~/Dev", &cfg), "~/Dev");
         assert_eq!(display_title("btop", &cfg), "btop");
+    }
+
+    #[test]
+    fn opacity_is_kept_inside_what_the_app_paints() {
+        let at = |opacity| WindowConfig { opacity }.opacity();
+        assert_eq!(at(1.0), 1.0);
+        assert_eq!(at(0.92), 0.92);
+        assert_eq!(at(0.1), WindowConfig::MIN_OPACITY);
+        assert_eq!(at(-3.0), WindowConfig::MIN_OPACITY);
+        assert_eq!(at(1.5), 1.0, "above 1.0 is solid, not an error");
+        assert_eq!(at(f32::NAN), 1.0);
+        assert!(!WindowConfig::default().translucent());
+        assert!(!WindowConfig { opacity: 2.0 }.translucent());
+        assert!(WindowConfig { opacity: 0.95 }.translucent());
+    }
+
+    #[test]
+    fn opacity_reads_from_the_window_table() {
+        let dir = scratch("opacity");
+        std::fs::write(config_path(&dir), "[window]\nopacity = 0.92\n").unwrap();
+        let cfg = load(&dir);
+        assert_eq!(cfg.window.opacity(), 0.92);
+        assert_eq!(cfg.theme.name, "monet-dark");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

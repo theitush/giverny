@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `window.opacity` (0.5-1.0, default 1.0) lets the desktop show through the
+  terminal and the rail. Only backgrounds go see-through: text, the cursor,
+  selections, search matches, images and cells a program colours stay solid,
+  and so do menus, popups, the palette and the settings screen. At 1.0 nothing
+  changes, and no transparent window is asked for. Going between 1.0 and a
+  lower value needs a restart; below 1.0 it changes live. The window stays
+  solid, with a line in the log saying why, on WSLg, on X11 without a
+  compositing manager, on an OpenGL framebuffer without alpha, and where wgpu
+  cannot composite premultiplied alpha. On GNOME, which does not blur behind
+  windows, 0.90-0.95 keeps text readable over a busy wallpaper.
+
 ## v1.1.0 — 2026-09-28
 
 Most of this release is [@theitush](https://github.com/theitush)'s, from running

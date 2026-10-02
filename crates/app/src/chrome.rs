@@ -7,6 +7,7 @@
 //! yellow and cyan are, and using them is what makes the chrome belong to it.
 
 use eframe::egui::{self, Color32};
+use giverny_term::render::opacity::see_through;
 use giverny_term::render::theme::Theme;
 
 #[derive(Debug, Clone, Copy)]
@@ -112,13 +113,32 @@ impl Chrome {
     }
 
     /// Push it into egui, so panels, text fields and buttons follow too.
-    pub fn apply(&self, ctx: &egui::Context, theme: &Theme) {
+    /// `opacity` is the window's: below 1.0 the panels let the desktop
+    /// through, and nothing else does.
+    pub fn apply(&self, ctx: &egui::Context, theme: &Theme, opacity: f32) {
+        ctx.set_visuals(self.visuals(theme, opacity));
+        // egui's floating scrollbars are drawn *over* the last ~10px of the
+        // content, so as soon as the rail has enough tabs to scroll, the "+"
+        // and close buttons at the right edge end up underneath the bar.
+        // Reserve the width instead — only when a bar is actually shown, so
+        // short rails keep the full width.
+        ctx.all_styles_mut(|s| {
+            s.spacing.scroll.floating_allocated_width = s.spacing.scroll.bar_width;
+        });
+    }
+
+    fn visuals(&self, theme: &Theme, opacity: f32) -> egui::Visuals {
         let mut v = if theme.is_light() {
             egui::Visuals::light()
         } else {
             egui::Visuals::dark()
         };
-        v.panel_fill = self.panel;
+        // The rail and the space around the grid. Each is lifted from the
+        // terminal by the same tint it always was, and over the same desktop
+        // the difference between them survives the alpha.
+        v.panel_fill = see_through(self.panel, opacity);
+        // Menus, popups and the palette float over the terminal and stay
+        // solid: they are read against whatever is under them.
         v.window_fill = self.panel;
         v.faint_bg_color = mix(self.panel, self.fg, 0.05);
         v.extreme_bg_color = theme.bg;
@@ -140,15 +160,7 @@ impl Chrome {
         v.widgets.hovered.weak_bg_fill = mix(self.panel, self.fg, 0.14);
         v.widgets.active.bg_fill = mix(self.panel, self.accent, 0.35);
         v.widgets.active.weak_bg_fill = mix(self.panel, self.accent, 0.28);
-        ctx.set_visuals(v);
-        // egui's floating scrollbars are drawn *over* the last ~10px of the
-        // content, so as soon as the rail has enough tabs to scroll, the "+"
-        // and close buttons at the right edge end up underneath the bar.
-        // Reserve the width instead — only when a bar is actually shown, so
-        // short rails keep the full width.
-        ctx.all_styles_mut(|s| {
-            s.spacing.scroll.floating_allocated_width = s.spacing.scroll.bar_width;
-        });
+        v
     }
 }
 
@@ -192,6 +204,62 @@ mod tests {
             assert!(contrast(c.dim, c.panel) >= 3.0, "{name}: hints on the rail");
             assert!(contrast(c.dim, c.fg) >= 1.5, "{name}: hints look like text");
             assert_ne!(c.accent, c.amber, "{name}: selection looks like attention");
+        }
+    }
+
+    /// A solid window gets the panels it always had.
+    #[test]
+    fn solid_visuals_are_unchanged() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name);
+            let c = Chrome::from_theme(&theme);
+            let v = c.visuals(&theme, 1.0);
+            assert_eq!(v.panel_fill, c.panel, "{name}");
+            assert_eq!(v.window_fill, c.panel, "{name}");
+            assert_eq!(v.extreme_bg_color, theme.bg, "{name}");
+        }
+    }
+
+    /// See-through changes the panels' alpha and nothing else: popups,
+    /// selection and every widget fill stay as solid as before.
+    #[test]
+    fn see_through_touches_only_the_panel_alpha() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name);
+            let c = Chrome::from_theme(&theme);
+            let solid = c.visuals(&theme, 1.0);
+            let mut clear = c.visuals(&theme, 0.92);
+            assert_eq!(clear.panel_fill.a(), 235, "{name}");
+            let [r, g, b, _] = clear.panel_fill.to_srgba_unmultiplied();
+            for (got, want) in [(r, c.panel.r()), (g, c.panel.g()), (b, c.panel.b())] {
+                assert!(got.abs_diff(want) <= 1, "{name}: panel hue moved");
+            }
+            clear.panel_fill = solid.panel_fill;
+            assert!(
+                clear == solid,
+                "{name}: something besides the panel changed"
+            );
+        }
+    }
+
+    /// The rail is a lifted surface; at the opacity the docs suggest it still
+    /// differs from the terminal beside it by the tint it had when solid.
+    #[test]
+    fn the_rail_still_reads_as_its_own_surface() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name);
+            let c = Chrome::from_theme(&theme);
+            let rail = see_through(c.panel, 0.92);
+            let grid = see_through(theme.bg, 0.92);
+            let step = |x: Color32, y: Color32| {
+                x.r().abs_diff(y.r()) as u32
+                    + x.g().abs_diff(y.g()) as u32
+                    + x.b().abs_diff(y.b()) as u32
+            };
+            assert!(
+                step(rail, grid) * 100 >= step(c.panel, theme.bg) * 85,
+                "{name}: rail blends into the grid"
+            );
         }
     }
 
