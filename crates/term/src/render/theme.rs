@@ -182,6 +182,27 @@ impl Theme {
         )
     }
 
+    /// Catppuccin Mocha as the Colloid GTK theme wears it on a GNOME desktop:
+    /// mauve where stock Mocha uses teal and rosewater, Latte's near-white
+    /// for text, and magenta given to mauve so programs pick it up too.
+    pub fn catppuccin_mauve() -> Self {
+        let mauve = hex(0xcba6f7);
+        Theme {
+            accent: Some(mauve),
+            selection_bg: Color32::from_rgba_unmultiplied(0xcb, 0xa6, 0xf7, 70),
+            ..Theme::from_hex(
+                0x1e1e2e,
+                0xeff1f5,
+                0xcba6f7,
+                0x1e1e2e,
+                [
+                    0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xcba6f7, 0x94e2d5, 0xbac2de,
+                    0x6c7086, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0xb4befe, 0xf5c2e7, 0x94e2d5, 0xeff1f5,
+                ],
+            )
+        }
+    }
+
     /// P3 amber phosphor: one colour at every brightness, and whatever a
     /// program sends in 24-bit colour goes amber with it.
     pub fn phosphor() -> Self {
@@ -378,6 +399,7 @@ impl Theme {
         "gruvbox",
         "nord",
         "catppuccin",
+        "catppuccin-mauve",
         "rouen",
         "phosphor",
         "abyss",
@@ -395,6 +417,7 @@ impl Theme {
             "gruvbox" => Theme::gruvbox(),
             "nord" => Theme::nord(),
             "catppuccin" => Theme::catppuccin(),
+            "catppuccin-mauve" => Theme::catppuccin_mauve(),
             // The app asks for the hour it actually is; see `rouen_at`.
             "rouen" => Theme::rouen_at(12.0),
             "phosphor" => Theme::phosphor(),

@@ -235,6 +235,7 @@ pub const SETTINGS: &[SettingDef] = &[
                 "gruvbox",
                 "nord",
                 "catppuccin",
+                "catppuccin-mauve",
                 "rouen",
                 "phosphor",
                 "abyss",
