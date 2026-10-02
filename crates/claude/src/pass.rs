@@ -59,6 +59,12 @@ usage: giverny pass <command> [args] [--session <id>]
                               refused as larger than the limits (5)
   release <task>              give the task's lease back (land and drop do it)
   resources                   capacity, limits, other programs' load, leases
+  run   <task> [--cpu N --ram 3G ...] -- <cmd…>
+                              run a worker's heavy command under the task's
+                              lease: capped by a systemd scope where there is
+                              one (else plain, advisory), its slots locked for
+                              the command's life, peak memory and CPU time
+                              recorded on the row; exit code = the command's
 
 <task> is any short name (`auth-fix`, `#12`); name it, as a whole word, in the
 worker's spawn description too. <dur> is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
@@ -78,7 +84,9 @@ Resources (giverny#160): one ledger for every session on the machine, at
 <feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
 20 minutes after their session's last `giverny pass` command. Limits are
 [orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
-90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.";
+90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
+`run` with no lease claims one first (3 cpu, 3G unless --cpu/--ram say), waits
+while it is queued, and releases it when the command ends (giverny#161).";
 
 /// One `giverny pass` command, parsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +108,8 @@ pub enum Cmd {
     Claim(String),
     Release(String),
     Resources,
+    /// Run a command under the task's lease (giverny#161).
+    Run(String),
 }
 
 /// The flags any command may carry.
@@ -129,6 +139,8 @@ pub struct Flags {
     pub slots: Vec<String>,
     pub min_ram_mb: Option<u64>,
     pub priority: Option<String>,
+    /// `run`: the command, everything after `--`.
+    pub command: Vec<String>,
 }
 
 impl Flags {
@@ -194,6 +206,10 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
     let mut pos: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if a == "--" {
+            flags.command = it.by_ref().cloned().collect();
+            break;
+        }
         let mut val = |name: &str| {
             it.next()
                 .cloned()
@@ -259,10 +275,16 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "claim" => Cmd::Claim(task()?),
         "release" => Cmd::Release(task()?),
         "resources" => Cmd::Resources,
+        "run" => Cmd::Run(task()?),
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     if matches!(cmd, Cmd::Plan(_)) && flags.eta_s.is_none() {
         return Err("`plan` needs --eta: the pane's Next up rows show it".into());
+    }
+    if matches!(cmd, Cmd::Run(_)) && flags.command.is_empty() {
+        return Err(format!(
+            "`run` needs a command after `--`, e.g. `giverny pass run t -- cargo test`\n\n{USAGE}"
+        ));
     }
     if flags.gpu.unwrap_or(0) > 0 && flags.vram_mb.is_none() {
         return Err("`--gpu` needs --vram: how much of each GPU the worker needs".into());
@@ -435,7 +457,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Nudge
         | Cmd::Claim(_)
         | Cmd::Release(_)
-        | Cmd::Resources => {
+        | Cmd::Resources
+        | Cmd::Run(_) => {
             return Ok(String::new());
         }
     };
@@ -648,7 +671,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Nudge
         | Cmd::Claim(_)
         | Cmd::Release(_)
-        | Cmd::Resources => unreachable!(),
+        | Cmd::Resources
+        | Cmd::Run(_) => unreachable!(),
     }
 }
 
@@ -824,6 +848,7 @@ pub fn run_in_code(
     }
     match cmd {
         Cmd::Claim(task) => return claim(dir, &ledger, session, task, flags, now, cap),
+        Cmd::Run(task) => return crate::pass_run::run(dir, &ledger, session, task, flags, cap),
         Cmd::Release(task) => {
             let gone = resources::release_at(&ledger, session, task, now)?;
             resources::annotate_row(dir, session, task, None);
@@ -882,7 +907,95 @@ fn claim(
     })?;
     resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
     let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
-    Ok((resources::outcome_line(task, &out, &eta), out.exit_code()))
+    let mut line = resources::outcome_line(task, &out, &eta);
+    if !matches!(out, resources::Outcome::Refused(_))
+        && let Some(hint) = size_hint(dir, session, task, repo.as_deref())
+    {
+        line.push_str(&format!(" ({hint})"));
+    }
+    Ok((line, out.exit_code()))
+}
+
+/// What past tasks like this one peaked at under `giverny pass run`
+/// (giverny#161), for `claim` to say beside its answer: `the last 4 BUG
+/// tasks in giverny peaked at 1.8G (median), 2.6G at most`.
+fn size_hint(dir: &Path, session: &str, task: &str, repo: Option<&str>) -> Option<String> {
+    let history = pass_history::path(dir)?;
+    let title = feed::find(dir, session).and_then(|(_, f)| {
+        f.rows
+            .into_iter()
+            .find(|r| r.key == task)
+            .and_then(|r| r.title)
+    });
+    let kind = title.as_deref().and_then(pass_history::kind_of);
+    pass_history::peak_hint(&pass_history::load(&history), repo, kind.as_deref())
+}
+
+/// Change `session`'s feed row for `task` under the feed's lock, when the
+/// feed is this writer's and has the row. False when nothing was changed.
+pub(crate) fn edit_row(
+    dir: &Path,
+    session: &str,
+    task: &str,
+    f: impl FnOnce(&mut Map<String, Value>),
+) -> bool {
+    let file = file_for(dir, session);
+    if !file.exists() {
+        return false;
+    }
+    let Ok(_lock) = Lock::take(&file) else {
+        return false;
+    };
+    let Some(mut doc) = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return false;
+    };
+    if writer_of(&doc).is_some_and(|w| w != WRITER) {
+        return false;
+    }
+    let Some(row) = doc
+        .get_mut("rows")
+        .and_then(Value::as_array_mut)
+        .and_then(|rows| {
+            rows.iter_mut()
+                .find(|r| r.get("key").and_then(Value::as_str) == Some(task))
+        })
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    f(row);
+    write(&file, &doc).is_ok()
+}
+
+/// Open (`Some(note)`) or close (`None`) a waiting span on a Running row,
+/// as `eta --why wait` and the next plain `eta` do: `run` waiting on a slot
+/// or a queued lease is not work. Opens only where no wait or pause is
+/// open; true when it opened one (only that one is closed later).
+pub(crate) fn mark_waiting(
+    dir: &Path,
+    session: &str,
+    task: &str,
+    note: Option<&str>,
+    now: u64,
+) -> bool {
+    let mut opened = false;
+    edit_row(dir, session, task, |row| match note {
+        Some(n) => {
+            if stage_of(row) == Some(feed::Stage::Running)
+                && !row.contains_key("waiting_since")
+                && !row.contains_key("paused_since")
+            {
+                row.insert("waiting_since".into(), json!(stamp(now)));
+                row.insert("note".into(), json!(n));
+                opened = true;
+            }
+        }
+        None => close_wait(row, now),
+    });
+    opened
 }
 
 /// The feed commands: read the session's feed, change it, write it back.
@@ -1044,6 +1157,11 @@ pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<pass_history::
     let wait_s = u64_of(r, "wait_s").unwrap_or(0);
     let s = |k: &str| r.get(k).and_then(Value::as_str).map(String::from);
     let title = s("title");
+    let usage_u64 = |k: &str| {
+        r.get("usage")
+            .and_then(Value::as_object)
+            .and_then(|u| u64_of(u, k))
+    };
     Some(pass_history::Record {
         key: s("key").unwrap_or_default(),
         kind: title.as_deref().and_then(pass_history::kind_of),
@@ -1062,6 +1180,9 @@ pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<pass_history::
         started: Some(stamp(started)),
         ended: Some(stamp(ended)),
         outcome: s("landing"),
+        peak_mb: usage_u64("peak_mb"),
+        cpu_s: usage_u64("cpu_s"),
+        oom_kills: usage_u64("oom_kills").filter(|n| *n > 0),
     })
 }
 
@@ -1093,7 +1214,7 @@ fn clear_done(file: &Path, existing: Option<Value>) -> String {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

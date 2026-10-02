@@ -66,6 +66,17 @@ pub struct Record {
     pub ended: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// The highest peak memory of the task's `giverny pass run` commands
+    /// (giverny#161), MiB: the cgroup's `memory.peak` under a systemd
+    /// scope, else the largest process's RSS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_mb: Option<u64>,
+    /// CPU time of those commands, summed, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_s: Option<u64>,
+    /// How many of them the memory cap killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kills: Option<u64>,
 }
 
 impl Record {
@@ -243,6 +254,49 @@ pub fn correct(
     None
 }
 
+/// How many tasks with a measured peak a level needs before
+/// [`peak_hint`] speaks.
+pub const MIN_PEAK_SAMPLES: usize = 3;
+
+/// What the most recent tasks like this one peaked at under `giverny pass
+/// run`, by the same levels as [`correct`] (repo and kind, repo, all):
+/// `the last 4 BUG tasks in giverny peaked at 1.8G (median), 2.6G at most`.
+/// A task the cap killed counts at its peak, which is a floor.
+pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<String> {
+    let levels: [(Option<&str>, Option<&str>); 3] = [(repo, kind), (repo, None), (None, None)];
+    for (i, (r, k)) in levels.into_iter().enumerate() {
+        if (i == 0 && (r.is_none() || k.is_none())) || (i == 1 && r.is_none()) {
+            continue;
+        }
+        let peaks: Vec<u64> = history
+            .iter()
+            .rev()
+            .filter(|h| r.is_none_or(|r| h.repo.as_deref() == Some(r)))
+            .filter(|h| k.is_none_or(|k| h.kind.as_deref() == Some(k)))
+            .filter_map(|h| h.peak_mb.filter(|p| *p > 0))
+            .take(RECENT)
+            .collect();
+        if peaks.len() < MIN_PEAK_SAMPLES {
+            continue;
+        }
+        let what = match (r, k) {
+            (Some(r), Some(k)) => format!("{k} tasks in {r}"),
+            (Some(r), None) => format!("tasks in {r}"),
+            _ => "tasks".to_string(),
+        };
+        let max = peaks.iter().copied().max().unwrap_or(0);
+        let med = median(peaks.iter().map(|p| *p as f64).collect()).round() as u64;
+        let mem = |m: u64| giverny_core::limits::Mem(m).to_string();
+        return Some(format!(
+            "the last {} {what} peaked at {} (median), {} at most",
+            peaks.len(),
+            mem(med),
+            mem(max)
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +312,37 @@ mod tests {
             outcome: Some("Done".into()),
             ..Record::default()
         }
+    }
+
+    #[test]
+    fn peaks_are_hinted_from_the_narrowest_level_with_three() {
+        let peak = |repo: &str, kind: &str, mb: u64| Record {
+            peak_mb: Some(mb),
+            ..rec(repo, Some(kind), 10, 10)
+        };
+        let mut h = vec![
+            peak("giverny", "BUG", 1024),
+            peak("giverny", "BUG", 2662),
+            peak("giverny", "FEATURE", 6000),
+        ];
+        // Two BUGs is too few: the repo speaks, over all three.
+        assert_eq!(
+            peak_hint(&h, Some("giverny"), Some("BUG")).as_deref(),
+            Some("the last 3 tasks in giverny peaked at 2.6G (median), 5.9G at most")
+        );
+        h.push(peak("giverny", "BUG", 1843));
+        assert_eq!(
+            peak_hint(&h, Some("giverny"), Some("BUG")).as_deref(),
+            Some("the last 3 BUG tasks in giverny peaked at 1.8G (median), 2.6G at most")
+        );
+        // Tasks with no measured peak say nothing; nor does too little.
+        assert_eq!(peak_hint(&[rec("x", None, 1, 1)], None, None), None);
+        assert_eq!(
+            peak_hint(&h, Some("inbar"), None)
+                .as_deref()
+                .map(|s| &s[..12]),
+            Some("the last 4 t")
+        );
     }
 
     #[test]
