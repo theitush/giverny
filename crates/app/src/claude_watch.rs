@@ -73,6 +73,61 @@ pub struct Peak {
     pub resets: Option<jiff::Timestamp>,
 }
 
+/// Where a reading falls against a high-water mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// The mark's own window: the reading can only raise it.
+    Same,
+    /// A window that closed before the mark's opened — a number nothing
+    /// current should be showing.
+    Older,
+    /// A later window, or one the mark cannot vouch for: start again.
+    Other,
+}
+
+impl Peak {
+    /// Two reset times this close apart name the same window. The sources do
+    /// not spell it the same way — the push says `17:30:00`, the cache
+    /// `17:30:00.062934` — and a window never renews less than five hours
+    /// after the last one did, so an hour is slack, not ambiguity.
+    const SAME_WINDOW_SECS: i64 = 3600;
+    /// Without a reset time to go by, a number that has fallen this far below
+    /// the mark is a new window rather than a source that is behind.
+    const A_RESET_NOT_A_DISAGREEMENT: f64 = 25.0;
+
+    /// Which window `read` is from, as far as this mark can tell.
+    ///
+    /// Every running `claude` pushes the percentage *its own* last request
+    /// was answered with, and a session that has sat idle for an hour pushes
+    /// an hour-old number — with the current window's reset time beside it,
+    /// because that has not changed. A known reset time is what identifies
+    /// the window, so a number that is merely behind never ends the mark,
+    /// however far behind it is.
+    fn place(&self, read: &Reading, now: jiff::Timestamp) -> Window {
+        match (self.resets, read.resets) {
+            // The mark's window is over; whatever comes next starts afresh.
+            (Some(mine), _) if mine <= now => Window::Other,
+            (Some(mine), Some(theirs)) => {
+                let apart = theirs.as_second() - mine.as_second();
+                if apart.abs() < Self::SAME_WINDOW_SECS {
+                    Window::Same
+                } else if apart < 0 {
+                    Window::Older
+                } else {
+                    Window::Other
+                }
+            }
+            // A mark with no reset time and a reading that has one: the
+            // reading knows more.
+            (None, Some(_)) => Window::Other,
+            (_, None) if read.percent + Self::A_RESET_NOT_A_DISAGREEMENT < self.percent => {
+                Window::Other
+            }
+            (_, None) => Window::Same,
+        }
+    }
+}
+
 /// One usage bar's numbers, taken from whichever source is freshest.
 ///
 /// The cache and the statusline push disagree whenever the cache has stopped
@@ -121,8 +176,6 @@ pub struct WatchEffects {
     pub captured: Vec<(TabId, Option<String>, Option<PathBuf>)>,
     /// Desktop notifications to fire: `(summary, body)`.
     pub notify: Vec<(String, String)>,
-    /// Any tab is animating (spinner/pulse) — keep repainting.
-    pub animating: bool,
 }
 
 pub struct ClaudeWatch {
@@ -598,14 +651,6 @@ impl ClaudeWatch {
             self.refresh_usage();
         }
 
-        effects.animating = self
-            .tabs
-            .values()
-            .any(|t| matches!(t.state, ClaudeState::Busy | ClaudeState::NeedsYou))
-            || self
-                .jobs
-                .iter()
-                .any(|j| j.live && j.state == jobs::JobState::Working);
         effects
     }
 
@@ -755,12 +800,10 @@ impl ClaudeWatch {
 
     /// Keep each window's high-water mark up to date.
     ///
-    /// A window that has reset starts again: a different reset time is a
-    /// different window, and so is a number that has fallen away from the mark
-    /// rather than drifted from it — two sources disagree by a few points,
-    /// never by tens.
+    /// A reading from the window the mark is for can only raise it; one from
+    /// a later window replaces it; one that belongs to no window the mark can
+    /// place is let in only if it has not fallen tens of points below the mark.
     fn remember_peaks(&mut self) {
-        const A_RESET_NOT_A_DISAGREEMENT: f64 = 25.0;
         let now = jiff::Timestamp::now();
         for acc in &mut self.accounts {
             let Some(usage) = &acc.usage else { continue };
@@ -770,15 +813,17 @@ impl ClaudeWatch {
                     percent: read.percent,
                     resets: read.resets,
                 });
-                if peak.resets != read.resets
-                    || read.percent + A_RESET_NOT_A_DISAGREEMENT < peak.percent
-                {
-                    *peak = Peak {
-                        percent: read.percent,
-                        resets: read.resets,
-                    };
-                } else {
-                    peak.percent = peak.percent.max(read.percent);
+                match peak.place(&read, now) {
+                    Window::Same => peak.percent = peak.percent.max(read.percent),
+                    // The mark's window is the current one; this number is
+                    // from before it.
+                    Window::Older => {}
+                    Window::Other => {
+                        *peak = Peak {
+                            percent: read.percent,
+                            resets: read.resets,
+                        }
+                    }
                 }
             }
         }
@@ -1090,11 +1135,12 @@ impl ClaudeWatch {
     ) -> Reading {
         let mut read = Self::sampled(acc, limit, now);
         if let Some(peak) = acc.peak.get(&limit.kind)
-            && peak.resets == read.resets
+            && peak.place(&read, now) != Window::Other
             && peak.percent > read.percent
         {
             read.percent = peak.percent;
             read.critical = read.critical || peak.percent >= 95.0;
+            read.resets = peak.resets.or(read.resets);
         }
         read
     }
@@ -1618,6 +1664,103 @@ mod tests {
         let acc = &w.accounts[0];
         let limits = &acc.usage.as_ref().unwrap().limits;
         assert_eq!(ClaudeWatch::reading(acc, &limits[0], now).percent, 3.0);
+    }
+
+    /// ita's 5h bar cycling 44 → 70 → 75 every second or two. Every running
+    /// `claude` pushes the percentage its own last request was answered with,
+    /// so a session idle since the window stood at 44 keeps saying 44 — with
+    /// the current window's reset time — between the pushes of the busy ones.
+    /// Thirty-one points below the mark read as a new window, and the mark
+    /// started again from 44 on every lap. The cache, meanwhile, spells the
+    /// same reset with microseconds the push does not have.
+    #[test]
+    fn an_idle_session_does_not_restart_the_window() {
+        use giverny_claude::usage::{AccountUsage, LimitEntry};
+        let now = jiff::Timestamp::now();
+        // The push's reset, whole seconds; the cache's, the same moment
+        // written the way `/usage` writes it.
+        let resets = jiff::Timestamp::from_second(now.as_second() + 5_400).unwrap();
+        let cache_resets = resets + jiff::SignedDuration::from_micros(62_934);
+        let limit: LimitEntry = serde_json::from_str(&format!(
+            r#"{{"kind":"session","percent":72,"severity":"warning",
+                 "is_active":true,"resets_at":"{cache_resets}"}}"#
+        ))
+        .unwrap();
+        let mut w = ClaudeWatch::for_tests();
+        w.accounts.push(AccountPanel {
+            profile: Profile {
+                name: "acct".into(),
+                config_dir: PathBuf::from("/tmp/giverny-test-acct"),
+                email: None,
+                account_uuid: None,
+            },
+            usage: Some(AccountUsage {
+                fetched_at_ms: (now.as_millisecond() - 120_000) as u64,
+                limits: vec![limit],
+            }),
+            live: None,
+            peak: HashMap::new(),
+            statusline_on: true,
+        });
+        // What `giverny statusline` relays: Claude Code's own payload shape.
+        let push = |percent: u32| {
+            msg(&format!(
+                r#"{{"tab_id":"giverny-7","config_dir":"/tmp/giverny-test-acct",
+                    "event":{{"hook_event_name":"GivernyStatusLine",
+                             "rate_limits":{{"five_hour":{{"used_percentage":{percent},
+                                                         "resets_at":{}}}}}}}}}"#,
+                resets.as_second()
+            ))
+        };
+        let shown = |w: &ClaudeWatch| {
+            let acc = &w.accounts[0];
+            ClaudeWatch::reading(acc, &acc.usage.as_ref().unwrap().limits[0], now).percent
+        };
+
+        // Before any push the cache is the only source: 72.
+        w.remember_peaks();
+        assert_eq!(shown(&w), 72.0);
+        let mut seen = Vec::new();
+        for _lap in 0..3 {
+            for percent in [44, 70, 75] {
+                // A tick: the peaks are brought up to date, then the push lands.
+                w.remember_peaks();
+                feed(&mut w, &push(percent), Some(TAB));
+                seen.push(shown(&w));
+                w.remember_peaks();
+                seen.push(shown(&w));
+            }
+        }
+        // It climbed to 75 once and stayed.
+        assert!(
+            seen.windows(2).all(|p| p[1] >= p[0]),
+            "walked back: {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&75.0));
+
+        // The window renews: a reset five hours on is a new window, and the
+        // bar starts again from what the new window says.
+        let next = jiff::Timestamp::from_second(resets.as_second() + 5 * 3600).unwrap();
+        w.accounts[0].usage = None;
+        w.accounts[0].peak.insert(
+            "session".into(),
+            Peak {
+                percent: 75.0,
+                resets: Some(resets),
+            },
+        );
+        let fresh: LimitEntry = serde_json::from_str(&format!(
+            r#"{{"kind":"session","percent":3,"severity":"normal",
+                 "is_active":true,"resets_at":"{next}"}}"#
+        ))
+        .unwrap();
+        w.accounts[0].live = None;
+        w.accounts[0].usage = Some(AccountUsage {
+            fetched_at_ms: now.as_millisecond() as u64,
+            limits: vec![fresh],
+        });
+        w.remember_peaks();
+        assert_eq!(shown(&w), 3.0);
     }
 
     /// An account whose cache has stopped being refreshed, which is every

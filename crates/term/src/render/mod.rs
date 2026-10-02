@@ -4,4 +4,5 @@ pub mod atlas;
 pub mod bidi;
 pub mod mesh;
 pub mod metrics;
+pub mod opacity;
 pub mod theme;

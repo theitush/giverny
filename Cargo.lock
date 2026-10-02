@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "1.0.4"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1410,10 +1410,12 @@ dependencies = [
  "giverny-core",
  "giverny-term",
  "jiff",
+ "khronos-egl",
  "notify-rust",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "pollster",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -1426,11 +1428,12 @@ dependencies = [
  "windows 0.62.2",
  "windows-sys 0.61.2",
  "winresource",
+ "x11-dl",
 ]
 
 [[package]]
 name = "giverny-claude"
-version = "1.0.4"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1447,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "1.0.4"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1464,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "1.0.4"
+version = "1.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

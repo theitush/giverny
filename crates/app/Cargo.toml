@@ -29,12 +29,23 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
 # The window handle: Wayland drag-and-drop needs it, so does the taskbar badge.
 raw-window-handle = "0.6"
+# Blocks on wgpu's adapter request before the window exists (`pick_renderer`).
+# The version eframe already uses, so no new tree.
+pollster = "0.4"
 
 # Wayland drag-and-drop, which winit 0.30 does not implement. It arrives
 # through the clipboard crate eframe already uses — patched in the workspace
 # root; see src/wayland_dnd.rs.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
 smithay-clipboard = "0.7.3"
+# WSLg's GPU path is an OpenGL driver picked by name (src/wslg.rs); a child
+# process tries it on a windowless EGL context first. The version and feature
+# wgpu's GL backend already uses, so no new tree.
+khronos-egl = { version = "6", features = ["dynamic"] }
+# Sizing WSLg's cursors to the display (src/wslg_cursor.rs), through the
+# libX11/libXcursor winit already loads. The version winit uses, so no new
+# tree.
+x11-dl = "2.21"
 
 # Shutting down on a signal, so a logout or a `kill` gets the same
 # scrollback-and-state write that closing the window does.

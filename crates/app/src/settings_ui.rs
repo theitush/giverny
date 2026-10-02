@@ -352,12 +352,19 @@ fn widget(
         }
         Kind::Float { min, max, .. } => {
             let mut v = value.as_f64().unwrap_or_default();
+            // Point sizes move in quarters; a fraction like opacity, whose
+            // useful values are 0.90-0.95, in hundredths.
+            let (speed, decimals) = if max - min <= 1.0 {
+                (0.005, 2)
+            } else {
+                (0.25, 1)
+            };
             if ui
                 .add(
                     egui::DragValue::new(&mut v)
-                        .speed(0.25)
+                        .speed(speed)
                         .range(*min..=*max)
-                        .fixed_decimals(1),
+                        .fixed_decimals(decimals),
                 )
                 .changed()
             {
