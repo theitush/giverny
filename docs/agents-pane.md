@@ -71,7 +71,7 @@ giverny pass reply <msg-id> "<text>"
 - **OOM.** A command the memory cap killed (the scope's `memory.events` counts an `oom_kill`) is reported — `the 3G memory cap killed it (OOM). Ask for more: …` — so the worker can ask its orchestrator for more RAM and run it again.
 - **Exit code** is the command's own, 128 + the signal when one killed it (137 for the OOM killer's SIGKILL). Ctrl-C reaches the command; `run` itself waits it out, so the run is still recorded.
 
-**Limits** are what *all* orchestrators on the machine together may use. They are `[orchestrator.limits]` in Giverny's `config.toml`, every key `"auto"` unless set:
+**Limits** are what *all* orchestrators on the machine together may use. Set them in **Settings → Orchestrator → Limits**, where each field takes `auto`, a number or size (`6`, `16G`), or a share of this machine (`50%` of the cores or of the RAM, written to the file as the figure it comes to). They are `[orchestrator.limits]` in Giverny's `config.toml`, every key `"auto"` unless set:
 
 ```toml
 [orchestrator.limits]

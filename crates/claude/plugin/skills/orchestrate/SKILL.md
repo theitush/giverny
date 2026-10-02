@@ -62,7 +62,32 @@ Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
 ## 2. Start a task
 
-For each task you start, stamp it and spawn its worker in the same breath:
+First claim what its worker needs from the machine. Every Giverny session
+shares one ledger of CPU, RAM, GPUs and exclusive slots, so a claim is how two
+orchestrators stay out of each other's way. You claim, because the lease is
+yours; workers never do.
+
+```bash
+giverny-pass claim auth-fix --cpu 3 --ram 3G
+```
+
+Size it from the hint `claim` prints once there is history (`the last 4 BUG
+tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with a sane
+default. Add `--slot <name>` for something only one task at a time may use (a
+shared build folder), `--priority` when the task is urgent, `--gpu N --vram 8G`
+for a GPU. The answer is one line and an exit code:
+
+- `granted` (0): go on.
+- `granted smaller` (3, only with `--min-ram`): go on, with what it says.
+- `queued` (4): something it needs is held. Start another planned task from a
+  free lane instead, and re-run the same `claim` now and then until it is
+  granted (nothing calls back). When it says the wait is longer than the task
+  itself and suggests `ask`, send `giverny-pass ask <holder's task> "<why, the
+  priority, how long you need it>"` and keep polling; the holder may release.
+- `refused` (5): larger than this machine's limits (Settings → Orchestrator →
+  Limits). Ask for less, or tell the user.
+
+Then, once granted, stamp the task and spawn its worker in the same breath:
 
 ```bash
 giverny-pass start auth-fix
@@ -91,8 +116,13 @@ When you spawn one:
   > Do the same whenever the estimate turns out wrong. When you are waiting on
   > something that is not the work (a build slot, a lock, a person), say so
   > with `--why wait`; your next `eta` without it ends the wait. Do not run
-  > `giverny-pass start` or `giverny-pass land`; the dispatcher does. End with a
-  > short report: what you did, how you checked it, and anything left undone.
+  > `giverny-pass start` or `giverny-pass land`; the dispatcher does. Run heavy
+  > commands (builds, test suites, anything that eats CPU or memory) as
+  > `giverny-pass run <task> -- <command>`: it keeps them inside what was
+  > granted and measures them. Never set CPU or memory caps by hand. If `run`
+  > says the memory cap killed your command (OOM), do not retry it: report that
+  > to the dispatcher, who claims more. End with a short report: what you did,
+  > how you checked it, and anything left undone.
 
   About five minutes into the task, Giverny's plugin puts a request for that
   re-estimate into the worker's context, once, unless it has re-estimated
@@ -119,6 +149,23 @@ before the ask is not counted, and the figure is not corrected from the history.
   worker marked with `eta --why wait`, are left out of the working time the
   history learns from; the pane still shows the wall time.
 - A task you decide not to do comes out of the plan: `giverny-pass drop <task>`.
+- A worker that reports an OOM needs a bigger lease: `giverny-pass release
+  <task>`, then `claim` it again with more `--ram`, then send the worker on
+  (`run` takes the new grant). A held lease never grows through `claim`. Once,
+  not in a loop: if the bigger claim fails too, tell the user.
+- **Another orchestrator may ask for your resources.** When a line like
+  `Giverny: another orchestrator on this machine asks for resources (message
+  mXXXXXX, …)` arrives in your context, weigh its priority and time left
+  against your task's, then answer, always, even with no:
+  - give way: `giverny-pass release <task>` frees everything, slots included
+    (the worker's next `run` claims afresh and waits its turn), or
+    `giverny-pass claim <task> --cpu <fewer> --ram <less>` shrinks in place and
+    keeps the slots (a `run` already going keeps its cap; the next one uses the
+    new grant), which does not help an asker waiting for your slot: release for that;
+  - `giverny-pass reply <id> "<answer>"`, then carry on.
+
+  The same hook tells you when a reply to your own ask arrives: re-run your
+  `claim` at once.
 - `giverny-pass show` prints the pass as it stands.
 
 ### Giving a worker its next task
@@ -152,6 +199,7 @@ it counts: anything visual, a judgement call between two good options, an
 irreversible change. The text is one line naming who, what exactly, and where
 to see it; the pane shows it at the top of the row.
 
+Landing also gives the task's lease back; there is nothing else to release.
 Then start the next planned task whose lane is free, until none are left.
 
 ## 5. Finish
@@ -166,3 +214,7 @@ asks.
 The command comes with Giverny. If running it fails with "command not found",
 carry on without it: the orchestration works the same, the pane just shows the
 workers without the plan and the estimates.
+
+If it is there but has no `claim` (an older Giverny: `giverny-pass` prints its
+usage with no `claim` in it), skip claiming, `run`, `ask` and `reply`, and carry
+on as before; workers run their commands themselves.

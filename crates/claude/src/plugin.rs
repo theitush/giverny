@@ -88,7 +88,9 @@ fn wrapper(exes: &[String]) -> String {
 
 /// `hooks/hooks.json`. Always a `PostToolUse` hook, `giverny-pass nudge`,
 /// which asks a worker five minutes into its task for a fresh estimate
-/// (giverny#143), and a subagent with no row for a first one (giverny#158); quiet and exit 0 whatever happens. With `orchestrate`,
+/// (giverny#143), and a subagent with no row for a first one (giverny#158);
+/// on an orchestrator's own calls it delivers the session's `ask`/`reply`
+/// messages and renews its resource leases (giverny#162); quiet and exit 0 whatever happens. With `orchestrate`,
 /// also on `SessionStart` (a new session, `/clear`, and after a compaction,
 /// which is when the context is fresh) print the reply that carries
 /// [`ORCHESTRATE_BY_DEFAULT`]: `cat` of a file Claude Code parses itself, so
