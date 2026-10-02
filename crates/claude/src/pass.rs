@@ -36,7 +36,9 @@ usage: giverny pass <command> [args] [--session <id>]
   start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N] [--repo R]
                               the task's worker is starting now (Running)
   eta   <task> <dur left> [--note N] [--why wait|blocked|scope|load|ready]
-                              re-estimate: this much is left from now;
+                              [--title T] [--agent <id>] [--repo R]
+                              re-estimate: this much is left from now (a task
+                              with no row is started now, Running, with it);
                               --why wait (or blocked) marks the worker waiting
                               until its next eta, and that span is not work
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
@@ -438,6 +440,31 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                     agent = f.agent.as_deref().unwrap_or("")
                 ),
             })
+        }
+        Cmd::Eta(_, left) if at.is_none() => {
+            // A worker spawned outside a pass (giverny#140, #144) has no row
+            // for `eta` to re-estimate, and an error would teach nothing:
+            // start one now, with what is left as its estimate. The time
+            // the worker spent before this is not known, so the clock starts
+            // here; and the figure is a re-estimate, which (like every `eta`)
+            // is taken as given, not scaled by the history.
+            let mut sf = f.clone();
+            sf.eta_s = Some(*left);
+            sf.guess_s = None;
+            sf.basis = None;
+            apply(doc, &Cmd::Start(key.clone()), &sf, now)?;
+            let rows = rows_mut(doc)?;
+            if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut())
+                && is_wait(f.why.as_deref())
+            {
+                row.insert("waiting_since".into(), json!(stamp(now)));
+            }
+            Ok(format!(
+                "{key}: no row in this pass, so started it now with ~{} left \
+                 (as given; `giverny pass start {key} --eta <min> --agent <id>` \
+                 before the spawn gives a row its whole time and a corrected estimate)",
+                feed::fmt_span(*left as i64)
+            ))
         }
         Cmd::Eta(_, left) => {
             let i = at.ok_or_else(missing)?;
@@ -1073,6 +1100,53 @@ mod tests {
             feed::Stage::Running,
             "another worker's task runs on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eta_on_a_task_with_no_row_starts_it() {
+        // giverny#144: a worker spawned outside a pass; its dispatcher (or
+        // the worker) reaches for `eta`, and gets a Running row, not an error.
+        let dir = scratch("eta-no-row");
+        let said = run(
+            &dir,
+            "eta inbar#613 40 --agent w9 --title Graph --repo inbar",
+            T0,
+        )
+        .unwrap();
+        assert!(said.contains("started it now with ~40m left"), "{said}");
+        assert!(
+            said.contains("giverny pass start inbar#613 --eta"),
+            "{said}"
+        );
+        let f = read_feed(&dir);
+        let r = &f.rows[0];
+        assert_eq!(r.key, "inbar#613");
+        assert_eq!(r.stage(), feed::Stage::Running);
+        assert_eq!(r.started_ms, Some(T0));
+        assert_eq!(r.eta_s, Some(40 * 60), "as given, not corrected");
+        assert_eq!(r.title.as_deref(), Some("Graph"));
+        assert_eq!(r.agent_id.as_deref(), Some("w9"));
+
+        // From then on it is an ordinary row: a later eta re-estimates it.
+        run(&dir, "eta inbar#613 10", T0 + 20 * MIN).unwrap();
+        assert_eq!(read_feed(&dir).rows[0].eta_s, Some(30 * 60));
+
+        // `--why wait` on a missing row starts it waiting.
+        run(&dir, "eta other 5 --why wait", T0).unwrap();
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
+        let other = doc["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == "other")
+            .unwrap();
+        assert!(other.get("waiting_since").is_some(), "{other}");
+
+        // The other verbs still refuse a task that is not there.
+        assert!(run(&dir, "land nope", T0).is_err());
+        assert!(run(&dir, "pause nope", T0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
