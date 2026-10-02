@@ -122,6 +122,51 @@ pub struct FeedRow {
     /// copy written by `giverny pass claim`, gone on `release`/`land`. The
     /// ledger itself (`resources`) is the truth; this is for drawing.
     pub lease: Option<RowLease>,
+    /// What the task's `giverny pass run` commands used (giverny#161).
+    pub usage: Option<RowUsage>,
+}
+
+/// A row's `usage` object: the task's `giverny pass run` commands so far,
+/// measured. Totals over every run, and the last run's command and cap.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowUsage {
+    pub runs: u64,
+    /// The highest peak memory of any run, MiB.
+    pub peak_mb: Option<u64>,
+    /// CPU time over every run, seconds.
+    pub cpu_s: u64,
+    /// Wall time over every run, seconds.
+    pub wall_s: u64,
+    /// Runs the memory cap killed.
+    pub oom_kills: u64,
+    pub last_cmd: Option<String>,
+    pub last_exit: Option<i64>,
+    pub last_peak_mb: Option<u64>,
+    /// The last run's cap: cores and RAM, when it was held to one.
+    pub cap_cpu: Option<u64>,
+    pub cap_ram_mb: Option<u64>,
+    /// The last run was capped by a systemd scope (else ran plain).
+    pub capped: bool,
+}
+
+fn parse_usage(v: &Value) -> Option<RowUsage> {
+    let u = v.get("usage")?;
+    if !u.is_object() {
+        return None;
+    }
+    Some(RowUsage {
+        runs: u64_field(u, "runs").unwrap_or(0),
+        peak_mb: u64_field(u, "peak_mb"),
+        cpu_s: u64_field(u, "cpu_s").unwrap_or(0),
+        wall_s: u64_field(u, "wall_s").unwrap_or(0),
+        oom_kills: u64_field(u, "oom_kills").unwrap_or(0),
+        last_cmd: str_field(u, "last_cmd"),
+        last_exit: i64_field(u, "last_exit"),
+        last_peak_mb: u64_field(u, "last_peak_mb"),
+        cap_cpu: u64_field(u, "cap_cpu"),
+        cap_ram_mb: u64_field(u, "cap_ram_mb"),
+        capped: u.get("capped").and_then(Value::as_bool) == Some(true),
+    })
 }
 
 /// Where a row's task stands with the machine ledger.
@@ -345,6 +390,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         review: str_field(v, "review"),
         follows_worker: v.get("follows_worker").and_then(Value::as_bool) == Some(true),
         lease: parse_lease(v),
+        usage: parse_usage(v),
     })
 }
 

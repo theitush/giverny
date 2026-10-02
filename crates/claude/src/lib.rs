@@ -11,6 +11,7 @@ pub mod jobs;
 pub mod pass;
 pub mod pass_history;
 pub mod pass_nudge;
+pub mod pass_run;
 pub mod plugin;
 pub mod profiles;
 pub mod registry;
