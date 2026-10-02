@@ -34,6 +34,52 @@ giverny pass clear-done                                                        #
 - **`clear-done` clears the Done rows** (giverny#112): from this session's feed when `giverny pass` wrote it, and from the agents pane of the Giverny tab it runs in, whoever wrote the feed. The pane drops its own Done rows, keeps them from coming back from disk, and hides the feed's Done rows that landed before the clear. Running and Next up rows stay. In a Claude session the plugin's `/giverny:clear-done` runs it.
 - **It never touches another writer's feed.** It marks its files `"writer": "giverny/pass"` and refuses any file whose `writer` names someone else.
 
+## Resources
+
+Before a worker starts, its orchestrator says what the worker needs, and the **machine ledger** answers. It is one file for every Claude session on the machine, so orchestrators in different tabs, repos and accounts share CPU, RAM, GPUs and exclusive slots without knowing about each other (giverny#159, #160).
+
+```
+giverny pass claim <task> [--cpu N] [--ram 3G] [--gpu N --vram 8G] [--slot NAME]… [--min-ram 2G] [--priority P]
+giverny pass release <task>
+giverny pass resources
+```
+
+- **`claim`** answers with one line and an exit code: `granted t1: 3 cpu, 3G, slot cargo:/x/target` (**0**); `granted smaller t1: 3 cpu, 2.5G (asked 3G, more is not free)` (**3**, only with `--min-ram`); `queued #2 behind giverny#12 (3G, slot cargo:/x/target; ~14m)` (**4**: who holds what it needs, and their time left from their own feed rows); `refused …` (**5**: larger than the limits, so never queued). 1 is an error, 2 a usage error. Without `--cpu` a claim asks for one core; without `--ram`, none. Sizes are `3G`, `1.5G`, `512M`; a bare number is GiB. A task that already holds a lease is answered with it (exit 0).
+- **Queued means poll.** Nothing calls back: the orchestrator re-runs the same `claim` (each run keeps its place alive) until it is granted. The queue is first come, first served, a `--priority` (`asap` › `high` › `medium` › `low`) ahead of none. A request may go past one waiting ahead of it only with what is left after that one's request is set aside, so a small task can start beside a big one that waits, never take what it waits for.
+- **The grant rule.** CPU: the request fits under the limit less every live lease, and under the machine's cores less the leases and the 1-minute load average the leases do not explain. RAM: under the limit less every live lease, and under `MemAvailable` less a headroom (5 % of RAM, at least 1 GiB) — that is how other programs count: a browser eating 6 G shrinks what is grantable. GPU: each GPU asked for has `--vram` free under its limit (leases share a GPU by VRAM). **Slots** are any name (`cargo:/path/to/target` for a shared cargo target dir) and exclusive: one lease holds a slot at a time.
+- **Leases expire.** A lease (or a place in the queue) lives 20 minutes past its last heartbeat, and every `giverny pass` command from its session is a heartbeat, so a working orchestrator keeps its leases without trying and a dead one's are dropped on the next read by anyone. `land` and `drop` release the task's lease; `release` does it by hand.
+- **`resources`** prints the machine, the limits (`(auto)` where not set), other programs' load, what is free now, every lease with its session and time left, and the queue.
+- **The feed row carries its lease** as the row's `lease` field (see **Row**), so the pane can show what each Running row holds and which Next up rows wait for resources.
+
+**Limits** are what *all* orchestrators on the machine together may use. They are `[orchestrator.limits]` in Giverny's `config.toml`, every key `"auto"` unless set:
+
+```toml
+[orchestrator.limits]
+cpu_cores = "auto"   # cores − 2, at least 1; or a number
+ram       = "auto"   # 70 % of RAM; or "16G"
+gpus      = "auto"   # 90 % of each GPU's VRAM (nvidia-smi; none without it); or [{ index = 0, vram = "20G" }], or [] for none
+```
+
+**The ledger file** is `<feed dir>/resources/ledger.json` (`$GIVERNY_LEDGER` overrides). A writer other than `giverny pass` may read it, and may write it only the same way: take an exclusive `flock` on the sibling `ledger.lock` for the whole read-modify-write, drop expired entries, write to a temporary name in the same directory and `rename` it over. Version 1:
+
+```json
+{
+  "version": 1,
+  "leases": [
+    { "id": "5c1e…:giverny#12", "session": "5c1e…", "task": "giverny#12", "repo": "giverny",
+      "cpu": 3, "ram_mb": 3072, "gpus": [], "vram_mb": 0, "slots": ["cargo:/home/me/giverny/.claude/target-shared"],
+      "granted_at": "2026-10-02T10:00:00Z", "heartbeat_at": "2026-10-02T10:12:30Z" }
+  ],
+  "queue": [
+    { "id": "77d2…:inbar#5", "session": "77d2…", "task": "inbar#5", "cpu": 4, "ram_mb": 8192, "gpu": 0, "vram_mb": 0,
+      "slots": [], "min_ram_mb": 4096, "priority": "high",
+      "queued_at": "2026-10-02T10:05:00Z", "heartbeat_at": "2026-10-02T10:12:00Z" }
+  ]
+}
+```
+
+A lease's `id` is `<session>:<task>`, one per task per session; its `session` is the Claude session to ask for it. `ram_mb`/`vram_mb` are MiB; `vram_mb` is held on each GPU in `gpus`. Timestamps are RFC 3339 (epoch milliseconds are read too). An entry whose `heartbeat_at` is 20 minutes old is gone. A file of a newer `version` is refused, never overwritten.
+
 ## Where the file goes
 
 ```
@@ -125,6 +171,7 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `open` | string (shell command) | no | Run in a new tab when a **Running** or **Done** row is clicked, in place of Giverny's own transcript view (`giverny transcript --follow <agent jsonl>`) — e.g. `claude --resume <id>`. A command that resumes a conversation something is already running is not run: Giverny switches to the tab holding it, or says so. |
 | `note` | string | no | Free text; shown for a Planned row with no `brief`, and as a tooltip otherwise. |
 | `review` | string | no | Done rows: the one line a person has to read before the row counts (`<who> — <what> — <where>`). It is shown at the top of the row's overlay, verbatim, and nothing is fetched. See **The Review line**. |
+| `lease` | object | no | `giverny pass claim`: what the machine ledger answered the row's task — `state` (`granted`, `smaller`, `queued`), `cpu`, `ram_mb`, `gpus` (indices), `vram_mb`, `slots`; granted rows add `id` and `granted_at` (and `smaller` ones `wanted_ram_mb`), queued rows `position` and `behind` (the holder it waits on). For a queued row the figures are the request. A copy as of the last `claim`, removed by `release`/`land`; the ledger is the truth. See **Resources**. |
 
 Timestamps and numbers are forgiving: a number sent as a numeric string (`"2400"`) is read, a fractional number is truncated, a negative `eta_s` or `tokens` reads as absent. `null` is the same as leaving the field out.
 

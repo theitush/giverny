@@ -1,0 +1,514 @@
+//! What all orchestrators on this machine together may use (giverny#159).
+//!
+//! [`Limits`] is the setting: CPU cores, RAM and GPUs, each `"auto"` unless
+//! the person set a figure. It is serde-ready to sit in `config.toml` as
+//! `[orchestrator.limits]`; [`Limits::resolve`] turns every `auto` into a
+//! number for the [`Machine`] it runs on (cores − 2, 70 % of RAM, 90 % of
+//! each GPU's VRAM). [`Load`] is what the machine is doing right now, so a
+//! grant can count programs that are not Giverny's.
+//!
+//! ```toml
+//! [orchestrator.limits]
+//! cpu_cores = "auto"        # or 8
+//! ram       = "auto"        # or "16G", "512M"; a bare number is GiB
+//! gpus      = "auto"        # or [{ index = 0, vram = "20G" }]; [] = none
+//! ```
+//!
+//! The ledger that hands these out is `giverny_claude::resources`.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Cores held back from orchestrators by `cpu_cores = "auto"`.
+pub const AUTO_CORES_SPARE: u32 = 2;
+/// The share of RAM `ram = "auto"` hands out, in percent.
+pub const AUTO_RAM_PCT: u64 = 70;
+/// The share of each GPU's VRAM `gpus = "auto"` hands out, in percent.
+pub const AUTO_VRAM_PCT: u64 = 90;
+
+/// `"auto"`, or a figure the person set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Auto<T> {
+    #[default]
+    Auto,
+    Set(T),
+}
+
+impl<T> Auto<T> {
+    pub fn get(&self) -> Option<&T> {
+        match self {
+            Auto::Auto => None,
+            Auto::Set(v) => Some(v),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Auto<T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Auto::Auto => s.serialize_str("auto"),
+            Auto::Set(v) => v.serialize(s),
+        }
+    }
+}
+
+/// Only the word `auto` (any case).
+struct AutoWord;
+
+impl<'de> Deserialize<'de> for AutoWord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.trim().eq_ignore_ascii_case("auto") {
+            Ok(AutoWord)
+        } else {
+            Err(serde::de::Error::custom("not `auto`"))
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Auto<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw<T> {
+            Word(AutoWord),
+            Val(T),
+        }
+        match Raw::<T>::deserialize(d) {
+            Ok(Raw::Word(_)) => Ok(Auto::Auto),
+            Ok(Raw::Val(v)) => Ok(Auto::Set(v)),
+            Err(_) => Err(serde::de::Error::custom(
+                "expected \"auto\" or a value (see [orchestrator.limits])",
+            )),
+        }
+    }
+}
+
+/// An amount of memory, in MiB. Written `"16G"`, `"1.5G"`, `"512M"`,
+/// `"1T"`; a bare number is GiB (`3` = `"3G"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Mem(pub u64);
+
+impl Mem {
+    pub const fn mb(mb: u64) -> Mem {
+        Mem(mb)
+    }
+    pub const fn gb(gb: u64) -> Mem {
+        Mem(gb * 1024)
+    }
+    pub fn mb_value(self) -> u64 {
+        self.0
+    }
+
+    /// `3G`, `3GB`, `3GiB`, `1.5g`, `512M`, `2T`, `3` (GiB). `None` for
+    /// anything else.
+    pub fn parse(s: &str) -> Option<Mem> {
+        let s = s.trim().to_ascii_lowercase();
+        let s = s
+            .strip_suffix("ib")
+            .or_else(|| s.strip_suffix('b'))
+            .unwrap_or(&s);
+        let (num, mul) = match s.chars().last()? {
+            'k' => (&s[..s.len() - 1], 1.0 / 1024.0),
+            'm' => (&s[..s.len() - 1], 1.0),
+            'g' => (&s[..s.len() - 1], 1024.0),
+            't' => (&s[..s.len() - 1], 1024.0 * 1024.0),
+            _ => (s, 1024.0),
+        };
+        let n: f64 = num.trim().parse().ok()?;
+        (n.is_finite() && n >= 0.0).then(|| Mem((n * mul).round() as u64))
+    }
+}
+
+impl fmt::Display for Mem {
+    /// `16G` when whole GiB, `1.5G` to a tenth, else `700M`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mb = self.0;
+        if mb >= 1024 && mb.is_multiple_of(1024) {
+            write!(f, "{}G", mb / 1024)
+        } else if mb >= 1024 {
+            write!(f, "{:.1}G", mb as f64 / 1024.0)
+        } else {
+            write!(f, "{mb}M")
+        }
+    }
+}
+
+impl Serialize for Mem {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_multiple_of(1024) {
+            s.serialize_str(&format!("{}G", self.0 / 1024))
+        } else {
+            s.serialize_str(&format!("{}M", self.0))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Mem {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(u64),
+            Float(f64),
+            Str(String),
+        }
+        let bad = || serde::de::Error::custom("a size like \"16G\" or \"512M\"");
+        match Raw::deserialize(d)? {
+            Raw::Int(n) => Ok(Mem::gb(n)),
+            Raw::Float(f) => Mem::parse(&f.to_string()).ok_or_else(bad),
+            Raw::Str(s) => Mem::parse(&s).ok_or_else(bad),
+        }
+    }
+}
+
+/// One GPU orchestrators may use: its index (as `nvidia-smi` numbers it)
+/// and how much of its VRAM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuLimit {
+    pub index: u32,
+    pub vram: Mem,
+}
+
+/// `[orchestrator.limits]`: the whole machine's budget for orchestrators.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    pub cpu_cores: Auto<u32>,
+    pub ram: Auto<Mem>,
+    pub gpus: Auto<Vec<GpuLimit>>,
+}
+
+/// [`Limits`] with every `auto` turned into a number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolved {
+    pub cpu_cores: u32,
+    pub ram: Mem,
+    pub gpus: Vec<GpuLimit>,
+}
+
+impl Limits {
+    /// Every `auto` as a number for `m`: cores − 2 (at least 1), 70 % of
+    /// RAM, 90 % of each GPU's VRAM. A set figure is taken as given.
+    pub fn resolve(&self, m: &Machine) -> Resolved {
+        Resolved {
+            cpu_cores: self
+                .cpu_cores
+                .get()
+                .copied()
+                .unwrap_or_else(|| m.cores.saturating_sub(AUTO_CORES_SPARE).max(1)),
+            ram: self
+                .ram
+                .get()
+                .copied()
+                .unwrap_or(Mem(m.ram.0 * AUTO_RAM_PCT / 100)),
+            gpus: self.gpus.get().cloned().unwrap_or_else(|| {
+                m.gpus
+                    .iter()
+                    .map(|g| GpuLimit {
+                        index: g.index,
+                        vram: Mem(g.vram.0 * AUTO_VRAM_PCT / 100),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// `[orchestrator.limits]` from the TOML text of a `config.toml`; all
+    /// `auto` when the table is absent. An unreadable table is an error, so
+    /// a typo is said rather than silently ignored.
+    pub fn from_config_str(text: &str) -> Result<Limits, String> {
+        let doc: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let Some(t) = doc
+            .get("orchestrator")
+            .and_then(|o| o.as_table())
+            .and_then(|o| o.get("limits"))
+        else {
+            return Ok(Limits::default());
+        };
+        t.clone()
+            .try_into()
+            .map_err(|e| format!("[orchestrator.limits]: {e}"))
+    }
+
+    /// The limits in `config.toml` at `path`; all `auto` when the file or
+    /// the table is absent.
+    pub fn load_from(path: &Path) -> Result<Limits, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                Limits::from_config_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+            }
+            Err(_) => Ok(Limits::default()),
+        }
+    }
+
+    /// The limits in Giverny's own `config.toml` (`<config>/giverny/`).
+    pub fn load() -> Result<Limits, String> {
+        Limits::load_from(&default_config_path())
+    }
+}
+
+/// `<config dir>/giverny/config.toml`, the file `config.rs` reads.
+pub fn default_config_path() -> PathBuf {
+    crate::config::config_path(crate::state::Paths::default_dirs().base())
+}
+
+/// One GPU as the machine reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gpu {
+    pub index: u32,
+    pub name: String,
+    pub vram: Mem,
+}
+
+/// What this machine has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    /// Logical CPUs (not the cgroup's share: a capped worker asking sees
+    /// the machine).
+    pub cores: u32,
+    pub ram: Mem,
+    pub gpus: Vec<Gpu>,
+}
+
+impl Machine {
+    /// Cores, total RAM (`/proc/meminfo` on Linux, the OS's own figure
+    /// elsewhere, which on macOS is `sysctl hw.memsize`), and NVIDIA GPUs
+    /// from `nvidia-smi` when it is installed — else none.
+    pub fn detect() -> Machine {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        let cores = (sys.cpus().len() as u32).max(
+            std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
+        );
+        let ram = meminfo_mb("MemTotal").map(Mem).unwrap_or_else(|| {
+            sys.refresh_memory();
+            Mem(sys.total_memory() / (1024 * 1024))
+        });
+        Machine {
+            cores,
+            ram,
+            gpus: detect_gpus(),
+        }
+    }
+}
+
+/// `nvidia-smi --query-gpu=index,name,memory.total`; none when it is not
+/// there or says nothing usable.
+pub fn detect_gpus() -> Vec<Gpu> {
+    std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_nvidia_smi(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// `0, NVIDIA GeForce RTX 4090, 24564` per line (MiB).
+pub fn parse_nvidia_smi(out: &str) -> Vec<Gpu> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split(',').map(str::trim);
+            let index = f.next()?.parse().ok()?;
+            let name = f.next()?.to_string();
+            let vram = f.next()?.parse().ok()?;
+            Some(Gpu {
+                index,
+                name,
+                vram: Mem(vram),
+            })
+        })
+        .collect()
+}
+
+/// What the machine is doing now, Giverny's workers and everyone else.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Load {
+    /// RAM the kernel could hand out now without swapping (`MemAvailable`).
+    pub mem_available: Option<Mem>,
+    /// The 1-minute load average.
+    pub load1: Option<f64>,
+}
+
+impl Load {
+    pub fn sample() -> Load {
+        let mem_available = meminfo_mb("MemAvailable").map(Mem).or_else(|| {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let b = sys.available_memory();
+            (b > 0).then_some(Mem(b / (1024 * 1024)))
+        });
+        let load1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse().ok())
+            .or_else(|| {
+                let l = sysinfo::System::load_average().one;
+                (l > 0.0).then_some(l)
+            });
+        Load {
+            mem_available,
+            load1,
+        }
+    }
+}
+
+/// One `/proc/meminfo` field, in MiB. `None` off Linux.
+fn meminfo_mb(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo(&text, field)
+}
+
+fn parse_meminfo(text: &str, field: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let rest = l.strip_prefix(field)?.strip_prefix(':')?;
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        Some(kb / 1024)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn machine(cores: u32, ram_gb: u64, gpus: &[(u32, u64)]) -> Machine {
+        Machine {
+            cores,
+            ram: Mem::gb(ram_gb),
+            gpus: gpus
+                .iter()
+                .map(|&(index, vram_mb)| Gpu {
+                    index,
+                    name: "gpu".into(),
+                    vram: Mem(vram_mb),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn auto_resolves_from_the_machine() {
+        let r = Limits::default().resolve(&machine(14, 23, &[]));
+        assert_eq!(r.cpu_cores, 12);
+        assert_eq!(r.ram, Mem(23 * 1024 * 70 / 100));
+        assert!(r.gpus.is_empty(), "no GPU, no GPU limit");
+        // Never below one core.
+        assert_eq!(Limits::default().resolve(&machine(2, 4, &[])).cpu_cores, 1);
+        let r = Limits::default().resolve(&machine(8, 32, &[(0, 10000), (1, 24000)]));
+        assert_eq!(
+            r.gpus,
+            vec![
+                GpuLimit {
+                    index: 0,
+                    vram: Mem(9000)
+                },
+                GpuLimit {
+                    index: 1,
+                    vram: Mem(21600)
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn set_figures_win_over_auto() {
+        let l = Limits {
+            cpu_cores: Auto::Set(6),
+            ram: Auto::Set(Mem::gb(10)),
+            gpus: Auto::Set(vec![]),
+        };
+        let r = l.resolve(&machine(14, 23, &[(0, 8000)]));
+        assert_eq!((r.cpu_cores, r.ram, r.gpus.len()), (6, Mem::gb(10), 0));
+    }
+
+    #[test]
+    fn reads_the_config_table_or_defaults() {
+        assert_eq!(
+            Limits::from_config_str("[font]\nsize = 3\n").unwrap(),
+            Limits::default()
+        );
+        let l = Limits::from_config_str(
+            "[orchestrator.limits]\ncpu_cores = 8\nram = \"16G\"\n\
+             gpus = [{ index = 0, vram = \"20G\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(l.cpu_cores, Auto::Set(8));
+        assert_eq!(l.ram, Auto::Set(Mem::gb(16)));
+        assert_eq!(
+            l.gpus,
+            Auto::Set(vec![GpuLimit {
+                index: 0,
+                vram: Mem::gb(20)
+            }])
+        );
+        let l = Limits::from_config_str("[orchestrator.limits]\nram = \"AUTO\"\nram_x = 1\n");
+        assert!(l.is_ok(), "unknown keys are ignored: {l:?}");
+        assert_eq!(l.unwrap().ram, Auto::Auto);
+        assert!(Limits::from_config_str("[orchestrator.limits]\nram = \"lots\"\n").is_err());
+        // Missing file: auto.
+        assert_eq!(
+            Limits::load_from(Path::new("/nonexistent/giverny/config.toml")).unwrap(),
+            Limits::default()
+        );
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let l = Limits {
+            cpu_cores: Auto::Auto,
+            ram: Auto::Set(Mem(1536)),
+            gpus: Auto::Set(vec![GpuLimit {
+                index: 1,
+                vram: Mem::gb(8),
+            }]),
+        };
+        let text = toml::to_string(&l).unwrap();
+        assert!(text.contains("cpu_cores = \"auto\""), "{text}");
+        assert!(text.contains("ram = \"1536M\""), "{text}");
+        assert_eq!(toml::from_str::<Limits>(&text).unwrap(), l);
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(Mem::parse("3G"), Some(Mem(3072)));
+        assert_eq!(Mem::parse("3gb"), Some(Mem(3072)));
+        assert_eq!(Mem::parse("3GiB"), Some(Mem(3072)));
+        assert_eq!(Mem::parse("1.5G"), Some(Mem(1536)));
+        assert_eq!(Mem::parse("512M"), Some(Mem(512)));
+        assert_eq!(Mem::parse("2"), Some(Mem(2048)), "bare is GiB");
+        assert_eq!(Mem::parse("1T"), Some(Mem(1024 * 1024)));
+        assert_eq!(Mem::parse("lots"), None);
+        assert_eq!(Mem::parse("-1G"), None);
+        assert_eq!(Mem(3072).to_string(), "3G");
+        assert_eq!(Mem(1536).to_string(), "1.5G");
+        assert_eq!(Mem(700).to_string(), "700M");
+    }
+
+    #[test]
+    fn parses_nvidia_smi_and_meminfo() {
+        let g = parse_nvidia_smi("0, NVIDIA RTX 4090, 24564\n1, A100, 81920\nbad\n");
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[1].index, g[1].vram), (1, Mem(81920)));
+        assert!(parse_nvidia_smi("").is_empty());
+        let mi = "MemTotal:       24117248 kB\nMemFree: 1 kB\nMemAvailable:   16777216 kB\n";
+        assert_eq!(parse_meminfo(mi, "MemTotal"), Some(23552));
+        assert_eq!(parse_meminfo(mi, "MemAvailable"), Some(16384));
+        assert_eq!(parse_meminfo(mi, "Mem"), None);
+    }
+
+    #[test]
+    fn detects_this_machine() {
+        let m = Machine::detect();
+        assert!(m.cores >= 1 && m.ram.0 > 0, "{m:?}");
+        let r = Limits::default().resolve(&m);
+        assert!(r.cpu_cores >= 1 && r.ram < m.ram);
+    }
+}

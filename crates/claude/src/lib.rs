@@ -14,6 +14,7 @@ pub mod pass_nudge;
 pub mod plugin;
 pub mod profiles;
 pub mod registry;
+pub mod resources;
 pub mod subagents;
 pub mod tokens;
 pub mod transcript;

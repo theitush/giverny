@@ -118,6 +118,92 @@ pub struct FeedRow {
     /// (giverny#158), so no dispatcher will land it: it is Done when its
     /// worker is.
     pub follows_worker: bool,
+    /// What the machine ledger answered this row's task (giverny#160): a
+    /// copy written by `giverny pass claim`, gone on `release`/`land`. The
+    /// ledger itself (`resources`) is the truth; this is for drawing.
+    pub lease: Option<RowLease>,
+}
+
+/// Where a row's task stands with the machine ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// Holds what it asked for.
+    Granted,
+    /// Holds less RAM than it asked for (`wanted_ram_mb`).
+    Smaller,
+    /// Waiting, at `position`, `behind` a holder.
+    Queued,
+}
+
+/// A row's `lease` object. For a queued row the figures are the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLease {
+    pub state: LeaseState,
+    /// The ledger's lease id (`<session>:<task>`); none while queued.
+    pub id: Option<String>,
+    pub cpu: u32,
+    pub ram_mb: u64,
+    pub gpus: Vec<u32>,
+    pub vram_mb: u64,
+    pub slots: Vec<String>,
+    pub granted_ms: Option<u64>,
+    pub wanted_ram_mb: Option<u64>,
+    /// 1-based place in the ledger's queue when it was last asked.
+    pub position: Option<u64>,
+    /// The task whose lease it waits on, or the queued task before it.
+    pub behind: Option<String>,
+}
+
+fn parse_lease(v: &Value) -> Option<RowLease> {
+    let l = v.get("lease")?;
+    if !l.is_object() {
+        return None;
+    }
+    let state = match l
+        .get("state")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "granted" => LeaseState::Granted,
+        "smaller" => LeaseState::Smaller,
+        "queued" => LeaseState::Queued,
+        _ => return None,
+    };
+    let strings = |k: &str| -> Vec<String> {
+        l.get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Some(RowLease {
+        state,
+        id: str_field(l, "id"),
+        cpu: u64_field(l, "cpu").unwrap_or(0) as u32,
+        ram_mb: u64_field(l, "ram_mb").unwrap_or(0),
+        gpus: l
+            .get("gpus")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|g| g as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        vram_mb: u64_field(l, "vram_mb").unwrap_or(0),
+        slots: strings("slots"),
+        granted_ms: millis_field(l, "granted_at"),
+        wanted_ram_mb: u64_field(l, "wanted_ram_mb"),
+        position: u64_field(l, "position"),
+        behind: str_field(l, "behind"),
+    })
 }
 
 impl FeedRow {
@@ -258,6 +344,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         note: str_field(v, "note"),
         review: str_field(v, "review"),
         follows_worker: v.get("follows_worker").and_then(Value::as_bool) == Some(true),
+        lease: parse_lease(v),
     })
 }
 
@@ -1293,6 +1380,37 @@ mod tests {
             agent_id: agent.map(Into::into),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_rows_lease_is_read_and_a_bad_one_costs_only_itself() {
+        let f = parse(
+            br#"{"version":1,"rows":[
+              {"key":"a","stage":"running","lease":{"state":"granted","id":"s:a","cpu":3,
+                "ram_mb":3072,"gpus":[0],"vram_mb":8192,"slots":["cargo:/t"],
+                "granted_at":"2026-10-02T10:00:00Z"}},
+              {"key":"b","stage":"planned","lease":{"state":"queued","position":2,
+                "behind":"a","cpu":"2","ram_mb":1024,"slots":[]}},
+              {"key":"c","stage":"planned","lease":{"state":"???"}},
+              {"key":"d","stage":"planned","lease":7}]}"#,
+        )
+        .unwrap();
+        let a = f.rows[0].lease.as_ref().unwrap();
+        assert_eq!(a.state, LeaseState::Granted);
+        assert_eq!((a.cpu, a.ram_mb, a.vram_mb), (3, 3072, 8192));
+        assert_eq!(a.gpus, vec![0]);
+        assert_eq!(a.slots, vec!["cargo:/t".to_string()]);
+        assert_eq!(a.id.as_deref(), Some("s:a"));
+        assert!(a.granted_ms.is_some());
+        let b = f.rows[1].lease.as_ref().unwrap();
+        assert_eq!(b.state, LeaseState::Queued);
+        assert_eq!(
+            (b.position, b.behind.as_deref(), b.cpu),
+            (Some(2), Some("a"), 2)
+        );
+        assert_eq!(f.rows[2].lease, None);
+        assert_eq!(f.rows[3].lease, None);
+        assert_eq!(f.rows.len(), 4, "a bad lease never costs the row");
     }
 
     #[test]

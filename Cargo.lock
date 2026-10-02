@@ -1438,6 +1438,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "dirs",
+ "giverny-core",
  "jiff",
  "libc",
  "notify",
