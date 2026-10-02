@@ -162,6 +162,7 @@ mod tests {
             no_eta: false,
             now: now.into(),
             tokens: tokens.into(),
+            lease: String::new(),
             click: RowClick {
                 stage: Stage::Running,
                 key: String::new(),
