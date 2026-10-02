@@ -59,6 +59,12 @@ usage: giverny pass <command> [args] [--session <id>]
                               refused as larger than the limits (5)
   release <task>              give the task's lease back (land and drop do it)
   resources                   capacity, limits, other programs' load, leases
+  ask   <task-or-session> \"<msg>\" [--task <yours>] [--priority P]
+                              when the ledger is not enough, ask the session
+                              holding <task>'s lease (or a session id); the
+                              message reaches it on its next tool call
+  reply <msg-id> \"<text>\"     answer an ask (or a reply); it reaches the asker
+                              the same way
   run   <task> [--cpu N --ram 3G ...] -- <cmd…>
                               run a worker's heavy command under the task's
                               lease: capped by a systemd scope where there is
@@ -86,7 +92,10 @@ Resources (giverny#160): one ledger for every session on the machine, at
 [orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
 90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
 `run` with no lease claims one first (3 cpu, 3G unless --cpu/--ram say), waits
-while it is queued, and releases it when the command ends (giverny#161).";
+while it is queued, and releases it when the command ends (giverny#161).
+`claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
+Messages (giverny#162) go to <feed dir>/inbox/<session>.jsonl; `nudge` delivers
+them, and renews the calling session's leases, on every tool call.";
 
 /// One `giverny pass` command, parsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +119,10 @@ pub enum Cmd {
     Resources,
     /// Run a command under the task's lease (giverny#161).
     Run(String),
+    /// Ask the session holding a lease (giverny#162): target, message.
+    Ask(String, String),
+    /// Answer a message: its id, the text.
+    Reply(String, String),
 }
 
 /// The flags any command may carry.
@@ -141,6 +154,8 @@ pub struct Flags {
     pub priority: Option<String>,
     /// `run`: the command, everything after `--`.
     pub command: Vec<String>,
+    /// `ask`: the asker's own task, when the ledger does not make it plain.
+    pub task: Option<String>,
 }
 
 impl Flags {
@@ -236,6 +251,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--min-ram" => flags.min_ram_mb = Some(parse_mem("--min-ram", &val("--min-ram")?)?),
             "--slot" => flags.slots.push(val("--slot")?),
             "--priority" => flags.priority = Some(val("--priority")?),
+            "--task" => flags.task = Some(val("--task")?),
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => pos.push(a.clone()),
@@ -276,6 +292,20 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "release" => Cmd::Release(task()?),
         "resources" => Cmd::Resources,
         "run" => Cmd::Run(task()?),
+        "ask" | "reply" => {
+            let what = task()?;
+            let text = pos.by_ref().collect::<Vec<_>>().join(" ");
+            if text.trim().is_empty() {
+                return Err(format!(
+                    "`{verb}` needs the message, e.g. `giverny pass {verb} {what} \"…\"`"
+                ));
+            }
+            if verb == "ask" {
+                Cmd::Ask(what, text)
+            } else {
+                Cmd::Reply(what, text)
+            }
+        }
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     if matches!(cmd, Cmd::Plan(_)) && flags.eta_s.is_none() {
@@ -458,7 +488,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Claim(_)
         | Cmd::Release(_)
         | Cmd::Resources
-        | Cmd::Run(_) => {
+        | Cmd::Run(_)
+        | Cmd::Ask(..)
+        | Cmd::Reply(..) => {
             return Ok(String::new());
         }
     };
@@ -672,7 +704,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Claim(_)
         | Cmd::Release(_)
         | Cmd::Resources
-        | Cmd::Run(_) => unreachable!(),
+        | Cmd::Run(_)
+        | Cmd::Ask(..)
+        | Cmd::Reply(..) => unreachable!(),
     }
 }
 
@@ -860,6 +894,23 @@ pub fn run_in_code(
                 0,
             ));
         }
+        Cmd::Ask(target, text) => {
+            let msg = crate::pass_inbox::ask(
+                dir,
+                &ledger,
+                session,
+                target,
+                text,
+                flags.task.as_deref(),
+                flags.priority.as_deref(),
+                now,
+            )?;
+            return Ok((msg, 0));
+        }
+        Cmd::Reply(id, text) => {
+            let msg = crate::pass_inbox::reply(dir, &ledger, session, id, text, now)?;
+            return Ok((msg, 0));
+        }
         Cmd::Resources => {
             let cap = match cap {
                 Some(c) => c.clone(),
@@ -902,12 +953,47 @@ fn claim(
         let cwd = std::env::current_dir().unwrap_or_default();
         pass_history::repo_of(task, &cwd)
     });
-    let out = resources::with_ledger(ledger, now, |l| {
-        l.claim(&cap, session, task, repo.as_deref(), &req, now)
+    // Figures given on a held lease, each no larger, shrink it in place: the
+    // answer to an ask (giverny#162). Otherwise it is a claim as ever.
+    let (out, shrunk) = resources::with_ledger(ledger, now, |l| {
+        if let Some(s) = l.shrink(session, task, flags.cpu, flags.ram_mb, flags.vram_mb, now) {
+            l.heartbeat(session, now);
+            return (resources::Outcome::Held(s.1.clone()), Some(s.0));
+        }
+        (
+            l.claim(&cap, session, task, repo.as_deref(), &req, now),
+            None,
+        )
     })?;
     resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
     let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
+    if let (Some(was), resources::Outcome::Held(l)) = (&shrunk, &out) {
+        return Ok((
+            format!("shrunk {task}: {} (was {})", l.describe(), was.describe()),
+            resources::exit::GRANTED,
+        ));
+    }
     let mut line = resources::outcome_line(task, &out, &eta);
+    if let resources::Outcome::Held(l) = &out {
+        let grow = flags.cpu.is_some_and(|c| c > l.cpu)
+            || flags.ram_mb.is_some_and(|r| r > l.ram_mb)
+            || flags
+                .vram_mb
+                .is_some_and(|v| v > l.vram_mb && !l.gpus.is_empty());
+        if grow {
+            line.push_str("; a held lease is not grown: release it and claim again");
+        }
+    }
+    if let resources::Outcome::Queued { blockers, .. } = &out
+        && let Some(hint) = resources::ask_hint(
+            task,
+            blockers,
+            resources::eta_or_estimate_s(dir, session, task, now),
+            &eta,
+        )
+    {
+        line.push_str(&format!("; {hint}"));
+    }
     if !matches!(out, resources::Outcome::Refused(_))
         && let Some(hint) = size_hint(dir, session, task, repo.as_deref())
     {
@@ -1236,7 +1322,7 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         // A hook: whatever happens, it never fails the tool call it rides on.
         let mut input = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
-        if let Ok(payload) = serde_json::from_str::<Value>(&input)
+        if let Some(payload) = crate::pass_nudge::payload_of(&input)
             && let Some(out) = crate::pass_nudge::run(&payload, &feed::feed_dir(), now_ms())
         {
             println!("{out}");
@@ -1826,6 +1912,172 @@ mod tests {
         let shown = run_as(&dir, "c", "resources", T0 + 26 * MIN).0;
         assert!(!shown.contains("dead"), "{shown}");
         assert!(shown.contains("live"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hook's reply for `session`'s own call, as text.
+    fn hook(dir: &Path, session: &str, now: u64) -> Option<String> {
+        let out = crate::pass_nudge::run(&json!({"session_id": session}), dir, now)?;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        Some(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    fn line(s: &str) -> Vec<String> {
+        // Like a shell: `"…"` is one argument.
+        let mut out = Vec::new();
+        for (i, part) in s.split('"').enumerate() {
+            if i % 2 == 1 {
+                out.push(part.to_string());
+            } else {
+                out.extend(part.split_whitespace().map(String::from));
+            }
+        }
+        out
+    }
+
+    fn run_line(dir: &Path, session: &str, l: &str, now: u64) -> Result<(String, i32), String> {
+        let (cmd, flags) = parse_args(&line(l))?;
+        run_in_code(dir, session, &cmd, &flags, now, Some(&machine()))
+    }
+
+    #[test]
+    fn a_queued_orchestrator_asks_the_holder_which_shrinks_and_releases() {
+        let dir = scratch("ask");
+        // a holds the cargo slot for a long task; b's short task needs it.
+        run_as(&dir, "sess-a", "start giverny#12 --eta 60", T0);
+        let (msg, _) = run_as(
+            &dir,
+            "sess-a",
+            "claim giverny#12 --cpu 3 --ram 6G --slot cargo:/t",
+            T0,
+        );
+        assert!(msg.starts_with("granted"), "{msg}");
+        run_as(&dir, "sess-b", "plan inbar#5 --eta 10", T0);
+        let (msg, code) = run_as(
+            &dir,
+            "sess-b",
+            "claim inbar#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            T0 + MIN,
+        );
+        assert_eq!(code, resources::exit::QUEUED, "{msg}");
+        assert!(
+            msg.contains("that wait (~59m) is longer than inbar#5 itself (~10m)")
+                && msg.contains("giverny pass ask giverny#12"),
+            "the queued answer suggests asking: {msg}"
+        );
+        // Nothing in anyone's inbox yet: the hook says nothing.
+        assert_eq!(hook(&dir, "sess-a", T0 + MIN), None);
+
+        let (msg, _) = run_line(
+            &dir,
+            "sess-b",
+            r#"ask giverny#12 "a 2-minute test needs the slot""#,
+            T0 + 2 * MIN,
+        )
+        .unwrap();
+        assert!(
+            msg.starts_with("asked giverny#12 (session sess-a)"),
+            "{msg}"
+        );
+        assert!(msg.contains("while inbar#5 holds or waits"), "{msg}");
+        let id = msg.split("message ").nth(1).unwrap()[..7].to_string();
+
+        // a's next tool call carries it, once; b's own calls do not.
+        assert_eq!(hook(&dir, "sess-b", T0 + 3 * MIN), None);
+        let ctx = hook(&dir, "sess-a", T0 + 3 * MIN).unwrap();
+        for want in [
+            "session sess-b, task inbar#5",
+            "priority high",
+            "queued #1 for 2 cpu, 2G, slot cargo:/t",
+            "~10m left on it",
+            "your lease giverny#12 (3 cpu, 6G, slot cargo:/t)",
+            "\"a 2-minute test needs the slot\"",
+            &format!("giverny-pass reply {id} "),
+            "giverny-pass release giverny#12",
+            "giverny-pass claim giverny#12 --cpu <fewer> --ram <less>",
+        ] {
+            assert!(ctx.contains(want), "{want:?} in {ctx}");
+        }
+        assert_eq!(hook(&dir, "sess-a", T0 + 3 * MIN), None, "delivered once");
+
+        // a shrinks in place: fewer cores, less RAM, the slot kept.
+        let (msg, code) = run_as(
+            &dir,
+            "sess-a",
+            "claim giverny#12 --cpu 2 --ram 3G",
+            T0 + 4 * MIN,
+        );
+        assert_eq!(code, resources::exit::GRANTED);
+        assert_eq!(
+            msg,
+            "shrunk giverny#12: 2 cpu, 3G, slot cargo:/t (was 3 cpu, 6G, slot cargo:/t)"
+        );
+        let (msg, _) = run_as(&dir, "sess-a", "claim giverny#12 --ram 8G", T0 + 4 * MIN);
+        assert!(msg.contains("is not grown"), "{msg}");
+        let f = feed::read(&feed::feed_path(&dir, "sess-a")).unwrap();
+        assert_eq!(f.rows[0].lease.as_ref().unwrap().ram_mb, 3072);
+        // ... then gives up the slot altogether, and answers.
+        run_as(&dir, "sess-a", "release giverny#12", T0 + 5 * MIN);
+        let (msg, _) = run_line(
+            &dir,
+            "sess-a",
+            &format!(r#"reply {id} "released; claim it again when done""#),
+            T0 + 5 * MIN,
+        )
+        .unwrap();
+        assert!(
+            msg.starts_with("replied to inbar#5 (session sess-b)"),
+            "{msg}"
+        );
+
+        // b's next call carries the reply; its re-claim is granted.
+        let ctx = hook(&dir, "sess-b", T0 + 6 * MIN).unwrap();
+        assert!(ctx.contains(&format!("to your ask {id}")), "{ctx}");
+        assert!(ctx.contains("giverny#12 has released its lease"), "{ctx}");
+        assert!(ctx.contains("giverny-pass claim inbar#5"), "{ctx}");
+        let (msg, code) = run_as(
+            &dir,
+            "sess-b",
+            "claim inbar#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            T0 + 6 * MIN,
+        );
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+
+        // Errors say what to do.
+        assert!(run_line(&dir, "sess-b", r#"reply mzzzzzz "x""#, T0 + 6 * MIN).is_err());
+        assert!(run_line(&dir, "sess-b", r#"ask inbar#5 "x""#, T0 + 6 * MIN).is_err());
+        assert!(run_line(&dir, "sess-b", r#"ask nobody "x""#, T0 + 6 * MIN).is_err());
+        assert!(parse_args(&line("ask giverny#12")).is_err(), "no message");
+
+        // A message expires with the asker's lease: b asks a, then lands.
+        run_as(&dir, "sess-a", "claim other --cpu 1", T0 + 7 * MIN);
+        run_line(&dir, "sess-b", r#"ask other "spare a core?""#, T0 + 7 * MIN).unwrap();
+        run_as(&dir, "sess-b", "release inbar#5", T0 + 8 * MIN);
+        assert_eq!(hook(&dir, "sess-a", T0 + 9 * MIN), None, "expired unread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hook_keeps_a_busy_orchestrators_leases_alive() {
+        let dir = scratch("hook-beat");
+        run_as(&dir, "busy", "claim t --cpu 2", T0);
+        run_as(&dir, "idle", "claim u --cpu 2", T0);
+        // `busy` runs no pass command, but its (and its workers') tool calls
+        // fire the hook every minute; `idle` does nothing.
+        for k in 1..=25 {
+            let worker = json!({"session_id": "busy", "agent_id": "w1"});
+            let now = T0 + k * MIN;
+            let _ = crate::pass_nudge::run(&worker, &dir, now);
+            let _ = hook(&dir, "busy", now + 1000);
+        }
+        let shown = run_as(&dir, "other", "resources", T0 + 25 * MIN).0;
+        assert!(shown.contains("t   "), "busy's lease kept: {shown}");
+        assert!(!shown.contains("u   "), "idle's expired: {shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -25,13 +25,24 @@
 //! re-estimate above applies to it like any other. That it was asked is a
 //! marker file under the feed directory's `eta-asked/`, not a feed: creating
 //! the session's feed would claim it from another writer (coo#162).
+//!
+//! **Messages and heartbeats** (giverny#162). On every call the hook also
+//! renews the calling session's ledger leases — `session_id` is the
+//! orchestrator's for its own calls and its workers' alike, so a busy pass
+//! keeps its leases though it runs no `giverny pass` command — at most every
+//! [`resources::BEAT_EVERY_MS`], timed by a marker under
+//! `resources/beats/` so the calls in between cost a `stat`. And on the
+//! orchestrator's own calls (not a worker's: an ask is for whoever holds the
+//! lease) it delivers the session's unread `ask`/`reply` messages
+//! ([`crate::pass_inbox`]), a `stat` of the inbox when there are none. So a
+//! call that is not a worker's costs three `stat`s at most, and reads no file.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use crate::feed;
 use crate::pass::{self, Lock};
+use crate::{feed, pass_inbox, resources};
 
 /// How long into its task a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
@@ -231,10 +242,111 @@ pub fn check(
     ))
 }
 
+/// The few fields of a hook payload the hook reads, as a small JSON object:
+/// a `PostToolUse` payload carries the whole tool response, which is not
+/// built into a tree only to be dropped.
+pub fn payload_of(input: &str) -> Option<Value> {
+    #[derive(serde::Deserialize)]
+    struct Hook {
+        session_id: Option<String>,
+        agent_id: Option<String>,
+        transcript_path: Option<String>,
+        hook_event_name: Option<String>,
+    }
+    let h: Hook = serde_json::from_str(input).ok()?;
+    let mut m = Map::new();
+    for (k, v) in [
+        ("session_id", h.session_id),
+        ("agent_id", h.agent_id),
+        ("transcript_path", h.transcript_path),
+        ("hook_event_name", h.hook_event_name),
+    ] {
+        if let Some(v) = v {
+            m.insert(k.into(), Value::String(v));
+        }
+    }
+    Some(Value::Object(m))
+}
+
+/// Where the hook's heartbeat markers live, beside the ledger.
+pub const BEATS_DIR: &str = "beats";
+
+/// Renew `session`'s leases, at most every [`resources::BEAT_EVERY_MS`]:
+/// nothing at all without a ledger (one `stat`); between beats, a `stat` of
+/// the session's marker, whose mtime is the last beat. True when it beat.
+pub fn beat(ledger: &Path, session: &str, now: u64) -> bool {
+    if std::fs::metadata(ledger).is_err() {
+        return false;
+    }
+    let name: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return false;
+    }
+    let dir = ledger.parent().unwrap_or(Path::new(".")).join(BEATS_DIR);
+    let marker = dir.join(&name);
+    let ms_of = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    let last = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .map(ms_of)
+        .ok();
+    if last.is_some_and(|t| now.saturating_sub(t) < resources::BEAT_EVERY_MS && t <= now) {
+        return false;
+    }
+    if last.is_none() {
+        // A new session's first marker: sweep the ones a day old.
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let old = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| now.saturating_sub(ms_of(t)) > ASKED_KEEP.as_millis() as u64)
+                    .unwrap_or(false);
+                if old {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+    let _ = resources::heartbeat(ledger, session, now);
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&marker)
+    {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(now);
+        let _ = f.set_modified(at);
+    }
+    true
+}
+
 /// The hook's whole run: `payload` is its stdin, `dir` the feed directory.
 /// Returns what to print (the hook reply), or nothing.
 pub fn run(payload: &Value, dir: &Path, now: u64) -> Option<String> {
-    let caller = Caller::of(payload)?;
+    let session = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains(['/', '\\']) && !s.starts_with('.'))?;
+    let ledger = resources::ledger_path(dir);
+    beat(&ledger, session, now);
+    let Some(caller) = Caller::of(payload) else {
+        // The orchestrator's own call: its messages, if any.
+        return pass_inbox::deliver(dir, &ledger, session, now).map(|t| reply(&t));
+    };
+    worker(&caller, dir, now)
+}
+
+/// A worker's call: the estimate asks.
+fn worker(caller: &Caller, dir: &Path, now: u64) -> Option<String> {
     let description = caller.description();
     let desc = description.as_deref();
     let file = pass::file_for(dir, &caller.session);
