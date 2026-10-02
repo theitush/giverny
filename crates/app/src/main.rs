@@ -1618,7 +1618,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(ctx, config::load(self.paths.base()));
+                        self.apply_config(ctx, config::load_or(self.paths.base(), &self.cfg));
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -2310,7 +2310,7 @@ impl App {
             return;
         }
         self.cfg_mtime = mtime;
-        let cfg = config::load(self.paths.base());
+        let cfg = config::load_or(self.paths.base(), &self.cfg);
         self.apply_config(ctx, cfg);
     }
 

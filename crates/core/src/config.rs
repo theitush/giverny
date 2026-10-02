@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
@@ -20,7 +20,7 @@ pub struct Config {
 
 /// How Claude Code itself is launched in a tab.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ClaudeConfig {
     /// Start every session in auto mode, by setting `permissions.defaultMode`
     /// in each account's `settings.json`.
@@ -33,7 +33,7 @@ pub struct ClaudeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct TitlesConfig {
     /// Drop a leading `user@host:` from titles the shell sets.
     pub strip_host_prefix: bool,
@@ -140,7 +140,7 @@ fn shorten_paths(title: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UsageConfig {
     /// Ask Claude Code to refresh its usage cache (`claude -p /usage`) when
     /// an account's numbers are older than this. 0 disables it, leaving the
@@ -157,7 +157,7 @@ impl Default for UsageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UpdateConfig {
     /// Ask GitHub once a day whether a newer release exists. This is the
     /// only network request Giverny makes; set false to make it zero.
@@ -171,7 +171,7 @@ impl Default for UpdateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct FontConfig {
     /// Preferred family; empty = auto-detect a monospace font.
     pub family: String,
@@ -179,14 +179,14 @@ pub struct FontConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ThemeConfig {
     /// Built-in theme name: `monet-dark`, `monet-light`, `ink`.
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct WindowConfig {
     /// How much of the window's background is painted: 1.0 is solid, lower
     /// lets the desktop show through. Text and anything a program colours
@@ -221,7 +221,7 @@ impl Default for WindowConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct BehaviorConfig {
     /// Re-run `claude --resume` for restored tabs: `auto`, `prompt`, `off`.
     pub restore_claude: RestoreClaude,
@@ -314,19 +314,68 @@ pub fn config_path(base: &Path) -> PathBuf {
     base.join("config.toml")
 }
 
-/// Load the config, writing the commented template on first run. Invalid
-/// files are reported and ignored rather than blocking startup.
-pub fn load(base: &Path) -> Config {
-    let path = config_path(base);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                tracing::error!("config.toml ignored ({err}); using defaults");
-                Config::default()
+/// Dotted paths in `input` that `known` (the parsed config, re-serialized)
+/// lacks. A key this build does not know — usually one a newer build wrote.
+fn unknown_keys(input: &toml::Value, known: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let (Some(input), Some(known)) = (input.as_table(), known.as_table()) else {
+        return;
+    };
+    for (key, value) in input {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match known.get(key) {
+            Some(k) => unknown_keys(value, k, &path, out),
+            None => out.push(path),
+        }
+    }
+}
+
+/// Parse config text. Keys this build does not know are dropped and returned
+/// beside the config rather than failing the whole file; a value of the wrong
+/// type is still an error.
+pub fn parse(text: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let cfg: Config = toml::from_str(text)?;
+    let mut unknown = Vec::new();
+    if let (Ok(input), Ok(known)) = (text.parse::<toml::Value>(), toml::Value::try_from(&cfg)) {
+        unknown_keys(&input, &known, "", &mut unknown);
+    }
+    Ok((cfg, unknown))
+}
+
+fn read(path: &Path) -> Option<Result<Config, String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(match parse(&text) {
+        Ok((cfg, unknown)) => {
+            if !unknown.is_empty() {
+                tracing::warn!("config.toml: ignoring unknown keys: {}", unknown.join(", "));
             }
-        },
-        Err(_) => {
+            Ok(cfg)
+        }
+        Err(err) => Err(err.to_string()),
+    })
+}
+
+/// Load the config, writing the commented template on first run. Unknown keys
+/// are warned about and skipped; an invalid file is reported and ignored
+/// rather than blocking startup.
+pub fn load(base: &Path) -> Config {
+    load_or(base, &Config::default())
+}
+
+/// Like [`load`], but a file that cannot be parsed yields `previous` instead
+/// of defaults, so a hot-reload never resets running settings.
+pub fn load_or(base: &Path, previous: &Config) -> Config {
+    let path = config_path(base);
+    match read(&path) {
+        Some(Ok(cfg)) => cfg,
+        Some(Err(err)) => {
+            tracing::error!("config.toml ignored ({err}); keeping previous settings");
+            previous.clone()
+        }
+        None => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -470,6 +519,35 @@ mod tests {
         std::fs::write(config_path(&dir), "this is not toml {{{").unwrap();
         let cfg = load(&dir);
         assert_eq!(cfg.font.size, 13.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_keys_keep_the_known_ones() {
+        let (cfg, unknown) = parse(
+            "[claude]\nauto_mode = true\nfuture_key = 1\n[orchestrator]\nx = 2\n[font]\nsize = 20.0\n",
+        )
+        .unwrap();
+        assert!(cfg.claude.auto_mode);
+        assert_eq!(cfg.font.size, 20.0);
+        assert_eq!(unknown, ["claude.future_key", "orchestrator"]);
+    }
+
+    #[test]
+    fn reload_keeps_previous_on_invalid_value_but_not_on_unknown_key() {
+        let dir = std::env::temp_dir().join(format!("giverny-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut prev = Config::default();
+        prev.claude.auto_mode = true;
+        prev.font.size = 31.0;
+        // Unknown key: the known keys still apply.
+        std::fs::write(config_path(&dir), "[font]\nsize = 20.0\nnew_key = true\n").unwrap();
+        assert_eq!(load_or(&dir, &prev).font.size, 20.0);
+        // Invalid value: running settings stay as they were.
+        std::fs::write(config_path(&dir), "[font]\nsize = \"big\"\n").unwrap();
+        let kept = load_or(&dir, &prev);
+        assert_eq!(kept.font.size, 31.0);
+        assert!(kept.claude.auto_mode);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
