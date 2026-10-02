@@ -2338,8 +2338,8 @@ mod tests {
             got,
             [
                 (Stage::Running, "inbar#616", "20:00", "", "156.3k"),
-                (Stage::Done, "inbar#613", "20:00", "→ inbar#614", "13.5k"),
                 (Stage::Done, "inbar#614", "20:00", "→ inbar#616", "4.9k"),
+                (Stage::Done, "inbar#613", "20:00", "→ inbar#614", "13.5k"),
             ]
         );
         assert!(
