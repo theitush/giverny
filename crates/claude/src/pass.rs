@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
-use crate::{feed, pass_history};
+use crate::{feed, pass_history, resources};
 
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/pass";
@@ -51,6 +51,15 @@ usage: giverny pass <command> [args] [--session <id>]
                               and from the agents pane of the Giverny tab it runs in
   clear                       delete this session's feed
 
+  claim <task> [--cpu N] [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
+               [--min-ram 2G] [--priority asap|high|medium|low]
+                              ask the machine ledger for what the task's worker
+                              needs: granted (exit 0), granted smaller (3),
+                              queued behind its holders (4; re-run to poll),
+                              refused as larger than the limits (5)
+  release <task>              give the task's lease back (land and drop do it)
+  resources                   capacity, limits, other programs' load, leases
+
 <task> is any short name (`auth-fix`, `#12`); name it, as a whole word, in the
 worker's spawn description too. <dur> is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
 The session is --session, else $CLAUDE_CODE_SESSION_ID (set inside Claude Code).
@@ -63,7 +72,13 @@ scale N by the median working-time/estimate ratio of recent tasks of the same
 kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
 pane counts down from that, and both figures are printed. `nudge` is the
 plugin's hook: it asks a worker to re-estimate five minutes into its task, and
-a subagent with no row, on its first call, for a first estimate.";
+a subagent with no row, on its first call, for a first estimate.
+
+Resources (giverny#160): one ledger for every session on the machine, at
+<feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
+20 minutes after their session's last `giverny pass` command. Limits are
+[orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
+90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.";
 
 /// One `giverny pass` command, parsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +96,10 @@ pub enum Cmd {
     Clear,
     /// The plugin's `PostToolUse` hook: a hook payload on stdin.
     Nudge,
+    /// Ask the machine ledger for a lease (giverny#160).
+    Claim(String),
+    Release(String),
+    Resources,
 }
 
 /// The flags any command may carry.
@@ -102,6 +121,41 @@ pub struct Flags {
     /// and where the correction came from.
     pub guess_s: Option<u64>,
     pub basis: Option<String>,
+    /// `claim`: what the worker needs.
+    pub cpu: Option<u32>,
+    pub ram_mb: Option<u64>,
+    pub gpu: Option<u32>,
+    pub vram_mb: Option<u64>,
+    pub slots: Vec<String>,
+    pub min_ram_mb: Option<u64>,
+    pub priority: Option<String>,
+}
+
+impl Flags {
+    /// The ledger request these flags make: one core and no RAM unless said.
+    pub fn request(&self) -> resources::Request {
+        resources::Request {
+            cpu: self.cpu.unwrap_or(1),
+            ram_mb: self.ram_mb.unwrap_or(0),
+            gpu: self.gpu.unwrap_or(0),
+            vram_mb: self.vram_mb.unwrap_or(0),
+            slots: self.slots.clone(),
+            min_ram_mb: self.min_ram_mb,
+            priority: self.priority.clone(),
+        }
+    }
+}
+
+fn parse_mem(name: &str, v: &str) -> Result<u64, String> {
+    giverny_core::limits::Mem::parse(v)
+        .map(|m| m.0)
+        .ok_or_else(|| format!("{name}: bad size {v} (e.g. 3G, 512M)"))
+}
+
+fn parse_count(name: &str, v: &str) -> Result<u32, String> {
+    v.trim()
+        .parse()
+        .map_err(|_| format!("{name}: not a whole number: {v}"))
 }
 
 /// `25` (minutes), `25m`, `90s`, `1h30m`, `1.5h` → seconds.
@@ -159,6 +213,13 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--session" => flags.session = Some(val("--session")?),
             "--why" => flags.why = Some(val("--why")?),
             "--repo" => flags.repo = Some(val("--repo")?),
+            "--cpu" => flags.cpu = Some(parse_count("--cpu", &val("--cpu")?)?),
+            "--gpu" => flags.gpu = Some(parse_count("--gpu", &val("--gpu")?)?),
+            "--ram" => flags.ram_mb = Some(parse_mem("--ram", &val("--ram")?)?),
+            "--vram" => flags.vram_mb = Some(parse_mem("--vram", &val("--vram")?)?),
+            "--min-ram" => flags.min_ram_mb = Some(parse_mem("--min-ram", &val("--min-ram")?)?),
+            "--slot" => flags.slots.push(val("--slot")?),
+            "--priority" => flags.priority = Some(val("--priority")?),
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => pos.push(a.clone()),
@@ -195,10 +256,16 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
         "clear" => Cmd::Clear,
         "nudge" => Cmd::Nudge,
+        "claim" => Cmd::Claim(task()?),
+        "release" => Cmd::Release(task()?),
+        "resources" => Cmd::Resources,
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     if matches!(cmd, Cmd::Plan(_)) && flags.eta_s.is_none() {
         return Err("`plan` needs --eta: the pane's Next up rows show it".into());
+    }
+    if flags.gpu.unwrap_or(0) > 0 && flags.vram_mb.is_none() {
+        return Err("`--gpu` needs --vram: how much of each GPU the worker needs".into());
     }
     Ok((cmd, flags))
 }
@@ -361,7 +428,14 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Pause(k)
         | Cmd::Resume(k)
         | Cmd::Drop(k) => k.clone(),
-        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone | Cmd::Nudge => {
+        Cmd::Show
+        | Cmd::Path
+        | Cmd::Clear
+        | Cmd::ClearDone
+        | Cmd::Nudge
+        | Cmd::Claim(_)
+        | Cmd::Release(_)
+        | Cmd::Resources => {
             return Ok(String::new());
         }
     };
@@ -534,6 +608,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             row.insert("stage".into(), json!("done"));
             row.insert("ended".into(), json!(stamp(now)));
             row.insert("landing".into(), json!(landing));
+            // `run_in` gives the lease back to the ledger.
+            row.remove("lease");
             set_str(row, "review", &f.review);
             set_str(row, "agent_id", &f.agent);
             Ok(format!("landed {key}: {landing}"))
@@ -565,7 +641,14 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             rows.remove(i);
             Ok(format!("dropped {key}"))
         }
-        Cmd::Show | Cmd::Path | Cmd::Clear | Cmd::ClearDone | Cmd::Nudge => unreachable!(),
+        Cmd::Show
+        | Cmd::Path
+        | Cmd::Clear
+        | Cmd::ClearDone
+        | Cmd::Nudge
+        | Cmd::Claim(_)
+        | Cmd::Release(_)
+        | Cmd::Resources => unreachable!(),
     }
 }
 
@@ -716,9 +799,100 @@ pub fn run_in(
     flags: &Flags,
     now: u64,
 ) -> Result<String, String> {
+    run_in_code(dir, session, cmd, flags, now, None).map(|(msg, _)| msg)
+}
+
+/// [`run_in`], with the exit code (`claim` has several, [`resources::exit`])
+/// and, for tests, the machine to claim against (else this one, detected).
+pub fn run_in_code(
+    dir: &Path,
+    session: &str,
+    cmd: &Cmd,
+    flags: &Flags,
+    now: u64,
+    cap: Option<&resources::Capacity>,
+) -> Result<(String, i32), String> {
     if session.is_empty() || session.contains(['/', '\\']) || session.starts_with('.') {
         return Err(format!("not a session id: {session:?}"));
     }
+    let ledger = resources::ledger_path(dir);
+    // Every command from a session keeps its leases alive.
+    if *cmd != Cmd::Path
+        && let Err(e) = resources::heartbeat(&ledger, session, now)
+    {
+        eprintln!("giverny pass: {e}");
+    }
+    match cmd {
+        Cmd::Claim(task) => return claim(dir, &ledger, session, task, flags, now, cap),
+        Cmd::Release(task) => {
+            let gone = resources::release_at(&ledger, session, task, now)?;
+            resources::annotate_row(dir, session, task, None);
+            return Ok((
+                match gone {
+                    Some(l) => format!("released {task}: {}", l.describe()),
+                    None => format!("{task} held no lease"),
+                },
+                0,
+            ));
+        }
+        Cmd::Resources => {
+            let cap = match cap {
+                Some(c) => c.clone(),
+                None => resources::Capacity::detect()?,
+            };
+            let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
+            let out =
+                resources::with_ledger(&ledger, now, |l| resources::report(l, &cap, now, &eta))?;
+            return Ok((out, 0));
+        }
+        _ => {}
+    }
+    let msg = run_feed(dir, session, cmd, flags, now)?;
+    // A task that lands or is dropped gives its lease back, after the feed's
+    // lock is let go (the ledger's is never taken under it).
+    if let Cmd::Land(task) | Cmd::Drop(task) = cmd
+        && let Some(l) = resources::release_at(&ledger, session, task, now)?
+    {
+        return Ok((format!("{msg}; released {}", l.describe()), 0));
+    }
+    Ok((msg, 0))
+}
+
+/// `claim`: ask the ledger, and copy the answer onto the task's feed row.
+fn claim(
+    dir: &Path,
+    ledger: &Path,
+    session: &str,
+    task: &str,
+    flags: &Flags,
+    now: u64,
+    cap: Option<&resources::Capacity>,
+) -> Result<(String, i32), String> {
+    let cap = match cap {
+        Some(c) => c.clone(),
+        None => resources::Capacity::detect()?,
+    };
+    let req = flags.request();
+    let repo = flags.repo.clone().or_else(|| {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        pass_history::repo_of(task, &cwd)
+    });
+    let out = resources::with_ledger(ledger, now, |l| {
+        l.claim(&cap, session, task, repo.as_deref(), &req, now)
+    })?;
+    resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
+    let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
+    Ok((resources::outcome_line(task, &out, &eta), out.exit_code()))
+}
+
+/// The feed commands: read the session's feed, change it, write it back.
+fn run_feed(
+    dir: &Path,
+    session: &str,
+    cmd: &Cmd,
+    flags: &Flags,
+    now: u64,
+) -> Result<String, String> {
     let file = file_for(dir, session);
     if *cmd == Cmd::Path {
         return Ok(file.display().to_string());
@@ -962,8 +1136,8 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         return 2;
     };
     let now = now_ms();
-    match run_in(&feed::feed_dir(), &session, &cmd, &flags, now) {
-        Ok(msg) if cmd == Cmd::ClearDone => {
+    match run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None) {
+        Ok((msg, _)) if cmd == Cmd::ClearDone => {
             let pane = if crate::hooks::send_clear_done(spool, Some(&session), now) {
                 "asked Giverny to clear the agents pane's Done rows in this tab"
             } else {
@@ -972,11 +1146,11 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
             println!("{msg}; {pane}");
             0
         }
-        Ok(msg) => {
+        Ok((msg, code)) => {
             if !msg.is_empty() {
                 println!("{}", msg.trim_end());
             }
-            0
+            code
         }
         Err(e) => {
             eprintln!("giverny pass: {e}");
@@ -1425,6 +1599,134 @@ mod tests {
                 .map(|v| (!v.is_empty()).then(|| PathBuf::from(v)))
                 .unwrap_or(Some(PathBuf::from("/f/history.jsonl")))
         );
+    }
+
+    /// 14 cores, 23 G; limits 12 cores, 16 G; idle.
+    fn machine() -> resources::Capacity {
+        use giverny_core::limits::{Limits, Load, Machine, Mem, Resolved};
+        resources::Capacity {
+            machine: Machine {
+                cores: 14,
+                ram: Mem::gb(23),
+                gpus: vec![],
+            },
+            limits: Resolved {
+                cpu_cores: 12,
+                ram: Mem::gb(16),
+                gpus: vec![],
+            },
+            configured: Limits::default(),
+            load: Load {
+                mem_available: Some(Mem::gb(20)),
+                load1: Some(0.0),
+            },
+        }
+    }
+
+    fn run_as(dir: &Path, session: &str, line: &str, now: u64) -> (String, i32) {
+        let (cmd, flags) = parse_args(&args(line)).unwrap();
+        run_in_code(dir, session, &cmd, &flags, now, Some(&machine())).unwrap()
+    }
+
+    #[test]
+    fn claim_queues_past_the_limit_across_sessions_and_land_releases() {
+        let dir = scratch("claim");
+        run_as(&dir, "a", "start t1 --eta 30", T0);
+        let (msg, code) = run_as(&dir, "a", "claim t1 --cpu 8 --ram 10G --slot cargo:/t", T0);
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        assert_eq!(msg, "granted t1: 8 cpu, 10G, slot cargo:/t");
+        // The row carries its lease for the pane.
+        let f = feed::read(&feed::feed_path(&dir, "a")).unwrap();
+        let l = f.rows[0].lease.as_ref().unwrap();
+        assert_eq!(
+            (l.state, l.cpu, l.ram_mb),
+            (feed::LeaseState::Granted, 8, 10240)
+        );
+
+        // Session b asks past the limit: queued behind t1, with t1's ETA.
+        run_as(&dir, "b", "plan t2 --eta 10", T0);
+        let (msg, code) = run_as(&dir, "b", "claim t2 --cpu 6 --ram 2G", T0 + 16 * MIN);
+        assert_eq!(code, resources::exit::QUEUED, "{msg}");
+        assert!(
+            msg.starts_with("queued #1 behind t1 (8 cpu, 10G, slot cargo:/t; ~14m)"),
+            "{msg}"
+        );
+        let f = feed::read(&feed::feed_path(&dir, "b")).unwrap();
+        let l = f.rows[0].lease.as_ref().unwrap();
+        assert_eq!(l.state, feed::LeaseState::Queued);
+        assert_eq!((l.position, l.behind.as_deref()), (Some(1), Some("t1")));
+        // The slot is exclusive whatever the size.
+        let (_, code) = run_as(&dir, "b", "claim t3 --cpu 1 --slot cargo:/t", T0 + 16 * MIN);
+        assert_eq!(code, resources::exit::QUEUED);
+        run_as(&dir, "b", "release t3", T0 + 16 * MIN);
+
+        let shown = run_as(&dir, "b", "resources", T0 + 17 * MIN).0;
+        assert!(
+            shown.contains("limits    12 cores (auto), 16G RAM (auto)"),
+            "{shown}"
+        );
+        assert!(shown.contains("t1"), "{shown}");
+        assert!(shown.contains("#1 t2"), "{shown}");
+
+        // t1 lands: its lease goes, and t2's re-claim is granted.
+        let (msg, _) = run_as(&dir, "a", "land t1", T0 + 18 * MIN);
+        assert!(msg.contains("released 8 cpu, 10G, slot cargo:/t"), "{msg}");
+        let f = feed::read(&feed::feed_path(&dir, "a")).unwrap();
+        assert_eq!(f.rows[0].lease, None, "a landed row holds nothing");
+        let (msg, code) = run_as(&dir, "b", "claim t2 --cpu 6 --ram 2G", T0 + 19 * MIN);
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        // Too big for the limits is refused, not queued.
+        let (msg, code) = run_as(&dir, "a", "claim huge --cpu 20", T0 + 19 * MIN);
+        assert_eq!(code, resources::exit::REFUSED, "{msg}");
+        // `drop` releases too; `release` of nothing says so.
+        let (msg, _) = run_as(&dir, "b", "drop t2", T0 + 22 * MIN);
+        assert!(msg.contains("released"), "{msg}");
+        assert_eq!(
+            run_as(&dir, "b", "release t2", T0 + 22 * MIN).0,
+            "t2 held no lease"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_lease_frees_itself_and_any_command_keeps_it() {
+        let dir = scratch("claim-ttl");
+        run_as(&dir, "a", "claim dead --cpu 12", T0);
+        run_as(&dir, "b", "claim live --cpu 0 --ram 4G", T0);
+        let (_, code) = run_as(&dir, "c", "claim x --cpu 4", T0);
+        assert_eq!(code, resources::exit::QUEUED);
+        // b and c run pass commands every few minutes; a is gone.
+        for k in 1..=5 {
+            run_as(&dir, "b", "show", T0 + k * 5 * MIN);
+            run_as(&dir, "c", "show", T0 + k * 5 * MIN);
+        }
+        let (msg, code) = run_as(&dir, "c", "claim x --cpu 4", T0 + 26 * MIN);
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        let shown = run_as(&dir, "c", "resources", T0 + 26 * MIN).0;
+        assert!(!shown.contains("dead"), "{shown}");
+        assert!(shown.contains("live"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claim_flags_parse() {
+        let (cmd, f) = parse_args(&args(
+            "claim t --cpu 3 --ram 1.5G --gpu 1 --vram 8G --slot a --slot b --min-ram 512M --priority high",
+        ))
+        .unwrap();
+        assert_eq!(cmd, Cmd::Claim("t".into()));
+        let r = f.request();
+        assert_eq!((r.cpu, r.ram_mb, r.gpu, r.vram_mb), (3, 1536, 1, 8192));
+        assert_eq!(r.slots, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(r.min_ram_mb, Some(512));
+        assert_eq!(r.priority.as_deref(), Some("high"));
+        assert!(parse_args(&args("claim t --ram lots")).is_err());
+        assert!(
+            parse_args(&args("claim t --gpu 1")).is_err(),
+            "--gpu needs --vram"
+        );
+        assert!(parse_args(&args("claim")).is_err());
+        assert_eq!(parse_args(&args("resources")).unwrap().0, Cmd::Resources);
     }
 
     #[test]
