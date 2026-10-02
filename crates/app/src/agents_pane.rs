@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
-use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, Stage};
+use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
@@ -95,7 +95,7 @@ const LEASE_SEG: usize = 6;
 /// How strongly a lease cell is inked, against its row's colour.
 const LEASE_INK: f32 = 0.75;
 /// The widest a lease cell is drawn; a longer one is cut.
-const LEASE_MAX: usize = 22;
+const LEASE_MAX: usize = 32;
 
 // --------------------------------------------------------- view state ----
 
@@ -609,8 +609,8 @@ fn mem(mb: u64) -> String {
 /// smaller grant as got/asked (`2.5G/3G · 3c`); one still queued under a
 /// Running row as `wait 3G · 3c`. Empty for a lease of nothing.
 ///
-/// giverny#161's peak use belongs at its end (`· peak 2.1G`) once feed rows
-/// carry it; they do not yet.
+/// The row's measured peak ([`peak_part`]) is added at its end by [`build`]:
+/// `3G · 3c · peak 2.1G`.
 pub fn lease_cell(l: &RowLease) -> String {
     let mut parts = Vec::new();
     if l.ram_mb > 0 {
@@ -644,6 +644,48 @@ pub fn lease_cell(l: &RowLease) -> String {
     }
     if l.state == LeaseState::Queued && !s.is_empty() {
         s = format!("wait {s}");
+    }
+    s
+}
+
+/// What a row's `giverny pass run` commands measured, for its lease cell:
+/// `peak 2.1G`, and `OOM` after it when the memory cap killed a run
+/// (giverny#173). Empty when nothing was measured or killed.
+pub fn peak_part(u: &RowUsage) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = u.peak_mb.filter(|&p| p > 0) {
+        parts.push(format!("peak {}", mem(p)));
+    }
+    if u.oom_kills > 0 {
+        parts.push("OOM".to_string());
+    }
+    parts.join(" · ")
+}
+
+/// The usage in full for the row's overlay header: `peak 2.1G of 3G, 45s
+/// CPU, killed by the memory cap (OOM) x2`.
+fn usage_fact(u: &RowUsage) -> String {
+    let mut s = String::new();
+    if let Some(p) = u.peak_mb.filter(|&p| p > 0) {
+        s = format!("peak {}", mem(p));
+        if let Some(cap) = u.cap_ram_mb.filter(|&c| c > 0) {
+            s.push_str(&format!(" of {}", mem(cap)));
+        }
+    }
+    if u.cpu_s > 0 {
+        if !s.is_empty() {
+            s.push_str(", ");
+        }
+        s.push_str(&match u.cpu_s {
+            n if n < 60 => format!("{n}s CPU"),
+            n => format!("{} CPU", feed::fmt_span(n as i64)),
+        });
+    }
+    if u.oom_kills > 0 {
+        if !s.is_empty() {
+            s.push_str(", ");
+        }
+        s.push_str(&format!("OOM-killed x{}", u.oom_kills));
     }
     s
 }
@@ -812,6 +854,9 @@ pub struct Line {
     /// What the row's task holds in the machine ledger ([`lease_cell`]),
     /// empty when nothing (giverny#164).
     pub lease: String,
+    /// A `giverny pass run` of the row was killed by its memory cap: the
+    /// lease cell is drawn in the warning colour (giverny#173).
+    pub oom: bool,
     pub click: RowClick,
 }
 
@@ -1002,10 +1047,27 @@ fn format_row(
         .and_then(|f| f.lease.as_ref())
         .filter(|_| row.stage != Stage::Done);
     let queued = held.filter(|l| row.stage == Stage::Planned && l.state == LeaseState::Queued);
-    let lease = match held {
+    let mut lease = match held {
         Some(l) if queued.is_none() => lease_cell(l),
         _ => String::new(),
     };
+    // What its commands measured (giverny#173): on Running rows after the
+    // lease, and a Done row keeps its peak alone (a short cell, so it does
+    // not crowd the row).
+    let usage = f.and_then(|f| f.usage.as_ref());
+    if queued.is_none()
+        && let Some(u) = usage
+        && row.stage != Stage::Planned
+    {
+        let p = peak_part(u);
+        if !p.is_empty() {
+            if !lease.is_empty() {
+                lease.push_str(" · ");
+            }
+            lease.push_str(&p);
+        }
+    }
+    let oom = usage.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
         // The limit first: a row the writer paused for it says why.
@@ -1041,6 +1103,12 @@ fn format_row(
     if let Some(h) = held {
         facts.push(lease_fact(h));
     }
+    if let Some(u) = usage.filter(|_| row.stage != Stage::Planned) {
+        let fact = usage_fact(u);
+        if !fact.is_empty() {
+            facts.push(fact);
+        }
+    }
     Line {
         stage: row.stage,
         id,
@@ -1051,6 +1119,7 @@ fn format_row(
         now,
         tokens,
         lease,
+        oom,
         click: RowClick {
             stage: row.stage,
             key,
@@ -1777,6 +1846,8 @@ fn draw_table(
             let quiet = k == LEASE_SEG && line.is_some();
             let ink = if missing {
                 chrome.dim
+            } else if quiet && line.is_some_and(|l| l.oom) {
+                chrome.amber
             } else if quiet {
                 color.gamma_multiply(LEASE_INK)
             } else {
@@ -2438,6 +2509,36 @@ mod tests {
         l.position = Some(2);
         assert!(lease_cell(&l).starts_with("wait "));
         assert_eq!(lease_fact(&l), "queued #2 for 2.5G");
+    }
+
+    #[test]
+    fn a_rows_peak_use_follows_its_lease_and_an_oom_kill_is_flagged() {
+        let json = r#"{"session":"s","rows":[
+            {"key":"giverny#12","stage":"running","eta_s":1800,"started":1790000000000,
+             "lease":{"state":"granted","id":"s:giverny#12","cpu":3,"ram_mb":3072,
+                      "granted_at":1790000000000},
+             "usage":{"runs":1,"peak_mb":2150,"cpu_s":45,"cap_ram_mb":3072}},
+            {"key":"giverny#13","stage":"running","started":1790000000000,
+             "lease":{"state":"granted","id":"s:giverny#13","cpu":1,"ram_mb":128,
+                      "granted_at":1790000000000},
+             "usage":{"runs":1,"peak_mb":128,"oom_kills":1}},
+            {"key":"giverny#14","stage":"done","started":1790000000000,"ended":1790000600000,
+             "usage":{"runs":2,"peak_mb":512}},
+            {"key":"giverny#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
+        let t = build(Some(&feed(json)), &[], T0 + 60_000);
+        assert_eq!(t.lines[0].lease, "3G · 3c · peak 2.1G");
+        assert!(!t.lines[0].oom);
+        assert!(
+            t.lines[0]
+                .click
+                .facts
+                .iter()
+                .any(|f| f.starts_with("peak 2.1G of 3G, 45s CPU"))
+        );
+        assert_eq!(t.lines[1].lease, "128M · 1c · peak 128M · OOM");
+        assert!(t.lines[1].oom);
+        assert_eq!(t.lines[2].lease, "peak 512M");
+        assert_eq!(t.lines[3].lease, "");
     }
 
     #[test]
