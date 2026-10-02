@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use crate::config::{self, Config};
+use crate::limits::{self, Auto, GpuLimit, Mem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Section {
@@ -23,6 +24,7 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
+    Orchestrator,
     Keys,
     Updates,
     About,
@@ -36,6 +38,7 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
+        Section::Orchestrator,
         Section::Keys,
         Section::Updates,
         Section::About,
@@ -48,6 +51,7 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
+            Section::Orchestrator => "orchestrator",
             Section::Keys => "keys",
             Section::Updates => "updates",
             Section::About => "about",
@@ -88,6 +92,23 @@ pub enum Kind {
         /// `None` = empty by default; `Some` supplies a non-empty default.
         default: Option<fn() -> Vec<String>>,
     },
+    /// One of `[orchestrator.limits]`: `"auto"` by default, else a figure.
+    /// Carried as [`Value::Text`] in the form the file holds — `"auto"`,
+    /// `"8"`, `"16G"`, or for GPUs a TOML array (`[]`,
+    /// `[{ index = 0, vram = "20G" }]`) — and written back as the TOML type
+    /// the ledger reads (an integer for cores, a string for RAM, an array
+    /// of tables for GPUs).
+    Limit {
+        field: LimitField,
+    },
+}
+
+/// Which of `[orchestrator.limits]` a [`Kind::Limit`] row edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitField {
+    Cores,
+    Ram,
+    Gpus,
 }
 
 #[derive(Debug, Clone)]
@@ -114,8 +135,9 @@ impl SettingDef {
         self.key.split('.')
     }
 
+    /// Everything above the leaf: `font`, or `orchestrator.limits`.
     pub fn table(&self) -> &str {
-        self.key.split('.').next().unwrap_or(self.key)
+        self.key.rsplit_once('.').map_or(self.key, |(t, _)| t)
     }
 
     pub fn leaf(&self) -> &str {
@@ -130,6 +152,7 @@ impl SettingDef {
             Kind::Text { default, .. } => Value::Text((*default).into()),
             Kind::Choice { default, .. } => Value::Text((*default).into()),
             Kind::StringList { default } => Value::List(default.map(|f| f()).unwrap_or_default()),
+            Kind::Limit { .. } => Value::Text("auto".into()),
         }
     }
 }
@@ -458,6 +481,48 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "orchestrator.limits.cpu_cores",
+        label: "CPU cores",
+        section: Section::Orchestrator,
+        doc: "Cores all orchestrator passes together may hand to workers. auto = all but 2.",
+        note: &[
+            "The resource ledger (`giverny pass claim`) grants workers cores,",
+            "RAM and GPUs out of these limits, across every orchestrator on",
+            "this machine, and reads them on each claim: an edit applies to the",
+            "next one. A number, or \"auto\" (cores - 2, at least 1).",
+        ],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Cores,
+        },
+    },
+    SettingDef {
+        key: "orchestrator.limits.ram",
+        label: "RAM",
+        section: Section::Orchestrator,
+        doc: "Memory all orchestrator passes together may hand to workers. auto = 70 %.",
+        note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Ram,
+        },
+    },
+    SettingDef {
+        key: "orchestrator.limits.gpus",
+        label: "GPUs",
+        section: Section::Orchestrator,
+        doc: "GPUs and VRAM orchestrator passes may use. auto = 90 % of each GPU's VRAM.",
+        note: &[
+            "GPUs are found with nvidia-smi; without it there are none. A list",
+            "like [{ index = 0, vram = \"20G\" }] names the GPUs and how much of",
+            "each; [] gives orchestrators none.",
+        ],
+        needs_restart: false,
+        kind: Kind::Limit {
+            field: LimitField::Gpus,
+        },
+    },
+    SettingDef {
         key: "update.check",
         label: "check for updates",
         section: Section::Updates,
@@ -490,6 +555,9 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
     for part in def.path() {
         node = node.get(part)?;
     }
+    if let Kind::Limit { field } = def.kind {
+        return limit_text(field, node).map(Value::Text);
+    }
     Some(match (node, &def.kind) {
         (toml::Value::Boolean(b), _) => Value::Bool(*b),
         (toml::Value::Float(f), _) => Value::Float(*f),
@@ -506,6 +574,56 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
         ),
         _ => return None,
     })
+}
+
+/// A `[orchestrator.limits]` value in the form [`Kind::Limit`] carries it:
+/// read with the ledger's own types, so the screen shows what the ledger
+/// would grant from.
+fn limit_text(field: LimitField, node: &toml::Value) -> Option<String> {
+    let node = node.clone();
+    Some(match field {
+        LimitField::Cores => match node.try_into::<Auto<u32>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(n) => n.to_string(),
+        },
+        LimitField::Ram => match node.try_into::<Auto<Mem>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(m) => limits::mem_text(m),
+        },
+        LimitField::Gpus => match node.try_into::<Auto<Vec<GpuLimit>>>().ok()? {
+            Auto::Auto => "auto".into(),
+            Auto::Set(g) => limits::gpus_text(&g),
+        },
+    })
+}
+
+/// A [`Kind::Limit`] value as the TOML the ledger reads. `None` when the
+/// text is not one (the screen validates before it gets here).
+fn limit_toml(field: LimitField, text: &str) -> Option<toml_edit::Value> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Some("auto".into());
+    }
+    match field {
+        LimitField::Cores => t.parse::<i64>().ok().filter(|n| *n > 0).map(Into::into),
+        LimitField::Ram => Mem::parse(t).map(|m| limits::mem_text(m).into()),
+        LimitField::Gpus => {
+            let v: toml_edit::Value = t.parse().ok()?;
+            // Only what the ledger can read back.
+            let probe: toml::Value = toml::from_str(&format!("g = {t}")).ok()?;
+            probe.get("g")?.clone().try_into::<Vec<GpuLimit>>().ok()?;
+            Some(v)
+        }
+    }
+}
+
+/// The TOML for `value` as option `def` stores it.
+fn encode(def: &SettingDef, value: &Value) -> anyhow::Result<toml_edit::Value> {
+    match (&def.kind, value) {
+        (Kind::Limit { field }, Value::Text(t)) => limit_toml(*field, t)
+            .ok_or_else(|| anyhow::anyhow!("{}: `{t}` is not a limit", def.key)),
+        _ => Ok(toml_edit_value(value)),
+    }
 }
 
 /// Is this option still at its default?
@@ -550,10 +668,13 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     // Walk (creating) the tables above the leaf.
     let mut node = doc.as_table_mut();
     let parts: Vec<&str> = def.path().collect();
-    for part in &parts[..parts.len() - 1] {
+    let parents = parts.len() - 1;
+    for (i, part) in parts[..parents].iter().enumerate() {
         if !node.contains_key(part) {
             let mut table = toml_edit::Table::new();
-            table.set_implicit(false);
+            // `[orchestrator.limits]` alone, not an empty `[orchestrator]`
+            // above it.
+            table.set_implicit(i + 1 < parents);
             node.insert(part, toml_edit::Item::Table(table));
         }
         node = node
@@ -563,6 +684,7 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     }
 
     let leaf = parts[parts.len() - 1];
+    let encoded = encode(def, value)?;
     match node.get_mut(leaf) {
         Some(item) => {
             let slot = item.as_value_mut().ok_or_else(|| {
@@ -572,11 +694,11 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
             // `size = 11.0  # deliberately small`. Replacing the value alone
             // would take the user's note with it.
             let decor = slot.decor().clone();
-            *slot = toml_edit_value(value);
+            *slot = encoded;
             *slot.decor_mut() = decor;
         }
         None => {
-            node.insert(leaf, toml_edit::Item::Value(toml_edit_value(value)));
+            node.insert(leaf, toml_edit::Item::Value(encoded));
         }
     }
 
@@ -703,6 +825,11 @@ mod tests {
         );
         assert_eq!(parsed.usage.refresh_minutes, defaults.usage.refresh_minutes);
         assert_eq!(parsed.update.check, defaults.update.check);
+        assert_eq!(parsed.orchestrator, defaults.orchestrator);
+        assert!(
+            text.contains("\n[orchestrator.limits]\n"),
+            "limits get their own table:\n{text}"
+        );
     }
 
     #[test]
@@ -831,6 +958,77 @@ mod tests {
         let cfg: Config =
             toml::from_str(&std::fs::read_to_string(config::config_path(&dir)).unwrap()).unwrap();
         assert_eq!(cfg.usage.refresh_minutes, 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limits_write_back_as_the_ledger_reads_them() {
+        let dir = scratch("limits");
+        std::fs::write(config::config_path(&dir), template()).unwrap();
+        let path = config::config_path(&dir);
+        let set = |key: &str, v: &str| {
+            write(&dir, by_key(key).unwrap(), &Value::Text(v.into())).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            (config::parse(&text).unwrap().0, text)
+        };
+        let (cfg, text) = set("orchestrator.limits.cpu_cores", "8");
+        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(8));
+        assert!(text.contains("cpu_cores = 8"), "an integer: {text}");
+        let (cfg, _) = set("orchestrator.limits.ram", "1.5G");
+        assert_eq!(cfg.orchestrator.limits.ram, Auto::Set(Mem(1536)));
+        let (cfg, text) = set(
+            "orchestrator.limits.gpus",
+            r#"[{ index = 0, vram = "20G" }]"#,
+        );
+        assert_eq!(
+            cfg.orchestrator.limits.gpus,
+            Auto::Set(vec![GpuLimit {
+                index: 0,
+                vram: Mem::gb(20)
+            }])
+        );
+        assert_eq!(
+            limits::Limits::from_config_str(&text).unwrap(),
+            cfg.orchestrator.limits,
+            "the ledger reads the same"
+        );
+        for def in in_section(Section::Orchestrator) {
+            assert_ne!(current(&cfg, def), Some(def.default_value()));
+        }
+        // Back to auto, and the screen sees it as the default again.
+        let (cfg, _) = set("orchestrator.limits.gpus", "auto");
+        assert!(is_default(
+            &cfg,
+            by_key("orchestrator.limits.gpus").unwrap()
+        ));
+        assert_eq!(
+            current(&cfg, by_key("orchestrator.limits.ram").unwrap()),
+            Some(Value::Text("1536M".into()))
+        );
+        // Not a limit: refused, file untouched.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = Value::Text("lots".into());
+        assert!(write(&dir, by_key("orchestrator.limits.ram").unwrap(), &bad).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_limit_written_into_a_file_without_the_table_gets_only_that_table() {
+        let dir = scratch("limits-new");
+        std::fs::write(config::config_path(&dir), "[font]\nsize = 13.0\n").unwrap();
+        write(
+            &dir,
+            by_key("orchestrator.limits.cpu_cores").unwrap(),
+            &Value::Text("4".into()),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(config::config_path(&dir)).unwrap();
+        assert!(!text.contains("[orchestrator]\n"), "{text}");
+        assert!(
+            text.contains("[orchestrator.limits]\ncpu_cores = 4"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

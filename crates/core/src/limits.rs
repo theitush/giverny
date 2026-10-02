@@ -219,17 +219,20 @@ impl Limits {
     /// `[orchestrator.limits]` from the TOML text of a `config.toml`; all
     /// `auto` when the table is absent. An unreadable table is an error, so
     /// a typo is said rather than silently ignored.
+    ///
+    /// Read through [`crate::config::OrchestratorConfig`], the same type
+    /// `Config` mounts, so the ledger and the settings screen cannot read
+    /// the table two ways. Only the `[orchestrator]` table is looked at: a
+    /// bad value elsewhere in the file is the settings screen's business,
+    /// not a reason to refuse a claim.
     pub fn from_config_str(text: &str) -> Result<Limits, String> {
         let doc: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-        let Some(t) = doc
-            .get("orchestrator")
-            .and_then(|o| o.as_table())
-            .and_then(|o| o.get("limits"))
-        else {
+        let Some(o) = doc.get("orchestrator") else {
             return Ok(Limits::default());
         };
-        t.clone()
-            .try_into()
+        o.clone()
+            .try_into::<crate::config::OrchestratorConfig>()
+            .map(|o| o.limits)
             .map_err(|e| format!("[orchestrator.limits]: {e}"))
     }
 
@@ -248,6 +251,102 @@ impl Limits {
     pub fn load() -> Result<Limits, String> {
         Limits::load_from(&default_config_path())
     }
+}
+
+/// A size as `config.toml` holds it: `"16G"` when whole GiB, else `"1536M"`
+/// (what [`Mem`]'s `Serialize` writes, without the quotes).
+pub fn mem_text(m: Mem) -> String {
+    if m.0.is_multiple_of(1024) {
+        format!("{}G", m.0 / 1024)
+    } else {
+        format!("{}M", m.0)
+    }
+}
+
+/// `gpus` as a TOML literal: `[]` or `[{ index = 0, vram = "20G" }, …]`.
+pub fn gpus_text(gpus: &[GpuLimit]) -> String {
+    let items: Vec<String> = gpus
+        .iter()
+        .map(|g| format!("{{ index = {}, vram = \"{}\" }}", g.index, mem_text(g.vram)))
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// `50%` → `Some(50.0)`; anything without a trailing `%` → `None`.
+fn percent(s: &str) -> Option<Result<f64, String>> {
+    let n = s.strip_suffix('%')?.trim();
+    Some(match n.parse::<f64>() {
+        Ok(p) if p.is_finite() && p > 0.0 && p <= 100.0 => Ok(p),
+        _ => Err(format!("{s} is not a share between 0 and 100 %")),
+    })
+}
+
+fn is_auto(s: &str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case("auto")
+}
+
+/// What a person typed for `cpu_cores`: `auto` (or nothing), a number of
+/// cores, or a share of this machine's (`50%`). A share is turned into
+/// cores here, so the file holds a figure the ledger reads as given.
+pub fn parse_cores(input: &str, m: &Machine) -> Result<Auto<u32>, String> {
+    let s = input.trim();
+    if is_auto(s) {
+        return Ok(Auto::Auto);
+    }
+    let n = match percent(s) {
+        Some(p) => ((m.cores as f64 * p? / 100.0).round() as u32).max(1),
+        None => s
+            .parse::<u32>()
+            .map_err(|_| format!("`{s}`: a number of cores, a share like 50%, or auto"))?,
+    };
+    if n == 0 {
+        return Err("at least one core".into());
+    }
+    if n > m.cores {
+        return Err(format!("this machine has {} cores", m.cores));
+    }
+    Ok(Auto::Set(n))
+}
+
+/// What a person typed for `ram`: `auto`, a size (`16G`, `512M`, a bare
+/// number is GiB), or a share of this machine's RAM (`50%`).
+pub fn parse_ram(input: &str, m: &Machine) -> Result<Auto<Mem>, String> {
+    let s = input.trim();
+    if is_auto(s) {
+        return Ok(Auto::Auto);
+    }
+    Ok(Auto::Set(parse_share_of(s, m.ram, "RAM")?))
+}
+
+/// A size or a share (`50%`) of `whole`, more than nothing and no more
+/// than `whole`. A share is rounded to a whole GiB when it is that large.
+pub fn parse_share_of(s: &str, whole: Mem, what: &str) -> Result<Mem, String> {
+    let mem = match percent(s) {
+        Some(p) => {
+            let mb = (whole.0 as f64 * p? / 100.0) as u64;
+            // 50 % of 23.5G is 11.75G; the file says "12G", not "12032M".
+            if mb >= 4096 {
+                let g = mb as f64 / 1024.0;
+                let near = Mem::gb(g.round() as u64);
+                if near > whole {
+                    Mem::gb(g.floor() as u64)
+                } else {
+                    near
+                }
+            } else {
+                Mem(mb)
+            }
+        }
+        None => Mem::parse(s)
+            .ok_or_else(|| format!("`{s}`: a size like 16G or 512M, a share like 50%, or auto"))?,
+    };
+    if mem.0 == 0 {
+        return Err(format!("more than no {what}"));
+    }
+    if mem > whole {
+        return Err(format!("this machine has {whole} of {what}"));
+    }
+    Ok(mem)
 }
 
 /// `<config dir>/giverny/config.toml`, the file `config.rs` reads.
@@ -502,6 +601,38 @@ mod tests {
         assert_eq!(parse_meminfo(mi, "MemTotal"), Some(23552));
         assert_eq!(parse_meminfo(mi, "MemAvailable"), Some(16384));
         assert_eq!(parse_meminfo(mi, "Mem"), None);
+    }
+
+    #[test]
+    fn typed_limits_take_numbers_and_shares() {
+        let m = machine(14, 24, &[]);
+        assert_eq!(parse_cores("auto", &m), Ok(Auto::Auto));
+        assert_eq!(parse_cores("  ", &m), Ok(Auto::Auto));
+        assert_eq!(parse_cores("8", &m), Ok(Auto::Set(8)));
+        assert_eq!(parse_cores("50%", &m), Ok(Auto::Set(7)));
+        assert_eq!(parse_cores("1%", &m), Ok(Auto::Set(1)), "never zero");
+        assert!(parse_cores("0", &m).is_err());
+        assert!(parse_cores("15", &m).is_err(), "more than the machine");
+        assert!(parse_cores("150%", &m).is_err());
+        assert!(parse_cores("lots", &m).is_err());
+        assert_eq!(parse_ram("AUTO", &m), Ok(Auto::Auto));
+        assert_eq!(parse_ram("16G", &m), Ok(Auto::Set(Mem::gb(16))));
+        assert_eq!(parse_ram("16", &m), Ok(Auto::Set(Mem::gb(16))));
+        assert_eq!(parse_ram("50%", &m), Ok(Auto::Set(Mem::gb(12))));
+        assert!(parse_ram("32G", &m).is_err());
+        assert!(parse_ram("0", &m).is_err());
+        // 100 % of 23.5G rounds down, not up past the machine.
+        assert_eq!(parse_share_of("100%", Mem(24064), "RAM"), Ok(Mem::gb(23)));
+        assert_eq!(parse_share_of("50%", Mem(2048), "VRAM"), Ok(Mem(1024)));
+        assert_eq!(mem_text(Mem(1536)), "1536M");
+        assert_eq!(
+            gpus_text(&[GpuLimit {
+                index: 1,
+                vram: Mem::gb(8)
+            }]),
+            r#"[{ index = 1, vram = "8G" }]"#
+        );
+        assert_eq!(gpus_text(&[]), "[]");
     }
 
     #[test]

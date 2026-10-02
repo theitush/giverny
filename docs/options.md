@@ -25,4 +25,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.orchestrate_by_default` | `false` | Have Claude hand any task longer than about a minute to subagents, via /giverny:orchestrate. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
+| `orchestrator.limits.cpu_cores` | `"auto"` | Cores all orchestrator passes together may hand to workers. auto = all but 2. |
+| `orchestrator.limits.ram` | `"auto"` | Memory all orchestrator passes together may hand to workers. auto = 70 %. |
+| `orchestrator.limits.gpus` | `"auto"` | GPUs and VRAM orchestrator passes may use. auto = 90 % of each GPU's VRAM. |
 | `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |

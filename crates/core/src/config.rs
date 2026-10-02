@@ -15,6 +15,18 @@ pub struct Config {
     pub usage: UsageConfig,
     pub claude: ClaudeConfig,
     pub update: UpdateConfig,
+    pub orchestrator: OrchestratorConfig,
+}
+
+/// `[orchestrator]`: what orchestrator passes (`/giverny:orchestrate`) on
+/// this machine share. Only the limits so far; `claude.orchestrate_by_default`
+/// stays under `[claude]`, where the settings it depends on live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    /// `[orchestrator.limits]`, read by the resource ledger on every claim
+    /// (`giverny_claude::resources`), so an edit applies to the next one.
+    pub limits: crate::limits::Limits,
 }
 
 /// How Claude Code itself is launched in a tab.
@@ -475,7 +487,26 @@ mod tests {
         .unwrap();
         assert!(cfg.claude.auto_mode);
         assert_eq!(cfg.font.size, 20.0);
-        assert_eq!(unknown, ["claude.future_key", "orchestrator"]);
+        assert_eq!(unknown, ["claude.future_key", "orchestrator.x"]);
+    }
+
+    #[test]
+    fn orchestrator_limits_mount_in_config_and_match_the_ledger() {
+        use crate::limits::{Auto, Limits, Mem};
+        let text = "[orchestrator.limits]\ncpu_cores = 6\nram = \"12G\"\ngpus = []\n";
+        let (cfg, unknown) = parse(text).unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(6));
+        assert_eq!(cfg.orchestrator.limits.ram, Auto::Set(Mem::gb(12)));
+        assert_eq!(cfg.orchestrator.limits.gpus, Auto::Set(vec![]));
+        // One parse path: the ledger reads what the Config reads.
+        assert_eq!(
+            Limits::from_config_str(text).unwrap(),
+            cfg.orchestrator.limits
+        );
+        // Absent: all auto, both ways.
+        let (cfg, _) = parse("[font]\nsize = 14.0\n").unwrap();
+        assert_eq!(cfg.orchestrator.limits, Limits::default());
     }
 
     #[test]

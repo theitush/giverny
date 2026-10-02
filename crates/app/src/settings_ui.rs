@@ -10,8 +10,11 @@
 //! screen teaches the file, so the next edit can be made over SSH or dropped
 //! into dotfiles.
 
+use std::sync::OnceLock;
+
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText};
-use giverny_core::settings::{self, Kind, Section, SettingDef, Value};
+use giverny_core::limits::{self, Auto, GpuLimit, Limits, Machine};
+use giverny_core::settings::{self, Kind, LimitField, Section, SettingDef, Value};
 
 use crate::{Action, App};
 
@@ -25,6 +28,9 @@ pub struct SettingsState {
     /// number rows commit on Enter or focus loss, not on every keystroke — a
     /// half-typed "1" in a "10000" field must not be written to disk.
     pub editing: Option<(String, String)>,
+    /// A value that was typed but refused (a limit larger than the machine,
+    /// say): the row's edit key and why. Cleared by the next good commit.
+    pub error: Option<(String, String)>,
 }
 
 impl Default for SettingsState {
@@ -34,8 +40,32 @@ impl Default for SettingsState {
             search: String::new(),
             search_focus: true,
             editing: None,
+            error: None,
         }
     }
+}
+
+/// This machine's cores, RAM and GPUs, for the orchestrator limits.
+///
+/// Detected once per process, off the UI thread: GPU detection runs
+/// `nvidia-smi`, which can take a second, and none of it changes while
+/// Giverny runs. `None` until the first detection finishes.
+fn machine(ctx: &egui::Context) -> Option<&'static Machine> {
+    static MACHINE: OnceLock<Machine> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("detect-machine".into())
+            .spawn(move || {
+                let _ = MACHINE.set(Machine::detect());
+                ctx.request_repaint();
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("could not detect the machine: {err}");
+        }
+    });
+    MACHINE.get()
 }
 
 /// Rows to show: everything in the current section, or — while searching —
@@ -80,6 +110,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
 
     let cfg = app.cfg.clone();
     let c = app.chrome;
+    let machine = machine(&ctx);
     let rows = visible(&state);
     // Suggestions for the restore list, from what tabs have actually run.
     let allowed: Vec<String> = cfg.behavior.restore_apps.clone();
@@ -112,6 +143,7 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
                                 ui,
                                 &mut state,
                                 &cfg,
+                                machine,
                                 &rows,
                                 &suggestions,
                                 &mut actions,
@@ -194,6 +226,7 @@ fn body(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
     rows: &[&'static SettingDef],
     suggestions: &[String],
     actions: &mut Vec<Action>,
@@ -231,16 +264,69 @@ fn body(
         ui.add_space(8.0);
     }
 
+    if state.search.is_empty() && state.section == Section::Orchestrator {
+        limits_intro(ui, machine, c);
+    }
+
     for def in rows {
-        row(ui, state, cfg, def, suggestions, actions, c);
+        // No GPU, no GPU row — unless one is set, which then needs a reset.
+        if matches!(
+            def.kind,
+            Kind::Limit {
+                field: LimitField::Gpus
+            }
+        ) && settings::is_default(cfg, def)
+            && machine.is_none_or(|m| m.gpus.is_empty())
+        {
+            continue;
+        }
+        row(ui, state, cfg, machine, def, suggestions, actions, c);
         ui.add_space(10.0);
     }
 }
 
+/// The head of Settings → Orchestrator: what the limits are for, and the
+/// machine `auto` is worked out from.
+fn limits_intro(ui: &mut egui::Ui, machine: Option<&Machine>, c: Chrome) {
+    ui.label(
+        RichText::new("limits")
+            .font(FontId::monospace(12.5))
+            .color(c.accent),
+    );
+    ui.label(
+        RichText::new(
+            "What every orchestrator pass on this machine together may hand to its \
+             workers (giverny pass claim). auto follows the machine; type a number, \
+             a size, or a share like 50%.",
+        )
+        .font(FontId::monospace(10.0))
+        .color(c.dim),
+    );
+    let this = match machine {
+        None => "this machine: detecting…".to_string(),
+        Some(m) => {
+            let gpus = if m.gpus.is_empty() {
+                "no GPU (nvidia-smi)".to_string()
+            } else {
+                m.gpus
+                    .iter()
+                    .map(|g| format!("GPU {} {} {}", g.index, g.name, g.vram))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            format!("this machine: {} cores · {} RAM · {gpus}", m.cores, m.ram)
+        }
+    };
+    ui.label(RichText::new(this).font(FontId::monospace(10.5)));
+    ui.add_space(10.0);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
     def: &'static SettingDef,
     suggestions: &[String],
     actions: &mut Vec<Action>,
@@ -264,7 +350,12 @@ fn row(
         });
 
         ui.vertical(|ui| {
-            widget(ui, state, def, &value, suggestions, actions, c);
+            match def.kind {
+                Kind::Limit { field } => {
+                    limit_widget(ui, state, cfg, machine, def, field, &value, actions, c)
+                }
+                _ => widget(ui, state, def, &value, suggestions, actions, c),
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(def.doc)
@@ -293,6 +384,7 @@ fn row(
                     {
                         actions.push(Action::SetSetting(def.key.into(), def.default_value()));
                         state.editing = None;
+                        state.error = None;
                     }
                 }
             });
@@ -398,6 +490,222 @@ fn widget(
             }
         }
         Kind::StringList { .. } => list_widget(ui, state, def, value, suggestions, actions, c),
+        // Drawn by `limit_widget`, which needs the machine.
+        Kind::Limit { .. } => {}
+    }
+}
+
+/// A short text field committing on Enter or focus loss, like the text
+/// rows. `Some(typed)` once a changed value is committed.
+fn commit_field(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    key: &str,
+    stored: &str,
+) -> Option<String> {
+    let editing = state.editing.as_ref().is_some_and(|(k, _)| k == key);
+    let mut buf = match (&state.editing, editing) {
+        (Some((_, b)), true) => b.clone(),
+        _ => stored.to_string(),
+    };
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .hint_text("auto")
+            .desired_width(90.0)
+            .font(FontId::monospace(12.0)),
+    );
+    if resp.changed() {
+        state.editing = Some((key.into(), buf.clone()));
+    }
+    let done = resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter));
+    if done && editing {
+        state.editing = None;
+        if buf.trim() != stored {
+            return Some(buf);
+        }
+    }
+    None
+}
+
+fn dim(ui: &mut egui::Ui, text: String, c: Chrome) {
+    ui.label(
+        RichText::new(text)
+            .font(FontId::monospace(11.0))
+            .color(c.dim),
+    );
+}
+
+fn refused(ui: &mut egui::Ui, state: &SettingsState, key: &str, c: Chrome) {
+    if let Some((_, why)) = state.error.as_ref().filter(|(k, _)| k == key) {
+        ui.label(
+            RichText::new(why)
+                .font(FontId::monospace(10.0))
+                .color(c.amber),
+        );
+    }
+}
+
+/// `pct` of `whole`, as a whole percent.
+fn share(part: u64, whole: u64) -> u64 {
+    (part * 100).checked_div(whole).unwrap_or(0)
+}
+
+/// One `[orchestrator.limits]` row: the figure (or `auto`) to edit, and
+/// beside it what that comes to on this machine.
+#[allow(clippy::too_many_arguments)]
+fn limit_widget(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    field: LimitField,
+    value: &Value,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let limits = &cfg.orchestrator.limits;
+    if field == LimitField::Gpus {
+        return gpu_rows(ui, state, limits, machine, def, actions, c);
+    }
+    let stored = value.as_str().unwrap_or("auto").to_string();
+    ui.horizontal(|ui| {
+        let typed = commit_field(ui, state, def.key, &stored);
+        let Some(m) = machine else {
+            dim(ui, "detecting this machine…".into(), c);
+            return;
+        };
+        if let Some(typed) = typed {
+            let parsed = match field {
+                LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
+                    Auto::Auto => "auto".to_string(),
+                    Auto::Set(n) => n.to_string(),
+                }),
+                _ => limits::parse_ram(&typed, m).map(|a| match a {
+                    Auto::Auto => "auto".to_string(),
+                    Auto::Set(mem) => limits::mem_text(mem),
+                }),
+            };
+            match parsed {
+                Ok(text) => {
+                    state.error = None;
+                    if text != stored {
+                        actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                    }
+                }
+                Err(why) => state.error = Some((def.key.into(), why)),
+            }
+        }
+        let r = limits.resolve(m);
+        let auto = stored == "auto";
+        let text = match field {
+            LimitField::Cores if auto => format!("= {} of {} cores", r.cpu_cores, m.cores),
+            LimitField::Cores => format!(
+                "of {} cores ({}%)",
+                m.cores,
+                share(r.cpu_cores as u64, m.cores as u64)
+            ),
+            _ if auto => format!("= {} of {} ({}%)", r.ram, m.ram, limits::AUTO_RAM_PCT),
+            _ => format!("of {} ({}%)", m.ram, share(r.ram.0, m.ram.0)),
+        };
+        dim(ui, text, c);
+    });
+    refused(ui, state, def.key, c);
+}
+
+/// `gpus`: a line per GPU the machine has. The file holds one list, so
+/// setting one GPU writes them all — the rest at their auto figure — and a
+/// list that comes back to every GPU at auto is written as `"auto"` again.
+fn gpu_rows(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    limits: &Limits,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let auto_list = Limits::default().resolve(m).gpus;
+    let current: Vec<GpuLimit> = limits.gpus.get().cloned().unwrap_or(auto_list.clone());
+    if m.gpus.is_empty() {
+        dim(ui, "no GPU detected (nvidia-smi)".into(), c);
+    }
+    for g in &m.gpus {
+        let key = format!("{}#{}", def.key, g.index);
+        let set = current.iter().find(|l| l.index == g.index);
+        let stored = match (&limits.gpus, set) {
+            (Auto::Auto, _) => "auto".to_string(),
+            (Auto::Set(_), Some(l)) => limits::mem_text(l.vram),
+            (Auto::Set(_), None) => "off".to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} {} {}", g.index, g.name, g.vram))
+                    .font(FontId::monospace(11.0)),
+            );
+            if let Some(typed) = commit_field(ui, state, &key, &stored) {
+                let t = typed.trim().to_ascii_lowercase();
+                let auto_vram = auto_list
+                    .iter()
+                    .find(|l| l.index == g.index)
+                    .map(|l| l.vram);
+                let vram = match t.as_str() {
+                    "" | "auto" => Ok(auto_vram),
+                    "off" | "none" | "0" => Ok(None),
+                    _ => limits::parse_share_of(&t, g.vram, "VRAM").map(Some),
+                };
+                match vram {
+                    Ok(vram) => {
+                        state.error = None;
+                        let mut next: Vec<GpuLimit> = current
+                            .iter()
+                            .filter(|l| l.index != g.index)
+                            .cloned()
+                            .collect();
+                        if let Some(vram) = vram {
+                            next.push(GpuLimit {
+                                index: g.index,
+                                vram,
+                            });
+                        }
+                        next.sort_by_key(|l| l.index);
+                        let text = if next == auto_list {
+                            "auto".to_string()
+                        } else {
+                            limits::gpus_text(&next)
+                        };
+                        actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                    }
+                    Err(why) => state.error = Some((key.clone(), why)),
+                }
+            }
+            let text = match set {
+                _ if stored == "auto" => format!(
+                    "= {} of {} ({}%)",
+                    set.map(|l| l.vram).unwrap_or_default(),
+                    g.vram,
+                    limits::AUTO_VRAM_PCT
+                ),
+                Some(l) => format!("of {} ({}%)", g.vram, share(l.vram.0, g.vram.0)),
+                None => "not used".into(),
+            };
+            dim(ui, text, c);
+        });
+        refused(ui, state, &key, c);
+    }
+    // Set in the file for a GPU this machine does not have.
+    for l in current
+        .iter()
+        .filter(|l| !m.gpus.iter().any(|g| g.index == l.index))
+    {
+        dim(
+            ui,
+            format!("GPU {}: {} set, not detected", l.index, l.vram),
+            c,
+        );
     }
 }
 
@@ -729,5 +1037,18 @@ mod tests {
         // Searching by TOML key works too — that is half the point of showing it.
         state.search = "titles.strip".into();
         assert_eq!(visible(&state).len(), 1);
+        // The orchestrator limits, by their table and by what they are.
+        state.search = "limits".into();
+        let keys: Vec<&str> = visible(&state).iter().map(|d| d.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "orchestrator.limits.cpu_cores",
+                "orchestrator.limits.ram",
+                "orchestrator.limits.gpus"
+            ]
+        );
+        state.search = "vram".into();
+        assert_eq!(visible(&state)[0].key, "orchestrator.limits.gpus");
     }
 }
