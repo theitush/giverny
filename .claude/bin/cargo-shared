@@ -1,0 +1,42 @@
+#!/bin/sh
+# cargo for a worktree that builds into the shared CARGO_TARGET_DIR (giverny#148).
+#
+# Cargo names a workspace crate's artifacts by a hash that leaves out the
+# worktree's path, and judges them fresh by mtime. So when worktree A builds
+# after B edited the same crate, B's next build sees A's newer artifact, calls
+# it fresh, and links A's code, silently (giverny#171).
+#
+# The fix: one lock around every build in the folder, and a note of which
+# worktree built last. When it was another one, touch this worktree's sources
+# first so cargo rebuilds the workspace crates; registry deps stay shared.
+#
+#   cargo-shared test -p giverny-claude
+#   cargo-shared --then 'cp "$CARGO_TARGET_DIR/debug/giverny" /tmp/gv' build
+#       --then runs a shell command after a successful cargo, still under the
+#       lock, so another worktree can't overwrite the artifact in between.
+set -eu
+: "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR to the shared folder}"
+then_cmd=
+if [ "${1:-}" = --then ]; then then_cmd=$2; shift 2; fi
+
+manifest=$(cargo locate-project --workspace --message-format plain)
+root=$(dirname "$manifest")
+mkdir -p "$CARGO_TARGET_DIR"
+exec 9>"$CARGO_TARGET_DIR/.worktree.lock"
+if ! flock -n 9; then
+  echo "cargo-shared: waiting for the shared build folder (another worktree is building)" >&2
+  flock 9
+fi
+
+last=$(cat "$CARGO_TARGET_DIR/.last-worktree" 2>/dev/null || true)
+if [ "$last" != "$root" ]; then
+  # Everything a workspace crate can read: sources, include_str! files, build
+  # scripts, manifests. Untracked new files too, hence find, not git ls-files.
+  find "$root" -path "$root/target" -prune -o -path "$root/.git" -prune \
+    -o -path "$root/.toolchain" -prune -o -path "$root/.claude" -prune \
+    -o -type f -print0 | xargs -0 touch -c
+  printf '%s\n' "$root" > "$CARGO_TARGET_DIR/.last-worktree"
+fi
+
+cargo "$@"
+if [ -n "$then_cmd" ]; then sh -c "$then_cmd"; fi
