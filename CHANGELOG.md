@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 — 2026-10-02
+
+- A new theme, `catppuccin-mauve`: Catppuccin Mocha as the Colloid GTK theme
+  wears it on GNOME, with mauve as the accent and Latte's near-white for text.
 
 - `window.opacity` (0.5-1.0, default 1.0) lets the desktop show through the
   terminal and the rail. Only backgrounds go see-through: text, the cursor,
