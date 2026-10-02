@@ -114,6 +114,10 @@ pub struct FeedRow {
     /// it, nothing is fetched; without it, a key naming a GitHub issue has
     /// the line read from the issue where `gh` works (giverny#60, #101).
     pub review: Option<String>,
+    /// The row's worker started it itself, asked for a first estimate
+    /// (giverny#158), so no dispatcher will land it: it is Done when its
+    /// worker is.
+    pub follows_worker: bool,
 }
 
 impl FeedRow {
@@ -253,6 +257,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         open: str_field(v, "open"),
         note: str_field(v, "note"),
         review: str_field(v, "review"),
+        follows_worker: v.get("follows_worker").and_then(Value::as_bool) == Some(true),
     })
 }
 
@@ -634,7 +639,8 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 
 /// Merge the feed with the live rows.
 ///
-/// - Every feed row is a row, in feed order, in the stage the feed gave it.
+/// - Every feed row is a row, in feed order, in the stage the feed gave it;
+///   but one that `follows_worker` is Done once its finished worker is.
 ///   It carries the live row its `agent_id` names; failing that (no
 ///   `agent_id`, or one Claude Code no longer lists), the live row whose
 ///   description names the row's key — `Work giverny#82 …` holds
@@ -672,15 +678,19 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
     };
     let mut out: Vec<PaneRow<'a, L>> = feed_rows
         .iter()
-        .map(|f| PaneRow {
-            stage: f.stage(),
-            feed: Some(f),
-            live: f
+        .map(|f| {
+            let live = f
                 .agent_id
                 .as_deref()
                 .and_then(find_live)
-                .or_else(|| by_description(f)),
-            ..PaneRow::bare()
+                .or_else(|| by_description(f));
+            let finished = f.follows_worker && live.is_some_and(|l| !l.running());
+            PaneRow {
+                stage: if finished { Stage::Done } else { f.stage() },
+                feed: Some(f),
+                live,
+                ..PaneRow::bare()
+            }
         })
         .collect();
     for l in live {
@@ -1082,6 +1092,48 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// giverny#158: a row its worker started itself (`follows_worker`) has
+    /// no dispatcher to land it, so it is Done when the worker is; a
+    /// dispatcher's Running row stays Running until it is landed.
+    #[test]
+    fn a_row_that_follows_its_worker_ends_with_it() {
+        let mut own = row("agent-w1", Stage::Running, Some("w1"));
+        own.follows_worker = true;
+        let f = Feed {
+            rows: vec![own, row("giverny#9", Stage::Running, Some("w2"))],
+            ..Default::default()
+        };
+        let lives = [live("w1", false), live("w2", false)];
+        let rows = merge(Some(&f), &lives);
+        let stage_of = |k: &str| {
+            rows.iter()
+                .find(|r| r.feed.is_some_and(|f| f.key == k))
+                .unwrap()
+                .stage
+        };
+        assert_eq!(stage_of("agent-w1"), Stage::Done);
+        assert_eq!(
+            stage_of("giverny#9"),
+            Stage::Running,
+            "the dispatcher lands it"
+        );
+        let lives = [live("w1", true), live("w2", false)];
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.feed.is_some_and(|f| f.key == "agent-w1"))
+                .unwrap()
+                .stage,
+            Stage::Running
+        );
+        assert!(
+            parse(br#"{"version":1,"rows":[{"key":"a","stage":"running","follows_worker":true}]}"#)
+                .unwrap()
+                .rows[0]
+                .follows_worker
+        );
     }
 
     #[test]

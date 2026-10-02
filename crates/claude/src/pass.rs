@@ -429,6 +429,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             set_str(row, "title", &f.title);
             set_str(row, "agent_id", &f.agent);
             set_str(row, "note", &f.note);
+            // A dispatcher's `start` owns the row: it lands it.
+            row.remove("follows_worker");
             let handed = match &f.agent {
                 Some(agent) => hand_off(rows, i, agent, now),
                 None => Vec::new(),
@@ -455,10 +457,14 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             sf.basis = None;
             apply(doc, &Cmd::Start(key.clone()), &sf, now)?;
             let rows = rows_mut(doc)?;
-            if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut())
-                && is_wait(f.why.as_deref())
-            {
-                row.insert("waiting_since".into(), json!(stamp(now)));
+            if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut()) {
+                // Started from `eta`, by a worker asked for a first estimate
+                // (giverny#158) or a dispatcher that forgot `start`: none may
+                // ever land it, so the pane ends it with its worker.
+                row.insert("follows_worker".into(), json!(true));
+                if is_wait(f.why.as_deref()) {
+                    row.insert("waiting_since".into(), json!(stamp(now)));
+                }
             }
             Ok(format!(
                 "{key}: no row in this pass, so started it now with ~{} left \
@@ -1128,10 +1134,15 @@ mod tests {
         assert_eq!(r.eta_s, Some(40 * 60), "as given, not corrected");
         assert_eq!(r.title.as_deref(), Some("Graph"));
         assert_eq!(r.agent_id.as_deref(), Some("w9"));
+        assert!(r.follows_worker, "no dispatcher lands it (giverny#158)");
 
         // From then on it is an ordinary row: a later eta re-estimates it.
         run(&dir, "eta inbar#613 10", T0 + 20 * MIN).unwrap();
         assert_eq!(read_feed(&dir).rows[0].eta_s, Some(30 * 60));
+        assert!(read_feed(&dir).rows[0].follows_worker);
+        // A dispatcher's `start` takes it over: it lands it, not the worker.
+        run(&dir, "start inbar#613 --agent w9", T0 + 21 * MIN).unwrap();
+        assert!(!read_feed(&dir).rows[0].follows_worker);
 
         // `--why wait` on a missing row starts it waiting.
         run(&dir, "eta other 5 --why wait", T0).unwrap();
