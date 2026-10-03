@@ -1,0 +1,50 @@
+  [38;5;153mGlass divided into frames of light,[39m                                           [2m[48;5;235m│[0;1;7m[48;5;235m Agents [0m[48;5;235m  Brief inbar#616                                     [38;5;246m✕
+[39m[49m  [38;5;153mEach pane a window to the world outside,[39m                                      [2m[48;5;235m│[0;1m[38;5;38m[48;5;235mRunning[0m[38;5;246m[48;5;235m 3[39m
+[49m  [38;5;153mHolding back the wind, the rain, the cold,[39m                                    [2m[48;5;235m│[0;1m[38;5;38m[48;5;235m● [0m[48;5;235m▸ giverny#183 BUG: pane: ETA counts past zero
+[49m  [38;5;153mYet letting in the sun's embrace so bright.[39m                                   [2m[48;5;235m│[0m[48;5;235m  [38;5;38m████[38;5;246m░░░░[39m 13:45 ~16m[38;5;246m 64.1kt[39m
+[49m                                                                                [2m[48;5;235m│[0m[48;5;235m  [38;5;246mBash cargo-shared test[39m
+[49m  [38;5;153mTransparent barriers between two worlds,[39m                                      [2m[48;5;235m│[0;1m[38;5;38m[48;5;235m● [0m[48;5;235m▾ inbar#616 RESEARCH: backtest(#61): slippage sweep over 2024
+[49m  [38;5;153mOne warm within, one wild and free,[39m                                           [2m[48;5;235m│[0m[48;5;235m  [38;5;172m████████[39m 42:38[38;5;172m +3m[38;5;246m 212.4kt[39m
+[49m  [38;5;153mThe panes stand steady, strong, and true,[39m                                     [2m[48;5;235m│[0m[48;5;235m  [38;5;246mEdit sweep.py[39m
+[49m  [38;5;153mDividing space yet keeping both in view.[39m                                      [2m[48;5;235m│[0m[38;5;38m[48;5;235m╭─────────────────────────────────────────────────────────────╮
+[39m[49m                                                                                [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m [38;5;246mholds 2 cpu · 6G · uses 1.9 cpu 5.2G · 212.4k tokens[39m        [38;5;38m│
+[39m[49m  [38;5;153mIn winter frost they gleam and shine,[39m                                         [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m [1;3;4minbar#616[0m[48;5;235m                                                   [38;5;38m│
+[39m[49m  [38;5;153mCrystalline patterns etched by ice,[39m                                           [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m                                                             [38;5;38m│
+[39m[49m  [38;5;153mA million tiny geometric dreams,[39m                                              [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m [1mAsk[0m[48;5;235m — sweep slippage                                        [38;5;38m│
+[39m[49m  [38;5;153mEach pane a canvas for the night.[39m                                             [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m                                                             [38;5;38m│
+[39m[49m                                                                                [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m - read the issue                                            [38;5;38m│
+[39m[49m  [38;5;153mThe rain runs down in silvered threads,[39m                                       [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m - do the work in a worktree                                 [38;5;38m│
+[39m[49m  [38;5;153mDancing across the clear divide,[39m                                              [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m - [38;5;153mcargo-shared test[39m then push                               [38;5;38m│
+[39m[49m  [38;5;153mPanes like tears of liquid glass,[39m                                             [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m                                                             [38;5;38m│
+[39m[49m  [38;5;153mWeeping while the storm rages on.[39m                                             [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m [3mbrief: /tmp/briefs/inbar-616.md[0m[48;5;235m                             [38;5;38m│
+[39m[49m                                                                                [2m[48;5;235m│[0m[38;5;38m[48;5;235m│[39m [1m[38;5;153m[ Open brief in a pane ][0m[48;5;235m [1m[ Collapse ][0m[48;5;235m                       [38;5;38m│
+[39m[49m  [38;5;153mIn summer heat they glow like fire,[39m                                           [2m[48;5;235m│[0m[38;5;38m[48;5;235m╰─────────────────────────────────────────────────────────────╯
+[39m[49m  [38;5;153mAmber light through amber panes,[39m                                              [2m[48;5;235m│[0;1m[38;5;38m[48;5;235m● [0m[48;5;235m▸ coo#170 FEATURE: board: pause a pass
+[49m  [38;5;153mCasting shadows long and deep,[39m                                                [2m[48;5;235m│[0m[48;5;235m  [38;5;246m········[39m 5:08[38;5;246m no ETA 9.8kt[39m
+[49m  [38;5;153mPainting rooms with golden hues.[39m                                              [2m[48;5;235m│[0m[48;5;235m  [38;5;246mRead board.ts[39m
+[49m                                                                                [2m[48;5;235m│[0;1m[38;5;109m[48;5;235mNext up[0m[38;5;246m[48;5;235m 2[39m
+[49m  [38;5;153mA child presses palms against the glass,[39m                                      [2m[48;5;235m│[0m[38;5;109m[48;5;235m○ [39m▸ giverny#184 CLEANUP: feed: drop the v1 reader
+[49m  [38;5;153mFingers spread like starfish thin,[39m                                            [2m[48;5;235m│[0m[48;5;235m  [38;5;246m········[39m  ~25m
+[49m  [38;5;153mTwo panes between the world and wish,[39m                                         [2m[48;5;235m│[0m[48;5;235m  [38;5;246mqueued: 2nd for 3G[39m
+[49m  [38;5;153mYearning for what lies beyond.[39m                                                [2m[48;5;235m│[0m[38;5;109m[48;5;235m○ [39m▸ planets#88 FEATURE: editor: export SVG at poster size
+[49m                                                                                [2m[48;5;235m│[0m[48;5;235m  [38;5;246m········[39m  ~1h3m
+[49m  [38;5;153mThe wind strikes hard but cannot break,[39m                                       [2m[48;5;235m│[0;1m[38;5;34m[48;5;235mDone[0m[38;5;246m[48;5;235m 3[39m
+[49m  [38;5;153mThese patient soldiers stand their ground,[39m                                    [2m[48;5;235m│[0m[38;5;34m[48;5;235m✓ [39m▸ giverny#179 BUG: tabs: title flickers on resume
+[49m  [38;5;153mDivided into grid and square,[39m                                                 [2m[48;5;235m│[0m[48;5;235m  [38;5;34m████████[39m 35:00 (+5m)[38;5;246m 156.3kt[39m
+[49m  [38;5;153mEach pane reflects the passing clouds.[39m                                        [2m[48;5;235m│[0m[48;5;235m  [38;5;34mlanded[39m
+[49m                                                                                [2m[48;5;235m│[0m[38;5;34m[48;5;235m✓ [39m▸ leadgen#41 RUN: outreach: send batch 7
+[49m  [38;5;153mSimple silence, strong and clear,[39m                                             [2m[48;5;235m│[0m[48;5;235m  [38;5;174m████████[39m 10:00 (-10m)[38;5;246m 31kt[39m
+[49m  [38;5;153mBoundaries that bind yet free,[39m                                                [2m[48;5;235m│[0m[48;5;235m  [38;5;174mBlocked — SMTP creds expired[39m
+[49m  [38;5;153mPanes of glass that hold the line,[39m                                            [2m[48;5;235m│[0m[38;5;34m[48;5;235m✓ [39m▸ giverny#35 FEATURE: theme: catppuccin-mauve
+[49m  [38;5;153mBetween the safe and the unknown.[39m                                             [2m[48;5;235m│[0m[48;5;235m  [38;5;178m████████[39m 55:00 (-5m)[38;5;246m 488kt[39m
+[49m                                                                                [2m[48;5;235m│[0m[48;5;235m  [38;5;178mReview[39m
+[49m  Done with both—the command slept for 6 seconds, and here's your 30-line       [2m[48;5;235m│[0m[38;5;246m[48;5;235mleased 11G/22G RAM · 5/8 cores · body 63 cols · dock · opened …
+[39m[49m  meditation on panes, from window frames to perspective.                       [2m[48;5;235m│[0m[48;5;235m
+[49m                                                                                [2m[48;5;235m│[0m[48;5;235m
+[38;5;246m[49m✻[39m [38;5;246mChurned for 13s · done 12:37 PM[39m                                               [2m[48;5;235m│[0m[48;5;235m
+[49m                                                                                [2m[48;5;235m│[0m[48;5;235m
+[38;5;244m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mHaiku 4.5  ·  5h 4%  ·  wk 21%  ·  session: 37.7k[39m
+  [38;5;246m⏸ manual mode on · ← 2 agents[39m

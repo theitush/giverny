@@ -1,0 +1,50 @@
+  Dancing across the clear divide,
+  Panes like tears of liquid glass,
+  Weeping while the storm rages on.
+
+  In summer heat they glow like fire,
+  Amber light through amber panes,
+  Casting shadows long and deep,
+  Painting rooms with golden hues.
+
+  A child presses palms against the glass,
+  Fingers spread like starfish thin,
+  Two panes between the world and wish,
+  Yearning for what lies beyond.
+
+  The wind strikes hard but cannot break,
+  These patient soldiers stand their ground,
+  Divided into grid and square,
+  Each pane reflects the passing clouds.
+
+  Simple silence, strong and clear,
+  Boundaries that bind yet free,
+  Panes of glass that hold the line,
+  Between the safe and the unknown.
+
+  Done with both—the command slept for 6 seconds, and here's your 30-line meditation on panes, from
+  window frames to perspective.
+
+✻ Churned for 13s · done 12:37 PM
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Agents   Brief inbar#616                                                                      ✕ │
+│ Running 3                                                                                        │
+│ Running  ▸ giverny#183  BUG: pane… █████░░░░░    13:50     ~16m Bash cargo-shared test     64.1k │
+│ Running  ▾ inbar#616    RESEARCH:… ██████████    42:43      +3m Edit sweep.py             212.4k │
+│ ╭──────────────────────────────────────────────────────────────────────────────────────────────╮ │
+│ │ holds 2 cpu · 6G · uses 1.9 cpu 5.2G · 212.4k tokens                                         │ │
+│ │ inbar#616                                                                                    │ │
+│ │                                                                                              │ │
+│ │ Ask — sweep slippage                                                                         │ │
+│ │                                                                                              │ │
+│ │ - read the issue                                                                             │ │
+│ │ - do the work in a worktree                                                                  │ │
+│ │ - cargo-shared test then push                                                                │ │
+│ │                                                                                              │ │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 21%  ·  session: 37.7k
+  ⏸ manual mode on · ← 2 agents

@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.288[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m~/giverny/.claude/worktrees/task-186-mod-spike[39m
+
+
+[38;5;246m●[39m [38;5;246magents-pane-spike: agents-pane-spike: opened unasked: NOT placed — unasked below 144 [39m
+  [38;5;246mcolumns (100 now): placed when the person opens it, or when the terminal is widened to 144[39m
+  [38;5;246mcolumns[39m
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/agents-pane[39m [49m
+[38;5;246m  ⎿  [39magents-pane-spike: Agents pane opened.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[2m╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[0m [1m[38;5;38mRunning[0m[38;5;246m 3[39m                                                                                      [38;5;246m✕[39m [2m│
+│[0m [1m[38;5;38mRunning  [0m▸ giverny#183  BUG: pane… [38;5;38m████[38;5;246m░░░░░░[39m    12:24     ~18m [38;5;246mBash cargo-shared test   [39m  64.1k [2m│
+│[0m [1m[38;5;38mRunning  [0m▸ inbar#616    RESEARCH:… [38;5;172m██████████[39m    41:17 [38;5;172m     +1m [38;5;246mEdit sweep.py            [39m 212.4k [2m│
+│[0m [1m[38;5;38mRunning  [0m▸ coo#170      FEATURE: … [38;5;246m··········[39m     3:47 [38;5;246m  no ETA Read board.ts            [39m   9.8k [2m│
+│[0m [1m[38;5;109mNext up[0m[38;5;246m 2[39m                                                                                        [2m│
+│[0m [38;5;109mNextUp   [39m▸ giverny#184  CLEANUP: … [38;5;246m··········[39m              ~25m [38;5;246mqueued: 2nd for 3G       [39m        [2m│
+│[0m [38;5;109mNextUp   [39m▸ planets#88   FEATURE: … [38;5;246m··········[39m             ~1h3m [38;5;246m                         [39m        [2m│
+│[0m [1m[38;5;34mDone[0m[38;5;246m 3[39m                                                                                           [2m│
+│[0m [38;5;34mDone     [39m▸ giverny#179  BUG: tabs… [38;5;34m██████████[39m    35:00    (+5m) [38;5;34mlanded                   [39m 156.3k [2m│
+│[0m [38;5;34mDone     [39m▸ leadgen#41   RUN: outr… [38;5;174m██████████[39m    10:00   (-10m) [38;5;174mBlocked — SMTP creds ex… [39m    31k [2m│
+│[0m [38;5;34mDone     [39m▸ giverny#35   FEATURE: … [38;5;178m██████████[39m    55:00    (-5m) [38;5;178mReview                   [39m   488k [2m│
+│[0m [38;5;246mleased 11G/22G RAM · 5/8 cores · body 96 cols · inline · opened unasked: NOT placed — unasked b…[39m [2m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+[0m  [38;5;246mtmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tra…[39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mHaiku 4.5  ·  5h 4%  ·  wk 21%[39m
+  [38;5;246m⏸ manual mode on · ← 2 agents[39m

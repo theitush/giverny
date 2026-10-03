@@ -1,0 +1,50 @@
+  [38;5;153mDancing across the clear divide,[39m
+  [38;5;153mPanes like tears of liquid glass,[39m
+  [38;5;153mWeeping while the storm rages on.[39m
+
+  [38;5;153mIn summer heat they glow like fire,[39m
+  [38;5;153mAmber light through amber panes,[39m
+  [38;5;153mCasting shadows long and deep,[39m
+  [38;5;153mPainting rooms with golden hues.[39m
+
+  [38;5;153mA child presses palms against the glass,[39m
+  [38;5;153mFingers spread like starfish thin,[39m
+  [38;5;153mTwo panes between the world and wish,[39m
+  [38;5;153mYearning for what lies beyond.[39m
+
+  [38;5;153mThe wind strikes hard but cannot break,[39m
+  [38;5;153mThese patient soldiers stand their ground,[39m
+  [38;5;153mDivided into grid and square,[39m
+  [38;5;153mEach pane reflects the passing clouds.[39m
+
+  [38;5;153mSimple silence, strong and clear,[39m
+  [38;5;153mBoundaries that bind yet free,[39m
+  [38;5;153mPanes of glass that hold the line,[39m
+  [38;5;153mBetween the safe and the unknown.[39m
+
+  Done with both—the command slept for 6 seconds, and here's your 30-line meditation on panes, from
+  window frames to perspective.
+
+[38;5;246m✻[39m [38;5;246mChurned for 13s · done 12:37 PM[39m
+[2m╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[0m [1;7m Agents [0m  Brief inbar#616                                                                      [38;5;246m✕[39m [2m│
+│[0m [1m[38;5;38mRunning[0m[38;5;246m 3[39m                                                                                        [2m│
+│[0m [1m[38;5;38mRunning  [0m▸ giverny#183  BUG: pane… [38;5;38m█████[38;5;246m░░░░░[39m    13:50     ~16m [38;5;246mBash cargo-shared test   [39m  64.1k [2m│
+│[0m [1m[38;5;38mRunning  [0m▾ inbar#616    RESEARCH:… [38;5;172m██████████[39m    42:43 [38;5;172m     +3m [38;5;246mEdit sweep.py            [39m 212.4k [2m│
+│[0m [38;5;38m╭──────────────────────────────────────────────────────────────────────────────────────────────╮[39m [2m│
+│[0m [38;5;38m│[39m [38;5;246mholds 2 cpu · 6G · uses 1.9 cpu 5.2G · 212.4k tokens[39m                                         [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m [1;3;4minbar#616[0m                                                                                    [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m                                                                                              [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m [1mAsk[0m — sweep slippage                                                                         [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m                                                                                              [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m - read the issue                                                                             [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m - do the work in a worktree                                                                  [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m - [38;5;153mcargo-shared test[39m then push                                                                [38;5;38m│[39m [2m│
+│[0m [38;5;38m│[39m                                                                                              [38;5;38m│[39m [2m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[0m[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mHaiku 4.5  ·  5h 4%  ·  wk 21%  ·  session: 37.7k[39m
+  [38;5;246m⏸ manual mode on · ← 2 agents[39m

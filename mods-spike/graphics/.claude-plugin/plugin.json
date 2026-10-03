@@ -1,0 +1,6 @@
+{
+  "name": "agents-pane-spike",
+  "version": "0.0.1",
+  "description": "Spike for giverny#186: can a mod pane draw Giverny's agents pane? Fake data, live countdowns.",
+  "types": "./types/index.d.ts"
+}

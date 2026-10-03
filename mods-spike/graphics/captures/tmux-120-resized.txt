@@ -1,0 +1,50 @@
+  Glass divided into frames of light,                                 │ Agents   Brief inbar#616                       ✕
+  Each pane a window to the world outside,                            │Running 3
+  Holding back the wind, the rain, the cold,                          │● ▸ giverny#183 BUG: pane: ETA counts past zero
+  Yet letting in the sun's embrace so bright.                         │  ████░░░░ 13:47 ~16m 64.1kt
+                                                                      │  Bash cargo-shared test
+  Transparent barriers between two worlds,                            │●▾ inbar#616 RESEARCH: backtest(#61): slippage s…
+  One warm within, one wild and free,                                 │
+  The panes stand steady, strong, and true,                           │  ████████ 42:40 +3m 212.4kt
+  Dividing space yet keeping both in view.                            │  Edit sweep.py
+                                                                      │╭───────────────────────────────────────────────╮
+  In winter frost they gleam and shine,                               ││ holds 2 cpu · 6G · uses 1.9 cpu 5.2G · 212.4k │
+  Crystalline patterns etched by ice,                                 ││ tokens                                        │
+  A million tiny geometric dreams,                                    ││ inbar#616                                     │
+  Each pane a canvas for the night.                                   ││                                               │
+                                                                      ││ Ask — sweep slippage                          │
+  The rain runs down in silvered threads,                             ││                                               │
+  Dancing across the clear divide,                                    ││ - read the issue                              │
+  Panes like tears of liquid glass,                                   ││ - do the work in a worktree                   │
+  Weeping while the storm rages on.                                   ││ - cargo-shared test then push                 │
+                                                                      ││                                               │
+  In summer heat they glow like fire,                                 ││ brief: /tmp/briefs/inbar-616.md               │
+  Amber light through amber panes,                                    ││ [ Open brief in a pane ] [ Collapse ]         │
+  Casting shadows long and deep,                                      │╰───────────────────────────────────────────────╯
+  Painting rooms with golden hues.                                    │● ▸ coo#170 FEATURE: board: pause a pass
+                                                                      │  ········ 5:10 no ETA 9.8kt
+  A child presses palms against the glass,                            │  Read board.ts
+  Fingers spread like starfish thin,                                  │Next up 2
+  Two panes between the world and wish,                               │○ ▸ giverny#184 CLEANUP: feed: drop the v1 reader
+  Yearning for what lies beyond.                                      │  ········  ~25m
+                                                                      │  queued: 2nd for 3G
+  The wind strikes hard but cannot break,                             │○ ▸ planets#88 FEATURE: editor: export SVG at po…
+  These patient soldiers stand their ground,                          │  ········  ~1h3m
+  Divided into grid and square,                                       │Done 3
+  Each pane reflects the passing clouds.                              │✓ ▸ giverny#179 BUG: tabs: title flickers on res…
+                                                                      │  ████████ 35:00 (+5m) 156.3kt
+  Simple silence, strong and clear,                                   │  landed
+  Boundaries that bind yet free,                                      │✓ ▸ leadgen#41 RUN: outreach: send batch 7
+  Panes of glass that hold the line,                                  │  ████████ 10:00 (-10m) 31kt
+  Between the safe and the unknown.                                   │  Blocked — SMTP creds expired
+                                                                      │✓ ▸ giverny#35 FEATURE: theme: catppuccin-mauve
+  Done with both—the command slept for 6 seconds, and here's your     │  ████████ 55:00 (-5m) 488kt
+  30-line meditation on panes, from window frames to perspective.     │  Review
+                                                                      │leased 11G/22G RAM · 5/8 cores · body 49 cols · …
+✻ Churned for 13s · done 12:37 PM                                     │
+                                                                      │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 21%  ·  session: 37.7k
+  ⏸ manual mode on · ← 2 agents

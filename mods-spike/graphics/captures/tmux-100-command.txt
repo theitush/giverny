@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.288
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   ~/giverny/.claude/worktrees/task-186-mod-spike
+
+
+● agents-pane-spike: agents-pane-spike: opened unasked: NOT placed — unasked below 144
+  columns (100 now): placed when the person opens it, or when the terminal is widened to 144
+  columns
+
+❯ /agents-pane
+  ⎿  agents-pane-spike: Agents pane opened.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Running 3                                                                                      ✕ │
+│ Running  ▸ giverny#183  BUG: pane… ████░░░░░░    12:24     ~18m Bash cargo-shared test     64.1k │
+│ Running  ▸ inbar#616    RESEARCH:… ██████████    41:17      +1m Edit sweep.py             212.4k │
+│ Running  ▸ coo#170      FEATURE: … ··········     3:47   no ETA Read board.ts               9.8k │
+│ Next up 2                                                                                        │
+│ NextUp   ▸ giverny#184  CLEANUP: … ··········              ~25m queued: 2nd for 3G               │
+│ NextUp   ▸ planets#88   FEATURE: … ··········             ~1h3m                                  │
+│ Done 3                                                                                           │
+│ Done     ▸ giverny#179  BUG: tabs… ██████████    35:00    (+5m) landed                    156.3k │
+│ Done     ▸ leadgen#41   RUN: outr… ██████████    10:00   (-10m) Blocked — SMTP creds ex…     31k │
+│ Done     ▸ giverny#35   FEATURE: … ██████████    55:00    (-5m) Review                      488k │
+│ leased 11G/22G RAM · 5/8 cores · body 96 cols · inline · opened unasked: NOT placed — unasked b… │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tra…
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 21%
+  ⏸ manual mode on · ← 2 agents

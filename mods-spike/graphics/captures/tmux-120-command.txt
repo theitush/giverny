@@ -1,0 +1,50 @@
+                                                                      │Running 3                                       ✕
+ ▐▛███▛█   Claude Code v2.1.288                                       │● ▸ giverny#183 BUG: pane: ETA counts past zero
+▝▜██████▀  Haiku 4.5 · Claude Max                                     │  ███░░░░░ 12:25 ~18m 64.1kt
+ ▝▝   ▝▝   ~/giverny/.claude/worktrees/task-186-mod-spike             │  Bash cargo-shared test
+                                                                      │●▸ inbar#616 RESEARCH: backtest(#61): slippage s…
+                                                                      │
+● agents-pane-spike: agents-pane-spike: opened unasked: NOT           │  ████████ 41:18 +1m 212.4kt
+  placed — unasked below 144 columns (120 now): placed when           │  Edit sweep.py
+  the person opens it, or when the terminal is widened to 144         │● ▸ coo#170 FEATURE: board: pause a pass
+  columns                                                             │  ········ 3:48 no ETA 9.8kt
+                                                                      │  Read board.ts
+❯ /agents-pane                                                        │Next up 2
+  ⎿  agents-pane-spike: Agents pane opened.                           │○ ▸ giverny#184 CLEANUP: feed: drop the v1 reader
+                                                                      │  ········  ~25m
+                                                                      │  queued: 2nd for 3G
+                                                                      │○ ▸ planets#88 FEATURE: editor: export SVG at po…
+                                                                      │  ········  ~1h3m
+                                                                      │Done 3
+                                                                      │✓ ▸ giverny#179 BUG: tabs: title flickers on res…
+                                                                      │  ████████ 35:00 (+5m) 156.3kt
+                                                                      │  landed
+                                                                      │✓ ▸ leadgen#41 RUN: outreach: send batch 7
+                                                                      │  ████████ 10:00 (-10m) 31kt
+                                                                      │  Blocked — SMTP creds expired
+                                                                      │✓ ▸ giverny#35 FEATURE: theme: catppuccin-mauve
+                                                                      │  ████████ 55:00 (-5m) 488kt
+                                                                      │  Review
+                                                                      │leased 11G/22G RAM · 5/8 cores · body 49 cols · …
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.c…  │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 21%
+  ⏸ manual mode on · ← 2 agents
