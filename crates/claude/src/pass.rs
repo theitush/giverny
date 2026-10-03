@@ -42,7 +42,8 @@ usage: giverny pass <command> [args] [--session <id>]
                               --why wait (or blocked) marks the worker waiting
                               until its next eta, and that span is not work;
                               a worker's first eta on a Running row is its
-                              re-estimate, corrected from past re-estimates
+                              re-estimate: taken as given, scored, and told
+                              how past re-estimates fared
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
@@ -155,9 +156,6 @@ pub struct Flags {
     /// and where the correction came from.
     pub guess_s: Option<u64>,
     pub basis: Option<String>,
-    /// Set by [`run_in`] for a worker's first re-estimate: the time left,
-    /// corrected from the re-estimates' history (giverny#181).
-    pub left_s: Option<u64>,
     /// `claim`: what the worker needs.
     pub cpu: Option<u32>,
     pub ram_mb: Option<u64>,
@@ -640,15 +638,13 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                 feed::fmt_span(*left as i64)
             ))
         }
-        Cmd::Eta(_, raw_left) => {
+        Cmd::Eta(_, left) => {
             let i = at.ok_or_else(missing)?;
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
-            let left = &f.left_s.unwrap_or(*raw_left);
             if stage == Some(feed::Stage::Running) && !row.contains_key("reest_s") {
-                // The worker's first re-estimate (giverny#181): kept as
-                // given, as corrected, and when, in working time.
-                row.insert("reest_s".into(), json!(raw_left));
-                row.insert("reest_eta_s".into(), json!(left));
+                // The worker's first re-estimate (giverny#181): kept, with
+                // when it was made in working time, to be scored at landing.
+                row.insert("reest_s".into(), json!(left));
                 row.insert("reest_at_s".into(), json!(worked_s(row, now)));
             }
             let eta = match stage {
@@ -1258,19 +1254,14 @@ fn correct_estimate(
     let kind = pass_history::kind_of(title);
     let past = history.map(pass_history::load).unwrap_or_default();
     let (repo, kind) = (flags.repo.as_deref(), kind.as_deref());
-    let fix = pass_history::correct_on(&past, track, repo, kind, guess);
+    let fix = pass_history::correct(&past, repo, kind, guess);
     let record = pass_history::track_record(&past, track, repo, kind)
         .map(|r| format!("\n  {r}"))
         .unwrap_or_default();
     let span = |s: u64| feed::fmt_span(s as i64);
     if track == pass_history::Track::Reestimate {
-        let c = fix?;
-        flags.left_s = Some(c.eta_s);
-        return Some(format!(
-            " (you said {}; {}){record}",
-            span(guess),
-            c.describe()
-        ));
+        // Told, not corrected (Ita's call on #181): the figure stands.
+        return (!record.is_empty()).then_some(record);
     }
     flags.guess_s = Some(guess);
     Some(match fix {
@@ -1364,7 +1355,6 @@ pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<pass_history::
         eta_s: u64_of(r, "eta_first_s").or_else(|| u64_of(r, "eta_s")),
         eta_final_s: u64_of(r, "eta_s"),
         reest_s: u64_of(r, "reest_s"),
-        reest_eta_s: u64_of(r, "reest_eta_s"),
         reest_at_s: u64_of(r, "reest_at_s"),
         wall_s,
         paused_s,
@@ -1627,15 +1617,13 @@ mod tests {
         // Paused two minutes: not working time.
         run(&dir, "pause giverny#9", T0 + MIN).unwrap();
         run(&dir, "resume giverny#9", T0 + 3 * MIN).unwrap();
+        // Told how such re-estimates fared, but the figure stands.
         let said = run(&dir, "eta giverny#9 10", T0 + 6 * MIN).unwrap();
-        assert!(
-            said.starts_with(
-                "giverny#9: ~15m left (you said 10m; \
-                 ×1.50 from the last 5 FEATURE re-estimates in giverny)"
-            ),
-            "{said}"
+        assert_eq!(
+            said,
+            "giverny#9: ~10m left\n  your last 5 FEATURE re-estimates in giverny took \
+             ×1.50 of what was said (median): they run short: estimate higher"
         );
-        assert!(said.contains("your last 5 FEATURE re-estimates"), "{said}");
         let row = |k: &str| {
             let doc: Value =
                 serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap())
@@ -1643,9 +1631,8 @@ mod tests {
             doc["rows"][0][k].clone()
         };
         assert_eq!(row("reest_s"), 600, "kept as given");
-        assert_eq!(row("reest_eta_s"), 900, "and as corrected");
         assert_eq!(row("reest_at_s"), 4 * 60, "four minutes worked");
-        assert_eq!(row("eta_s"), 4 * 60 + 900);
+        assert_eq!(row("eta_s"), 4 * 60 + 600, "not corrected");
         // A later eta is taken as given and leaves the re-estimate alone.
         let said = run(&dir, "eta giverny#9 10", T0 + 8 * MIN).unwrap();
         assert_eq!(said, "giverny#9: ~10m left");
@@ -1655,7 +1642,6 @@ mod tests {
         run(&dir, "land giverny#9", T0 + 30 * MIN).unwrap();
         let last = pass_history::load(&h).pop().unwrap();
         assert_eq!(last.reest_s, Some(600));
-        assert_eq!(last.reest_eta_s, Some(900));
         assert_eq!(last.reest_at_s, Some(240));
         assert_eq!(last.work_s, 28 * 60);
         // `accuracy` reads the same history.

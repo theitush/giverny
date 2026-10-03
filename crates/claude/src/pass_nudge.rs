@@ -249,7 +249,7 @@ pub fn check(
                 kind.as_deref(),
             )
         })
-        .map(|r| format!(" For calibration, {r} (the pane corrects your figure by that too)."))
+        .map(|r| format!(" For calibration, {r}: weigh that in your figure."))
         .unwrap_or_default();
     Some(format!(
         "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \

@@ -77,15 +77,16 @@ Under it, `plan` says how your guesses for such tasks have fared:
 Read it before the next guess, and let it move your raw figure too: the
 correction only fixes the bias it has already seen.
 
-A worker's re-estimate is scored the same way, on its own track: its first
-`eta` on a running task (the one Giverny asks for five minutes in, after it
-has read the code) is kept as given, corrected from past re-estimates of the
-same kind, and later checked against the working time that was still to come.
-The ask itself shows the worker how its kind's re-estimates have fared.
+A worker's re-estimate is scored too, on its own track: its first `eta` on a
+running task (the one Giverny asks for five minutes in, after it has read the
+code) goes on the pane as given, not corrected, and is later checked against
+the working time that was still to come. The ask, and the `eta` output, show
+the worker how its kind's re-estimates have fared, so the figure itself
+improves.
 
 `giverny-pass accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess, the pane's corrected
-start figure, and the worker's re-estimate as given and corrected. When the
+start figure, and the worker's re-estimate. When the
 user asks whether estimates are getting better, answer from it.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.

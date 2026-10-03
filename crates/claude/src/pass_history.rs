@@ -15,8 +15,9 @@
 //! Each estimator is scored on its own **track** (giverny#181): the
 //! dispatcher's guess against the whole working time, and the worker's first
 //! re-estimate (made after reading the code) against the working time that
-//! was still to come when it was made. Each is corrected from its own track
-//! ([`correct_on`]), told how its past estimates fared ([`track_record`]),
+//! was still to come when it was made. Each is told how its past estimates
+//! fared ([`track_record`]); the guess is also corrected ([`correct`]), the
+//! re-estimate goes on the pane as given (Ita's call on #181: tell only),
 //! and [`accuracy`] reports every track's error, older against recent, so
 //! whether estimates improve is read from the data.
 
@@ -69,10 +70,6 @@ pub struct Record {
     /// (giverny#181).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_s: Option<u64>,
-    /// That re-estimate corrected from the re-estimates' own history: what
-    /// the pane counted down from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reest_eta_s: Option<u64>,
     /// Working time already spent when the re-estimate was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_at_s: Option<u64>,
@@ -123,17 +120,10 @@ pub enum Track {
     /// The worker's first re-estimate of the time left, as given, against
     /// the working time still to come when it was made.
     Reestimate,
-    /// That re-estimate corrected.
-    ReestimateCorrected,
 }
 
 impl Track {
-    pub const ALL: [Track; 4] = [
-        Track::Guess,
-        Track::Start,
-        Track::Reestimate,
-        Track::ReestimateCorrected,
-    ];
+    pub const ALL: [Track; 3] = [Track::Guess, Track::Start, Track::Reestimate];
 
     /// `(estimated, took)` in seconds, when `r` teaches this track anything.
     pub fn pair(self, r: &Record) -> Option<(u64, u64)> {
@@ -145,7 +135,6 @@ impl Track {
             Track::Guess => (r.estimate_s?, r.work_s),
             Track::Start => (r.eta_s?, r.work_s),
             Track::Reestimate => (r.reest_s?, left()?),
-            Track::ReestimateCorrected => (r.reest_eta_s?, left()?),
         };
         (est > 0).then_some((est, took))
     }
@@ -160,7 +149,7 @@ impl Track {
         match self {
             Track::Guess => "guesses",
             Track::Start => "start figures",
-            Track::Reestimate | Track::ReestimateCorrected => "re-estimates",
+            Track::Reestimate => "re-estimates",
         }
     }
 
@@ -170,7 +159,6 @@ impl Track {
             Track::Guess => "dispatcher's guess, as given",
             Track::Start => "pane's start figure (the guess corrected)",
             Track::Reestimate => "worker's re-estimate of the time left, as given",
-            Track::ReestimateCorrected => "worker's re-estimate, corrected",
         }
     }
 }
@@ -351,7 +339,7 @@ pub fn correct_on(
     let mins = ((guess_s as f64 * ratio) / 60.0).round().max(1.0);
     let noun = match track {
         Track::Guess | Track::Start => "tasks",
-        Track::Reestimate | Track::ReestimateCorrected => "re-estimates",
+        Track::Reestimate => "re-estimates",
     };
     Some(Correction {
         eta_s: mins as u64 * 60,
@@ -699,7 +687,6 @@ mod tests {
     fn reest(repo: &str, kind: &str, est_m: u64, work_m: u64, at_m: u64, left_m: u64) -> Record {
         Record {
             reest_s: Some(left_m * 60),
-            reest_eta_s: Some(left_m * 60),
             reest_at_s: Some(at_m * 60),
             ..rec(repo, Some(kind), est_m, work_m)
         }
