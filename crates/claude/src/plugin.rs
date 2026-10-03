@@ -23,13 +23,7 @@
 //! - Removing the keys unloads it; a missing directory makes Claude Code skip
 //!   it silently.
 //!
-//! - With `claude.orchestrate_by_default` also on (giverny#130), the plugin
-//!   carries a `SessionStart` hook (`hooks/hooks.json`) whose command prints
-//!   `hooks/orchestrate-by-default.json`: an `additionalContext` telling the
-//!   session to run anything longer than about a minute as a pass of
-//!   subagents. Off, that hook and its reply are pruned like any other
-//!   stale file.
-//! - Always, `hooks/hooks.json` also carries a `PostToolUse` hook running
+//! - `hooks/hooks.json` carries a `PostToolUse` hook running
 //!   `giverny-pass nudge` (giverny#143): five minutes into a worker's task it
 //!   asks that worker, once, for a fresh estimate; and a subagent that holds
 //!   no row at all is asked on its first call for a first one (giverny#158),
@@ -56,9 +50,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SKILL: &str = include_str!("../plugin/skills/orchestrate/SKILL.md");
 /// `/giverny:clear-done`: the agents pane's Done rows, cleared (giverny#112).
 const CLEAR_DONE: &str = include_str!("../plugin/commands/clear-done.md");
-/// What the `SessionStart` hook adds to a new session's context with
-/// `claude.orchestrate_by_default` on (giverny#130).
-pub const ORCHESTRATE_BY_DEFAULT: &str = include_str!("../plugin/hooks/orchestrate-by-default.md");
 
 /// Where the marketplace lives: `<giverny config base>/claude-plugin`.
 pub fn marketplace_dir(base: &Path) -> PathBuf {
@@ -86,54 +77,30 @@ fn wrapper(exes: &[String]) -> String {
     )
 }
 
-/// `hooks/hooks.json`. Always a `PostToolUse` hook, `giverny-pass nudge`,
-/// which asks a worker five minutes into its task for a fresh estimate
+/// `hooks/hooks.json`: a `PostToolUse` hook, `giverny-pass nudge`, which
+/// asks a worker five minutes into its task for a fresh estimate
 /// (giverny#143), and a subagent with no row for a first one (giverny#158);
 /// on an orchestrator's own calls it delivers the session's `ask`/`reply`
-/// messages and renews its resource leases (giverny#162); quiet and exit 0 whatever happens. With `orchestrate`,
-/// also on `SessionStart` (a new session, `/clear`, and after a compaction,
-/// which is when the context is fresh) print the reply that carries
-/// [`ORCHESTRATE_BY_DEFAULT`]: `cat` of a file Claude Code parses itself, so
-/// nothing is escaped by a shell.
-fn session_hooks(orchestrate: bool) -> Value {
-    let mut hooks = json!({
-        "PostToolUse": [{
-            "matcher": "*",
-            "hooks": [{
-                "type": "command",
-                "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-pass\" nudge 2>/dev/null || true"
-            }]
-        }]
-    });
-    if orchestrate {
-        hooks["SessionStart"] = json!([{
-            "matcher": "startup|clear|compact",
-            "hooks": [{
-                "type": "command",
-                "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/orchestrate-by-default.json\""
-            }]
-        }]);
-    }
+/// messages and renews its resource leases (giverny#162); quiet and exit 0
+/// whatever happens. (The `SessionStart` hook of orchestrate by default went
+/// with giverny#183; a sync prunes its old reply file.)
+fn session_hooks() -> Value {
     json!({
-        "description": "Giverny: re-estimate prompts for workers, and orchestrate by default \
-                        (claude.orchestrate_by_default)",
-        "hooks": hooks
-    })
-}
-
-/// The hook's stdout: the instruction as `additionalContext`.
-fn session_reply() -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": ORCHESTRATE_BY_DEFAULT.trim_end()
+        "description": "Giverny: re-estimate prompts for workers",
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-pass\" nudge 2>/dev/null || true"
+                }]
+            }]
         }
     })
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-/// `orchestrate` adds the `SessionStart` hook (`claude.orchestrate_by_default`).
-pub fn files(exes: &[String], orchestrate: bool) -> Vec<(&'static str, String, bool)> {
+pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
         "owner": { "name": "Giverny" },
@@ -153,7 +120,7 @@ pub fn files(exes: &[String], orchestrate: bool) -> Vec<(&'static str, String, b
         "author": { "name": "Giverny" }
     });
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
-    let mut out = vec![
+    vec![
         (
             ".claude-plugin/marketplace.json",
             pretty(&marketplace),
@@ -177,18 +144,10 @@ pub fn files(exes: &[String], orchestrate: bool) -> Vec<(&'static str, String, b
         ("plugins/giverny/bin/giverny-pass", wrapper(exes), true),
         (
             "plugins/giverny/hooks/hooks.json",
-            pretty(&session_hooks(orchestrate)),
+            pretty(&session_hooks()),
             false,
         ),
-    ];
-    if orchestrate {
-        out.push((
-            "plugins/giverny/hooks/orchestrate-by-default.json",
-            pretty(&session_reply()),
-            false,
-        ));
-    }
-    out
+    ]
 }
 
 /// The binary as the wrapper should name it: this one, and on Windows also
@@ -210,8 +169,8 @@ pub fn exe_candidates() -> Vec<String> {
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
 /// whether anything changed.
-pub fn sync(dir: &Path, exes: &[String], orchestrate: bool) -> std::io::Result<bool> {
-    let want = files(exes, orchestrate);
+pub fn sync(dir: &Path, exes: &[String]) -> std::io::Result<bool> {
+    let want = files(exes);
     let mut changed = false;
     for (rel, body, exec) in &want {
         let path = dir.join(rel);
@@ -471,8 +430,8 @@ mod tests {
     fn sync_writes_once_and_prunes_what_is_not_ours() {
         let d = scratch("sync").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes, false).unwrap());
-        assert!(!sync(&d, &exes, false).unwrap(), "a second sync is a no-op");
+        assert!(sync(&d, &exes).unwrap());
+        assert!(!sync(&d, &exes).unwrap(), "a second sync is a no-op");
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/.claude-plugin/plugin.json")).unwrap(),
         )
@@ -492,7 +451,7 @@ mod tests {
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
         std::fs::create_dir_all(d.join("plugins/giverny/skills/old")).unwrap();
         std::fs::write(d.join("plugins/giverny/skills/old/SKILL.md"), "x").unwrap();
-        assert!(sync(&d, &["/elsewhere/giverny".into()], false).unwrap());
+        assert!(sync(&d, &["/elsewhere/giverny".into()]).unwrap());
         assert!(!d.join("plugins/giverny/skills/old").exists());
         assert!(remove_dir(&d).unwrap());
         assert!(!d.exists());
@@ -504,53 +463,27 @@ mod tests {
     }
 
     #[test]
-    fn orchestrate_by_default_adds_the_session_hook_and_off_prunes_it() {
+    fn a_sync_prunes_the_dropped_orchestrate_hook() {
+        // giverny#183: a plugin written while orchestrate by default was on
+        // still holds its SessionStart reply; the next sync removes it, and
+        // hooks.json carries no SessionStart hook.
         let d = scratch("orchestrate").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
         let reply = d.join("plugins/giverny/hooks/orchestrate-by-default.json");
-        assert!(sync(&d, &exes, false).unwrap());
-        assert!(!reply.exists(), "off, no SessionStart reply");
+        assert!(sync(&d, &exes).unwrap());
+        std::fs::write(&reply, "{}").unwrap();
+        std::fs::write(
+            &hooks,
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[]}]}}"#,
+        )
+        .unwrap();
+        assert!(sync(&d, &exes).unwrap());
+        assert!(!reply.exists(), "the old reply is pruned");
         let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
-        assert!(
-            h["hooks"].get("SessionStart").is_none(),
-            "off, no SessionStart hook"
-        );
-        assert!(sync(&d, &exes, true).unwrap());
-        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
-
-        let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
-        let start = &h["hooks"]["SessionStart"][0];
-        assert_eq!(start["matcher"], "startup|clear|compact");
-        let cmd = start["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(start["hooks"][0]["type"], "command");
-        assert!(cmd.contains("${CLAUDE_PLUGIN_ROOT}"), "{cmd}");
-
-        // The hook's command, run as Claude Code runs it, prints the reply.
-        #[cfg(unix)]
-        {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .env("CLAUDE_PLUGIN_ROOT", d.join("plugins/giverny"))
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{out:?}");
-            let r: Value = serde_json::from_slice(&out.stdout).unwrap();
-            let o = &r["hookSpecificOutput"];
-            assert_eq!(o["hookEventName"], "SessionStart");
-            let ctx = o["additionalContext"].as_str().unwrap();
-            assert!(ctx.contains("/giverny:orchestrate"), "{ctx}");
-            assert!(ctx.contains("giverny-pass plan"), "{ctx}");
-        }
-
-        assert!(sync(&d, &exes, false).unwrap());
-        assert!(!reply.exists(), "off prunes the reply");
-        let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
-        assert!(
-            h["hooks"].get("SessionStart").is_none(),
-            "and the SessionStart hook"
-        );
+        assert!(h["hooks"].get("SessionStart").is_none(), "{h}");
+        assert!(h["hooks"].get("PostToolUse").is_some(), "{h}");
+        assert!(!sync(&d, &exes).unwrap(), "a second sync is a no-op");
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -558,7 +491,7 @@ mod tests {
     fn the_re_estimate_hook_is_always_there_and_quiet() {
         let d = scratch("nudge").join(DIR_NAME);
         // A wrapper naming no binary at all: the hook still exits 0, silent.
-        assert!(sync(&d, &["/nonexistent/giverny".into()], false).unwrap());
+        assert!(sync(&d, &["/nonexistent/giverny".into()]).unwrap());
         let h: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
         )

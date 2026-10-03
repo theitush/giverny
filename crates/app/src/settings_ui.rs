@@ -264,11 +264,21 @@ fn body(
         ui.add_space(8.0);
     }
 
-    if state.search.is_empty() && state.section == Section::Orchestrator {
+    // Orchestrator: the limits under their heading, then the rest (the
+    // agents pane, whose key sits earlier in the table, giverny#183).
+    let orchestrator = state.search.is_empty() && state.section == Section::Orchestrator;
+    let mut rows = rows.to_vec();
+    if orchestrator {
+        rows.sort_by_key(|d| !matches!(d.kind, Kind::Limit { .. }));
         limits_intro(ui, c);
     }
+    let mut after_limits = false;
 
     for def in rows {
+        if orchestrator && !after_limits && !matches!(def.kind, Kind::Limit { .. }) {
+            after_limits = true;
+            ui.add_space(8.0);
+        }
         // No GPU, no GPU row — unless one is set, which then needs a reset.
         if matches!(
             def.kind,
