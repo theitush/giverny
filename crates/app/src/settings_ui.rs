@@ -325,21 +325,18 @@ fn row(
         });
 
         ui.vertical(|ui| {
-            match def.kind {
-                Kind::Limit { field } => {
-                    limit_widget(ui, state, cfg, machine, def, field, &value, actions, c)
-                }
-                _ => widget(ui, state, def, &value, suggestions, actions, c),
+            // The limits are bare figures, their ● ↺ beside the field; the
+            // doc stays on the def for search (giverny#180).
+            if let Kind::Limit { field } = def.kind {
+                return limit_widget(ui, state, cfg, machine, def, field, &value, actions, c);
             }
+            widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
-                // The limits show bare figures: their doc stays for search.
-                if !matches!(def.kind, Kind::Limit { .. }) {
-                    ui.label(
-                        RichText::new(def.doc)
-                            .font(FontId::monospace(10.0))
-                            .color(c.dim),
-                    );
-                }
+                ui.label(
+                    RichText::new(def.doc)
+                        .font(FontId::monospace(10.0))
+                        .color(c.dim),
+                );
                 if def.needs_restart && modified {
                     ui.label(
                         RichText::new("restart to apply")
@@ -349,25 +346,37 @@ fn row(
                     .on_hover_text("the change is saved; it loads at startup");
                 }
                 if modified {
-                    ui.label(
-                        RichText::new("●")
-                            .font(FontId::monospace(9.0))
-                            .color(c.amber),
-                    )
-                    .on_hover_text("changed from the default");
-                    if ui
-                        .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
-                        .on_hover_text("reset to default")
-                        .clicked()
-                    {
-                        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
-                        state.editing = None;
-                        state.error = None;
-                    }
+                    changed_mark(ui, state, def, actions, c);
                 }
             });
         });
     });
+}
+
+/// `● ↺`: the row is changed from its default, and the button putting the
+/// default back.
+fn changed_mark(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    def: &'static SettingDef,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    ui.label(
+        RichText::new("●")
+            .font(FontId::monospace(9.0))
+            .color(c.amber),
+    )
+    .on_hover_text("changed from the default");
+    if ui
+        .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
+        .on_hover_text("reset to default")
+        .clicked()
+    {
+        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
+        state.editing = None;
+        state.error = None;
+    }
 }
 
 fn widget(
@@ -555,7 +564,16 @@ fn limit_widget(
         return dim(ui, "detecting this machine…".into(), c);
     };
     let shown = limit_figure(limits, m, field);
-    if let Some(typed) = commit_field(ui, state, def.key, &shown) {
+    let typed = ui
+        .horizontal(|ui| {
+            let typed = commit_field(ui, state, def.key, &shown);
+            if *value != def.default_value() {
+                changed_mark(ui, state, def, actions, c);
+            }
+            typed
+        })
+        .inner;
+    if let Some(typed) = typed {
         let parsed = match field {
             LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
                 Auto::Auto => "auto".to_string(),
@@ -606,9 +624,16 @@ fn gpu_rows(
     let auto_list = Limits::default().resolve(m).gpus;
     let current: Vec<GpuLimit> = limits.gpus.get().cloned().unwrap_or(auto_list.clone());
     if m.gpus.is_empty() {
-        dim(ui, "no GPU detected (nvidia-smi)".into(), c);
+        // Shown only when set: then it needs its ↺.
+        ui.horizontal(|ui| {
+            dim(ui, "no GPU detected (nvidia-smi)".into(), c);
+            if !matches!(limits.gpus, Auto::Auto) {
+                changed_mark(ui, state, def, actions, c);
+            }
+        });
     }
-    for g in &m.gpus {
+    for (i, g) in m.gpus.iter().enumerate() {
+        let first = i == 0;
         let key = format!("{}#{}", def.key, g.index);
         let set = current.iter().find(|l| l.index == g.index);
         // The VRAM in force, at auto too: the field never says `auto`.
@@ -621,7 +646,12 @@ fn gpu_rows(
                 RichText::new(format!("{} {} {}", g.index, g.name, g.vram))
                     .font(FontId::monospace(11.0)),
             );
-            if let Some(typed) = commit_field(ui, state, &key, &stored) {
+            let typed = commit_field(ui, state, &key, &stored);
+            // One list in the file: one ● ↺, on the first GPU's line.
+            if first && !matches!(limits.gpus, Auto::Auto) {
+                changed_mark(ui, state, def, actions, c);
+            }
+            if let Some(typed) = typed {
                 let t = typed.trim().to_ascii_lowercase();
                 let auto_vram = auto_list
                     .iter()
