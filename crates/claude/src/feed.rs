@@ -124,6 +124,9 @@ pub struct FeedRow {
     pub lease: Option<RowLease>,
     /// What the task's `giverny pass run` commands used (giverny#161).
     pub usage: Option<RowUsage>,
+    /// What its running `giverny pass run` commands use now, sampled by the
+    /// pane from their cgroups (giverny#182). Never in the feed file.
+    pub live: Option<crate::run_live::RunLive>,
 }
 
 /// A row's `usage` object: the task's `giverny pass run` commands so far,
@@ -391,6 +394,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         follows_worker: v.get("follows_worker").and_then(Value::as_bool) == Some(true),
         lease: parse_lease(v),
         usage: parse_usage(v),
+        live: None,
     })
 }
 

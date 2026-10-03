@@ -44,7 +44,7 @@ use giverny_core::limits::Mem;
 use serde_json::{Map, Value, json};
 
 use crate::pass::{self, Flags};
-use crate::{pass_history, resources};
+use crate::{pass_history, resources, run_live};
 
 /// What `run` claims for a task that holds no lease.
 pub const DEFAULT_CPU: u32 = 3;
@@ -67,7 +67,7 @@ s="$GIVERNY_RUN_STATS"
 cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
 [ -n "$cg" ] || cg=/nonexistent
 d="/sys/fs/cgroup$cg"
-[ -n "$s" ] && echo started > "$s" 2>/dev/null
+[ -n "$s" ] && printf 'started\ncgroup %s\n' "$d" > "$s" 2>/dev/null
 "$@"
 rc=$?
 if [ -n "$s" ]; then
@@ -303,7 +303,7 @@ pub fn run_with(
             session.to_string(),
             opts.heartbeat_every,
         );
-        let m = execute(ledger, task, &cap, &flags.command, opts);
+        let m = execute(ledger, session, task, &cap, &flags.command, opts);
         drop(hb);
         m.map(|m| (m, cap))
     })();
@@ -613,7 +613,7 @@ fn shim_path(ledger: &Path) -> Result<PathBuf, String> {
 
 fn stats_path(ledger: &Path) -> Result<PathBuf, String> {
     static N: AtomicU64 = AtomicU64::new(0);
-    let dir = ledger.parent().unwrap_or(Path::new(".")).join("runs");
+    let dir = run_live::runs_dir(ledger);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir.join(format!(
         "{}-{}.stats",
@@ -626,6 +626,7 @@ fn stats_path(ledger: &Path) -> Result<PathBuf, String> {
 /// falls back to running plain.
 fn execute(
     ledger: &Path,
+    session: &str,
     task: &str,
     cap: &Cap,
     cmd: &[String],
@@ -646,7 +647,10 @@ fn execute(
                 cap.describe()
             ),
         );
+        // Seen by the agents pane while it runs (giverny#182).
+        let live = run_live::register(&stats, task, session, pass::now_ms());
         let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals);
+        drop(live);
         let st = std::fs::read_to_string(&stats)
             .map(|t| parse_stats(&t))
             .unwrap_or_default();
