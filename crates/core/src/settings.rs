@@ -440,7 +440,9 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "claude.agents_pane",
         label: "agents pane",
-        section: Section::Claude,
+        // Shown under Orchestrator, below the limits (giverny#183); the key
+        // stays under [claude], where it always was.
+        section: Section::Orchestrator,
         doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
         note: &[
             "Running and Done come from Claude Code's own files and need no",
@@ -453,22 +455,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "subagent; off, nothing is read or drawn.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: false },
-    },
-    SettingDef {
-        key: "claude.orchestrate_by_default",
-        label: "orchestrate by default",
-        section: Section::Claude,
-        doc: "Have Claude hand any task longer than about a minute to subagents, via /giverny:orchestrate.",
-        note: &[
-            "Needs the agents pane on: it adds a SessionStart hook to the",
-            "giverny plugin that tells each new session to run such work as a",
-            "pass, one subagent per task, shown in the agents pane. Quick",
-            "questions and reads stay in the main thread. Reaches sessions",
-            "started after the change; off removes the hook.",
-        ],
-        needs_restart: false,
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "claude.resume_after_limit",
@@ -1043,7 +1030,9 @@ mod tests {
             cfg.orchestrator.limits,
             "the ledger reads the same"
         );
-        for def in in_section(Section::Orchestrator) {
+        for def in
+            in_section(Section::Orchestrator).filter(|d| d.key.starts_with("orchestrator.limits."))
+        {
             assert_ne!(current(&cfg, def), Some(def.default_value()));
         }
         // Back to auto, and the screen sees it as the default again.

@@ -20,8 +20,8 @@ pub struct Config {
 }
 
 /// `[orchestrator]`: what orchestrator passes (`/giverny:orchestrate`) on
-/// this machine share. Only the limits so far; `claude.orchestrate_by_default`
-/// stays under `[claude]`, where the settings it depends on live.
+/// this machine share. Only the limits so far; `claude.agents_pane`, shown
+/// beside them in the settings screen, stays under `[claude]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OrchestratorConfig {
@@ -31,7 +31,7 @@ pub struct OrchestratorConfig {
 }
 
 /// How Claude Code itself is launched in a tab.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
     /// Start every session in auto mode, by setting `permissions.defaultMode`
@@ -42,11 +42,20 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
-    /// Show the tab's subagents in a table under the terminal.
+    /// Show the tab's subagents in a table under the terminal. On by
+    /// default (giverny#183).
     pub agents_pane: bool,
-    /// Tell every new Claude session to run work longer than about a minute
-    /// as an orchestrator pass of subagents (needs `agents_pane`).
-    pub orchestrate_by_default: bool,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        ClaudeConfig {
+            auto_mode: false,
+            skip_resume_summary: false,
+            resume_after_limit: false,
+            agents_pane: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,6 +557,31 @@ mod tests {
         assert!(cfg.claude.auto_mode);
         assert_eq!(cfg.font.size, 20.0);
         assert_eq!(unknown, ["claude.future_key", "orchestrator.x"]);
+    }
+
+    #[test]
+    fn a_config_with_the_dropped_orchestrate_key_still_loads_whole() {
+        // giverny#183 dropped `claude.orchestrate_by_default`; a file that
+        // still sets it keeps every other setting, the old key just ignored.
+        let text = "[font]\nsize = 15.0\n[claude]\nauto_mode = true\nagents_pane = false\n\
+                    orchestrate_by_default = true\nresume_after_limit = true\n";
+        let (cfg, unknown) = parse(text).unwrap();
+        assert_eq!(unknown, ["claude.orchestrate_by_default"]);
+        assert_eq!(cfg.font.size, 15.0);
+        assert!(cfg.claude.auto_mode);
+        assert!(cfg.claude.resume_after_limit);
+        assert!(!cfg.claude.agents_pane, "an explicit off stays off");
+        // The same through a live reload, over a running config.
+        let dir = scratch("dropped-key");
+        std::fs::write(config_path(&dir), text).unwrap();
+        let cfg = load_or(&dir, &Config::default());
+        assert_eq!(cfg.font.size, 15.0);
+        assert!(!cfg.claude.agents_pane);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unset, the agents pane is on.
+        let (cfg, _) = parse("[claude]\nauto_mode = true\n").unwrap();
+        assert!(cfg.claude.agents_pane);
+        assert!(Config::default().claude.agents_pane);
     }
 
     #[test]
