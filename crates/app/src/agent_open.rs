@@ -30,7 +30,8 @@
 //!   `/tasks`, and its transcript is not a resumable session), and the one
 //!   way back in — the parent's `SendMessage` — speaks for Ita, so the old
 //!   **Revive** that typed a line at the parent's prompt is gone (giverny#61).
-//! * **Planned** shows the row's brief, or its note, in the same overlay.
+//! * **Planned** shows the row's brief in the same overlay; without one, its
+//!   task, title and note, and how a dispatcher adds a brief (giverny#179).
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab — unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave.
@@ -156,18 +157,34 @@ pub fn plan(click: &RowClick) -> Plan {
                     body: Body::File(b.clone()),
                 };
             }
-            let note = click
-                .note
-                .as_deref()
-                .filter(|n| !n.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| "No brief for this row yet.".to_string());
             Plan::Show {
                 title,
-                body: Body::Text(note),
+                body: Body::Text(planned_without_brief(click)),
             }
         }
     }
+}
+
+/// A Next up row with no brief still says what it has (giverny#179): its
+/// task, its title and its note, then how a dispatcher gives it a brief.
+fn planned_without_brief(click: &RowClick) -> String {
+    let some = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(k) = some(&click.key) {
+        parts.push(format!("Task: {k}"));
+    }
+    if let Some(t) = some(&click.name).filter(|t| *t != click.key.trim()) {
+        parts.push(t);
+    }
+    if let Some(n) = click.note.as_deref().and_then(some) {
+        parts.push(n);
+    }
+    parts.push(
+        "No brief was given for this row. The dispatcher adds one with \
+         `giverny-pass plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
+            .to_string(),
+    );
+    parts.join("\n\n")
 }
 
 /// What the overlay for this click offers.
@@ -1557,13 +1574,16 @@ mod tests {
         let mut c = click(Stage::Planned);
         c.transcript = Some("/t/a.jsonl".into());
         c.note = Some("lane 2".into());
-        assert_eq!(
-            plan(&c),
-            Plan::Show {
-                title: "coo#158 · Wren".into(),
-                body: Body::Text("lane 2".into())
-            }
-        );
+        let Plan::Show {
+            title,
+            body: Body::Text(t),
+        } = plan(&c)
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(title, "coo#158 · Wren");
+        assert!(t.starts_with("Task: coo#158\n\nWren\n\nlane 2\n\n"), "{t}");
+        assert!(t.contains("--brief FILE"), "{t}");
         c.brief = Some("/b/brief.md".into());
         assert_eq!(
             plan(&c),
@@ -1572,11 +1592,18 @@ mod tests {
                 body: Body::File("/b/brief.md".into())
             }
         );
+        // No brief and no note: the task and its title, and how to add one.
         c.brief = None;
         c.note = None;
-        assert!(
-            matches!(plan(&c), Plan::Show { body: Body::Text(t), .. } if t == "No brief for this row yet.")
-        );
+        c.name = "coo#158".into();
+        let Plan::Show {
+            body: Body::Text(t),
+            ..
+        } = plan(&c)
+        else {
+            panic!("expected text");
+        };
+        assert!(t.starts_with("Task: coo#158\n\nNo brief was given"), "{t}");
     }
 
     #[test]

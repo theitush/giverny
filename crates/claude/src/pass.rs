@@ -33,8 +33,8 @@ usage: giverny pass <command> [args] [--session <id>]
 
   plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE] [--repo R]
                               queue a task (a Next up row) with its estimate
-  start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N] [--repo R]
-                              the task's worker is starting now (Running)
+  start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N] [--brief FILE]
+               [--repo R]     the task's worker is starting now (Running)
   eta   <task> <dur left> [--note N] [--why wait|blocked|scope|load|ready]
                               [--title T] [--agent <id>] [--repo R]
                               re-estimate: this much is left from now (a task
@@ -73,7 +73,9 @@ usage: giverny pass <command> [args] [--session <id>]
                               recorded on the row; exit code = the command's
 
 <task> is any short name (`auth-fix`, `#12`); name it, as a whole word, in the
-worker's spawn description too. <dur> is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
+worker's spawn description too. --brief FILE is what the task's row opens to in
+the pane: write the worker's prompt (or at least the task's text) to a file and
+pass it on every `plan`; `start` fills it in or replaces it. <dur> is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
 The session is --session, else $CLAUDE_CODE_SESSION_ID (set inside Claude Code).
 The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.
 
@@ -237,7 +239,15 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             }
             "--title" => flags.title = Some(val("--title")?),
             "--note" => flags.note = Some(val("--note")?),
-            "--brief" => flags.brief = Some(val("--brief")?),
+            "--brief" => {
+                // The pane reads it from its own directory: keep it absolute.
+                let v = val("--brief")?;
+                flags.brief = Some(
+                    std::path::absolute(&v)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(v),
+                );
+            }
             "--agent" => flags.agent = Some(val("--agent")?),
             "--outcome" => flags.outcome = Some(val("--outcome")?),
             "--review" => flags.review = Some(val("--review")?),
@@ -558,6 +568,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             set_str(row, "title", &f.title);
             set_str(row, "agent_id", &f.agent);
             set_str(row, "note", &f.note);
+            set_str(row, "brief", &f.brief);
             // A dispatcher's `start` owns the row: it lands it.
             row.remove("follows_worker");
             let handed = match &f.agent {
@@ -1137,12 +1148,35 @@ fn run_feed(
             if let Some(h) = &history {
                 learn(&doc, &before, session, h);
             }
-            Ok(match said {
+            let msg = match said {
                 Some(said) => format!("{msg}: {said}"),
                 None => msg,
+            };
+            Ok(match cmd {
+                Cmd::Plan(key) if !has_brief(&doc, key) => format!("{msg}\n{}", no_brief(key)),
+                _ => msg,
             })
         }
     }
+}
+
+/// Whether the row `key` names a brief.
+fn has_brief(doc: &Value, key: &str) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| find(rows, key).map(|i| &rows[i]))
+        .and_then(|r| r.get("brief"))
+        .and_then(Value::as_str)
+        .is_some_and(|b| !b.trim().is_empty())
+}
+
+/// The line `plan` adds when its row has no brief (giverny#179).
+fn no_brief(key: &str) -> String {
+    format!(
+        "  no brief: its Next up row opens to its title and note only; write the \
+         worker's prompt (or the task's text) to a file and pass `--brief FILE` \
+         (`giverny pass plan {key} --eta … --brief FILE`, or on `start`)"
+    )
 }
 
 /// `plan`/`start` with `--eta N`: scale N from the history (giverny#143).
@@ -1463,6 +1497,30 @@ mod tests {
     }
 
     #[test]
+    fn plan_says_when_a_row_has_no_brief_and_start_fills_it() {
+        let dir = scratch("brief");
+        let said = run(&dir, "plan a --eta 10", T0).unwrap();
+        assert!(said.contains("no brief"), "{said}");
+        assert_eq!(read_feed(&dir).rows[0].brief, None);
+        let said = run(&dir, "plan b --eta 10 --brief /x/b.md", T0).unwrap();
+        assert!(!said.contains("no brief"), "{said}");
+        assert_eq!(read_feed(&dir).rows[1].brief, Some("/x/b.md".into()));
+        // Re-planned without --brief: the row keeps its brief, and says nothing.
+        let said = run(&dir, "plan b --eta 12", T0).unwrap();
+        assert!(!said.contains("no brief"), "{said}");
+        // `start` fills one in, and replaces one.
+        run(&dir, "start a --brief /x/a.md", T0).unwrap();
+        run(&dir, "start b --brief /x/b2.md", T0).unwrap();
+        let f = read_feed(&dir);
+        assert_eq!(f.rows[0].brief, Some("/x/a.md".into()));
+        assert_eq!(f.rows[1].brief, Some("/x/b2.md".into()));
+        // A relative path is stored absolute: the pane reads it from elsewhere.
+        let (_, flags) = parse_args(&args("plan c --eta 5 --brief rel.md")).unwrap();
+        assert!(Path::new(flags.brief.as_deref().unwrap()).is_absolute());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn starting_a_workers_next_task_lands_the_one_before() {
         let dir = scratch("handoff");
         // Spawned with a batch of two: both run, neither closes the other.
@@ -1705,7 +1763,7 @@ mod tests {
         flags.title = Some("BUG: pane flickers".into());
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         assert_eq!(
-            said,
+            said.lines().next().unwrap(),
             "planned giverny#1: ~20m (you said 40m; ×0.50 from the last 5 BUG tasks in giverny)"
         );
         let doc: Value =
@@ -1731,7 +1789,10 @@ mod tests {
         // Another repo: everything (0.25 ×5, 0.5 ×5 → 0.375).
         let said = run(&dir, "plan inbar#3 --eta 40", T0).unwrap();
         assert!(
-            said.ends_with("~15m (you said 40m; ×0.38 from the last 10 tasks)"),
+            said.lines()
+                .next()
+                .unwrap()
+                .ends_with("~15m (you said 40m; ×0.38 from the last 10 tasks)"),
             "{said}"
         );
 

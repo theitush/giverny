@@ -34,12 +34,22 @@ choose:
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another.
 
+Write each task's **brief** to a file: the prompt you will give its worker
+(see [Start a task](#2-start-a-task)), or at least the task's own text. Its
+**Next up** row opens to it when clicked, so the user can read what each
+worker will be told before it starts. Every `plan` gets one; a `plan` without
+`--brief` says so.
+
 Record every task, in the order you mean to run it:
 
 ```bash
-giverny-pass plan auth-fix --eta 25 --title "Fix the token refresh race"
-giverny-pass plan docs-api --eta 15 --title "Document the new endpoints"
+giverny-pass plan auth-fix --eta 25 --title "Fix the token refresh race" --brief briefs/auth-fix.md
+giverny-pass plan docs-api --eta 15 --title "Document the new endpoints" --brief briefs/docs-api.md
 ```
+
+Keep the briefs somewhere that outlives the pass (a scratch directory is
+fine); a relative path is stored absolute. If the prompt changes before the
+spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
 Each `plan` (and `start --eta`) prints what the pane will count down from.
 Giverny keeps a history of every task that landed: its estimate, its wall time
