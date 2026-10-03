@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::pass::{self, Lock};
-use crate::{feed, pass_inbox, resources};
+use crate::{feed, pass_history, pass_inbox, resources};
 
 /// How long into its task a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
@@ -206,6 +206,7 @@ pub fn check(
     agent_id: &str,
     description: Option<&str>,
     now: u64,
+    history: Option<&Path>,
 ) -> Option<String> {
     let rows = doc.get_mut("rows")?.as_array_mut()?;
     let row = rows
@@ -234,10 +235,26 @@ pub fn check(
         ),
         None => "It has no estimate yet.".to_string(),
     };
+    // How this kind of re-estimate has fared, so the figure itself improves
+    // (giverny#181): read only now, once per worker.
+    let s = |k: &str| row.get(k).and_then(Value::as_str);
+    let kind = s("title").and_then(pass_history::kind_of);
+    let record = history
+        .map(pass_history::load)
+        .and_then(|h| {
+            pass_history::track_record(
+                &h,
+                pass_history::Track::Reestimate,
+                s("repo"),
+                kind.as_deref(),
+            )
+        })
+        .map(|r| format!(" For calibration, {r} (the pane corrects your figure by that too)."))
+        .unwrap_or_default();
     Some(format!(
         "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \
          the code, re-estimate it once: run `giverny-pass eta {key} <minutes left> --note \
-         \"<why>\"`, even if the figure stands. Then carry on.",
+         \"<why>\"`, even if the figure stands.{record} Then carry on.",
         span(worked / 1000)
     ))
 }
@@ -358,7 +375,13 @@ fn worker(caller: &Caller, dir: &Path, now: u64) -> Option<String> {
             return None; // another writer's pass: its rows, its estimates
         }
         if holds_row(&d, &caller.agent_id, desc) {
-            let ask = check(&mut d, &caller.agent_id, desc, now)?;
+            let ask = check(
+                &mut d,
+                &caller.agent_id,
+                desc,
+                now,
+                pass_history::path(dir).as_deref(),
+            )?;
             pass::write(&file, &d).ok()?;
             return Some(reply(&ask));
         }
@@ -400,15 +423,54 @@ mod tests {
             {"key": "docs", "stage": "running", "started": pass::stamp(T0)}
         ]));
         let desc = Some("auth-fix: fix the token race");
-        assert_eq!(check(&mut d, "w1", desc, T0 + 4 * MIN), None, "too early");
-        let ask = check(&mut d, "w1", desc, T0 + 5 * MIN).unwrap();
+        assert_eq!(
+            check(&mut d, "w1", desc, T0 + 4 * MIN, None),
+            None,
+            "too early"
+        );
+        let ask = check(&mut d, "w1", desc, T0 + 5 * MIN, None).unwrap();
         assert!(ask.contains("giverny-pass eta auth-fix"), "{ask}");
         assert!(ask.contains("30m") && ask.contains("25m left"), "{ask}");
         assert!(d["rows"][0].get("reestimate_asked").is_some());
-        assert_eq!(check(&mut d, "w1", desc, T0 + 9 * MIN), None, "only once");
+        assert_eq!(
+            check(&mut d, "w1", desc, T0 + 9 * MIN, None),
+            None,
+            "only once"
+        );
         // Another worker, on a row with no estimate.
-        let ask = check(&mut d, "w2", Some("docs"), T0 + 6 * MIN).unwrap();
+        let ask = check(&mut d, "w2", Some("docs"), T0 + 6 * MIN, None).unwrap();
         assert!(ask.contains("no estimate"), "{ask}");
+    }
+
+    #[test]
+    fn the_ask_shows_how_past_re_estimates_fared() {
+        let dir = std::env::temp_dir().join(format!("giverny-nudge-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = dir.join(pass_history::FILE);
+        for _ in 0..pass_history::MIN_SAMPLES {
+            let rec = pass_history::Record {
+                key: "g#1".into(),
+                repo: Some("g".into()),
+                kind: Some("BUG".into()),
+                reest_s: Some(600),
+                reest_at_s: Some(300),
+                wall_s: 1500,
+                work_s: 1500,
+                ..pass_history::Record::default()
+            };
+            pass_history::append(&h, &rec).unwrap();
+        }
+        let mut d = doc(json!([{"key": "g#2", "stage": "running", "repo": "g",
+            "title": "BUG: x", "started": pass::stamp(T0), "eta_s": 1800}]));
+        let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
+        assert!(
+            ask.contains(
+                "For calibration, your last 5 BUG re-estimates in g took ×2.00 of what was \
+                 said (median): they run short: estimate higher"
+            ),
+            "{ask}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -421,19 +483,19 @@ mod tests {
             {"key": "c", "stage": "planned", "eta_s": 600},
             {"key": "d", "stage": "running", "started": started, "agent_id": "other"}
         ]));
-        assert_eq!(check(&mut d, "w", Some("a"), T0 + 10 * MIN), None);
+        assert_eq!(check(&mut d, "w", Some("a"), T0 + 10 * MIN, None), None);
         assert_eq!(
-            check(&mut d, "w", Some("b"), T0 + 10 * MIN),
+            check(&mut d, "w", Some("b"), T0 + 10 * MIN, None),
             None,
             "two minutes worked"
         );
-        assert_eq!(check(&mut d, "w", Some("c"), T0 + 10 * MIN), None);
+        assert_eq!(check(&mut d, "w", Some("c"), T0 + 10 * MIN, None), None);
         assert_eq!(
-            check(&mut d, "w", Some("d"), T0 + 10 * MIN),
+            check(&mut d, "w", Some("d"), T0 + 10 * MIN, None),
             None,
             "d is another agent's"
         );
-        assert!(check(&mut d, "other", None, T0 + 10 * MIN).is_some());
+        assert!(check(&mut d, "other", None, T0 + 10 * MIN, None).is_some());
     }
 
     #[test]

@@ -68,6 +68,26 @@ user the plan. With too little history it says `as given`. Pass
 `--repo <name>` when the task belongs to a project other than the directory
 you run in.
 
+Under it, `plan` says how your guesses for such tasks have fared:
+
+```
+  your last 9 BUG guesses in myapp took ×0.48 of what was said (median): they run long: estimate lower
+```
+
+Read it before the next guess, and let it move your raw figure too: the
+correction only fixes the bias it has already seen.
+
+A worker's re-estimate is scored the same way, on its own track: its first
+`eta` on a running task (the one Giverny asks for five minutes in, after it
+has read the code) is kept as given, corrected from past re-estimates of the
+same kind, and later checked against the working time that was still to come.
+The ask itself shows the worker how its kind's re-estimates have fared.
+
+`giverny-pass accuracy` (optionally `--repo <name>`) shows every track,
+older tasks against recent: the dispatcher's guess, the pane's corrected
+start figure, and the worker's re-estimate as given and corrected. When the
+user asks whether estimates are getting better, answer from it.
+
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
 ## 2. Start a task
