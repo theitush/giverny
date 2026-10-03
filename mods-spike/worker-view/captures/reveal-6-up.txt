@@ -1,0 +1,50 @@
+                                                                                                              │1: ● w1a: peek running 1m17s · 3 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep  ✕
+ ▐▛███▛█   Claude Code v2.1.288                                                                               │                       6;…
+▝▜██████▀  Haiku 4.5 · Claude Max                                                                             │2: ● w2b: peek running 1m17s · 3 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native       │                       6;…
+                                                                                                              │[ Native /tasks ]
+                                                                                                              │w1: shown in the agent strip under the prompt; Esc, then ↓ ↓ Enter enters it
+❯ Run this exact Bash command: echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; │view: w1
+  sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; echo tick 8; sleep 6             │
+  Then run it once more. Then reply "DONE w1" and a one-line summary.                                         │
+                                                                                                              │
+● Running 3 shell commands · 5s…                                                                              │
+  ⎿  $ echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5;   │
+     sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; echo tick 8; sleep 6 (4s · 2 lines)                 │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+✻ Bunning… (1m 18s · ↓ 6.6k tokens)                                                                           │
+  ⎿  Tip: Run /install-slack-app to use Claude in Slack                                                       │
+                                                                                                              │
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── w1 ─
+❯ Message @worker-view-spike:w……
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 11%  ·  wk 22%  ·  session: 0  ·  subagents: 12.4k  ·  total: 12.4k
+  ↑/↓ to select · Enter to view
+
+❯ ◯ main
+  ● worker-view-spike:worker  Running tick sequence command                                                                                                                     1m 18s · ↓ 6.6k tokens

@@ -1,0 +1,50 @@
+                                                                                                              │w1 running · 22s · 1 tools · last event 18s ago · 3 msgs read in 8 ms                   ✕
+ ▐▛███▛█   Claude Code v2.1.288                                                                               │› Run this exact Bash command: echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; …
+▝▜██████▀  Haiku 4.5 · Claude Max                                                                             │● Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick …)
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native       │  ⎿ running…
+                                                                                                              │to worker › : also run: echo MOD-MSG-OK  ⏎ send
+                                                                                                              │[ Back (Esc) ] [ Stop worker ]
+❯ /wv-spawn                                                                                                   │
+  ⎿  worker-view-spike: spawned ab959beb58d058417, ae5108b02a4b9f5f7                                          │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 9%  ·  wk 21%
+  ⏸ manual mode on · ← 2 agents
+
+  ● main
+  ◯ worker-view-spike:worker  w1                                                                                                                                                   22s · ↓ 5.3k tokens
+  ◯ worker-view-spike:worker  w2                                                                                                                                                   22s · ↓ 5.1k tokens

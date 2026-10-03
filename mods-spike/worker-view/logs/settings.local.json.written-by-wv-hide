@@ -1,0 +1,6 @@
+{
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "/home/ita/giverny/.claude/worktrees/task-186-mod-spike/mods-spike/worker-view/bin/strip.py"
+  }
+}

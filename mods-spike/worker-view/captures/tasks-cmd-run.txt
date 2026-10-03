@@ -1,0 +1,50 @@
+                                                                                                              │1: ● w1a: peek running 1m37s · 3 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep  ✕
+ ▐▛███▛█   Claude Code v2.1.288                                                                               │                       6;…
+▝▜██████▀  Haiku 4.5 · Claude Max                                                                             │2: ● w2b: peek running 1m37s · 3 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native       │                       6;…
+                                                                                                              │[ Native /tasks ]
+                                                                                                              │view: main
+❯ /wv-spawn                                                                                                   │
+  ⎿  worker-view-spike: spawned a696acb0ac224a507, ab0970744993cfbc0                                          │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Background
+   2 active agents
+
+     Local agents (2)
+   ❯ ● w2   running · Haiku 4.5
+     ● w1   running · Haiku 4.5
+
+   ↑/↓ to select · Enter to view · f to foreground · x to stop · ctrl+x ctrl+k to stop all agents · Esc to close

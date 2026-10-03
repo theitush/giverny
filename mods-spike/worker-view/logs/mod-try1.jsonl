@@ -1,0 +1,10 @@
+{"t":1791021317580,"kind":"agent.register","r":{"agent":"worker-view-spike:worker"}}
+{"t":1791021333874,"kind":"spawn","name":"w2","r":{"model":"claude-haiku-4-5-20251001","agentId":"a68851eccb6f52bf9"}}
+{"t":1791021333874,"kind":"spawn","name":"w1","r":{"model":"claude-haiku-4-5-20251001","agentId":"ab899739551cb7705"}}
+{"t":1791021336790,"kind":"tool.start","agentId":"ab899739551cb7705","tool":"Bash","what":"echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; …"}
+{"t":1791021337003,"kind":"tool.start","agentId":"a68851eccb6f52bf9","tool":"Bash","what":"echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; …"}
+{"t":1791021353955,"kind":"open.worker","id":"a68851eccb6f52bf9","ms":12,"r":{"isPlaced":true}}
+{"t":1791021385617,"kind":"agent.register","r":{"agent":"worker-view-spike:worker"}}
+{"t":1791021387740,"kind":"tool.end","agentId":"a68851eccb6f52bf9","tool":"Bash","ms":50737}
+{"t":1791021387793,"kind":"tool.end","agentId":"ab899739551cb7705","tool":"Bash","ms":51002}
+{"t":1791021394010,"kind":"agent.register","r":{"agent":"worker-view-spike:worker"}}

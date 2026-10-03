@@ -1,0 +1,50 @@
+                                                                                                              │1: ● w1a: peek running 1m09s · 2 tools · Bash(giverny-pass eta agent-a696acb0 2 --agent ✕
+ ▐▛███▛█   Claude Code v2.1.288                                                                               │                       a…
+▝▜██████▀  Haiku 4.5 · Claude Max                                                                             │2: ● w2b: peek running 1m09s · 3 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native       │                       6;…
+                                                                                                              │[ Native /tasks ]
+                                                                                                              │w1: shown in the agent strip under the prompt; Esc, then ↓ ↓ Enter enters it
+❯ Run this exact Bash command: echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; │view: w1
+  sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; echo tick 8; sleep 6             │
+  Then run it once more. Then reply "DONE w1" and a one-line summary.                                         │
+                                                                                                              │
+● Running 2 shell commands · 10s…                                                                             │
+  ⎿  $ giverny-pass eta agent-a696acb0 2 --agent a696acb0ac224a507 --title "w1"                               │
+                                                                                                              │
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+ Bash command · from the worker-view-spike plugin                                                             │
+ Provide ETA to giverny for completion                                                                        │
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│
+ giverny-pass eta agent-a696acb0 2 --agent a696acb0ac224a507 --title "w1"                                     │
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│
+ This command requires approval                                                                               │
+                                                                                                              │
+ Do you want to proceed?                                                                                      │
+ ❯ 1. Yes                                                                                                     │
+   2. No                                                                                                      │
+                                                                                                              │
+ Esc to cancel · Tab to amend                                                                                 │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │
+                                                                                                              │

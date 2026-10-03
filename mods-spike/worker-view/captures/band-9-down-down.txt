@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.288
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native
+
+
+❯ /wv-spawn 6
+  ⎿  worker-view-spike: spawned a4b087c50cde3b7b5, a2bf8ff6692eb38b2, a072bd2257b10919d, af3fb1af291bd3b29, a50f161e7e835d82a, a3024801033d794fa
+
+❯ /wv-hide
+  ⎿  worker-view-spike: wrote subagentStatusLine into /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1: ● w1a: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6;[-]
+2: ● w3b: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …
+3: ● w4c: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …
+4: ● w2d: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …
+5: ● w5e: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …
+6: ● w6f: peek running 53s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …
+[ Native /tasks ]
+w3: shown in the agent strip under the prompt; Esc, then ↓ ↓ Enter enters it
+view: main
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 12%  ·  wk 22%
+  Enter to view · x to stop · ctrl+x ctrl+k to stop all agents
+
+  ● main
+❯ ◯ worker-view-spike:worker  w3                                                                                                                                                   54s · ↓ 5.1k tokens

@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.288[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native[39m
+
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/wv-spawn 6[39m [49m
+[38;5;246m  ⎿  [39mworker-view-spike: spawned a4b087c50cde3b7b5, a2bf8ff6692eb38b2, a072bd2257b10919d, af3fb1af291bd3b29, a50f161e7e835d82a, a3024801033d794fa
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/wv-hide[39m [49m
+[38;5;246m  ⎿  [39mworker-view-spike: wrote subagentStatusLine into /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/wv-native/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;153m1[39m: ● w1[38;5;153ma[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6;[-]
+[7m[38;5;153m2[39m: ● w3[0m[38;5;153mb[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …[39m
+[38;5;153m3[39m: ● w4[38;5;153mc[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …[39m
+[38;5;153m4[39m: ● w2[38;5;153md[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …[39m
+[38;5;153m5[39m: ● w5[38;5;153me[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …[39m
+[38;5;153m6[39m: ● w6[38;5;153mf[38;5;246m: peek[38;5;38m running [38;5;246m39s · 1 tools · Bash(echo tick 1; sleep 6; echo tick 2; sleep 6; echo tick 3; sleep 6; echo tick 4; sleep 6; echo tick 5; sleep 6; echo tick 6; sleep 6; echo tick 7; sleep 6; …[39m
+[1m[ Native /tasks ][0m
+[38;5;178mw3: shown in the agent strip under the prompt; Esc, then ↓ ↓ Enter enters it[39m
+[38;5;246mview: main[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mHaiku 4.5  ·  5h 12%  ·  wk 22%[39m
+  [38;5;246m⏸ manual mode on · ← 2 agents[39m
+
+[1m  ● main[0m
+[38;5;246m  ◯ worker-view-spike:worker[39m  [38;5;246mw4[39m                                                                                                                                                   [38;5;246m40s · ↓ 5.0k tokens[39m
