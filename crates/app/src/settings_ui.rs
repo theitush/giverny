@@ -265,7 +265,7 @@ fn body(
     }
 
     if state.search.is_empty() && state.section == Section::Orchestrator {
-        limits_intro(ui, machine, c);
+        limits_intro(ui, c);
     }
 
     for def in rows {
@@ -285,39 +285,14 @@ fn body(
     }
 }
 
-/// The head of Settings → Orchestrator: what the limits are for, and the
-/// machine `auto` is worked out from.
-fn limits_intro(ui: &mut egui::Ui, machine: Option<&Machine>, c: Chrome) {
+/// The head of Settings → Orchestrator: the heading, and nothing more —
+/// the fields show their own figures (giverny#180).
+fn limits_intro(ui: &mut egui::Ui, c: Chrome) {
     ui.label(
         RichText::new("limits")
             .font(FontId::monospace(12.5))
             .color(c.accent),
     );
-    ui.label(
-        RichText::new(
-            "What every orchestrator pass on this machine together may hand to its \
-             workers (giverny pass claim). auto follows the machine; type a number, \
-             a size, or a share like 50%.",
-        )
-        .font(FontId::monospace(10.0))
-        .color(c.dim),
-    );
-    let this = match machine {
-        None => "this machine: detecting…".to_string(),
-        Some(m) => {
-            let gpus = if m.gpus.is_empty() {
-                "no GPU (nvidia-smi)".to_string()
-            } else {
-                m.gpus
-                    .iter()
-                    .map(|g| format!("GPU {} {} {}", g.index, g.name, g.vram))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            };
-            format!("this machine: {} cores · {} RAM · {gpus}", m.cores, m.ram)
-        }
-    };
-    ui.label(RichText::new(this).font(FontId::monospace(10.5)));
     ui.add_space(10.0);
 }
 
@@ -357,11 +332,14 @@ fn row(
                 _ => widget(ui, state, def, &value, suggestions, actions, c),
             }
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(def.doc)
-                        .font(FontId::monospace(10.0))
-                        .color(c.dim),
-                );
+                // The limits show bare figures: their doc stays for search.
+                if !matches!(def.kind, Kind::Limit { .. }) {
+                    ui.label(
+                        RichText::new(def.doc)
+                            .font(FontId::monospace(10.0))
+                            .color(c.dim),
+                    );
+                }
                 if def.needs_restart && modified {
                     ui.label(
                         RichText::new("restart to apply")
@@ -503,21 +481,22 @@ fn widget(
 }
 
 /// A short text field committing on Enter or focus loss, like the text
-/// rows. `Some(typed)` once a changed value is committed.
+/// rows. It shows `shown` — the figure in force, never the word `auto` —
+/// and gives `Some(typed)` once something other than that is committed.
 fn commit_field(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     key: &str,
-    stored: &str,
+    shown: &str,
 ) -> Option<String> {
     let editing = state.editing.as_ref().is_some_and(|(k, _)| k == key);
     let mut buf = match (&state.editing, editing) {
         (Some((_, b)), true) => b.clone(),
-        _ => stored.to_string(),
+        _ => shown.to_string(),
     };
     let resp = ui.add(
         egui::TextEdit::singleline(&mut buf)
-            .hint_text("auto")
+            .hint_text(shown)
             .desired_width(90.0)
             .font(FontId::monospace(12.0)),
     );
@@ -527,7 +506,7 @@ fn commit_field(
     let done = resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter));
     if done && editing {
         state.editing = None;
-        if buf.trim() != stored {
+        if buf.trim() != shown {
             return Some(buf);
         }
     }
@@ -552,13 +531,9 @@ fn refused(ui: &mut egui::Ui, state: &SettingsState, key: &str, c: Chrome) {
     }
 }
 
-/// `pct` of `whole`, as a whole percent.
-fn share(part: u64, whole: u64) -> u64 {
-    (part * 100).checked_div(whole).unwrap_or(0)
-}
-
-/// One `[orchestrator.limits]` row: the figure (or `auto`) to edit, and
-/// beside it what that comes to on this machine.
+/// One `[orchestrator.limits]` row: a bare field holding the figure in
+/// force — at `auto`, what that comes to on this machine. The row's ↺ puts
+/// `auto` back.
 #[allow(clippy::too_many_arguments)]
 fn limit_widget(
     ui: &mut egui::Ui,
@@ -576,48 +551,41 @@ fn limit_widget(
         return gpu_rows(ui, state, limits, machine, def, actions, c);
     }
     let stored = value.as_str().unwrap_or("auto").to_string();
-    ui.horizontal(|ui| {
-        let typed = commit_field(ui, state, def.key, &stored);
-        let Some(m) = machine else {
-            dim(ui, "detecting this machine…".into(), c);
-            return;
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let shown = limit_figure(limits, m, field);
+    if let Some(typed) = commit_field(ui, state, def.key, &shown) {
+        let parsed = match field {
+            LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
+                Auto::Auto => "auto".to_string(),
+                Auto::Set(n) => n.to_string(),
+            }),
+            _ => limits::parse_ram(&typed, m).map(|a| match a {
+                Auto::Auto => "auto".to_string(),
+                Auto::Set(mem) => limits::mem_text(mem),
+            }),
         };
-        if let Some(typed) = typed {
-            let parsed = match field {
-                LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
-                    Auto::Auto => "auto".to_string(),
-                    Auto::Set(n) => n.to_string(),
-                }),
-                _ => limits::parse_ram(&typed, m).map(|a| match a {
-                    Auto::Auto => "auto".to_string(),
-                    Auto::Set(mem) => limits::mem_text(mem),
-                }),
-            };
-            match parsed {
-                Ok(text) => {
-                    state.error = None;
-                    if text != stored {
-                        actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
-                    }
+        match parsed {
+            Ok(text) => {
+                state.error = None;
+                if text != stored {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
                 }
-                Err(why) => state.error = Some((def.key.into(), why)),
             }
+            Err(why) => state.error = Some((def.key.into(), why)),
         }
-        let r = limits.resolve(m);
-        let auto = stored == "auto";
-        let text = match field {
-            LimitField::Cores if auto => format!("= {} of {} cores", r.cpu_cores, m.cores),
-            LimitField::Cores => format!(
-                "of {} cores ({}%)",
-                m.cores,
-                share(r.cpu_cores as u64, m.cores as u64)
-            ),
-            _ if auto => format!("= {} of {} ({}%)", r.ram, m.ram, limits::AUTO_RAM_PCT),
-            _ => format!("of {} ({}%)", m.ram, share(r.ram.0, m.ram.0)),
-        };
-        dim(ui, text, c);
-    });
+    }
     refused(ui, state, def.key, c);
+}
+
+/// The figure a cores or RAM limit comes to on `m`: `12`, `18.8G`.
+fn limit_figure(limits: &Limits, m: &Machine, field: LimitField) -> String {
+    let r = limits.resolve(m);
+    match field {
+        LimitField::Cores => r.cpu_cores.to_string(),
+        _ => r.ram.to_string(),
+    }
 }
 
 /// `gpus`: a line per GPU the machine has. The file holds one list, so
@@ -643,10 +611,10 @@ fn gpu_rows(
     for g in &m.gpus {
         let key = format!("{}#{}", def.key, g.index);
         let set = current.iter().find(|l| l.index == g.index);
-        let stored = match (&limits.gpus, set) {
-            (Auto::Auto, _) => "auto".to_string(),
-            (Auto::Set(_), Some(l)) => limits::mem_text(l.vram),
-            (Auto::Set(_), None) => "off".to_string(),
+        // The VRAM in force, at auto too: the field never says `auto`.
+        let stored = match set {
+            Some(l) => l.vram.to_string(),
+            None => "off".to_string(),
         };
         ui.horizontal(|ui| {
             ui.label(
@@ -689,17 +657,6 @@ fn gpu_rows(
                     Err(why) => state.error = Some((key.clone(), why)),
                 }
             }
-            let text = match set {
-                _ if stored == "auto" => format!(
-                    "= {} of {} ({}%)",
-                    set.map(|l| l.vram).unwrap_or_default(),
-                    g.vram,
-                    limits::AUTO_VRAM_PCT
-                ),
-                Some(l) => format!("of {} ({}%)", g.vram, share(l.vram.0, g.vram.0)),
-                None => "not used".into(),
-            };
-            dim(ui, text, c);
         });
         refused(ui, state, &key, c);
     }
@@ -952,7 +909,30 @@ fn footer(ui: &mut egui::Ui, actions: &mut Vec<Action>, close: &mut bool, c: Chr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giverny_core::limits::Mem;
     use giverny_term::render::theme::Theme;
+
+    #[test]
+    fn a_limit_field_shows_the_figure_never_auto() {
+        // giverny#180: at auto the field holds what auto comes to here.
+        let m = Machine {
+            cores: 14,
+            ram: Mem::gb(27),
+            gpus: vec![],
+        };
+        let mut l = Limits::default();
+        assert_eq!(limit_figure(&l, &m, LimitField::Cores), "12");
+        // 70 % of 27G is 18.9G, written as the field can read it back.
+        assert_eq!(limit_figure(&l, &m, LimitField::Ram), "18.9G");
+        assert_eq!(
+            limits::parse_ram("18.9G", &m),
+            Ok(Auto::Set(Mem::parse("18.9G").unwrap()))
+        );
+        l.cpu_cores = Auto::Set(4);
+        l.ram = Auto::Set(Mem::gb(8));
+        assert_eq!(limit_figure(&l, &m, LimitField::Cores), "4");
+        assert_eq!(limit_figure(&l, &m, LimitField::Ram), "8G");
+    }
 
     #[test]
     fn every_theme_the_screen_offers_is_real_and_distinct() {
