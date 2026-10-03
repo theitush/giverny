@@ -342,11 +342,15 @@ fn row(
             }
             widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(def.doc)
-                        .font(FontId::monospace(10.0))
-                        .color(c.dim),
-                );
+                // The Orchestrator page is bare figures and switches; the
+                // doc stays on the def for search (giverny#183).
+                if def.section != Section::Orchestrator {
+                    ui.label(
+                        RichText::new(def.doc)
+                            .font(FontId::monospace(10.0))
+                            .color(c.dim),
+                    );
+                }
                 if def.needs_restart && modified {
                     ui.label(
                         RichText::new("restart to apply")
