@@ -1,0 +1,5 @@
+{
+  "name": "pass-spike",
+  "version": "0.0.1",
+  "description": "Spike for giverny#186: can a Claude Code mod run the orchestrator (parallel workers, inbox, a pass loop, a shared view, usage, resources)?"
+}

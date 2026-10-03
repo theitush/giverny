@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.288
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/spike-cwd
+
+▎ Debug mode enabled · logging to /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/spike-cwd/A.debug.log
+
+❯ /clear
+
+❯ /spike-list
+  ⎿  pass-spike: [{"id":"a60b726bc2b064def","description":"par 1","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"},{"id":"a4ccf33098c99af1f","description":"par
+     2","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"},{"id":"ab14df7d4c4015937","description":"par
+     3","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"}]
+
+❯ /spike-store 200
+  ⎿  pass-spike: race done: wrote 200, final 200
+
+● pass-spike: reloaded (7 hooks: session.start, agent.offer, tool.call, turn.complete, session.measure, session.end, command.run)
+
+❯ /spike-keys 150
+  ⎿  pass-spike: wrote 150
+
+❯ /spike-proc
+  ⎿  pass-spike: 5 pieces
+
+● pass-spike: reloaded (7 hooks: session.start, agent.offer, tool.call, turn.complete, session.measure, session.end, command.run)
+
+❯ /spike-proc 20
+  ⎿  pass-spike: 22 pieces
+
+❯ /spike-list
+  ⎿  pass-spike: []
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 21%
+  ⏸ manual mode on · ← 2 agents

@@ -1,0 +1,68 @@
+{"t":1791020364610,"load":"dkninp","kind":"session.start","e":{"cwd":"/tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/spike-cwd","surface":"terminal","isInteractive":true}}
+{"t":1791020364716,"load":"dkninp","kind":"agent.register","r":{"agent":"pass-spike:worker"}}
+{"t":1791020365228,"load":"dkninp","kind":"session.measure","rateLimits":[{"kind":"five_hour","percentUsed":5,"resetsAt":"2026-10-03T13:40:00.000Z"},{"kind":"seven_day","percentUsed":21,"resetsAt":"2026-10-08T10:00:00.000Z"}],"changed":["context","rateLimits","cost"],"cost":{"usd":0}}
+{"t":1791020374824,"load":"dkninp","kind":"heartbeat.start-timer"}
+{"t":1791020374908,"load":"dkninp","kind":"store.race","n":200,"lastSeen":160,"final":160,"keys":["loop:0203024f-8af8-4f90-979a-8f8a81cf4229","race","rows"],"rows":{"331f2907-c292-44dc-b81f-618fdf967778":{"at":1791020374901,"label":"B"}}}
+{"t":1791020388137,"load":"dkninp","kind":"heartbeat.start-timer"}
+{"t":1791020388555,"load":"8f555v","kind":"session.start","e":{"cwd":"/tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/spike-cwd","surface":"terminal","isInteractive":true}}
+{"t":1791020388583,"load":"8f555v","kind":"agent.register","r":{"agent":"pass-spike:worker"}}
+{"t":1791020395795,"load":"8f555v","kind":"store.keys","n":150,"mine":150,"all":300}
+{"t":1791020398652,"load":"8f555v","kind":"heartbeat.start-timer"}
+{"t":1791020408654,"load":"8f555v","kind":"heartbeat.start-timer"}
+{"t":1791020416893,"load":"ehl5mi","kind":"session.start","e":{"cwd":"/tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/spike-cwd","surface":"terminal","isInteractive":true}}
+{"t":1791020416927,"load":"ehl5mi","kind":"agent.register","r":{"agent":"pass-spike:worker"}}
+{"t":1791020426991,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020437011,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020444057,"load":"ehl5mi","kind":"tool.call.start","tool":"Agent"}
+{"t":1791020444057,"load":"ehl5mi","kind":"tool.call.start","tool":"Agent"}
+{"t":1791020444057,"load":"ehl5mi","kind":"tool.call.start","tool":"Agent"}
+{"t":1791020444217,"load":"ehl5mi","kind":"tool.call.end","tool":"Agent","ms":160}
+{"t":1791020444217,"load":"ehl5mi","kind":"tool.call.end","tool":"Agent","ms":161}
+{"t":1791020444218,"load":"ehl5mi","kind":"tool.call.end","tool":"Agent","ms":160}
+{"t":1791020444242,"load":"ehl5mi","kind":"par.spawned","ms":196,"results":[{"model":"claude-haiku-4-5-20251001","agentId":"a2c45f2a8bc76c90c"},{"model":"claude-haiku-4-5-20251001","agentId":"adbea40d1a8661435"},{"model":"claude-haiku-4-5-20251001","agentId":"abec86f798a5dedbd"}]}
+{"t":1791020444251,"load":"ehl5mi","kind":"agent.list","list":[{"id":"a2c45f2a8bc76c90c","description":"par 1","type":"pass-spike:worker","status":"running"},{"id":"adbea40d1a8661435","description":"par 2","type":"pass-spike:worker","status":"running"},{"id":"abec86f798a5dedbd","description":"par 3","type":"pass-spike:worker","status":"running"}]}
+{"t":1791020445896,"load":"ehl5mi","kind":"tool.call.start","agentId":"adbea40d1a8661435","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020446037,"load":"ehl5mi","kind":"tool.call.start","agentId":"a2c45f2a8bc76c90c","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020446238,"load":"ehl5mi","kind":"tool.call.start","agentId":"abec86f798a5dedbd","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020450061,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020460063,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020470080,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020478882,"load":"ehl5mi","kind":"tool.call.start","agentId":"ac77e6d6c0e930304","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020478894,"load":"ehl5mi","kind":"tool.call.end","agentId":"ac77e6d6c0e930304","tool":"Bash","ms":13,"isError":true}
+{"t":1791020479241,"load":"ehl5mi","kind":"tool.call.end","agentId":"adbea40d1a8661435","tool":"Bash","ms":33344}
+{"t":1791020479252,"load":"ehl5mi","kind":"tool.call.end","agentId":"a2c45f2a8bc76c90c","tool":"Bash","ms":33222}
+{"t":1791020479332,"load":"ehl5mi","kind":"tool.call.start","agentId":"aacd122a7aeaf9afe","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020479344,"load":"ehl5mi","kind":"tool.call.end","agentId":"aacd122a7aeaf9afe","tool":"Bash","ms":12,"isError":true}
+{"t":1791020479452,"load":"ehl5mi","kind":"tool.call.end","agentId":"abec86f798a5dedbd","tool":"Bash","ms":33224}
+{"t":1791020480081,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020480804,"load":"ehl5mi","kind":"turn.complete","agentId":"a2c45f2a8bc76c90c","reason":"answer","durationMs":36638,"usage":{"input_tokens":18,"output_tokens":303,"cache_read_input_tokens":4722,"cache_creation_input_tokens":5686,"model":"claude-haiku-4-5-20251001"},"answer":"DONE1"}
+{"t":1791020480831,"load":"ehl5mi","kind":"turn.complete","agentId":"abec86f798a5dedbd","reason":"answer","durationMs":36670,"usage":{"input_tokens":18,"output_tokens":324,"cache_read_input_tokens":4722,"cache_creation_input_tokens":5695,"model":"claude-haiku-4-5-20251001"},"answer":"DONE3"}
+{"t":1791020481140,"load":"ehl5mi","kind":"tool.call.start","agentId":"ace0d3fb706d9b9f8","tool":"Bash","desc":"date +%s.%N; sleep 30; date +%s.%N"}
+{"t":1791020481154,"load":"ehl5mi","kind":"tool.call.end","agentId":"ace0d3fb706d9b9f8","tool":"Bash","ms":14,"isError":true}
+{"t":1791020481520,"load":"ehl5mi","kind":"tool.call.start","agentId":"adbea40d1a8661435","tool":"Bash","desc":"giverny-pass eta agent-adbea40d 1 --agent adbea40d1a8661435 --title \"par 2\""}
+{"t":1791020481769,"load":"ehl5mi","kind":"tool.call.end","agentId":"adbea40d1a8661435","tool":"Bash","ms":253}
+{"t":1791020485898,"load":"ehl5mi","kind":"turn.complete","agentId":"adbea40d1a8661435","reason":"answer","durationMs":41755,"usage":{"input_tokens":26,"output_tokens":464,"cache_read_input_tokens":10380,"cache_creation_input_tokens":5998,"model":"claude-haiku-4-5-20251001"},"answer":"DONE2"}
+{"t":1791020486996,"load":"ehl5mi","kind":"agent.list","list":[{"id":"a2c45f2a8bc76c90c","description":"par 1","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"},{"id":"adbea40d1a8661435","description":"par 2","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"},{"id":"abec86f798a5dedbd","description":"par 3","type":"pass-spike:worker","status":"completed","spawnedBy":"pass-spike"}],"moduleLoop":null}
+{"t":1791020493116,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020503117,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020513120,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020523371,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020537087,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020547090,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020557092,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020567093,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020575647,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020585648,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020595650,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020607560,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020617562,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020627564,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020639612,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020649694,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020649753,"load":"ehl5mi","kind":"agent.list","list":[],"moduleLoop":null}
+{"t":1791020659696,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020672010,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020682036,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020692037,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020702039,"load":"ehl5mi","kind":"heartbeat.start-timer"}
+{"t":1791020708671,"load":"ehl5mi","kind":"session.end","reason":"other","agents":[]}
