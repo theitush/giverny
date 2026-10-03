@@ -35,11 +35,13 @@
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click (giverny#40).
 //!
-//! **Resources** (giverny#164): a row's lease from the machine ledger in a
-//! quiet column, a Next up row's place in the ledger's queue in NOW, and the
-//! machine's leases against its limits on a dim bottom line. The ledger is
-//! read off the UI thread ([`LedgerWatch`]) and wins over a row's own copy
-//! ([`with_ledger`]).
+//! **Resources** (giverny#164, #182): what a row's `giverny pass run`
+//! commands use in a quiet column — live CPU and memory while one runs, the
+//! memory peak once the row is Done — its lease from the machine ledger in
+//! its overlay header, a Next up row's place in the ledger's queue in NOW,
+//! and the machine's leases against its limits on a dim bottom line. The
+//! ledger and the commands' cgroups are read off the UI thread
+//! ([`LedgerWatch`]); the ledger wins over a row's own copy ([`with_ledger`]).
 //!
 //! **Text is selectable** (giverny#84): a drag — never a click — selects
 //! the pane's text the way the terminal does, as a stream of cells across
@@ -55,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
 use giverny_claude::resources::{self, Ledger};
+use giverny_claude::run_live::{self, RunLive, TaskLive};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
 use giverny_core::limits::{Limits, Machine, Mem, Resolved};
@@ -90,11 +93,11 @@ const MIN_TITLE: usize = 12;
 pub const NO_ETA: &str = "no ETA";
 /// Where in [`Cols::segments`] the ETA cell sits.
 const ETA_SEG: usize = 3;
-/// Where in [`Cols::segments`] the lease cell sits (giverny#164).
+/// Where in [`Cols::segments`] the use cell sits (giverny#164, #182).
 const LEASE_SEG: usize = 6;
-/// How strongly a lease cell is inked, against its row's colour.
+/// How strongly a use cell is inked, against its row's colour.
 const LEASE_INK: f32 = 0.75;
-/// The widest a lease cell is drawn; a longer one is cut.
+/// The widest a use cell is drawn; a longer one is cut.
 const LEASE_MAX: usize = 32;
 
 // --------------------------------------------------------- view state ----
@@ -431,6 +434,9 @@ pub struct LedgerView {
     /// `[orchestrator.limits]` resolved for this machine; `None` when the
     /// config could not be read.
     pub limits: Option<Resolved>,
+    /// What each task's running `giverny pass run` commands use now
+    /// (giverny#182), sampled with the ledger.
+    pub live: Vec<TaskLive>,
 }
 
 /// The ledger, read by a thread of its own (giverny#164): the read takes the
@@ -472,6 +478,7 @@ impl LedgerWatch {
 
 fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
     let mut machine: Option<(Machine, Instant)> = None;
+    let mut sampler = run_live::Sampler::default();
     loop {
         let now = now_ms();
         if now.saturating_sub(shared.wanted_ms.load(Ordering::Relaxed)) <= LEDGER_IDLE_MS {
@@ -483,7 +490,8 @@ fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
                     m
                 }
             };
-            if let Some(view) = read_ledger(&m, now) {
+            if let Some(mut view) = read_ledger(&m, now) {
+                view.live = sampler.sample(&run_live::runs_dir(&ledger_file()), now);
                 let mut snap = match shared.snap.lock() {
                     Ok(s) => s,
                     Err(p) => p.into_inner(),
@@ -503,7 +511,7 @@ fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
 /// ledger is an empty one; an unreadable one is `None` (the last good read
 /// stays).
 fn read_ledger(machine: &Machine, now: u64) -> Option<LedgerView> {
-    let path = resources::ledger_path(&feed::feed_dir());
+    let path = ledger_file();
     let mut ledger = if path.exists() {
         let _lock = resources::LedgerLock::take(&path).ok()?;
         Ledger::parse(&std::fs::read(&path).ok()?).ok()?
@@ -512,7 +520,27 @@ fn read_ledger(machine: &Machine, now: u64) -> Option<LedgerView> {
     };
     ledger.expire(now);
     let limits = Limits::load().ok().map(|l| l.resolve(machine));
-    Some(LedgerView { ledger, limits })
+    Some(LedgerView {
+        ledger,
+        limits,
+        live: Vec::new(),
+    })
+}
+
+fn ledger_file() -> PathBuf {
+    resources::ledger_path(&feed::feed_dir())
+}
+
+/// `feed` with each row's `live` use: its task's running commands under any
+/// of `sessions`, matched as [`with_ledger`] matches leases (giverny#182).
+pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
+    for row in &mut feed.rows {
+        row.live = live
+            .iter()
+            .find(|t| t.task == row.key && sessions.contains(&t.session.as_str()))
+            .map(|t| t.live);
+    }
+    feed
 }
 
 /// `feed` with every row's `lease` taken from the ledger rather than the
@@ -605,58 +633,20 @@ fn mem(mb: u64) -> String {
     }
 }
 
-/// A row's lease in its cell, compactly: `3G · 3c`, `+slot`, `gpu0 8G`; a
-/// smaller grant as got/asked (`2.5G/3G · 3c`); one still queued under a
-/// Running row as `wait 3G · 3c`. Empty for a lease of nothing.
-///
-/// The row's measured peak ([`peak_part`]) is added at its end by [`build`]:
-/// `3G · 3c · peak 2.1G`.
-pub fn lease_cell(l: &RowLease) -> String {
+/// A row's use in its cell (giverny#182): a Running row's commands now,
+/// `14% CPU 4.2G` (CPU as a share of the whole machine), a Done row's memory
+/// peak alone, `2.1G`; `OOM` after either when the memory cap killed a run
+/// (giverny#173). Empty when there is nothing to say. The lease is not here:
+/// the overlay header says it ([`lease_fact`]).
+pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool) -> String {
     let mut parts = Vec::new();
-    if l.ram_mb > 0 {
-        parts.push(match l.wanted_ram_mb {
-            Some(w) if l.state == LeaseState::Smaller && w > l.ram_mb => {
-                format!("{}/{}", mem(l.ram_mb), mem(w))
-            }
-            _ => mem(l.ram_mb),
-        });
+    if let Some(l) = live {
+        parts.push(format!("{}% CPU {}", l.cpu_pct, mem(l.mem_mb)));
     }
-    if l.cpu > 0 {
-        parts.push(format!("{}c", l.cpu));
+    if let Some(p) = peak_mb.filter(|&p| p > 0) {
+        parts.push(mem(p));
     }
-    for g in &l.gpus {
-        parts.push(format!("gpu{g} {}", mem(l.vram_mb)));
-    }
-    if l.gpus.is_empty() && l.vram_mb > 0 {
-        parts.push(format!("gpu {}", mem(l.vram_mb)));
-    }
-    let mut s = parts.join(" · ");
-    let slots = match l.slots.len() {
-        0 => String::new(),
-        1 => "+slot".into(),
-        n => format!("+{n} slots"),
-    };
-    if !slots.is_empty() {
-        if !s.is_empty() {
-            s.push(' ');
-        }
-        s.push_str(&slots);
-    }
-    if l.state == LeaseState::Queued && !s.is_empty() {
-        s = format!("wait {s}");
-    }
-    s
-}
-
-/// What a row's `giverny pass run` commands measured, for its lease cell:
-/// `peak 2.1G`, and `OOM` after it when the memory cap killed a run
-/// (giverny#173). Empty when nothing was measured or killed.
-pub fn peak_part(u: &RowUsage) -> String {
-    let mut parts = Vec::new();
-    if let Some(p) = u.peak_mb.filter(|&p| p > 0) {
-        parts.push(format!("peak {}", mem(p)));
-    }
-    if u.oom_kills > 0 {
+    if oom {
         parts.push("OOM".to_string());
     }
     parts.join(" · ")
@@ -851,9 +841,9 @@ pub struct Line {
     pub no_eta: bool,
     pub now: String,
     pub tokens: String,
-    /// What the row's task holds in the machine ledger ([`lease_cell`]),
-    /// empty when nothing (giverny#164).
-    pub lease: String,
+    /// What the row's commands use ([`usage_cell`]): live on a Running row,
+    /// the memory peak on a Done one; empty when nothing (giverny#182).
+    pub usage: String,
     /// A `giverny pass run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour (giverny#173).
     pub oom: bool,
@@ -1041,33 +1031,21 @@ fn format_row(
         Stage::Done => row.eta_delta_s().map(feed::fmt_delta).unwrap_or_default(),
     };
     let no_eta = row.stage == Stage::Running && eta_s.is_none();
-    // What the task holds in the machine ledger: a cell of its own, but a
-    // Next up row that waits for it says so in NOW instead (giverny#164).
+    // What the task holds in the machine ledger is in the overlay header; a
+    // Next up row that waits for it says so in NOW (giverny#164).
     let held = f
         .and_then(|f| f.lease.as_ref())
         .filter(|_| row.stage != Stage::Done);
     let queued = held.filter(|l| row.stage == Stage::Planned && l.state == LeaseState::Queued);
-    let mut lease = match held {
-        Some(l) if queued.is_none() => lease_cell(l),
-        _ => String::new(),
+    // The cell is the row's use (giverny#182): a Running row's commands now,
+    // a Done row's memory peak alone (giverny#173).
+    let measured = f.and_then(|f| f.usage.as_ref());
+    let oom = measured.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
+    let usage = match row.stage {
+        Stage::Running => usage_cell(f.and_then(|f| f.live), None, oom),
+        Stage::Done => usage_cell(None, measured.and_then(|u| u.peak_mb), oom),
+        Stage::Planned => String::new(),
     };
-    // What its commands measured (giverny#173): on Running rows after the
-    // lease, and a Done row keeps its peak alone (a short cell, so it does
-    // not crowd the row).
-    let usage = f.and_then(|f| f.usage.as_ref());
-    if queued.is_none()
-        && let Some(u) = usage
-        && row.stage != Stage::Planned
-    {
-        let p = peak_part(u);
-        if !p.is_empty() {
-            if !lease.is_empty() {
-                lease.push_str(" · ");
-            }
-            lease.push_str(&p);
-        }
-    }
-    let oom = usage.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
         // The limit first: a row the writer paused for it says why.
@@ -1103,7 +1081,7 @@ fn format_row(
     if let Some(h) = held {
         facts.push(lease_fact(h));
     }
-    if let Some(u) = usage.filter(|_| row.stage != Stage::Planned) {
+    if let Some(u) = measured.filter(|_| row.stage != Stage::Planned) {
         let fact = usage_fact(u);
         if !fact.is_empty() {
             facts.push(fact);
@@ -1118,7 +1096,7 @@ fn format_row(
         no_eta,
         now,
         tokens,
-        lease,
+        usage,
         oom,
         click: RowClick {
             stage: row.stage,
@@ -1330,7 +1308,11 @@ pub fn show(
             sessions.extend(f.aliases.iter().map(String::as_str));
             sessions.extend(tracker.session_id.as_deref());
             sessions.extend(tracker.aliases.iter().map(String::as_str));
-            Some(with_ledger(f, &sessions, &l.ledger))
+            Some(with_live(
+                with_ledger(f, &sessions, &l.ledger),
+                &sessions,
+                &l.live,
+            ))
         }
         _ => None,
     };
@@ -1497,8 +1479,8 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
-    /// The lease column (giverny#164), between TASK and ELAPSED: as wide as
-    /// its widest cell, and not there at all while no row holds anything.
+    /// The use column (giverny#164, #182), between TASK and ELAPSED: as wide
+    /// as its widest cell, and not there at all while no row has one.
     leasew: usize,
     x_lease: usize,
     x_el_end: usize,
@@ -1518,7 +1500,7 @@ impl Cols {
         let leasew = table
             .lines
             .iter()
-            .map(|l| l.lease.chars().count().min(LEASE_MAX))
+            .map(|l| l.usage.chars().count().min(LEASE_MAX))
             .max()
             .unwrap_or(0);
         let lease_cols = if leasew > 0 { leasew + GAP } else { 0 };
@@ -1576,7 +1558,7 @@ impl Cols {
                 ),
             ),
             (right_at(self.x_tok_end, &line.tokens), line.tokens.clone()),
-            (self.x_lease, cut(&line.lease, self.leasew)),
+            (self.x_lease, cut(&line.usage, self.leasew)),
         ]
     }
 }
@@ -2484,35 +2466,35 @@ mod tests {
         Ledger::parse(json.as_bytes()).expect("test ledger parses")
     }
 
-    #[test]
-    fn a_lease_reads_compactly() {
-        let f = feed(LEASED);
-        assert_eq!(
-            lease_cell(f.rows[0].lease.as_ref().unwrap()),
-            "3G · 3c +slot"
-        );
-        let mut l = f.rows[0].lease.clone().unwrap();
-        l.slots.clear();
-        l.cpu = 0;
-        l.gpus = vec![0];
-        l.vram_mb = 8192;
-        assert_eq!(lease_cell(&l), "3G · gpu0 8G");
-        l.state = LeaseState::Smaller;
-        l.ram_mb = 2560;
-        l.wanted_ram_mb = Some(3072);
-        l.gpus.clear();
-        l.vram_mb = 0;
-        l.cpu = 3;
-        l.slots = vec!["a".into(), "b".into()];
-        assert_eq!(lease_cell(&l), "2.5G/3G · 3c +2 slots");
-        l.state = LeaseState::Queued;
-        l.position = Some(2);
-        assert!(lease_cell(&l).starts_with("wait "));
-        assert_eq!(lease_fact(&l), "queued #2 for 2.5G");
+    fn task_live(task: &str, cpu_pct: u32, mem_mb: u64) -> TaskLive {
+        TaskLive {
+            session: "s".into(),
+            task: task.into(),
+            live: RunLive { cpu_pct, mem_mb },
+        }
     }
 
     #[test]
-    fn a_rows_peak_use_follows_its_lease_and_an_oom_kill_is_flagged() {
+    fn the_use_cell_reads_compactly() {
+        let now = RunLive {
+            cpu_pct: 14,
+            mem_mb: 4300,
+        };
+        assert_eq!(usage_cell(Some(now), None, false), "14% CPU 4.2G");
+        assert_eq!(usage_cell(None, Some(2150), false), "2.1G");
+        assert_eq!(usage_cell(None, Some(128), true), "128M · OOM");
+        assert_eq!(usage_cell(None, Some(0), false), "");
+        assert_eq!(usage_cell(None, None, false), "");
+        let mut l = feed(LEASED).rows[0].lease.clone().unwrap();
+        l.state = LeaseState::Queued;
+        l.position = Some(2);
+        assert_eq!(lease_fact(&l), "queued #2 for 3G");
+    }
+
+    /// giverny#182: a Running row's cell is what its commands use now, not
+    /// its lease; a Done row's is its memory peak alone.
+    #[test]
+    fn a_running_row_shows_its_use_now_and_a_done_row_its_peak() {
         let json = r#"{"session":"s","rows":[
             {"key":"giverny#12","stage":"running","eta_s":1800,"started":1790000000000,
              "lease":{"state":"granted","id":"s:giverny#12","cpu":3,"ram_mb":3072,
@@ -2525,27 +2507,46 @@ mod tests {
             {"key":"giverny#14","stage":"done","started":1790000000000,"ended":1790000600000,
              "usage":{"runs":2,"peak_mb":512}},
             {"key":"giverny#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
+        // No run going: nothing in the cell, the lease in the header only.
         let t = build(Some(&feed(json)), &[], T0 + 60_000);
-        assert_eq!(t.lines[0].lease, "3G · 3c · peak 2.1G");
+        assert_eq!(t.lines[0].usage, "");
         assert!(!t.lines[0].oom);
+        let facts = &t.lines[0].click.facts;
+        assert!(facts.iter().any(|f| f == "holds 3 cpu, 3G"), "{facts:?}");
         assert!(
-            t.lines[0]
-                .click
-                .facts
+            facts
                 .iter()
                 .any(|f| f.starts_with("peak 2.1G of 3G, 45s CPU"))
         );
-        assert_eq!(t.lines[1].lease, "128M · 1c · peak 128M · OOM");
+        assert_eq!(t.lines[1].usage, "OOM");
         assert!(t.lines[1].oom);
-        assert_eq!(t.lines[2].lease, "peak 512M");
-        assert_eq!(t.lines[3].lease, "");
+        assert_eq!(t.lines[2].usage, "512M");
+        assert_eq!(t.lines[3].usage, "");
+        // A run going: its use now. Another session's run of the same key
+        // is not this row's.
+        let mut other = task_live("giverny#13", 50, 100);
+        other.session = "elsewhere".into();
+        let f = with_live(
+            feed(json),
+            &["s"],
+            &[
+                task_live("giverny#12", 14, 4300),
+                other,
+                task_live("giverny#14", 9, 9),
+            ],
+        );
+        let t = build(Some(&f), &[], T0 + 60_000);
+        assert_eq!(t.lines[0].usage, "14% CPU 4.2G");
+        assert_eq!(t.lines[1].usage, "OOM");
+        assert_eq!(t.lines[2].usage, "512M", "a Done row keeps its peak");
     }
 
     #[test]
-    fn a_running_row_shows_its_lease_and_a_queued_next_up_row_says_what_it_waits_for() {
+    fn a_running_row_keeps_its_lease_in_the_header_and_a_queued_next_up_row_says_what_it_waits_for()
+    {
         let t = build(Some(&feed(LEASED)), &[], T0 + 60_000);
         let (run, next) = (&t.lines[0], &t.lines[1]);
-        assert_eq!(run.lease, "3G · 3c +slot");
+        assert_eq!(run.usage, "", "the lease is not the cell");
         assert!(
             run.click
                 .facts
@@ -2555,24 +2556,27 @@ mod tests {
             run.click.facts
         );
         assert_eq!(next.now, "queued for 3G behind giverny#12");
-        assert_eq!(next.lease, "", "said in NOW, not twice");
-        // Drawn whole: a Next up row lends NOW the TOKENS column.
-        let cols = Cols::new(&t, 100);
-        let drawn = compose(&cols.segments(next));
+        assert_eq!(next.usage, "", "said in NOW, not twice");
+        // Nothing running: no use column, the title keeps its width.
+        assert_eq!(Cols::new(&t, 100).leasew, 0);
+        let busy = build(
+            Some(&with_live(
+                feed(LEASED),
+                &["s"],
+                &[task_live("giverny#12", 14, 4300)],
+            )),
+            &[],
+            T0 + 60_000,
+        );
+        let cols = Cols::new(&busy, 100);
+        let drawn = compose(&cols.segments(&busy.lines[1]));
         assert!(
             drawn.ends_with("queued for 3G behind giverny#12"),
             "{drawn}"
         );
-        let drawn = compose(&cols.segments(run));
-        assert!(drawn.contains("3G · 3c +slot"), "{drawn}");
-        // No lease anywhere: no lease column, the title keeps its width.
-        let bare = build(
-            Some(&feed(r#"{"rows":[{"key":"k","stage":"planned"}]}"#)),
-            &[],
-            T0,
-        );
-        assert_eq!(Cols::new(&bare, 100).leasew, 0);
-        assert!(Cols::new(&t, 100).taskw < Cols::new(&bare, 100).taskw);
+        let drawn = compose(&cols.segments(&busy.lines[0]));
+        assert!(drawn.contains("14% CPU 4.2G"), "{drawn}");
+        assert!(cols.taskw < Cols::new(&t, 100).taskw);
     }
 
     /// giverny#160's note: a row's copy is only as fresh as its session's
@@ -2614,8 +2618,8 @@ mod tests {
         let bare = feed(r#"{"session":"s","rows":[{"key":"giverny#12","stage":"running"}]}"#);
         let g = with_ledger(&bare, &["s", "old"], &l);
         assert_eq!(
-            lease_cell(g.rows[0].lease.as_ref().unwrap()),
-            "1G · 1c +slot"
+            lease_fact(g.rows[0].lease.as_ref().unwrap()),
+            "holds 1 cpu, 1G, slot cargo:/x/target"
         );
         assert!(
             with_ledger(&bare, &["s"], &l).rows[0].lease.is_none(),

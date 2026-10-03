@@ -17,6 +17,7 @@ pub mod plugin;
 pub mod profiles;
 pub mod registry;
 pub mod resources;
+pub mod run_live;
 pub mod subagents;
 pub mod tokens;
 pub mod transcript;
