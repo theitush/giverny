@@ -192,7 +192,7 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `brief` | string (absolute path) | no | A file shown read-only when a **Planned** row is clicked. |
 | `open` | string (shell command) | no | Run in a new tab when a **Running** or **Done** row is clicked, in place of Giverny's own transcript view (`giverny transcript --follow <agent jsonl>`) — e.g. `claude --resume <id>`. A command that resumes a conversation something is already running is not run: Giverny switches to the tab holding it, or says so. |
 | `note` | string | no | Free text; shown, with the row's key and title, for a Planned row with no `brief`, and as a tooltip otherwise. |
-| `review` | string | no | Done rows: the one line a person has to read before the row counts (`<who> — <what> — <where>`). It is shown at the top of the row's overlay, verbatim, and nothing is fetched. See **The Review line**. |
+| `review` | string | no | Done rows: the one line a person has to read before the row counts (`<who> — <what> — <where>`). It is shown at the top of the row's overlay, verbatim. See **The Review line**. |
 | `usage` | object | no | `giverny pass run`: what the task's commands used, measured — `runs`, `peak_mb` (the highest peak of any run, MiB), `cpu_s` and `wall_s` (summed), `oom_kills`, and the last run's `last_cmd`, `last_exit`, `last_peak_mb`, `last_at`, `capped` (held by a systemd scope) with its `cap_cpu`/`cap_ram_mb`. Kept on the Done row; its peak goes into the history at landing. See **Resources**. |
 | `lease` | object | no | `giverny pass claim`: what the machine ledger answered the row's task — `state` (`granted`, `smaller`, `queued`), `cpu`, `ram_mb`, `gpus` (indices), `vram_mb`, `slots`; granted rows add `id` and `granted_at` (and `smaller` ones `wanted_ram_mb`), queued rows `position` and `behind` (the holder it waits on). For a queued row the figures are the request. A copy as of the last `claim`, removed by `release`/`land`; the ledger is the truth. See **Resources**. |
 
@@ -240,8 +240,7 @@ Durations everywhere in the pane are written the way the ETA column writes them:
 
 When a **Done** row is clicked, the top of its overlay can carry one line saying what a person has to look at before the work counts.
 
-- **The row's `review` field** is that line. It is shown as written. This is what `giverny pass land --review` writes, and it needs nothing else.
-- **Without one, a `key` naming a GitHub issue** (`repo#12` or `owner/repo#12`) has the line read from the issue: one REST call through `gh` (`gh api repos/<owner>/<repo>/issues/<n>`), off the UI thread, taking the body's first `**Review:**` line above its first `---`. This only works where `gh` is installed and logged in. Where it is not, or the issue has no such line, the overlay opens without it.
+That line is the row's `review` field, shown as written. The orchestrator writes it with `giverny pass land <task> --review "<who> — <what> — <where>"`. A row without one opens with no Review line. Giverny does not look the line up anywhere else, such as an issue tracker.
 
 ## The orchestrator plugin
 

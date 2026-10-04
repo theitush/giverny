@@ -13,7 +13,6 @@ mod keymap;
 mod oom;
 mod overlays;
 mod rail;
-mod review;
 mod settings_ui;
 mod splash;
 mod taskbar;
@@ -3198,16 +3197,9 @@ impl App {
         }
         let plan = agent_open::plan(click);
         let button = self.overlay_button(parent, click);
-        // A Done row's task may have landed in Review: its Review line goes
-        // at the top of the overlay. The feed's own `review` text is used as
-        // is; else a key naming a GitHub issue has it fetched through `gh`
-        // off the UI thread.
-        let review = (click.stage == giverny_claude::feed::Stage::Done)
-            .then(|| match &click.review {
-                Some(text) => Some(review::ready(text)),
-                None => review::issue_of(&click.key).map(|issue| review::fetch(issue, ctx.clone())),
-            })
-            .flatten();
+        // A Done row's task may have landed in Review: the line its
+        // orchestrator wrote (`land --review`) goes at the top of the overlay.
+        let review = overlays::review_line(click.stage, click.review.as_deref());
         self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
         if self.brief.is_some() {
             self.brief_row = Some((parent, click.clone()));
@@ -4089,7 +4081,7 @@ impl App {
         plan: agent_open::Plan,
         facts: Vec<String>,
         button: overlays::Button,
-        review: Option<review::Slot>,
+        review: Option<String>,
     ) {
         use agent_open::{Body, Plan};
         let mut overlay = match plan {

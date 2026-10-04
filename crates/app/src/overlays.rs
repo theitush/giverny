@@ -281,9 +281,9 @@ pub struct BriefOverlay {
     pub source: Option<PathBuf>,
     /// The row's state in words (landing, timing, tokens).
     pub facts: Vec<String>,
-    /// A Done row's task's Review line, once fetched: drawn at
+    /// A Done row's Review line, as its orchestrator wrote it: drawn at
     /// the top, set apart, because it is what a person has to read.
-    pub review: Option<crate::review::Slot>,
+    pub review: Option<String>,
     pub content: Content,
     pub button: Button,
     /// Bumped whenever the text changes; the laid-out text is cached on it.
@@ -669,6 +669,18 @@ pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
 }
 
 /// The Review line, boxed in amber under the title: the first thing read.
+/// The Review line a clicked row's overlay shows: a Done row's `review`
+/// text from the feed (what `giverny pass land --review` writes), trimmed.
+/// Nothing for any other row, or for a blank line; nothing is looked up
+/// anywhere else.
+pub fn review_line(stage: giverny_claude::feed::Stage, review: Option<&str>) -> Option<String> {
+    (stage == giverny_claude::feed::Stage::Done)
+        .then_some(review?)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
 fn draw_review(ui: &mut egui::Ui, c: &crate::chrome::Chrome, line: &str) {
     ui.add_space(4.0);
     egui::Frame::new()
@@ -760,12 +772,8 @@ fn draw_overlay(
                             }
                         });
                     });
-                    let review = ov
-                        .review
-                        .as_ref()
-                        .and_then(|s| s.lock().ok().and_then(|g| g.clone()));
-                    if let Some(line) = review {
-                        draw_review(ui, &c, &line);
+                    if let Some(line) = &ov.review {
+                        draw_review(ui, &c, line);
                     }
                     let sub = match (&ov.source, &ov.content) {
                         (Some(src), _) => Some(src.display().to_string()),
@@ -885,6 +893,23 @@ fn draw_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_review_line_is_the_feeds_and_only_a_done_rows() {
+        use giverny_claude::feed::Stage;
+        let line = "sam — the empty state — branch x";
+        assert_eq!(review_line(Stage::Done, Some(line)).as_deref(), Some(line));
+        assert_eq!(
+            review_line(Stage::Done, Some("  sam — look \n")).as_deref(),
+            Some("sam — look")
+        );
+        // No text in the feed: nothing, whatever the key names.
+        assert_eq!(review_line(Stage::Done, None), None);
+        assert_eq!(review_line(Stage::Done, Some("   ")), None);
+        // Only a Done row carries one.
+        assert_eq!(review_line(Stage::Running, Some(line)), None);
+        assert_eq!(review_line(Stage::Planned, Some(line)), None);
+    }
 
     #[test]
     fn fuzzy_prefers_word_starts_and_runs() {
