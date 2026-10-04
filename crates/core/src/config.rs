@@ -359,9 +359,33 @@ fn unknown_keys(input: &toml::Value, known: &toml::Value, prefix: &str, out: &mu
     }
 }
 
+/// Config text, parsed as far as it goes.
+#[derive(Debug, Clone)]
+pub struct Parsed {
+    pub config: Config,
+    /// Keys this build does not know, dropped (dotted paths).
+    pub unknown: Vec<String>,
+    /// Keys whose value could not be used — the wrong type, say — each with
+    /// why. Such a key keeps the value it had (`previous`'s), and every other
+    /// key in the file still applies.
+    pub invalid: Vec<(String, String)>,
+}
+
+impl Parsed {
+    /// Did anything at or under `key` (a dotted path) fail to apply?
+    pub fn invalid_under(&self, key: &str) -> bool {
+        self.invalid.iter().any(|(path, _)| {
+            path == key
+                || path.starts_with(&format!("{key}."))
+                || key.starts_with(&format!("{path}."))
+        })
+    }
+}
+
 /// Parse config text. Keys this build does not know are dropped and returned
 /// beside the config rather than failing the whole file; a value of the wrong
-/// type is still an error.
+/// type is still an error. See [`parse_over`] for a parse that keeps the
+/// rest of the file when one value is wrong.
 pub fn parse(text: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
     let cfg: Config = toml::from_str(text)?;
     let mut unknown = Vec::new();
@@ -371,46 +395,158 @@ pub fn parse(text: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
     Ok((cfg, unknown))
 }
 
-fn read(path: &Path) -> Option<Result<Config, String>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(match parse(&text) {
-        Ok((cfg, unknown)) => {
-            if !unknown.is_empty() {
-                tracing::warn!("config.toml: ignoring unknown keys: {}", unknown.join(", "));
+/// Parse config text key by key, so one bad value costs that value and not
+/// the file. Only text that is not TOML at all is an error. A key whose value
+/// does not fit keeps `previous`'s value for it (the defaults, at startup)
+/// and is listed in [`Parsed::invalid`]; unknown keys are dropped as in
+/// [`parse`].
+pub fn parse_over(text: &str, previous: &Config) -> Result<Parsed, toml::de::Error> {
+    let input: toml::Value = text.parse()?;
+    if let Ok((config, unknown)) = parse(text) {
+        return Ok(Parsed {
+            config,
+            unknown,
+            invalid: Vec::new(),
+        });
+    }
+    let empty = || toml::Value::Table(toml::Table::new());
+    let mut good = empty();
+    let mut invalid = Vec::new();
+    if let Some(table) = input.as_table() {
+        for (key, value) in table {
+            salvage(&mut good, &[key.as_str()], value, &mut invalid);
+        }
+    }
+    // A key that did not fit keeps what was there before it, where that
+    // value is itself one the config takes.
+    if let Ok(prev) = toml::Value::try_from(previous) {
+        for (path, _) in &invalid {
+            let keys: Vec<&str> = path.split('.').collect();
+            if let Some(old) = lookup(&prev, &keys) {
+                let mut with = good.clone();
+                insert(&mut with, &keys, old.clone());
+                if with.clone().try_into::<Config>().is_ok() {
+                    good = with;
+                }
             }
-            Ok(cfg)
+        }
+    }
+    let config: Config = good.try_into().unwrap_or_default();
+    let mut unknown = Vec::new();
+    if let Ok(known) = toml::Value::try_from(&config) {
+        unknown_keys(&input, &known, "", &mut unknown);
+    }
+    Ok(Parsed {
+        config,
+        unknown,
+        invalid,
+    })
+}
+
+/// Add `value` at `keys` to `good` if the config still deserializes with it.
+/// A table that does not fit whole is tried key by key, so what is wrong is
+/// narrowed to the values themselves; a value that does not fit is recorded
+/// in `invalid` with why.
+fn salvage(
+    good: &mut toml::Value,
+    keys: &[&str],
+    value: &toml::Value,
+    invalid: &mut Vec<(String, String)>,
+) {
+    let mut with = good.clone();
+    insert(&mut with, keys, value.clone());
+    let err = match with.clone().try_into::<Config>() {
+        Ok(_) => {
+            *good = with;
+            return;
+        }
+        Err(err) => err,
+    };
+    if let Some(table) = value.as_table().filter(|t| !t.is_empty()) {
+        for (key, inner) in table {
+            let mut path = keys.to_vec();
+            path.push(key);
+            salvage(good, &path, inner, invalid);
+        }
+        return;
+    }
+    invalid.push((keys.join("."), err.message().trim().to_string()));
+}
+
+fn lookup<'a>(value: &'a toml::Value, keys: &[&str]) -> Option<&'a toml::Value> {
+    keys.iter().try_fold(value, |v, k| v.as_table()?.get(*k))
+}
+
+/// Set `keys` in `root` to `value`, creating the tables on the way.
+fn insert(root: &mut toml::Value, keys: &[&str], value: toml::Value) {
+    let Some((last, parents)) = keys.split_last() else {
+        return;
+    };
+    let mut at = root;
+    for key in parents {
+        let Some(table) = at.as_table_mut() else {
+            return;
+        };
+        at = table
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    }
+    if let Some(table) = at.as_table_mut() {
+        table.insert(last.to_string(), value);
+    }
+}
+
+fn read(path: &Path, previous: &Config) -> Option<Result<Parsed, String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(match parse_over(&text, previous) {
+        Ok(parsed) => {
+            if !parsed.unknown.is_empty() {
+                tracing::warn!(
+                    "config.toml: ignoring unknown keys: {}",
+                    parsed.unknown.join(", ")
+                );
+            }
+            for (key, why) in &parsed.invalid {
+                tracing::error!("config.toml: ignoring {key} ({why}); it keeps its current value");
+            }
+            Ok(parsed)
         }
         Err(err) => Err(err.to_string()),
     })
 }
 
 /// Load the config, writing the commented template on first run. Unknown keys
-/// are warned about and skipped; an invalid file is reported and ignored
-/// rather than blocking startup.
+/// are warned about and skipped, a value that does not fit is reported and
+/// left at its default, and a file that is not TOML at all is reported and
+/// ignored rather than blocking startup.
 pub fn load(base: &Path) -> Config {
     load_or(base, &Config::default())
 }
 
-/// Like [`load`], but a file that cannot be parsed yields `previous` instead
-/// of defaults, so a hot-reload never resets running settings.
+/// Like [`load`], but what cannot be used keeps `previous`'s value instead of
+/// the default — the whole of it when the file is not TOML at all — so a
+/// hot-reload never resets running settings.
 pub fn load_or(base: &Path, previous: &Config) -> Config {
-    load_checked(base).unwrap_or_else(|err| {
-        tracing::error!("config.toml ignored ({err}); keeping previous settings");
-        previous.clone()
-    })
+    match load_checked(base, previous) {
+        Ok(parsed) => parsed.config,
+        Err(err) => {
+            tracing::error!("config.toml ignored ({err}); keeping previous settings");
+            previous.clone()
+        }
+    }
 }
 
-/// Like [`load`], but says when the file exists and cannot be parsed, rather
-/// than quietly standing defaults in for it. Defaults in that case are not
-/// what the user configured, so a caller that would write them somewhere
-/// else (an account's `settings.json`, say) must not treat them as if they
-/// were. A missing file is not an error: it is the first run, and gets the
-/// template and defaults as [`load`] does.
-pub fn load_checked(base: &Path) -> Result<Config, String> {
+/// Like [`load_or`], but says what could not be read rather than quietly
+/// standing other values in for it: `Err` when the file exists and is not
+/// TOML at all, and [`Parsed::invalid`] for each value that did not fit.
+/// Values stood in are not what the user configured, so a caller that would
+/// write them somewhere else (an account's `settings.json`, say) must not
+/// treat them as if they were. A missing file is not an error: it is the
+/// first run, and gets the template and defaults as [`load`] does.
+pub fn load_checked(base: &Path, previous: &Config) -> Result<Parsed, String> {
     let path = config_path(base);
-    match read(&path) {
-        Some(Ok(cfg)) => Ok(cfg),
-        Some(Err(err)) => Err(err),
+    match read(&path, previous) {
+        Some(result) => result,
         None => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -418,7 +554,11 @@ pub fn load_checked(base: &Path) -> Result<Config, String> {
             // Generated from the settings table, so the file can never
             // document an option the app does not have.
             let _ = std::fs::write(&path, crate::settings::template());
-            Ok(Config::default())
+            Ok(Parsed {
+                config: Config::default(),
+                unknown: Vec::new(),
+                invalid: Vec::new(),
+            })
         }
     }
 }
@@ -483,14 +623,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file that cannot be parsed is reported, not passed off as defaults,
-    /// and is left exactly as the user wrote it.
+    /// A file that is not TOML at all is reported, not passed off as
+    /// defaults, and is left exactly as the user wrote it.
     #[test]
     fn unparseable_config_is_an_error_not_defaults() {
         let dir = scratch("broken");
-        let broken = "[font]\nsize = \"large\"\n";
+        let broken = "[font\nsize = 16.0\n";
         std::fs::write(config_path(&dir), broken).unwrap();
-        assert!(load_checked(&dir).is_err());
+        assert!(load_checked(&dir, &Config::default()).is_err());
         // `load_or` still keeps what was running, and neither one rewrites
         // the file.
         let previous = Config {
@@ -505,9 +645,108 @@ mod tests {
 
         // A missing file is a first run, not an error.
         let fresh = scratch("broken-fresh");
-        assert!(load_checked(&fresh).is_ok());
+        assert!(load_checked(&fresh, &Config::default()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    const ONE_BAD_VALUE: &str = "[font]\nsize = \"big\"\nfamily = \"Iosevka\"\n\
+        [theme]\nname = \"ink\"\n\
+        [behavior]\nscrollback_lines = 500\nnotifications = false\n\
+        [claude]\nagents_pane = false\nauto_mode = true\n";
+
+    /// One value of the wrong type costs that value, not the file: every
+    /// other key, in its section and in the others, still applies, and the
+    /// bad one is named.
+    #[test]
+    fn one_bad_value_keeps_every_other_key() {
+        let parsed = parse_over(ONE_BAD_VALUE, &Config::default()).unwrap();
+        let cfg = &parsed.config;
+        assert_eq!(cfg.font.size, FontConfig::default().size, "bad: default");
+        assert_eq!(cfg.font.family, "Iosevka", "same section, kept");
+        assert_eq!(cfg.theme.name, "ink");
+        assert_eq!(cfg.behavior.scrollback_lines, 500);
+        assert!(!cfg.behavior.notifications);
+        assert!(!cfg.claude.agents_pane);
+        assert!(cfg.claude.auto_mode);
+        let names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["font.size"]);
+        assert!(!parsed.invalid[0].1.is_empty(), "with why");
+        assert!(parsed.unknown.is_empty(), "a bad key is not an unknown one");
+        assert!(parsed.invalid_under("font"));
+        assert!(parsed.invalid_under("font.size"));
+        assert!(!parsed.invalid_under("claude"));
+        assert!(!parsed.invalid_under("fon"));
+
+        // On a reload the bad key keeps what was running, not the default.
+        let previous = Config {
+            font: FontConfig {
+                size: 21.0,
+                ..FontConfig::default()
+            },
+            ..Config::default()
+        };
+        let reloaded = parse_over(ONE_BAD_VALUE, &previous).unwrap().config;
+        assert_eq!(reloaded.font.size, 21.0);
+        assert_eq!(reloaded.font.family, "Iosevka");
+        assert_eq!(reloaded.theme.name, "ink");
+    }
+
+    /// A whole section of the wrong shape, and a bad value deep in a nested
+    /// table, are each narrowed to what is wrong.
+    #[test]
+    fn bad_values_are_found_at_any_depth() {
+        let text = "titles = 5\n[font]\nsize = 15.0\n\
+            [orchestrator.limits]\nram = \"lots\"\ncpu_cores = 3\n";
+        let parsed = parse_over(text, &Config::default()).unwrap();
+        let mut names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["orchestrator.limits.ram", "titles"]);
+        assert_eq!(parsed.config.font.size, 15.0);
+        assert_eq!(
+            parsed.config.orchestrator.limits.cpu_cores,
+            crate::limits::Limits::from_config_str("[orchestrator.limits]\ncpu_cores = 3\n")
+                .unwrap()
+                .cpu_cores
+        );
+        assert!(parsed.config.titles.strip_host_prefix, "default kept");
+    }
+
+    /// Unknown keys are dropped and listed as before, beside a bad value or
+    /// without one, and never count as invalid.
+    #[test]
+    fn unknown_keys_behave_as_before() {
+        let text = format!("{ONE_BAD_VALUE}[font.extra]\nweight = 3\n[nonsense]\nx = 1\n");
+        let parsed = parse_over(&text, &Config::default()).unwrap();
+        let mut unknown = parsed.unknown.clone();
+        unknown.sort_unstable();
+        assert_eq!(unknown, ["font.extra", "nonsense"]);
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(parsed.config.font.family, "Iosevka");
+
+        let clean = "[font]\nsize = 15.0\nweight = 3\n";
+        let parsed = parse_over(clean, &Config::default()).unwrap();
+        assert_eq!(parsed.unknown, ["font.weight"]);
+        assert!(parsed.invalid.is_empty());
+        assert_eq!(parsed.config.font.size, 15.0);
+        assert_eq!(parse(clean).unwrap().1, parsed.unknown);
+    }
+
+    /// A startup with one bad value loads every other key and leaves the
+    /// file as written.
+    #[test]
+    fn a_bad_value_on_disk_loads_the_rest() {
+        let dir = scratch("one-bad");
+        std::fs::write(config_path(&dir), ONE_BAD_VALUE).unwrap();
+        let parsed = load_checked(&dir, &Config::default()).unwrap();
+        assert_eq!(parsed.config.theme.name, "ink");
+        assert_eq!(parsed.invalid.len(), 1);
+        assert_eq!(load(&dir).font.family, "Iosevka");
+        assert_eq!(
+            std::fs::read_to_string(config_path(&dir)).unwrap(),
+            ONE_BAD_VALUE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -650,11 +889,17 @@ mod tests {
         // Unknown key: the known keys still apply.
         std::fs::write(config_path(&dir), "[font]\nsize = 20.0\nnew_key = true\n").unwrap();
         assert_eq!(load_or(&dir, &prev).font.size, 20.0);
-        // Invalid value: running settings stay as they were.
-        std::fs::write(config_path(&dir), "[font]\nsize = \"big\"\n").unwrap();
+        // Invalid value: that one keeps its running value, while the rest of
+        // the file still applies.
+        std::fs::write(
+            config_path(&dir),
+            "[font]\nsize = \"big\"\n[claude]\nauto_mode = true\nagents_pane = false\n",
+        )
+        .unwrap();
         let kept = load_or(&dir, &prev);
         assert_eq!(kept.font.size, 31.0);
         assert!(kept.claude.auto_mode);
+        assert!(!kept.claude.agents_pane);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
