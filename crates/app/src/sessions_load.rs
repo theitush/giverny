@@ -71,8 +71,16 @@ fn read_loop(shared: &Shared, ctx: &egui::Context) {
 }
 
 /// The line's figures: `45% CPU  4.2G`, and `  gpu 1.2G` with a GPU.
+/// Unpadded: the status line pads its figures to fixed widths to hold
+/// them in their columns, which a line read from the left has no use for.
 pub fn figures(u: &AllUse) -> String {
-    giverny_claude::session_use::segments(&u.total).join("  ")
+    use giverny_claude::session_use::gb;
+    let t = &u.total;
+    let mut s = format!("{}% CPU  {}", t.cpu_pct.min(100), gb(t.mem_mb));
+    if let Some(g) = t.gpu_mb {
+        s.push_str(&format!("  gpu {}", gb(g)));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -93,5 +101,11 @@ mod tests {
         assert_eq!(figures(&u), "45% CPU  4.2G");
         u.total.gpu_mb = Some(1229);
         assert_eq!(figures(&u), "45% CPU  4.2G  gpu 1.2G");
+        u.total = SessionUse {
+            cpu_pct: 3,
+            mem_mb: 12 * 1024,
+            gpu_mb: Some(12 * 1024),
+        };
+        assert_eq!(figures(&u), "3% CPU  12G  gpu 12G");
     }
 }
