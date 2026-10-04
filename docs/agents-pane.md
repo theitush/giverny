@@ -283,6 +283,14 @@ Claude Code runs that command at least every five seconds while a session has li
 - **An account whose `subagentStatusLine` is someone else's** is left alone: the installer never replaces a command it did not write. On that account the pane gets no live rows.
 - **Project settings override user settings.** A project that sets its own `subagentStatusLine` shadows Giverny's. To keep both, that command must pass through. Inside a Giverny tab (`GIVERNY_TAB_ID` set), pipe the stdin it received, byte for byte, into `giverny relay --subagent-line`, and print that command's stdout as its own. It must not add decorations of its own for ids the relay hid.
 
+## Known limits
+
+- **`giverny pass run` caps and measures only on Linux with a user systemd.** Elsewhere — macOS, Windows, a container, no user systemd — the command runs uncapped and the lease is advisory, and its memory peak is the largest single process's, not the whole tree's. On Windows two `run`s under one lease do not take its slots in turn (there is no slot lock there). macOS has not been tried.
+- **A plain `run` shows no live use.** Without a systemd scope there is no cgroup to read, so the pane's use column stays empty while the command runs; its peak and CPU time appear once it ends.
+- **An `ask` waits for its orchestrator's next own tool call.** An orchestrator blocked in a long tool call (waiting on its workers, say) does not see it until that call returns.
+- **An `ask` is addressed by session id.** One sent to a session that has since been re-id'd (`/clear`, a compaction) never arrives.
+- **A held lease does not grow.** `claim` only shrinks one in place; to grow it, release it and claim again, which gives up its place in the queue.
+
 ## Versioning
 
 - `version` is bumped **only for an incompatible change** — a field whose meaning or type changes, or a new field a reader must understand to draw the table correctly.
