@@ -37,7 +37,7 @@
 //!
 //! **Resources**: what a row's `giverny pass run`
 //! commands use in a quiet column — live CPU and memory while one runs, the
-//! memory peak once the row is Done — its lease from the machine ledger in
+//! memory peak once the row is Done, a dim zero when there is neither — its lease from the machine ledger in
 //! its overlay header, a Next up row's place in the ledger's queue in NOW,
 //! and the machine's leases against its limits on a dim bottom line. The
 //! ledger and the commands' cgroups are read off the UI thread
@@ -651,30 +651,25 @@ fn mem4(mb: u64) -> String {
     format!("{s:>4}")
 }
 
-/// How wide every non-empty [`usage_cell`] is: `100% CPU 4.2G OOM`.
+/// How wide every [`usage_cell`] is: `100% CPU 4.2G OOM`.
 const USAGE_W: usize = 17;
 
 /// A row's use in its cell: a Running row's commands now,
 /// `  14% CPU 4.2G` (CPU as a share of the whole machine, so at most
 /// `100%`), a Done row's memory peak alone in the same place, `4.2G`;
-/// `OOM` after either when the memory cap killed a run. Every slot has a
-/// fixed width, so every non-empty cell is [`USAGE_W`] characters and the
-/// column never jumps as the figures change. Empty when there is nothing
-/// to say. The lease is not here: the overlay header says it
-/// ([`lease_fact`]).
+/// `OOM` after either when the memory cap killed a run. Nothing measured
+/// reads as zero, `  0M`, never as a blank: the cell is always there. Every
+/// slot has a fixed width, so every cell is [`USAGE_W`] characters and the
+/// column never jumps as the figures change. The lease is not here: the
+/// overlay header says it ([`lease_fact`]).
 pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool) -> String {
-    let peak = peak_mb.filter(|&p| p > 0);
-    if live.is_none() && peak.is_none() && !oom {
-        return String::new();
-    }
     let cpu = match live {
         Some(l) => format!("{:>3}% CPU ", l.cpu_pct.min(100)),
         None => " ".repeat(9),
     };
-    let memory = match (live, peak) {
-        (Some(l), _) => mem4(l.mem_mb),
-        (None, Some(p)) => mem4(p),
-        (None, None) => " ".repeat(4),
+    let memory = match live {
+        Some(l) => mem4(l.mem_mb),
+        None => mem4(peak_mb.unwrap_or(0)),
     };
     let oom = if oom { " OOM" } else { "    " };
     format!("{cpu}{memory}{oom}")
@@ -869,9 +864,12 @@ pub struct Line {
     pub no_eta: bool,
     pub now: String,
     pub tokens: String,
-    /// What the row's commands use ([`usage_cell`]): live on a Running row,
-    /// the memory peak on a Done one; empty when nothing.
+    /// What the row's commands use ([`usage_cell`]): live on a Running row
+    /// (zero between its commands), the memory peak on a Done one (zero when
+    /// nothing was measured); empty on a Next up row.
     pub usage: String,
+    /// `usage` is all zeros, nothing going or measured: drawn dim.
+    pub usage_idle: bool,
     /// A `giverny pass run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
@@ -1068,10 +1066,19 @@ fn format_row(
     // a Done row's memory peak alone.
     let measured = f.and_then(|f| f.usage.as_ref());
     let oom = measured.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
-    let usage = match row.stage {
-        Stage::Running => usage_cell(f.and_then(|f| f.live), None, oom),
-        Stage::Done => usage_cell(None, measured.and_then(|u| u.peak_mb), oom),
-        Stage::Planned => String::new(),
+    // Running and Done rows always have a cell, zero when nothing is going
+    // or was measured; Next up rows say what they wait for in NOW instead.
+    let peak = measured.and_then(|u| u.peak_mb);
+    let (usage, usage_idle) = match row.stage {
+        Stage::Running => {
+            let live = f.and_then(|f| f.live).unwrap_or_default();
+            (
+                usage_cell(Some(live), None, oom),
+                live.mem_mb == 0 && live.cpu_pct == 0,
+            )
+        }
+        Stage::Done => (usage_cell(None, peak, oom), peak.unwrap_or(0) == 0),
+        Stage::Planned => (String::new(), false),
     };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let now = match row.stage {
@@ -1124,6 +1131,7 @@ fn format_row(
         now,
         tokens,
         usage,
+        usage_idle,
         oom,
         click: RowClick {
             stage: row.stage,
@@ -1501,8 +1509,8 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
-    /// The use column, between TASK and ELAPSED: [`USAGE_W`] wide, and not
-    /// there at all while no row has a cell.
+    /// The use column, between TASK and ELAPSED: [`USAGE_W`] wide while any
+    /// row is Running or Done, not there at all while every row is Next up.
     leasew: usize,
     x_lease: usize,
     x_el_end: usize,
@@ -1519,8 +1527,8 @@ impl Cols {
             .map(|l| l.id.chars().count())
             .max()
             .unwrap_or(0);
-        // Every cell is USAGE_W wide or empty: the column is one width
-        // whenever it is there.
+        // Every Running and Done row has a USAGE_W-wide cell, a Next up row
+        // none: the column is one width whenever it is there.
         let leasew = if table.lines.iter().any(|l| !l.usage.is_empty()) {
             USAGE_W
         } else {
@@ -1853,6 +1861,8 @@ fn draw_table(
                 chrome.dim
             } else if quiet && line.is_some_and(|l| l.oom) {
                 chrome.amber
+            } else if quiet && line.is_some_and(|l| l.usage_idle) {
+                chrome.dim
             } else if quiet {
                 color.gamma_multiply(LEASE_INK)
             } else {
@@ -2502,15 +2512,19 @@ mod tests {
         assert_eq!(usage_cell(Some(now), None, false), " 14% CPU 4.2G    ");
         assert_eq!(usage_cell(None, Some(2150), false), "         2.1G    ");
         assert_eq!(usage_cell(None, Some(128), true), "         128M OOM");
-        assert_eq!(usage_cell(None, Some(0), false), "");
-        assert_eq!(usage_cell(None, None, false), "");
+        assert_eq!(usage_cell(None, Some(0), false), "           0M    ");
+        assert_eq!(usage_cell(None, None, false), "           0M    ");
+        assert_eq!(
+            usage_cell(Some(RunLive::default()), None, false),
+            "  0% CPU   0M    "
+        );
         let mut l = feed(LEASED).rows[0].lease.clone().unwrap();
         l.state = LeaseState::Queued;
         l.position = Some(2);
         assert_eq!(lease_fact(&l), "queued #2 for 3G");
     }
 
-    /// Every cell that says anything is as wide as every other, whatever
+    /// Every cell is as wide as every other, whatever
     /// the figures and the state, so the column and what follows it hold
     /// still.
     #[test]
@@ -2547,10 +2561,8 @@ mod tests {
             for oom in [false, true] {
                 for peak in [None, Some(0), Some(m)] {
                     let cell = usage_cell(None, peak, oom);
-                    if !cell.is_empty() {
-                        assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
-                        seen += 1;
-                    }
+                    assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
+                    seen += 1;
                 }
                 for &cpu_pct in &cpus {
                     let live = RunLive { cpu_pct, mem_mb: m };
@@ -2561,7 +2573,7 @@ mod tests {
             }
         }
         assert!(seen > 300);
-        assert_eq!(usage_cell(None, None, false), "");
+        assert_eq!(usage_cell(None, None, false).chars().count(), USAGE_W);
         assert_eq!(mem4(980), "980M");
         assert_eq!(mem4(1000), "1.0G");
         assert_eq!(mem4(10_188), "9.9G");
@@ -2585,9 +2597,10 @@ mod tests {
             {"key":"demo#14","stage":"done","started":1790000000000,"ended":1790000600000,
              "usage":{"runs":2,"peak_mb":512}},
             {"key":"demo#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
-        // No run going: nothing in the cell, the lease in the header only.
+        // No run going: zero in the cell, dim, the lease in the header only.
         let t = build(Some(&feed(json)), &[], T0 + 60_000);
-        assert_eq!(t.lines[0].usage, "");
+        assert_eq!(t.lines[0].usage, "  0% CPU   0M    ");
+        assert!(t.lines[0].usage_idle);
         assert!(!t.lines[0].oom);
         let facts = &t.lines[0].click.facts;
         assert!(facts.iter().any(|f| f == "holds 3 cpu, 3G"), "{facts:?}");
@@ -2596,10 +2609,13 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("peak 2.1G of 3G, 45s CPU"))
         );
-        assert_eq!(t.lines[1].usage, "              OOM");
+        assert_eq!(t.lines[1].usage, "  0% CPU   0M OOM");
         assert!(t.lines[1].oom);
         assert_eq!(t.lines[2].usage, "         512M    ");
-        assert_eq!(t.lines[3].usage, "");
+        assert!(!t.lines[2].usage_idle);
+        // Done with nothing measured: a zero peak, not a blank.
+        assert_eq!(t.lines[3].usage, "           0M    ");
+        assert!(t.lines[3].usage_idle);
         // A run going: its use now. Another session's run of the same key
         // is not this row's.
         let mut other = task_live("demo#13", 50, 100);
@@ -2615,7 +2631,8 @@ mod tests {
         );
         let t = build(Some(&f), &[], T0 + 60_000);
         assert_eq!(t.lines[0].usage, " 14% CPU 4.2G    ");
-        assert_eq!(t.lines[1].usage, "              OOM");
+        assert!(!t.lines[0].usage_idle);
+        assert_eq!(t.lines[1].usage, "  0% CPU   0M OOM");
         assert_eq!(
             t.lines[2].usage, "         512M    ",
             "a Done row keeps its peak"
@@ -2627,7 +2644,7 @@ mod tests {
     {
         let t = build(Some(&feed(LEASED)), &[], T0 + 60_000);
         let (run, next) = (&t.lines[0], &t.lines[1]);
-        assert_eq!(run.usage, "", "the lease is not the cell");
+        assert_eq!(run.usage, "  0% CPU   0M    ", "the lease is not the cell");
         assert!(
             run.click
                 .facts
@@ -2638,8 +2655,14 @@ mod tests {
         );
         assert_eq!(next.now, "queued for 3G behind demo#12");
         assert_eq!(next.usage, "", "said in NOW, not twice");
-        // Nothing running: no use column, the title keeps its width.
-        assert_eq!(Cols::new(&t, 100).leasew, 0);
+        // A Running row between commands: the column is there all the same.
+        assert_eq!(Cols::new(&t, 100).leasew, USAGE_W);
+        // Every row Next up: no use column, the title keeps its width.
+        let queued = Table {
+            lines: vec![next.clone()],
+            ..Default::default()
+        };
+        assert_eq!(Cols::new(&queued, 100).leasew, 0);
         let busy = build(
             Some(&with_live(
                 feed(LEASED),
@@ -2655,7 +2678,7 @@ mod tests {
         let drawn = compose(&cols.segments(&busy.lines[0]));
         assert!(drawn.contains("14% CPU 4.2G"), "{drawn}");
         assert_eq!(cols.leasew, USAGE_W);
-        assert!(cols.taskw < Cols::new(&t, 100).taskw);
+        assert!(cols.taskw < Cols::new(&queued, 100).taskw);
     }
 
     /// A row's copy is only as fresh as its session's
