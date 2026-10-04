@@ -979,13 +979,23 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
+/// Can account setup follow this config? Not when a value it reads — the
+/// `[claude]` section — is one that did not fit and was stood in for.
+fn accounts_readable(parsed: &config::Parsed) -> bool {
+    !parsed.invalid_under("claude")
+}
+
 /// Bring every account in line with the config at startup: auto mode.
 ///
-/// Not when the config could not be parsed (`config_read` false). The app
-/// then runs on defaults, and following those would rewrite accounts against
-/// what the user configured. Once the file parses again, the hot reload
-/// applies what it says.
-fn set_up_accounts(claude: &mut claude_watch::ClaudeWatch, cfg: &config::Config, config_read: bool) {
+/// Not when the config could not be parsed, or its `[claude]` values could
+/// not (`config_read` false). The app then runs on defaults there, and
+/// following those would rewrite accounts against what the user configured.
+/// Once the file parses again, the hot reload applies what it says.
+fn set_up_accounts(
+    claude: &mut claude_watch::ClaudeWatch,
+    cfg: &config::Config,
+    config_read: bool,
+) {
     if !config_read {
         tracing::warn!(
             "config.toml could not be parsed: Claude account settings left as they are until it is fixed"
@@ -1208,14 +1218,19 @@ impl App {
         let paths = Paths::default_dirs();
         // A config that cannot be parsed runs on defaults, but those are not
         // what the user chose, so nothing is written into the accounts from
-        // them (see `set_up_accounts`).
-        let (mut cfg, config_read) = match config::load_checked(paths.base()) {
-            Ok(cfg) => (cfg, true),
-            Err(err) => {
-                tracing::error!("config.toml ignored ({err}); running on defaults");
-                (config::Config::default(), false)
-            }
-        };
+        // them (see `set_up_accounts`). Nor when only a value account setup
+        // reads is unusable: one bad value is otherwise just left out.
+        let (mut cfg, config_read) =
+            match config::load_checked(paths.base(), &config::Config::default()) {
+                Ok(parsed) => {
+                    let read = accounts_readable(&parsed);
+                    (parsed.config, read)
+                }
+                Err(err) => {
+                    tracing::error!("config.toml ignored ({err}); running on defaults");
+                    (config::Config::default(), false)
+                }
+            };
         remember_env_accounts(&paths, &mut cfg);
         let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
@@ -2366,10 +2381,11 @@ impl App {
     /// Read `config.toml` again and apply it. A file that does not parse
     /// changes nothing: the running settings stay.
     fn reload_config(&mut self, ctx: &egui::Context) {
-        match config::load_checked(self.paths.base()) {
-            Ok(cfg) => {
-                self.apply_config(ctx, cfg);
-                if std::mem::take(&mut self.accounts_unset) {
+        match config::load_checked(self.paths.base(), &self.cfg) {
+            Ok(parsed) => {
+                let read = accounts_readable(&parsed);
+                self.apply_config(ctx, parsed.config);
+                if read && std::mem::take(&mut self.accounts_unset) {
                     tracing::info!("config.toml parses again: setting up Claude accounts");
                     set_up_accounts(&mut self.claude, &self.cfg, true);
                 }
@@ -3797,6 +3813,17 @@ mod tests {
         }
         // A bare word naming something that exists is a path, not a command.
         assert!(!is_unknown_subcommand("project", true));
+    }
+
+    /// One bad value elsewhere still lets account setup follow the config; a
+    /// bad value in what it reads does not.
+    #[test]
+    fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
+        let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
+        assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
+        assert!(accounts_readable(&parse("[claude]\nauto_mode = false\n")));
+        assert!(!accounts_readable(&parse("[claude]\nauto_mode = \"no\"\n")));
+        assert!(!accounts_readable(&parse("claude = 5\n")));
     }
 
     /// A config that cannot be parsed leaves every account as it was —
