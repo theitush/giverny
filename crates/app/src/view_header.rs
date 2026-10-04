@@ -163,6 +163,7 @@ mod tests {
             now: now.into(),
             tokens: tokens.into(),
             usage: String::new(),
+            usage_idle: false,
             oom: false,
             click: RowClick {
                 stage: Stage::Running,
