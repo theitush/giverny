@@ -1466,7 +1466,10 @@ fn sessions_load_row(ui: &mut Ui, dim: Color32, fg: Color32) {
     };
     ui.add_space(3.0);
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    let (mut rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    // A wide row above (a banner, a button) can stretch the panel's
+    // layout past what is shown: the figures end at the visible edge.
+    rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
     let p = ui.painter_at(rect);
     p.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
