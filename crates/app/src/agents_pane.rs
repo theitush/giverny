@@ -96,8 +96,6 @@ const ETA_SEG: usize = 3;
 const LEASE_SEG: usize = 6;
 /// How strongly a use cell is inked, against its row's colour.
 const LEASE_INK: f32 = 0.75;
-/// The widest a use cell is drawn; a longer one is cut.
-const LEASE_MAX: usize = 32;
 
 // --------------------------------------------------------- view state ----
 
@@ -632,23 +630,54 @@ fn mem(mb: u64) -> String {
     }
 }
 
+/// A size in exactly four characters, for [`usage_cell`]: `980M`, `1.0G`,
+/// `4.2G`, ` 12G`, `128G`, `1.5T`. Tenths only below ten, so the figure
+/// never grows a fifth character.
+fn mem4(mb: u64) -> String {
+    if mb < 1000 {
+        return format!("{:>4}", format!("{mb}M"));
+    }
+    let mut v = mb as f64 / 1024.0;
+    let mut unit = 'G';
+    if v >= 999.5 {
+        v /= 1024.0;
+        unit = 'T';
+    }
+    let s = if v < 9.95 {
+        format!("{v:.1}{unit}")
+    } else {
+        format!("{:.0}{unit}", v.min(999.0))
+    };
+    format!("{s:>4}")
+}
+
+/// How wide every non-empty [`usage_cell`] is: `100% CPU 4.2G OOM`.
+const USAGE_W: usize = 17;
+
 /// A row's use in its cell: a Running row's commands now,
-/// `14% CPU 4.2G` (CPU as a share of the whole machine), a Done row's memory
-/// peak alone, `2.1G`; `OOM` after either when the memory cap killed a run.
-/// Empty when there is nothing to say. The lease is not here:
-/// the overlay header says it ([`lease_fact`]).
+/// `  14% CPU 4.2G` (CPU as a share of the whole machine, so at most
+/// `100%`), a Done row's memory peak alone in the same place, `4.2G`;
+/// `OOM` after either when the memory cap killed a run. Every slot has a
+/// fixed width, so every non-empty cell is [`USAGE_W`] characters and the
+/// column never jumps as the figures change. Empty when there is nothing
+/// to say. The lease is not here: the overlay header says it
+/// ([`lease_fact`]).
 pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool) -> String {
-    let mut parts = Vec::new();
-    if let Some(l) = live {
-        parts.push(format!("{}% CPU {}", l.cpu_pct, mem(l.mem_mb)));
+    let peak = peak_mb.filter(|&p| p > 0);
+    if live.is_none() && peak.is_none() && !oom {
+        return String::new();
     }
-    if let Some(p) = peak_mb.filter(|&p| p > 0) {
-        parts.push(mem(p));
-    }
-    if oom {
-        parts.push("OOM".to_string());
-    }
-    parts.join(" · ")
+    let cpu = match live {
+        Some(l) => format!("{:>3}% CPU ", l.cpu_pct.min(100)),
+        None => " ".repeat(9),
+    };
+    let memory = match (live, peak) {
+        (Some(l), _) => mem4(l.mem_mb),
+        (None, Some(p)) => mem4(p),
+        (None, None) => " ".repeat(4),
+    };
+    let oom = if oom { " OOM" } else { "    " };
+    format!("{cpu}{memory}{oom}")
 }
 
 /// The usage in full for the row's overlay header: `peak 2.1G of 3G, 45s
@@ -1472,8 +1501,8 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
-    /// The use column, between TASK and ELAPSED: as wide
-    /// as its widest cell, and not there at all while no row has one.
+    /// The use column, between TASK and ELAPSED: [`USAGE_W`] wide, and not
+    /// there at all while no row has a cell.
     leasew: usize,
     x_lease: usize,
     x_el_end: usize,
@@ -1490,12 +1519,13 @@ impl Cols {
             .map(|l| l.id.chars().count())
             .max()
             .unwrap_or(0);
-        let leasew = table
-            .lines
-            .iter()
-            .map(|l| l.usage.chars().count().min(LEASE_MAX))
-            .max()
-            .unwrap_or(0);
+        // Every cell is USAGE_W wide or empty: the column is one width
+        // whenever it is there.
+        let leasew = if table.lines.iter().any(|l| !l.usage.is_empty()) {
+            USAGE_W
+        } else {
+            0
+        };
         let lease_cols = if leasew > 0 { leasew + GAP } else { 0 };
         let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W + lease_cols;
         let taskw = cols.saturating_sub(fixed).max(MIN_TITLE);
@@ -2469,15 +2499,74 @@ mod tests {
             cpu_pct: 14,
             mem_mb: 4300,
         };
-        assert_eq!(usage_cell(Some(now), None, false), "14% CPU 4.2G");
-        assert_eq!(usage_cell(None, Some(2150), false), "2.1G");
-        assert_eq!(usage_cell(None, Some(128), true), "128M · OOM");
+        assert_eq!(usage_cell(Some(now), None, false), " 14% CPU 4.2G    ");
+        assert_eq!(usage_cell(None, Some(2150), false), "         2.1G    ");
+        assert_eq!(usage_cell(None, Some(128), true), "         128M OOM");
         assert_eq!(usage_cell(None, Some(0), false), "");
         assert_eq!(usage_cell(None, None, false), "");
         let mut l = feed(LEASED).rows[0].lease.clone().unwrap();
         l.state = LeaseState::Queued;
         l.position = Some(2);
         assert_eq!(lease_fact(&l), "queued #2 for 3G");
+    }
+
+    /// Every cell that says anything is as wide as every other, whatever
+    /// the figures and the state, so the column and what follows it hold
+    /// still.
+    #[test]
+    fn every_use_cell_is_the_same_width() {
+        let mems = [
+            0,
+            1,
+            9,
+            99,
+            512,
+            980,
+            999,
+            1000,
+            1023,
+            1024,
+            1100,
+            4300,
+            10_188,
+            10_189,
+            12_288,
+            131_072,
+            1_022_976,
+            1_023_487,
+            1_023_488,
+            1_048_576,
+            1_572_864,
+            10_485_760,
+            u64::MAX / 2,
+        ];
+        let cpus = [0, 5, 45, 99, 100, 145, 1200];
+        let mut seen = 0;
+        for &m in &mems {
+            assert_eq!(mem4(m).chars().count(), 4, "{m}: {:?}", mem4(m));
+            for oom in [false, true] {
+                for peak in [None, Some(0), Some(m)] {
+                    let cell = usage_cell(None, peak, oom);
+                    if !cell.is_empty() {
+                        assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
+                        seen += 1;
+                    }
+                }
+                for &cpu_pct in &cpus {
+                    let live = RunLive { cpu_pct, mem_mb: m };
+                    let cell = usage_cell(Some(live), None, oom);
+                    assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 300);
+        assert_eq!(usage_cell(None, None, false), "");
+        assert_eq!(mem4(980), "980M");
+        assert_eq!(mem4(1000), "1.0G");
+        assert_eq!(mem4(10_188), "9.9G");
+        assert_eq!(mem4(10_189), " 10G");
+        assert_eq!(mem4(1_572_864), "1.5T");
     }
 
     /// A Running row's cell is what its commands use now, not
@@ -2507,9 +2596,9 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("peak 2.1G of 3G, 45s CPU"))
         );
-        assert_eq!(t.lines[1].usage, "OOM");
+        assert_eq!(t.lines[1].usage, "              OOM");
         assert!(t.lines[1].oom);
-        assert_eq!(t.lines[2].usage, "512M");
+        assert_eq!(t.lines[2].usage, "         512M    ");
         assert_eq!(t.lines[3].usage, "");
         // A run going: its use now. Another session's run of the same key
         // is not this row's.
@@ -2525,9 +2614,12 @@ mod tests {
             ],
         );
         let t = build(Some(&f), &[], T0 + 60_000);
-        assert_eq!(t.lines[0].usage, "14% CPU 4.2G");
-        assert_eq!(t.lines[1].usage, "OOM");
-        assert_eq!(t.lines[2].usage, "512M", "a Done row keeps its peak");
+        assert_eq!(t.lines[0].usage, " 14% CPU 4.2G    ");
+        assert_eq!(t.lines[1].usage, "              OOM");
+        assert_eq!(
+            t.lines[2].usage, "         512M    ",
+            "a Done row keeps its peak"
+        );
     }
 
     #[test]
@@ -2562,6 +2654,7 @@ mod tests {
         assert!(drawn.ends_with("queued for 3G behind demo#12"), "{drawn}");
         let drawn = compose(&cols.segments(&busy.lines[0]));
         assert!(drawn.contains("14% CPU 4.2G"), "{drawn}");
+        assert_eq!(cols.leasew, USAGE_W);
         assert!(cols.taskw < Cols::new(&t, 100).taskw);
     }
 
