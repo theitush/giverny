@@ -95,6 +95,13 @@ pub fn run_relay(spool: &Path) {
     let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
         return;
     };
+    // A session that only inherited the tab's identity — a claude started
+    // inside the tab's claude, or under a multiplexer the tab launched — is
+    // not the tab's: its hooks would move the tab's state and its resume
+    // target.
+    if !crate::lineage::of_this_process().is_tabs() {
+        return;
+    }
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let msg = RelayMsg {
         tab_id: Some(tab_id),
@@ -553,8 +560,10 @@ pub fn subagent_line_msg(
 /// on stdin. Inside a Giverny tab it forwards that list to the app (the
 /// agents pane's Running rows) and, when `pane_on`, hides every row of Claude
 /// Code's own panel — or, while the app has asked for the panel
-/// ([`show_strip`]), draws each row tagged with its agent id. Outside a tab it does nothing and prints nothing, so an
-/// account-wide install never changes a session Giverny is not showing.
+/// ([`show_strip`]), draws each row tagged with its agent id. Outside a tab,
+/// or in a session that is not the tab's own ([`crate::lineage`]), it does
+/// nothing and prints nothing, so an account-wide install never changes a
+/// session Giverny is not showing.
 ///
 /// Like `relay`, it never fails: Claude Code logs a non-zero exit and drops
 /// the tick, and a relay problem must not cost the user their panel.
@@ -564,6 +573,11 @@ pub fn run_subagent_line(spool: &Path, pane_on: bool) {
     let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
         return;
     };
+    // Another session that inherited the tab's identity keeps its own panel
+    // and its workers stay out of the tab's pane ([`crate::lineage`]).
+    if !crate::lineage::of_this_process().is_tabs() {
+        return;
+    }
     let payload: serde_json::Value =
         serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let rows = match (pane_on, strip_wanted(spool, &tab_id)) {

@@ -8,6 +8,7 @@
 pub mod feed;
 pub mod hooks;
 pub mod jobs;
+pub mod lineage;
 pub mod pass;
 pub mod pass_history;
 pub mod pass_inbox;
