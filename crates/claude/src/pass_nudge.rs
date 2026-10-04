@@ -351,10 +351,13 @@ pub fn beat(ledger: &Path, session: &str, now: u64) -> bool {
     true
 }
 
-/// Whether this process runs in a Giverny tab: `$GIVERNY_TAB_ID`, which the
-/// app sets in a tab's shell and a hook inherits.
+/// Whether this process runs for a Giverny tab's own session:
+/// `$GIVERNY_TAB_ID`, which the app sets in a tab's shell and a hook
+/// inherits, and no other claude between it and the tab's
+/// ([`crate::lineage`]) — a claude nested in the tab is not the tab's.
 pub fn in_giverny_tab() -> bool {
     std::env::var("GIVERNY_TAB_ID").is_ok_and(|t| !t.trim().is_empty())
+        && crate::lineage::of_this_process().is_tabs()
 }
 
 /// The hook's whole run: `payload` is its stdin, `dir` the feed directory,
