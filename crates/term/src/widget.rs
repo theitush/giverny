@@ -199,7 +199,7 @@ pub struct TabView {
     /// Where the row button was drawn last frame, if it was.
     pub button_rect: Option<Rect>,
     /// Keep painting the last frame drawn, whatever the program writes
-    /// meanwhile (giverny#82): the app sets it while it walks Claude Code
+    /// meanwhile: the app sets it while it walks Claude Code
     /// from one view to another, so the steps between never reach the
     /// screen and the view changes in one frame. Input still goes through.
     pub hold: bool,
@@ -207,7 +207,7 @@ pub struct TabView {
     was_held: bool,
 }
 
-/// What the app paints over a tab's grid (giverny#75: the agents pane
+/// What the app paints over a tab's grid (the agents pane
 /// standing in for Claude Code's agent strip). Rows are screen rows of the
 /// live screen, and nothing is painted while the view is scrolled back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -218,7 +218,7 @@ pub struct RowMarks {
     /// `used` on: at the row's right end, or at [`Self::button_left`].
     pub button: Option<(u16, u16)>,
     /// The button's label starts at this column instead of the button
-    /// sitting at the row's right end (giverny#89: where the strip's
+    /// sitting at the row's right end (where the strip's
     /// `main` was, under the terminal's other text).
     pub button_left: Option<u16>,
     /// Esc presses the button instead of reaching the program.
@@ -322,7 +322,7 @@ struct CachedFrame {
 impl TabView {
     /// Whether the cursor is blinking at egui time `now`: a held picture
     /// ([`TabView::hold`]) would stop it mid-blink, so a hold nothing asked
-    /// for is not started while it does (giverny#132).
+    /// for is not started while it does.
     pub fn cursor_blinking(&self, now: f64) -> bool {
         self.blink_from.is_some_and(|from| now - from < BLINK_FOR)
     }

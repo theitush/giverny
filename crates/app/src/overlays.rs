@@ -265,7 +265,7 @@ fn humanize(d: std::time::Duration) -> String {
 
 // ---- worker overlay (agents pane: a row's brief or transcript) -------------
 
-/// Read-only text over the terminal session (giverny#5, #41, #44): a
+/// Read-only text over the terminal session: a
 /// Planned row's brief, a Running worker's transcript followed live, a Done
 /// worker's transcript opened at its final report, or what a row that has
 /// nothing to open says instead of doing nothing.
@@ -281,7 +281,7 @@ pub struct BriefOverlay {
     pub source: Option<PathBuf>,
     /// The row's state in words (landing, timing, tokens).
     pub facts: Vec<String>,
-    /// A Done row's task's Review line, once fetched (giverny#60): drawn at
+    /// A Done row's task's Review line, once fetched: drawn at
     /// the top, set apart, because it is what a person has to read.
     pub review: Option<crate::review::Slot>,
     pub content: Content,
@@ -453,7 +453,7 @@ impl TranscriptView {
 /// The overlay's keyboard, taken before the terminal sees it (called from
 /// `App::shortcuts`): `Esc` closes, `o` opens in Claude Code,
 /// the scroll keys scroll, and every other plain key or typed text is
-/// swallowed so it never reaches the shell under the overlay (giverny#20).
+/// swallowed so it never reaches the shell under the overlay.
 /// Ctrl/Alt chords pass through to Giverny's own shortcuts.
 pub fn brief_keys(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -635,7 +635,7 @@ fn title_job(
     job
 }
 
-/// Copy-on-select for egui's own labels (giverny#84), the terminal's
+/// Copy-on-select for egui's own labels, the terminal's
 /// behaviour: when a drag that began in `rect` ends with label text
 /// selected, the frame gets a `Copy` event, so the labels drawn after this
 /// call put their selection on the clipboard as the pointer comes up. Call
@@ -734,7 +734,7 @@ fn draw_overlay(
                     ui.set_max_size(inner);
 
                     // Header: the title in full, wrapped over as many lines
-                    // as it takes and selectable (giverny#84), in all the
+                    // as it takes and selectable, in all the
                     // width but the ✕'s lane at the right — so the ✕ can
                     // never sit over text.
                     ui.horizontal_top(|ui| {
@@ -956,7 +956,7 @@ mod tests {
     fn the_overlay_sits_in_the_session_with_the_x_above_the_body() {
         let ctx = egui::Context::default();
         let mut ov = BriefOverlay::text(
-            "coo#158 · a title long enough to reach the corner of the overlay header, and then \
+            "acme#158 · a title long enough to reach the corner of the overlay header, and then \
              some more of it so it would run under the close button if it could"
                 .into(),
             Some("/b/brief.md".into()),
@@ -1004,7 +1004,7 @@ mod tests {
         );
     }
 
-    /// giverny#84: frames of the overlay with `events`, and what each put
+    /// Frames of the overlay with `events`, and what each put
     /// on the clipboard and drew as text.
     fn run_overlay(
         ctx: &egui::Context,
@@ -1047,7 +1047,7 @@ mod tests {
         (drawn.unwrap(), copied, galleys)
     }
 
-    const LONG_TITLE: &str = "giverny#83 · BUG: agents pane: a running task splits into two rows \
+    const LONG_TITLE: &str = "demo#83 · BUG: agents pane: a running task splits into two rows \
          when the feed row has no agent_id and the worker's own row carries the tokens, so the \
          pane shows one row with no tokens and one with no task number";
 
@@ -1063,7 +1063,7 @@ mod tests {
         let (d, _, galleys) = last.unwrap();
         let title = galleys
             .iter()
-            .find(|g| g.text().contains("giverny#83"))
+            .find(|g| g.text().contains("demo#83"))
             .expect("the title is drawn");
         assert_eq!(title.text(), LONG_TITLE, "whole, never cut");
         assert!(!title.text().contains('…'));
@@ -1119,7 +1119,7 @@ mod tests {
             tab: TabId(3),
             click: Box::new(RowClick {
                 stage: giverny_claude::feed::Stage::Running,
-                key: "giverny#23".into(),
+                key: "demo#23".into(),
                 agent_id: Some("a1".into()),
                 name: "attach".into(),
                 transcript: None,
@@ -1156,7 +1156,7 @@ mod tests {
         frame(&ctx, &mut ov, session(), vec![key(Key::Home)]);
         frame(&ctx, &mut ov, session(), vec![]);
         assert_eq!(ov.offset, 0.0);
-        // `r` is not this overlay's key (Revive is gone, giverny#61); `o`
+        // `r` is not this overlay's key (Revive is gone); `o`
         // is, and its text is eaten too.
         let (act, _, _, left) = frame(
             &ctx,

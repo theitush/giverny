@@ -265,7 +265,7 @@ fn body(
     }
 
     // Orchestrator: the limits under their heading, then the rest (the
-    // agents pane, whose key sits earlier in the table, giverny#183).
+    // agents pane, whose key sits earlier in the table).
     let orchestrator = state.search.is_empty() && state.section == Section::Orchestrator;
     let mut rows = rows.to_vec();
     if orchestrator {
@@ -296,7 +296,7 @@ fn body(
 }
 
 /// The head of Settings → Orchestrator: the heading, and nothing more —
-/// the fields show their own figures (giverny#180).
+/// the fields show their own figures.
 fn limits_intro(ui: &mut egui::Ui, c: Chrome) {
     ui.label(
         RichText::new("limits")
@@ -336,14 +336,14 @@ fn row(
 
         ui.vertical(|ui| {
             // The limits are bare figures, their ● ↺ beside the field; the
-            // doc stays on the def for search (giverny#180).
+            // doc stays on the def for search.
             if let Kind::Limit { field } = def.kind {
                 return limit_widget(ui, state, cfg, machine, def, field, &value, actions, c);
             }
             widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
                 // The Orchestrator page is bare figures and switches; the
-                // doc stays on the def for search (giverny#183).
+                // doc stays on the def for search.
                 if def.section != Section::Orchestrator {
                     ui.label(
                         RichText::new(def.doc)
@@ -631,7 +631,7 @@ fn share_pct(part: u64, whole: u64) -> u64 {
 
 /// What sits after a cores or RAM field: this machine's total and the
 /// share the figure in force is of it — `of 16 cores · 88 %`,
-/// `of 31.3G · 70 %` (giverny#190).
+/// `of 31.3G · 70 %`.
 fn limit_share(limits: &Limits, m: &Machine, field: LimitField) -> String {
     let r = limits.resolve(m);
     match field {
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn a_limit_field_shows_the_figure_never_auto() {
-        // giverny#180: at auto the field holds what auto comes to here.
+        // At auto the field holds what auto comes to here.
         let m = Machine {
             cores: 14,
             ram: Mem::gb(27),
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[test]
     fn a_limit_says_the_machine_total_and_its_share() {
-        // giverny#190: after the field, the whole and the share of it.
+        // After the field, the whole and the share of it.
         let m = Machine {
             cores: 16,
             ram: Mem::parse("31.3G").unwrap(),

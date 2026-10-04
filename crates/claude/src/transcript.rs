@@ -5,7 +5,7 @@
 //! line, the argument that says what it is doing), and the first lines of
 //! what came back. Thinking, attachments and bookkeeping lines are left out.
 //! Two views use it: the overlay a Running or Done row of the agents pane
-//! opens (giverny#41, #44), which keeps the task text whole, and
+//! opens, which keeps the task text whole, and
 //! `giverny transcript [--follow]`, which folds it to watch in a terminal.
 //!
 //! [`render_rows`] is the pure half — one JSONL line in, zero or more rows
@@ -72,7 +72,7 @@ impl Fold {
         prompt_lines: Some(PROMPT_LINES),
         result_lines: RESULT_LINES,
     };
-    /// Giverny's overlay (giverny#41): the task text whole, tool output
+    /// Giverny's overlay: the task text whole, tool output
     /// still folded — it is the noise, not the task.
     pub const OVERLAY: Fold = Fold {
         prompt_lines: None,
@@ -307,7 +307,7 @@ pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
             _ => {}
         },
         // A message typed to a running worker in its own view (the view
-        // Open in Claude Code puts the tab on, giverny#75) is not a `user`
+        // Open in Claude Code puts the tab on) is not a `user`
         // line: it lands as a queued command attachment, origin human, when
         // the worker takes it.
         Some("attachment") => {
@@ -520,7 +520,7 @@ mod tests {
         let att = r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta"}}"#;
         assert!(render_line(att, PLAIN).is_empty());
         // A line typed to the worker in its view (Claude Code 2.1.281, as
-        // the giverny#71 check wrote it) shows as a message.
+        // captured while testing the worker view) shows as a message.
         let typed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"Hello sigma","source_uuid":"1b","origin":{"kind":"human"},"isMeta":true}}"#;
         assert_eq!(
             render_line(typed, PLAIN),
@@ -539,7 +539,7 @@ mod tests {
         let path = dir.join("agent-x.jsonl");
         std::fs::write(
             dir.join("agent-x.meta.json"),
-            r#"{"description":"Work giverny#5","agentType":"general-purpose","model":"opus"}"#,
+            r#"{"description":"Work demo#5","agentType":"general-purpose","model":"opus"}"#,
         )
         .unwrap();
         std::fs::write(
@@ -554,7 +554,7 @@ mod tests {
         let mut buf = Vec::new();
         follow(&path, false, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        assert!(text.contains("Work giverny#5"));
+        assert!(text.contains("Work demo#5"));
         assert!(text.contains("general-purpose · opus"));
         assert!(text.contains("  hi"));
         assert!(text.contains("  tail"));

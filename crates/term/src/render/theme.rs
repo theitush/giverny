@@ -393,7 +393,7 @@ impl Theme {
     pub const WORKER_TINT: f32 = 0.12;
 
     /// The background a tab shows while it is a worker rather than the
-    /// orchestrator (giverny#17): a Claude Code subagent view, or a tab that
+    /// orchestrator: a Claude Code subagent view, or a tab that
     /// follows a worker's transcript. A shift of this theme's own background
     /// toward its own magenta, so it reads on light and dark themes alike,
     /// follows a theme change (Rouen's hour included), and is not the accent

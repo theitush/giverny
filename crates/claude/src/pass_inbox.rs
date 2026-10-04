@@ -1,10 +1,10 @@
 //! `giverny pass ask` / `reply`: orchestrators talk when the ledger cannot
-//! grant (giverny#162).
+//! grant.
 //!
-//! The ledger ([`crate::resources`]) answers *queued behind giverny#12*; it
-//! cannot say whether giverny#12's orchestrator would hand over its cargo
+//! The ledger ([`crate::resources`]) answers *queued behind demo#12*; it
+//! cannot say whether demo#12's orchestrator would hand over its cargo
 //! slot for a two-minute test of a higher-Priority task. So the queued one
-//! asks: `giverny pass ask giverny#12 "<why>"` finds the session holding that
+//! asks: `giverny pass ask demo#12 "<why>"` finds the session holding that
 //! lease and drops a message in that session's **inbox**, a JSON-lines file
 //! at `<feed dir>/inbox/<session>.jsonl`. The plugin's `PostToolUse` hook
 //! (`giverny pass nudge`) checks the calling session's inbox on every tool
@@ -473,7 +473,7 @@ fn ago(now: u64, at: u64) -> String {
     }
 }
 
-/// What the sender is: `task inbar#5 — priority high, queued #1 for 4 cpu,
+/// What the sender is: `task acme#5 — priority high, queued #1 for 4 cpu,
 /// 8G, ~10m of work`.
 fn sender(m: &Message) -> String {
     let mut s = format!("session {}", short(&m.from_session));
@@ -633,21 +633,18 @@ mod tests {
     fn resolve_finds_the_holder_by_task_or_session() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "holder-session-1", "giverny#12", None, &slot(3), T0);
-        l.claim(&c, "asker-session-2", "inbar#5", None, &slot(1), T0);
+        l.claim(&c, "holder-session-1", "demo#12", None, &slot(3), T0);
+        l.claim(&c, "asker-session-2", "acme#5", None, &slot(1), T0);
         assert_eq!(
-            resolve(&l, "asker-session-2", "giverny#12").unwrap(),
-            ("holder-session-1".into(), Some("giverny#12".into()))
+            resolve(&l, "asker-session-2", "demo#12").unwrap(),
+            ("holder-session-1".into(), Some("demo#12".into()))
         );
         assert_eq!(
             resolve(&l, "asker-session-2", "holder-s").unwrap(),
-            ("holder-session-1".into(), Some("giverny#12".into())),
+            ("holder-session-1".into(), Some("demo#12".into())),
             "a session prefix, whose one lease is the one asked about"
         );
-        assert!(
-            resolve(&l, "holder-session-1", "giverny#12").is_err(),
-            "own"
-        );
+        assert!(resolve(&l, "holder-session-1", "demo#12").is_err(), "own");
         assert!(resolve(&l, "asker-session-2", "nope").is_err());
         assert_eq!(
             resolve(&l, "asker-session-2", "0123abcd-unknown").unwrap(),
@@ -658,12 +655,12 @@ mod tests {
         l.claim(
             &c,
             "third-session-3",
-            "giverny#12",
+            "demo#12",
             None,
             &resources::Request::default(),
             T0,
         );
-        assert!(resolve(&l, "asker-session-2", "giverny#12").is_err());
+        assert!(resolve(&l, "asker-session-2", "demo#12").is_err());
     }
 
     #[test]

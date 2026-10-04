@@ -43,7 +43,7 @@ pub struct ClaudeConfig {
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
     /// Show the tab's subagents in a table under the terminal. On by
-    /// default (giverny#183).
+    /// default.
     pub agents_pane: bool,
 }
 
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn a_config_with_the_dropped_orchestrate_key_still_loads_whole() {
-        // giverny#183 dropped `claude.orchestrate_by_default`; a file that
+        // `claude.orchestrate_by_default` is dropped; a file that
         // still sets it keeps every other setting, the old key just ignored.
         let text = "[font]\nsize = 15.0\n[claude]\nauto_mode = true\nagents_pane = false\n\
                     orchestrate_by_default = true\nresume_after_limit = true\n";

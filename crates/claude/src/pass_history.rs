@@ -1,4 +1,4 @@
-//! What `giverny pass` learns its estimates from (giverny#143).
+//! What `giverny pass` learns its estimates from.
 //!
 //! Every task that lands appends one line to `history.jsonl` beside the
 //! feeds: its raw estimate (the guess as given, before any correction), its
@@ -12,12 +12,12 @@
 //! the same type word in the title (`BUG:`, `FEATURE:` …), else the same repo,
 //! else every task. With too little history the guess stands as given.
 //!
-//! Each estimator is scored on its own **track** (giverny#181): the
+//! Each estimator is scored on its own **track**: the
 //! dispatcher's guess against the whole working time, and the worker's first
 //! re-estimate (made after reading the code) against the working time that
 //! was still to come when it was made. Each is told how its past estimates
 //! fared ([`track_record`]); the guess is also corrected ([`correct`]), the
-//! re-estimate goes on the pane as given (Ita's call on #181: tell only),
+//! re-estimate goes on the pane as given (told, never corrected),
 //! and [`accuracy`] reports every track's error, older against recent, so
 //! whether estimates improve is read from the data.
 
@@ -40,8 +40,8 @@ pub const RECENT: usize = 20;
 /// The ratio is held inside this range, so one odd history cannot turn a
 /// guess into nonsense. The median of five or more is already robust to one
 /// odd task; the range only stops a history that is nonsense as a whole.
-/// (It was ×0.25–×4 and the floor bound: guesses that ran ×0.2 were only
-/// corrected to ×0.25, giverny#181.)
+/// (A ×0.25–×4 range bound in practice: guesses that ran ×0.2 were only
+/// corrected to ×0.25.)
 pub const RATIO_MIN: f64 = 0.1;
 pub const RATIO_MAX: f64 = 10.0;
 
@@ -66,8 +66,7 @@ pub struct Record {
     /// The last estimate, after any re-estimates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_final_s: Option<u64>,
-    /// The worker's first re-estimate of the time left, as given
-    /// (giverny#181).
+    /// The worker's first re-estimate of the time left, as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_s: Option<u64>,
     /// Working time already spent when the re-estimate was made.
@@ -85,8 +84,8 @@ pub struct Record {
     pub ended: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
-    /// The highest peak memory of the task's `giverny pass run` commands
-    /// (giverny#161), MiB: the cgroup's `memory.peak` under a systemd
+    /// The highest peak memory of the task's `giverny pass run` commands,
+    /// MiB: the cgroup's `memory.peak` under a systemd
     /// scope, else the largest process's RSS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_mb: Option<u64>,
@@ -108,8 +107,7 @@ impl Record {
     }
 }
 
-/// One estimator's figures, each scored against what it estimated
-/// (giverny#181).
+/// One estimator's figures, each scored against what it estimated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Track {
     /// The dispatcher's guess (`plan`/`start --eta`), as given, against the
@@ -247,13 +245,13 @@ pub struct Correction {
     pub eta_s: u64,
     pub ratio: f64,
     pub samples: usize,
-    /// Which level matched: `"FEATURE tasks in giverny"`, `"tasks in
+    /// Which level matched: `"FEATURE tasks in demo"`, `"tasks in
     /// giverny"`, `"tasks"`.
     pub basis: String,
 }
 
 impl Correction {
-    /// `×0.39 from the last 12 FEATURE tasks in giverny`.
+    /// `×0.39 from the last 12 FEATURE tasks in demo`.
     pub fn describe(&self) -> String {
         format!(
             "×{:.2} from the last {} {}",
@@ -297,7 +295,7 @@ fn level_ratios(
         if ratios.len() < MIN_SAMPLES {
             continue;
         }
-        // `{}` is where the track's noun goes: `FEATURE {} in giverny`.
+        // `{}` is where the track's noun goes: `FEATURE {} in demo`.
         let words = match (r, k) {
             (Some(r), Some(k)) => format!("{k} {{}} in {r}"),
             (Some(r), None) => format!("{{}} in {r}"),
@@ -321,7 +319,7 @@ pub fn correct(
 }
 
 /// [`correct`] on any track: a worker's re-estimate is corrected from the
-/// re-estimates' history (giverny#181), not the guesses'.
+/// re-estimates' history, not the guesses'.
 pub fn correct_on(
     history: &[Record],
     track: Track,
@@ -350,7 +348,7 @@ pub fn correct_on(
 }
 
 /// How an estimator's own past estimates fared, for it to see before it
-/// makes the next one (giverny#181): `your last 8 FEATURE guesses in
+/// makes the next one: `your last 8 FEATURE guesses in
 /// giverny took ×0.21 of what was said (median): you guess long`. The
 /// median as measured, not clamped. `None` with too little history.
 pub fn track_record(
@@ -397,7 +395,7 @@ pub fn score(ratios: &[f64]) -> Option<Score> {
     })
 }
 
-/// `giverny pass accuracy` (giverny#181): every track's error, older half
+/// `giverny pass accuracy`: every track's error, older half
 /// against recent half, for all tasks, each repo, and each repo's types with
 /// [`MIN_SAMPLES`] or more. `repo` narrows it to one repo.
 pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
@@ -487,7 +485,7 @@ pub const MIN_PEAK_SAMPLES: usize = 3;
 
 /// What the most recent tasks like this one peaked at under `giverny pass
 /// run`, by the same levels as [`correct`] (repo and kind, repo, all):
-/// `the last 4 BUG tasks in giverny peaked at 1.8G (median), 2.6G at most`.
+/// `the last 4 BUG tasks in demo peaked at 1.8G (median), 2.6G at most`.
 /// A task the cap killed counts at its peak, which is a floor.
 pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<String> {
     let levels: [(Option<&str>, Option<&str>); 3] = [(repo, kind), (repo, None), (None, None)];
@@ -548,24 +546,24 @@ mod tests {
             ..rec(repo, Some(kind), 10, 10)
         };
         let mut h = vec![
-            peak("giverny", "BUG", 1024),
-            peak("giverny", "BUG", 2662),
-            peak("giverny", "FEATURE", 6000),
+            peak("demo", "BUG", 1024),
+            peak("demo", "BUG", 2662),
+            peak("demo", "FEATURE", 6000),
         ];
         // Two BUGs is too few: the repo speaks, over all three.
         assert_eq!(
-            peak_hint(&h, Some("giverny"), Some("BUG")).as_deref(),
-            Some("the last 3 tasks in giverny peaked at 2.6G (median), 5.9G at most")
+            peak_hint(&h, Some("demo"), Some("BUG")).as_deref(),
+            Some("the last 3 tasks in demo peaked at 2.6G (median), 5.9G at most")
         );
-        h.push(peak("giverny", "BUG", 1843));
+        h.push(peak("demo", "BUG", 1843));
         assert_eq!(
-            peak_hint(&h, Some("giverny"), Some("BUG")).as_deref(),
-            Some("the last 3 BUG tasks in giverny peaked at 1.8G (median), 2.6G at most")
+            peak_hint(&h, Some("demo"), Some("BUG")).as_deref(),
+            Some("the last 3 BUG tasks in demo peaked at 1.8G (median), 2.6G at most")
         );
         // Tasks with no measured peak say nothing; nor does too little.
         assert_eq!(peak_hint(&[rec("x", None, 1, 1)], None, None), None);
         assert_eq!(
-            peak_hint(&h, Some("inbar"), None)
+            peak_hint(&h, Some("acme"), None)
                 .as_deref()
                 .map(|s| &s[..12]),
             Some("the last 4 t")
@@ -580,11 +578,8 @@ mod tests {
         assert_eq!(kind_of("no colon"), None);
         assert_eq!(kind_of("A: one letter"), None);
         let nowhere = Path::new("/nonexistent/place/proj");
-        assert_eq!(repo_of("giverny#143", nowhere).as_deref(), Some("giverny"));
-        assert_eq!(
-            repo_of("theitush/inbar#7", nowhere).as_deref(),
-            Some("inbar")
-        );
+        assert_eq!(repo_of("demo#143", nowhere).as_deref(), Some("demo"));
+        assert_eq!(repo_of("owner/acme#7", nowhere).as_deref(), Some("acme"));
         assert_eq!(repo_of("auth-fix", nowhere).as_deref(), Some("proj"));
         assert_eq!(repo_of("#12", nowhere).as_deref(), Some("proj"));
 
@@ -618,24 +613,21 @@ mod tests {
     #[test]
     fn the_narrowest_level_with_enough_history_wins() {
         let mut h = Vec::new();
-        // giverny FEATUREs run at 0.4×, giverny BUGs at 1×, inbar at 2×.
+        // demo FEATUREs run at 0.4×, demo BUGs at 1×, acme at 2×.
         for _ in 0..5 {
-            h.push(rec("giverny", Some("FEATURE"), 50, 20));
-            h.push(rec("giverny", Some("BUG"), 20, 20));
-            h.push(rec("inbar", Some("BUG"), 10, 20));
+            h.push(rec("demo", Some("FEATURE"), 50, 20));
+            h.push(rec("demo", Some("BUG"), 20, 20));
+            h.push(rec("acme", Some("BUG"), 10, 20));
         }
-        let c = correct(&h, Some("giverny"), Some("FEATURE"), 3000).unwrap();
+        let c = correct(&h, Some("demo"), Some("FEATURE"), 3000).unwrap();
         assert_eq!(c.eta_s, 20 * 60);
         assert_eq!(c.samples, 5);
-        assert_eq!(c.basis, "FEATURE tasks in giverny");
-        assert_eq!(
-            c.describe(),
-            "×0.40 from the last 5 FEATURE tasks in giverny"
-        );
+        assert_eq!(c.basis, "FEATURE tasks in demo");
+        assert_eq!(c.describe(), "×0.40 from the last 5 FEATURE tasks in demo");
 
-        // No RESEARCH history in giverny: repo alone, median of 0.4 and 1.0.
-        let c = correct(&h, Some("giverny"), Some("RESEARCH"), 3000).unwrap();
-        assert_eq!(c.basis, "tasks in giverny");
+        // No RESEARCH history in demo: repo alone, median of 0.4 and 1.0.
+        let c = correct(&h, Some("demo"), Some("RESEARCH"), 3000).unwrap();
+        assert_eq!(c.basis, "tasks in demo");
         assert_eq!(c.samples, 10);
         assert!((c.ratio - 0.7).abs() < 1e-9, "{}", c.ratio);
         assert_eq!(c.eta_s, 35 * 60);

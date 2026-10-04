@@ -81,7 +81,7 @@ impl Stage {
 /// optional; see `docs/agents-pane.md` for what each one drives.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FeedRow {
-    /// What the row is — a task id such as `coo#158`. Falls back to
+    /// What the row is — a task id such as `acme#158`. Falls back to
     /// `agent_id` when the writer gave none.
     pub key: String,
     pub stage: Option<Stage>,
@@ -91,7 +91,7 @@ pub struct FeedRow {
     pub agent_id: Option<String>,
     pub started_ms: Option<u64>,
     pub ended_ms: Option<u64>,
-    /// The true spawn, when `started` was moved on by paused spans (coo#170).
+    /// The true spawn, when `started` was moved on by paused spans.
     pub spawned_ms: Option<u64>,
     /// Seconds the row has spent paused, an open pause counted up to when
     /// the feed was written; `started` is already moved on by them.
@@ -112,20 +112,20 @@ pub struct FeedRow {
     /// What a person has to look at before a Done row counts
     /// (`<who> — <what> — <where>`): the top line of the row's overlay. With
     /// it, nothing is fetched; without it, a key naming a GitHub issue has
-    /// the line read from the issue where `gh` works (giverny#60, #101).
+    /// the line read from the issue where `gh` works.
     pub review: Option<String>,
-    /// The row's worker started it itself, asked for a first estimate
-    /// (giverny#158), so no dispatcher will land it: it is Done when its
+    /// The row's worker started it itself, asked for a first estimate,
+    /// so no dispatcher will land it: it is Done when its
     /// worker is.
     pub follows_worker: bool,
-    /// What the machine ledger answered this row's task (giverny#160): a
+    /// What the machine ledger answered this row's task: a
     /// copy written by `giverny pass claim`, gone on `release`/`land`. The
     /// ledger itself (`resources`) is the truth; this is for drawing.
     pub lease: Option<RowLease>,
-    /// What the task's `giverny pass run` commands used (giverny#161).
+    /// What the task's `giverny pass run` commands used.
     pub usage: Option<RowUsage>,
     /// What its running `giverny pass run` commands use now, sampled by the
-    /// pane from their cgroups (giverny#182). Never in the feed file.
+    /// pane from their cgroups. Never in the feed file.
     pub live: Option<crate::run_live::RunLive>,
 }
 
@@ -283,7 +283,7 @@ pub struct Feed {
 impl Feed {
     /// The feed without the Done rows that landed by `cutoff_ms` (or never
     /// said when): what the pane shows after its Done rows were cleared by
-    /// hand, whoever wrote the file (giverny#112).
+    /// hand, whoever wrote the file.
     pub fn without_done_by(&self, cutoff_ms: u64) -> Feed {
         let mut f = self.clone();
         f.rows
@@ -569,8 +569,8 @@ pub trait LiveAgent {
     fn started_ms(&self) -> Option<u64>;
     fn tokens(&self) -> Option<u64>;
     /// What the spawn said the worker is for (the Agent tool's
-    /// `description`, e.g. `Work giverny#82 …`): the second join key, for a
-    /// feed row that carries no `agent_id` (giverny#83).
+    /// `description`, e.g. `Work demo#82 …`): the second join key, for a
+    /// feed row that carries no `agent_id`.
     fn description(&self) -> Option<&str> {
         None
     }
@@ -580,9 +580,9 @@ pub trait LiveAgent {
     }
 }
 
-/// Does `text` name `key` as a whole word? `giverny#82` is named by
-/// `Work giverny#82 pane` and by `theitush/giverny#82`, never by
-/// `giverny#820` nor `xgiverny#82`.
+/// Does `text` name `key` as a whole word? `demo#82` is named by
+/// `Work demo#82 pane` and by `owner/demo#82`, never by
+/// `demo#820` nor `xdemo#82`.
 pub fn names_key(text: &str, key: &str) -> bool {
     if key.is_empty() {
         return false;
@@ -597,7 +597,7 @@ pub fn names_key(text: &str, key: &str) -> bool {
 
 /// How long after its worker a feed row must have begun to be a later task
 /// of that worker, keeping its own clock, rather than the spawn the writer
-/// stamped a little early (giverny#116). A writer stamps `started` seconds
+/// stamped a little early. A writer stamps `started` seconds
 /// to a minute or two before the spawn; a second task sent to a worker that
 /// finished its first comes a task's length later.
 pub const LATER_TASK_MS: u64 = 5 * 60 * 1000;
@@ -613,16 +613,16 @@ pub struct PaneRow<'a, L> {
     pub ditto: bool,
     /// When this row's task reached its worker, where the worker's own
     /// transcript says so: the dispatcher's message naming it, if that came
-    /// before the feed's `started` (giverny#141).
+    /// before the feed's `started`.
     pub handed_ms: Option<u64>,
     /// The start of the same worker's next task, and its key: this row's
-    /// task ended there at the latest (giverny#141).
+    /// task ended there at the latest.
     pub next_ms: Option<u64>,
     pub next_key: Option<String>,
     /// One of a worker's tasks taken one after another: what this task
     /// spent, the turns from its hand-off to the next one's. `Some(None)`
     /// when the transcript could not be read: never the worker's whole
-    /// count, which every such row would repeat (giverny#141).
+    /// count, which every such row would repeat.
     pub task_tokens: Option<Option<u64>>,
     /// A Planned row queued on a worker busy with another task: that task.
     pub after_key: Option<String>,
@@ -651,7 +651,7 @@ impl<L> PaneRow<'_, L> {
 }
 
 /// How far a writer moved a row's `started` on for its pauses
-/// (`started − spawned`, else `paused_s`, coo#170).
+/// (`started − spawned`, else `paused_s`).
 fn moved_ms(f: &FeedRow) -> u64 {
     match (f.spawned_ms, f.started_ms) {
         (Some(spawned), Some(started)) => started.saturating_sub(spawned),
@@ -668,7 +668,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 
     /// Start of the row's clock. With a worker, the worker's own start —
     /// Claude Code's `startTime`, the clock its agents view counts from —
-    /// so the two agree (giverny#116): a writer stamps `started` when it
+    /// so the two agree: a writer stamps `started` when it
     /// is about to spawn, a little before the worker exists. The feed's
     /// `started` still counts where it is the truer one:
     ///
@@ -678,7 +678,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     ///   row per task, each started at its own time;
     /// - the row's paused spans, which Claude Code knows nothing of: the
     ///   worker's start is moved on by the same amount the writer moved
-    ///   `started` on by (`started − spawned`, else `paused_s`, coo#170).
+    ///   `started` on by (`started − spawned`, else `paused_s`).
     pub fn started_ms(&self) -> Option<u64> {
         self.row_started_ms()
     }
@@ -707,7 +707,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         };
         let began = started.saturating_sub(moved);
         // A task the spawn named is the worker's first, whenever the writer
-        // stamped it (giverny#141).
+        // stamped it.
         if began > worker.saturating_add(LATER_TASK_MS) && !self.spawn_task() {
             Some(started)
         } else {
@@ -725,8 +725,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     }
 
     /// When the row's task ended: the feed's `ended`, else its finished
-    /// worker's end — and no later than the same worker's next task began
-    /// (giverny#141).
+    /// worker's end — and no later than the same worker's next task began.
     pub fn ended_ms(&self) -> Option<u64> {
         let own = self.feed.and_then(|f| f.ended_ms).or_else(|| {
             self.live
@@ -748,7 +747,7 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             return t;
         }
         // Nothing is spent on a task before it starts, whoever it is
-        // queued on (giverny#141).
+        // queued on.
         if self.stage == Stage::Planned {
             return None;
         }
@@ -780,9 +779,9 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 ///   but one that `follows_worker` is Done once its finished worker is.
 ///   It carries the live row its `agent_id` names; failing that (no
 ///   `agent_id`, or one Claude Code no longer lists), the live row whose
-///   description names the row's key — `Work giverny#82 …` holds
-///   `giverny#82`, and one naming several keys holds each of them
-///   (giverny#83). The feed's stage wins: one worker may hold a Done row and
+///   description names the row's key — `Work demo#82 …` holds
+///   `demo#82`, and one naming several keys holds each of them
+///   The feed's stage wins: one worker may hold a Done row and
 ///   a Running one at once.
 /// - A live row that no feed row carries, and whose description names no
 ///   feed key, is a row of its own, Running or Done by its own state, after
@@ -797,7 +796,7 @@ pub fn merge<'a, L: LiveAgent>(feed: Option<&'a Feed>, live: &'a [L]) -> Vec<Pan
 
 /// [`merge`], with each worker's transcript ([`WorkerLog`], by agent id) to
 /// split a worker that took tasks one after another into a row per task
-/// ([`queue`], giverny#141).
+/// ([`queue`]).
 pub fn merge_with<'a, 'w, L: LiveAgent>(
     feed: Option<&'a Feed>,
     live: &'a [L],
@@ -854,7 +853,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
     }
     queue(&mut out, &log);
     // Running and Next up keep feed order, then live order. Done is newest
-    // landed first (giverny#170); a worker's batch is kept together and
+    // landed first; a worker's batch is kept together and
     // sorts by its latest end, and rows with no end time go after the dated
     // ones, in their old order.
     let group_end = |r: &PaneRow<'a, L>| {
@@ -891,7 +890,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
     out
 }
 
-/// One worker, tasks one after another (giverny#141). Rows are already
+/// One worker, tasks one after another. Rows are already
 /// joined to their workers; this works out which of a worker's rows came
 /// after which.
 ///
@@ -1008,9 +1007,9 @@ fn queue<'w, L: LiveAgent>(
     }
 }
 
-/// The feed with the hand-offs nothing recorded (giverny#141): a worker
+/// The feed with the hand-offs nothing recorded: a worker
 /// whose dispatcher sent it a message saying it is a **new task** and naming
-/// one (`New task for you: inbar#614, …`) holds that task from then, though
+/// one (`New task for you: acme#614, …`) holds that task from then, though
 /// the dispatcher never ran `start <task> --agent <worker>`.
 ///
 /// - A feed row with that key still waiting (Planned, or Running with no
@@ -1192,12 +1191,12 @@ mod tests {
 
     const FULL: &str = r#"{"version":1,"session":"s-new","aliases":["s-old"],
       "rows":[
-        {"key":"coo#158","stage":"running","title":"FEATURE: pane","agent_id":"a1",
+        {"key":"acme#158","stage":"running","title":"FEATURE: pane","agent_id":"a1",
          "started":"2026-09-23T10:00:00Z","eta_s":2400,"landing":"Review — ita",
          "tokens":123456,"group":"lane-1","brief":"/tmp/b.md","open":"claude --resume x","note":"n"},
-        {"key":"coo#159","stage":"done","agent_id":"a1",
+        {"key":"acme#159","stage":"done","agent_id":"a1",
          "started":"2026-09-23T09:00:00Z","ended":"2026-09-23T09:45:00Z","eta_s":2400},
-        {"key":"coo#160","stage":"planned","title":"later","eta_s":600}
+        {"key":"acme#160","stage":"planned","title":"later","eta_s":600}
       ],
       "footer":{"text":"session: 3 · subagents: 1.2M · total: 1.2M"}}"#;
 
@@ -1259,7 +1258,7 @@ mod tests {
             .collect()
     }
 
-    /// giverny#158: a row its worker started itself (`follows_worker`) has
+    /// A row its worker started itself (`follows_worker`) has
     /// no dispatcher to land it, so it is Done when the worker is; a
     /// dispatcher's Running row stays Running until it is landed.
     #[test]
@@ -1267,7 +1266,7 @@ mod tests {
         let mut own = row("agent-w1", Stage::Running, Some("w1"));
         own.follows_worker = true;
         let f = Feed {
-            rows: vec![own, row("giverny#9", Stage::Running, Some("w2"))],
+            rows: vec![own, row("demo#9", Stage::Running, Some("w2"))],
             ..Default::default()
         };
         let lives = [live("w1", false), live("w2", false)];
@@ -1280,7 +1279,7 @@ mod tests {
         };
         assert_eq!(stage_of("agent-w1"), Stage::Done);
         assert_eq!(
-            stage_of("giverny#9"),
+            stage_of("demo#9"),
             Stage::Running,
             "the dispatcher lands it"
         );
@@ -1303,39 +1302,39 @@ mod tests {
 
     #[test]
     fn keys_are_named_as_whole_words() {
-        assert!(names_key("Work giverny#82 pane link", "giverny#82"));
-        assert!(names_key("giverny#82", "giverny#82"));
-        assert!(names_key("Work theitush/giverny#82: x", "giverny#82"));
-        assert!(names_key("Work giverny#82+giverny#84", "giverny#84"));
-        assert!(!names_key("Work giverny#820", "giverny#82"));
-        assert!(!names_key("Work xgiverny#82", "giverny#82"));
-        assert!(!names_key("Work coo#giverny#82", "giverny#82"));
+        assert!(names_key("Work demo#82 pane link", "demo#82"));
+        assert!(names_key("demo#82", "demo#82"));
+        assert!(names_key("Work owner/demo#82: x", "demo#82"));
+        assert!(names_key("Work demo#82+demo#84", "demo#84"));
+        assert!(!names_key("Work demo#820", "demo#82"));
+        assert!(!names_key("Work xdemo#82", "demo#82"));
+        assert!(!names_key("Work acme#demo#82", "demo#82"));
         assert!(!names_key("anything", ""));
     }
 
-    /// giverny#83: the feed was written at `start`, before the worker's id
+    /// The feed was written at `start`, before the worker's id
     /// was known, and nothing refreshed it. The worker Claude Code lists
     /// names the row's key in its description: one row, carrying both.
     #[test]
     fn a_stale_row_is_joined_to_the_worker_its_description_names() {
-        let mut stale = row("giverny#82", Stage::Running, None);
+        let mut stale = row("demo#82", Stage::Running, None);
         stale.started_ms = Some(500);
         stale.eta_s = Some(3600);
         let f = Feed {
-            rows: vec![stale, row("giverny#84", Stage::Planned, None)],
+            rows: vec![stale, row("demo#84", Stage::Planned, None)],
             ..Default::default()
         };
         let lives = [
-            described("w82", true, "Work giverny#82 open direct"),
+            described("w82", true, "Work demo#82 open direct"),
             described("other", true, "Explore the relay"),
         ];
         let rows = merge(Some(&f), &lives);
         assert_eq!(
             shape(&rows),
             [
-                (Stage::Running, Some("giverny#82"), Some("w82"), false),
+                (Stage::Running, Some("demo#82"), Some("w82"), false),
                 (Stage::Running, None, Some("other"), false),
-                (Stage::Planned, Some("giverny#84"), None, false),
+                (Stage::Planned, Some("demo#84"), None, false),
             ]
         );
         assert_eq!(rows[0].agent_id(), Some("w82"));
@@ -1347,7 +1346,7 @@ mod tests {
         );
     }
 
-    /// giverny#116: Claude Code's agents view counts a worker from its own
+    /// Claude Code's agents view counts a worker from its own
     /// `startTime`; the pane counts the same row from the same instant,
     /// whenever `start` was stamped before the spawn — and still keeps a
     /// later task's own start, and a paused row's pauses.
@@ -1359,7 +1358,7 @@ mod tests {
             ..live("w", true)
         }];
         let at = |started: u64, spawned: Option<u64>, paused_s: Option<u64>| {
-            let mut r = row("giverny#116", Stage::Running, Some("w"));
+            let mut r = row("demo#116", Stage::Running, Some("w"));
             r.started_ms = Some(started);
             r.spawned_ms = spawned;
             r.paused_s = paused_s;
@@ -1503,7 +1502,7 @@ mod tests {
         );
         assert_eq!(f.rows.len(), 3);
         let r = &f.rows[0];
-        assert_eq!(r.key, "coo#158");
+        assert_eq!(r.key, "acme#158");
         assert_eq!(r.stage(), Stage::Running);
         assert_eq!(r.title.as_deref(), Some("FEATURE: pane"));
         assert_eq!(r.agent_id.as_deref(), Some("a1"));
@@ -1588,15 +1587,15 @@ mod tests {
         assert_eq!(
             shape,
             [
-                (Stage::Running, Some("coo#158"), Some("a1"), false),
+                (Stage::Running, Some("acme#158"), Some("a1"), false),
                 (Stage::Running, None, Some("zz"), false),
-                (Stage::Planned, Some("coo#160"), None, false),
-                (Stage::Done, Some("coo#159"), Some("a1"), false),
+                (Stage::Planned, Some("acme#160"), None, false),
+                (Stage::Done, Some("acme#159"), Some("a1"), false),
                 (Stage::Done, None, Some("gone"), false),
             ]
         );
-        // A row begun long after its worker keeps the feed's `started`
-        // (giverny#12, #116); a live-only row runs on the worker's own.
+        // A row begun long after its worker keeps the feed's `started`;
+        // a live-only row runs on the worker's own.
         // Tokens: native first.
         assert_eq!(rows[0].started_ms(), rows[0].feed.unwrap().started_ms);
         assert_ne!(rows[0].started_ms(), Some(1_000));
@@ -1692,8 +1691,8 @@ mod tests {
 
     #[test]
     fn a_paused_row_carries_its_pause() {
-        // What coo/orchestrate-status writes for a row paused at 10:30 and
-        // still paused when the feed was written (coo#170).
+        // What a pausing writer writes for a row paused at 10:30 and
+        // still paused when the feed was written.
         let f = parse(
             br#"{"rows":[
               {"key":"g#1","stage":"running","started":"2026-09-23T10:20:00Z",

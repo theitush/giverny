@@ -1,4 +1,4 @@
-//! A Running row's open, started on the hover (giverny#132).
+//! A Running row's open, started on the hover.
 //!
 //! Opening a Running agents-pane row waits first on Claude Code's agent
 //! strip: the relay draws it only when asked, and Claude Code runs the

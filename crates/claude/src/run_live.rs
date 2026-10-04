@@ -1,4 +1,4 @@
-//! What a task's `giverny pass run` commands use right now (giverny#182).
+//! What a task's `giverny pass run` commands use right now.
 //!
 //! While a command runs, `run` keeps a small JSON file beside its stats
 //! file, `<ledger dir>/runs/<pid>-<n>.live` (`task`, `session`, `pid`,
@@ -290,7 +290,7 @@ mod tests {
         std::fs::write(cg.join("cpu.stat"), "usage_usec 0\n").unwrap();
         let stats = runs.join("1-0.stats");
         std::fs::write(&stats, format!("started\ncgroup {}\n", cg.display())).unwrap();
-        let reg = register(&stats, "giverny#182", "s1", 1_000).expect("registered");
+        let reg = register(&stats, "demo#182", "s1", 1_000).expect("registered");
         assert!(live_path(&stats).exists());
         // A dead run's file is skipped.
         std::fs::write(
@@ -305,7 +305,7 @@ mod tests {
         };
         let got = s.sample(&runs, 2_000);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].task, "giverny#182");
+        assert_eq!(got[0].task, "demo#182");
         assert_eq!(got[0].session, "s1");
         assert_eq!(got[0].live.mem_mb, 512);
         std::fs::write(cg.join("cpu.stat"), "usage_usec 99999999999\n").unwrap();

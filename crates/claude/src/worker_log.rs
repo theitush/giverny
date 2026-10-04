@@ -1,4 +1,4 @@
-//! One worker's transcript as a queue of tasks (giverny#141): the tokens
+//! One worker's transcript as a queue of tasks: the tokens
 //! each of its turns added, and the messages its dispatcher sent it.
 //!
 //! A worker handed a second task by `SendMessage` holds one row per task in
@@ -17,7 +17,7 @@
 //!
 //! The dispatcher's messages arrive as `user` lines with
 //! `"origin": {"kind": "coordinator"}`. One that says it is a **new task**
-//! and names one (`New task for you: inbar#614, …`) is a hand-off even when
+//! and names one (`New task for you: acme#614, …`) is a hand-off even when
 //! nothing recorded it in the feed; one that names a feed row's key first is
 //! when that row's task reached the worker.
 
@@ -38,7 +38,7 @@ pub struct Turn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub at_ms: u64,
-    /// The first task the message names (`inbar#614`, `#70`), if any.
+    /// The first task the message names (`acme#614`, `#70`), if any.
     pub key: Option<String>,
     /// It says it is a new task (`New task for you…`, `Next task: …`).
     pub new_task: bool,
@@ -314,17 +314,14 @@ mod tests {
     #[test]
     fn keys_are_the_first_task_named() {
         assert_eq!(
-            first_key("New task for you, Wren: inbar#614, the follow-up to #613"),
-            Some("inbar#614".into())
+            first_key("New task for you, Wren: acme#614, the follow-up to #613"),
+            Some("acme#614".into())
         );
         assert_eq!(
             first_key("New task for you, #70 (already In Progress)"),
             Some("#70".into())
         );
-        assert_eq!(
-            first_key("see theitush/giverny#87."),
-            Some("giverny#87".into())
-        );
+        assert_eq!(first_key("see owner/demo#87."), Some("demo#87".into()));
         assert_eq!(first_key("no task here, just C# and #x"), None);
     }
 
@@ -365,10 +362,10 @@ mod tests {
         let p = d.join("agent-a.jsonl");
         let lines = [
             reply("m1", "2026-10-01T10:00:00Z", 1, 100, 0, 10),
-            sent("2026-10-01T10:01:00Z", "Yes — do the red run (coo#56)."),
+            sent("2026-10-01T10:01:00Z", "Yes — do the red run (acme#56)."),
             sent(
                 "2026-10-01T10:30:00Z",
-                "New task for you, Wren: inbar#614, the follow-up to #613.",
+                "New task for you, Wren: acme#614, the follow-up to #613.",
             ),
             reply("m2", "2026-10-01T10:31:00Z", 1, 100, 0, 10),
         ];
@@ -377,8 +374,8 @@ mod tests {
         log.poll();
         let m = log.messages();
         assert_eq!(m.len(), 2);
-        assert!(!m[0].new_task && m[0].hands_off("coo#56"));
-        assert!(m[1].new_task && m[1].hands_off("inbar#614"));
+        assert!(!m[0].new_task && m[0].hands_off("acme#56"));
+        assert!(m[1].new_task && m[1].hands_off("acme#614"));
         assert_eq!(log.turns().len(), 1, "the unended last line waits");
         std::fs::write(&p, lines.join("\n") + "\n").unwrap();
         log.poll();

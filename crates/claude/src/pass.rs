@@ -9,7 +9,7 @@
 //! The feed file *is* the state: each command reads it, changes one row and
 //! writes it back atomically, under a lock, since workers re-estimate their
 //! own rows while the dispatcher stamps others. A feed some other writer owns
-//! (its `writer` field names someone else, e.g. `coo/orchestrate-status`) is
+//! (its `writer` field names someone else, e.g. another orchestrator's) is
 //! never touched.
 
 use std::io::Write as _;
@@ -84,7 +84,7 @@ pass it on every `plan`; `start` fills it in or replaces it. <dur> is minutes (`
 The session is --session, else $CLAUDE_CODE_SESSION_ID (set inside Claude Code).
 The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.
 
-Estimates learn (giverny#143): every landed task appends its estimate, wall time
+Estimates learn: every landed task appends its estimate, wall time
 and working time (wall minus pauses and waits) to history.jsonl beside the feeds
 ($GIVERNY_PASS_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
 scale N by the median working-time/estimate ratio of recent tasks of the same
@@ -92,19 +92,19 @@ kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
 pane counts down from that, and both figures are printed, with how such
 guesses have fared. A worker's first `eta` on a running task (its re-estimate,
 made after reading the code) is scored and corrected the same way, against the
-working time that was still to come (giverny#181). `accuracy` shows each track. `nudge` is the
+working time that was still to come. `accuracy` shows each track. `nudge` is the
 plugin's hook: it asks a worker to re-estimate five minutes into its task, and
 a subagent with no row, on its first call, for a first estimate.
 
-Resources (giverny#160): one ledger for every session on the machine, at
+Resources: one ledger for every session on the machine, at
 <feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
 20 minutes after their session's last `giverny pass` command. Limits are
 [orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
 90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
 `run` with no lease claims one first (3 cpu, 3G unless --cpu/--ram say), waits
-while it is queued, and releases it when the command ends (giverny#161).
+while it is queued, and releases it when the command ends.
 `claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
-Messages (giverny#162) go to <feed dir>/inbox/<session>.jsonl; `nudge` delivers
+Messages go to <feed dir>/inbox/<session>.jsonl; `nudge` delivers
 them, and renews the calling session's leases, on every tool call.";
 
 /// One `giverny pass` command, parsed.
@@ -123,17 +123,17 @@ pub enum Cmd {
     Clear,
     /// The plugin's `PostToolUse` hook: a hook payload on stdin.
     Nudge,
-    /// Ask the machine ledger for a lease (giverny#160).
+    /// Ask the machine ledger for a lease.
     Claim(String),
     Release(String),
     Resources,
-    /// Run a command under the task's lease (giverny#161).
+    /// Run a command under the task's lease.
     Run(String),
-    /// Ask the session holding a lease (giverny#162): target, message.
+    /// Ask the session holding a lease: target, message.
     Ask(String, String),
     /// Answer a message: its id, the text.
     Reply(String, String),
-    /// How each estimator's figures fared, older against recent (giverny#181).
+    /// How each estimator's figures fared, older against recent.
     Accuracy,
 }
 
@@ -410,7 +410,7 @@ fn set_str(row: &mut Map<String, Value>, key: &str, v: &Option<String>) {
 }
 
 /// Close an open pause at `now`: `started` moves on by the span, which is
-/// added to `paused_s`; `spawned` keeps the true start (coo#170's fields).
+/// added to `paused_s`; `spawned` keeps the true start.
 fn close_pause(row: &mut Map<String, Value>, now: u64) {
     let Some(since) = ms_of(row, "paused_since") else {
         return;
@@ -436,7 +436,7 @@ fn is_wait(why: Option<&str>) -> bool {
 }
 
 /// Close an open waiting span at `now`: its length goes to `wait_s`, which
-/// the history takes off the task's working time (giverny#143). The pane's
+/// the history takes off the task's working time. The pane's
 /// clock is not moved: a wait is still wall time.
 fn close_wait(row: &mut Map<String, Value>, now: u64) {
     let Some(since) = ms_of(row, "waiting_since") else {
@@ -471,7 +471,7 @@ fn set_guess(row: &mut Map<String, Value>, f: &Flags) {
 }
 
 /// `start <task> --agent <worker>` on a worker already running another
-/// task: the dispatcher has handed it the next one (giverny#141), so the
+/// task: the dispatcher has handed it the next one, so the
 /// worker's earlier Running rows land now, each with its own measured span,
 /// and the pane gives the new task its own clock and its own tokens. A row
 /// started less than [`feed::LATER_TASK_MS`] before is not an earlier task
@@ -610,7 +610,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             })
         }
         Cmd::Eta(_, left) if at.is_none() => {
-            // A worker spawned outside a pass (giverny#140, #144) has no row
+            // A worker spawned outside a pass has no row
             // for `eta` to re-estimate, and an error would teach nothing:
             // start one now, with what is left as its estimate. The time
             // the worker spent before this is not known, so the clock starts
@@ -624,7 +624,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             let rows = rows_mut(doc)?;
             if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut()) {
                 // Started from `eta`, by a worker asked for a first estimate
-                // (giverny#158) or a dispatcher that forgot `start`: none may
+                // or a dispatcher that forgot `start`: none may
                 // ever land it, so the pane ends it with its worker.
                 row.insert("follows_worker".into(), json!(true));
                 if is_wait(f.why.as_deref()) {
@@ -642,7 +642,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             let i = at.ok_or_else(missing)?;
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
             if stage == Some(feed::Stage::Running) && !row.contains_key("reest_s") {
-                // The worker's first re-estimate (giverny#181): kept, with
+                // The worker's first re-estimate: kept, with
                 // when it was made in working time, to be scored at landing.
                 row.insert("reest_s".into(), json!(left));
                 row.insert("reest_at_s".into(), json!(worked_s(row, now)));
@@ -998,7 +998,7 @@ fn claim(
         pass_history::repo_of(task, &cwd)
     });
     // Figures given on a held lease, each no larger, shrink it in place: the
-    // answer to an ask (giverny#162). Otherwise it is a claim as ever.
+    // answer to an ask. Otherwise it is a claim as ever.
     let (out, shrunk) = resources::with_ledger(ledger, now, |l| {
         if let Some(s) = l.shrink(session, task, flags.cpu, flags.ram_mb, flags.vram_mb, now) {
             l.heartbeat(session, now);
@@ -1046,9 +1046,9 @@ fn claim(
     Ok((line, out.exit_code()))
 }
 
-/// What past tasks like this one peaked at under `giverny pass run`
-/// (giverny#161), for `claim` to say beside its answer: `the last 4 BUG
-/// tasks in giverny peaked at 1.8G (median), 2.6G at most`.
+/// What past tasks like this one peaked at under `giverny pass run`,
+/// for `claim` to say beside its answer: `the last 4 BUG
+/// tasks in demo peaked at 1.8G (median), 2.6G at most`.
 fn size_hint(dir: &Path, session: &str, task: &str, repo: Option<&str>) -> Option<String> {
     let history = pass_history::path(dir)?;
     let title = feed::find(dir, session).and_then(|(_, f)| {
@@ -1203,7 +1203,7 @@ fn has_brief(doc: &Value, key: &str) -> bool {
         .is_some_and(|b| !b.trim().is_empty())
 }
 
-/// The line `plan` adds when its row has no brief (giverny#179).
+/// The line `plan` adds when its row has no brief.
 fn no_brief(key: &str) -> String {
     format!(
         "  no brief: its Next up row opens to its title and note only; write the \
@@ -1212,11 +1212,11 @@ fn no_brief(key: &str) -> String {
     )
 }
 
-/// `plan`/`start` with `--eta N`: scale N from the history (giverny#143).
+/// `plan`/`start` with `--eta N`: scale N from the history.
 /// Sets `flags.eta_s` to the corrected figure, keeping N as `guess_s`, and
 /// fills in the repo the row will remember. A worker's first `eta` on a
 /// Running row is its re-estimate, scaled from the re-estimates' own history
-/// into `flags.left_s` (giverny#181). Returns what to add to the command's
+/// into `flags.left_s`. Returns what to add to the command's
 /// line (both numbers, and how such estimates fared), or `None` for a
 /// command with no estimate.
 fn correct_estimate(
@@ -1260,7 +1260,7 @@ fn correct_estimate(
         .unwrap_or_default();
     let span = |s: u64| feed::fmt_span(s as i64);
     if track == pass_history::Track::Reestimate {
-        // Told, not corrected (Ita's call on #181): the figure stands.
+        // Told, not corrected: the figure stands.
         return (!record.is_empty()).then_some(record);
     }
     flags.guess_s = Some(guess);
@@ -1288,7 +1288,7 @@ fn correct_estimate(
     })
 }
 
-/// `accuracy`: the history's report (giverny#181).
+/// `accuracy`: the history's report.
 fn accuracy(dir: &Path, repo: Option<&str>) -> String {
     match pass_history::path(dir) {
         Some(h) => pass_history::accuracy(&pass_history::load(&h), repo),
@@ -1592,11 +1592,11 @@ mod tests {
     fn a_workers_first_re_estimate_is_kept_corrected_and_learned() {
         let dir = scratch("reest");
         let h = dir.join(pass_history::FILE);
-        // Past FEATURE re-estimates in giverny ran ×1.5: 10m said, 15m taken.
+        // Past FEATURE re-estimates in demo ran ×1.5: 10m said, 15m taken.
         for _ in 0..pass_history::MIN_SAMPLES {
             let rec = pass_history::Record {
-                key: "giverny#1".into(),
-                repo: Some("giverny".into()),
+                key: "demo#1".into(),
+                repo: Some("demo".into()),
                 kind: Some("FEATURE".into()),
                 estimate_s: Some(3000),
                 reest_s: Some(600),
@@ -1608,20 +1608,20 @@ mod tests {
             };
             pass_history::append(&h, &rec).unwrap();
         }
-        let said = run(&dir, "plan giverny#9 --eta 50 --title FEATURE:x", T0).unwrap();
+        let said = run(&dir, "plan demo#9 --eta 50 --title FEATURE:x", T0).unwrap();
         assert!(
-            said.contains("your last 5 FEATURE guesses in giverny took ×0.40"),
+            said.contains("your last 5 FEATURE guesses in demo took ×0.40"),
             "{said}"
         );
-        run(&dir, "start giverny#9", T0).unwrap();
+        run(&dir, "start demo#9", T0).unwrap();
         // Paused two minutes: not working time.
-        run(&dir, "pause giverny#9", T0 + MIN).unwrap();
-        run(&dir, "resume giverny#9", T0 + 3 * MIN).unwrap();
+        run(&dir, "pause demo#9", T0 + MIN).unwrap();
+        run(&dir, "resume demo#9", T0 + 3 * MIN).unwrap();
         // Told how such re-estimates fared, but the figure stands.
-        let said = run(&dir, "eta giverny#9 10", T0 + 6 * MIN).unwrap();
+        let said = run(&dir, "eta demo#9 10", T0 + 6 * MIN).unwrap();
         assert_eq!(
             said,
-            "giverny#9: ~10m left\n  your last 5 FEATURE re-estimates in giverny took \
+            "demo#9: ~10m left\n  your last 5 FEATURE re-estimates in demo took \
              ×1.50 of what was said (median): they run short: estimate higher"
         );
         let row = |k: &str| {
@@ -1634,19 +1634,19 @@ mod tests {
         assert_eq!(row("reest_at_s"), 4 * 60, "four minutes worked");
         assert_eq!(row("eta_s"), 4 * 60 + 600, "not corrected");
         // A later eta is taken as given and leaves the re-estimate alone.
-        let said = run(&dir, "eta giverny#9 10", T0 + 8 * MIN).unwrap();
-        assert_eq!(said, "giverny#9: ~10m left");
+        let said = run(&dir, "eta demo#9 10", T0 + 8 * MIN).unwrap();
+        assert_eq!(said, "demo#9: ~10m left");
         assert_eq!(row("eta_s"), 6 * 60 + 600);
         assert_eq!(row("reest_s"), 600);
         // Landed: the record carries the re-estimate.
-        run(&dir, "land giverny#9", T0 + 30 * MIN).unwrap();
+        run(&dir, "land demo#9", T0 + 30 * MIN).unwrap();
         let last = pass_history::load(&h).pop().unwrap();
         assert_eq!(last.reest_s, Some(600));
         assert_eq!(last.reest_at_s, Some(240));
         assert_eq!(last.work_s, 28 * 60);
         // `accuracy` reads the same history.
-        let out = run(&dir, "accuracy --repo giverny", T0).unwrap();
-        assert!(out.contains("over 6 landed tasks in giverny"), "{out}");
+        let out = run(&dir, "accuracy --repo demo", T0).unwrap();
+        assert!(out.contains("over 6 landed tasks in demo"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1681,36 +1681,33 @@ mod tests {
 
     #[test]
     fn eta_on_a_task_with_no_row_starts_it() {
-        // giverny#144: a worker spawned outside a pass; its dispatcher (or
+        // A worker spawned outside a pass; its dispatcher (or
         // the worker) reaches for `eta`, and gets a Running row, not an error.
         let dir = scratch("eta-no-row");
         let said = run(
             &dir,
-            "eta inbar#613 40 --agent w9 --title Graph --repo inbar",
+            "eta acme#613 40 --agent w9 --title Graph --repo acme",
             T0,
         )
         .unwrap();
         assert!(said.contains("started it now with ~40m left"), "{said}");
-        assert!(
-            said.contains("giverny pass start inbar#613 --eta"),
-            "{said}"
-        );
+        assert!(said.contains("giverny pass start acme#613 --eta"), "{said}");
         let f = read_feed(&dir);
         let r = &f.rows[0];
-        assert_eq!(r.key, "inbar#613");
+        assert_eq!(r.key, "acme#613");
         assert_eq!(r.stage(), feed::Stage::Running);
         assert_eq!(r.started_ms, Some(T0));
         assert_eq!(r.eta_s, Some(40 * 60), "as given, not corrected");
         assert_eq!(r.title.as_deref(), Some("Graph"));
         assert_eq!(r.agent_id.as_deref(), Some("w9"));
-        assert!(r.follows_worker, "no dispatcher lands it (giverny#158)");
+        assert!(r.follows_worker, "no dispatcher lands it");
 
         // From then on it is an ordinary row: a later eta re-estimates it.
-        run(&dir, "eta inbar#613 10", T0 + 20 * MIN).unwrap();
+        run(&dir, "eta acme#613 10", T0 + 20 * MIN).unwrap();
         assert_eq!(read_feed(&dir).rows[0].eta_s, Some(30 * 60));
         assert!(read_feed(&dir).rows[0].follows_worker);
         // A dispatcher's `start` takes it over: it lands it, not the worker.
-        run(&dir, "start inbar#613 --agent w9", T0 + 21 * MIN).unwrap();
+        run(&dir, "start acme#613 --agent w9", T0 + 21 * MIN).unwrap();
         assert!(!read_feed(&dir).rows[0].follows_worker);
 
         // `--why wait` on a missing row starts it waiting.
@@ -1779,10 +1776,10 @@ mod tests {
     fn someone_elses_feed_is_left_alone() {
         let dir = scratch("theirs");
         std::fs::create_dir_all(&dir).unwrap();
-        let theirs = br#"{"version":1,"session":"s1","writer":"coo/orchestrate-status","rows":[]}"#;
+        let theirs = br#"{"version":1,"session":"s1","writer":"other/status-writer","rows":[]}"#;
         std::fs::write(feed::feed_path(&dir, "s1"), theirs).unwrap();
         let err = run(&dir, "start a", T0).unwrap_err();
-        assert!(err.contains("coo/orchestrate-status"), "{err}");
+        assert!(err.contains("other/status-writer"), "{err}");
         assert!(run(&dir, "clear", T0).is_err());
         assert_eq!(
             std::fs::read(feed::feed_path(&dir, "s1")).unwrap(),
@@ -1851,10 +1848,10 @@ mod tests {
                 .contains("no Done rows")
         );
 
-        let theirs = br#"{"version":1,"session":"s1","writer":"coo/orchestrate-status","rows":[{"key":"x","stage":"done"}]}"#;
+        let theirs = br#"{"version":1,"session":"s1","writer":"other/status-writer","rows":[{"key":"x","stage":"done"}]}"#;
         std::fs::write(feed::feed_path(&dir, "s1"), theirs).unwrap();
         let msg = run(&dir, "clear-done", T0).unwrap();
-        assert!(msg.contains("coo/orchestrate-status"), "{msg}");
+        assert!(msg.contains("other/status-writer"), "{msg}");
         assert_eq!(
             std::fs::read(feed::feed_path(&dir, "s1")).unwrap(),
             theirs.to_vec()
@@ -1872,13 +1869,13 @@ mod tests {
         let dir = scratch("correct");
         std::fs::create_dir_all(&dir).unwrap();
         let h = dir.join(pass_history::FILE);
-        // Five landed giverny BUGs that took half their guess, and five
+        // Five landed demo BUGs that took half their guess, and five
         // FEATUREs that took a quarter.
         for (kind, work) in [("BUG", 15), ("FEATURE", 10)] {
             for _ in 0..pass_history::MIN_SAMPLES {
                 let rec = pass_history::Record {
                     key: "x".into(),
-                    repo: Some("giverny".into()),
+                    repo: Some("demo".into()),
                     kind: Some(kind.into()),
                     estimate_s: Some(if kind == "BUG" { 1800 } else { 2400 }),
                     wall_s: work * 60,
@@ -1889,12 +1886,12 @@ mod tests {
                 pass_history::append(&h, &rec).unwrap();
             }
         }
-        let (cmd, mut flags) = parse_args(&args("plan giverny#1 --eta 40")).unwrap();
+        let (cmd, mut flags) = parse_args(&args("plan demo#1 --eta 40")).unwrap();
         flags.title = Some("BUG: pane flickers".into());
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         assert_eq!(
             said.lines().next().unwrap(),
-            "planned giverny#1: ~20m (you said 40m; ×0.50 from the last 5 BUG tasks in giverny)"
+            "planned demo#1: ~20m (you said 40m; ×0.50 from the last 5 BUG tasks in demo)"
         );
         let doc: Value =
             serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
@@ -1904,23 +1901,23 @@ mod tests {
             "the pane counts down from the corrected figure"
         );
         assert_eq!(row["eta_guess_s"], 2400, "the raw guess is kept");
-        assert_eq!(row["repo"], "giverny");
+        assert_eq!(row["repo"], "demo");
         assert!(run(&dir, "show", T0).unwrap().contains("~20m (said 40m)"));
 
         // `start --eta` re-corrects; a FEATURE title picks its own level.
-        let (cmd, mut flags) = parse_args(&args("start giverny#2 --eta 40")).unwrap();
+        let (cmd, mut flags) = parse_args(&args("start demo#2 --eta 40")).unwrap();
         flags.title = Some("FEATURE: estimates".into());
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         assert!(
             said.lines()
                 .next()
                 .unwrap()
-                .ends_with("~10m (you said 40m; ×0.25 from the last 5 FEATURE tasks in giverny)"),
+                .ends_with("~10m (you said 40m; ×0.25 from the last 5 FEATURE tasks in demo)"),
             "{said}"
         );
 
         // Another repo: everything (0.25 ×5, 0.5 ×5 → 0.375).
-        let said = run(&dir, "plan inbar#3 --eta 40", T0).unwrap();
+        let said = run(&dir, "plan acme#3 --eta 40", T0).unwrap();
         assert!(
             said.lines()
                 .next()
@@ -1942,28 +1939,23 @@ mod tests {
     #[test]
     fn land_appends_wall_and_working_time_without_waits_or_pauses() {
         let dir = scratch("learn");
-        let (cmd, mut flags) = parse_args(&args("start giverny#9 --eta 30")).unwrap();
+        let (cmd, mut flags) = parse_args(&args("start demo#9 --eta 30")).unwrap();
         flags.title = Some("FEATURE: x".into());
         run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         // 10m work, then 20m waiting on a build slot, then 5m work…
-        run(
-            &dir,
-            "eta giverny#9 30 --why wait --note slot",
-            T0 + 10 * MIN,
-        )
-        .unwrap();
-        run(&dir, "eta giverny#9 20 --why ready", T0 + 30 * MIN).unwrap();
+        run(&dir, "eta demo#9 30 --why wait --note slot", T0 + 10 * MIN).unwrap();
+        run(&dir, "eta demo#9 20 --why ready", T0 + 30 * MIN).unwrap();
         // …a 15m pause (a wait open across it is closed by the pause)…
-        run(&dir, "eta giverny#9 15 --why blocked", T0 + 35 * MIN).unwrap();
-        run(&dir, "pause giverny#9", T0 + 40 * MIN).unwrap();
-        run(&dir, "resume giverny#9", T0 + 55 * MIN).unwrap();
+        run(&dir, "eta demo#9 15 --why blocked", T0 + 35 * MIN).unwrap();
+        run(&dir, "pause demo#9", T0 + 40 * MIN).unwrap();
+        run(&dir, "resume demo#9", T0 + 55 * MIN).unwrap();
         // …and 5m more work.
-        run(&dir, "land giverny#9", T0 + 60 * MIN).unwrap();
+        run(&dir, "land demo#9", T0 + 60 * MIN).unwrap();
         let h = history(&dir);
         assert_eq!(h.len(), 1);
         let r = &h[0];
-        assert_eq!(r.key, "giverny#9");
-        assert_eq!(r.repo.as_deref(), Some("giverny"));
+        assert_eq!(r.key, "demo#9");
+        assert_eq!(r.repo.as_deref(), Some("demo"));
         assert_eq!(r.kind.as_deref(), Some("FEATURE"));
         assert_eq!(r.estimate_s, Some(1800), "the guess as given");
         assert_eq!(r.eta_s, Some(1800), "the first figure the pane showed");
@@ -2143,25 +2135,25 @@ mod tests {
     fn a_queued_orchestrator_asks_the_holder_which_shrinks_and_releases() {
         let dir = scratch("ask");
         // a holds the cargo slot for a long task; b's short task needs it.
-        run_as(&dir, "sess-a", "start giverny#12 --eta 60", T0);
+        run_as(&dir, "sess-a", "start demo#12 --eta 60", T0);
         let (msg, _) = run_as(
             &dir,
             "sess-a",
-            "claim giverny#12 --cpu 3 --ram 6G --slot cargo:/t",
+            "claim demo#12 --cpu 3 --ram 6G --slot cargo:/t",
             T0,
         );
         assert!(msg.starts_with("granted"), "{msg}");
-        run_as(&dir, "sess-b", "plan inbar#5 --eta 10", T0);
+        run_as(&dir, "sess-b", "plan acme#5 --eta 10", T0);
         let (msg, code) = run_as(
             &dir,
             "sess-b",
-            "claim inbar#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            "claim acme#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
             T0 + MIN,
         );
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
         assert!(
-            msg.contains("that wait (~59m) is longer than inbar#5 itself (~10m)")
-                && msg.contains("giverny pass ask giverny#12"),
+            msg.contains("that wait (~59m) is longer than acme#5 itself (~10m)")
+                && msg.contains("giverny pass ask demo#12"),
             "the queued answer suggests asking: {msg}"
         );
         // Nothing in anyone's inbox yet: the hook says nothing.
@@ -2170,30 +2162,27 @@ mod tests {
         let (msg, _) = run_line(
             &dir,
             "sess-b",
-            r#"ask giverny#12 "a 2-minute test needs the slot""#,
+            r#"ask demo#12 "a 2-minute test needs the slot""#,
             T0 + 2 * MIN,
         )
         .unwrap();
-        assert!(
-            msg.starts_with("asked giverny#12 (session sess-a)"),
-            "{msg}"
-        );
-        assert!(msg.contains("while inbar#5 holds or waits"), "{msg}");
+        assert!(msg.starts_with("asked demo#12 (session sess-a)"), "{msg}");
+        assert!(msg.contains("while acme#5 holds or waits"), "{msg}");
         let id = msg.split("message ").nth(1).unwrap()[..7].to_string();
 
         // a's next tool call carries it, once; b's own calls do not.
         assert_eq!(hook(&dir, "sess-b", T0 + 3 * MIN), None);
         let ctx = hook(&dir, "sess-a", T0 + 3 * MIN).unwrap();
         for want in [
-            "session sess-b, task inbar#5",
+            "session sess-b, task acme#5",
             "priority high",
             "queued #1 for 2 cpu, 2G, slot cargo:/t",
             "~10m left on it",
-            "your lease giverny#12 (3 cpu, 6G, slot cargo:/t)",
+            "your lease demo#12 (3 cpu, 6G, slot cargo:/t)",
             "\"a 2-minute test needs the slot\"",
             &format!("giverny-pass reply {id} "),
-            "giverny-pass release giverny#12",
-            "giverny-pass claim giverny#12 --cpu <fewer> --ram <less>",
+            "giverny-pass release demo#12",
+            "giverny-pass claim demo#12 --cpu <fewer> --ram <less>",
         ] {
             assert!(ctx.contains(want), "{want:?} in {ctx}");
         }
@@ -2203,20 +2192,20 @@ mod tests {
         let (msg, code) = run_as(
             &dir,
             "sess-a",
-            "claim giverny#12 --cpu 2 --ram 3G",
+            "claim demo#12 --cpu 2 --ram 3G",
             T0 + 4 * MIN,
         );
         assert_eq!(code, resources::exit::GRANTED);
         assert_eq!(
             msg,
-            "shrunk giverny#12: 2 cpu, 3G, slot cargo:/t (was 3 cpu, 6G, slot cargo:/t)"
+            "shrunk demo#12: 2 cpu, 3G, slot cargo:/t (was 3 cpu, 6G, slot cargo:/t)"
         );
-        let (msg, _) = run_as(&dir, "sess-a", "claim giverny#12 --ram 8G", T0 + 4 * MIN);
+        let (msg, _) = run_as(&dir, "sess-a", "claim demo#12 --ram 8G", T0 + 4 * MIN);
         assert!(msg.contains("is not grown"), "{msg}");
         let f = feed::read(&feed::feed_path(&dir, "sess-a")).unwrap();
         assert_eq!(f.rows[0].lease.as_ref().unwrap().ram_mb, 3072);
         // ... then gives up the slot altogether, and answers.
-        run_as(&dir, "sess-a", "release giverny#12", T0 + 5 * MIN);
+        run_as(&dir, "sess-a", "release demo#12", T0 + 5 * MIN);
         let (msg, _) = run_line(
             &dir,
             "sess-a",
@@ -2225,33 +2214,33 @@ mod tests {
         )
         .unwrap();
         assert!(
-            msg.starts_with("replied to inbar#5 (session sess-b)"),
+            msg.starts_with("replied to acme#5 (session sess-b)"),
             "{msg}"
         );
 
         // b's next call carries the reply; its re-claim is granted.
         let ctx = hook(&dir, "sess-b", T0 + 6 * MIN).unwrap();
         assert!(ctx.contains(&format!("to your ask {id}")), "{ctx}");
-        assert!(ctx.contains("giverny#12 has released its lease"), "{ctx}");
-        assert!(ctx.contains("giverny-pass claim inbar#5"), "{ctx}");
+        assert!(ctx.contains("demo#12 has released its lease"), "{ctx}");
+        assert!(ctx.contains("giverny-pass claim acme#5"), "{ctx}");
         let (msg, code) = run_as(
             &dir,
             "sess-b",
-            "claim inbar#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            "claim acme#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
             T0 + 6 * MIN,
         );
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
 
         // Errors say what to do.
         assert!(run_line(&dir, "sess-b", r#"reply mzzzzzz "x""#, T0 + 6 * MIN).is_err());
-        assert!(run_line(&dir, "sess-b", r#"ask inbar#5 "x""#, T0 + 6 * MIN).is_err());
+        assert!(run_line(&dir, "sess-b", r#"ask acme#5 "x""#, T0 + 6 * MIN).is_err());
         assert!(run_line(&dir, "sess-b", r#"ask nobody "x""#, T0 + 6 * MIN).is_err());
-        assert!(parse_args(&line("ask giverny#12")).is_err(), "no message");
+        assert!(parse_args(&line("ask demo#12")).is_err(), "no message");
 
         // A message expires with the asker's lease: b asks a, then lands.
         run_as(&dir, "sess-a", "claim other --cpu 1", T0 + 7 * MIN);
         run_line(&dir, "sess-b", r#"ask other "spare a core?""#, T0 + 7 * MIN).unwrap();
-        run_as(&dir, "sess-b", "release inbar#5", T0 + 8 * MIN);
+        run_as(&dir, "sess-b", "release acme#5", T0 + 8 * MIN);
         assert_eq!(hook(&dir, "sess-a", T0 + 9 * MIN), None, "expired unread");
         let _ = std::fs::remove_dir_all(&dir);
     }

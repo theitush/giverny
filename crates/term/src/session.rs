@@ -177,7 +177,7 @@ impl TermSession {
     }
 
     /// Tell the program the terminal is one column narrower (`narrow`), or
-    /// its real size again, without touching the grid (giverny#82). A
+    /// its real size again, without touching the grid. A
     /// width change is what makes Claude Code run its `subagentStatusLine`
     /// at once rather than on its five-second tick; the grid is left alone
     /// because the program repaints it when the real width comes back.
@@ -350,7 +350,7 @@ impl TermSession {
     /// The live screen row the cursor is on, while the program shows it
     /// (`DECTCEM`); `None` while it is hidden. Claude Code shows it only
     /// while its prompt has the keyboard, which is how a walk tells the
-    /// prompt's focus from the strip's or a footer pill's (giverny#75).
+    /// prompt's focus from the strip's or a footer pill's.
     pub fn cursor_row(&self) -> Option<usize> {
         let term = self.term.lock();
         if !term.mode().contains(TermMode::SHOW_CURSOR) {

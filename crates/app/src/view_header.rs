@@ -1,4 +1,4 @@
-//! The header over a worker's view (giverny#82).
+//! The header over a worker's view.
 //!
 //! While a tab's Claude Code shows a worker's view, a slim band at the top
 //! of the terminal says what that worker is on: its task id and full title,
@@ -98,7 +98,7 @@ pub fn show(ui: &mut Ui, term: Rect, line: &Line, chrome: &Chrome, tab: TabId) -
         egui::Stroke::new(1.0, chrome.dim.gamma_multiply(0.4)),
     );
     // The text is selectable, as a label's is, and copied as a drag over
-    // it ends (giverny#84); registered after the band, so a drag is the
+    // it ends; registered after the band, so a drag is the
     // text's.
     crate::overlays::copy_on_release(ui.ctx(), id, band);
     let text_at = egui::pos2(band.min.x + PAD_X, band.min.y + PAD_Y);
@@ -155,7 +155,7 @@ mod tests {
     fn line(elapsed: &str, eta: &str, now: &str, tokens: &str) -> Line {
         Line {
             stage: Stage::Running,
-            id: "giverny#82".into(),
+            id: "demo#82".into(),
             title: "a title".into(),
             elapsed: elapsed.into(),
             eta: eta.into(),

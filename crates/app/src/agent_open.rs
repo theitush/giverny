@@ -1,11 +1,11 @@
-//! What a click on an agents-pane row opens (build task D).
+//! What a click on an agents-pane row opens.
 //!
 //! The pane hands the app a [`RowClick`]; this module decides, without
 //! touching the app, what that click means — so the decision is tested here
 //! and `main.rs::apply` only carries it out:
 //!
 //! * A **Running** worker opens straight into its view in the parent's
-//!   Claude Code (giverny#82; the #23 attach): Giverny types the keys that
+//!   Claude Code: Giverny types the keys that
 //!   put Claude Code in that subagent's interactive view, driven by
 //!   [`Walk`], which reads the parent's screen after every key rather than
 //!   typing blind. With the agents pane on, the relay is asked to show
@@ -17,21 +17,21 @@
 //!   forward so the hold is short. Only when that cannot start does the
 //!   row open the overlay below.
 //! * **Done** workers (and a Running one that cannot be opened) open an
-//!   overlay over the current terminal (giverny#41, #44) showing the
+//!   overlay over the current terminal showing the
 //!   worker's transcript, rendered as `giverny transcript` renders it: a
 //!   Running one live, following it as it grows; a Done one opened at its
 //!   end, on the final report. Nothing is typed into Claude Code.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
-//!   orchestrator" button walk it back to the main view ([`Walk::home`],
-//!   giverny#75), and the strip's own `main` row is not drawn
+//!   orchestrator" button walk it back to the main view ([`Walk::home`]),
+//!   and the strip's own `main` row is not drawn
 //!   ([`row_marks`]).
 //! * A Done worker's overlay only reads: nothing is offered. Claude Code
 //!   keeps no view of a finished subagent (it leaves the agent strip and
 //!   `/tasks`, and its transcript is not a resumable session), and the one
-//!   way back in — the parent's `SendMessage` — speaks for Ita, so the old
-//!   **Revive** that typed a line at the parent's prompt is gone (giverny#61).
+//!   way back in — the parent's `SendMessage` — speaks for the user, so the old
+//!   **Revive** that typed a line at the parent's prompt is gone.
 //! * **Planned** shows the row's brief in the same overlay; without one, its
-//!   task, title and note, and how a dispatcher adds a brief (giverny#179).
+//!   task, title and note, and how a dispatcher adds a brief.
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab — unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave.
@@ -82,7 +82,7 @@ pub enum Offer {
     },
 }
 
-/// The row's title for a tab or overlay: `coo#158 · name`, whichever exist.
+/// The row's title for a tab or overlay: `acme#158 · name`, whichever exist.
 pub fn title_of(click: &RowClick) -> String {
     match (click.key.is_empty(), click.name.is_empty()) {
         (false, false) if click.key != click.name => format!("{} · {}", click.key, click.name),
@@ -165,7 +165,7 @@ pub fn plan(click: &RowClick) -> Plan {
     }
 }
 
-/// A Next up row with no brief still says what it has (giverny#179): its
+/// A Next up row with no brief still says what it has: its
 /// task, its title and its note, then how a dispatcher gives it a brief.
 fn planned_without_brief(click: &RowClick) -> String {
     let some = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
@@ -199,7 +199,7 @@ pub fn offer(click: &RowClick) -> Offer {
 
 /// The conversation a Done row's `open` command resumes, if it does: a
 /// click on it goes to the tab running that conversation rather than
-/// showing the overlay (giverny#41).
+/// showing the overlay.
 pub fn done_resumes(click: &RowClick) -> Option<String> {
     if click.stage != Stage::Done {
         return None;
@@ -262,8 +262,8 @@ pub fn resumed_session(command: &str) -> Option<String> {
 /// update that moves them is fixed here.
 ///
 /// Established on Claude Code 2.1.281 with `"tui": "fullscreen"` by driving
-/// a real `claude` in tmux with background subagents (giverny#44; #23 has
-/// the earlier `/tasks` findings). Nothing is typed: only arrow keys and
+/// a real `claude` in tmux with background subagents. Nothing is typed:
+/// only arrow keys and
 /// Enter, so nothing is left in the prompt and no dialog flickers open.
 ///
 /// 1. Under the prompt, Claude Code draws its agent strip: `● main`, then a
@@ -313,7 +313,7 @@ pub mod cc_keys {
 }
 
 /// Whether Claude Code on this screen shows a worker's view rather than the
-/// main session (giverny#17) — entered by an attach, by `/tasks`, or by
+/// main session — entered by an attach, by `/tasks`, or by
 /// hand, and left with the strip's `main` or ←. Read from the screen alone,
 /// so it is right however the view was reached.
 ///
@@ -364,7 +364,7 @@ pub struct Item {
     pub label: String,
     pub selected: bool,
     /// The agent id a strip row is tagged with, while the relay tags them
-    /// (`hooks::tag_strip_row`, giverny#94).
+    /// (`hooks::tag_strip_row`).
     pub id: Option<String>,
 }
 
@@ -476,7 +476,7 @@ pub fn prompt_box(screen: &str, undimmed: &str) -> Option<PromptBox> {
 
 /// Whether Claude Code's agent strip is drawn under the prompt: its `main`
 /// row is on screen. With the agents pane on, Giverny's relay hides the
-/// strip (giverny#3) until asked to show it (giverny#71).
+/// strip until asked to show it.
 pub fn strip_shown(screen: &str) -> bool {
     screen.lines().any(|row| main_row(row).is_some())
 }
@@ -645,7 +645,7 @@ pub enum Stuck {
 }
 
 impl Stuck {
-    /// What the overlay tells Ita.
+    /// What the overlay tells the user.
     pub fn explain(&self, description: &str) -> String {
         match self {
             Stuck::NoPrompt => "This means typing into this tab's Claude Code, and its prompt \
@@ -700,8 +700,7 @@ pub const SETTLE: Duration = Duration::from_millis(700);
 /// it, before the walk takes the footer's shells pill to have the focus.
 /// Claude Code draws the frame and puts its cursor back in one write, so
 /// this only has to outlast a frame split across reads; the full [`SETTLE`]
-/// here cost every open ~0.7 s whenever a background shell was running
-/// (giverny#108).
+/// here cost every open ~0.7 s whenever a background shell was running.
 pub const FOCUS_CALM: Duration = Duration::from_millis(150);
 /// The whole attach, start to finish.
 pub const DEADLINE: Duration = Duration::from_secs(5);
@@ -719,7 +718,7 @@ pub struct Attach {
     /// for a caller that checks the view it lands on ([`Walk`]).
     only_agent: bool,
     /// The worker's agent id: on a strip whose rows carry ids (the relay
-    /// tags them while a walk asks for the strip, giverny#94) the row is
+    /// tags them while a walk asks for the strip) the row is
     /// found by it alone, whatever Claude Code labels it.
     id: Option<String>,
     /// ↓ has been sent out of the prompt.
@@ -831,7 +830,7 @@ impl Attach {
         match &view {
             View::Strip(items) => {
                 // Rows tagged with ids: the id alone says which is the
-                // worker's (giverny#94). A busy worker's label is Claude
+                // worker's. A busy worker's label is Claude
                 // Code's summary of what it is doing, never its description.
                 let by_id = self
                     .id
@@ -908,7 +907,7 @@ pub fn strip_agents(screen: &str) -> Vec<Item> {
 /// Whether Claude Code's prompt has the keyboard: the terminal cursor
 /// (`cursor`, its screen row while it is shown) sits in the prompt box.
 /// Claude Code shows the cursor only there; with the focus on the strip or
-/// the footer's `N shells` pill it hides it (2.1.281, giverny#75), and
+/// the footer's `N shells` pill it hides it (2.1.281), and
 /// nothing else on screen tells the pill's focus from the prompt's.
 pub fn prompt_focused(screen: &str, cursor: Option<usize>) -> bool {
     let Some(row) = cursor else {
@@ -937,7 +936,7 @@ pub enum Goal {
         description: String,
         aliases: Vec<String>,
         /// Its agent id, which the relay tags the strip's rows with while
-        /// the strip is asked for (giverny#94): found by that first.
+        /// the strip is asked for: found by that first.
         agent_id: Option<String>,
     },
     /// The main session's view: the orchestrator.
@@ -976,7 +975,7 @@ type Seen = (View, Option<PromptBox>, Option<usize>);
 /// What the focus walk waits to hold still: the view, the prompt box's
 /// label and draft, and the cursor's row within the box — not where on
 /// screen the box is, which moves when the relay hides the strip's rows
-/// under it and says nothing about the focus (giverny#108).
+/// under it and says nothing about the focus.
 type Held = (View, Option<(Option<String>, bool)>, Option<isize>);
 
 fn held(seen: &Seen) -> Held {
@@ -993,9 +992,9 @@ fn held(seen: &Seen) -> Held {
 }
 
 /// Moves a tab's Claude Code between the main view and a worker's view
-/// through the agent strip (giverny#23, #75): wait for the strip, step to
+/// through the agent strip: wait for the strip, step to
 /// the row with [`Attach`], Enter, check the view that opened, then put the
-/// focus back in that view's prompt — so what Ita types next goes to it,
+/// focus back in that view's prompt — so what the user types next goes to it,
 /// and an Enter never lands on the strip. Reads the screen before every
 /// key and never types text; `/tasks` is never opened.
 ///
@@ -1068,16 +1067,16 @@ impl Walk {
 
     /// Whether the walk needs Claude Code's strip drawn: into a worker's
     /// view until the focus is off the strip — its rows going away under a
-    /// focused strip would move its selection (giverny#82). From there the
+    /// focused strip would move its selection. From there the
     /// relay can hide them again while the focus walk finishes, so its
-    /// answer is not waited for only after it (giverny#108). Going home
+    /// answer is not waited for only after it. Going home
     /// needs no help: a worker's view keeps `main` on the strip whatever
     /// the relay hides.
     pub fn wants_strip(&self) -> bool {
         matches!(self.goal, Goal::Worker { .. }) && !self.off_strip
     }
 
-    /// The phase the walk is in, for the timing log (giverny#108).
+    /// The phase the walk is in, for the timing log.
     pub fn phase_name(&self) -> &'static str {
         match self.phase {
             Phase::Start => "start",
@@ -1250,8 +1249,8 @@ pub const SETTLE_CALM: Duration = Duration::from_millis(60);
 pub const SETTLE_MAX: Duration = Duration::from_millis(2500);
 
 /// After a [`Walk`] lands: waits for the screen to be the view's final
-/// one, so the terminal can go from the view before to it in one frame
-/// (giverny#82). Into a worker's view with the agents pane on, final is
+/// one, so the terminal can go from the view before to it in one frame.
+/// Into a worker's view with the agents pane on, final is
 /// the strip's agent rows gone again (only its `main` row stays, and that
 /// is not drawn); back on main, it is main's prompt.
 #[derive(Debug, Clone)]
@@ -1302,7 +1301,7 @@ pub const NUDGE_NARROW: Duration = Duration::from_millis(90);
 /// How long after a nudge the next is sent, while still waited on. Claude
 /// Code answers a nudge about 0.4 s after the width comes back; one sent
 /// while its relay run is in flight throws that run's answer away, so the
-/// next waits well past it (giverny#108).
+/// next waits well past it.
 pub const NUDGE_AGAIN: Duration = Duration::from_millis(800);
 /// The longest a [`Nudge::ask_held`] keeps the pty narrow waiting for the
 /// answer: long enough that it never cuts off a relay run in flight.
@@ -1321,8 +1320,8 @@ pub enum Width {
     Restore,
 }
 
-/// Brings Claude Code's next `subagentStatusLine` run forward
-/// (giverny#82). Claude Code runs it every five seconds, and 300 ms after
+/// Brings Claude Code's next `subagentStatusLine` run forward.
+/// Claude Code runs it every five seconds, and 300 ms after
 /// the terminal's width changes — so a width one column short for a moment
 /// makes the relay's answer to a new strip ask land within about half a
 /// second instead of up to five. The pty alone is narrowed, never the grid,
@@ -1400,13 +1399,13 @@ impl Nudge {
 // ------------------------------------------------------------ marks ----
 
 /// What Giverny paints over a Claude Code tab's grid while the agents pane
-/// stands in for Claude Code's own agent strip (giverny#75):
+/// stands in for Claude Code's own agent strip:
 ///
 /// * the strip's `main` row is not drawn — the pane shows which worker the
 ///   tab is on, and the way back is Giverny's button;
 /// * while a worker's view is on screen, a "back to orchestrator" button
 ///   sits where that `◯ main` was, left-aligned under the terminal's other
-///   text (giverny#89); with no such row, at the right end of the status
+///   text; with no such row, at the right end of the status
 ///   line under the prompt (the row with the session's token counts);
 /// * and Esc presses that button rather than reaching Claude Code, while
 ///   the prompt or the strip has the keyboard (not over a dialog, whose Esc
@@ -1470,7 +1469,7 @@ mod tests {
     fn click(stage: Stage) -> RowClick {
         RowClick {
             stage,
-            key: "coo#158".into(),
+            key: "acme#158".into(),
             agent_id: Some("a93".into()),
             name: "Wren".into(),
             transcript: None,
@@ -1490,7 +1489,7 @@ mod tests {
         assert_eq!(
             plan(&c),
             Plan::Watch {
-                title: "coo#158 · Wren".into(),
+                title: "acme#158 · Wren".into(),
                 transcript: "/t/agent-a93.jsonl".into(),
                 live: true,
             }
@@ -1507,7 +1506,7 @@ mod tests {
         assert_eq!(
             plan(&c),
             Plan::Watch {
-                title: "coo#158 · Wren".into(),
+                title: "acme#158 · Wren".into(),
                 transcript: "/t/agent-a93.jsonl".into(),
                 live: false,
             }
@@ -1581,21 +1580,21 @@ mod tests {
         else {
             panic!("expected text");
         };
-        assert_eq!(title, "coo#158 · Wren");
-        assert!(t.starts_with("Task: coo#158\n\nWren\n\nlane 2\n\n"), "{t}");
+        assert_eq!(title, "acme#158 · Wren");
+        assert!(t.starts_with("Task: acme#158\n\nWren\n\nlane 2\n\n"), "{t}");
         assert!(t.contains("--brief FILE"), "{t}");
         c.brief = Some("/b/brief.md".into());
         assert_eq!(
             plan(&c),
             Plan::Show {
-                title: "coo#158 · Wren".into(),
+                title: "acme#158 · Wren".into(),
                 body: Body::File("/b/brief.md".into())
             }
         );
         // No brief and no note: the task and its title, and how to add one.
         c.brief = None;
         c.note = None;
-        c.name = "coo#158".into();
+        c.name = "acme#158".into();
         let Plan::Show {
             body: Body::Text(t),
             ..
@@ -1603,16 +1602,16 @@ mod tests {
         else {
             panic!("expected text");
         };
-        assert!(t.starts_with("Task: coo#158\n\nNo brief was given"), "{t}");
+        assert!(t.starts_with("Task: acme#158\n\nNo brief was given"), "{t}");
     }
 
     #[test]
     fn titles() {
         let mut c = click(Stage::Planned);
-        c.name = "coo#158".into();
-        assert_eq!(title_of(&c), "coo#158");
+        c.name = "acme#158".into();
+        assert_eq!(title_of(&c), "acme#158");
         c.key.clear();
-        assert_eq!(title_of(&c), "coo#158");
+        assert_eq!(title_of(&c), "acme#158");
         c.name.clear();
         assert_eq!(title_of(&c), "a93");
     }
@@ -1657,7 +1656,7 @@ mod tests {
     // ------------------------------------------------------ attach ----
     //
     // The screens below are Claude Code 2.1.280 (fullscreen tui), captured
-    // from a real `claude` in a pty during the giverny#23 spike.
+    // from a real `claude` in a pty while building the attach.
 
     const TRANSCRIPT: &str = "\
 ❯ Spawn three general-purpose subagents in parallel
@@ -1759,7 +1758,7 @@ mod tests {
         assert_eq!(items.iter().position(|i| i.selected), Some(3));
     }
 
-    /// The footer strip under a worker's view, as #23 saw it (`─── <desc> ─`,
+    /// The footer strip under a worker's view, as the attach saw it (`─── <desc> ─`,
     /// the `Message @…` placeholder, `◯ main`), and the same strip on main.
     fn strip_screen(main: &str, pointer: bool) -> String {
         let p = if pointer { "❯ " } else { "  " };
@@ -1813,8 +1812,8 @@ mod tests {
     fn labels_match_through_spacing_and_truncation() {
         assert!(label_matches("theta  worker", "theta worker"));
         assert!(label_matches(
-            "giverny#23 click a Run…",
-            "giverny#23 click a Running row"
+            "demo#23 click a Run…",
+            "demo#23 click a Running row"
         ));
         assert!(!label_matches("theta worker", "eta worker"));
         assert!(!label_matches("…", "eta worker"));
@@ -1832,7 +1831,7 @@ mod tests {
     }
 
     // Claude Code 2.1.281 (fullscreen tui), captured from a real `claude`
-    // in tmux during the giverny#44 check: two background agents, two
+    // in tmux while testing the attach: two background agents, two
     // background shells.
 
     const STRIP_TOP: &str = "\
@@ -2046,7 +2045,7 @@ mod tests {
     // ------------------------------------------------------- walk ----
     //
     // A fake Claude Code 2.1.281 that draws the screens seen in tmux during
-    // giverny#71 and #75 (main view, a worker's view, the strip focused or
+    // the strip and back-to-main work (main view, a worker's view, the strip focused or
     // not, the shells pill focused, the agents pane's relay hiding rows)
     // and answers keys the way that one did.
 
@@ -2066,8 +2065,8 @@ mod tests {
         pane: bool,
         /// The relay has been asked to show the strip anyway.
         asked: bool,
-        /// The relay tags each row it shows on an ask with the agent's id
-        /// (giverny#94): `◯ [<id>] <label>`.
+        /// The relay tags each row it shows on an ask with the agent's id:
+        /// `◯ [<id>] <label>`.
         tagged: bool,
         /// A background shell: the footer's `1 shell` pill.
         shells: bool,
@@ -2296,7 +2295,7 @@ mod tests {
     fn the_strip_goes_as_soon_as_the_focus_is_off_it_and_the_pill_costs_no_settle() {
         // The relay answers every ask at once, both ways: the rows go the
         // frame the walk lets them, and nothing is typed into a strip
-        // that is going away (giverny#108).
+        // that is going away.
         for shells in [true, false] {
             let mut fake = Fake::new();
             fake.shells = shells;
@@ -2497,8 +2496,8 @@ mod tests {
     }
 
     /// The strip in a parent whose workers are busy, one of them resumed
-    /// with SendMessage, as Claude Code 2.1.283 drew it in tmux
-    /// (giverny#94): each row is labelled with the worker's progress
+    /// with SendMessage, as Claude Code 2.1.283 drew it in tmux:
+    /// each row is labelled with the worker's progress
     /// summary, never its description (`gamma busy worker`, `beta resumed
     /// worker`), and the summary moves on every thirty seconds.
     const STRIP_SUMMARIES: &str = "\
@@ -2529,7 +2528,7 @@ mod tests {
             ]
         );
         assert!(items.iter().all(|i| i.id.is_none()));
-        // What #94 hit: by description (and the pane's own activity) the
+        // What a real session hit: by description (and the pane's own activity) the
         // worker is not on the strip, and with two rows no guess is made.
         let t = Instant::now();
         let mut a = Attach::new("beta resumed worker", t)
@@ -2542,7 +2541,7 @@ mod tests {
         );
     }
 
-    /// The same strip once the relay tags its rows (giverny#94).
+    /// The same strip once the relay tags its rows.
     const STRIP_TAGGED: &str = "\
 ✻ Waiting for 2 background agents to finish
 ────────────────────────────────────────────────────────────
@@ -2760,7 +2759,7 @@ mod tests {
         assert!(keystroke_bytes(Keystroke::Up, |_, _| None).is_empty());
     }
 
-    /// The attach keys against a real Claude Code in tmux (giverny#44):
+    /// The attach keys against a real Claude Code in tmux:
     /// `GIVERNY_TMUX=<socket>:<target>`, a `claude` there with the agent
     /// `GIVERNY_TMUX_AGENT` (a description) in its strip.
     /// Run by hand: `cargo test -p giverny live_tmux -- --ignored --nocapture`.
@@ -2875,8 +2874,8 @@ mod tests {
         (plain, bright)
     }
 
-    /// Into a worker's view and back against a real Claude Code in tmux
-    /// (giverny#75): `GIVERNY_TMUX=<socket>:<target>`, a `claude` there
+    /// Into a worker's view and back against a real Claude Code in tmux:
+    /// `GIVERNY_TMUX=<socket>:<target>`, a `claude` there
     /// with the running agent `GIVERNY_TMUX_AGENT` (its description; the
     /// strip's label for it, if different, in `GIVERNY_TMUX_ALIAS`). With
     /// the agents pane on, `GIVERNY_TMUX_ASK` names the relay's ask file

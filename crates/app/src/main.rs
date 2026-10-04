@@ -762,12 +762,11 @@ pub enum Action {
     /// A row of the agents pane was clicked: Running and Done open the
     /// worker, Planned shows its brief (`agent_open`).
     AgentRowClicked(TabId, Box<agents_pane::RowClick>),
-    /// The worker overlay's Open in Claude Code (giverny#44): attach the
+    /// The worker overlay's Open in Claude Code: attach the
     /// row's running worker in its parent tab.
     OpenWorkerInClaude(TabId, Box<agents_pane::RowClick>),
     /// Esc, or the terminal's "back to orchestrator" button, in a tab
-    /// showing a worker's view: walk its Claude Code back to the main view
-    /// (giverny#75).
+    /// showing a worker's view: walk its Claude Code back to the main view.
     BackToMain(TabId),
 }
 
@@ -810,13 +809,13 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
-    /// When the screen was last read for a worker's view (giverny#17).
+    /// When the screen was last read for a worker's view.
     worker_checked: Option<Instant>,
     /// The worker whose view the tab's Claude Code shows, by the label on
     /// its prompt's rule (the Agent call's description); `None` on main.
     viewed: Option<String>,
     /// [`Self::viewed`] as of the picture on screen: it stays put while
-    /// the picture is held (giverny#82), so the header over the terminal
+    /// the picture is held, so the header over the terminal
     /// changes in the same frame as the view under it.
     shown_viewed: Option<String>,
     /// The worker view whose header was closed with its `×`; it stays
@@ -863,7 +862,7 @@ struct Snapshot {
 }
 
 /// Paint `rt` on the worker background while it is a worker's tab, or while
-/// its Claude Code shows a subagent's view (giverny#17). The screen is read
+/// its Claude Code shows a subagent's view. The screen is read
 /// at most every [`WORKER_CHECK`], and only for the tab on screen.
 fn update_worker_bg(ctx: &egui::Context, rt: &mut TabRuntime, worker_tab: bool) {
     if worker_tab {
@@ -1035,7 +1034,7 @@ pub struct App {
     /// transcript (`overlays::BriefOverlay`).
     pub brief: Option<overlays::BriefOverlay>,
     /// The tab and row that opened `brief`, when a row did: a second click
-    /// on that row closes it (giverny#121).
+    /// on that row closes it.
     brief_row: Option<(TabId, agents_pane::RowClick)>,
     /// The terminal session's rect last frame: where that overlay goes.
     pub session_rect: Option<egui::Rect>,
@@ -1052,12 +1051,12 @@ pub struct App {
     strip_asks: HashMap<TabId, Instant>,
     /// The pointer over the active tab's agents pane, as the pane saw it
     /// last frame (`Views::take_hover`), and the watch deciding when a
-    /// rest on a Running row starts its open early (giverny#132).
+    /// rest on a Running row starts its open early.
     hover: Option<(TabId, Option<agents_pane::RowClick>)>,
     hover_watch: Option<(TabId, hover_open::Watch)>,
-    /// Since when the active tab's screen has held still (giverny#132).
+    /// Since when the active tab's screen has held still.
     screen_still: Option<(TabId, hover_open::Still)>,
-    /// A hover's early strip ask, holding its tab's picture (giverny#132).
+    /// A hover's early strip ask, holding its tab's picture.
     prearm: Option<PrearmJob>,
     /// Where the worker header's `×` was drawn last frame, if it was.
     header_close: Option<egui::Rect>,
@@ -1084,13 +1083,13 @@ struct AttachJob {
     title: String,
     driver: agent_open::Walk,
     /// When the walk began: the tab's picture is held from here until the
-    /// view is final, and never longer than [`HOLD_MAX`] (giverny#82).
+    /// view is final, and never longer than [`HOLD_MAX`].
     started: Instant,
     /// Once the walk is done: waiting for the view's final screen.
     settle: Option<agent_open::Settle>,
     /// Brings the relay's next run forward while its answer is waited on.
     nudge: agent_open::Nudge,
-    /// The walk's phase last frame, for the timing log (giverny#108).
+    /// The walk's phase last frame, for the timing log.
     phase: &'static str,
     /// The relay has been told it may hide the strip's rows again, and
     /// the nudge set on bringing that forward.
@@ -1126,7 +1125,7 @@ impl AttachJob {
     }
 }
 
-/// A Running row's open started on the hover (giverny#132): which tab's
+/// A Running row's open started on the hover: which tab's
 /// strip is asked for, and the pre-arm holding that tab's picture.
 struct PrearmJob {
     tab: TabId,
@@ -1134,7 +1133,7 @@ struct PrearmJob {
     started: Instant,
 }
 
-/// The longest a tab's picture is held while a walk runs (giverny#82): a
+/// The longest a tab's picture is held while a walk runs: a
 /// walk this slow is shown as it goes rather than as a frozen screen.
 const HOLD_MAX: Duration = Duration::from_secs(6);
 
@@ -1148,7 +1147,7 @@ fn tab_env_id(id: TabId) -> String {
 /// inside `hooks::STRIP_WANTED_FOR`, after which the relay forgets it.
 const STRIP_ASK_RENEW: Duration = Duration::from_secs(30);
 
-/// The terminal's back button (giverny#75), longest first: the first that
+/// The terminal's back button, longest first: the first that
 /// fits the blank cells where the strip's `main` was is drawn.
 const BACK_LABELS: &[&str] = &["↺ back to orchestrator", "↺ orchestrator", "↺ back"];
 
@@ -3151,7 +3150,7 @@ impl App {
         click: &agents_pane::RowClick,
     ) {
         // The row the tab already shows, clicked again, is the way back to
-        // the orchestrator (giverny#121).
+        // the orchestrator.
         let overlay = self
             .brief
             .as_ref()
@@ -3175,14 +3174,14 @@ impl App {
             }
         }
         // A Done row whose `open` resumes a conversation that is running in
-        // a Giverny tab goes to that tab (giverny#41).
+        // a Giverny tab goes to that tab.
         if let Some(sid) = agent_open::done_resumes(click)
             && let Some(id) = self.live_holder(&sid)
         {
             self.apply(ctx, Action::Select(id));
             return;
         }
-        // A Running worker opens straight into its view (giverny#82): no
+        // A Running worker opens straight into its view: no
         // overlay. The overlay is what is left when that cannot start.
         if let (giverny_claude::feed::Stage::Running, Some(agent_id)) =
             (click.stage, click.agent_id.as_deref())
@@ -3202,7 +3201,7 @@ impl App {
         // A Done row's task may have landed in Review: its Review line goes
         // at the top of the overlay. The feed's own `review` text is used as
         // is; else a key naming a GitHub issue has it fetched through `gh`
-        // off the UI thread (giverny#60, #101).
+        // off the UI thread.
         let review = (click.stage == giverny_claude::feed::Stage::Done)
             .then(|| match &click.review {
                 Some(text) => Some(review::ready(text)),
@@ -3217,7 +3216,7 @@ impl App {
 
     /// The worker whose view `tab` shows, or is on its way to: its id in the
     /// tab's tracker. What its pane row is marked for, and what a second
-    /// click on that row walks away from (giverny#121).
+    /// click on that row walks away from.
     fn viewed_worker(&self, tab: TabId) -> Option<String> {
         let job = self.attach.as_ref().filter(|j| j.tab == tab);
         let label = match job.map(|j| &j.driver.goal) {
@@ -3353,7 +3352,7 @@ impl App {
         }
     }
 
-    /// Attach a running worker (giverny#23): show its parent tab and start
+    /// Attach a running worker: show its parent tab and start
     /// typing Claude Code's key path to the worker's view into it. False
     /// when it cannot start — no live terminal in the tab, or no description
     /// to find the worker by in Claude Code's list.
@@ -3377,7 +3376,7 @@ impl App {
         // with ids (an older relay): the found row is checked against the
         // view's prompt rule, which names the description. With the agents
         // pane on, the relay tags each row with its agent id while the
-        // walk asks for the strip, and the id finds it (giverny#94).
+        // walk asks for the strip, and the id finds it.
         let aliases: Vec<String> = self
             .claude
             .agents
@@ -3391,8 +3390,8 @@ impl App {
         }
         self.reveal_terminal();
         // A hover's early ask is the click's now: the strip it asked for
-        // is the one the walk waits on, and the picture it held stays held
-        // (giverny#132). Its narrow pty is left narrow; the walk's own
+        // is the one the walk waits on, and the picture it held stays held.
+        // Its narrow pty is left narrow; the walk's own
         // nudge keeps it so until the strip is drawn.
         if let Some(pre) = self.prearm.take() {
             tracing::debug!(
@@ -3435,7 +3434,7 @@ impl App {
         true
     }
 
-    /// Esc or the back button in a tab on a worker's view (giverny#75):
+    /// Esc or the back button in a tab on a worker's view:
     /// walk it back to the orchestrator's view. A walk already under way
     /// finishes first.
     fn back_to_main(&mut self, ctx: &egui::Context, tab: TabId) {
@@ -3450,10 +3449,10 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Keep the relay's asks to show Claude Code's agent strip (giverny#75)
+    /// Keep the relay's asks to show Claude Code's agent strip
     /// in step with what needs it: a walk on its way into a worker's view,
     /// until it is done. Everything else leaves the strip to the agents
-    /// pane — a Running worker opens straight into its view (giverny#82),
+    /// pane — a Running worker opens straight into its view,
     /// and the walk brings the relay's run forward itself (`Nudge`).
     fn sync_strip_asks(&mut self) {
         let mut want: HashSet<TabId> = HashSet::new();
@@ -3503,7 +3502,7 @@ impl App {
 
     /// One frame of an attach: read the parent's screen, maybe type a key;
     /// once the walk is done, wait for the view's final screen before the
-    /// tab's picture is let go (giverny#82).
+    /// tab's picture is let go.
     fn process_attach(&mut self, ctx: &egui::Context) {
         use agent_open::Tick;
         let pane_on = self.cfg.claude.agents_pane;
@@ -3528,7 +3527,7 @@ impl App {
         // keeps the pty narrow until Enter is on the worker's row
         // (`ask_held`): Claude Code's next run is 300 ms after the width
         // comes back, so it comes just after the walk lets the strip go,
-        // and answers that with no second nudge (giverny#108).
+        // and answers that with no second nudge.
         let to_worker = matches!(job.driver.goal, agent_open::Goal::Worker { .. });
         let waiting = pane_on
             && to_worker
@@ -3632,7 +3631,7 @@ impl App {
         }
     }
 
-    /// One frame of the hover pre-arm (giverny#132): while the pointer
+    /// One frame of the hover pre-arm: while the pointer
     /// rests on a Running row of the active tab's pane, on a screen that
     /// has held still, ask for the strip and nudge now, holding the tab's
     /// picture, so a click finds the strip already drawn. Off the row, the
@@ -3853,7 +3852,7 @@ impl App {
 
     /// Debug builds only: `GIVERNY_DEBUG_CMD=<file>`. When the file shows up
     /// it is taken, one command per line, and each is carried out as the
-    /// input it stands for (giverny#75), in-process, so a real window can be
+    /// input it stands for, in-process, so a real window can be
     /// driven and watched without synthetic input events:
     ///
     /// * `click <row>` — select the tab whose agents pane has the row (its
@@ -3866,7 +3865,7 @@ impl App {
     /// * `key <enter|up|down>` — that key press, as typed;
     /// * `dump <file>` — the active tab's screen text into the file;
     /// * `drag <row> <col> <row> <col>` — a pointer drag over the active
-    ///   tab's agents pane, cell to cell (giverny#84); the same cell twice
+    ///   tab's agents pane, cell to cell; the same cell twice
     ///   is a click;
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points.
     #[cfg(debug_assertions)]
@@ -3966,8 +3965,7 @@ impl App {
                 }
                 // `hover <row>`: the pointer onto that agents-pane row (its
                 // feed key, agent id or name) and left there; `press <row>`
-                // clicks it there; `unhover` moves it onto the terminal
-                // (giverny#132).
+                // clicks it there; `unhover` moves it onto the terminal.
                 "hover" | "press" | "unhover" => {
                     let tab = self.ws.active;
                     let pos = if cmd == "unhover" {
@@ -4059,7 +4057,7 @@ impl App {
                     feed(vec![button(to, false)]);
                 }
                 // `shots <dir> <frames> <stride>`: photograph the window's
-                // next frames, leaving it open (giverny#132).
+                // next frames, leaving it open.
                 "shots" => {
                     let mut it = arg.split_whitespace();
                     let dir = it.next().unwrap_or("/tmp/giverny-shots");
@@ -4297,7 +4295,7 @@ fn count_frame(ctx: &egui::Context) {
 
 /// Input queued by `debug_cmd`, one frame's worth per entry.
 /// The terminal `id` has lost the keyboard to something that is not meant
-/// to hold it, and should take it back (giverny#109): anything but a text
+/// to hold it, and should take it back: anything but a text
 /// field, while no `overlay` reading keys of its own is open.
 fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
     !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
@@ -4584,7 +4582,7 @@ impl eframe::App for App {
                 || self.prearm.as_ref().is_some_and(|p| p.tab == active);
             if let Some(rt) = self.rt.get_mut(&active) {
                 update_worker_bg(&ctx, rt, self.worker_tabs.contains(&active));
-                // Held (giverny#82): the picture stays the view it was, and
+                // Held: the picture stays the view it was, and
                 // so does everything drawn about it.
                 if !holding {
                     rt.shown_viewed = rt.viewed.clone();
@@ -4612,7 +4610,7 @@ impl eframe::App for App {
                 let (click, line) = agents_pane::show(
                     &mut self.agent_views,
                     active,
-                    // Only once the tab's session is up (giverny#111).
+                    // Only once the tab's session is up.
                     self.claude.agents.shown(active),
                     viewed.as_deref(),
                     header_id.as_deref(),
@@ -4636,7 +4634,7 @@ impl eframe::App for App {
             if let Some(rt) = self.rt.get_mut(&active) {
                 // With the agents pane on, Giverny stands in for Claude
                 // Code's strip: its `main` row is not drawn, and a worker's
-                // view gets a way back (giverny#75).
+                // view gets a way back.
                 rt.view.marks_for = self
                     .cfg
                     .claude
@@ -4653,8 +4651,8 @@ impl eframe::App for App {
                     if rt.view.button_pressed {
                         actions.push(Action::BackToMain(active));
                     }
-                    // Over the top of the terminal, on the worker's view
-                    // (giverny#82): what it is working on, in full.
+                    // Over the top of the terminal, on the worker's view:
+                    // what it is working on, in full.
                     self.header_close = None;
                     if let Some(line) = &header {
                         let (closed, close) =
@@ -4665,7 +4663,7 @@ impl eframe::App for App {
                             self.focus_terminal = true;
                         }
                     }
-                    // Typing goes to the terminal (giverny#109). egui drops
+                    // Typing goes to the terminal. egui drops
                     // a widget's focus on any press outside it — a pane
                     // row, the rail, the taskbar, a header button — and
                     // the keys typed after that went nowhere until the
@@ -5157,7 +5155,7 @@ fn fresh_nonce(salt: u64) -> String {
 mod tests {
     use super::*;
 
-    /// giverny#109: a press on anything else — here a button, as a pane
+    /// A press on anything else — here a button, as a pane
     /// row or the rail would be — takes egui's focus off the terminal, and
     /// the terminal is then told to take it back; a text field keeps it.
     #[test]

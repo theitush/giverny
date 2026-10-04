@@ -164,7 +164,7 @@ pub fn tokens_of(path: &Path) -> Option<u64> {
 
 /// What one compaction took off the session: `compactMetadata.preTokens` of a
 /// `compact_boundary` line — Claude Code's own count of the context it had
-/// when it compacted (giverny#133).
+/// when it compacted.
 ///
 /// Measured on this machine's four compacted transcripts, 2026-09-28: a
 /// compaction stays in the same `.jsonl` under the same `sessionId`, marked by
@@ -357,7 +357,7 @@ pub fn subagent_transcripts(dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 /// `(session, subagents, total)`: the session's count, the sum of every
 /// subagent's, and everything added — the session, what it spent before its
-/// compactions (`compacted`, giverny#133) and its subagents — so the parts
+/// compactions (`compacted`) and its subagents — so the parts
 /// always add up (giverny#95). `None` for all three when nothing could be
 /// counted; `subagents` is `Some(0)` when the session has none.
 pub fn session_subagents_total(
@@ -396,7 +396,7 @@ pub fn fmt_tokens(n: u64) -> String {
 
 /// The status-line segments: `session: <n>` always once anything was counted,
 /// with `(+<n>)` after it once the session has compacted — what it spent
-/// before (giverny#133) — then `subagents: <n>` only when the subagents have
+/// before — then `subagents: <n>` only when the subagents have
 /// tokens and `total: <n>` only when there is something besides the session's
 /// own count to add (giverny#95): otherwise the total would only repeat it.
 pub fn segments(

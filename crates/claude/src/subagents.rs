@@ -245,10 +245,10 @@ const ROOT_SCAN: usize = 500;
 /// user or assistant turn. Claude Code copies a conversation's records
 /// forward when it re-ids a session, so this is the same before and after
 /// where the session id is not; `/clear` starts a new root, and a different
-/// conversation has its own (the key `orchestrate-status` files passes by,
-/// coo#92). `None` for a transcript with no turn of its own yet — a session
+/// conversation has its own (a key an orchestrator can file its passes by).
+/// `None` for a transcript with no turn of its own yet — a session
 /// just switched to in the agents view holds only headers until its next
-/// turn (coo#198).
+/// turn.
 pub fn conversation_root(transcript: &Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(transcript).ok()?;
@@ -337,20 +337,20 @@ pub struct Activity {
     /// and that is not the worker working (seen on real transcripts).
     pub last_turn_ms: Option<u64>,
     /// The context the worker carries now: input + cache creation + cache
-    /// read of its *last* API response, assigned, never summed — the count
-    /// `coo/tools/orchestrate-status` writes (`tokens_of`, "WHAT A TOKEN
-    /// COUNT IS"), so the pane and the orchestrator agree (giverny#83).
+    /// read of its *last* API response, assigned, never summed — the rule
+    /// [`crate::tokens`] counts by, so the pane and the status line
+    /// agree.
     pub tokens: Option<u64>,
     /// The model the last assistant turn ran on.
     pub model: Option<String>,
     /// Spans the worker stood stopped on an API error, oldest first: from
     /// Claude Code's `<synthetic>` `isApiErrorMessage` line to its next real
-    /// turn, the last one open while nothing came after it (giverny#91).
+    /// turn, the last one open while nothing came after it.
     pub stops: Vec<Stop>,
 }
 
 /// A span a worker stood stopped on an API error — no network, a usage
-/// limit, an expired login — and its clocks with it (giverny#91).
+/// limit, an expired login — and its clocks with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stop {
     /// The error line's timestamp.
@@ -418,7 +418,7 @@ pub fn read_activity(path: &Path) -> Activity {
 /// [`TAIL_BYTES`], every later one only the bytes appended since, so
 /// keeping a running worker's tokens and activity current every second
 /// costs a `stat` while it is thinking and a few lines' parse when it
-/// writes (giverny#83).
+/// writes.
 ///
 /// [`poll`]: TranscriptTail::poll
 #[derive(Debug, Clone, Default)]
@@ -564,8 +564,7 @@ fn fold_line(act: &mut Activity, line: &[u8]) {
 /// The context one `usage` says the worker carries: input, cache creation
 /// and cache read, added. Claude Code measures a turn that ran several API
 /// iterations by the last real one (not an `advisor_message` or a
-/// `compaction`), and falls back to the top level on anything unexpected;
-/// `usage_numbers` in `orchestrate-status` is the same rule.
+/// `compaction`), and falls back to the top level on anything unexpected.
 fn context_tokens(u: &Value) -> u64 {
     let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     let top = n(u, "input_tokens")
@@ -847,8 +846,8 @@ pub fn is_finished(completion: &Completion, last_turn_ms: Option<u64>) -> bool {
 // Rows
 // ---------------------------------------------------------------------------
 
-/// One subagent, as the pane shows it. The stable type the pane (build task
-/// C) and the relay (task B) consume; fields are only ever added.
+/// One subagent, as the pane shows it. The stable type the pane and the
+/// relay consume; fields are only ever added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentRow {
     /// Agent id: `agent-<id>.jsonl`, `tasks[].id`, `<task-id>`. The join key
@@ -893,7 +892,7 @@ pub struct SubagentRow {
     /// the live list's `tokenCount` never replaces it: that count is the
     /// context *plus* output so far, and an API error zeroes the context
     /// part, so a failed worker lists at its output alone — the `764`
-    /// of giverny#92.
+    /// of the real transcript in the tests.
     #[serde(default)]
     pub tokens_from_transcript: bool,
     /// Claude Code's own count, the live list's `tokenCount`: the context of
@@ -933,7 +932,7 @@ impl SubagentRow {
     /// Why its clocks stand still, and since when: an API error it has not
     /// written past, else a failed, killed or stopped end. `None` while it
     /// is working — or finished cleanly, where the orchestrator's landing is
-    /// still time on the task (giverny#91).
+    /// still time on the task.
     pub fn stopped(&self) -> Option<(u64, String)> {
         if let Some(s) = self.stops.last().filter(|s| s.to_ms.is_none()) {
             return Some((s.from_ms, format!("stopped: {}", s.reason)));
@@ -1023,10 +1022,10 @@ impl SubagentRow {
     }
 
     /// The count the pane draws: Claude Code's own (`tokenCount`, what its
-    /// agents view shows, giverny#116), unless the transcript's context is
+    /// agents view shows), unless the transcript's context is
     /// larger. By construction Claude Code's is the context plus output, so
     /// it is only ever smaller when it is wrong: after an API error it is
-    /// the output alone (giverny#92), and just after a continue it is a
+    /// the output alone, and just after a continue it is a
     /// count the next turn replaces. Then the transcript's stands in, as it
     /// does while no live list has named one.
     pub fn shown_tokens(&self) -> Option<u64> {
@@ -1136,7 +1135,7 @@ pub struct Tracker {
     followers: HashMap<String, TranscriptTail>,
     /// Finished workers whose transcript this process has read once: a row
     /// restored with the live list's count (or none) is set right from its
-    /// transcript after a restart, and then left alone (giverny#92).
+    /// transcript after a restart, and then left alone.
     #[serde(skip)]
     checked: std::collections::HashSet<String>,
     /// Workers whose Done rows were cleared by hand ([`Tracker::clear_done`]):
@@ -1177,7 +1176,7 @@ impl Tracker {
         self.rows.clear();
     }
 
-    /// Clear the Done rows by hand (`giverny pass clear-done`, giverny#112),
+    /// Clear the Done rows by hand (`giverny pass clear-done`),
     /// keeping the Running ones. A cleared worker stays gone — the next
     /// refresh finds its transcript and notification still on disk — unless
     /// it runs again. Returns how many rows went.
@@ -1278,7 +1277,7 @@ impl Tracker {
             }
             // A worker continued after an API error is listed afresh, its
             // start moved to the continue: the stop ends there and the
-            // clock carries on from where it stood (giverny#91).
+            // clock carries on from where it stood.
             let resumed = Outcome::parse(&t.status).is_none() && row.resume_at(t.start_ms);
             if t.start_ms.is_some() && !(resumed && row.started_ms.is_some()) {
                 row.started_ms = t.start_ms;
@@ -1287,7 +1286,7 @@ impl Tracker {
             // is one (it moves every second, and agrees with the
             // orchestrator's); the live list's stands in until then. It is
             // never taken back: after an API error the live count is the
-            // output alone (giverny#92).
+            // output alone.
             if t.tokens.is_some() && !row.tokens_from_transcript {
                 row.tokens = t.tokens;
             }
@@ -1580,7 +1579,7 @@ mod tests {
     fn parses_live_snapshot_tolerantly() {
         let snap = LiveSnapshot::parse(
             r#"{"session_id":"s1","columns":179,"tasks":[
-                {"id":"a1","type":"local_agent","status":"running","description":"Work coo#74",
+                {"id":"a1","type":"local_agent","status":"running","description":"Work acme#74",
                  "label":"Grepping","startTime":1790089835667,"model":"m","tokenCount":124832,"cwd":"/w"},
                 {"id":"a2","status":"completed","startTime":"2026-09-23T08:00:00Z","tokenCount":"oops"},
                 {"status":"running"}
@@ -1638,7 +1637,7 @@ mod tests {
             Some(T0 + 3000),
             "attachments are not turns"
         );
-        // Context carried (2 + 100 + 8), not the output on top (coo#118).
+        // Context carried (2 + 100 + 8), not the output on top.
         assert_eq!(act.tokens, Some(110));
         assert_eq!(act.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(
@@ -1740,7 +1739,7 @@ mod tests {
 
     #[test]
     fn iterations_measure_a_turn_by_its_last_real_one() {
-        // orchestrate-status `usage_numbers`, case for case.
+        // Each way a turn's `iterations` can look, case for case.
         let u = serde_json::json!({"input_tokens": 1, "cache_read_input_tokens": 1000,
         "iterations": [
             {"type": "message", "input_tokens": 1, "cache_read_input_tokens": 400},
@@ -1978,7 +1977,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             subs.join("agent-a2.meta.json"),
-            r#"{"agentType":"coo","description":"Work coo#1 thing","model":"opus"}"#,
+            r#"{"agentType":"orchestrator","description":"Work acme#1 thing","model":"opus"}"#,
         )
         .unwrap();
         // a3: a transcript but no notification and no live entry — ignored.
@@ -2001,8 +2000,8 @@ mod tests {
         let a2 = t.get("a2").unwrap();
         assert_eq!(a2.stage, Stage::Done);
         assert_eq!(a2.outcome, Some(Outcome::Completed));
-        assert_eq!(a2.description.as_deref(), Some("Work coo#1 thing"));
-        assert_eq!(a2.agent_type.as_deref(), Some("coo"));
+        assert_eq!(a2.description.as_deref(), Some("Work acme#1 thing"));
+        assert_eq!(a2.agent_type.as_deref(), Some("orchestrator"));
         assert_eq!(a2.started_ms, Some(T0 - 50_000));
         assert_eq!(a2.ended_ms, Some(T0 + 30));
         assert!(t.get("a3").is_none());
@@ -2118,7 +2117,7 @@ mod tests {
         finished_worker(&config, "a", "wa", Some("root-a"));
         finished_worker(&config, "a2", "wa2", Some("root-a")); // a re-id, records copied
         finished_worker(&config, "b", "wb", Some("root-b"));
-        finished_worker(&config, "switched", "ws", None); // headers only (coo#198)
+        finished_worker(&config, "switched", "ws", None); // headers only
         let mut t = Tracker::new(Some(config.clone()));
         t.set_session("a");
         assert_eq!(t.continues("a"), Some(true));
@@ -2170,9 +2169,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&config);
     }
 
-    /// A real worker's transcript (giverny#84's, trimmed to its usage,
+    /// A real worker's transcript (trimmed to its usage,
     /// tool names and timestamps): cut off by `EAI_AGAIN` at 17:38:46 and
-    /// continued the next morning. `orchestrate-status`' `tokens_of()`
+    /// continued the next morning. Counted as context per turn, it
     /// reads 131752 on the first 143 lines and 134773 on all 175.
     const REAL: &str = include_str!("../testdata/agent-api-error-resume.jsonl");
     const REAL_BEFORE_LINES: usize = 143;
@@ -2255,7 +2254,7 @@ mod tests {
         }
     }
 
-    /// giverny#116: Claude Code's agents view shows the live list's
+    /// Claude Code's agents view shows the live list's
     /// `tokenCount` — the context plus the output so far — and so does the
     /// pane, while the transcript's context stays on the row as the floor.
     #[test]
@@ -2288,7 +2287,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&config);
     }
 
-    /// giverny#92: the live list's count for a worker an API error stopped
+    /// The live list's count for a worker an API error stopped
     /// is its output alone (764 on the real one), and a row that took it —
     /// new to a tracker, or restored from a save written before the
     /// transcript was read — must show the transcript's count instead,

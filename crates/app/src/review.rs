@@ -1,13 +1,13 @@
-//! A Done row's Review line (giverny#60).
+//! A Done row's Review line.
 //!
 //! When a task lands in Review, its issue body opens with one line —
 //! `**Review:** <who> — <what> — <where>` — which is the thing a person has
 //! to read about it. A Done row's overlay shows that line at its top. The
-//! row's key names the issue (`giverny#60`, or `owner/repo#60`); the body is
+//! row's key names the issue (`demo#60`, or `owner/repo#60`); the body is
 //! one REST read through `gh`, made off the UI thread, and a row whose issue
 //! has no such line (or no issue, or no `gh`) opens exactly as before.
 //!
-//! A feed row may carry the line itself (`review`, giverny#101): then that
+//! A feed row may carry the line itself (`review`): then that
 //! text is shown and `gh` is never run, which is how a pass with no GitHub
 //! behind it gets the same box.
 
@@ -140,18 +140,18 @@ mod tests {
     #[test]
     fn keys_name_issues() {
         assert_eq!(
-            issue_of("giverny#60"),
+            issue_of("demo#60"),
             Some(IssueRef {
                 owner: None,
-                repo: "giverny".into(),
+                repo: "demo".into(),
                 number: 60
             })
         );
         assert_eq!(
-            issue_of("y0av/giverny#7"),
+            issue_of("y0av/demo#7"),
             Some(IssueRef {
                 owner: Some("y0av".into()),
-                repo: "giverny".into(),
+                repo: "demo".into(),
                 number: 7
             })
         );
@@ -164,15 +164,15 @@ mod tests {
 
     #[test]
     fn finds_the_review_line() {
-        let body = "**Review:** ita — the empty state — branch x\n\n**Agent:** Wren\n\
-                    **Ask** — Ita:\n> hi\n";
+        let body = "**Review:** sam — the empty state — branch x\n\n**Agent:** Wren\n\
+                    **Ask** — a person:\n> hi\n";
         assert_eq!(
             review_line(body).as_deref(),
-            Some("ita — the empty state — branch x")
+            Some("sam — the empty state — branch x")
         );
         // Below the signature line is still the top of the body.
-        let body = "**Agent:** Wren\n**Review:**  ita — look\n";
-        assert_eq!(review_line(body).as_deref(), Some("ita — look"));
+        let body = "**Agent:** Wren\n**Review:**  sam — look\n";
+        assert_eq!(review_line(body).as_deref(), Some("sam — look"));
     }
 
     #[test]

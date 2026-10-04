@@ -440,7 +440,7 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "claude.agents_pane",
         label: "agents pane",
-        // Shown under Orchestrator, below the limits (giverny#183); the key
+        // Shown under Orchestrator, below the limits; the key
         // stays under [claude], where it always was.
         section: Section::Orchestrator,
         doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",

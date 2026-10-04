@@ -3,7 +3,7 @@
 //!
 //! `giverny relay --subagent-line` forwards Claude Code's live worker list
 //! with the tab it ran in (`GIVERNY_TAB_ID`, which reaches that command:
-//! verified against 2.1.280, giverny#3). [`ClaudeWatch`] hands each one here,
+//! verified against 2.1.280). [`ClaudeWatch`] hands each one here,
 //! and this keeps one [`Tracker`] per tab — Running rows from the ticks, Done
 //! rows from the transcripts once a worker leaves the list. The pane reads
 //! them through [`AgentsLive::tracker`]; nothing here draws anything.
@@ -13,8 +13,7 @@
 //! `claude` starts in it (`source: "startup"`), or the tab is closed, and they are saved to disk so a Giverny restart keeps the Done
 //! rows. They are part of the tab's session, though: after a restart they are
 //! not shown until that session is back up — its `SessionStart`, or a tick
-//! from it — and they go again when it ends ([`AgentsLive::shown`],
-//! giverny#111).
+//! from it — and they go again when it ends ([`AgentsLive::shown`]).
 //!
 //! [`ClaudeWatch`]: crate::claude_watch::ClaudeWatch
 
@@ -92,7 +91,7 @@ impl AgentsLive {
 
     /// [`AgentsLive::tracker`], but only while `tab`'s session is up: what
     /// the pane draws. Rows restored from disk wait for the session they
-    /// belong to, so the pane does not show before it (giverny#111).
+    /// belong to, so the pane does not show before it.
     pub fn shown(&self, tab: TabId) -> Option<&Tracker> {
         self.tracker(tab).filter(|_| self.up.contains(&tab))
     }
@@ -141,23 +140,23 @@ impl AgentsLive {
     /// table over, bound to the new session — its old ids are not aliases,
     /// or their finished workers would come back as Done rows on the next
     /// refresh. So does a fresh `claude` (`source: "startup"`), whose
-    /// conversation has no transcript yet to compare roots with
-    /// (giverny#117), and a start in *another* conversation — `/resume` of
+    /// conversation has no transcript yet to compare roots with,
+    /// and a start in *another* conversation — `/resume` of
     /// an older one, whose transcript has a root of its own
     /// ([`Tracker::continues`]): the table is that conversation's, rebuilt
     /// from its own `subagents/` on the next refresh, and nothing of what the
-    /// tab ran before (giverny#112). Any other start — the same conversation
+    /// tab ran before. Any other start — the same conversation
     /// re-id'd (`compact`, or `fork`/`resume` for the agents view's switch
-    /// and the move into a background host, coo#198), or one whose root
+    /// and the move into a background host), or one whose root
     /// cannot be read yet — keeps the rows and records the new id beside the
-    /// old (giverny#105).
+    /// old.
     ///
     /// `startup` is safe to take as new because Claude Code (2.1.283) raises
     /// it only where no conversation is carried in: a launch without
     /// `--resume`/`--continue`, and the claim of a spare that has not run a
     /// turn. Every path that loads an existing conversation raises `resume`,
     /// or `fork` when the id changes — the switch recorded in real
-    /// transcripts as `SessionStart:fork` (giverny#117).
+    /// transcripts as `SessionStart:fork`.
     pub fn session_started(&mut self, tab: TabId, source: Option<&str>, session_id: Option<&str>) {
         self.up.insert(tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
@@ -230,7 +229,7 @@ impl AgentsLive {
 }
 
 /// What a refresh can change that is worth saving: a corrected token count
-/// (giverny#92) and a stop opening or closing (giverny#91) among them, so a
+/// and a stop opening or closing among them, so a
 /// restart comes back to them.
 type Signature = (
     String,
@@ -347,10 +346,10 @@ mod tests {
         assert!(live.tracker(TabId(9)).is_none());
     }
 
-    /// giverny#117: quitting claude and starting a fresh one in the tab
+    /// Quitting claude and starting a fresh one in the tab
     /// empties the pane, though the new transcript is not on disk yet; a
     /// re-id of the same conversation (`fork`, `resume`, `compact`, no root
-    /// to compare) keeps the rows, as #105 needs.
+    /// to compare) keeps the rows.
     #[test]
     fn a_fresh_claude_starts_over_and_a_re_id_does_not() {
         let mut live = AgentsLive::in_memory();
@@ -375,7 +374,7 @@ mod tests {
         assert_eq!(t.config_dir.as_deref(), Some(Path::new("/nowhere")));
     }
 
-    /// giverny#112: a tab resumed into A, then B, then A again shows each
+    /// A tab resumed into A, then B, then A again shows each
     /// conversation's own finished workers, and nothing of the others'.
     #[test]
     fn a_resume_into_another_conversation_shows_only_its_rows() {
@@ -440,7 +439,7 @@ mod tests {
         assert_eq!(ids(&live), ["wa"]);
         assert_eq!(live.tracker(TAB).unwrap().aliases, ["A".to_string()]);
 
-        // giverny#117: a plain `claude` (startup, nothing on disk yet) is
+        // A plain `claude` (startup, nothing on disk yet) is
         // empty; `/resume` from there back into A brings A's rows back
         // from disk. Claude Code sends startup, then resume, in that order.
         live.session_ended(TAB);
@@ -470,7 +469,7 @@ mod tests {
         live.clear_done(TabId(99), None); // no tracker: nothing happens
     }
 
-    /// giverny#111: rows restored from disk are the session's; the pane
+    /// Rows restored from disk are the session's; the pane
     /// waits for that session, and goes when it ends.
     #[test]
     fn restored_rows_wait_for_their_session() {
@@ -520,12 +519,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// giverny#116, on giverny#84's real transcript (its first 120 lines,
+    /// On a real worker's transcript (its first 120 lines,
     /// still working): the pane's row reads what Claude Code's agents view
     /// reads. Claude Code counts ELAPSED from the tick's `startTime` and
     /// shows the tick's `tokenCount` — the last turn's context (123,200
     /// here) plus every output token so far (734). The feed's `started`
-    /// was stamped 75 s before the spawn, as `orchestrate-status start`
+    /// was stamped 75 s before the spawn, as an orchestrator's `start`
     /// does, and is not the clock.
     #[test]
     fn a_worked_row_reads_as_claude_codes_agents_view() {
@@ -545,7 +544,7 @@ mod tests {
         std::fs::write(subs.join("agent-a84.jsonl"), text).unwrap();
         let feed = giverny_claude::feed::parse(
             format!(
-                r#"{{"session":"s","rows":[{{"key":"giverny#84","stage":"running",
+                r#"{{"session":"s","rows":[{{"key":"demo#84","stage":"running",
                    "title":"FEATURE: selectable","started":{},"eta_s":3600}}]}}"#,
                 SPAWN_MS - 75_000
             )
@@ -557,7 +556,7 @@ mod tests {
         t.apply_live(
             &LiveSnapshot::from_value(&serde_json::json!({"session_id": "s", "tasks": [
                 {"id": "a84", "type": "local_agent", "status": "running",
-                 "description": "Work giverny#84 select", "startTime": SPAWN_MS,
+                 "description": "Work demo#84 select", "startTime": SPAWN_MS,
                  "tokenCount": CLAUDE_CODES}]})),
             now,
         );
@@ -565,14 +564,14 @@ mod tests {
         let a84 = t.get("a84").unwrap();
         assert_eq!(a84.tokens, Some(123_200), "the transcript's context");
         let l = build(Some(&feed), t.rows(), now).lines[0].clone();
-        assert_eq!(l.id, "giverny#84");
+        assert_eq!(l.id, "demo#84");
         assert_eq!(l.elapsed, stopwatch(705), "11:45, from the spawn");
         assert_eq!(l.tokens, fmt_tokens(CLAUDE_CODES));
         assert_eq!(l.tokens, "123.9k");
         let _ = std::fs::remove_dir_all(&config);
     }
 
-    /// giverny#91, on giverny#84's real transcript (trimmed): cut off by
+    /// On a real worker's transcript (trimmed): cut off by
     /// `EAI_AGAIN` at 17:38:46, continued at 07:34:58 the next morning. Its
     /// row stands still with the reason while it is stopped, whatever the
     /// live list says and however long that lasts, and counts on from where
@@ -603,12 +602,12 @@ mod tests {
 
         let tick = |status: &str, start: u64, tokens: u64| {
             LiveSnapshot::from_value(&serde_json::json!({"session_id": "s", "tasks": [
-                {"id": "a84", "status": status, "description": "Work giverny#84 select",
+                {"id": "a84", "status": status, "description": "Work demo#84 select",
                  "startTime": start, "tokenCount": tokens}]}))
         };
         let feed = giverny_claude::feed::parse(
             format!(
-                r#"{{"session":"s","rows":[{{"key":"giverny#84","stage":"running",
+                r#"{{"session":"s","rows":[{{"key":"demo#84","stage":"running",
                    "title":"FEATURE: selectable","started":{start},"eta_s":3600}}]}}"#
             )
             .as_bytes(),

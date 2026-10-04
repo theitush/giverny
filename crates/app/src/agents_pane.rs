@@ -12,7 +12,7 @@
 //! fixed width, no header row, the whole row tinted by its stage, a
 //! stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done row's
 //! `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's row
-//! above it — the same table `coo/tools/orchestrate-status` pins under
+//! above it — a compact status table pinned under
 //! Claude Code. The session's token total is not here: it is on the status
 //! line's model row.
 //!
@@ -21,21 +21,21 @@
 //! emptied on `/clear` and refreshed once a second — and keeps only what the
 //! pane itself needs per tab: the feed it last read.
 //!
-//! **Clocks stop while nothing can run** (giverny#53): while the tab's
+//! **Clocks stop while nothing can run**: while the tab's
 //! account is out of a usage limit ([`Limit`]), a Running row's ELAPSED
 //! stops and its ETA holds instead of counting down past zero, and NOW says
 //! `5h limit → 13:00`. The pane remembers each such span ([`Hold`]) and
 //! both clocks carry on from where they stopped once the limit resets. A
-//! feed row the orchestrator has paused (`paused_since`, coo#170) is held
+//! feed row the orchestrator has paused (`paused_since`) is held
 //! the same way, and reads `paused since 12:58`. Planned ETAs are durations
 //! and hold by themselves; a Done row is measured history and never moves.
 //!
 //! **Clicks** produce a [`RowClick`], which the app receives as
 //! `Action::AgentRowClicked`. What a click *does* is not decided here, and
 //! it leaves no mark: a row is tinted only while the pointer is on it
-//! ([`row_tint`]), so nothing stays highlighted after a click (giverny#40).
+//! ([`row_tint`]), so nothing stays highlighted after a click.
 //!
-//! **Resources** (giverny#164, #182): what a row's `giverny pass run`
+//! **Resources**: what a row's `giverny pass run`
 //! commands use in a quiet column — live CPU and memory while one runs, the
 //! memory peak once the row is Done — its lease from the machine ledger in
 //! its overlay header, a Next up row's place in the ledger's queue in NOW,
@@ -43,7 +43,7 @@
 //! ledger and the commands' cgroups are read off the UI thread
 //! ([`LedgerWatch`]); the ledger wins over a row's own copy ([`with_ledger`]).
 //!
-//! **Text is selectable** (giverny#84): a drag — never a click — selects
+//! **Text is selectable**: a drag — never a click — selects
 //! the pane's text the way the terminal does, as a stream of cells across
 //! rows, copies it as plain text line by line when the drag ends, and
 //! `Ctrl+Shift+C` copies it again. The next press anywhere lets it go.
@@ -67,8 +67,8 @@ use giverny_term::widget::RenderShared;
 use crate::chrome::Chrome;
 use crate::claude_watch::ClaudeWatch;
 
-/// The three stage tints, the 256-colour codes `orchestrate-status` uses
-/// (38;5;32, 38;5;67, 38;5;28), picked there to read on dark and light
+/// The three stage tints, the 256-colour codes 38;5;32, 38;5;67 and
+/// 38;5;28, picked to read on dark and light
 /// themes alike.
 pub const RUNNING: Color32 = Color32::from_rgb(0x00, 0x87, 0xd7);
 pub const PLANNED: Color32 = Color32::from_rgb(0x5f, 0x87, 0xaf);
@@ -77,8 +77,7 @@ pub const DONE: Color32 = Color32::from_rgb(0x00, 0x87, 0x00);
 /// How often the feed file is stat'ed.
 const POLL: Duration = Duration::from_secs(1);
 
-// Column widths, in characters (orchestrate-status: HEAD_W, EL_W, ETA_W,
-// NOW_W, TOK_W).
+// Column widths, in characters.
 const STAGE_W: usize = 7;
 const EL_W: usize = 8;
 const ETA_W: usize = 10;
@@ -89,11 +88,11 @@ const MIN_TITLE: usize = 12;
 
 /// What a Running row's ETA cell says when nobody gave it an estimate —
 /// drawn dim, so a row the dispatcher forgot to estimate reads as missing
-/// one rather than as a blank (giverny#140).
+/// one rather than as a blank.
 pub const NO_ETA: &str = "no ETA";
 /// Where in [`Cols::segments`] the ETA cell sits.
 const ETA_SEG: usize = 3;
-/// Where in [`Cols::segments`] the use cell sits (giverny#164, #182).
+/// Where in [`Cols::segments`] the use cell sits.
 const LEASE_SEG: usize = 6;
 /// How strongly a use cell is inked, against its row's colour.
 const LEASE_INK: f32 = 0.75;
@@ -104,7 +103,7 @@ const LEASE_MAX: usize = 32;
 
 /// What the pane itself keeps per tab: the feed it last read and the text
 /// dragged over. Never the rows — those are the tracker's — and no row
-/// selection: a click acts and leaves no mark (giverny#40).
+/// selection: a click acts and leaves no mark.
 #[derive(Default)]
 struct View {
     feed: FeedCache,
@@ -116,7 +115,7 @@ struct View {
     fit: Option<f32>,
     /// Every usage-limit span this tab's clocks were held through.
     holds: Vec<Hold>,
-    /// The text dragged over, until the next press (giverny#84).
+    /// The text dragged over, until the next press.
     sel: Option<Selection>,
     /// Where the rows were drawn last frame, and the cell width: what the
     /// debug `drag` command aims at.
@@ -127,13 +126,13 @@ struct View {
     #[cfg(debug_assertions)]
     clicks: Vec<RowClick>,
     /// The pointer over the rows last frame: `Some(None)` on the pane but
-    /// not on a worker's row, `Some(Some(row))` on that row (giverny#132).
+    /// not on a worker's row, `Some(Some(row))` on that row.
     hover: Option<Option<RowClick>>,
     /// The transcripts are due a poll (with the feed, once a [`POLL`]).
     logs_due: bool,
     /// Each worker's whole transcript, by agent id: its turns' tokens and
     /// its dispatcher's messages, to split a worker that took tasks one
-    /// after another into a row per task (giverny#141).
+    /// after another into a row per task.
     logs: Logs,
 }
 
@@ -177,7 +176,7 @@ pub fn poll_logs(logs: &mut Logs, live: &[SubagentRow]) {
 pub struct Views {
     tabs: HashMap<TabId, View>,
     /// The machine ledger, read off the UI thread: one for every tab, as
-    /// there is one ledger for the whole machine (giverny#164).
+    /// there is one ledger for the whole machine.
     ledger: LedgerWatch,
 }
 
@@ -190,7 +189,7 @@ impl Views {
     /// Where the pointer was over `tab`'s rows when the pane was last drawn,
     /// taken so it is never read twice: `None` off the pane (or when the
     /// pane was not drawn), `Some(None)` on it but off every row,
-    /// `Some(Some(row))` on a row (giverny#132).
+    /// `Some(Some(row))` on a row.
     pub fn take_hover(&mut self, tab: TabId) -> Option<Option<RowClick>> {
         self.tabs.get_mut(&tab)?.hover.take()
     }
@@ -434,14 +433,14 @@ pub struct LedgerView {
     /// `[orchestrator.limits]` resolved for this machine; `None` when the
     /// config could not be read.
     pub limits: Option<Resolved>,
-    /// What each task's running `giverny pass run` commands use now
-    /// (giverny#182), sampled with the ledger.
+    /// What each task's running `giverny pass run` commands use now,
+    /// sampled with the ledger.
     pub live: Vec<TaskLive>,
 }
 
-/// The ledger, read by a thread of its own (giverny#164): the read takes the
+/// The ledger, read by a thread of its own: the read takes the
 /// ledger's `flock`, which a writer may hold, and resolving the limits runs
-/// `nvidia-smi` — neither belongs on the UI thread (giverny#150). The pane
+/// `nvidia-smi` — neither belongs on the UI thread. The pane
 /// only ever takes the last snapshot.
 #[derive(Default)]
 struct LedgerWatch {
@@ -532,7 +531,7 @@ fn ledger_file() -> PathBuf {
 }
 
 /// `feed` with each row's `live` use: its task's running commands under any
-/// of `sessions`, matched as [`with_ledger`] matches leases (giverny#182).
+/// of `sessions`, matched as [`with_ledger`] matches leases.
 pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
     for row in &mut feed.rows {
         row.live = live
@@ -546,7 +545,7 @@ pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
 /// `feed` with every row's `lease` taken from the ledger rather than the
 /// row's own copy, which is only as fresh as its session's last `claim`: a
 /// lease another session released, or one that expired, is not pushed back
-/// to rows (giverny#160). A row's lease is the ledger's entry for its key
+/// to rows. A row's lease is the ledger's entry for its key
 /// under any of `sessions` (the feed's and the tab's ids); a row with none
 /// holds nothing. A queued row's place is its place now, and it waits
 /// behind the task its copy named while that one still holds or waits
@@ -633,10 +632,10 @@ fn mem(mb: u64) -> String {
     }
 }
 
-/// A row's use in its cell (giverny#182): a Running row's commands now,
+/// A row's use in its cell: a Running row's commands now,
 /// `14% CPU 4.2G` (CPU as a share of the whole machine), a Done row's memory
-/// peak alone, `2.1G`; `OOM` after either when the memory cap killed a run
-/// (giverny#173). Empty when there is nothing to say. The lease is not here:
+/// peak alone, `2.1G`; `OOM` after either when the memory cap killed a run.
+/// Empty when there is nothing to say. The lease is not here:
 /// the overlay header says it ([`lease_fact`]).
 pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool) -> String {
     let mut parts = Vec::new();
@@ -681,7 +680,7 @@ fn usage_fact(u: &RowUsage) -> String {
 }
 
 /// A Next up row waiting in the ledger, in its NOW cell: `queued for 3G
-/// behind giverny#12` — what it waits for (its RAM, else VRAM, cores, a
+/// behind demo#12` — what it waits for (its RAM, else VRAM, cores, a
 /// slot) and on whom.
 pub fn queued_note(l: &RowLease) -> String {
     let need = if l.ram_mb > 0 {
@@ -761,12 +760,12 @@ pub fn capacity_line(ledger: &Ledger, limits: &Resolved) -> Option<String> {
 
 // ------------------------------------------------------------- clicks ----
 
-/// What a click on a row names — everything the action behind it (build
-/// task D) could want, so deciding what to do never needs the pane again.
+/// What a click on a row names — everything the action behind it
+/// ([`crate::agent_open`]) could want, so deciding what to do never needs the pane again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowClick {
     pub stage: Stage,
-    /// The feed's key (`coo#158`), else empty.
+    /// The feed's key (`acme#158`), else empty.
     pub key: String,
     /// The Claude Code subagent id, when a worker holds the row.
     pub agent_id: Option<String>,
@@ -783,7 +782,7 @@ pub struct RowClick {
     /// The feed's `review` line (Done): shown at the overlay's top as is.
     pub review: Option<String>,
     /// The row's state in words, for the overlay's header: how it landed,
-    /// how long it took against its estimate, its tokens (giverny#41).
+    /// how long it took against its estimate, its tokens.
     pub facts: Vec<String>,
 }
 
@@ -802,7 +801,7 @@ impl RowClick {
     }
 }
 
-/// What a row click does (giverny#121): a click on the row the tab is
+/// What a row click does: a click on the row the tab is
 /// already showing takes it back to the orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toggle {
@@ -837,15 +836,15 @@ pub struct Line {
     pub elapsed: String,
     pub eta: String,
     /// A Running row with no estimate: `eta` is empty, and the cell is
-    /// drawn as a dim [`NO_ETA`] (giverny#140).
+    /// drawn as a dim [`NO_ETA`].
     pub no_eta: bool,
     pub now: String,
     pub tokens: String,
     /// What the row's commands use ([`usage_cell`]): live on a Running row,
-    /// the memory peak on a Done one; empty when nothing (giverny#182).
+    /// the memory peak on a Done one; empty when nothing.
     pub usage: String,
     /// A `giverny pass run` of the row was killed by its memory cap: the
-    /// lease cell is drawn in the warning colour (giverny#173).
+    /// lease cell is drawn in the warning colour.
     pub oom: bool,
     pub click: RowClick,
 }
@@ -878,7 +877,7 @@ pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
 
 /// [`build`], with the clocks held through `clock`'s usage-limit spans and
 /// each worker's transcript ([`Logs`]) to give a worker that took tasks one
-/// after another a row per task (giverny#141).
+/// after another a row per task.
 pub fn build_at(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -939,7 +938,7 @@ fn dittos(rows: &[PaneRow<'_, SubagentRow>], lines: &mut [Line]) {
 
 /// Where a Running row's clock stands: `now`, or for a row paused in the
 /// feed, the instant its `started` is true as of — the feed's write time
-/// (coo moves `started` on by the open pause up to then), never before the
+/// (a writer that pauses moves `started` on by the open pause up to then), never before the
 /// pause began nor after `now`.
 fn clock_stop(paused_since: Option<u64>, written: Option<u64>, now_ms: u64) -> u64 {
     match paused_since {
@@ -973,20 +972,19 @@ fn format_row(
         (None, None) => (String::new(), String::new()),
     };
     // This row's own start: the feed's (a worker holding several tasks
-    // started each at a different time, and coo moves it on by the row's
+    // started each at a different time, and a pausing writer moves it on by the row's
     // pauses), else the worker's.
     let row_start = row.started_ms();
     let paused = row.paused_since_ms();
     // A feed row that carries its pauses has its stops taken off `started`
-    // already (coo#170, and coo#200 pauses rows for a limit itself): the
+    // already (a writer may also pause rows for a limit itself): the
     // pane's own holds would take them off twice.
     let writer_pauses = f.is_some_and(|f| f.paused_s.is_some() || f.paused_since_ms.is_some());
     let holds = if writer_pauses { &[][..] } else { clock.holds };
     // A Running row's work so far, in seconds: wall time up to where its
     // clock stands, less every span the account was out of its limit.
     // A worker stopped on an API error, or ended badly under a Running
-    // row, stands still from then, and its error spans are off its clock
-    // (giverny#91).
+    // row, stands still from then, and its error spans are off its clock.
     let stopped = l
         .filter(|_| row.stage == Stage::Running)
         .and_then(|l| l.stopped());
@@ -1032,13 +1030,13 @@ fn format_row(
     };
     let no_eta = row.stage == Stage::Running && eta_s.is_none();
     // What the task holds in the machine ledger is in the overlay header; a
-    // Next up row that waits for it says so in NOW (giverny#164).
+    // Next up row that waits for it says so in NOW.
     let held = f
         .and_then(|f| f.lease.as_ref())
         .filter(|_| row.stage != Stage::Done);
     let queued = held.filter(|l| row.stage == Stage::Planned && l.state == LeaseState::Queued);
-    // The cell is the row's use (giverny#182): a Running row's commands now,
-    // a Done row's memory peak alone (giverny#173).
+    // The cell is the row's use: a Running row's commands now,
+    // a Done row's memory peak alone.
     let measured = f.and_then(|f| f.usage.as_ref());
     let oom = measured.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
     let usage = match row.stage {
@@ -1058,8 +1056,8 @@ fn format_row(
                 .and_then(|l| l.activity.clone())
                 .unwrap_or_default(),
         },
-        // Waiting in the machine ledger (giverny#164), else queued on a
-        // worker busy with another task (giverny#141).
+        // Waiting in the machine ledger, else queued on a
+        // worker busy with another task.
         Stage::Planned => queued
             .map(queued_note)
             .or_else(|| row.after_key.as_ref().map(|k| format!("after {k}")))
@@ -1138,26 +1136,22 @@ fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) ->
 }
 
 /// How the dispatcher gives a Running row with no estimate one, as the
-/// overlay header says it (giverny#140): a feed row is re-estimated in
-/// place; a worker with no feed row at all needs one planned and started
-/// first, since `orchestrate-status eta` answers "nothing to re-estimate"
-/// when there is no pass.
+/// overlay header says it: `giverny-pass eta` re-estimates a feed row in
+/// place, and starts a row (Running, with the estimate) for a worker that
+/// has none.
 fn no_eta_hint(key: &str, agent_id: Option<&str>, title: &str) -> String {
     if !key.is_empty() {
-        return format!("no ETA — add one: orchestrate-status eta {key} <min> --why scope");
+        return format!("no ETA — add one: giverny-pass eta {key} <min> --why scope");
     }
     let id = task_key(title).unwrap_or("<task>");
     let agent = agent_id
         .map(|a| format!(" --agent {a}"))
         .unwrap_or_default();
-    format!(
-        "no ETA — add one: echo '{id} | <title> | 1 | <min>' | orchestrate-status plan \
-         && orchestrate-status start {id} --eta <min>{agent}"
-    )
+    format!("no ETA — add one: giverny-pass eta {id} <min>{agent}")
 }
 
-/// The first `repo#n` a worker's description names (`inbar#613 market SD
-/// graph` → `inbar#613`), the id its row would be planned under.
+/// The first `repo#n` a worker's description names (`acme#613 market SD
+/// graph` → `acme#613`), the id its row would be planned under.
 fn task_key(text: &str) -> Option<&str> {
     text.split_whitespace()
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
@@ -1267,8 +1261,8 @@ fn cut(s: &str, max: usize) -> String {
 /// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
 /// while it is, the Running rows' clocks are held. `viewed` is the worker
 /// whose view the tab's Claude Code shows (its id): its row is lit as the
-/// selection (giverny#75). `header` names the worker the terminal's
-/// header is about (giverny#82), whose row comes back with the click, as
+/// selection. `header` names the worker the terminal's
+/// header is about, whose row comes back with the click, as
 /// the pane drew it.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -1300,7 +1294,7 @@ pub fn show(
         .and_then(|c| view.feed_now.as_ref().map(|f| f.without_done_by(c)));
     let feed = cleared.as_ref().or(view.feed_now.as_ref());
     // The ledger is the truth about leases; a row's copy is as of its
-    // session's last claim (giverny#160, #164).
+    // session's last claim.
     let ledger = views.ledger.get(ui.ctx());
     let leased = match (feed, ledger.as_deref()) {
         (Some(f), Some(l)) => {
@@ -1370,8 +1364,7 @@ pub fn show(
         .show(ui, |ui| {
             // Measured outside the scroll area: inside it, the width shrinks
             // by the bar's lane only while the rows overflow, and the right
-            // columns would jump as the pane is resized across that point
-            // (giverny#45).
+            // columns would jump as the pane is resized across that point.
             let cols = table_cols(ui.available_width(), cell.x, bar_lane(ui));
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1413,7 +1406,7 @@ fn pane_frame(bg: Color32) -> egui::Frame {
 /// The pane's outer height for `rows` rows of `row_h`: the rows, egui's
 /// `gap` between each two of them, and the frame's `margin`. Leave out the
 /// gaps and the rows overflow by one gap a row — about one row in seven —
-/// and the scroll area's fade dims the last row shown (giverny#38).
+/// and the scroll area's fade dims the last row shown.
 fn pane_height(rows: usize, row_h: f32, gap: f32, margin: f32) -> f32 {
     let n = rows as f32;
     n * row_h + (n - 1.0).max(0.0) * gap + margin
@@ -1443,7 +1436,7 @@ fn follow_rows(ctx: &egui::Context, id: egui::Id, fit: &mut Option<f32>, want: f
 
 /// A row's background tint, from the pointer alone: a deeper one while it is
 /// pressed, a light one while hovered, none otherwise. There is no third
-/// input — a click leaves nothing behind to highlight (giverny#40).
+/// input — a click leaves nothing behind to highlight.
 /// How strongly the row of the worker on view is lit: past a hover's, so
 /// it reads as the selection even under the pointer.
 const VIEWED_TINT: f32 = 0.26;
@@ -1479,7 +1472,7 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
-    /// The use column (giverny#164, #182), between TASK and ELAPSED: as wide
+    /// The use column, between TASK and ELAPSED: as wide
     /// as its widest cell, and not there at all while no row has one.
     leasew: usize,
     x_lease: usize,
@@ -1545,7 +1538,7 @@ impl Cols {
                 eta_cell(line).into(),
             ),
             // A row with no tokens (Next up) lends NOW the TOKENS column:
-            // `queued for 3G behind giverny#12` is longer than NOW.
+            // `queued for 3G behind demo#12` is longer than NOW.
             (
                 self.x_now,
                 cut(
@@ -1570,7 +1563,7 @@ fn eta_cell(line: &Line) -> &str {
 }
 
 /// A row's text as it reads on screen, one character a cell: what a
-/// selection over it copies (giverny#84).
+/// selection over it copies.
 fn compose(segments: &[(usize, String)]) -> String {
     let mut buf: Vec<char> = Vec::new();
     for (at, s) in segments {
@@ -1588,7 +1581,7 @@ fn compose(segments: &[(usize, String)]) -> String {
 
 // ---------------------------------------------------------- selection ----
 
-/// A drag over the pane's text (giverny#84), in `(row, column)` cells —
+/// A drag over the pane's text, in `(row, column)` cells —
 /// rows count the table's lines, then its footer. The terminal's own model:
 /// a stream from where the drag began to where the pointer is, copied when
 /// the drag ends.
@@ -1765,7 +1758,7 @@ fn draw_table(
     if let Some(footer) = &table.footer {
         segs.push(vec![(0, cut(footer, cols))]);
     }
-    // The machine's capacity, right-aligned under TOKENS (giverny#164).
+    // The machine's capacity, right-aligned under TOKENS.
     if let Some(cap) = &table.capacity {
         let cap = cut(cap, layout.x_tok_end);
         segs.push(vec![(right_at(layout.x_tok_end, &cap), cap)]);
@@ -1793,7 +1786,7 @@ fn draw_table(
         let line = table.lines.get(i);
         let color = line.map_or(chrome.dim, |l| stage_color(l.stage));
         if let Some(line) = line {
-            // The worker whose view the terminal above shows (giverny#75):
+            // The worker whose view the terminal above shows:
             // held lit, with a bar at its left edge, as a selection.
             let on_view = viewed.is_some() && line.click.agent_id.as_deref() == viewed;
             if on_view {
@@ -1882,24 +1875,24 @@ mod tests {
 
     #[test]
     fn clicking_the_viewed_workers_row_goes_home() {
-        let r = row("giverny#1", Some("a1"), Stage::Running);
+        let r = row("demo#1", Some("a1"), Stage::Running);
         assert_eq!(toggle(&r, Some("a1"), None), Toggle::Home);
         // The worker finished while it was viewed: still its row.
-        let done = row("giverny#1", Some("a1"), Stage::Done);
+        let done = row("demo#1", Some("a1"), Stage::Done);
         assert_eq!(toggle(&done, Some("a1"), None), Toggle::Home);
     }
 
     #[test]
     fn clicking_another_row_while_viewing_opens_it() {
-        let r = row("giverny#2", Some("b2"), Stage::Running);
+        let r = row("demo#2", Some("b2"), Stage::Running);
         assert_eq!(toggle(&r, Some("a1"), None), Toggle::Open);
-        let planned = row("giverny#3", None, Stage::Planned);
+        let planned = row("demo#3", None, Stage::Planned);
         assert_eq!(toggle(&planned, Some("a1"), None), Toggle::Open);
     }
 
     #[test]
     fn clicking_with_nothing_viewed_opens() {
-        let r = row("giverny#1", Some("a1"), Stage::Running);
+        let r = row("demo#1", Some("a1"), Stage::Running);
         assert_eq!(toggle(&r, None, None), Toggle::Open);
         let keyless = row("", None, Stage::Done);
         assert_eq!(toggle(&keyless, None, None), Toggle::Open);
@@ -1907,12 +1900,12 @@ mod tests {
 
     #[test]
     fn clicking_the_row_whose_overlay_is_up_closes_it() {
-        let done = row("giverny#1", Some("a1"), Stage::Done);
+        let done = row("demo#1", Some("a1"), Stage::Done);
         assert_eq!(toggle(&done, None, Some(&done)), Toggle::Close);
         // The overlay was opened while the row was Running.
-        let was = row("giverny#1", Some("a1"), Stage::Running);
+        let was = row("demo#1", Some("a1"), Stage::Running);
         assert_eq!(toggle(&done, None, Some(&was)), Toggle::Close);
-        let other = row("giverny#2", Some("b2"), Stage::Done);
+        let other = row("demo#2", Some("b2"), Stage::Done);
         assert_eq!(toggle(&other, None, Some(&done)), Toggle::Open);
     }
 
@@ -1961,7 +1954,7 @@ mod tests {
         let rows = live(
             r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
                 "description":"Fix the board","startTime":1789999958000,
-                "tokenCount":64100,"label":"Editing tools/board"}]}"#,
+                "tokenCount":64100,"label":"Editing src/lib.rs"}]}"#,
         );
         let t = build(None, &rows, T0);
         assert_eq!(t.lines.len(), 1);
@@ -1969,7 +1962,7 @@ mod tests {
         assert_eq!(l.stage, Stage::Running);
         assert_eq!(l.title, "Fix the board");
         assert_eq!(l.elapsed, "0:42");
-        assert_eq!(l.now, "Editing tools/board");
+        assert_eq!(l.now, "Editing src/lib.rs");
         assert_eq!(l.tokens, "64.1k");
         assert_eq!(l.eta, "");
         assert_eq!(l.click.agent_id.as_deref(), Some("a1"));
@@ -1977,10 +1970,10 @@ mod tests {
 
     #[test]
     fn a_running_row_with_no_estimate_says_so() {
-        // A worker spawned outside a pass (giverny#140): a row, but no ETA.
+        // A worker spawned outside a pass: a row, but no ETA.
         let rows = live(
             r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
-                "description":"inbar#613 market SD graph","startTime":1789999958000}]}"#,
+                "description":"acme#613 market SD graph","startTime":1789999958000}]}"#,
         );
         let t = build(None, &rows, T0);
         let l = &t.lines[0];
@@ -1993,10 +1986,9 @@ mod tests {
         let hint = &l.click.facts[1];
         assert!(hint.starts_with("no ETA — add one:"), "{hint}");
         assert!(
-            hint.contains("orchestrate-status start inbar#613 --eta <min> --agent a1"),
+            hint.contains("giverny-pass eta acme#613 <min> --agent a1"),
             "{hint}"
         );
-        assert!(hint.contains("echo 'inbar#613 | <title> | 1 | <min>' | orchestrate-status plan"));
 
         // A feed row with no estimate is re-estimated in place.
         let f = feed(
@@ -2009,7 +2001,7 @@ mod tests {
             t.lines[0]
                 .click
                 .facts
-                .contains(&"no ETA — add one: orchestrate-status eta g#3 <min> --why scope".into())
+                .contains(&"no ETA — add one: giverny-pass eta g#3 <min> --why scope".into())
         );
     }
 
@@ -2028,12 +2020,9 @@ mod tests {
 
     #[test]
     fn a_task_key_is_the_first_repo_and_number_named() {
-        assert_eq!(task_key("inbar#613 market SD graph"), Some("inbar#613"));
-        assert_eq!(
-            task_key("Work theitush/giverny#82: x"),
-            Some("theitush/giverny#82")
-        );
-        assert_eq!(task_key("fix #12 and coo#3"), Some("coo#3"));
+        assert_eq!(task_key("acme#613 market SD graph"), Some("acme#613"));
+        assert_eq!(task_key("Work owner/demo#82: x"), Some("owner/demo#82"));
+        assert_eq!(task_key("fix #12 and acme#3"), Some("acme#3"));
         assert_eq!(task_key("Fix the board"), None);
     }
 
@@ -2045,16 +2034,16 @@ mod tests {
         );
         let f = feed(
             r#"{"version":1,"session":"s","rows":[
-              {"key":"coo#1","stage":"running","title":"FEATURE: one","agent_id":"a1",
+              {"key":"acme#1","stage":"running","title":"FEATURE: one","agent_id":"a1",
                "started":1789999400000,"eta_s":1800},
-              {"key":"coo#2","stage":"planned","title":"FEATURE: two","eta_s":3780},
-              {"key":"coo#3","stage":"done","title":"BUG: three","started":1789990000000,
+              {"key":"acme#2","stage":"planned","title":"FEATURE: two","eta_s":3780},
+              {"key":"acme#3","stage":"done","title":"BUG: three","started":1789990000000,
                "ended":1789993900000,"eta_s":3600,"landing":"Review — ita","tokens":5000}
             ]}"#,
         );
         let t = build(Some(&f), &rows, T0);
         let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
-        assert_eq!(ids, ["coo#1", "coo#2", "coo#3"]);
+        assert_eq!(ids, ["acme#1", "acme#2", "acme#3"]);
         // Running: 10m in, 30m estimate → 20m left.
         assert_eq!(t.lines[0].elapsed, "10:00");
         assert_eq!(t.lines[0].eta, "~20m");
@@ -2128,7 +2117,7 @@ mod tests {
         assert_eq!(t.lines[0].eta, "");
     }
 
-    /// giverny#83: a feed written at `start` (no `agent_id`, no tokens) and
+    /// A feed written at `start` (no `agent_id`, no tokens) and
     /// never refreshed, and the worker Claude Code runs for it. One row,
     /// with the feed's id and ETA and the worker's tokens and activity,
     /// which move with its transcript at every refresh.
@@ -2163,16 +2152,16 @@ mod tests {
         tr.apply_live(
             &LiveSnapshot::parse(
                 r#"{"session_id":"s","tasks":[{"id":"w82","status":"running",
-                    "description":"Work giverny#82 open direct","startTime":1789999400000,
+                    "description":"Work demo#82 open direct","startTime":1789999400000,
                     "tokenCount":49000}]}"#,
             ),
             T0,
         );
         let f = feed(
             r#"{"session":"s","rows":[
-              {"key":"giverny#82","stage":"running","title":"FEATURE: open direct",
+              {"key":"demo#82","stage":"running","title":"FEATURE: open direct",
                "started":1789999400000,"eta_s":3600},
-              {"key":"giverny#84","stage":"planned","title":"FEATURE: selectable","eta_s":1800}
+              {"key":"demo#84","stage":"planned","title":"FEATURE: selectable","eta_s":1800}
             ]}"#,
         );
         let mut seen = Vec::new();
@@ -2191,7 +2180,7 @@ mod tests {
                 "one row for the task and its worker: {t:?}"
             );
             let l = &t.lines[0];
-            assert_eq!(l.id, "giverny#82");
+            assert_eq!(l.id, "demo#82");
             assert_eq!(l.title, "FEATURE: open direct");
             assert_eq!(l.eta, "~50m");
             assert_eq!(l.click.agent_id.as_deref(), Some("w82"));
@@ -2231,7 +2220,7 @@ mod tests {
         .to_string()
     }
 
-    /// A worker `w` spawned at `T0 - 60m` for inbar#613, and its transcript.
+    /// A worker `w` spawned at `T0 - 60m` for acme#613, and its transcript.
     fn reused_worker(
         name: &str,
         lines: &[String],
@@ -2246,7 +2235,7 @@ mod tests {
         let status = if running { "running" } else { "completed" };
         let mut rows = live(&format!(
             r#"{{"session_id":"s","tasks":[{{"id":"w","status":"{status}",
-                "description":"inbar#613 market SD graph","startTime":{},
+                "description":"acme#613 market SD graph","startTime":{},
                 "tokenCount":156313}}]}}"#,
             T0 - 60 * MIN
         ));
@@ -2259,8 +2248,8 @@ mod tests {
         (dir, rows, logs)
     }
 
-    /// The inbar#613 → #614 case as coo's feed wrote it (giverny#141): #613
-    /// landed late with no span, #614 started eight minutes after the
+    /// A worker's run as a feed writer recorded it: acme#613
+    /// landed late with no span, acme#614 started eight minutes after the
     /// message, and both rows carried the worker's whole count.
     #[test]
     fn a_worker_handed_its_next_task_has_a_row_clock_and_count_per_task() {
@@ -2269,21 +2258,21 @@ mod tests {
             reply("m2", T0 - 40 * MIN, 5_000, 20_000, 2_000),
             sent(
                 T0 - 50 * MIN,
-                "Dispatcher note: the build is warm (coo#211).",
+                "Dispatcher note: the build is warm (acme#211).",
             ),
             sent(
                 T0 - 30 * MIN,
-                "New task for you, Wren Tilbury: inbar#614, the follow-up to #613.",
+                "New task for you, Wren Tilbury: acme#614, the follow-up to #613.",
             ),
             reply("m3", T0 - 20 * MIN, 8_000, 27_000, 3_000),
         ];
         let (dir, rows, logs) = reused_worker("feed", &lines, true);
         let f = feed(&format!(
             r#"{{"session":"s","rows":[
-              {{"key":"inbar#614","stage":"running","agent_id":"w","started":{s614},
+              {{"key":"acme#614","stage":"running","agent_id":"w","started":{s614},
                 "eta_s":3600,"tokens":156313}},
-              {{"key":"inbar#616","stage":"planned","agent_id":"w","eta_s":900}},
-              {{"key":"inbar#613","stage":"done","agent_id":"w","started":{late},"ended":{late},
+              {{"key":"acme#616","stage":"planned","agent_id":"w","eta_s":900}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{late},"ended":{late},
                 "eta_s":1200,"tokens":156313,"landing":"Review — ita"}}
             ]}}"#,
             s614 = T0 - 22 * MIN,
@@ -2291,7 +2280,7 @@ mod tests {
         ));
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
-        assert_eq!(ids, ["inbar#614", "inbar#616", "inbar#613"]);
+        assert_eq!(ids, ["acme#614", "acme#616", "acme#613"]);
         let (run, next, done) = (&t.lines[0], &t.lines[1], &t.lines[2]);
         // Running: timed from the message, the worker's live count.
         assert_eq!(run.stage, Stage::Running);
@@ -2300,7 +2289,7 @@ mod tests {
         assert_eq!(run.tokens, "156.3k");
         // Queued behind it on the same worker.
         assert_eq!(next.stage, Stage::Planned);
-        assert_eq!(next.now, "after inbar#614");
+        assert_eq!(next.now, "after acme#614");
         assert_eq!(next.tokens, "", "nothing spent on a task before it starts");
         // Done: from the spawn to the hand-off, and only what it added.
         assert_eq!(done.stage, Stage::Done);
@@ -2321,10 +2310,10 @@ mod tests {
         }
 
         // The next task is sent and nobody runs `start`: the queued row is
-        // the worker's from the message, and #614 is Done there.
+        // the worker's from the message, and acme#614 is Done there.
         let more = [sent(
             T0 - 10 * MIN,
-            "New task for you: inbar#616, the legend.",
+            "New task for you: acme#616, the legend.",
         )];
         let (dir2, rows, logs) =
             reused_worker("feed-next", &[&lines[..], &more[..]].concat(), true);
@@ -2344,9 +2333,9 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "inbar#616", "10:00", "156.3k"),
-                (Stage::Done, "inbar#614", "20:00", "11k"),
-                (Stage::Done, "inbar#613", "30:00", "28k"),
+                (Stage::Running, "acme#616", "10:00", "156.3k"),
+                (Stage::Done, "acme#614", "20:00", "11k"),
+                (Stage::Done, "acme#613", "30:00", "28k"),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2363,13 +2352,13 @@ mod tests {
             reply("m1", T0 - 55 * MIN, 10_000, 0, 1_000),
             sent(
                 T0 - 45 * MIN,
-                "One more thing on inbar#613: keep the old axis.",
+                "One more thing on acme#613: keep the old axis.",
             ),
             reply("m2", T0 - 44 * MIN, 2_000, 10_000, 500),
-            sent(T0 - 40 * MIN, "New task for you: inbar#614, same template."),
+            sent(T0 - 40 * MIN, "New task for you: acme#614, same template."),
             reply("m3", T0 - 30 * MIN, 4_000, 12_000, 600),
             reply("m3", T0 - 30 * MIN, 4_000, 12_000, 900),
-            sent(T0 - 20 * MIN, "Next task: inbar#616 (the legend)."),
+            sent(T0 - 20 * MIN, "Next task: acme#616 (the legend)."),
             reply("m4", T0 - 10 * MIN, 3_000, 16_000, 700),
         ];
         let (dir, rows, logs) = reused_worker("derived", &lines, true);
@@ -2390,16 +2379,16 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "inbar#616", "20:00", "", "156.3k"),
-                (Stage::Done, "inbar#614", "20:00", "→ inbar#616", "4.9k"),
-                (Stage::Done, "inbar#613", "20:00", "→ inbar#614", "13.5k"),
+                (Stage::Running, "acme#616", "20:00", "", "156.3k"),
+                (Stage::Done, "acme#614", "20:00", "→ acme#616", "4.9k"),
+                (Stage::Done, "acme#613", "20:00", "→ acme#614", "13.5k"),
             ]
         );
         assert!(
             t.lines[0].no_eta,
             "a hand-off nobody recorded has no estimate"
         );
-        assert!(t.lines[0].title.starts_with("Next task: inbar#616"));
+        assert!(t.lines[0].title.starts_with("Next task: acme#616"));
         assert_eq!(
             logs["w"].added(0, Some(T0 - 20 * MIN)),
             11_000 + 2_500 + 4_900
@@ -2408,7 +2397,7 @@ mod tests {
         // Once the worker has finished, its last task is Done too, with the rest.
         let (dir2, rows, logs) = reused_worker("derived-done", &lines, false);
         let t = build_at(None, &rows, T0, &Clock::plain(), &logs);
-        let last = t.lines.iter().find(|l| l.id == "inbar#616").unwrap();
+        let last = t.lines.iter().find(|l| l.id == "acme#616").unwrap();
         assert_eq!((last.stage, last.elapsed.as_str()), (Stage::Done, "15:00"));
         assert_eq!(last.tokens, "3.7k");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2423,7 +2412,7 @@ mod tests {
         use giverny_claude::tokens;
         let lines = [
             reply("m1", T0 - 55 * MIN, 10_000, 0, 1_000),
-            sent(T0 - 40 * MIN, "New task for you: inbar#614."),
+            sent(T0 - 40 * MIN, "New task for you: acme#614."),
             reply("m2", T0 - 30 * MIN, 4_000, 10_000, 600),
         ];
         let (dir, rows, logs) = reused_worker("total", &lines, true);
@@ -2451,16 +2440,16 @@ mod tests {
         assert!(build(None, &[], T0).is_empty());
     }
 
-    // ------------------------------------------------- resources (#164) ----
+    // ------------------------------------------------- resources ----
 
     /// A feed with a granted Running row and a queued Next up row, as
     /// `giverny pass claim` leaves them.
     const LEASED: &str = r#"{"session":"s","rows":[
-        {"key":"giverny#12","stage":"running","eta_s":1800,"started":1790000000000,
-         "lease":{"state":"granted","id":"s:giverny#12","cpu":3,"ram_mb":3072,
+        {"key":"demo#12","stage":"running","eta_s":1800,"started":1790000000000,
+         "lease":{"state":"granted","id":"s:demo#12","cpu":3,"ram_mb":3072,
                   "slots":["cargo:/x/target"],"granted_at":1790000000000}},
-        {"key":"giverny#13","stage":"planned","eta_s":600,
-         "lease":{"state":"queued","position":1,"behind":"giverny#12","cpu":2,"ram_mb":3072}}]}"#;
+        {"key":"demo#13","stage":"planned","eta_s":600,
+         "lease":{"state":"queued","position":1,"behind":"demo#12","cpu":2,"ram_mb":3072}}]}"#;
 
     fn ledger(json: &str) -> Ledger {
         Ledger::parse(json.as_bytes()).expect("test ledger parses")
@@ -2491,22 +2480,22 @@ mod tests {
         assert_eq!(lease_fact(&l), "queued #2 for 3G");
     }
 
-    /// giverny#182: a Running row's cell is what its commands use now, not
+    /// A Running row's cell is what its commands use now, not
     /// its lease; a Done row's is its memory peak alone.
     #[test]
     fn a_running_row_shows_its_use_now_and_a_done_row_its_peak() {
         let json = r#"{"session":"s","rows":[
-            {"key":"giverny#12","stage":"running","eta_s":1800,"started":1790000000000,
-             "lease":{"state":"granted","id":"s:giverny#12","cpu":3,"ram_mb":3072,
+            {"key":"demo#12","stage":"running","eta_s":1800,"started":1790000000000,
+             "lease":{"state":"granted","id":"s:demo#12","cpu":3,"ram_mb":3072,
                       "granted_at":1790000000000},
              "usage":{"runs":1,"peak_mb":2150,"cpu_s":45,"cap_ram_mb":3072}},
-            {"key":"giverny#13","stage":"running","started":1790000000000,
-             "lease":{"state":"granted","id":"s:giverny#13","cpu":1,"ram_mb":128,
+            {"key":"demo#13","stage":"running","started":1790000000000,
+             "lease":{"state":"granted","id":"s:demo#13","cpu":1,"ram_mb":128,
                       "granted_at":1790000000000},
              "usage":{"runs":1,"peak_mb":128,"oom_kills":1}},
-            {"key":"giverny#14","stage":"done","started":1790000000000,"ended":1790000600000,
+            {"key":"demo#14","stage":"done","started":1790000000000,"ended":1790000600000,
              "usage":{"runs":2,"peak_mb":512}},
-            {"key":"giverny#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
+            {"key":"demo#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
         // No run going: nothing in the cell, the lease in the header only.
         let t = build(Some(&feed(json)), &[], T0 + 60_000);
         assert_eq!(t.lines[0].usage, "");
@@ -2524,15 +2513,15 @@ mod tests {
         assert_eq!(t.lines[3].usage, "");
         // A run going: its use now. Another session's run of the same key
         // is not this row's.
-        let mut other = task_live("giverny#13", 50, 100);
+        let mut other = task_live("demo#13", 50, 100);
         other.session = "elsewhere".into();
         let f = with_live(
             feed(json),
             &["s"],
             &[
-                task_live("giverny#12", 14, 4300),
+                task_live("demo#12", 14, 4300),
                 other,
-                task_live("giverny#14", 9, 9),
+                task_live("demo#14", 9, 9),
             ],
         );
         let t = build(Some(&f), &[], T0 + 60_000);
@@ -2555,7 +2544,7 @@ mod tests {
             "{:?}",
             run.click.facts
         );
-        assert_eq!(next.now, "queued for 3G behind giverny#12");
+        assert_eq!(next.now, "queued for 3G behind demo#12");
         assert_eq!(next.usage, "", "said in NOW, not twice");
         // Nothing running: no use column, the title keeps its width.
         assert_eq!(Cols::new(&t, 100).leasew, 0);
@@ -2563,23 +2552,20 @@ mod tests {
             Some(&with_live(
                 feed(LEASED),
                 &["s"],
-                &[task_live("giverny#12", 14, 4300)],
+                &[task_live("demo#12", 14, 4300)],
             )),
             &[],
             T0 + 60_000,
         );
         let cols = Cols::new(&busy, 100);
         let drawn = compose(&cols.segments(&busy.lines[1]));
-        assert!(
-            drawn.ends_with("queued for 3G behind giverny#12"),
-            "{drawn}"
-        );
+        assert!(drawn.ends_with("queued for 3G behind demo#12"), "{drawn}");
         let drawn = compose(&cols.segments(&busy.lines[0]));
         assert!(drawn.contains("14% CPU 4.2G"), "{drawn}");
         assert!(cols.taskw < Cols::new(&t, 100).taskw);
     }
 
-    /// giverny#160's note: a row's copy is only as fresh as its session's
+    /// A row's copy is only as fresh as its session's
     /// last claim. The ledger decides.
     #[test]
     fn the_ledger_wins_over_a_rows_stale_copy() {
@@ -2588,14 +2574,14 @@ mod tests {
         let empty = with_ledger(&f, &["s"], &Ledger::default());
         assert!(empty.rows.iter().all(|r| r.lease.is_none()));
 
-        // giverny#12 released; giverny#13 still waits, now first, behind
+        // demo#12 released; demo#13 still waits, now first, behind
         // another session's task holding nothing it named: behind nobody.
         let l = ledger(
             r#"{"version":1,"leases":[
-              {"id":"o:inbar#5","session":"o","task":"inbar#5","cpu":4,"ram_mb":8192,
+              {"id":"o:acme#5","session":"o","task":"acme#5","cpu":4,"ram_mb":8192,
                "granted_at":1790000000000,"heartbeat_at":1790000000000}],
              "queue":[
-              {"id":"s:giverny#13","session":"s","task":"giverny#13","cpu":2,"ram_mb":3072,
+              {"id":"s:demo#13","session":"s","task":"demo#13","cpu":2,"ram_mb":3072,
                "queued_at":1790000000000,"heartbeat_at":1790000000000}]}"#,
         );
         let g = with_ledger(&f, &["s"], &l);
@@ -2603,19 +2589,19 @@ mod tests {
         let q = g.rows[1].lease.as_ref().unwrap();
         assert_eq!(q.state, LeaseState::Queued);
         assert_eq!(q.position, Some(1));
-        assert_eq!(q.behind, None, "giverny#12 holds nothing now");
+        assert_eq!(q.behind, None, "demo#12 holds nothing now");
 
         // A lease in the ledger the row never got a copy of (another
         // writer, or the tab's older session id) is drawn.
         let l = ledger(
             r#"{"version":1,"leases":[
-              {"id":"old:giverny#12","session":"old","task":"giverny#12","cpu":1,"ram_mb":1024,
+              {"id":"old:demo#12","session":"old","task":"demo#12","cpu":1,"ram_mb":1024,
                "slots":["cargo:/x/target"],"granted_at":1790000000000,"heartbeat_at":1790000000000}],
              "queue":[
-              {"id":"s:giverny#13","session":"s","task":"giverny#13","cpu":1,"ram_mb":0,
+              {"id":"s:demo#13","session":"s","task":"demo#13","cpu":1,"ram_mb":0,
                "slots":["cargo:/x/target"],"queued_at":1790000000000,"heartbeat_at":1790000000000}]}"#,
         );
-        let bare = feed(r#"{"session":"s","rows":[{"key":"giverny#12","stage":"running"}]}"#);
+        let bare = feed(r#"{"session":"s","rows":[{"key":"demo#12","stage":"running"}]}"#);
         let g = with_ledger(&bare, &["s", "old"], &l);
         assert_eq!(
             lease_fact(g.rows[0].lease.as_ref().unwrap()),
@@ -2627,12 +2613,12 @@ mod tests {
         );
         // Queued with no copy: behind the holder of the slot it asks for.
         let g = with_ledger(
-            &feed(r#"{"session":"s","rows":[{"key":"giverny#13","stage":"planned"}]}"#),
+            &feed(r#"{"session":"s","rows":[{"key":"demo#13","stage":"planned"}]}"#),
             &["s"],
             &l,
         );
         let q = g.rows[0].lease.as_ref().unwrap();
-        assert_eq!(queued_note(q), "queued for 1c behind giverny#12");
+        assert_eq!(queued_note(q), "queued for 1c behind demo#12");
     }
 
     #[test]
@@ -2672,7 +2658,7 @@ mod tests {
 
     #[test]
     fn a_row_is_tinted_only_while_the_pointer_is_on_it() {
-        // giverny#40: once the pointer has left, a clicked row looks like
+        // Once the pointer has left, a clicked row looks like
         // any other.
         assert_eq!(row_tint(false, false), None);
         assert_eq!(row_tint(true, false), Some(0.10));
@@ -2864,7 +2850,7 @@ mod tests {
         assert_eq!(fit, None);
     }
 
-    // ------------------------------------------- giverny#53: held clocks ----
+    // ------------------------------------------------------ held clocks ----
 
     const MIN: u64 = 60_000;
 
@@ -2974,7 +2960,7 @@ mod tests {
 
     #[test]
     fn a_paused_feed_row_holds_its_clock() {
-        // coo#170: paused at T0; `started` already moved on by the open
+        // Paused at T0; `started` already moved on by the open
         // pause up to when the file was written, five minutes later.
         let written = T0 + 5 * MIN;
         let mut f = feed(&format!(
@@ -2992,7 +2978,7 @@ mod tests {
             assert_eq!(t.lines[0].eta, "~20m");
             assert_eq!(t.lines[0].now, "paused since 14:13");
         }
-        // The writer paused it for a limit (coo#200): its `started` already
+        // The writer paused it for a limit: its `started` already
         // leaves the wait out, so the pane's own hold must not take it off
         // again; NOW names the limit.
         let limit = Limit {
@@ -3096,12 +3082,12 @@ mod tests {
         assert_eq!(held_ms(&holds, 12, 18), 0);
     }
 
-    // ------------------------------------- giverny#84: selectable text ----
+    // --------------------------------------------------- selectable text ----
 
     fn rows_text() -> Vec<String> {
         vec![
-            "Running  giverny#84 FEATURE: selectable      1:02".into(),
-            "NextUp   giverny#85 BUG: something".into(),
+            "Running  demo#84 FEATURE: selectable      1:02".into(),
+            "NextUp   demo#85 BUG: something".into(),
             "session 3".into(),
         ]
     }
@@ -3116,7 +3102,7 @@ mod tests {
         };
         assert_eq!(
             selected_text(&rows, &sel),
-            "giverny#84 FEATURE: selectable      1:02\nNextUp   giv"
+            "demo#84 FEATURE: selectable      1:02\nNextUp   dem"
         );
         // Past the row's end is the row's end, and blanks are not copied.
         let sel = Selection {
@@ -3126,9 +3112,9 @@ mod tests {
         assert_eq!(selected_text(&rows, &sel), rows.join("\n"));
         let one = Selection {
             anchor: (0, 9),
-            head: (0, 19),
+            head: (0, 16),
         };
-        assert_eq!(selected_text(&rows, &one), "giverny#84");
+        assert_eq!(selected_text(&rows, &one), "demo#84");
         assert_eq!(one.span(1, 30), None);
     }
 
@@ -3258,7 +3244,7 @@ mod tests {
         );
         let (input, copied) = r.frame(vec![button(to, false)]);
         assert_eq!(input.clicked, None, "a drag is not a click");
-        let want = "giverny#84 FEATURE: selectable      1:02\nNextUp   giv";
+        let want = "demo#84 FEATURE: selectable      1:02\nNextUp   dem";
         assert_eq!(copied, [want]);
         assert_eq!(input.copied.as_deref(), Some(want));
         // The selection stays lit until the next press, which lets it go.

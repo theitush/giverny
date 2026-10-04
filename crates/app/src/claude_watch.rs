@@ -232,7 +232,7 @@ pub struct ClaudeWatch {
 pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 
 /// Is this a side instance that must leave every account's Claude config
-/// alone (giverny#113)?
+/// alone?
 ///
 /// Each account's `settings.json` names one Giverny binary for its hooks,
 /// status lines and plugin, and every Giverny adopts the accounts it finds:
@@ -1145,7 +1145,7 @@ impl ClaudeWatch {
     /// Claude Code watches its settings files, so this reaches running
     /// sessions without a restart.
     ///
-    /// The same switch carries the `giverny` plugin (giverny#101): on, its
+    /// The same switch carries the `giverny` plugin: on, its
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
     /// keys go and so does the directory.
@@ -2120,7 +2120,7 @@ mod tests {
         ));
     }
 
-    /// giverny#113: a side instance writes nothing into an account — not at
+    /// A side instance writes nothing into an account — not at
     /// startup, not from the UI — while the same calls on the installed
     /// instance do rewrite it (so this test would see a write).
     #[test]

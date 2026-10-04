@@ -1,5 +1,5 @@
 //! `giverny pass run <task> -- <cmd…>`: a worker's heavy command, held to
-//! its task's granted lease and measured (giverny#159, #161).
+//! its task's granted lease and measured.
 //!
 //! **The cap.** On Linux with a user systemd the command runs in a scope of
 //! its own: `systemd-run --user --scope -p MemoryMax=<ram> -p
@@ -61,7 +61,7 @@ const STATS_ENV: &str = "GIVERNY_RUN_STATS";
 /// Runs the command inside its scope, then reads the scope's cgroup while
 /// it still exists. `started` first, so an empty file means the scope never
 /// ran (systemd-run failed) and the command can be run plain instead.
-const SHIM: &str = r#"# giverny pass run (giverny#161): run the command in its systemd scope, then
+const SHIM: &str = r#"# giverny pass run: run the command in its systemd scope, then
 # record the scope's peak memory and OOM kills while the scope still exists.
 s="$GIVERNY_RUN_STATS"
 cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
@@ -647,7 +647,7 @@ fn execute(
                 cap.describe()
             ),
         );
-        // Seen by the agents pane while it runs (giverny#182).
+        // Seen by the agents pane while it runs.
         let live = run_live::register(&stats, task, session, pass::now_ms());
         let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals);
         drop(live);
@@ -974,15 +974,15 @@ mod tests {
         let cmd: Vec<String> = ["cargo", "test", "$HOME"].map(String::from).into();
         let a = scope_args(
             true,
-            &unit_name("giverny#161", 42),
-            "giverny#161",
+            &unit_name("demo#161", 42),
+            "demo#161",
             &cap,
             Path::new("/l/run-shim.sh"),
             &cmd,
         );
         let s = a.join(" ");
         assert!(s.starts_with("--user --scope --quiet --collect --expand-environment=no"));
-        assert!(s.contains("--unit=giverny-run-giverny_161-42"), "{s}");
+        assert!(s.contains("--unit=giverny-run-demo_161-42"), "{s}");
         assert!(
             s.contains("-p MemoryMax=3072M -p MemorySwapMax=0 -p CPUQuota=300%"),
             "{s}"
@@ -1015,12 +1015,12 @@ mod tests {
     #[test]
     fn a_leased_run_keeps_its_exit_and_lands_its_usage_on_the_row_and_in_the_history() {
         let dir = scratch("leased");
-        cmd(&dir, "start giverny#7 --eta 30 --title BUG:x");
-        let (_, code) = cmd(&dir, "claim giverny#7 --cpu 2 --ram 1G");
+        cmd(&dir, "start demo#7 --eta 30 --title BUG:x");
+        let (_, code) = cmd(&dir, "claim demo#7 --cpu 2 --ram 1G");
         assert_eq!(code, 0);
         let code = run(
             &dir,
-            "giverny#7",
+            "demo#7",
             &[],
             &format!("test \"$CARGO_BUILD_JOBS\" = {} && exit 3", jobs(2)),
             plain(60_000),
@@ -1029,7 +1029,7 @@ mod tests {
             code, 3,
             "the command's exit, with CARGO_BUILD_JOBS from the lease"
         );
-        let u = row(&dir, "giverny#7").usage.unwrap();
+        let u = row(&dir, "demo#7").usage.unwrap();
         assert_eq!((u.runs, u.last_exit, u.capped), (1, Some(3), false));
         assert!(u.peak_mb.is_some_and(|p| p > 0), "{u:?}");
         assert_eq!(u.cap_ram_mb, None, "uncapped runs record no cap");
@@ -1040,19 +1040,19 @@ mod tests {
             "{u:?}"
         );
         // The lease was the dispatcher's: it stays.
-        assert!(ledger(&dir).lease("s1", "giverny#7").is_some());
+        assert!(ledger(&dir).lease("s1", "demo#7").is_some());
         // A command killed by a signal exits 128 + it.
-        let code = run(&dir, "giverny#7", &[], "kill -9 $$", plain(60_000));
+        let code = run(&dir, "demo#7", &[], "kill -9 $$", plain(60_000));
         assert_eq!(code, 137);
-        let u = row(&dir, "giverny#7").usage.unwrap();
+        let u = row(&dir, "demo#7").usage.unwrap();
         assert_eq!((u.runs, u.last_exit), (2, Some(137)));
         // Landing carries the peak into the history.
-        cmd(&dir, "land giverny#7");
+        cmd(&dir, "land demo#7");
         let h = pass_history::load(&dir.join(pass_history::FILE));
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].peak_mb, u.peak_mb);
         assert!(
-            row(&dir, "giverny#7").usage.is_some(),
+            row(&dir, "demo#7").usage.is_some(),
             "a Done row keeps its usage"
         );
         let _ = std::fs::remove_dir_all(&dir);

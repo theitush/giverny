@@ -151,8 +151,8 @@ fn deliver(msg: &RelayMsg, spool: &Path) {
 }
 
 /// Synthetic event name for `giverny pass clear-done` (not a Claude hook
-/// event): clear the agents pane's Done rows in the tab it ran in
-/// (giverny#112). The event carries `session_id` and `at_ms`, the moment the
+/// event): clear the agents pane's Done rows in the tab it ran in.
+/// The event carries `session_id` and `at_ms`, the moment the
 /// command ran.
 pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
 
@@ -388,7 +388,7 @@ pub fn run_statusline(spool: &Path) {
 }
 
 /// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the
-/// status line (giverny#22, giverny#95, giverny#133): this conversation's own tokens, every subagent's
+/// status line (giverny#22, giverny#95): this conversation's own tokens, every subagent's
 /// summed, and the two added, counted the way coo's `orchestrate-status`
 /// counts them (see [`crate::tokens`]).
 fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
@@ -416,7 +416,7 @@ fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
         tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
     let session = tokens::session_tokens(payload, transcript.as_deref());
     // What the session spent before its compactions: `(+<n>)` beside its own
-    // count, and in the total (giverny#133).
+    // count, and in the total.
     let compacted = transcript.as_deref().map_or(0, |t| {
         tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
     });
@@ -454,7 +454,7 @@ pub enum StripRows {
     /// No row at all: the agents pane stands in for the panel.
     Hidden,
     /// Every row drawn, each opened by its agent id in brackets
-    /// ([`tag_strip_row`]), for a walk to a worker's view (giverny#94).
+    /// ([`tag_strip_row`]), for a walk to a worker's view.
     Tagged,
 }
 
@@ -465,7 +465,7 @@ pub enum StripRows {
 ///
 /// Claude Code 2.1.280 drops any row whose decoration is the empty string
 /// from its subagent panel, and with every row dropped the panel — `● main`
-/// included — is not drawn at all (verified in a live session, giverny#3).
+/// included — is not drawn at all (verified in a live session).
 /// Printing nothing leaves every row undecorated, which draws it natively.
 /// A non-empty decoration takes the place of the row's type, label and
 /// stats, after its pointer and dot (2.1.283).
@@ -500,7 +500,7 @@ pub fn subagent_line_output(payload: &serde_json::Value, rows: StripRows) -> Str
     out
 }
 
-/// A strip row's text while a walk looks for a worker (giverny#94):
+/// A strip row's text while a walk looks for a worker:
 /// `[<agent id>] <label>`. Claude Code labels a busy worker's row with a
 /// model-written summary of what it is doing (`Reading runAgent.ts`),
 /// which changes every thirty seconds and is never its description, so
@@ -590,7 +590,7 @@ pub fn strip_flag(spool: &Path, tab_id: &str) -> PathBuf {
 
 /// Ask the relay to draw Claude Code's subagent panel in `tab_id` (`on`),
 /// or to go back to hiding it. The panel is what Claude Code's keyboard
-/// path to a worker's view walks (giverny#71): hidden, `↓` has nothing to
+/// path to a worker's view walks: hidden, `↓` has nothing to
 /// reach. Claude Code runs the relay about every five seconds, so the
 /// panel follows within one tick.
 pub fn show_strip(spool: &Path, tab_id: &str, on: bool) -> std::io::Result<()> {
@@ -970,7 +970,7 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 
 /// Remove our relay entries from one settings file.
 pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
-    // The `giverny` plugin's keys, where they are ours (giverny#101).
+    // The `giverny` plugin's keys, where they are ours.
     let _ = crate::plugin::set_plugin(settings_path, Path::new(""), false);
     let Ok(bytes) = std::fs::read(settings_path) else {
         return Ok(());
@@ -1247,7 +1247,7 @@ mod tests {
         );
     }
 
-    /// A busy worker's row as Claude Code 2.1.283 sent it (giverny#94): the
+    /// A busy worker's row as Claude Code 2.1.283 sent it: the
     /// label is its progress summary, not its description.
     #[test]
     fn subagent_line_tags_every_row_with_its_id_when_the_strip_is_asked_for() {

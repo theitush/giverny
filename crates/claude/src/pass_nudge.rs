@@ -1,6 +1,5 @@
 //! `giverny pass nudge`: the plugin's `PostToolUse` hook, which asks a
-//! worker for a fresh estimate once it has been on its task a few minutes
-//! (giverny#143).
+//! worker for a fresh estimate once it has been on its task a few minutes.
 //!
 //! A first estimate is made before anyone has read the code. Five minutes in,
 //! the worker has, so its own re-estimate is the better figure — and the
@@ -19,14 +18,14 @@
 //!
 //! A subagent that holds no row at all (spawned outside a pass, or any
 //! subagent at all: an Explore search, a one-off helper) would sit on the pane
-//! as `no ETA` (giverny#140). On its first call the hook asks it, once, for a
-//! first estimate (giverny#158): `giverny-pass eta <task> <min> --agent <id>`,
-//! which starts its row with that estimate (#144), after which the five-minute
+//! as `no ETA`. On its first call the hook asks it, once, for a
+//! first estimate: `giverny-pass eta <task> <min> --agent <id>`,
+//! which starts its row with that estimate, after which the five-minute
 //! re-estimate above applies to it like any other. That it was asked is a
 //! marker file under the feed directory's `eta-asked/`, not a feed: creating
-//! the session's feed would claim it from another writer (coo#162).
+//! the session's feed would claim it from another writer.
 //!
-//! **Messages and heartbeats** (giverny#162). On every call the hook also
+//! **Messages and heartbeats**. On every call the hook also
 //! renews the calling session's ledger leases — `session_id` is the
 //! orchestrator's for its own calls and its workers' alike, so a busy pass
 //! keeps its leases though it runs no `giverny pass` command — at most every
@@ -106,7 +105,7 @@ fn holds_row(doc: &Value, agent_id: &str, description: Option<&str>) -> bool {
 }
 
 /// The task name a worker with no row is asked to report under: its spawn
-/// description's first word when that reads as a task id (`inbar#613 …`,
+/// description's first word when that reads as a task id (`acme#613 …`,
 /// `auth-fix: …`) and no other row has it, else `agent-<its id>`, which the
 /// `--agent` join needs no description for.
 pub fn first_key(description: Option<&str>, agent_id: &str, doc: Option<&Value>) -> String {
@@ -235,8 +234,8 @@ pub fn check(
         ),
         None => "It has no estimate yet.".to_string(),
     };
-    // How this kind of re-estimate has fared, so the figure itself improves
-    // (giverny#181): read only now, once per worker.
+    // How this kind of re-estimate has fared, so the figure itself improves:
+    // read only now, once per worker.
     let s = |k: &str| row.get(k).and_then(Value::as_str);
     let kind = s("title").and_then(pass_history::kind_of);
     let record = history
@@ -514,13 +513,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("proj/s1/subagents")).unwrap();
         std::fs::write(
             dir.join("proj/s1/subagents/agent-abc.meta.json"),
-            r#"{"description":"giverny#143: better estimates","agentType":"general-purpose"}"#,
+            r#"{"description":"demo#143: better estimates","agentType":"general-purpose"}"#,
         )
         .unwrap();
         let feeds = dir.join("feeds");
         std::fs::create_dir_all(&feeds).unwrap();
         let f = feed::feed_path(&feeds, "s1");
-        let d = doc(json!([{"key": "giverny#143", "stage": "running",
+        let d = doc(json!([{"key": "demo#143", "stage": "running",
                             "started": pass::stamp(T0), "eta_s": 4500}]));
         pass::write(&f, &d).unwrap();
         let payload = json!({"session_id": "s1", "agent_id": "abc",
@@ -533,7 +532,7 @@ mod tests {
         let ctx = v["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
-        assert!(ctx.contains("giverny-pass eta giverny#143"), "{ctx}");
+        assert!(ctx.contains("giverny-pass eta demo#143"), "{ctx}");
         assert_eq!(run(&payload, &feeds, T0 + 7 * MIN), None, "asked once");
         let back = feed::read(&f).unwrap();
         assert_eq!(back.rows.len(), 1);
@@ -542,9 +541,9 @@ mod tests {
 
     #[test]
     fn a_first_estimate_is_asked_under_a_task_word_or_the_agent() {
-        let d = doc(json!([{"key": "inbar#614", "stage": "running", "agent_id": "x"}]));
+        let d = doc(json!([{"key": "acme#614", "stage": "running", "agent_id": "x"}]));
         let k = |desc: Option<&str>| first_key(desc, "a1b2c3d4e5f6", Some(&d));
-        assert_eq!(k(Some("inbar#613 market SD graph")), "inbar#613");
+        assert_eq!(k(Some("acme#613 market SD graph")), "acme#613");
         assert_eq!(k(Some("auth-fix: fix the token race")), "auth-fix");
         assert_eq!(
             k(Some("Find the config loader")),
@@ -552,14 +551,16 @@ mod tests {
             "not a task id"
         );
         assert_eq!(
-            k(Some("inbar#614 again")),
+            k(Some("acme#614 again")),
             "agent-a1b2c3d4",
             "another row's key"
         );
         assert_eq!(k(None), "agent-a1b2c3d4");
-        let ask = first_ask("inbar#613", "a1b2", Some("inbar#613 \"SD\" graph"));
+        let ask = first_ask("acme#613", "a1b2", Some("acme#613 \"SD\" graph"));
         assert!(
-            ask.contains("`giverny-pass eta inbar#613 <minutes> --agent a1b2 --title \"inbar#613 'SD' graph\"`"),
+            ask.contains(
+                "`giverny-pass eta acme#613 <minutes> --agent a1b2 --title \"acme#613 'SD' graph\"`"
+            ),
             "{ask}"
         );
         assert!(first_ask("agent-a1", "a1", None).contains("--agent a1` now"));
@@ -603,7 +604,7 @@ mod tests {
         let g = feed::feed_path(&feeds, "s3");
         std::fs::write(
             &g,
-            r#"{"version":1,"session":"s3","writer":"coo/orchestrate-status","rows":[]}"#,
+            r#"{"version":1,"session":"s3","writer":"other/status-writer","rows":[]}"#,
         )
         .unwrap();
         assert_eq!(

@@ -1,5 +1,5 @@
 //! The `giverny` Claude Code plugin: the orchestrator the agents pane needs,
-//! carried inside the binary (giverny#101).
+//! carried inside the binary.
 //!
 //! The pane shows Running, Next up with ETAs and Done when an orchestrating
 //! session writes a feed; `giverny pass` writes it, and this plugin's
@@ -24,14 +24,14 @@
 //!   it silently.
 //!
 //! - `hooks/hooks.json` carries a `PostToolUse` hook running
-//!   `giverny-pass nudge` (giverny#143): five minutes into a worker's task it
+//!   `giverny-pass nudge`: five minutes into a worker's task it
 //!   asks that worker, once, for a fresh estimate; and a subagent that holds
-//!   no row at all is asked on its first call for a first one (giverny#158),
+//!   no row at all is asked on its first call for a first one,
 //!   so every subagent gets an ETA. It returns at once for any call that is
 //!   not a subagent's.
 //!
-//! The settings keys follow the house rules the other agents-pane key does
-//! (giverny#68): written only with `claude.agents_pane` on, never over a
+//! The settings keys follow the house rules the other agents-pane key does:
+//! written only with `claude.agents_pane` on, never over a
 //! marketplace called `giverny` that is not ours, removed when the setting
 //! goes off and on uninstall, and a no-op writes nothing.
 
@@ -48,7 +48,7 @@ pub const DIR_NAME: &str = "claude-plugin";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SKILL: &str = include_str!("../plugin/skills/orchestrate/SKILL.md");
-/// `/giverny:clear-done`: the agents pane's Done rows, cleared (giverny#112).
+/// `/giverny:clear-done`: the agents pane's Done rows, cleared.
 const CLEAR_DONE: &str = include_str!("../plugin/commands/clear-done.md");
 
 /// Where the marketplace lives: `<giverny config base>/claude-plugin`.
@@ -78,12 +78,12 @@ fn wrapper(exes: &[String]) -> String {
 }
 
 /// `hooks/hooks.json`: a `PostToolUse` hook, `giverny-pass nudge`, which
-/// asks a worker five minutes into its task for a fresh estimate
-/// (giverny#143), and a subagent with no row for a first one (giverny#158);
+/// asks a worker five minutes into its task for a fresh estimate,
+/// and a subagent with no row for a first one;
 /// on an orchestrator's own calls it delivers the session's `ask`/`reply`
-/// messages and renews its resource leases (giverny#162); quiet and exit 0
-/// whatever happens. (The `SessionStart` hook of orchestrate by default went
-/// with giverny#183; a sync prunes its old reply file.)
+/// messages and renews its resource leases; quiet and exit 0
+/// whatever happens. (The `SessionStart` hook of orchestrate by default is
+/// gone; a sync prunes its old reply file.)
 fn session_hooks() -> Value {
     json!({
         "description": "Giverny: re-estimate prompts for workers",
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn a_sync_prunes_the_dropped_orchestrate_hook() {
-        // giverny#183: a plugin written while orchestrate by default was on
+        // A plugin written while orchestrate by default was on
         // still holds its SessionStart reply; the next sync removes it, and
         // hooks.json carries no SessionStart hook.
         let d = scratch("orchestrate").join(DIR_NAME);

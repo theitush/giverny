@@ -1,4 +1,4 @@
-//! What all orchestrators on this machine together may use (giverny#159).
+//! What all orchestrators on this machine together may use.
 //!
 //! [`Limits`] is the setting: CPU cores, RAM and GPUs, each `"auto"` unless
 //! the person set a figure. It is serde-ready to sit in `config.toml` as

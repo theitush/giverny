@@ -51,7 +51,7 @@ impl Capture {
 
     /// Debug builds: `frames` frames into `dir`, every `stride`th, from
     /// the next frame on, leaving the window open after (the debug
-    /// command `shots`, giverny#132).
+    /// command `shots`).
     #[cfg(debug_assertions)]
     pub fn burst(dir: PathBuf, frames: u32, stride: u32) -> Option<Self> {
         std::fs::create_dir_all(&dir).ok()?;

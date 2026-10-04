@@ -1,5 +1,4 @@
-//! The machine ledger: what every orchestrator on this machine holds
-//! (giverny#159, #160).
+//! The machine ledger: what every orchestrator on this machine holds.
 //!
 //! Before a worker starts, its orchestrator *claims* what the worker needs
 //! (`giverny pass claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
@@ -7,8 +6,8 @@
 //! or *queued* behind whoever holds what it needs. The answer is a
 //! [`Lease`] in one JSON file shared by every session on the machine; it is
 //! the "hello" orchestrators say to each other, and the source of truth when
-//! they talk (giverny#162) or when a worker's commands are capped to its
-//! grant (giverny#161).
+//! they talk or when a worker's commands are capped to its
+//! grant.
 //!
 //! **The file.** `<feed dir>/resources/ledger.json` (`$GIVERNY_LEDGER`
 //! overrides), every read-modify-write under an exclusive `flock` on the
@@ -135,7 +134,7 @@ pub struct Request {
 pub struct Lease {
     /// `<session>:<task>`: one lease per task per session.
     pub id: String,
-    /// The Claude session that claimed it — whom to ask for it (giverny#162).
+    /// The Claude session that claimed it — whom to ask for it.
     pub session: String,
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -598,7 +597,7 @@ impl Ledger {
 
     /// Shrink `session`'s lease for `task` in place to the figures given
     /// (`None` keeps that one), when at least one is smaller than held and
-    /// none larger: the orchestrator asked to make room (giverny#162). The
+    /// none larger: the orchestrator asked to make room. The
     /// lease before and after; `None` when there is no such lease or the
     /// figures do not shrink it. A lease is never grown here: what it gives
     /// up may already be granted to another.
@@ -718,7 +717,7 @@ pub fn eta_left_s(feed_dir: &Path, session: &str, task: &str, now: u64) -> Optio
 
 /// `session`'s `task`'s time by its feed row: left on a Running row (as
 /// [`eta_left_s`]), the estimate of a Planned one — the asker's own figure
-/// when weighing a wait (giverny#162).
+/// when weighing a wait.
 pub fn eta_or_estimate_s(feed_dir: &Path, session: &str, task: &str, now: u64) -> Option<i64> {
     let (_, f) = feed::find(feed_dir, session)?;
     let r = f.rows.iter().find(|r| r.key == task)?;
@@ -729,7 +728,7 @@ pub fn eta_or_estimate_s(feed_dir: &Path, session: &str, task: &str, now: u64) -
     }
 }
 
-/// When a queued claim should talk rather than wait (giverny#162): the
+/// When a queued claim should talk rather than wait: the
 /// soonest any holder in `blockers` expects to finish is longer than the
 /// asker's own `own_s`, or no holder can say. The holder to ask and the
 /// line to print.
@@ -1355,7 +1354,7 @@ mod tests {
         let path = dir.join("resources").join("ledger.json");
         let c = cap();
         let out = with_ledger(&path, T0, |l| {
-            l.claim(&c, "a", "t", Some("giverny"), &req(2, 3), T0)
+            l.claim(&c, "a", "t", Some("demo"), &req(2, 3), T0)
         })
         .unwrap();
         assert!(matches!(out, Outcome::Granted(_)));
@@ -1366,7 +1365,7 @@ mod tests {
         );
         let l = Ledger::parse(text.as_bytes()).unwrap();
         assert_eq!(l.leases[0].ram_mb, 3072);
-        assert_eq!(l.leases[0].repo.as_deref(), Some("giverny"));
+        assert_eq!(l.leases[0].repo.as_deref(), Some("demo"));
         // Heartbeats beat; a silent ledger expires on the next read.
         heartbeat(&path, "a", T0 + 10 * MIN).unwrap();
         let l = Ledger::parse(&std::fs::read(&path).unwrap()).unwrap();
