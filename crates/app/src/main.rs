@@ -1810,10 +1810,15 @@ impl App {
                 self.queue_resume(id);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => match self.claude.install_hooks() {
-                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                Err(e) => tracing::error!("hook install: {e}"),
-            },
+            Action::InstallHooks => {
+                match self.claude.install_hooks() {
+                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                    Err(e) => tracing::error!("hook install: {e}"),
+                }
+                // The hooks are the consent the agents pane's keys wait for.
+                self.claude
+                    .set_agents_pane(agents_pane_on(&self.cfg), self.paths.base());
+            }
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
             Action::SetCategoryProfile(id, dir) => {
                 if let Some(cat) = self.ws.category_mut(id) {
