@@ -319,7 +319,7 @@ pub fn run_with(
         }
     }
     let (m, cap) = held?;
-    let _ = resources::heartbeat(ledger, session, pass::now_ms());
+    let _ = resources::heartbeat(ledger, None, session, pass::now_ms());
     let recorded = pass::edit_row(dir, session, task, |row| {
         record_usage(row, &m, &cap, &flags.command, pass::now_ms())
     });
@@ -575,7 +575,7 @@ impl Heartbeat {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
-                if let Err(e) = resources::heartbeat(&ledger, &session, pass::now_ms()) {
+                if let Err(e) = resources::heartbeat(&ledger, None, &session, pass::now_ms()) {
                     eprintln!("giverny pass run: heartbeat: {e}");
                 }
             }

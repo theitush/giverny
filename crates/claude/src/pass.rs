@@ -169,6 +169,13 @@ pub struct Flags {
     pub command: Vec<String>,
     /// `ask`: the asker's own task, when the ledger does not make it plain.
     pub task: Option<String>,
+    /// Set by [`run_in`], not parsed: the `--agent` worker's spawn
+    /// description, which names the rows a dispatcher started for it before
+    /// its id was known.
+    pub agent_desc: Option<String>,
+    /// The Claude config dir to read spawn descriptions from: tests set it;
+    /// else `$CLAUDE_CONFIG_DIR`, `$GIVERNY_PROFILE_DIR`, `~/.claude`.
+    pub claude_dir: Option<PathBuf>,
 }
 
 impl Flags {
@@ -478,14 +485,31 @@ fn set_guess(row: &mut Map<String, Value>, f: &Flags) {
 /// started less than [`feed::LATER_TASK_MS`] before is not an earlier task
 /// but one of a batch the worker was spawned with (`Work #144 #145`), and
 /// keeps running. Returns the keys landed.
-fn hand_off(rows: &mut [Value], new: usize, agent: &str, now: u64) -> Vec<String> {
+///
+/// The worker's rows are those carrying its `agent_id`, and — since a
+/// dispatcher may `start` a task before the spawn tells it the id — those
+/// with no `agent_id` whose key its spawn description (`desc`) names, the
+/// join the pane makes. A landed row loses its `lease`: the caller gives it
+/// back to the ledger.
+fn hand_off(
+    rows: &mut [Value],
+    new: usize,
+    agent: &str,
+    desc: Option<&str>,
+    now: u64,
+) -> Vec<String> {
     let mut landed = Vec::new();
     for (i, row) in rows.iter_mut().enumerate() {
         let Some(row) = row.as_object_mut() else {
             continue;
         };
+        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+        let theirs = match row.get("agent_id").and_then(Value::as_str) {
+            Some(a) => a == agent,
+            None => desc.is_some_and(|d| feed::names_key(d, key)),
+        };
         let earlier = i != new
-            && row.get("agent_id").and_then(Value::as_str) == Some(agent)
+            && theirs
             && stage_of(row) == Some(feed::Stage::Running)
             && ms_of(row, "started").is_some_and(|s| s.saturating_add(feed::LATER_TASK_MS) <= now);
         if !earlier {
@@ -496,11 +520,43 @@ fn hand_off(rows: &mut [Value], new: usize, agent: &str, now: u64) -> Vec<String
         row.insert("stage".into(), json!("done"));
         row.insert("ended".into(), json!(stamp(now)));
         row.entry("landing").or_insert(json!("Done"));
+        row.entry("agent_id").or_insert(json!(agent));
+        row.remove("lease");
         if let Some(k) = row.get("key").and_then(Value::as_str) {
             landed.push(k.to_string());
         }
     }
     landed
+}
+
+/// Whether a `start --agent` could hand off a row the agent id alone does
+/// not find: a Running row with no `agent_id`, old enough to be an earlier
+/// task. Only then is the worker's spawn description looked up.
+fn needs_description(doc: &Value, now: u64) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|r| {
+            !r.contains_key("agent_id")
+                && stage_of(r) == Some(feed::Stage::Running)
+                && ms_of(r, "started").is_some_and(|s| s.saturating_add(feed::LATER_TASK_MS) <= now)
+        })
+}
+
+/// The spawn description of `session`'s subagent `agent`, from its
+/// `agent-<id>.meta.json` under the Claude config dir the session runs in.
+fn agent_description(cfg: Option<&Path>, session: &str, agent: &str) -> Option<String> {
+    let cfg = cfg.map(Path::to_path_buf).or_else(|| {
+        ["CLAUDE_CONFIG_DIR", "GIVERNY_PROFILE_DIR"]
+            .into_iter()
+            .find_map(|v| std::env::var_os(v).filter(|d| !d.is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+    })?;
+    let dir = crate::subagents::subagents_dir(&cfg, session)?;
+    crate::subagents::read_meta(&dir, agent).description
 }
 
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
@@ -598,7 +654,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             // A dispatcher's `start` owns the row: it lands it.
             row.remove("follows_worker");
             let handed = match &f.agent {
-                Some(agent) => hand_off(rows, i, agent, now),
+                Some(agent) => hand_off(rows, i, agent, f.agent_desc.as_deref(), now),
                 None => Vec::new(),
             };
             Ok(match handed.as_slice() {
@@ -920,7 +976,7 @@ pub fn run_in_code(
     let ledger = resources::ledger_path(dir);
     // Every command from a session keeps its leases alive.
     if *cmd != Cmd::Path
-        && let Err(e) = resources::heartbeat(&ledger, session, now)
+        && let Err(e) = resources::heartbeat(&ledger, Some(dir), session, now)
     {
         eprintln!("giverny pass: {e}");
     }
@@ -968,13 +1024,36 @@ pub fn run_in_code(
         }
         _ => {}
     }
-    let msg = run_feed(dir, session, cmd, flags, now)?;
-    // A task that lands or is dropped gives its lease back, after the feed's
-    // lock is let go (the ledger's is never taken under it).
+    let (mut msg, landed) = match run_feed(dir, session, cmd, flags, now) {
+        Ok(x) => x,
+        // A task that is over gives its lease back even when its row could
+        // not be changed (none in this pass, another writer's feed).
+        Err(e) => {
+            if let Cmd::Land(task) | Cmd::Drop(task) = cmd
+                && let Some(l) = resources::release_at(&ledger, session, task, now)?
+            {
+                return Err(format!("{e}; released {}", l.describe()));
+            }
+            return Err(e);
+        }
+    };
+    // A task that lands — by `land`, or handed off by a `start --agent` — or
+    // is dropped gives its lease back, after the feed's lock is let go (the
+    // ledger's is never taken under it).
+    let mut free = landed;
     if let Cmd::Land(task) | Cmd::Drop(task) = cmd
-        && let Some(l) = resources::release_at(&ledger, session, task, now)?
+        && !free.contains(task)
     {
-        return Ok((format!("{msg}; released {}", l.describe()), 0));
+        free.push(task.clone());
+    }
+    for task in &free {
+        if let Some(l) = resources::release_at(&ledger, session, task, now)? {
+            msg = if free.len() > 1 {
+                format!("{msg}; released {task}: {}", l.describe())
+            } else {
+                format!("{msg}; released {}", l.describe())
+            };
+        }
     }
     Ok((msg, 0))
 }
@@ -1130,16 +1209,17 @@ pub(crate) fn mark_waiting(
 }
 
 /// The feed commands: read the session's feed, change it, write it back.
+/// The message, and the keys the command landed (whose leases go back).
 fn run_feed(
     dir: &Path,
     session: &str,
     cmd: &Cmd,
     flags: &Flags,
     now: u64,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let file = file_for(dir, session);
     if *cmd == Cmd::Path {
-        return Ok(file.display().to_string());
+        return Ok((file.display().to_string(), Vec::new()));
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let _lock = Lock::take(&file)?;
@@ -1148,7 +1228,7 @@ fn run_feed(
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .filter(Value::is_object);
     if *cmd == Cmd::ClearDone {
-        return Ok(clear_done(&file, existing));
+        return Ok((clear_done(&file, existing), Vec::new()));
     }
     if let Some(doc) = &existing
         && let Some(w) = writer_of(doc)
@@ -1160,12 +1240,15 @@ fn run_feed(
         ));
     }
     match cmd {
-        Cmd::Show => Ok(show(existing.as_ref().unwrap_or(&new_doc(session)), now)),
+        Cmd::Show => Ok((
+            show(existing.as_ref().unwrap_or(&new_doc(session)), now),
+            Vec::new(),
+        )),
         Cmd::Clear => {
             if existing.is_some() {
                 std::fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
             }
-            Ok("cleared".into())
+            Ok(("cleared".into(), Vec::new()))
         }
         _ => {
             let mut doc = existing.unwrap_or_else(|| new_doc(session));
@@ -1176,6 +1259,11 @@ fn run_feed(
             let history = pass_history::path(dir);
             let mut flags = flags.clone();
             let said = correct_estimate(&doc, cmd, &mut flags, history.as_deref());
+            if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
+                && needs_description(&doc, now)
+            {
+                flags.agent_desc = agent_description(flags.claude_dir.as_deref(), session, agent);
+            }
             let before = done_keys(&doc);
             let msg = apply(&mut doc, cmd, &flags, now)?;
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -1186,10 +1274,15 @@ fn run_feed(
                 Some(said) => format!("{msg}{said}"),
                 None => msg,
             };
-            Ok(match cmd {
+            let landed = done_keys(&doc)
+                .into_iter()
+                .filter(|k| !before.contains(k))
+                .collect();
+            let msg = match cmd {
                 Cmd::Plan(key) if !has_brief(&doc, key) => format!("{msg}\n{}", no_brief(key)),
                 _ => msg,
-            })
+            };
+            Ok((msg, landed))
         }
     }
 }
@@ -2289,6 +2382,168 @@ mod tests {
         );
         assert!(parse_args(&args("claim")).is_err());
         assert_eq!(parse_args(&args("resources")).unwrap().0, Cmd::Resources);
+    }
+
+    /// A worker spawned with the Agent tool: its `agent-<id>.meta.json`
+    /// (the spawn description) under `<dir>/claude/projects/-w/<session>/
+    /// subagents`. Returns that config dir.
+    fn spawned(dir: &Path, session: &str, agent: &str, desc: &str) -> PathBuf {
+        let cfg = dir.join("claude");
+        let sub = cfg
+            .join("projects")
+            .join("-w")
+            .join(session)
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let meta = json!({"description": desc, "agentType": "general-purpose"});
+        std::fs::write(
+            sub.join(format!("agent-{agent}.meta.json")),
+            meta.to_string(),
+        )
+        .unwrap();
+        std::fs::write(sub.join(format!("agent-{agent}.jsonl")), "").unwrap();
+        cfg
+    }
+
+    fn run_cfg(dir: &Path, session: &str, l: &str, cfg: Option<&Path>, now: u64) -> (String, i32) {
+        let (cmd, mut flags) = parse_args(&args(l)).unwrap();
+        flags.claude_dir = cfg.map(Path::to_path_buf);
+        run_in_code(dir, session, &cmd, &flags, now, Some(&machine())).unwrap()
+    }
+
+    fn held(dir: &Path, session: &str, task: &str, now: u64) -> bool {
+        resources::with_ledger(&resources::ledger_path(dir), now, |l| {
+            l.lease(session, task).is_some()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_hand_off_lands_a_row_started_before_the_worker_had_an_id() {
+        let dir = scratch("handoff-noid");
+        // plan → claim → start with no --agent → spawn (description `parse-fix: …`).
+        run_cfg(&dir, "s1", "plan parse-fix --eta 30", None, T0);
+        let (msg, code) = run_cfg(&dir, "s1", "claim parse-fix --cpu 3 --ram 3G", None, T0);
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        run_cfg(&dir, "s1", "start parse-fix", None, T0);
+        let cfg = spawned(&dir, "s1", "w1", "parse-fix: the parser");
+        // Another session needs more than is left: it queues behind parse-fix.
+        let (msg, code) = run_cfg(&dir, "s2", "claim big --cpu 10 --ram 2G", None, T0 + MIN);
+        assert_eq!(code, resources::exit::QUEUED, "{msg}");
+
+        // Fifteen minutes on, the dispatcher hands that worker its next task.
+        let (said, _) = run_cfg(
+            &dir,
+            "s1",
+            "start lex-fix --agent w1 --eta 20",
+            Some(&cfg),
+            T0 + 15 * MIN,
+        );
+        assert!(said.contains("handed on from parse-fix"), "{said}");
+        assert!(said.contains("released 3 cpu, 3G"), "{said}");
+        let f = read_feed_of(&dir, "s1");
+        let row = |k: &str| f.rows.iter().find(|r| r.key == k).unwrap();
+        assert_eq!(row("parse-fix").stage(), feed::Stage::Done);
+        assert_eq!(row("parse-fix").ended_ms, Some(T0 + 15 * MIN));
+        assert_eq!(row("parse-fix").landing.as_deref(), Some("Done"));
+        assert_eq!(row("parse-fix").agent_id.as_deref(), Some("w1"));
+        assert_eq!(row("parse-fix").lease, None, "a landed row holds nothing");
+        assert_eq!(row("lex-fix").stage(), feed::Stage::Running);
+        assert!(
+            !held(&dir, "s1", "parse-fix", T0 + 15 * MIN),
+            "the lease went back"
+        );
+        let (msg, code) = run_cfg(
+            &dir,
+            "s2",
+            "claim big --cpu 10 --ram 2G",
+            None,
+            T0 + 16 * MIN,
+        );
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hook_puts_the_workers_id_on_a_row_started_without_it() {
+        let dir = scratch("handoff-hook");
+        run_cfg(&dir, "s1", "plan cfg-keys --eta 30", None, T0);
+        run_cfg(&dir, "s1", "claim cfg-keys --cpu 3 --ram 3G", None, T0);
+        run_cfg(&dir, "s1", "start cfg-keys", None, T0);
+        let cfg = spawned(&dir, "s1", "w2", "cfg-keys: config keys");
+        // The worker's first tool call: the hook joins it to its row by the
+        // spawn description, and writes the id on the row.
+        let transcript = cfg.join("projects").join("-w").join("s1.jsonl");
+        let payload = json!({"session_id": "s1", "agent_id": "w2",
+                             "transcript_path": transcript});
+        crate::pass_nudge::run(&payload, &dir, T0 + MIN, true);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(f.rows[0].agent_id.as_deref(), Some("w2"));
+        // So the hand-off finds it by the id alone, no description read.
+        let nowhere = dir.join("nowhere");
+        let (said, _) = run_cfg(
+            &dir,
+            "s1",
+            "start cfg-docs --agent w2",
+            Some(&nowhere),
+            T0 + 15 * MIN,
+        );
+        assert!(said.contains("handed on from cfg-keys"), "{said}");
+        assert!(said.contains("released 3 cpu, 3G"), "{said}");
+        assert!(!held(&dir, "s1", "cfg-keys", T0 + 15 * MIN));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_description_naming_no_row_hands_off_nothing() {
+        let dir = scratch("handoff-other");
+        run_cfg(&dir, "s1", "start parse-fix", None, T0);
+        let cfg = spawned(&dir, "s1", "w2", "other: something else");
+        let (said, _) = run_cfg(
+            &dir,
+            "s1",
+            "start more --agent w2",
+            Some(&cfg),
+            T0 + 40 * MIN,
+        );
+        assert!(!said.contains("handed on"), "{said}");
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(f.rows[0].stage(), feed::Stage::Running, "not w2's task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_lease_outlives_its_task() {
+        let dir = scratch("lease-landed");
+        run_cfg(&dir, "s1", "start t", None, T0);
+        run_cfg(&dir, "s1", "claim t --cpu 3 --ram 3G", None, T0);
+        // The row lands by a path that missed the ledger (an older writer,
+        // an edit by hand): the lease is still there…
+        assert!(edit_row(&dir, "s1", "t", |r| {
+            r.insert("stage".into(), json!("done"));
+        }));
+        assert!(held(&dir, "s1", "t", T0 + MIN));
+        // …until the session's next command or hook beat, which drops it
+        // rather than renewing it.
+        run_cfg(&dir, "s1", "show", None, T0 + 2 * MIN);
+        assert!(!held(&dir, "s1", "t", T0 + 2 * MIN));
+        run_cfg(&dir, "s1", "claim t2 --cpu 1", None, T0 + 2 * MIN);
+        // A task landed with no row in the pass still gives its lease back.
+        run_cfg(&dir, "s1", "claim u --cpu 1", None, T0 + 3 * MIN);
+        let (cmd, flags) = parse_args(&args("land u")).unwrap();
+        let err =
+            run_in_code(&dir, "s1", &cmd, &flags, T0 + 4 * MIN, Some(&machine())).unwrap_err();
+        assert!(err.contains("released 1 cpu"), "{err}");
+        assert!(!held(&dir, "s1", "u", T0 + 4 * MIN));
+        assert!(
+            held(&dir, "s1", "t2", T0 + 4 * MIN),
+            "a rowless claim is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn read_feed_of(dir: &Path, session: &str) -> feed::Feed {
+        feed::read(&feed::feed_path(dir, session)).expect("a feed the pane reads")
     }
 
     #[test]

@@ -331,6 +331,21 @@ impl Ledger {
         moved
     }
 
+    /// Drop `session`'s leases and queued requests for tasks that have
+    /// `landed`: a lease a landing missed would otherwise be renewed by
+    /// every heartbeat of a busy session and never expire. The leases
+    /// dropped.
+    pub fn drop_landed(&mut self, session: &str, landed: &[String]) -> Vec<Lease> {
+        let gone_task = |s: &str, t: &str| s == session && landed.iter().any(|k| k == t);
+        self.queue.retain(|w| !gone_task(&w.session, &w.task));
+        let (gone, keep): (Vec<_>, Vec<_>) = self
+            .leases
+            .drain(..)
+            .partition(|l| gone_task(&l.session, &l.task));
+        self.leases = keep;
+        gone
+    }
+
     /// The queue in grant order: Priority first, then first come.
     pub fn ordered_queue(&self) -> Vec<&Waiter> {
         let mut q: Vec<&Waiter> = self.queue.iter().collect();
@@ -919,9 +934,29 @@ pub fn with_ledger<R>(
     Ok(out)
 }
 
+/// The tasks of `session`'s feed in `feed_dir` that have landed (Done rows).
+fn landed_tasks(feed_dir: &Path, session: &str) -> Vec<String> {
+    feed::find(feed_dir, session)
+        .map(|(_, f)| {
+            f.rows
+                .into_iter()
+                .filter(|r| r.stage() == feed::Stage::Done)
+                .map(|r| r.key)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every `giverny pass` command's heartbeat for `session`. Touches nothing
 /// when there is no ledger yet, and writes only every [`BEAT_EVERY_MS`].
-pub fn heartbeat(path: &Path, session: &str, now: u64) -> Result<(), String> {
+/// With the feed dir, a lease or queued request of a task whose feed row
+/// has landed is dropped rather than renewed.
+pub fn heartbeat(
+    path: &Path,
+    feed_dir: Option<&Path>,
+    session: &str,
+    now: u64,
+) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
@@ -932,6 +967,15 @@ pub fn heartbeat(path: &Path, session: &str, now: u64) -> Result<(), String> {
     let mut l = Ledger::parse(&bytes)?;
     let before = l.clone();
     l.expire(now);
+    let holds = |l: &Ledger| {
+        l.leases.iter().any(|x| x.session == session)
+            || l.queue.iter().any(|w| w.session == session)
+    };
+    if let Some(dir) = feed_dir
+        && holds(&l)
+    {
+        l.drop_landed(session, &landed_tasks(dir, session));
+    }
     if l.heartbeat(session, now)
         || l.leases.len() != before.leases.len()
         || l.queue.len() != before.queue.len()
@@ -1367,7 +1411,7 @@ mod tests {
         assert_eq!(l.leases[0].ram_mb, 3072);
         assert_eq!(l.leases[0].repo.as_deref(), Some("demo"));
         // Heartbeats beat; a silent ledger expires on the next read.
-        heartbeat(&path, "a", T0 + 10 * MIN).unwrap();
+        heartbeat(&path, None, "a", T0 + 10 * MIN).unwrap();
         let l = Ledger::parse(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(l.leases[0].heartbeat_at, T0 + 10 * MIN);
         let n = with_ledger(&path, T0 + 10 * MIN + TTL_MS, |l| l.leases.len()).unwrap();

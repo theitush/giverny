@@ -111,6 +111,27 @@ fn holds_row(doc: &Value, agent_id: &str, description: Option<&str>) -> bool {
         })
 }
 
+/// Put the worker's id on the Running rows its spawn description names that
+/// carry none yet: a dispatcher that ran `start` before the spawn could not
+/// give it, and a later `start <next> --agent <id>` finds the worker's
+/// earlier task by it. True when a row changed.
+pub fn stamp_agent(doc: &mut Value, agent_id: &str, description: Option<&str>) -> bool {
+    let Some(rows) = doc.get_mut("rows").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        if !row.contains_key("agent_id")
+            && pass::stage_of(row) == Some(feed::Stage::Running)
+            && is_mine(row, agent_id, description)
+        {
+            row.insert("agent_id".into(), json!(agent_id));
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The task name a worker with no row is asked to report under: its spawn
 /// description's first word when that reads as a task id (`acme#613 …`,
 /// `auth-fix: …`) and no other row has it, else `agent-<its id>`, which the
@@ -297,7 +318,8 @@ pub const BEATS_DIR: &str = "beats";
 /// Renew `session`'s leases, at most every [`resources::BEAT_EVERY_MS`]:
 /// nothing at all without a ledger (one `stat`); between beats, a `stat` of
 /// the session's marker, whose mtime is the last beat. True when it beat.
-pub fn beat(ledger: &Path, session: &str, now: u64) -> bool {
+/// With the feed dir, the beat also drops leases of tasks that have landed.
+pub fn beat(ledger: &Path, feed_dir: Option<&Path>, session: &str, now: u64) -> bool {
     if std::fs::metadata(ledger).is_err() {
         return false;
     }
@@ -338,7 +360,7 @@ pub fn beat(ledger: &Path, session: &str, now: u64) -> bool {
             }
         }
     }
-    let _ = resources::heartbeat(ledger, session, now);
+    let _ = resources::heartbeat(ledger, feed_dir, session, now);
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -370,7 +392,7 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.contains(['/', '\\']) && !s.starts_with('.'))?;
     let ledger = resources::ledger_path(dir);
-    beat(&ledger, session, now);
+    beat(&ledger, Some(dir), session, now);
     let Some(caller) = Caller::of(payload) else {
         // The orchestrator's own call: its messages, if any.
         return pass_inbox::deliver(dir, &ledger, session, now).map(|t| reply(&t));
@@ -396,15 +418,18 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String>
             return None; // another writer's pass: its rows, its estimates
         }
         if holds_row(&d, &caller.agent_id, desc) {
+            let stamped = stamp_agent(&mut d, &caller.agent_id, desc);
             let ask = check(
                 &mut d,
                 &caller.agent_id,
                 desc,
                 now,
                 pass_history::path(dir).as_deref(),
-            )?;
-            pass::write(&file, &d).ok()?;
-            return Some(reply(&ask));
+            );
+            if stamped || ask.is_some() {
+                pass::write(&file, &d).ok()?;
+            }
+            return ask.map(|a| reply(&a));
         }
         doc = Some(d);
     }
