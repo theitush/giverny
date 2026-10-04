@@ -1149,6 +1149,12 @@ impl ClaudeWatch {
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
     /// keys go and so does the directory.
+    ///
+    /// The setting is on by default, so it is not consent by itself: the
+    /// keys are written only into an account that already holds our hooks
+    /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
+    /// it is for the live-usage statusline. Every other account is left
+    /// byte-identical. Off removes only what is ours, wherever it is.
     pub fn set_agents_pane(&mut self, enable: bool, base: &Path) {
         if self.leave_accounts {
             return;
@@ -1163,6 +1169,7 @@ impl ClaudeWatch {
         }
         for p in &self.profiles {
             let settings = p.config_dir.join("settings.json");
+            let enable = enable && hooks::partly_installed_in(&settings);
             match hooks::set_subagent_line(&settings, enable) {
                 Ok(true) => tracing::info!(
                     "subagentStatusLine {} for {}",
@@ -2188,6 +2195,55 @@ mod tests {
         w.set_agents_pane(false, &base);
         w.set_auto_mode(true);
         assert_ne!(std::fs::read(&settings).unwrap(), before.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pane is on by default, so the setting alone is not consent: an
+    /// account without our hooks is left byte-identical, and one with them
+    /// gets the pane's keys, which go again when the pane goes off.
+    #[test]
+    fn the_pane_writes_only_where_the_hooks_are() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-pane-consent-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let base = root.join("giverny");
+        let profile = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            Profile {
+                name: name.into(),
+                config_dir: dir,
+                email: None,
+                account_uuid: None,
+            }
+        };
+        let (plain, hooked) = (profile("plain"), profile("hooked"));
+        let plain_settings = plain.config_dir.join("settings.json");
+        let hooked_settings = hooked.config_dir.join("settings.json");
+        let text = "{\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&plain_settings, text).unwrap();
+        std::fs::write(&hooked_settings, text).unwrap();
+        hooks::install_into(&hooked_settings).unwrap();
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![plain.clone(), hooked.clone()];
+        w.leave_accounts = false;
+        w.set_agents_pane(true, &base);
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(
+            !plain.config_dir.join("settings.json.giverny-bak").exists(),
+            "no backup for a write that never happened"
+        );
+        assert!(hooks::subagent_line_installed_in(&hooked_settings));
+        assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+
+        w.set_agents_pane(false, &base);
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(!hooks::subagent_line_installed_in(&hooked_settings));
+        assert!(!giverny_claude::plugin::installed_in(&hooked_settings));
 
         let _ = std::fs::remove_dir_all(&root);
     }
