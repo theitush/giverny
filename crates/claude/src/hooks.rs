@@ -342,7 +342,9 @@ pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 /// The `giverny statusline` entrypoint: Claude Code runs this after every
 /// assistant message and displays our stdout. We forward the payload's
 /// official `rate_limits` to the app (fresh usage without any API call) and
-/// print a compact line back.
+/// print a compact line back: model and token counts on the
+/// left, the session's CPU, memory and GPU at the right edge
+/// ([`crate::session_use`]).
 pub fn run_statusline(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
@@ -368,14 +370,6 @@ pub fn run_statusline(spool: &Path) {
     deliver(&msg, spool);
 
     // What Claude displays. Keep it short and useful.
-    let pct = |key: &str| -> Option<i64> {
-        payload
-            .get("rate_limits")?
-            .get(key)?
-            .get("used_percentage")?
-            .as_f64()
-            .map(|v| v.round() as i64)
-    };
     let mut parts: Vec<String> = Vec::new();
     if let Some(model) = payload
         .get("model")
@@ -384,14 +378,18 @@ pub fn run_statusline(spool: &Path) {
     {
         parts.push(model.to_string());
     }
-    if let Some(p) = pct("five_hour") {
-        parts.push(format!("5h {p}%"));
-    }
-    if let Some(p) = pct("seven_day") {
-        parts.push(format!("wk {p}%"));
-    }
+    // No 5h or week usage here: Giverny's sidebar shows both.
     parts.extend(statusline_tokens(&payload));
-    println!("{}", parts.join("  ·  "));
+    // The whole session's CPU, memory and GPU now, at the right edge.
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let used = crate::session_use::measure(session_id)
+        .map(|u| crate::session_use::segments(&u).join(crate::session_use::SEP))
+        .unwrap_or_default();
+    let width = crate::session_use::line_width(std::env::var("COLUMNS").ok().as_deref());
+    println!(
+        "{}",
+        crate::session_use::align(&parts.join(crate::session_use::SEP), &used, width)
+    );
 }
 
 /// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the

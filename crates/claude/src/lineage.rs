@@ -120,7 +120,7 @@ fn of_process(pid: u32, app: u32) -> Lineage {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_parent(pid: u32) -> Option<u32> {
+pub(crate) fn proc_parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 4 (ppid) follows the parenthesized comm, which may itself hold
     // spaces or parentheses — split after the last `)`.
@@ -132,7 +132,7 @@ fn proc_parent(pid: u32) -> Option<u32> {
 /// versioned file is called) and Claude Code also sets it as its process
 /// title; `argv[0]` is the second opinion.
 #[cfg(target_os = "linux")]
-fn proc_is_claude(pid: u32) -> bool {
+pub(crate) fn proc_is_claude(pid: u32) -> bool {
     if std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| is_claude_name(&c)) {
         return true;
     }

@@ -640,21 +640,7 @@ fn mem4(mb: u64) -> String {
 /// A measured size in G, unpadded: [`mem4`]'s figure, for the overlay
 /// header's `peak 0.5G of 3G`.
 fn gb(mb: u64) -> String {
-    if mb == 0 {
-        return "0.0G".into();
-    }
-    let mut v = mb as f64 / 1024.0;
-    let mut unit = 'G';
-    if v >= 999.5 {
-        v /= 1024.0;
-        unit = 'T';
-    }
-    if v < 9.95 {
-        // A real figure never reads as nothing.
-        format!("{:.1}{unit}", v.max(0.1))
-    } else {
-        format!("{:.0}{unit}", v.min(999.0))
-    }
+    giverny_claude::session_use::gb(mb)
 }
 
 /// How wide every [`usage_cell`] is: `100% CPU 4.2G OOM`.

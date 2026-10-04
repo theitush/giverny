@@ -221,6 +221,9 @@ pub struct RowMarks {
     /// sitting at the row's right end (where the strip's
     /// `main` was, under the terminal's other text).
     pub button_left: Option<u16>,
+    /// The button ends before this column instead of at the row's end
+    /// (text further right on the row, which it must not cover).
+    pub button_end: Option<u16>,
     /// Esc presses the button instead of reaching the program.
     pub escape: bool,
 }
@@ -654,19 +657,20 @@ impl TabView {
         }
         // One cell of padding inside each end; at the right, the end one
         // cell in; at the left, the label on the column asked for.
+        let end = self.marks.button_end.map_or(cols, |e| e.min(cols));
         let (free, left) = match self.marks.button_left {
             Some(at) => {
                 let start = at.saturating_sub(1).max(used);
-                (cols.saturating_sub(start), Some(start))
+                (end.saturating_sub(start), Some(start))
             }
-            None => (cols.saturating_sub(used), None),
+            None => (end.saturating_sub(used), None),
         };
         let label = self
             .button_labels
             .iter()
             .find(|l| (l.chars().count() as u16) + 4 <= free)?;
         let width = label.chars().count() as u16 + 2;
-        let start = left.unwrap_or(cols - 1 - width);
+        let start = left.unwrap_or(end - 1 - width);
         let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
         let r = Rect::from_min_size(
             Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),

@@ -19,6 +19,7 @@ pub mod profiles;
 pub mod registry;
 pub mod resources;
 pub mod run_live;
+pub mod session_use;
 pub mod subagents;
 pub mod tokens;
 pub mod transcript;

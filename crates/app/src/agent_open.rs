@@ -1405,8 +1405,9 @@ impl Nudge {
 ///   tab is on, and the way back is Giverny's button;
 /// * while a worker's view is on screen, a "back to orchestrator" button
 ///   sits where that `◯ main` was, left-aligned under the terminal's other
-///   text; with no such row, at the right end of the status
-///   line under the prompt (the row with the session's token counts);
+///   text; with no such row, on the status line under the prompt (the
+///   row with the session's token counts), after its text and before the
+///   session's use at its right edge;
 /// * and Esc presses that button rather than reaching Claude Code, while
 ///   the prompt or the strip has the keyboard (not over a dialog, whose Esc
 ///   is its own).
@@ -1458,8 +1459,34 @@ pub fn row_marks(screen: &str) -> giverny_term::widget::RowMarks {
         .clone()
         .find(|&i| rows[i].contains("total:") || rows[i].contains("session:"))
         .or_else(|| near.clone().find(|&i| !rows[i].trim().is_empty()));
-    marks.button = status.and_then(|i| Some((as_row(i)?, as_row(rows[i].chars().count())?)));
+    let Some(i) = status else {
+        return marks;
+    };
+    // The session's use sits at the line's right edge, past a gap: the
+    // button goes in the gap, between the two.
+    let (used, end) = status_gap(rows[i]);
+    marks.button = as_row(i).zip(as_row(used));
+    marks.button_end = end.and_then(as_row);
     marks
+}
+
+/// Where a status line's left part ends, in columns, and where a
+/// right-aligned part after a gap of three or more blanks starts (`None`
+/// with no such part: the whole line is the left part).
+fn status_gap(row: &str) -> (usize, Option<usize>) {
+    let chars: Vec<char> = row.trim_end().chars().collect();
+    let first = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+    let mut run = 0;
+    for j in (first..chars.len()).rev() {
+        if chars[j] == ' ' {
+            run += 1;
+        } else if run >= 3 {
+            return (j + 1, Some(j + 1 + run));
+        } else {
+            run = 0;
+        }
+    }
+    (row.chars().count(), None)
 }
 
 #[cfg(test)]
@@ -2695,6 +2722,17 @@ mod tests {
         let (screen, _, _) = fake.look();
         let labels: Vec<String> = strip_agents(&screen).into_iter().map(|i| i.label).collect();
         assert_eq!(labels, ["Starting Python sleep", "theta worker"]);
+    }
+
+    #[test]
+    fn the_way_back_sits_in_the_status_lines_gap() {
+        assert_eq!(status_gap("  Opus 5.5  ·  5h 12%"), (21, None));
+        assert_eq!(status_gap("  Opus 5.5  ·  5h 12%  "), (23, None));
+        let row = "  Opus 5.5  ·  session: 3k        45% CPU  ·  4.2G";
+        assert_eq!(status_gap(row), (26, Some(34)));
+        assert_eq!(row.chars().skip(34).collect::<String>(), "45% CPU  ·  4.2G");
+        // `·` is one column, wherever it is.
+        assert_eq!(status_gap("  a · b   c · d"), (7, Some(10)));
     }
 
     #[test]
