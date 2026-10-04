@@ -13,7 +13,7 @@
 //! not sampled. A `.live` file whose `run` is gone (killed) is skipped by
 //! readers and swept by the next `run`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -27,6 +27,9 @@ pub struct RunLive {
     pub cpu_pct: u32,
     /// The cgroups' `memory.current`, MiB.
     pub mem_mb: u64,
+    /// GPU memory of the cgroups' processes, MiB; `None` when the machine
+    /// has no NVIDIA GPU (or `nvidia-smi`'s answer is not in yet).
+    pub gpu_mb: Option<u64>,
 }
 
 /// One task's use, keyed as the ledger keys leases.
@@ -162,6 +165,13 @@ pub fn usage_usec(cpu_stat: &str) -> Option<u64> {
         .and_then(|n| n.trim().parse().ok())
 }
 
+/// The processes in a cgroup (`cgroup.procs`).
+pub fn cgroup_pids(dir: &Path) -> HashSet<u32> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
 /// CPU used between two reads, percent of `cores` cores, rounded.
 pub fn cpu_pct(used_usec: u64, over_usec: u64, cores: u32) -> u32 {
     if over_usec == 0 || cores == 0 {
@@ -199,6 +209,9 @@ impl Sampler {
         let now = Instant::now();
         let mut seen = HashMap::new();
         let mut out: Vec<TaskLive> = Vec::new();
+        // GPU memory per process, from the answer the status line keeps
+        // (asked for afresh when old); none without an NVIDIA GPU.
+        let gpu = crate::session_use::cache_dir().and_then(|d| crate::session_use::gpu::apps(&d));
         for (_, l) in read_dir(runs_dir) {
             if !alive(l.pid) {
                 continue;
@@ -224,8 +237,11 @@ impl Sampler {
                     self.cores,
                 ),
             };
-            seen.insert(cg, (usec, now));
             let mem_mb = mem.div_ceil(1024 * 1024);
+            let gpu_mb = gpu
+                .as_ref()
+                .map(|apps| crate::session_use::gpu::of(apps, &cgroup_pids(&cg)));
+            seen.insert(cg, (usec, now));
             match out
                 .iter_mut()
                 .find(|t| t.task == l.task && t.session == l.session)
@@ -233,6 +249,10 @@ impl Sampler {
                 Some(t) => {
                     t.live.cpu_pct = (t.live.cpu_pct + pct).min(100);
                     t.live.mem_mb += mem_mb;
+                    t.live.gpu_mb = match (t.live.gpu_mb, gpu_mb) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        (a, b) => a.or(b),
+                    };
                 }
                 None => out.push(TaskLive {
                     session: l.session,
@@ -240,6 +260,7 @@ impl Sampler {
                     live: RunLive {
                         cpu_pct: pct,
                         mem_mb,
+                        gpu_mb,
                     },
                 }),
             }
@@ -274,6 +295,16 @@ mod tests {
         assert_eq!(cpu_pct(1_000_000, 1_000_000, 4), 25);
         assert_eq!(cpu_pct(9_000_000, 1_000_000, 4), 100);
         assert_eq!(cpu_pct(5, 0, 4), 0);
+    }
+
+    /// The pids whose GPU memory a run's cell sums.
+    #[test]
+    fn a_cgroups_processes_are_read() {
+        let cg = scratch("procs");
+        assert!(cgroup_pids(&cg).is_empty(), "no file, no processes");
+        std::fs::write(cg.join("cgroup.procs"), "4242\n77\n\n").unwrap();
+        assert_eq!(cgroup_pids(&cg), HashSet::from([4242, 77]));
+        let _ = std::fs::remove_dir_all(&cg);
     }
 
     /// A fake cgroup: the sampler sums a task's commands, keys them by

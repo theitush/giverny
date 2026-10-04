@@ -109,11 +109,25 @@ pub fn gb(mb: u64) -> String {
     }
 }
 
-/// `45% CPU`, `4.2G` and, with a GPU, `gpu 1.2G`.
+/// [`gb`] in exactly four columns, right-aligned: `4.2G`, ` 12G`.
+pub fn gb4(mb: u64) -> String {
+    format!("{:>4}", gb(mb))
+}
+
+/// CPU in exactly eight columns, right-aligned: ` 45% CPU`, `100% CPU`.
+pub fn cpu8(pct: u32) -> String {
+    format!("{:>3}% CPU", pct.min(100))
+}
+
+/// ` 45% CPU`, `4.2G` and, with a GPU, `gpu 1.2G`. Every figure has a
+/// fixed width ([`cpu8`], [`gb4`]), so the part, joined with [`SEP`] and
+/// right-aligned, keeps each figure in the same columns as it changes —
+/// and in the same columns as the agents pane's use cells drawn right
+/// under it, which are built from the same pieces.
 pub fn segments(u: &SessionUse) -> Vec<String> {
-    let mut out = vec![format!("{}% CPU", u.cpu_pct.min(100)), gb(u.mem_mb)];
+    let mut out = vec![cpu8(u.cpu_pct), gb4(u.mem_mb)];
     if let Some(g) = u.gpu_mb {
-        out.push(format!("gpu {}", gb(g)));
+        out.push(format!("gpu {}", gb4(g)));
     }
     out
 }
@@ -168,7 +182,7 @@ pub fn align(left: &str, right: &str, width: Option<usize>) -> String {
 pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
     let me = std::process::id();
     let root = claude_root(me)?;
-    let dir = dirs::cache_dir()?.join("giverny").join("statusline");
+    let dir = cache_dir()?;
     let key = session_id
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
         .map_or_else(|| format!("pid-{root}"), str::to_string);
@@ -220,6 +234,18 @@ pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
         mem_mb: rss_kb.div_ceil(1024),
         gpu_mb,
     })
+}
+
+/// Where the status line keeps its readings and the kept `nvidia-smi`
+/// answer.
+#[cfg(target_os = "linux")]
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("giverny").join("statusline"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -386,11 +412,41 @@ pub mod gpu {
     #[cfg(target_os = "linux")]
     const FRESH_MS: u64 = 5_000;
 
+    /// Whether the machine has `nvidia-smi`, so a GPU to show: looked for
+    /// once.
+    #[cfg(target_os = "linux")]
+    pub fn present() -> bool {
+        static SMI: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        SMI.get_or_init(|| find_on_path("nvidia-smi")).is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn present() -> bool {
+        false
+    }
+
+    /// The GPU memory of the processes in `pids`, MiB: [`apps`] summed
+    /// over them.
+    pub fn of(apps: &HashMap<u32, u64>, pids: &HashSet<u32>) -> u64 {
+        apps.iter()
+            .filter(|(pid, _)| pids.contains(pid))
+            .map(|(_, mb)| mb)
+            .sum()
+    }
+
     /// The session's GPU memory, MiB: `None` with no `nvidia-smi` on the
-    /// machine or no answer kept yet. Asks for a fresh answer in the
-    /// background when the kept one is old, and never waits for it.
+    /// machine or no answer kept yet.
     #[cfg(target_os = "linux")]
     pub fn session_mb(dir: &Path, tree: &HashSet<u32>) -> Option<u64> {
+        Some(of(&apps(dir)?, tree))
+    }
+
+    /// GPU memory per process, MiB, from the answer kept in `dir`: `None`
+    /// with no `nvidia-smi` on the machine or no fresh answer kept. Asks
+    /// for a fresh answer in the background when the kept one is old, and
+    /// never waits for it.
+    #[cfg(target_os = "linux")]
+    pub fn apps(dir: &Path) -> Option<HashMap<u32, u64>> {
         let smi = find_on_path("nvidia-smi")?;
         let answer = dir.join("gpu.csv");
         let asked = dir.join("gpu.asked");
@@ -410,13 +466,12 @@ pub mod gpu {
         if age(&answer).is_some_and(|a| a > 60_000) {
             return None;
         }
-        Some(
-            parse_compute_apps(&text)
-                .iter()
-                .filter(|(pid, _)| tree.contains(pid))
-                .map(|(_, mb)| mb)
-                .sum(),
-        )
+        Some(parse_compute_apps(&text))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn apps(_dir: &std::path::Path) -> Option<HashMap<u32, u64>> {
+        None
     }
 
     /// Run `nvidia-smi` detached, its answer written beside the readings.
@@ -531,12 +586,19 @@ mod tests {
             mem_mb: 4300,
             gpu_mb: None,
         };
-        assert_eq!(segments(&u), ["45% CPU", "4.2G"]);
+        assert_eq!(segments(&u), [" 45% CPU", "4.2G"]);
         let u = SessionUse {
             gpu_mb: Some(1229),
             ..u
         };
-        assert_eq!(segments(&u), ["45% CPU", "4.2G", "gpu 1.2G"]);
+        assert_eq!(segments(&u), [" 45% CPU", "4.2G", "gpu 1.2G"]);
+        // Fixed widths: the figures keep their columns as they change.
+        let u = SessionUse {
+            cpu_pct: 100,
+            mem_mb: 12 * 1024,
+            gpu_mb: Some(0),
+        };
+        assert_eq!(segments(&u), ["100% CPU", " 12G", "gpu 0.0G"]);
     }
 
     #[test]
@@ -545,6 +607,8 @@ mod tests {
         assert_eq!(m.get(&4242), Some(&1224));
         assert_eq!(m.get(&77), Some(&300));
         assert_eq!(m.len(), 2);
+        assert_eq!(gpu::of(&m, &HashSet::from([4242, 9])), 1224);
+        assert_eq!(gpu::of(&m, &HashSet::new()), 0);
     }
 
     #[test]

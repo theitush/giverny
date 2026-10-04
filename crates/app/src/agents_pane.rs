@@ -58,6 +58,7 @@ use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{self, RunLive, TaskLive};
+use giverny_claude::session_use;
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
 use giverny_core::config::{AgentsPanelConfig, DoneRows, PaneColumns};
@@ -634,7 +635,7 @@ fn mem(mb: u64) -> String {
 /// anything, `4.2G`, ` 12G`, `999G`, `1.5T`. Tenths only below ten, so the
 /// figure never grows a fifth character.
 fn mem4(mb: u64) -> String {
-    format!("{:>4}", gb(mb))
+    session_use::gb4(mb)
 }
 
 /// A measured size in G, unpadded: [`mem4`]'s figure, for the overlay
@@ -643,28 +644,55 @@ fn gb(mb: u64) -> String {
     giverny_claude::session_use::gb(mb)
 }
 
-/// How wide every [`usage_cell`] is: `100% CPU 4.2G OOM`.
-const USAGE_W: usize = 17;
+/// The OOM slot at the head of a [`usage_cell`].
+const OOM_SLOT: &str = "OOM ";
 
-/// A row's use in its cell: a Running row's commands now,
-/// `  14% CPU 4.2G` (CPU as a share of the whole machine, so at most
-/// `100%`), a Done row's memory peak alone in the same place, `4.2G`;
-/// `OOM` after either when the memory cap killed a run. Nothing measured
-/// reads as zero, `0.0G`, never as a blank: the cell is always there. Every
-/// slot has a fixed width, so every cell is [`USAGE_W`] characters and the
-/// column never jumps as the figures change. The lease is not here: the
-/// overlay header says it ([`lease_fact`]).
-pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool) -> String {
-    let cpu = match live {
-        Some(l) => format!("{:>3}% CPU ", l.cpu_pct.min(100)),
-        None => " ".repeat(9),
+/// The GPU slot at the tail of a [`usage_cell`] on a machine with a GPU:
+/// `  ·  gpu 1.2G`.
+const GPU_W: usize = 13;
+
+/// How wide every [`usage_cell`] is: `OOM 100% CPU  ·  4.2G`, and
+/// [`GPU_W`] more with a GPU.
+#[cfg(test)]
+fn usage_w(gpu: bool) -> usize {
+    // `·` is two bytes and one column.
+    let w = OOM_SLOT.len() + 8 + session_use::SEP.chars().count() + 4;
+    if gpu { w + GPU_W } else { w }
+}
+
+/// A row's use in its cell, read like the status line's use part right
+/// above the pane and built from the same pieces, so the figures sit in
+/// the same columns: a Running row's commands now, ` 14% CPU  ·  4.2G` (CPU
+/// as a share of the whole machine, so at most `100%`), a Done row's
+/// memory peak alone in the same place, `4.2G`; on a machine with a GPU
+/// (`gpu`), a Running row's GPU memory after, `  ·  gpu 1.2G`. `OOM`
+/// leads when the memory cap killed a run, so the figures keep their
+/// places. Nothing measured reads as zero, `0.0G`, never as a blank: the
+/// cell is always there. Every slot has a fixed width, so every cell is
+/// as wide as every other and the column never jumps as the figures
+/// change. The lease is not here: the overlay header says it
+/// ([`lease_fact`]).
+pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool, gpu: bool) -> String {
+    let blank = |n: usize| " ".repeat(n);
+    let sep = session_use::SEP;
+    let oom = if oom {
+        OOM_SLOT.to_string()
+    } else {
+        blank(OOM_SLOT.len())
     };
-    let memory = match live {
-        Some(l) => mem4(l.mem_mb),
-        None => mem4(peak_mb.unwrap_or(0)),
+    let (cpu, memory) = match live {
+        Some(l) => (
+            format!("{}{sep}", session_use::cpu8(l.cpu_pct)),
+            mem4(l.mem_mb),
+        ),
+        None => (blank(8 + sep.chars().count()), mem4(peak_mb.unwrap_or(0))),
     };
-    let oom = if oom { " OOM" } else { "    " };
-    format!("{cpu}{memory}{oom}")
+    let gpu = match live.and_then(|l| l.gpu_mb) {
+        Some(g) if gpu => format!("{sep}gpu {}", mem4(g)),
+        _ if gpu => blank(GPU_W),
+        _ => String::new(),
+    };
+    format!("{oom}{cpu}{memory}{gpu}")
 }
 
 /// The usage in full for the row's overlay header: `peak 2.1G of 3G, 45s
@@ -1059,9 +1087,15 @@ fn format_row(
     // Running and Done rows always have a cell, zero when nothing is going
     // or was measured; Next up rows say what they wait for in NOW instead.
     let peak = measured.and_then(|u| u.peak_mb);
+    let gpu = session_use::gpu::present();
     let usage = match row.stage {
-        Stage::Running => usage_cell(Some(f.and_then(|f| f.live).unwrap_or_default()), None, oom),
-        Stage::Done => usage_cell(None, peak, oom),
+        Stage::Running => usage_cell(
+            Some(f.and_then(|f| f.live).unwrap_or_default()),
+            None,
+            oom,
+            gpu,
+        ),
+        Stage::Done => usage_cell(None, peak, oom, gpu),
         Stage::Planned => String::new(),
     };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
@@ -1381,7 +1415,15 @@ pub fn show(
             // Measured outside the scroll area: inside it, the width shrinks
             // by the bar's lane only while the rows overflow, and the right
             // columns would jump as the pane is resized across that point.
-            let cols = table_cols(ui.available_width(), cell.x, bar_lane(ui));
+            let full = ui.available_rect_before_wrap();
+            let ppp = ui.ctx().pixels_per_point();
+            let cols = table_cols(full.width(), cell.x, ppp, bar_lane(ui));
+            // The table on the terminal's grid: INSET whole cells in, as
+            // Claude Code's status line is.
+            let grid = full.with_min_x(full.min.x + INSET as f32 * cell.x);
+            let outer = ui;
+            let mut inner = outer.new_child(egui::UiBuilder::new().max_rect(grid));
+            let ui = &mut inner;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -1407,6 +1449,7 @@ pub fn show(
                     view.rows_at = rects;
                     view.cell_w = cell.x.max(1.0);
                 });
+            outer.advance_cursor_after_rect(inner.min_rect());
         });
     (clicked, header_line)
 }
@@ -1415,9 +1458,11 @@ pub fn show(
 /// panel colour, so the pane reads as part of the terminal above it. egui's
 /// separator line (on by default) keeps the boundary between the two.
 fn pane_frame(bg: Color32) -> egui::Frame {
+    // No margin at the sides: the table is placed on the terminal's grid
+    // ([`INSET`]), and the scroll bar sits at the right edge.
     egui::Frame::NONE
         .fill(bg)
-        .inner_margin(egui::Margin::symmetric(8, 5))
+        .inner_margin(egui::Margin::symmetric(0, 5))
 }
 
 /// The pane's outer height for `rows` rows of `row_h`: the rows, egui's
@@ -1474,13 +1519,31 @@ fn bar_lane(ui: &Ui) -> f32 {
     bar.bar_inner_margin + bar.bar_width + bar.bar_outer_margin
 }
 
+/// How many cells in from the pane's left edge the table starts: as many
+/// as Claude Code leaves at the left of its status line, which it draws
+/// two columns into the terminal right above the pane.
+const INSET: usize = session_use::CLAUDE_MARGIN / 2;
+
 /// How many character columns the table lays out in, from the pane's width
-/// *outside* the scroll area. The bar's lane is always left free, so it
-/// never paints over TOKENS and the columns never move when it appears.
-fn table_cols(width: f32, cell_w: f32, bar_lane: f32) -> usize {
-    let cw = cell_w.max(1.0);
-    let usable = width - bar_lane - cw;
-    ((usable / cw).floor() as usize).max(40)
+/// *outside* the scroll area, which is the terminal's: the pane spans the
+/// terminal's area, and is drawn on its grid ([`INSET`] whole cells in).
+/// The table is as wide as the status line Claude Code draws over it
+/// (the terminal's columns less [`session_use::CLAUDE_MARGIN`]), so its
+/// last column, the use column, ends exactly under the status line's use
+/// part and the figures line up. The bar's lane is always left free, so it
+/// never paints over a cell and the columns never move when it appears; on
+/// the usual sizes it fits in the two cells right of the table anyway.
+fn table_cols(width: f32, cell_w: f32, ppp: f32, bar_lane: f32) -> usize {
+    let cw = cell_w.max(0.1);
+    // The terminal counts its columns in whole device pixels
+    // (`TermView::show`); counted the same way, the two never disagree.
+    let cell_px = (cw * ppp).round().max(1.0);
+    let terminal = (width * ppp / cell_px).floor() as usize;
+    let under_line = terminal.saturating_sub(session_use::CLAUDE_MARGIN);
+    let room = ((width - INSET as f32 * cw - bar_lane) / cw)
+        .floor()
+        .max(0.0) as usize;
+    under_line.min(room).max(40)
 }
 
 /// Where each column of a row starts or ends, in characters, for a table
@@ -1492,14 +1555,16 @@ struct Cols {
     idw: usize,
     taskw: usize,
     x_task: usize,
-    /// The use column, between TASK and ELAPSED: [`USAGE_W`] wide while any
-    /// row is Running or Done, not there at all while every row is Next up.
-    leasew: usize,
-    x_lease: usize,
     x_el_end: usize,
     x_eta_end: usize,
     x_now: usize,
     x_tok_end: usize,
+    /// The use column, the last: a [`usage_cell`] wide while any row is Running
+    /// or Done, not there at all while every row is Next up. It ends on
+    /// the table's last column, so it sits right under the status line's
+    /// use part ([`table_cols`]).
+    usew: usize,
+    x_use: usize,
 }
 
 impl Cols {
@@ -1520,20 +1585,25 @@ impl Cols {
         } else {
             0
         };
-        // Every Running and Done row has a USAGE_W-wide cell, a Next up row
-        // none: the column is one width whenever it is there.
-        let leasew = if on.usage && table.lines.iter().any(|l| !l.usage.is_empty()) {
-            USAGE_W
+        // Every Running and Done row has a cell, all of one width
+        // ([`usage_cell`]), a Next up row none.
+        let usew = if on.usage {
+            table
+                .lines
+                .iter()
+                .map(|l| l.usage.chars().count())
+                .max()
+                .unwrap_or(0)
         } else {
             0
         };
         // The fixed columns right of TASK, each with the gap before it.
         let fixed_right: usize = [
-            (leasew > 0, leasew),
             (on.elapsed, EL_W),
             (on.eta, ETA_W),
             (on.now, NOW_W),
             (on.tokens, TOK_W),
+            (usew > 0, usew),
         ]
         .iter()
         .filter(|(shown, _)| *shown)
@@ -1561,22 +1631,25 @@ impl Cols {
         };
         place(on.stage, STAGE_W);
         let x_task = place(taskw > 0, taskw);
-        let x_lease = place(leasew > 0, leasew);
         let x_el_end = place(on.elapsed, EL_W) + EL_W;
         let x_eta_end = place(on.eta, ETA_W) + ETA_W;
         let x_now = place(on.now, NOW_W);
         let x_tok_end = place(on.tokens, TOK_W) + TOK_W;
+        // The use column ends on the table's last column even when TASK
+        // does not stretch to fill (the title off), never closer than a
+        // gap to what is before it.
+        let x_use = place(usew > 0, usew).max(cols.saturating_sub(usew));
         Cols {
             on: *on,
             idw,
             taskw,
             x_task,
-            leasew,
-            x_lease,
             x_el_end,
             x_eta_end,
             x_now,
             x_tok_end,
+            usew,
+            x_use,
         }
     }
 
@@ -1629,7 +1702,7 @@ impl Cols {
                 right_at(self.x_tok_end, &line.tokens),
                 line.tokens.clone(),
             ),
-            cell(self.leasew > 0, self.x_lease, cut(&line.usage, self.leasew)),
+            cell(self.usew > 0, self.x_use, cut(&line.usage, self.usew)),
         ]
     }
 }
@@ -2636,10 +2709,18 @@ mod tests {
     }
 
     fn task_live(task: &str, cpu_pct: u32, mem_mb: u64) -> TaskLive {
+        task_live_gpu(task, cpu_pct, mem_mb, None)
+    }
+
+    fn task_live_gpu(task: &str, cpu_pct: u32, mem_mb: u64, gpu_mb: Option<u64>) -> TaskLive {
         TaskLive {
             session: "s".into(),
             task: task.into(),
-            live: RunLive { cpu_pct, mem_mb },
+            live: RunLive {
+                cpu_pct,
+                mem_mb,
+                gpu_mb,
+            },
         }
     }
 
@@ -2648,15 +2729,53 @@ mod tests {
         let now = RunLive {
             cpu_pct: 14,
             mem_mb: 4300,
+            gpu_mb: None,
         };
-        assert_eq!(usage_cell(Some(now), None, false), " 14% CPU 4.2G    ");
-        assert_eq!(usage_cell(None, Some(2150), false), "         2.1G    ");
-        assert_eq!(usage_cell(None, Some(128), true), "         0.1G OOM");
-        assert_eq!(usage_cell(None, Some(0), false), "         0.0G    ");
-        assert_eq!(usage_cell(None, None, false), "         0.0G    ");
         assert_eq!(
-            usage_cell(Some(RunLive::default()), None, false),
-            "  0% CPU 0.0G    "
+            usage_cell(Some(now), None, false, false),
+            "     14% CPU  ·  4.2G"
+        );
+        assert_eq!(
+            usage_cell(None, Some(2150), false, false),
+            "                 2.1G"
+        );
+        assert_eq!(
+            usage_cell(None, Some(128), true, false),
+            "OOM              0.1G"
+        );
+        assert_eq!(
+            usage_cell(None, Some(0), false, false),
+            "                 0.0G"
+        );
+        assert_eq!(
+            usage_cell(None, None, false, false),
+            "                 0.0G"
+        );
+        assert_eq!(
+            usage_cell(Some(RunLive::default()), None, true, false),
+            "OOM   0% CPU  ·  0.0G"
+        );
+        // A machine with a GPU: a place for it, filled on a Running row.
+        let on_gpu = RunLive {
+            gpu_mb: Some(1229),
+            ..now
+        };
+        assert_eq!(
+            usage_cell(Some(on_gpu), None, false, true),
+            "     14% CPU  ·  4.2G  ·  gpu 1.2G"
+        );
+        assert_eq!(
+            usage_cell(Some(now), None, false, true),
+            "     14% CPU  ·  4.2G             "
+        );
+        assert_eq!(
+            usage_cell(None, Some(2150), false, true),
+            "                 2.1G             "
+        );
+        // GPU figures only where the machine has one.
+        assert_eq!(
+            usage_cell(Some(on_gpu), None, false, false),
+            "     14% CPU  ·  4.2G"
         );
         let mut l = feed(LEASED).rows[0].lease.clone().unwrap();
         l.state = LeaseState::Queued;
@@ -2700,20 +2819,29 @@ mod tests {
             assert_eq!(mem4(m).chars().count(), 4, "{m}: {:?}", mem4(m));
             for oom in [false, true] {
                 for peak in [None, Some(0), Some(m)] {
-                    let cell = usage_cell(None, peak, oom);
-                    assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
+                    for gpu in [false, true] {
+                        let cell = usage_cell(None, peak, oom, gpu);
+                        assert_eq!(cell.chars().count(), usage_w(gpu), "{cell:?}");
+                    }
                     seen += 1;
                 }
                 for &cpu_pct in &cpus {
-                    let live = RunLive { cpu_pct, mem_mb: m };
-                    let cell = usage_cell(Some(live), None, oom);
-                    assert_eq!(cell.chars().count(), USAGE_W, "{cell:?}");
+                    for (gpu_mb, gpu) in [(None, false), (None, true), (Some(m), true)] {
+                        let live = RunLive {
+                            cpu_pct,
+                            mem_mb: m,
+                            gpu_mb,
+                        };
+                        let cell = usage_cell(Some(live), None, oom, gpu);
+                        assert_eq!(cell.chars().count(), usage_w(gpu), "{cell:?}");
+                    }
                     seen += 1;
                 }
             }
         }
         assert!(seen > 300);
-        assert_eq!(usage_cell(None, None, false).chars().count(), USAGE_W);
+        assert_eq!(usage_w(false), 21);
+        assert_eq!(usage_w(true), 34);
         assert_eq!(mem4(0), "0.0G");
         assert_eq!(mem4(1), "0.1G");
         assert_eq!(mem4(100), "0.1G");
@@ -2743,7 +2871,7 @@ mod tests {
             {"key":"demo#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
         // No run going: zero in the cell, the lease in the header only.
         let t = build(Some(&feed(json)), &[], T0 + 60_000);
-        assert_eq!(t.lines[0].usage, "  0% CPU 0.0G    ");
+        assert_eq!(t.lines[0].usage.trim_end(), "      0% CPU  ·  0.0G");
         assert!(!t.lines[0].oom);
         let facts = &t.lines[0].click.facts;
         assert!(facts.iter().any(|f| f == "holds 3 cpu, 3G"), "{facts:?}");
@@ -2752,11 +2880,11 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("peak 2.1G of 3G, 45s CPU"))
         );
-        assert_eq!(t.lines[1].usage, "  0% CPU 0.0G OOM");
+        assert_eq!(t.lines[1].usage.trim_end(), "OOM   0% CPU  ·  0.0G");
         assert!(t.lines[1].oom);
-        assert_eq!(t.lines[2].usage, "         0.5G    ");
+        assert_eq!(t.lines[2].usage.trim_end(), "                 0.5G");
         // Done with nothing measured: a zero peak, not a blank.
-        assert_eq!(t.lines[3].usage, "         0.0G    ");
+        assert_eq!(t.lines[3].usage.trim_end(), "                 0.0G");
         // A run going: its use now. Another session's run of the same key
         // is not this row's.
         let mut other = task_live("demo#13", 50, 100);
@@ -2771,12 +2899,28 @@ mod tests {
             ],
         );
         let t = build(Some(&f), &[], T0 + 60_000);
-        assert_eq!(t.lines[0].usage, " 14% CPU 4.2G    ");
-        assert_eq!(t.lines[1].usage, "  0% CPU 0.0G OOM");
+        // The GPU slot follows the machine; the rest is the same anywhere.
+        let gpu = session_use::gpu::present();
+        let live = |cpu_pct, mem_mb| {
+            Some(RunLive {
+                cpu_pct,
+                mem_mb,
+                gpu_mb: None,
+            })
+        };
         assert_eq!(
-            t.lines[2].usage, "         0.5G    ",
+            t.lines[0].usage,
+            usage_cell(live(14, 4300), None, false, gpu)
+        );
+        assert!(t.lines[0].usage.starts_with("     14% CPU  ·  4.2G"));
+        assert_eq!(t.lines[1].usage, usage_cell(live(0, 0), None, true, gpu));
+        assert!(t.lines[1].usage.starts_with("OOM   0% CPU  ·  0.0G"));
+        assert_eq!(
+            t.lines[2].usage,
+            usage_cell(None, Some(512), false, gpu),
             "a Done row keeps its peak"
         );
+        assert!(t.lines[2].usage.starts_with("                 0.5G"));
     }
 
     #[test]
@@ -2784,7 +2928,11 @@ mod tests {
     {
         let t = build(Some(&feed(LEASED)), &[], T0 + 60_000);
         let (run, next) = (&t.lines[0], &t.lines[1]);
-        assert_eq!(run.usage, "  0% CPU 0.0G    ", "the lease is not the cell");
+        assert_eq!(
+            run.usage.trim_end(),
+            "      0% CPU  ·  0.0G",
+            "the lease is not the cell"
+        );
         assert!(
             run.click
                 .facts
@@ -2796,13 +2944,13 @@ mod tests {
         assert_eq!(next.now, "queued for 3G behind demo#12");
         assert_eq!(next.usage, "", "said in NOW, not twice");
         // A Running row between commands: the column is there all the same.
-        assert_eq!(Cols::new(&t, 100).leasew, USAGE_W);
+        assert_eq!(Cols::new(&t, 100).usew, t.lines[0].usage.chars().count());
         // Every row Next up: no use column, the title keeps its width.
         let queued = Table {
             lines: vec![next.clone()],
             ..Default::default()
         };
-        assert_eq!(Cols::new(&queued, 100).leasew, 0);
+        assert_eq!(Cols::new(&queued, 100).usew, 0);
         let busy = build(
             Some(&with_live(
                 feed(LEASED),
@@ -2816,8 +2964,8 @@ mod tests {
         let drawn = compose(&cols.segments(&busy.lines[1]));
         assert!(drawn.ends_with("queued for 3G behind demo#12"), "{drawn}");
         let drawn = compose(&cols.segments(&busy.lines[0]));
-        assert!(drawn.contains("14% CPU 4.2G"), "{drawn}");
-        assert_eq!(cols.leasew, USAGE_W);
+        assert!(drawn.contains("14% CPU  ·  4.2G"), "{drawn}");
+        assert_eq!(cols.usew, busy.lines[0].usage.chars().count());
         assert!(cols.taskw < Cols::new(&queued, 100).taskw);
     }
 
@@ -2902,16 +3050,91 @@ mod tests {
     #[test]
     fn the_columns_leave_the_bar_its_lane_and_ignore_whether_it_shows() {
         let (width, cw, lane) = (800.0, 8.0, 10.0);
-        let cols = table_cols(width, cw, lane);
-        // TOKENS' last cell ends clear of the bar's lane.
-        assert!(cols as f32 * cw <= width - lane);
+        let cols = table_cols(width, cw, 1.0, lane);
+        // The last cell ends clear of the bar's lane.
+        assert!((INSET + cols) as f32 * cw <= width - lane);
         // The width the scroll area hands its content drops by the lane
         // while the bar shows; the table is laid out from the width outside
         // it, so that drop changes nothing; laid out from the inner width,
         // it would have lost a column.
-        assert_ne!(cols, table_cols(width - lane, cw, lane));
+        assert_ne!(cols, table_cols(width - lane, cw, 1.0, lane));
+        // A lane wider than the two cells right of the table: the table
+        // gives way rather than run under the bar.
+        let wide = table_cols(width, cw, 1.0, 30.0);
+        assert!((INSET + wide) as f32 * cw <= width - 30.0, "{wide}");
         // A cramped pane still gets a readable table.
-        assert_eq!(table_cols(100.0, cw, lane), 40);
+        assert_eq!(table_cols(100.0, cw, 1.0, lane), 40);
+    }
+
+    /// The table is as wide as Claude Code's status line: the terminal's
+    /// columns less two at each side, counted as the terminal counts them,
+    /// in whole device pixels, at any zoom.
+    #[test]
+    fn the_table_spans_the_status_line() {
+        // 100 columns of 8pt.
+        assert_eq!(table_cols(800.0, 8.0, 1.0, 10.0), 96);
+        assert_eq!(table_cols(807.9, 8.0, 1.0, 10.0), 96);
+        assert_eq!(table_cols(808.0, 8.0, 1.0, 10.0), 97);
+        // 11px cells at 125%: 8.8pt; 803.3pt is 1004.1px, 91 columns.
+        assert_eq!(table_cols(803.3, 8.8, 1.25, 10.0), 87);
+        // At 150%, a cell of 9px is 6pt: 1200pt is 1800px, 200 columns.
+        assert_eq!(table_cols(1200.0, 6.0, 1.5, 10.0), 196);
+    }
+
+    /// The use column is the last, and on screen its figures sit in the
+    /// very columns of the status line's use part drawn right above it:
+    /// both start [`INSET`] cells into the terminal, both are as wide, and
+    /// both are built from the same fixed-width pieces.
+    #[test]
+    fn the_use_column_lines_up_under_the_status_line() {
+        let gpu_live = |gpu_mb| task_live_gpu("demo#12", 14, 4300, gpu_mb);
+        for (columns, gpu) in [(120usize, None), (137, None), (160, Some(1229))] {
+            let su = session_use::SessionUse {
+                cpu_pct: 14,
+                mem_mb: 4300,
+                gpu_mb: gpu,
+            };
+            let right = session_use::segments(&su).join(session_use::SEP);
+            let width = session_use::line_width(Some(&columns.to_string()));
+            let status = session_use::align("Opus 5.5  ·  session: 1.2k", &right, width);
+            let status = format!("{}{status}", " ".repeat(INSET));
+
+            let width_pt = columns as f32 * 8.0 + 3.0;
+            let cols = table_cols(width_pt, 8.0, 1.0, 10.0);
+            let mut f = with_live(feed(LEASED), &["s"], &[gpu_live(gpu)]);
+            // The machine's GPU stands in for `gpu::present`.
+            let t = build(Some(&f), &[], T0 + 60_000);
+            let mut line = t.lines[0].clone();
+            let live = f.rows[0].live.take();
+            line.usage = usage_cell(live, None, false, gpu.is_some());
+            let table = Table {
+                lines: vec![line.clone()],
+                ..Default::default()
+            };
+            let layout = Cols::new(&table, cols);
+            let segs = layout.segments(&line);
+            // The use cell is the last one drawn, ending on the last column.
+            let (at, cell) = segs
+                .iter()
+                .max_by_key(|(at, s)| at + s.chars().count())
+                .unwrap();
+            assert_eq!(cell, &line.usage);
+            assert_eq!(at + cell.chars().count(), cols);
+            let row = format!("{}{}", " ".repeat(INSET), compose(&segs));
+            // Character for character under the status line's part.
+            assert_eq!(
+                status.chars().count(),
+                row.chars().count(),
+                "{status:?}\n{row:?}"
+            );
+            let tail = right.chars().count();
+            let above: String = status.chars().skip(status.chars().count() - tail).collect();
+            let below: String = row.chars().skip(row.chars().count() - tail).collect();
+            assert_eq!(above, below, "{columns} columns");
+            // And it ends where the status line does: two columns in from
+            // the terminal's right edge.
+            assert_eq!(row.chars().count(), columns - INSET);
+        }
     }
 
     /// The pane's shape in a headless egui (Chrome's scroll style, a bottom
@@ -2966,8 +3189,8 @@ mod tests {
         // The fix: the table is laid out from the width outside it.
         assert_eq!(outer_fit, outer_over);
         assert_eq!(
-            table_cols(outer_fit, cw, lane),
-            table_cols(outer_over, cw, lane)
+            table_cols(outer_fit, cw, 1.0, lane),
+            table_cols(outer_over, cw, 1.0, lane)
         );
     }
 
