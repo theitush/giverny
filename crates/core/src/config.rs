@@ -394,13 +394,23 @@ pub fn load(base: &Path) -> Config {
 /// Like [`load`], but a file that cannot be parsed yields `previous` instead
 /// of defaults, so a hot-reload never resets running settings.
 pub fn load_or(base: &Path, previous: &Config) -> Config {
+    load_checked(base).unwrap_or_else(|err| {
+        tracing::error!("config.toml ignored ({err}); keeping previous settings");
+        previous.clone()
+    })
+}
+
+/// Like [`load`], but says when the file exists and cannot be parsed, rather
+/// than quietly standing defaults in for it. Defaults in that case are not
+/// what the user configured, so a caller that would write them somewhere
+/// else (an account's `settings.json`, say) must not treat them as if they
+/// were. A missing file is not an error: it is the first run, and gets the
+/// template and defaults as [`load`] does.
+pub fn load_checked(base: &Path) -> Result<Config, String> {
     let path = config_path(base);
     match read(&path) {
-        Some(Ok(cfg)) => cfg,
-        Some(Err(err)) => {
-            tracing::error!("config.toml ignored ({err}); keeping previous settings");
-            previous.clone()
-        }
+        Some(Ok(cfg)) => Ok(cfg),
+        Some(Err(err)) => Err(err),
         None => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -408,7 +418,7 @@ pub fn load_or(base: &Path, previous: &Config) -> Config {
             // Generated from the settings table, so the file can never
             // document an option the app does not have.
             let _ = std::fs::write(&path, crate::settings::template());
-            Config::default()
+            Ok(Config::default())
         }
     }
 }
@@ -471,6 +481,33 @@ mod tests {
         assert!(cfg.update.check);
         assert_eq!(cfg.usage.refresh_minutes, 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that cannot be parsed is reported, not passed off as defaults,
+    /// and is left exactly as the user wrote it.
+    #[test]
+    fn unparseable_config_is_an_error_not_defaults() {
+        let dir = scratch("broken");
+        let broken = "[font]\nsize = \"large\"\n";
+        std::fs::write(config_path(&dir), broken).unwrap();
+        assert!(load_checked(&dir).is_err());
+        // `load_or` still keeps what was running, and neither one rewrites
+        // the file.
+        let previous = Config {
+            font: FontConfig {
+                size: 21.0,
+                ..FontConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(load_or(&dir, &previous).font.size, 21.0);
+        assert_eq!(std::fs::read_to_string(config_path(&dir)).unwrap(), broken);
+
+        // A missing file is a first run, not an error.
+        let fresh = scratch("broken-fresh");
+        assert!(load_checked(&fresh).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     #[test]

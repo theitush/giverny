@@ -376,9 +376,14 @@ fn reset_time(window: &serde_json::Value) -> Option<jiff::Timestamp> {
 }
 
 impl ClaudeWatch {
+    /// `config_read` is false when Giverny's config file could not be parsed:
+    /// then the startup pass that brings accounts' hook paths and statusline
+    /// up to date is skipped, since the settings it would follow are
+    /// defaults standing in for the unreadable file.
     pub fn new(
         spool: &Path,
         extra_dirs: &[PathBuf],
+        config_read: bool,
         wake: impl Fn() + Send + 'static,
     ) -> (Self, Vec<RelayMsg>) {
         let profiles = profiles::discover(extra_dirs);
@@ -401,7 +406,7 @@ impl ClaudeWatch {
         if leave_accounts {
             tracing::info!("{LEFT_ALONE}");
         }
-        Self::adopt_statusline_where_hooked(&profiles, leave_accounts);
+        Self::adopt_statusline_where_hooked(&profiles, leave_accounts || !config_read);
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
@@ -1364,7 +1369,7 @@ impl ClaudeWatch {
 
     /// Test seam: a watcher with no listener and no profiles.
     #[cfg(test)]
-    fn for_tests() -> Self {
+    pub(crate) fn for_tests() -> Self {
         ClaudeWatch {
             profiles: Vec::new(),
             tabs: HashMap::new(),
