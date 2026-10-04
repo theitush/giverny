@@ -584,6 +584,7 @@ fn limit_widget(
             if *value != def.default_value() {
                 changed_mark(ui, state, def, actions, c);
             }
+            dim(ui, limit_share(limits, m, field), c);
             typed
         })
         .inner;
@@ -617,6 +618,30 @@ fn limit_figure(limits: &Limits, m: &Machine, field: LimitField) -> String {
     match field {
         LimitField::Cores => r.cpu_cores.to_string(),
         _ => r.ram.to_string(),
+    }
+}
+
+/// `part` as a whole percent of `whole` (0 when `whole` is).
+fn share_pct(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    (part as f64 * 100.0 / whole as f64).round() as u64
+}
+
+/// What sits after a cores or RAM field: this machine's total and the
+/// share the figure in force is of it — `of 16 cores · 88 %`,
+/// `of 31.3G · 70 %` (giverny#190).
+fn limit_share(limits: &Limits, m: &Machine, field: LimitField) -> String {
+    let r = limits.resolve(m);
+    match field {
+        LimitField::Cores => format!(
+            "of {} core{} · {} %",
+            m.cores,
+            if m.cores == 1 { "" } else { "s" },
+            share_pct(r.cpu_cores.into(), m.cores.into())
+        ),
+        _ => format!("of {} · {} %", m.ram, share_pct(r.ram.0, m.ram.0)),
     }
 }
 
@@ -664,6 +689,10 @@ fn gpu_rows(
             // One list in the file: one ● ↺, on the first GPU's line.
             if first && !matches!(limits.gpus, Auto::Auto) {
                 changed_mark(ui, state, def, actions, c);
+            }
+            // The row already names the GPU's VRAM; say the share of it.
+            if let Some(l) = set {
+                dim(ui, format!("{} %", share_pct(l.vram.0, g.vram.0)), c);
             }
             if let Some(typed) = typed {
                 let t = typed.trim().to_ascii_lowercase();
@@ -976,6 +1005,34 @@ mod tests {
         l.ram = Auto::Set(Mem::gb(8));
         assert_eq!(limit_figure(&l, &m, LimitField::Cores), "4");
         assert_eq!(limit_figure(&l, &m, LimitField::Ram), "8G");
+    }
+
+    #[test]
+    fn a_limit_says_the_machine_total_and_its_share() {
+        // giverny#190: after the field, the whole and the share of it.
+        let m = Machine {
+            cores: 16,
+            ram: Mem::parse("31.3G").unwrap(),
+            gpus: vec![],
+        };
+        let mut l = Limits::default();
+        assert_eq!(limit_share(&l, &m, LimitField::Cores), "of 16 cores · 88 %");
+        assert_eq!(limit_share(&l, &m, LimitField::Ram), "of 31.3G · 70 %");
+        l.cpu_cores = Auto::Set(4);
+        l.ram = Auto::Set(Mem::gb(8));
+        assert_eq!(limit_share(&l, &m, LimitField::Cores), "of 16 cores · 25 %");
+        assert_eq!(limit_share(&l, &m, LimitField::Ram), "of 31.3G · 26 %");
+        let one = Machine {
+            cores: 1,
+            ram: Mem::gb(4),
+            gpus: vec![],
+        };
+        assert_eq!(
+            limit_share(&Limits::default(), &one, LimitField::Cores),
+            "of 1 core · 100 %"
+        );
+        assert_eq!(share_pct(18, 20), 90);
+        assert_eq!(share_pct(1, 0), 0);
     }
 
     #[test]
