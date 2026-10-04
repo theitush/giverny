@@ -30,6 +30,12 @@
 //!   so every subagent gets an ETA. It returns at once for any call that is
 //!   not a subagent's.
 //!
+//! The skill is its own switch (`agents_panel.orchestrate_skill`, on by
+//! default): off, the plugin is written without `skills/`, so the hook,
+//! `giverny-pass` and `/giverny:clear-done` the pane needs stay, and only
+//! the skill goes — from every account at once, since they all load this
+//! one directory.
+//!
 //! The settings keys follow the house rules the other agents-pane key does:
 //! written only with `claude.agents_pane` on, never over a
 //! marketplace called `giverny` that is not ours, removed when the setting
@@ -100,7 +106,8 @@ fn session_hooks() -> Value {
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
+/// `skill` false leaves the orchestrate skill out.
+pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
         "owner": { "name": "Giverny" },
@@ -120,7 +127,7 @@ pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
         "author": { "name": "Giverny" }
     });
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
-    vec![
+    let mut out = vec![
         (
             ".claude-plugin/marketplace.json",
             pretty(&marketplace),
@@ -129,11 +136,6 @@ pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
         (
             "plugins/giverny/.claude-plugin/plugin.json",
             pretty(&plugin),
-            false,
-        ),
-        (
-            "plugins/giverny/skills/orchestrate/SKILL.md",
-            SKILL.to_string(),
             false,
         ),
         (
@@ -147,8 +149,15 @@ pub fn files(exes: &[String]) -> Vec<(&'static str, String, bool)> {
             pretty(&session_hooks()),
             false,
         ),
-    ]
+    ];
+    if skill {
+        out.push((SKILL_PATH, SKILL.to_string(), false));
+    }
+    out
 }
+
+/// Where the orchestrate skill sits in the marketplace.
+pub const SKILL_PATH: &str = "plugins/giverny/skills/orchestrate/SKILL.md";
 
 /// The binary as the wrapper should name it: this one, and on Windows also
 /// its path from inside WSL (a WSL account's Claude runs it through interop).
@@ -168,9 +177,10 @@ pub fn exe_candidates() -> Vec<String> {
 
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
-/// whether anything changed.
-pub fn sync(dir: &Path, exes: &[String]) -> std::io::Result<bool> {
-    let want = files(exes);
+/// whether anything changed. `skill` false writes the plugin without its
+/// orchestrate skill (and so prunes one written before).
+pub fn sync(dir: &Path, exes: &[String], skill: bool) -> std::io::Result<bool> {
+    let want = files(exes, skill);
     let mut changed = false;
     for (rel, body, exec) in &want {
         let path = dir.join(rel);
@@ -430,8 +440,8 @@ mod tests {
     fn sync_writes_once_and_prunes_what_is_not_ours() {
         let d = scratch("sync").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes).unwrap());
-        assert!(!sync(&d, &exes).unwrap(), "a second sync is a no-op");
+        assert!(sync(&d, &exes, true).unwrap());
+        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/.claude-plugin/plugin.json")).unwrap(),
         )
@@ -451,7 +461,7 @@ mod tests {
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
         std::fs::create_dir_all(d.join("plugins/giverny/skills/old")).unwrap();
         std::fs::write(d.join("plugins/giverny/skills/old/SKILL.md"), "x").unwrap();
-        assert!(sync(&d, &["/elsewhere/giverny".into()]).unwrap());
+        assert!(sync(&d, &["/elsewhere/giverny".into()], true).unwrap());
         assert!(!d.join("plugins/giverny/skills/old").exists());
         assert!(remove_dir(&d).unwrap());
         assert!(!d.exists());
@@ -463,6 +473,33 @@ mod tests {
     }
 
     #[test]
+    fn the_skill_switch_takes_only_the_skill() {
+        let d = scratch("skill").join(DIR_NAME);
+        let exes = vec!["/opt/giverny/giverny".to_string()];
+        assert!(sync(&d, &exes, true).unwrap());
+        assert!(d.join(SKILL_PATH).exists());
+        // Off: the skill goes, and its emptied directories with it; the
+        // hook, the wrapper and the command stay.
+        assert!(sync(&d, &exes, false).unwrap());
+        assert!(!d.join(SKILL_PATH).exists());
+        assert!(!d.join("plugins/giverny/skills").exists());
+        for kept in [
+            "plugins/giverny/hooks/hooks.json",
+            "plugins/giverny/bin/giverny-pass",
+            "plugins/giverny/commands/clear-done.md",
+            "plugins/giverny/.claude-plugin/plugin.json",
+            ".claude-plugin/marketplace.json",
+        ] {
+            assert!(d.join(kept).exists(), "{kept} stays");
+        }
+        assert!(!sync(&d, &exes, false).unwrap(), "a second sync is a no-op");
+        // On again: back, byte for byte.
+        assert!(sync(&d, &exes, true).unwrap());
+        assert_eq!(std::fs::read_to_string(d.join(SKILL_PATH)).unwrap(), SKILL);
+        assert!(remove_dir(&d).unwrap());
+    }
+
+    #[test]
     fn a_sync_prunes_the_dropped_orchestrate_hook() {
         // A plugin written while orchestrate by default was on
         // still holds its SessionStart reply; the next sync removes it, and
@@ -471,19 +508,19 @@ mod tests {
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
         let reply = d.join("plugins/giverny/hooks/orchestrate-by-default.json");
-        assert!(sync(&d, &exes).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         std::fs::write(&reply, "{}").unwrap();
         std::fs::write(
             &hooks,
             r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[]}]}}"#,
         )
         .unwrap();
-        assert!(sync(&d, &exes).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         assert!(!reply.exists(), "the old reply is pruned");
         let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
         assert!(h["hooks"].get("SessionStart").is_none(), "{h}");
         assert!(h["hooks"].get("PostToolUse").is_some(), "{h}");
-        assert!(!sync(&d, &exes).unwrap(), "a second sync is a no-op");
+        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -491,7 +528,7 @@ mod tests {
     fn the_re_estimate_hook_is_always_there_and_quiet() {
         let d = scratch("nudge").join(DIR_NAME);
         // A wrapper naming no binary at all: the hook still exits 0, silent.
-        assert!(sync(&d, &["/nonexistent/giverny".into()]).unwrap());
+        assert!(sync(&d, &["/nonexistent/giverny".into()], true).unwrap());
         let h: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
         )

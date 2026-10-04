@@ -10,7 +10,9 @@
 //! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease is advisory.
 //!
 //! **The lease.** The task's lease in the ledger ([`resources`]). With none,
-//! `run` claims one itself — 3 cores and 3G unless `--cpu`/`--ram` say —
+//! `run` claims one itself — the default lease (`[agents_panel.lease]`,
+//! Settings → Agents panel; 3 cores and 3G unless changed there) unless
+//! `--cpu`/`--ram` say —
 //! waits while that is queued (the row waiting, as `eta --why wait`), and
 //! releases it when the command ends. Refused (larger than the limits): the
 //! command does not run, exit 5.
@@ -46,9 +48,6 @@ use serde_json::{Map, Value, json};
 use crate::pass::{self, Flags};
 use crate::{pass_history, resources, run_live};
 
-/// What `run` claims for a task that holds no lease.
-pub const DEFAULT_CPU: u32 = 3;
-pub const DEFAULT_RAM_MB: u64 = 3 * 1024;
 /// How often a running command's session leases are beaten (the TTL is 20m).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often a queued claim is asked again.
@@ -390,9 +389,13 @@ fn lease_for(
     if let Some(l) = resources::with_ledger(ledger, now, |l| l.lease(session, task).cloned())? {
         return Ok(Some((l, false)));
     }
+    let default = match cap {
+        Some(c) => c.default_lease,
+        None => giverny_core::config::DefaultLease::load(),
+    };
     let req = resources::Request {
-        cpu: flags.cpu.unwrap_or(DEFAULT_CPU),
-        ram_mb: flags.ram_mb.unwrap_or(DEFAULT_RAM_MB),
+        cpu: flags.cpu.unwrap_or(default.cpu_cores),
+        ram_mb: flags.ram_mb.unwrap_or(default.ram.0),
         ..flags.request()
     };
     let repo = flags.repo.clone().or_else(|| {
@@ -897,6 +900,7 @@ mod tests {
                 mem_available: Some(Mem::gb(20)),
                 load1: Some(0.0),
             },
+            default_lease: Default::default(),
         }
     }
 
@@ -1084,6 +1088,33 @@ mod tests {
         );
         assert_eq!(code, resources::exit::REFUSED);
         assert!(!never.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_lease_run_claims_the_configured_default() {
+        let dir = scratch("default-lease");
+        cmd(&dir, "start t --eta 30");
+        let mut cap = machine();
+        cap.default_lease = giverny_core::config::DefaultLease {
+            cpu_cores: 2,
+            ram: Mem::gb(1),
+        };
+        let seen = dir.join("seen");
+        let script = format!(
+            "test \"$CARGO_BUILD_JOBS\" = {} && touch {}",
+            jobs(2),
+            seen.display()
+        );
+        let a: Vec<String> = ["run", "t", "--", "sh", "-c", &script]
+            .map(String::from)
+            .to_vec();
+        let (_, f) = parse_args(&a).unwrap();
+        let ledger = resources::ledger_path(&dir);
+        let (said, code) =
+            run_with(&dir, &ledger, "s1", "t", &f, Some(&cap), plain(60_000)).unwrap();
+        assert_eq!(code, 0, "{said}");
+        assert!(seen.exists(), "the default lease's cores are the cap");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

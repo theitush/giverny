@@ -617,6 +617,7 @@ mod tests {
                 mem_available: Some(Mem::gb(20)),
                 load1: Some(0.0),
             },
+            default_lease: Default::default(),
         }
     }
 

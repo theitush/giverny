@@ -17,6 +17,136 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub update: UpdateConfig,
     pub orchestrator: OrchestratorConfig,
+    pub agents_panel: AgentsPanelConfig,
+}
+
+/// `[agents_panel]`: the rest of Settings → Agents panel. The pane's own
+/// switch stays `claude.agents_pane` and the machine's budget
+/// `[orchestrator.limits]`, where they always were. Every default is the
+/// behaviour from before these keys existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsPanelConfig {
+    /// Ship the `/giverny:orchestrate` skill in the plugin the pane
+    /// installs. Off, the plugin keeps its hook and `giverny-pass`; only
+    /// the skill goes.
+    pub orchestrate_skill: bool,
+    /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
+    /// newest [`Self::done_last`]).
+    pub done_rows: String,
+    /// How many Done rows `done_rows = "last"` keeps.
+    pub done_last: u32,
+    /// One switch per pane column.
+    pub columns: PaneColumns,
+    /// What a task gets when nothing says otherwise.
+    pub lease: DefaultLease,
+}
+
+impl Default for AgentsPanelConfig {
+    fn default() -> Self {
+        AgentsPanelConfig {
+            orchestrate_skill: true,
+            done_rows: "all".into(),
+            done_last: 5,
+            columns: PaneColumns::default(),
+            lease: DefaultLease::default(),
+        }
+    }
+}
+
+/// Which Done rows the agents pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneRows {
+    All,
+    Hide,
+    /// The newest this many.
+    Last(usize),
+}
+
+impl AgentsPanelConfig {
+    /// `done_rows` and `done_last` as one value; an unknown word shows all.
+    pub fn done(&self) -> DoneRows {
+        match self.done_rows.trim().to_ascii_lowercase().as_str() {
+            "hide" | "none" => DoneRows::Hide,
+            "last" => DoneRows::Last(self.done_last as usize),
+            _ => DoneRows::All,
+        }
+    }
+}
+
+/// `[agents_panel.columns]`: the pane's columns, every one on by default.
+/// A column switched off takes no width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneColumns {
+    pub stage: bool,
+    pub id: bool,
+    pub title: bool,
+    pub usage: bool,
+    pub elapsed: bool,
+    pub eta: bool,
+    pub now: bool,
+    pub tokens: bool,
+}
+
+impl Default for PaneColumns {
+    fn default() -> Self {
+        PaneColumns {
+            stage: true,
+            id: true,
+            title: true,
+            usage: true,
+            elapsed: true,
+            eta: true,
+            now: true,
+            tokens: true,
+        }
+    }
+}
+
+/// `[agents_panel.lease]`: the CPU cores and RAM a task's lease holds when
+/// nothing says otherwise — what `giverny pass run` claims for a task that
+/// holds none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefaultLease {
+    pub cpu_cores: u32,
+    pub ram: crate::limits::Mem,
+}
+
+impl Default for DefaultLease {
+    fn default() -> Self {
+        DefaultLease {
+            cpu_cores: 3,
+            ram: crate::limits::Mem::gb(3),
+        }
+    }
+}
+
+impl DefaultLease {
+    /// `[agents_panel.lease]` from a `config.toml`'s text; the defaults when
+    /// the table is absent or does not read (a lease is never refused over
+    /// a typo elsewhere, nor over one here: the default stands in).
+    pub fn from_config_str(text: &str) -> DefaultLease {
+        let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+            return DefaultLease::default();
+        };
+        doc.get("agents_panel")
+            .and_then(|a| a.get("lease"))
+            .and_then(|l| l.clone().try_into::<DefaultLease>().ok())
+            .map(|l| DefaultLease {
+                cpu_cores: l.cpu_cores.max(1),
+                ram: l.ram,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The default lease in Giverny's own `config.toml`.
+    pub fn load() -> DefaultLease {
+        std::fs::read_to_string(crate::limits::default_config_path())
+            .map(|t| DefaultLease::from_config_str(&t))
+            .unwrap_or_default()
+    }
 }
 
 /// `[orchestrator]`: what orchestrator passes (`/giverny:orchestrate`) on
@@ -747,6 +877,33 @@ mod tests {
             ONE_BAD_VALUE
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_lease_reads_its_table_and_stands_in_for_a_bad_one() {
+        use crate::limits::Mem;
+        let d = DefaultLease::default();
+        assert_eq!((d.cpu_cores, d.ram), (3, Mem::gb(3)), "today's 3 cpu, 3G");
+        assert_eq!(DefaultLease::from_config_str(""), d);
+        assert_eq!(DefaultLease::from_config_str("[font]\nsize = 1\n"), d);
+        let set = "[agents_panel.lease]\ncpu_cores = 2\nram = \"1.5G\"\n";
+        assert_eq!(
+            DefaultLease::from_config_str(set),
+            DefaultLease {
+                cpu_cores: 2,
+                ram: Mem(1536)
+            }
+        );
+        // A bare number is GiB, as everywhere; one key alone keeps the other.
+        let one = DefaultLease::from_config_str("[agents_panel.lease]\nram = 4\n");
+        assert_eq!((one.cpu_cores, one.ram), (3, Mem::gb(4)));
+        // Unreadable: the default, never a refused run.
+        let bad = "[agents_panel.lease]\ncpu_cores = \"lots\"\n";
+        assert_eq!(DefaultLease::from_config_str(bad), d);
+        assert_eq!(
+            DefaultLease::from_config_str("[agents_panel.lease]\ncpu_cores = 0\n").cpu_cores,
+            1
+        );
     }
 
     #[test]

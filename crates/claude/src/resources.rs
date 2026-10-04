@@ -200,6 +200,8 @@ pub struct Capacity {
     /// Which limits were `auto` (for `resources` to say so).
     pub configured: Limits,
     pub load: Load,
+    /// `[agents_panel.lease]`: what a task gets when nothing says otherwise.
+    pub default_lease: giverny_core::config::DefaultLease,
 }
 
 impl Capacity {
@@ -213,6 +215,7 @@ impl Capacity {
             configured,
             load: Load::sample(),
             machine,
+            default_lease: giverny_core::config::DefaultLease::load(),
         })
     }
 }
@@ -1081,6 +1084,10 @@ pub fn report(
         auto(cap.configured.gpus.get().is_none()),
     ));
     out.push_str(&format!(
+        "default   {} cores, {} RAM a task (Settings → Agents panel)\n",
+        cap.default_lease.cpu_cores, cap.default_lease.ram
+    ));
+    out.push_str(&format!(
         "others    load {:.1} beyond the leases; {} available{} (headroom {})\n",
         free.foreign_cpu,
         cap.load
@@ -1174,6 +1181,7 @@ mod tests {
                 load1: Some(0.0),
             },
             machine,
+            default_lease: Default::default(),
         }
     }
 

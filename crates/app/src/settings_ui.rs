@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText};
-use giverny_core::limits::{self, Auto, GpuLimit, Limits, Machine};
+use giverny_core::limits::{self, Auto, GpuLimit, Limits, Machine, Mem};
 use giverny_core::settings::{self, Kind, LimitField, Section, SettingDef, Value};
 
 use crate::{Action, App};
@@ -264,30 +264,12 @@ fn body(
         ui.add_space(8.0);
     }
 
-    // Orchestrator: the limits under their heading, then the rest (the
-    // agents pane, whose key sits earlier in the table).
-    let orchestrator = state.search.is_empty() && state.section == Section::Orchestrator;
-    let mut rows = rows.to_vec();
-    if orchestrator {
-        rows.sort_by_key(|d| !matches!(d.kind, Kind::Limit { .. }));
-        limits_intro(ui, c);
+    if state.search.is_empty() && state.section == Section::AgentsPanel {
+        return agents_panel_page(ui, state, cfg, machine, rows, suggestions, actions, c);
     }
-    let mut after_limits = false;
 
     for def in rows {
-        if orchestrator && !after_limits && !matches!(def.kind, Kind::Limit { .. }) {
-            after_limits = true;
-            ui.add_space(8.0);
-        }
-        // No GPU, no GPU row — unless one is set, which then needs a reset.
-        if matches!(
-            def.kind,
-            Kind::Limit {
-                field: LimitField::Gpus
-            }
-        ) && settings::is_default(cfg, def)
-            && machine.is_none_or(|m| m.gpus.is_empty())
-        {
+        if skip_gpus(cfg, machine, def) {
             continue;
         }
         row(ui, state, cfg, machine, def, suggestions, actions, c);
@@ -295,11 +277,153 @@ fn body(
     }
 }
 
-/// The head of Settings → Orchestrator: the heading, and nothing more —
-/// the fields show their own figures.
-fn limits_intro(ui: &mut egui::Ui, c: Chrome) {
+/// No GPU, no GPU row — unless one is set, which then needs a reset.
+fn skip_gpus(
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    def: &SettingDef,
+) -> bool {
+    matches!(
+        def.kind,
+        Kind::Limit {
+            field: LimitField::Gpus
+        }
+    ) && settings::is_default(cfg, def)
+        && machine.is_none_or(|m| m.gpus.is_empty())
+}
+
+/// The table under the `columns` row: `agents_panel.columns.*`.
+const COLUMNS: &str = "agents_panel.columns.";
+
+/// Settings → Agents panel, in the order a person reads it: the pane and
+/// the skill, the columns as one row of switches, the Done rows, then the
+/// default lease and the limits under their headings.
+#[allow(clippy::too_many_arguments)]
+fn agents_panel_page(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    machine: Option<&Machine>,
+    rows: &[&'static SettingDef],
+    suggestions: &[String],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let draw = |ui: &mut egui::Ui,
+                state: &mut SettingsState,
+                actions: &mut Vec<Action>,
+                keep: &dyn Fn(&SettingDef) -> bool| {
+        for def in rows.iter().copied().filter(|d| keep(d)) {
+            if skip_gpus(cfg, machine, def) {
+                continue;
+            }
+            row(ui, state, cfg, machine, def, suggestions, actions, c);
+            ui.add_space(10.0);
+        }
+    };
+    draw(ui, state, actions, &|d| {
+        matches!(
+            d.key,
+            "claude.agents_pane" | "agents_panel.orchestrate_skill"
+        )
+    });
+    let columns: Vec<&'static SettingDef> = rows
+        .iter()
+        .copied()
+        .filter(|d| d.key.starts_with(COLUMNS))
+        .collect();
+    columns_row(ui, state, cfg, &columns, actions, c);
+    ui.add_space(10.0);
+    // `keep the last` only means something with `done rows = last`.
+    let last = cfg
+        .agents_panel
+        .done_rows
+        .trim()
+        .eq_ignore_ascii_case("last");
+    draw(ui, state, actions, &|d| {
+        d.key == "agents_panel.done_rows" || (last && d.key == "agents_panel.done_last")
+    });
+    ui.add_space(8.0);
+    heading(ui, "default lease", c);
+    draw(ui, state, actions, &|d| {
+        matches!(d.kind, Kind::Lease { .. })
+    });
+    ui.add_space(8.0);
+    heading(ui, "limits", c);
+    draw(ui, state, actions, &|d| {
+        matches!(d.kind, Kind::Limit { .. })
+    });
+}
+
+/// One row for every column of the pane: a switch each, lit while the
+/// column shows, and one ● ↺ putting every column back.
+fn columns_row(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cfg: &giverny_core::config::Config,
+    columns: &[&'static SettingDef],
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let modified: Vec<&'static SettingDef> = columns
+        .iter()
+        .copied()
+        .filter(|d| !settings::is_default(cfg, d))
+        .collect();
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(230.0);
+            ui.label(RichText::new("columns").font(FontId::monospace(12.5)));
+            ui.label(
+                RichText::new(COLUMNS.trim_end_matches('.'))
+                    .font(FontId::monospace(10.0))
+                    .color(c.dim),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            for def in columns {
+                let on = settings::current(cfg, def)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if ui
+                    .selectable_label(
+                        on,
+                        RichText::new(def.label)
+                            .font(FontId::monospace(12.0))
+                            .color(if on { c.accent } else { c.dim }),
+                    )
+                    .on_hover_text(format!("{}\n{}", def.doc, def.key))
+                    .clicked()
+                {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Bool(!on)));
+                }
+            }
+            if !modified.is_empty() {
+                ui.label(
+                    RichText::new("●")
+                        .font(FontId::monospace(9.0))
+                        .color(c.amber),
+                )
+                .on_hover_text("changed from the default");
+                if ui
+                    .small_button(RichText::new("↺").font(FontId::monospace(10.0)))
+                    .on_hover_text("every column back on")
+                    .clicked()
+                {
+                    for def in &modified {
+                        actions.push(Action::SetSetting(def.key.into(), def.default_value()));
+                    }
+                    state.editing = None;
+                }
+            }
+        });
+    });
+}
+
+/// A heading on the Agents panel page — the fields show their own figures.
+fn heading(ui: &mut egui::Ui, text: &str, c: Chrome) {
     ui.label(
-        RichText::new("limits")
+        RichText::new(text)
             .font(FontId::monospace(12.5))
             .color(c.accent),
     );
@@ -340,11 +464,14 @@ fn row(
             if let Kind::Limit { field } = def.kind {
                 return limit_widget(ui, state, cfg, machine, def, field, &value, actions, c);
             }
+            if let Kind::Lease { field, .. } = def.kind {
+                return lease_widget(ui, state, machine, def, field, &value, actions, c);
+            }
             widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
-                // The Orchestrator page is bare figures and switches; the
-                // doc stays on the def for search.
-                if def.section != Section::Orchestrator {
+                // The Agents panel page is bare figures and switches; the
+                // doc stays on the def for search (and on hover).
+                if def.section != Section::AgentsPanel {
                     ui.label(
                         RichText::new(def.doc)
                             .font(FontId::monospace(10.0))
@@ -498,8 +625,8 @@ fn widget(
             }
         }
         Kind::StringList { .. } => list_widget(ui, state, def, value, suggestions, actions, c),
-        // Drawn by `limit_widget`, which needs the machine.
-        Kind::Limit { .. } => {}
+        // Drawn by `limit_widget` and `lease_widget`, which need the machine.
+        Kind::Limit { .. } | Kind::Lease { .. } => {}
     }
 }
 
@@ -610,6 +737,78 @@ fn limit_widget(
         }
     }
     refused(ui, state, def.key, c);
+}
+
+/// One `[agents_panel.lease]` row: a bare field holding the figure, its
+/// ● ↺, and the share of this machine it is, like a limit's.
+#[allow(clippy::too_many_arguments)]
+fn lease_widget(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    machine: Option<&Machine>,
+    def: &'static SettingDef,
+    field: LimitField,
+    value: &Value,
+    actions: &mut Vec<Action>,
+    c: Chrome,
+) {
+    let stored = value.as_str().unwrap_or_default().to_string();
+    let Some(m) = machine else {
+        return dim(ui, "detecting this machine…".into(), c);
+    };
+    let typed = ui
+        .horizontal(|ui| {
+            let typed = commit_field(ui, state, def.key, &stored);
+            if *value != def.default_value() {
+                changed_mark(ui, state, def, actions, c);
+            }
+            dim(ui, lease_share(&stored, m, field), c);
+            typed
+        })
+        .inner;
+    if let Some(typed) = typed {
+        // `auto` (or nothing) here means the default lease.
+        let parsed = match field {
+            LimitField::Cores => limits::parse_cores(&typed, m).map(|a| match a {
+                Auto::Auto => def.default_value().as_str().unwrap_or("3").to_string(),
+                Auto::Set(n) => n.to_string(),
+            }),
+            _ => limits::parse_ram(&typed, m).map(|a| match a {
+                Auto::Auto => def.default_value().as_str().unwrap_or("3G").to_string(),
+                Auto::Set(mem) => limits::mem_text(mem),
+            }),
+        };
+        match parsed {
+            Ok(text) => {
+                state.error = None;
+                if text != stored {
+                    actions.push(Action::SetSetting(def.key.into(), Value::Text(text)));
+                }
+            }
+            Err(why) => state.error = Some((def.key.into(), why)),
+        }
+    }
+    refused(ui, state, def.key, c);
+}
+
+/// What sits after a default-lease field: `of 16 cores · 19 %`,
+/// `of 31.3G · 10 %`.
+fn lease_share(stored: &str, m: &Machine, field: LimitField) -> String {
+    match field {
+        LimitField::Cores => {
+            let n: u64 = stored.trim().parse().unwrap_or(0);
+            format!(
+                "of {} core{} · {} %",
+                m.cores,
+                if m.cores == 1 { "" } else { "s" },
+                share_pct(n, m.cores.into())
+            )
+        }
+        _ => {
+            let mb = Mem::parse(stored).map_or(0, |x| x.0);
+            format!("of {} · {} %", m.ram, share_pct(mb, m.ram.0))
+        }
+    }
 }
 
 /// The figure a cores or RAM limit comes to on `m`: `12`, `18.8G`.

@@ -60,6 +60,7 @@ use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{self, RunLive, TaskLive};
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
+use giverny_core::config::{AgentsPanelConfig, DoneRows, PaneColumns};
 use giverny_core::limits::{Limits, Machine, Mem, Resolved};
 use giverny_core::tabs::TabId;
 use giverny_term::widget::RenderShared;
@@ -908,6 +909,7 @@ pub fn build(feed: Option<&Feed>, live: &[SubagentRow], now_ms: u64) -> Table {
 /// [`build`], with the clocks held through `clock`'s usage-limit spans and
 /// each worker's transcript ([`Logs`]) to give a worker that took tasks one
 /// after another a row per task.
+#[cfg(any(test, debug_assertions))]
 pub fn build_at(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -915,10 +917,25 @@ pub fn build_at(
     clock: &Clock,
     logs: &Logs,
 ) -> Table {
+    build_with(feed, live, now_ms, clock, logs, DoneRows::All)
+}
+
+/// [`build_at`], showing only the Done rows `done` keeps
+/// (`agents_panel.done_rows`). Rows are dropped before they are formatted,
+/// so a `"` never stands for a row that is not drawn.
+pub fn build_with(
+    feed: Option<&Feed>,
+    live: &[SubagentRow],
+    now_ms: u64,
+    clock: &Clock,
+    logs: &Logs,
+    done: DoneRows,
+) -> Table {
     let log = |id: &str| logs.get(id);
     let handed = feed::with_handoffs(feed, live, log);
     let feed = handed.as_ref().or(feed);
-    let rows = feed::merge_with(feed, live, log);
+    let mut rows = feed::merge_with(feed, live, log);
+    keep_done(&mut rows, done, |r| r.stage);
     let written = feed.and_then(|f| f.written_ms);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -930,6 +947,24 @@ pub fn build_at(
         footer: feed.and_then(|f| f.footer.clone()),
         capacity: None,
     }
+}
+
+/// Drop the Done rows `done` does not keep. Done rows sit newest first, so
+/// `Last(n)` keeps the first `n` of them met.
+fn keep_done<R>(rows: &mut Vec<R>, done: DoneRows, stage: impl Fn(&R) -> Stage) {
+    let keep = match done {
+        DoneRows::All => return,
+        DoneRows::Hide => 0,
+        DoneRows::Last(n) => n,
+    };
+    let mut seen = 0;
+    rows.retain(|r| {
+        if stage(r) != Stage::Done {
+            return true;
+        }
+        seen += 1;
+        seen <= keep
+    });
 }
 
 /// A cell is `"` when its row is the same worker as the row above
@@ -1305,6 +1340,7 @@ pub fn show(
     viewed: Option<&str>,
     header: Option<&str>,
     limit: Option<Limit>,
+    panel: &AgentsPanelConfig,
     chrome: &Chrome,
     shared: &mut RenderShared,
     ui: &mut Ui,
@@ -1347,7 +1383,7 @@ pub fn show(
     if std::mem::take(&mut view.logs_due) {
         poll_logs(&mut view.logs, tracker.rows());
     }
-    let mut table = build_at(feed, tracker.rows(), now, &clock, &view.logs);
+    let mut table = build_with(feed, tracker.rows(), now, &clock, &view.logs, panel.done());
     table.capacity = ledger
         .as_deref()
         .and_then(|l| capacity_line(&l.ledger, l.limits.as_ref()?));
@@ -1406,6 +1442,7 @@ pub fn show(
                         ui,
                         id.with("rows"),
                         &table,
+                        &panel.columns,
                         viewed,
                         chrome,
                         shared,
@@ -1500,8 +1537,11 @@ fn table_cols(width: f32, cell_w: f32, bar_lane: f32) -> usize {
 }
 
 /// Where each column of a row starts or ends, in characters, for a table
-/// laid out in `cols` columns.
+/// laid out in `cols` columns. A column switched off
+/// (`[agents_panel.columns]`) takes no width: the rest close up, each a
+/// [`GAP`] from the one before, and TASK takes what is left.
 struct Cols {
+    on: PaneColumns,
     idw: usize,
     taskw: usize,
     x_task: usize,
@@ -1513,33 +1553,77 @@ struct Cols {
     x_eta_end: usize,
     x_now: usize,
     x_tok_end: usize,
+    /// Where the last column shown ends.
+    x_end: usize,
 }
 
 impl Cols {
+    /// Every column on.
+    #[cfg(test)]
     fn new(table: &Table, cols: usize) -> Self {
-        let idw = table
-            .lines
-            .iter()
-            .map(|l| l.id.chars().count())
-            .max()
-            .unwrap_or(0);
+        Self::shown(table, cols, &PaneColumns::default())
+    }
+
+    fn shown(table: &Table, cols: usize, on: &PaneColumns) -> Self {
+        let idw = if on.id {
+            table
+                .lines
+                .iter()
+                .map(|l| l.id.chars().count())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         // Every Running and Done row has a USAGE_W-wide cell, a Next up row
         // none: the column is one width whenever it is there.
-        let leasew = if table.lines.iter().any(|l| !l.usage.is_empty()) {
+        let leasew = if on.usage && table.lines.iter().any(|l| !l.usage.is_empty()) {
             USAGE_W
         } else {
             0
         };
-        let lease_cols = if leasew > 0 { leasew + GAP } else { 0 };
-        let fixed = STAGE_W + GAP + EL_W + GAP + ETA_W + GAP + NOW_W + GAP + TOK_W + lease_cols;
-        let taskw = cols.saturating_sub(fixed).max(MIN_TITLE);
-        let x_task = STAGE_W + GAP;
-        let x_lease = x_task + taskw + GAP;
-        let x_el_end = x_task + taskw + lease_cols + GAP + EL_W;
-        let x_eta_end = x_el_end + GAP + ETA_W;
-        let x_now = x_eta_end + GAP;
-        let x_tok_end = x_now + NOW_W + GAP + TOK_W;
+        // The fixed columns right of TASK, each with the gap before it.
+        let fixed_right: usize = [
+            (leasew > 0, leasew),
+            (on.elapsed, EL_W),
+            (on.eta, ETA_W),
+            (on.now, NOW_W),
+            (on.tokens, TOK_W),
+        ]
+        .iter()
+        .filter(|(shown, _)| *shown)
+        .map(|(_, w)| w + GAP)
+        .sum();
+        let stage_cols = if on.stage { STAGE_W + GAP } else { 0 };
+        // TASK is the id and the title; with the title off, just the id.
+        let taskw = if on.title {
+            cols.saturating_sub(stage_cols + fixed_right).max(MIN_TITLE)
+        } else {
+            idw
+        };
+        // Lay the shown columns out left to right; `place` gives a
+        // column's start and moves past it.
+        let mut x = 0;
+        let mut any = false;
+        let mut place = |shown: bool, w: usize| -> usize {
+            if !shown {
+                return x;
+            }
+            let at = if any { x + GAP } else { 0 };
+            any = true;
+            x = at + w;
+            at
+        };
+        place(on.stage, STAGE_W);
+        let x_task = place(taskw > 0, taskw);
+        let x_lease = place(leasew > 0, leasew);
+        let x_el_end = place(on.elapsed, EL_W) + EL_W;
+        let x_eta_end = place(on.eta, ETA_W) + ETA_W;
+        let x_now = place(on.now, NOW_W);
+        let x_tok_end = place(on.tokens, TOK_W) + TOK_W;
+        let x_end = if any { x } else { cols };
         Cols {
+            on: *on,
             idw,
             taskw,
             x_task,
@@ -1549,43 +1633,60 @@ impl Cols {
             x_eta_end,
             x_now,
             x_tok_end,
+            x_end,
         }
     }
 
     /// A row's cells as drawn: each one's text and the column it starts at.
+    /// Always the same seven, in this order ([`ETA_SEG`], [`LEASE_SEG`]); a
+    /// column switched off is an empty cell.
     fn segments(&self, line: &Line) -> Vec<(usize, String)> {
+        let on = &self.on;
         let idw = self.idw;
         // The id is never cut; the title takes what is left.
-        let task = if idw > 0 {
+        let task = if !on.title {
+            line.id.clone()
+        } else if idw > 0 {
             let title_w = self.taskw.saturating_sub(idw + 1);
             format!("{:<idw$} {}", line.id, cut(&line.title, title_w))
         } else {
             cut(&line.title, self.taskw)
         };
+        let cell = |shown: bool, at: usize, text: String| {
+            if shown {
+                (at, text)
+            } else {
+                (0, String::new())
+            }
+        };
+        // A row with no tokens (Next up) lends NOW the TOKENS column:
+        // `queued for 3G behind demo#12` is longer than NOW.
+        let now_w = if line.tokens.is_empty() && on.tokens {
+            NOW_W + GAP + TOK_W
+        } else {
+            NOW_W
+        };
         vec![
-            (0, stage_word(line.stage).to_string()),
-            (self.x_task, task),
+            cell(on.stage, 0, stage_word(line.stage).to_string()),
+            cell(self.taskw > 0, self.x_task, task),
             // Right-aligned: the text ends at the column's last cell.
-            (right_at(self.x_el_end, &line.elapsed), line.elapsed.clone()),
-            (
+            cell(
+                on.elapsed,
+                right_at(self.x_el_end, &line.elapsed),
+                line.elapsed.clone(),
+            ),
+            cell(
+                on.eta,
                 right_at(self.x_eta_end, eta_cell(line)),
                 eta_cell(line).into(),
             ),
-            // A row with no tokens (Next up) lends NOW the TOKENS column:
-            // `queued for 3G behind demo#12` is longer than NOW.
-            (
-                self.x_now,
-                cut(
-                    &line.now,
-                    if line.tokens.is_empty() {
-                        NOW_W + GAP + TOK_W
-                    } else {
-                        NOW_W
-                    },
-                ),
+            cell(on.now, self.x_now, cut(&line.now, now_w)),
+            cell(
+                on.tokens,
+                right_at(self.x_tok_end, &line.tokens),
+                line.tokens.clone(),
             ),
-            (right_at(self.x_tok_end, &line.tokens), line.tokens.clone()),
-            (self.x_lease, cut(&line.usage, self.leasew)),
+            cell(self.leasew > 0, self.x_lease, cut(&line.usage, self.leasew)),
         ]
     }
 }
@@ -1777,6 +1878,7 @@ fn draw_table(
     ui: &mut Ui,
     id: egui::Id,
     table: &Table,
+    shown: &PaneColumns,
     viewed: Option<&str>,
     chrome: &Chrome,
     shared: &mut RenderShared,
@@ -1786,7 +1888,7 @@ fn draw_table(
     sel: &mut Option<Selection>,
 ) -> (Option<RowClick>, Vec<egui::Rect>, Option<Option<RowClick>>) {
     let cw = cell.x.max(1.0);
-    let layout = Cols::new(table, cols);
+    let layout = Cols::shown(table, cols, shown);
     let mut segs: Vec<Vec<(usize, String)>> =
         table.lines.iter().map(|l| layout.segments(l)).collect();
     if let Some(footer) = &table.footer {
@@ -1794,8 +1896,8 @@ fn draw_table(
     }
     // The machine's capacity, right-aligned under TOKENS.
     if let Some(cap) = &table.capacity {
-        let cap = cut(cap, layout.x_tok_end);
-        segs.push(vec![(right_at(layout.x_tok_end, &cap), cap)]);
+        let cap = cut(cap, layout.x_end);
+        segs.push(vec![(right_at(layout.x_end, &cap), cap)]);
     }
     let texts: Vec<String> = segs.iter().map(|s| compose(s)).collect();
     let rects: Vec<egui::Rect> = segs
@@ -2049,6 +2151,116 @@ mod tests {
         let t = build(Some(&f), &[], T0);
         assert!(t.lines.iter().all(|l| !l.no_eta));
         assert!(t.lines[0].click.facts.iter().all(|x| !x.contains(NO_ETA)));
+    }
+
+    /// Four Done rows, newest landed first, under a Running and a Next up.
+    const DONE_FOUR: &str = r#"{"rows":[
+      {"key":"g#1","stage":"running","title":"one","started":1789999400000,"eta_s":1800},
+      {"key":"g#2","stage":"planned","title":"two","eta_s":600},
+      {"key":"g#3","stage":"done","title":"three","started":1789990000000,"ended":1789993900000},
+      {"key":"g#4","stage":"done","title":"four","started":1789990000000,"ended":1789994900000},
+      {"key":"g#5","stage":"done","title":"five","started":1789990000000,"ended":1789995900000},
+      {"key":"g#6","stage":"done","title":"six","started":1789990000000,"ended":1789996900000}]}"#;
+
+    #[test]
+    fn done_rows_are_all_none_or_the_newest_few() {
+        let f = feed(DONE_FOUR);
+        let keys = |done: DoneRows| -> Vec<String> {
+            build_with(Some(&f), &[], T0, &Clock::plain(), &Logs::new(), done)
+                .lines
+                .into_iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        assert_eq!(
+            keys(DoneRows::All),
+            ["g#1", "g#2", "g#6", "g#5", "g#4", "g#3"]
+        );
+        assert_eq!(keys(DoneRows::Hide), ["g#1", "g#2"]);
+        assert_eq!(keys(DoneRows::Last(2)), ["g#1", "g#2", "g#6", "g#5"]);
+        assert_eq!(keys(DoneRows::Last(9)), keys(DoneRows::All));
+        // The config's words come to the same.
+        let mut panel = AgentsPanelConfig::default();
+        assert_eq!(panel.done(), DoneRows::All);
+        panel.done_rows = "last".into();
+        panel.done_last = 1;
+        assert_eq!(keys(panel.done()), ["g#1", "g#2", "g#6"]);
+        panel.done_rows = "hide".into();
+        assert_eq!(keys(panel.done()), ["g#1", "g#2"]);
+    }
+
+    #[test]
+    fn a_hidden_column_takes_no_width_and_the_rest_stay_aligned() {
+        let t = build(Some(&feed(DONE_FOUR)), &[], T0);
+        let all = Cols::new(&t, 100);
+        let drawn: Vec<String> = t.lines.iter().map(|l| compose(&all.segments(l))).collect();
+        assert!(drawn[0].starts_with("Running  g#1 one"), "{drawn:?}");
+
+        // STAGE and ETA off: the task starts the row, and ETA's cells are
+        // gone without moving anything else out of line.
+        let on = PaneColumns {
+            stage: false,
+            eta: false,
+            ..PaneColumns::default()
+        };
+        let cols = Cols::shown(&t, 100, &on);
+        assert_eq!(cols.x_task, 0);
+        assert!(cols.taskw > all.taskw, "the title takes the room");
+        let drawn: Vec<String> = t.lines.iter().map(|l| compose(&cols.segments(l))).collect();
+        assert!(drawn[0].starts_with("g#1 one"), "{drawn:?}");
+        for (l, d) in t.lines.iter().zip(&drawn) {
+            assert!(!d.contains("Running") && !d.contains("Done"), "{d}");
+            assert_eq!(cols.segments(l)[ETA_SEG].1, "", "no ETA cell");
+            // Every row's TOKENS ends on the same column.
+            if !l.tokens.is_empty() {
+                assert!(d.ends_with(&l.tokens), "{d}");
+                assert_eq!(d.chars().count(), cols.x_tok_end, "{d}");
+            }
+        }
+        // ELAPSED ends at the same column on every row that has one.
+        let el_end: Vec<usize> = t
+            .lines
+            .iter()
+            .filter(|l| !l.elapsed.is_empty())
+            .map(|l| {
+                let seg = &cols.segments(l)[2];
+                seg.0 + seg.1.chars().count()
+            })
+            .collect();
+        assert!(el_end.iter().all(|e| *e == cols.x_el_end), "{el_end:?}");
+
+        // The title off: TASK is the id alone, and the columns after it
+        // close up to it.
+        let on = PaneColumns {
+            title: false,
+            ..PaneColumns::default()
+        };
+        let cols = Cols::shown(&t, 100, &on);
+        assert_eq!(cols.taskw, 3, "g#1");
+        let d = compose(&cols.segments(&t.lines[0]));
+        assert!(!d.contains("one"), "{d}");
+        assert!(d.starts_with("Running  g#1  "), "{d}");
+        // 7 + 3 + 17 + 8 + 10 + 28 + 6, a gap between each.
+        assert_eq!(cols.x_end, 91, "the table is narrower");
+        assert_eq!(all.x_end, 100);
+
+        // Everything off: nothing drawn.
+        let none = PaneColumns {
+            stage: false,
+            id: false,
+            title: false,
+            usage: false,
+            elapsed: false,
+            eta: false,
+            now: false,
+            tokens: false,
+        };
+        let cols = Cols::shown(&t, 100, &none);
+        assert!(
+            t.lines
+                .iter()
+                .all(|l| compose(&cols.segments(l)).is_empty())
+        );
     }
 
     #[test]

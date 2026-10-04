@@ -1214,6 +1214,11 @@ fn agents_pane_on(cfg: &config::Config) -> bool {
     bool_setting(cfg, "claude.agents_pane")
 }
 
+/// Does the agents pane's plugin carry the orchestrate skill?
+fn orchestrate_skill_on(cfg: &config::Config) -> bool {
+    cfg.agents_panel.orchestrate_skill
+}
+
 /// Can account setup follow this config? Not when a value it reads — the
 /// `[claude]` section — is one that did not fit and was stood in for.
 fn accounts_readable(parsed: &config::Parsed) -> bool {
@@ -1244,7 +1249,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
-    claude.set_agents_pane(agents_pane_on(cfg), base);
+    claude.set_agents_pane(agents_pane_on(cfg), orchestrate_skill_on(cfg), base);
 }
 
 fn bool_setting(cfg: &config::Config, key: &str) -> bool {
@@ -1885,8 +1890,11 @@ impl App {
                     Err(e) => tracing::error!("hook install: {e}"),
                 }
                 // The hooks are the consent the agents pane's keys wait for.
-                self.claude
-                    .set_agents_pane(agents_pane_on(&self.cfg), self.paths.base());
+                self.claude.set_agents_pane(
+                    agents_pane_on(&self.cfg),
+                    orchestrate_skill_on(&self.cfg),
+                    self.paths.base(),
+                );
             }
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
             Action::SetCategoryProfile(id, dir) => {
@@ -2694,9 +2702,14 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
-        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg) {
-            self.claude
-                .set_agents_pane(agents_pane_on(&cfg), self.paths.base());
+        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg)
+            || orchestrate_skill_on(&cfg) != orchestrate_skill_on(&self.cfg)
+        {
+            self.claude.set_agents_pane(
+                agents_pane_on(&cfg),
+                orchestrate_skill_on(&cfg),
+                self.paths.base(),
+            );
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
@@ -3948,7 +3961,9 @@ impl App {
     /// * `drag <row> <col> <row> <col>` — a pointer drag over the active
     ///   tab's agents pane, cell to cell; the same cell twice
     ///   is a click;
-    /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points.
+    /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
+    /// * `settings <section>` — the settings screen, on that section (its
+    ///   rail title, `agents panel`); `settings` alone closes it.
     #[cfg(debug_assertions)]
     fn debug_cmd(&mut self, ctx: &egui::Context) {
         let Ok(file) = std::env::var("GIVERNY_DEBUG_CMD") else {
@@ -4145,6 +4160,16 @@ impl App {
                     let frames = it.next().and_then(|n| n.parse().ok()).unwrap_or(30);
                     let stride = it.next().and_then(|n| n.parse().ok()).unwrap_or(2);
                     self.capture = capture::Capture::burst(dir.into(), frames, stride);
+                }
+                "settings" => {
+                    self.settings = giverny_core::settings::Section::ALL
+                        .iter()
+                        .find(|s| s.title() == arg)
+                        .map(|&section| settings_ui::SettingsState {
+                            section,
+                            search_focus: false,
+                            ..Default::default()
+                        });
                 }
                 "dump" => {
                     let session = self
@@ -4701,6 +4726,7 @@ impl eframe::App for App {
                         self.limited.get(&active).map(|w| w.reopens),
                         jiff::Timestamp::now(),
                     ),
+                    &self.cfg.agents_panel,
                     &self.chrome,
                     &mut self.shared,
                     ui,

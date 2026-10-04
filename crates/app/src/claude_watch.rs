@@ -1153,20 +1153,26 @@ impl ClaudeWatch {
     /// The same switch carries the `giverny` plugin: on, its
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
-    /// keys go and so does the directory.
+    /// keys go and so does the directory. `skill` is
+    /// `agents_panel.orchestrate_skill`: off, the plugin is written without
+    /// its orchestrate skill.
     ///
     /// The setting is on by default, so it is not consent by itself: the
     /// keys are written only into an account that already holds our hooks
     /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
     /// it is for the live-usage statusline. Every other account is left
     /// byte-identical. Off removes only what is ours, wherever it is.
-    pub fn set_agents_pane(&mut self, enable: bool, base: &Path) {
+    pub fn set_agents_pane(&mut self, enable: bool, skill: bool, base: &Path) {
         if self.leave_accounts {
             return;
         }
         let dir = giverny_claude::plugin::marketplace_dir(base);
         if enable {
-            match giverny_claude::plugin::sync(&dir, &giverny_claude::plugin::exe_candidates()) {
+            match giverny_claude::plugin::sync(
+                &dir,
+                &giverny_claude::plugin::exe_candidates(),
+                skill,
+            ) {
                 Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
                 Ok(false) => {}
                 Err(err) => tracing::warn!("giverny plugin not written: {err}"),
@@ -2186,8 +2192,8 @@ mod tests {
         assert!(w.set_statusline(false).is_err());
         w.set_auto_mode(true);
         w.ensure_auto_mode();
-        w.set_agents_pane(true, &base);
-        w.set_agents_pane(false, &base);
+        w.set_agents_pane(true, true, &base);
+        w.set_agents_pane(false, true, &base);
         let after = (
             std::fs::read(&settings).unwrap(),
             std::fs::read(&known).unwrap(),
@@ -2197,7 +2203,7 @@ mod tests {
 
         // The installed instance, same calls: the account does change.
         w.leave_accounts = false;
-        w.set_agents_pane(false, &base);
+        w.set_agents_pane(false, true, &base);
         w.set_auto_mode(true);
         assert_ne!(std::fs::read(&settings).unwrap(), before.0);
 
@@ -2236,7 +2242,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         w.profiles = vec![plain.clone(), hooked.clone()];
         w.leave_accounts = false;
-        w.set_agents_pane(true, &base);
+        w.set_agents_pane(true, true, &base);
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(
             !plain.config_dir.join("settings.json.giverny-bak").exists(),
@@ -2244,8 +2250,21 @@ mod tests {
         );
         assert!(hooks::subagent_line_installed_in(&hooked_settings));
         assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+        let skill =
+            giverny_claude::plugin::marketplace_dir(&base).join(giverny_claude::plugin::SKILL_PATH);
+        assert!(skill.exists());
 
-        w.set_agents_pane(false, &base);
+        // The skill off: only the skill goes; the plugin and the pane's
+        // keys stay, and the plain account is still untouched.
+        w.set_agents_pane(true, false, &base);
+        assert!(!skill.exists());
+        assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+        assert!(hooks::subagent_line_installed_in(&hooked_settings));
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        w.set_agents_pane(true, true, &base);
+        assert!(skill.exists());
+
+        w.set_agents_pane(false, true, &base);
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(!hooks::subagent_line_installed_in(&hooked_settings));
         assert!(!giverny_claude::plugin::installed_in(&hooked_settings));

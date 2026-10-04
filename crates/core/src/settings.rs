@@ -24,7 +24,7 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
-    Orchestrator,
+    AgentsPanel,
     Keys,
     Updates,
     About,
@@ -38,7 +38,7 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
-        Section::Orchestrator,
+        Section::AgentsPanel,
         Section::Keys,
         Section::Updates,
         Section::About,
@@ -51,7 +51,7 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
-            Section::Orchestrator => "orchestrator",
+            Section::AgentsPanel => "agents panel",
             Section::Keys => "keys",
             Section::Updates => "updates",
             Section::About => "about",
@@ -100,6 +100,14 @@ pub enum Kind {
     /// of tables for GPUs).
     Limit {
         field: LimitField,
+    },
+    /// One of `[agents_panel.lease]`: a figure, never `auto`. Carried as
+    /// [`Value::Text`] (`"3"`, `"3G"`) and written back as the ledger reads
+    /// it: an integer for cores, a size string for RAM. `field` is
+    /// [`LimitField::Cores`] or [`LimitField::Ram`].
+    Lease {
+        field: LimitField,
+        default: &'static str,
     },
 }
 
@@ -153,6 +161,7 @@ impl SettingDef {
             Kind::Choice { default, .. } => Value::Text((*default).into()),
             Kind::StringList { default } => Value::List(default.map(|f| f()).unwrap_or_default()),
             Kind::Limit { .. } => Value::Text("auto".into()),
+            Kind::Lease { default, .. } => Value::Text((*default).into()),
         }
     }
 }
@@ -440,9 +449,9 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "claude.agents_pane",
         label: "agents pane",
-        // Shown under Orchestrator, below the limits; the key
-        // stays under [claude], where it always was.
-        section: Section::Orchestrator,
+        // Shown at the top of Agents panel; the key stays under
+        // [claude], where it always was.
+        section: Section::AgentsPanel,
         doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
         note: &[
             "Running and Done come from Claude Code's own files and need no",
@@ -493,9 +502,146 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "agents_panel.orchestrate_skill",
+        label: "orchestrate skill",
+        section: Section::AgentsPanel,
+        doc: "Ship the /giverny:orchestrate skill with the plugin the agents pane installs.",
+        note: &[
+            "Written only where the agents pane's plugin is (accounts holding",
+            "Giverny's hooks, with claude.agents_pane on). Off removes only the",
+            "skill: the plugin keeps giverny-pass, its hook and /giverny:clear-done.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.done_rows",
+        label: "done rows",
+        section: Section::AgentsPanel,
+        doc: "Which Done rows the agents pane shows: all of them, none, or the newest few.",
+        note: &["\"last\" keeps the newest done_last of them (they sit newest first)."],
+        needs_restart: false,
+        kind: Kind::Choice {
+            default: "all",
+            options: &["all", "hide", "last"],
+        },
+    },
+    SettingDef {
+        key: "agents_panel.done_last",
+        label: "keep the last",
+        section: Section::AgentsPanel,
+        doc: "How many Done rows done_rows = \"last\" keeps.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Int {
+            default: 5,
+            min: 1,
+            max: 100,
+        },
+    },
+    SettingDef {
+        key: "agents_panel.columns.stage",
+        label: "stage",
+        section: Section::AgentsPanel,
+        doc: "STAGE: Running, Next up or Done.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.id",
+        label: "task id",
+        section: Section::AgentsPanel,
+        doc: "The task's id (a feed row's key, a subagent's name).",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.title",
+        label: "title",
+        section: Section::AgentsPanel,
+        doc: "The task's title, or a subagent's description: the column that takes the room left.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.usage",
+        label: "CPU / RAM",
+        section: Section::AgentsPanel,
+        doc: "What the row's `giverny pass run` commands use: live CPU and memory, a Done row's peak.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.elapsed",
+        label: "elapsed",
+        section: Section::AgentsPanel,
+        doc: "How long the row has worked: a stopwatch while it runs.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.eta",
+        label: "ETA",
+        section: Section::AgentsPanel,
+        doc: "Time left on a Running row, the estimate of a Next up one, how late or early a Done one landed.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.now",
+        label: "now",
+        section: Section::AgentsPanel,
+        doc: "What the row is doing now: its last tool call, a wait, a queue place.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.tokens",
+        label: "tokens",
+        section: Section::AgentsPanel,
+        doc: "The tokens the row has used.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.lease.cpu_cores",
+        label: "CPU cores",
+        section: Section::AgentsPanel,
+        doc: "Cores a task's lease holds when nothing says otherwise.",
+        note: &[
+            "What `giverny pass run` claims for a task that holds no lease, unless",
+            "--cpu says. `giverny pass resources` prints it.",
+        ],
+        needs_restart: false,
+        kind: Kind::Lease {
+            field: LimitField::Cores,
+            default: "3",
+        },
+    },
+    SettingDef {
+        key: "agents_panel.lease.ram",
+        label: "RAM",
+        section: Section::AgentsPanel,
+        doc: "Memory a task's lease holds when nothing says otherwise.",
+        note: &["A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it."],
+        needs_restart: false,
+        kind: Kind::Lease {
+            field: LimitField::Ram,
+            default: "3G",
+        },
+    },
+    SettingDef {
         key: "orchestrator.limits.cpu_cores",
         label: "CPU cores",
-        section: Section::Orchestrator,
+        section: Section::AgentsPanel,
         doc: "Cores all orchestrator passes together may hand to workers. auto = all but 2.",
         note: &[
             "The resource ledger (`giverny pass claim`) grants workers cores,",
@@ -511,7 +657,7 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "orchestrator.limits.ram",
         label: "RAM",
-        section: Section::Orchestrator,
+        section: Section::AgentsPanel,
         doc: "Memory all orchestrator passes together may hand to workers. auto = 70 %.",
         note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
         needs_restart: false,
@@ -522,7 +668,7 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "orchestrator.limits.gpus",
         label: "GPUs",
-        section: Section::Orchestrator,
+        section: Section::AgentsPanel,
         doc: "GPUs and VRAM orchestrator passes may use. auto = 90 % of each GPU's VRAM.",
         note: &[
             "GPUs are found with nvidia-smi; without it there are none. A list",
@@ -570,6 +716,9 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
     if let Kind::Limit { field } = def.kind {
         return limit_text(field, node).map(Value::Text);
     }
+    if let Kind::Lease { field, .. } = def.kind {
+        return lease_text(field, node).map(Value::Text);
+    }
     Some(match (node, &def.kind) {
         (toml::Value::Boolean(b), _) => Value::Bool(*b),
         (toml::Value::Float(f), _) => Value::Float(*f),
@@ -609,6 +758,27 @@ fn limit_text(field: LimitField, node: &toml::Value) -> Option<String> {
     })
 }
 
+/// A `[agents_panel.lease]` value in the form [`Kind::Lease`] carries it.
+fn lease_text(field: LimitField, node: &toml::Value) -> Option<String> {
+    let node = node.clone();
+    Some(match field {
+        LimitField::Ram => limits::mem_text(node.try_into::<Mem>().ok()?),
+        _ => node.try_into::<u32>().ok()?.to_string(),
+    })
+}
+
+/// A [`Kind::Lease`] value as the TOML the ledger reads; `None` when the
+/// text is not one.
+fn lease_toml(field: LimitField, text: &str) -> Option<toml_edit::Value> {
+    let t = text.trim();
+    match field {
+        LimitField::Ram => Mem::parse(t)
+            .filter(|m| m.0 > 0)
+            .map(|m| limits::mem_text(m).into()),
+        _ => t.parse::<i64>().ok().filter(|n| *n > 0).map(Into::into),
+    }
+}
+
 /// A [`Kind::Limit`] value as the TOML the ledger reads. `None` when the
 /// text is not one (the screen validates before it gets here).
 fn limit_toml(field: LimitField, text: &str) -> Option<toml_edit::Value> {
@@ -634,6 +804,8 @@ fn encode(def: &SettingDef, value: &Value) -> anyhow::Result<toml_edit::Value> {
     match (&def.kind, value) {
         (Kind::Limit { field }, Value::Text(t)) => limit_toml(*field, t)
             .ok_or_else(|| anyhow::anyhow!("{}: `{t}` is not a limit", def.key)),
+        (Kind::Lease { field, .. }, Value::Text(t)) => lease_toml(*field, t)
+            .ok_or_else(|| anyhow::anyhow!("{}: `{t}` is not a lease", def.key)),
         _ => Ok(toml_edit_value(value)),
     }
 }
@@ -731,6 +903,15 @@ fn render_value(value: &Value) -> String {
     toml_edit_value(value).to_string().trim().to_string()
 }
 
+/// The default as the file holds it: a lease's cores as an integer, not
+/// the text the screen carries.
+fn render_default(def: &SettingDef) -> String {
+    let default = def.default_value();
+    encode(def, &default)
+        .map(|v| v.to_string().trim().to_string())
+        .unwrap_or_else(|_| render_value(&default))
+}
+
 /// The commented `config.toml` written on first run, generated from the table
 /// above so it can never describe options the app does not have.
 pub fn template() -> String {
@@ -769,7 +950,7 @@ pub fn template() -> String {
                     render_value(&example)
                 ));
             }
-            _ => out.push_str(&format!("{} = {}\n", def.leaf(), render_value(&default))),
+            _ => out.push_str(&format!("{} = {}\n", def.leaf(), render_default(def))),
         }
     }
     out
@@ -790,7 +971,7 @@ pub fn markdown() -> String {
     for def in SETTINGS {
         let default = match def.default_value() {
             Value::List(items) if items.len() > 6 => format!("{} programs", items.len()),
-            other => format!("`{}`", render_value(&other)),
+            _ => format!("`{}`", render_default(def)),
         };
         let mut doc = def.doc.replace('|', "\\|");
         if let Kind::Choice { options, .. } = &def.kind {
@@ -839,6 +1020,11 @@ mod tests {
         assert_eq!(parsed.usage.refresh_minutes, defaults.usage.refresh_minutes);
         assert_eq!(parsed.update.check, defaults.update.check);
         assert_eq!(parsed.orchestrator, defaults.orchestrator);
+        assert_eq!(parsed.agents_panel, defaults.agents_panel);
+        assert!(
+            text.contains("\n[agents_panel.lease]\n") && text.contains("\ncpu_cores = 3\n"),
+            "the lease's cores are an integer:\n{text}"
+        );
         assert!(
             text.contains("\n[orchestrator.limits]\n"),
             "limits get their own table:\n{text}"
@@ -1033,7 +1219,7 @@ mod tests {
             "the ledger reads the same"
         );
         for def in
-            in_section(Section::Orchestrator).filter(|d| d.key.starts_with("orchestrator.limits."))
+            in_section(Section::AgentsPanel).filter(|d| d.key.starts_with("orchestrator.limits."))
         {
             assert_ne!(current(&cfg, def), Some(def.default_value()));
         }
@@ -1071,6 +1257,85 @@ mod tests {
             text.contains("[orchestrator.limits]\ncpu_cores = 4"),
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_agents_panel_key_round_trips_through_the_file() {
+        use crate::config::{DoneRows, PaneColumns};
+        let dir = scratch("agents-panel");
+        let path = config::config_path(&dir);
+        // A file from before these keys: the old ones load, the new ones
+        // come out at today's behaviour.
+        std::fs::write(
+            &path,
+            "[claude]\nagents_pane = false\n[orchestrator.limits]\ncpu_cores = 4\n",
+        )
+        .unwrap();
+        let read = || config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (cfg, unknown) = read();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert!(!cfg.claude.agents_pane);
+        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(4));
+        assert_eq!(cfg.agents_panel, config::AgentsPanelConfig::default());
+        assert_eq!(cfg.agents_panel.done(), DoneRows::All);
+        assert!(cfg.agents_panel.orchestrate_skill);
+        assert_eq!(cfg.agents_panel.columns, PaneColumns::default());
+
+        let set = |key: &str, v: Value| {
+            write(&dir, by_key(key).unwrap(), &v).unwrap();
+            let (cfg, unknown) = read();
+            assert!(unknown.is_empty(), "{key}: {unknown:?}");
+            let def = by_key(key).unwrap();
+            assert_eq!(current(&cfg, def), Some(v), "{key} reads back");
+            assert!(!is_default(&cfg, def), "{key}");
+            cfg
+        };
+        let cfg = set("agents_panel.orchestrate_skill", Value::Bool(false));
+        assert!(!cfg.agents_panel.orchestrate_skill);
+        let cfg = set("agents_panel.done_rows", Value::Text("hide".into()));
+        assert_eq!(cfg.agents_panel.done(), DoneRows::Hide);
+        set("agents_panel.done_rows", Value::Text("last".into()));
+        let cfg = set("agents_panel.done_last", Value::Int(3));
+        assert_eq!(cfg.agents_panel.done(), DoneRows::Last(3));
+        for def in SETTINGS
+            .iter()
+            .filter(|d| d.key.starts_with("agents_panel.columns."))
+        {
+            set(def.key, Value::Bool(false));
+        }
+        let (cfg, _) = read();
+        assert_eq!(
+            cfg.agents_panel.columns,
+            PaneColumns {
+                stage: false,
+                id: false,
+                title: false,
+                usage: false,
+                elapsed: false,
+                eta: false,
+                now: false,
+                tokens: false,
+            }
+        );
+        let cfg = set("agents_panel.lease.cpu_cores", Value::Text("2".into()));
+        assert_eq!(cfg.agents_panel.lease.cpu_cores, 2);
+        let cfg = set("agents_panel.lease.ram", Value::Text("1536M".into()));
+        assert_eq!(cfg.agents_panel.lease.ram, Mem(1536));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("cpu_cores = 2\n"), "an integer: {text}");
+        assert_eq!(
+            config::DefaultLease::from_config_str(&text),
+            cfg.agents_panel.lease,
+            "pass run reads the same"
+        );
+        // The old keys are where they were.
+        assert!(!cfg.claude.agents_pane);
+        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(4));
+        // Not a lease: refused, file untouched.
+        let bad = Value::Text("0".into());
+        assert!(write(&dir, by_key("agents_panel.lease.cpu_cores").unwrap(), &bad).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

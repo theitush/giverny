@@ -103,10 +103,10 @@ giverny-pass claim auth-fix --cpu 3 --ram 3G
 ```
 
 Size it from the hint `claim` prints once there is history (`the last 4 BUG
-tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with a sane
-default. Add `--slot <name>` for something only one task at a time may use (a
-shared build folder), `--priority` when the task is urgent, `--gpu N --vram 8G`
-for a GPU. The answer is one line and an exit code:
+tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the default
+lease (Settings → Agents panel; `giverny-pass resources` prints it). Add
+`--slot <name>` for something only one task at a time may use (a shared build
+folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU. The answer is one line and an exit code:
 
 - `granted` (0): go on.
 - `granted smaller` (3, only with `--min-ram`): go on, with what it says.
@@ -115,7 +115,7 @@ for a GPU. The answer is one line and an exit code:
   granted (nothing calls back). When it says the wait is longer than the task
   itself and suggests `ask`, send `giverny-pass ask <holder's task> "<why, the
   priority, how long you need it>"` and keep polling; the holder may release.
-- `refused` (5): larger than this machine's limits (Settings → Orchestrator →
+- `refused` (5): larger than this machine's limits (Settings → Agents panel →
   Limits). Ask for less, or tell the user.
 
 Then, once granted, stamp the task and spawn its worker in the same breath:

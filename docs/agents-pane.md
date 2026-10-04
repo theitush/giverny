@@ -4,6 +4,8 @@ The agents pane is a table under a tab's terminal listing that tab's Claude Code
 
 Giverny ships that orchestrator itself. With `claude.agents_pane` on, every Claude session gets a `/giverny:orchestrate` skill (see **The orchestrator plugin**) and a `giverny-pass` command that writes the feed, so Running, Next up with ETAs, and Done need nothing but Giverny and Claude Code: no issue tracker, no `gh`, no scripts of your own. Any other writer that follows this page works the same way, next to it.
 
+**Settings → Agents panel** holds everything about the pane: the pane itself (`claude.agents_pane`), the orchestrate skill (`agents_panel.orchestrate_skill`, see **The orchestrator plugin**), one switch per column (`[agents_panel.columns]`: `stage`, `id`, `title`, `usage`, `elapsed`, `eta`, `now`, `tokens`, all on by default; a column switched off takes no width, the rest close up and TASK takes the room), which **Done** rows show (`agents_panel.done_rows`: `"all"` by default, `"hide"`, or `"last"` for the newest `agents_panel.done_last` of them), the **default lease** and the **limits** (see **Resources**). Every one applies as it is changed.
+
 This document is the whole contract for writing a feed. The reader is `crates/claude/src/feed.rs`; anything this page promises, that module's tests pin.
 
 ## Writing it with `giverny pass`
@@ -65,7 +67,7 @@ giverny pass reply <msg-id> "<text>"
 **`run`: a worker's command under its lease**. A worker runs its heavy commands — builds, test suites, training — as `giverny pass run <task> -- <cmd…>`. Its own flags go before `--`; everything after is the command, untouched.
 
 - **The cap.** On Linux with a user systemd the command runs in a scope of its own, `systemd-run --user --scope -p MemoryMax=<ram> -p MemorySwapMax=0 -p CPUQuota=<cpu×100>% -p OOMPolicy=continue`, named `giverny-run-<task>-<pid>.scope` (`systemctl --user status` it while it runs). `CARGO_BUILD_JOBS=<cpu>` is exported unless already set. A lease of no RAM sets no memory cap, of no cores no CPU quota. Without a user systemd (macOS, Windows, a container, `GIVERNY_RUN_NO_SYSTEMD=1`), or when `systemd-run` will not make the scope, the command runs plain and the lease is advisory; it says so.
-- **No lease: claim one.** A task holding no lease gets one claimed by `run` — 3 cores and 3G unless `--cpu`/`--ram` say — and `run` gives it back when the command ends. While that claim is queued, `run` polls it every 15 s and the row is *waiting* (as with `eta --why wait`); refused (larger than the limits), the command does not run and `run` exits **5**.
+- **No lease: claim one.** A task holding no lease gets one claimed by `run` — the **default lease**, 3 cores and 3G unless set otherwise in Settings → Agents panel (`[agents_panel.lease]`), unless `--cpu`/`--ram` say — and `run` gives it back when the command ends. While that claim is queued, `run` polls it every 15 s and the row is *waiting* (as with `eta --why wait`); refused (larger than the limits), the command does not run and `run` exits **5**.
 - **Slots are held for the command's life.** For each slot of the lease, `run` takes an exclusive `flock` on `<ledger dir>/slots/<slot>.lock`, so two `run`s under one lease (a worker's parallel commands) take a slot in turn: the second says so and its row is *waiting* until it has it.
 - **Heartbeat.** While the command runs, `run` beats its session's leases every 5 minutes, so a long build never outlives its lease's 20 minutes.
 - **Live.** While the command runs, `run` keeps `<ledger dir>/runs/<pid>-<n>.live` (`task`, `session`, `pid`, `stats`, `started_ms`) and the shim writes its scope's cgroup (`cgroup <dir>`) into the stats file beside it as it starts; the pane reads the cgroup's `memory.current` and `cpu.stat` from there. The file goes when the command ends; one left by a killed `run` is skipped and swept by the next.
@@ -73,13 +75,21 @@ giverny pass reply <msg-id> "<text>"
 - **OOM.** A command the memory cap killed (the scope's `memory.events` counts an `oom_kill`) is reported — `the 3G memory cap killed it (OOM). Ask for more: …` — so the worker can ask its orchestrator for more RAM and run it again.
 - **Exit code** is the command's own, 128 + the signal when one killed it (137 for the OOM killer's SIGKILL). Ctrl-C reaches the command; `run` itself waits it out, so the run is still recorded.
 
-**Limits** are what *all* orchestrators on the machine together may use. Set them in **Settings → Orchestrator → Limits**, where each field takes `auto`, a number or size (`6`, `16G`), or a share of this machine (`50%` of the cores or of the RAM, written to the file as the figure it comes to). They are `[orchestrator.limits]` in Giverny's `config.toml`, every key `"auto"` unless set:
+**Limits** are what *all* orchestrators on the machine together may use. Set them in **Settings → Agents panel → Limits**, where each field takes `auto`, a number or size (`6`, `16G`), or a share of this machine (`50%` of the cores or of the RAM, written to the file as the figure it comes to). They are `[orchestrator.limits]` in Giverny's `config.toml`, every key `"auto"` unless set:
 
 ```toml
 [orchestrator.limits]
 cpu_cores = "auto"   # cores − 2, at least 1; or a number
 ram       = "auto"   # 70 % of RAM; or "16G"
 gpus      = "auto"   # 90 % of each GPU's VRAM (nvidia-smi; none without it); or [{ index = 0, vram = "20G" }], or [] for none
+```
+
+**The default lease** is what a task gets when nothing says otherwise: what `run` claims for a task holding no lease. Set it in **Settings → Agents panel → Default lease** (each field shows the share of this machine it is); `giverny pass resources` prints it. It is `[agents_panel.lease]`:
+
+```toml
+[agents_panel.lease]
+cpu_cores = 3
+ram       = "3G"
 ```
 
 **The ledger file** is `<feed dir>/resources/ledger.json` (`$GIVERNY_LEDGER` overrides). A writer other than `giverny pass` may read it, and may write it only the same way: take an exclusive `flock` on the sibling `ledger.lock` for the whole read-modify-write, drop expired entries, write to a temporary name in the same directory and `rename` it over. Version 1:
@@ -256,12 +266,13 @@ With `claude.agents_pane` on, Giverny carries a Claude Code plugin, `giverny`, w
   ```
   That is all Claude Code needs. There is no `claude plugin install` and no network. A directory marketplace is loaded straight from its directory at session start, not from a cache, so the next session runs what this binary wrote. The plugin's version is Giverny's own, so a Giverny upgrade updates the plugin. Sessions that were already running keep the skill they started with.
 - `bin/` of an enabled plugin is on the `PATH` of the Bash tool, in the session and in its subagents, which is how `giverny-pass` is found.
+- **The skill is a switch of its own.** `agents_panel.orchestrate_skill` (on by default) decides whether `skills/orchestrate/SKILL.md` is in the plugin. Off, the next sync removes that file only: the plugin, its hook, `giverny-pass` and `/giverny:clear-done` stay, so the pane works as before, and `/giverny:orchestrate` is gone from new sessions in every account. It follows the pane's consent rule: the plugin is written only where the pane's keys are.
 - **No `SessionStart` hook.** Orchestrate by default (`claude.orchestrate_by_default`) is gone: a config that still sets the key loads as before with the key ignored, and the next sync prunes the plugin's old `hooks/orchestrate-by-default.json`.
 - **The re-estimate nudge**. `hooks/hooks.json` carries a `PostToolUse` hook (matcher `*`) running `"${CLAUDE_PLUGIN_ROOT}/bin/giverny-pass" nudge 2>/dev/null || true`: about five minutes into a worker's task it asks that worker, once, for a fresh estimate (see **Writing it with `giverny pass`**). The same hook delivers an orchestrator's `ask`/`reply` messages and renews the calling session's ledger leases (see **Resources**). It exits 0 and prints nothing for every call that is not due anything, and reads no file for a call that is not a subagent's and has no message waiting: it parses only the payload's `session_id`, `agent_id` and `transcript_path`, `stat`s the inbox, the ledger and the session's heartbeat marker (`resources/beats/<session>`, whose mtime is the last beat; the ledger is locked, read and maybe written only when that is 30 s old). Measured in-process, that is about 8 µs a call with a 20 KB tool response, of which ~4 µs is the three `stat`s; the process start (~5–7 ms for the `giverny` binary) is the whole cost that matters.
 
 **The house rules**, the same ones `subagentStatusLine` follows:
 
-- **On by default, written only where the account opted in.** `claude.agents_pane` defaults to on and sits under Settings → Orchestrator, below the limits. The keys go only into an account whose `settings.json` holds Giverny's hooks (installed from the banner's click); an account without them is left byte-identical. Turned off, nothing is written.
+- **On by default, written only where the account opted in.** `claude.agents_pane` defaults to on and sits at the top of Settings → Agents panel. The keys go only into an account whose `settings.json` holds Giverny's hooks (installed from the banner's click); an account without them is left byte-identical. Turned off, nothing is written.
 - **Never over someone else's.** A marketplace called `giverny` that does not point at a `giverny/claude-plugin` directory is left alone. The plugin is then not installed on that account, and the settings log says so.
 - **A user's `disable` stands.** If `enabledPlugins["giverny@giverny"]` is already `false` (`claude plugin disable`), it stays `false`.
 - **Removed when the pane goes off.** Both keys go, and a map we emptied goes with them. Claude Code's own record of the marketplace (`plugins/known_marketplaces.json`) loses its `giverny` entry, as `claude plugin marketplace remove` would do. The `claude-plugin` directory is deleted. `uninstall_from` takes the keys too.

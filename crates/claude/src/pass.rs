@@ -102,8 +102,9 @@ Resources: one ledger for every session on the machine, at
 20 minutes after their session's last `giverny pass` command. Limits are
 [orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
 90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
-`run` with no lease claims one first (3 cpu, 3G unless --cpu/--ram say), waits
-while it is queued, and releases it when the command ends.
+`run` with no lease claims one first (the default lease, [agents_panel.lease]
+in config.toml: 3 cpu, 3G unless set; --cpu/--ram override), waits while it is
+queued, and releases it when the command ends.
 `claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
 Messages go to <feed dir>/inbox/<session>.jsonl; `nudge` delivers
 them, and renews the calling session's leases, on every tool call.";
@@ -2112,6 +2113,7 @@ mod tests {
                 mem_available: Some(Mem::gb(20)),
                 load1: Some(0.0),
             },
+            default_lease: Default::default(),
         }
     }
 
