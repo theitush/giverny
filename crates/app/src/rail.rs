@@ -1453,7 +1453,51 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             }
         }
     }
+    sessions_load_row(ui, dim, fg);
     ui.add_space(6.0);
+}
+
+/// Under the account bars: every Claude Code session running now, summed,
+/// `load   3 sess  45% CPU  4.2G  gpu 1.2G`, in the bars' lettering.
+/// Nothing until the first reading, nor where it cannot be read.
+fn sessions_load_row(ui: &mut Ui, dim: Color32, fg: Color32) {
+    let Some(u) = crate::sessions_load::latest(ui.ctx()) else {
+        return;
+    };
+    ui.add_space(3.0);
+    let width = ui.available_width();
+    let (mut rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
+    // A wide row above (a banner, a button) can stretch the panel's
+    // layout past what is shown: the figures end at the visible edge.
+    rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
+    let p = ui.painter_at(rect);
+    p.text(
+        Pos2::new(rect.min.x + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "load",
+        FontId::monospace(9.5),
+        if u.sessions > 0 { fg } else { dim },
+    );
+    p.text(
+        Pos2::new(rect.max.x - 6.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{} sess  {}", u.sessions, crate::sessions_load::figures(&u)),
+        FontId::monospace(9.0),
+        dim,
+    );
+    resp.on_hover_text(format!(
+        "{} Claude Code session{} running now, each with everything it started\n\
+         (commands, builds, capped `pass run` scopes), summed:\n\
+         CPU as a share of the whole machine, resident memory{}.\n\
+         Every claude on this machine counts, in Giverny or not.",
+        u.sessions,
+        if u.sessions == 1 { "" } else { "s" },
+        if u.total.gpu_mb.is_some() {
+            ", GPU memory"
+        } else {
+            ""
+        }
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]

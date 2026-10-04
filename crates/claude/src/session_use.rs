@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 pub struct SessionUse {
     /// CPU, percent of the whole machine (every core busy is 100).
     pub cpu_pct: u32,
-    /// Resident memory summed over the session's processes, MiB.
+    /// Memory the session's processes really use, MiB: their proportional
+    /// sets summed (see [`with_real_memory`]).
     pub mem_mb: u64,
     /// GPU memory of the session's processes, MiB; `None` when the
     /// machine has no NVIDIA GPU (or its answer is not in yet).
@@ -45,8 +46,9 @@ pub struct Proc {
     /// (`utime + stime + cutime + cstime`), so a command that ended is
     /// still counted, in its parent.
     pub ticks: u64,
-    /// Resident set, KiB.
-    pub rss_kb: u64,
+    /// Memory, KiB: the stat line's resident set at first, the
+    /// proportional set ([`with_real_memory`]) once that is read.
+    pub mem_kb: u64,
 }
 
 /// `root` and every process below it.
@@ -68,12 +70,12 @@ pub fn subtree(procs: &[Proc], root: u32) -> HashSet<u32> {
     seen
 }
 
-/// `(ticks, rss KiB)` summed over the processes in `pids`.
+/// `(ticks, memory KiB)` summed over the processes in `pids`.
 pub fn sum(procs: &[Proc], pids: &HashSet<u32>) -> (u64, u64) {
     procs
         .iter()
         .filter(|p| pids.contains(&p.pid))
-        .fold((0, 0), |(t, m), p| (t + p.ticks, m + p.rss_kb))
+        .fold((0, 0), |(t, m), p| (t + p.ticks, m + p.mem_kb))
 }
 
 /// CPU spent between two readings, percent of `cores` cores, rounded and
@@ -196,10 +198,10 @@ pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
     let read = || {
         let procs = proc_table(page_kb);
         let tree = subtree(&procs, root);
-        let (ticks, rss_kb) = sum(&procs, &tree);
-        (tree, ticks, rss_kb, now_ms())
+        let (ticks, _) = sum(&procs, &tree);
+        (procs, tree, ticks, now_ms())
     };
-    let (tree, ticks, rss_kb, at) = read();
+    let (mut procs, tree, ticks, at) = read();
     let prev = read_cache(&cache).filter(|c| c.root == root && c.at_ms <= at);
     let (cpu_pct_now, write) = match prev {
         // Asked again at once (Claude Code redraws in bursts): too short
@@ -211,7 +213,7 @@ pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
         }
         _ => {
             std::thread::sleep(SHORT_SAMPLE);
-            let (_, ticks2, _, at2) = read();
+            let (_, _, ticks2, at2) = read();
             let pct = cpu_pct(ticks, ticks2, ticks_per_s, at2.saturating_sub(at), cores);
             (pct, Some((ticks2, at2, pct)))
         }
@@ -229,9 +231,11 @@ pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
         );
     }
     let gpu_mb = gpu::session_mb(&dir, &tree);
+    with_real_memory(&mut procs, &tree);
+    let (_, mem_kb) = sum(&procs, &tree);
     Some(SessionUse {
         cpu_pct: cpu_pct_now,
-        mem_mb: rss_kb.div_ceil(1024),
+        mem_mb: mem_kb.div_ceil(1024),
         gpu_mb,
     })
 }
@@ -330,8 +334,37 @@ pub fn parse_stat(pid: u32, stat: &str, page_kb: u64) -> Option<Proc> {
         pid,
         ppid: n(4)? as u32,
         ticks,
-        rss_kb: n(24).unwrap_or(0).max(0) as u64 * page_kb,
+        mem_kb: n(24).unwrap_or(0).max(0) as u64 * page_kb,
     })
+}
+
+/// The `Pss:` line of a `/proc/<pid>/smaps_rollup`, KiB.
+pub fn parse_pss(smaps_rollup: &str) -> Option<u64> {
+    smaps_rollup
+        .lines()
+        .find_map(|l| l.strip_prefix("Pss:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+}
+
+/// Give each process in `pids` the memory it really uses: its
+/// proportional set (`Pss` in `/proc/<pid>/smaps_rollup`), where every
+/// page shared with other processes is split between them. The resident
+/// set counts a shared page once per sharer — the code of every `node`,
+/// `rustc` or `bash`, shared libraries — so a tree's resident sets add up
+/// to more than it uses; its proportional sets add up to what it holds
+/// (pages shared with processes outside the tree count only by its
+/// share). A process whose file cannot be read (gone, or another user's)
+/// keeps its resident set.
+#[cfg(target_os = "linux")]
+fn with_real_memory(procs: &mut [Proc], pids: &HashSet<u32>) {
+    for p in procs.iter_mut().filter(|p| pids.contains(&p.pid)) {
+        if let Some(kb) = std::fs::read_to_string(format!("/proc/{}/smaps_rollup", p.pid))
+            .ok()
+            .and_then(|t| parse_pss(&t))
+        {
+            p.mem_kb = kb;
+        }
+    }
 }
 
 /// The last reading, kept between two status lines.
@@ -502,7 +535,7 @@ pub mod gpu {
     /// (`/mnt/c/…`, a score of them on a usual `$PATH`) are skipped: each
     /// look there costs milliseconds, and a Linux `nvidia-smi` is never
     /// there (WSL's own is in `/usr/lib/wsl/lib`).
-    fn find_on_path(name: &str) -> Option<PathBuf> {
+    pub(super) fn find_on_path(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .filter(|d| !d.starts_with("/mnt"))
@@ -512,16 +545,182 @@ pub mod gpu {
     }
 }
 
+// ---- every session at once: the sidebar's line ----------------------------
+
+/// The sessions in a process table: every claude with no claude above it.
+/// A claude started inside another session is part of that session's tree,
+/// so it is counted there and not again.
+pub fn session_roots(procs: &[Proc], is_claude: impl Fn(u32) -> bool) -> Vec<u32> {
+    let parent: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
+    let mut roots: Vec<u32> = procs
+        .iter()
+        .filter(|p| is_claude(p.pid))
+        .filter(|p| {
+            let mut pid = p.ppid;
+            for _ in 0..64 {
+                if pid <= 1 {
+                    return true;
+                }
+                if is_claude(pid) {
+                    return false;
+                }
+                match parent.get(&pid) {
+                    Some(&pp) if pp != pid => pid = pp,
+                    _ => return true,
+                }
+            }
+            true
+        })
+        .map(|p| p.pid)
+        .collect();
+    roots.sort_unstable();
+    roots
+}
+
+/// Every session's use summed, from one reading of the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllUse {
+    /// How many sessions are running.
+    pub sessions: usize,
+    pub total: SessionUse,
+}
+
+/// Sum `roots`' trees. CPU is each session's ticks since `prev` (the last
+/// reading's ticks per session) over `over_ms`; a session not in `prev`
+/// (just started, or the first reading) adds no CPU yet. Returns the sum
+/// and this reading's ticks per session, for the next one. GPU memory is
+/// summed only when `gpu` (MiB per pid) is given.
+pub fn sum_sessions(
+    procs: &[Proc],
+    roots: &[u32],
+    prev: &HashMap<u32, u64>,
+    over_ms: u64,
+    ticks_per_s: u64,
+    cores: u32,
+    gpu: Option<&HashMap<u32, u64>>,
+) -> (AllUse, HashMap<u32, u64>) {
+    let mut now = HashMap::new();
+    let (mut cpu, mut mem_kb, mut gpu_mb) = (0u32, 0u64, 0u64);
+    for &root in roots {
+        let tree = subtree(procs, root);
+        let (ticks, rss) = sum(procs, &tree);
+        if let Some(&then) = prev.get(&root) {
+            cpu += cpu_pct(then, ticks, ticks_per_s, over_ms, cores);
+        }
+        mem_kb += rss;
+        if let Some(g) = gpu {
+            gpu_mb += g
+                .iter()
+                .filter(|(pid, _)| tree.contains(pid))
+                .map(|(_, mb)| mb)
+                .sum::<u64>();
+        }
+        now.insert(root, ticks);
+    }
+    let all = AllUse {
+        sessions: roots.len(),
+        total: SessionUse {
+            cpu_pct: cpu.min(100),
+            mem_mb: mem_kb.div_ceil(1024),
+            gpu_mb: gpu.map(|_| gpu_mb),
+        },
+    };
+    (all, now)
+}
+
+/// Reads every session on the machine, again and again, from a thread of
+/// its own (it reads all of `/proc`, and asks `nvidia-smi`, which is slow).
+/// Every claude counts, in Giverny's tabs or not: the machine's load is
+/// what the line is about.
+#[derive(Debug, Default)]
+pub struct AllSessions {
+    prev: HashMap<u32, u64>,
+    prev_at: Option<std::time::Instant>,
+    gpu: Option<(HashMap<u32, u64>, std::time::Instant)>,
+}
+
+impl AllSessions {
+    /// How often `nvidia-smi` is asked again.
+    #[cfg(target_os = "linux")]
+    const GPU_EVERY: std::time::Duration = std::time::Duration::from_secs(6);
+
+    /// Every session's use now; `None` where there is no `/proc`. The
+    /// first reading has no CPU yet (nothing to diff against).
+    #[cfg(target_os = "linux")]
+    pub fn sample(&mut self) -> Option<AllUse> {
+        let ticks_per_s = sysconf(libc::_SC_CLK_TCK).unwrap_or(100);
+        let page_kb = sysconf(libc::_SC_PAGESIZE).unwrap_or(4096) / 1024;
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        let mut procs = proc_table(page_kb);
+        if procs.is_empty() {
+            return None;
+        }
+        let claudes: HashSet<u32> = procs
+            .iter()
+            .map(|p| p.pid)
+            .filter(|&pid| crate::lineage::proc_is_claude(pid))
+            .collect();
+        let roots = session_roots(&procs, |pid| claudes.contains(&pid));
+        let all: HashSet<u32> = roots.iter().flat_map(|&r| subtree(&procs, r)).collect();
+        with_real_memory(&mut procs, &all);
+        let now = std::time::Instant::now();
+        if self
+            .gpu
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= Self::GPU_EVERY)
+        {
+            self.gpu = gpu::find_on_path("nvidia-smi").and_then(|smi| {
+                let out = std::process::Command::new(smi)
+                    .args([
+                        "--query-compute-apps=pid,used_memory",
+                        "--format=csv,noheader,nounits",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())?;
+                Some((
+                    gpu::parse_compute_apps(&String::from_utf8_lossy(&out.stdout)),
+                    now,
+                ))
+            });
+        }
+        let over_ms = self
+            .prev_at
+            .map_or(0, |at| now.duration_since(at).as_millis() as u64);
+        let (all, ticks) = sum_sessions(
+            &procs,
+            &roots,
+            &self.prev,
+            over_ms,
+            ticks_per_s,
+            cores,
+            self.gpu.as_ref().map(|(m, _)| m),
+        );
+        self.prev = ticks;
+        self.prev_at = Some(now);
+        Some(all)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn sample(&mut self) -> Option<AllUse> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn p(pid: u32, ppid: u32, ticks: u64, rss_kb: u64) -> Proc {
+    fn p(pid: u32, ppid: u32, ticks: u64, mem_kb: u64) -> Proc {
         Proc {
             pid,
             ppid,
             ticks,
-            rss_kb,
+            mem_kb,
         }
     }
 
@@ -560,8 +759,31 @@ mod tests {
         let got = parse_stat(4242, line, 4).unwrap();
         assert_eq!(got.ppid, 20);
         assert_eq!(got.ticks, 150 + 50 + 7 + 3);
-        assert_eq!(got.rss_kb, 2048 * 4);
+        assert_eq!(got.mem_kb, 2048 * 4);
         assert_eq!(parse_stat(1, "garbage", 4), None);
+    }
+
+    #[test]
+    fn real_memory_is_the_proportional_set() {
+        let rollup = "55d0c0de0000-7ffd00000000 ---p 00000000 00:00 0  [rollup]\n\
+                      Rss:              460000 kB\n\
+                      Pss:              362123 kB\n\
+                      Pss_Anon:         300000 kB\n";
+        assert_eq!(parse_pss(rollup), Some(362_123));
+        assert_eq!(parse_pss("Rss: 5 kB\n"), None);
+    }
+
+    /// This process's proportional set is read, and it is at most its
+    /// resident set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_gets_its_proportional_set() {
+        let mut procs = proc_table(4);
+        let me = std::process::id();
+        let rss = procs.iter().find(|p| p.pid == me).unwrap().mem_kb;
+        with_real_memory(&mut procs, &HashSet::from([me]));
+        let pss = procs.iter().find(|p| p.pid == me).unwrap().mem_kb;
+        assert!(pss > 0 && pss <= rss + 1024, "pss {pss} rss {rss}");
     }
 
     #[test]
@@ -647,5 +869,53 @@ mod tests {
         let tree = subtree(&procs, mine.ppid);
         assert!(tree.contains(&me));
         assert!(sum(&procs, &tree).1 > 0, "some memory is resident");
+    }
+
+    #[test]
+    fn every_session_is_counted_once() {
+        // init → shell → claude A → bash → claude C (inside A)
+        //      → tmux → claude B → cargo
+        //      → claude D whose parent is gone
+        let procs = [
+            p(1, 0, 0, 0),
+            p(10, 1, 0, 1_000),
+            p(20, 10, 100, 300_000),
+            p(21, 20, 10, 2_000),
+            p(22, 21, 50, 200_000),
+            p(30, 1, 0, 1_000),
+            p(31, 30, 200, 400_000),
+            p(32, 31, 600, 1_000_000),
+            p(40, 999, 0, 100_000),
+        ];
+        let claude = |pid: u32| matches!(pid, 20 | 22 | 31 | 40);
+        assert_eq!(session_roots(&procs, claude), [20, 31, 40]);
+        let roots = session_roots(&procs, claude);
+        // First reading: memory, no CPU yet.
+        let (all, ticks) = sum_sessions(&procs, &roots, &HashMap::new(), 0, 100, 4, None);
+        assert_eq!(all.sessions, 3);
+        assert_eq!(all.total.cpu_pct, 0);
+        assert_eq!(
+            all.total.mem_mb,
+            (502_000u64 + 1_400_000 + 100_000).div_ceil(1024)
+        );
+        assert_eq!(all.total.gpu_mb, None);
+        assert_eq!(ticks[&20], 160);
+        assert_eq!(ticks[&31], 800);
+        // A second later: A spent one core-second, B two; D is new to
+        // the reading after it (not in prev) and adds none.
+        let prev = HashMap::from([(20, 60), (31, 600)]);
+        let gpu = HashMap::from([(32, 1024), (22, 512), (777, 9999)]);
+        let (all, _) = sum_sessions(&procs, &roots, &prev, 1_000, 100, 4, Some(&gpu));
+        assert_eq!(all.total.cpu_pct, 25 + 50);
+        assert_eq!(all.total.gpu_mb, Some(1536), "only the sessions' pids");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn all_sessions_reads_the_real_table() {
+        let mut s = AllSessions::default();
+        let first = s.sample().expect("a /proc");
+        assert_eq!(first.total.cpu_pct, 0);
+        assert!(s.sample().is_some());
     }
 }

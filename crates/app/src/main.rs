@@ -13,6 +13,7 @@ mod keymap;
 mod oom;
 mod overlays;
 mod rail;
+mod sessions_load;
 mod settings_ui;
 mod splash;
 mod taskbar;
