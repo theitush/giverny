@@ -404,6 +404,33 @@ fn scrub_inherited_claude_markers() {
     );
 }
 
+/// `giverny --help`, and what an unknown command prints to stderr.
+const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
+     USAGE:\n  giverny            launch the terminal\n  \
+     giverny doctor     diagnose Claude integration\n  \
+     giverny welcome [from-version]\n                     \
+     print the welcome screen\n  \
+     giverny update     check for a newer release\n  \
+     giverny install-desktop [--remove]\n                     \
+     install the desktop entry + icons (needed for the\n                     \
+     taskbar icon on Wayland)\n  \
+     giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+     FLAGS:\n  -V, --version  print the version\n  \
+     -h, --help     print this help";
+
+/// Is `arg`, the first argument, a command this build does not have?
+///
+/// The window takes no arguments, so anything past the known subcommands
+/// used to be ignored and the window opened anyway. A bare word is refused:
+/// it is a command, likely one newer than this binary. Left to open the
+/// window as before: flags (a launcher may add some, e.g. macOS's `-psn_…`),
+/// and anything that reads as a path — one that `exists`, or is spelled with
+/// a separator, `.` or `~` — in case a launcher or file manager hands one over.
+fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
+    !arg.is_empty() && !arg.starts_with(['-', '.', '~']) && !arg.contains(['/', '\\']) && !exists
+}
+
 fn main() -> eframe::Result {
     scrub_inherited_claude_markers();
 
@@ -454,22 +481,15 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!(
-                "giverny — a native terminal built around Claude Code\n\n\
-                 USAGE:\n  giverny            launch the terminal\n  \
-                 giverny doctor     diagnose Claude integration\n  \
-                 giverny welcome [from-version]\n                     \
-                 print the welcome screen\n  \
-                 giverny update     check for a newer release\n  \
-                 giverny install-desktop [--remove]\n                     \
-                 install the desktop entry + icons (needed for the\n                     \
-                 taskbar icon on Wayland)\n  \
-                 giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
-                 FLAGS:\n  -V, --version  print the version\n  \
-                 -h, --help     print this help"
-            );
+            println!("{USAGE}");
             return Ok(());
+        }
+        // A word this build does not know: a typo, or a subcommand added
+        // since it was built. It must not fall through to opening a window,
+        // which would also set up the Claude accounts from this binary.
+        Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
+            eprintln!("giverny: unknown command '{arg}'\n\n{USAGE}");
+            std::process::exit(2);
         }
         _ => {}
     }
@@ -921,6 +941,9 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+    /// The config could not be parsed at startup, so the accounts were not
+    /// set up from it; the first reload that parses does that.
+    accounts_unset: bool,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -956,6 +979,24 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
+/// Bring every account in line with the config at startup: auto mode.
+///
+/// Not when the config could not be parsed (`config_read` false). The app
+/// then runs on defaults, and following those would rewrite accounts against
+/// what the user configured. Once the file parses again, the hot reload
+/// applies what it says.
+fn set_up_accounts(claude: &mut claude_watch::ClaudeWatch, cfg: &config::Config, config_read: bool) {
+    if !config_read {
+        tracing::warn!(
+            "config.toml could not be parsed: Claude account settings left as they are until it is fixed"
+        );
+        return;
+    }
+    if cfg.claude.auto_mode {
+        claude.ensure_auto_mode();
+    }
+}
+
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if claude.skip_resume_summary {
@@ -1165,7 +1206,16 @@ impl App {
         see_through: bool,
     ) -> Self {
         let paths = Paths::default_dirs();
-        let mut cfg = config::load(paths.base());
+        // A config that cannot be parsed runs on defaults, but those are not
+        // what the user chose, so nothing is written into the accounts from
+        // them (see `set_up_accounts`).
+        let (mut cfg, config_read) = match config::load_checked(paths.base()) {
+            Ok(cfg) => (cfg, true),
+            Err(err) => {
+                tracing::error!("config.toml ignored ({err}); running on defaults");
+                (config::Config::default(), false)
+            }
+        };
         remember_env_accounts(&paths, &mut cfg);
         let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
@@ -1248,6 +1298,7 @@ impl App {
         let (claude, spooled) = claude_watch::ClaudeWatch::new(
             &paths.hook_spool(),
             &cfg.behavior.extra_profile_dirs,
+            config_read,
             move || wake_ctx.request_repaint(),
         );
         // Events spooled while the app was closed: keep session captures.
@@ -1332,6 +1383,7 @@ impl App {
             theme_tick: std::time::Instant::now(),
             cfg,
             last_cfg_check: Instant::now(),
+            accounts_unset: !config_read,
         };
         if let Some(z) = zoom {
             cc.egui_ctx.set_zoom_factor(z);
@@ -1339,9 +1391,7 @@ impl App {
         }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
-        if app.cfg.claude.auto_mode {
-            app.claude.ensure_auto_mode();
-        }
+        set_up_accounts(&mut app.claude, &app.cfg, config_read);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1618,7 +1668,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(ctx, config::load_or(self.paths.base(), &self.cfg));
+                        self.reload_config(ctx);
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -2310,8 +2360,22 @@ impl App {
             return;
         }
         self.cfg_mtime = mtime;
-        let cfg = config::load_or(self.paths.base(), &self.cfg);
-        self.apply_config(ctx, cfg);
+        self.reload_config(ctx);
+    }
+
+    /// Read `config.toml` again and apply it. A file that does not parse
+    /// changes nothing: the running settings stay.
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        match config::load_checked(self.paths.base()) {
+            Ok(cfg) => {
+                self.apply_config(ctx, cfg);
+                if std::mem::take(&mut self.accounts_unset) {
+                    tracing::info!("config.toml parses again: setting up Claude accounts");
+                    set_up_accounts(&mut self.claude, &self.cfg, true);
+                }
+            }
+            Err(err) => tracing::error!("config.toml ignored ({err}); keeping previous settings"),
+        }
     }
 
     /// Put a theme on the grid, on every open session, and on the chrome.
@@ -3708,8 +3772,72 @@ fn fresh_nonce(salt: u64) -> String {
 mod tests {
     use super::*;
 
-    /// A press on anything else — here a button, as a pane
-    /// row or the rail would be — takes egui's focus off the terminal, and
+    /// A bare word the binary does not know is a command, and is refused;
+    /// flags and anything that reads as a path still open the window.
+    #[test]
+    fn unknown_words_are_commands_but_paths_and_flags_are_not() {
+        for word in ["doctr", "upgrade", "plan", "help", "status-line"] {
+            assert!(is_unknown_subcommand(word, false), "{word}");
+        }
+        for not_a_command in [
+            "",
+            "-psn_0_12345",
+            "--some-flag",
+            "./here",
+            "..",
+            "~/Dev",
+            "/home/me/project",
+            "proj/sub",
+            "C:\\Users\\me",
+        ] {
+            assert!(
+                !is_unknown_subcommand(not_a_command, false),
+                "{not_a_command}"
+            );
+        }
+        // A bare word naming something that exists is a path, not a command.
+        assert!(!is_unknown_subcommand("project", true));
+    }
+
+    /// A config that cannot be parsed leaves every account as it was —
+    /// here one auto mode would otherwise be written into — while a parsed
+    /// one is followed.
+    #[test]
+    fn an_unparseable_config_leaves_the_accounts_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-unread-config-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        std::fs::create_dir_all(&account).unwrap();
+        let settings = account.join("settings.json");
+        let before = r#"{"theme":"dark"}"#;
+        std::fs::write(&settings, before).unwrap();
+
+        let mut watch = claude_watch::ClaudeWatch::for_tests();
+        watch.profiles = vec![giverny_claude::profiles::Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        }];
+        let mut auto = config::Config::default();
+        auto.claude.auto_mode = true;
+
+        set_up_accounts(&mut watch, &auto, false);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+
+        // The same settings from a config that was read: the account follows.
+        set_up_accounts(&mut watch, &auto, true);
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(after.contains("defaultMode"), "{after}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A press on anything else — here a button, as the rail
+    /// would be — takes egui's focus off the terminal, and
     /// the terminal is then told to take it back; a text field keeps it.
     #[test]
     fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
