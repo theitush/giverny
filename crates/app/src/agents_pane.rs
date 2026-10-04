@@ -758,36 +758,6 @@ fn lease_fact(l: &RowLease) -> String {
     }
 }
 
-/// The machine's leases against its limits, one quiet line: `leased 6G/22G
-/// RAM · 5/10 cores`, each GPU when there is one, and how many wait. `None`
-/// while nothing is leased or queued anywhere on the machine.
-pub fn capacity_line(ledger: &Ledger, limits: &Resolved) -> Option<String> {
-    if ledger.leases.is_empty() && ledger.queue.is_empty() {
-        return None;
-    }
-    let cpu: u32 = ledger.leases.iter().map(|l| l.cpu).sum();
-    let ram: u64 = ledger.leases.iter().map(|l| l.ram_mb).sum();
-    let mut s = format!(
-        "leased {}/{} RAM · {cpu}/{} cores",
-        mem(ram),
-        limits.ram,
-        limits.cpu_cores
-    );
-    for g in &limits.gpus {
-        let used: u64 = ledger
-            .leases
-            .iter()
-            .filter(|l| l.gpus.contains(&g.index))
-            .map(|l| l.vram_mb)
-            .sum();
-        s.push_str(&format!(" · gpu{} {}/{}", g.index, mem(used), g.vram));
-    }
-    if !ledger.queue.is_empty() {
-        s.push_str(&format!(" · {} queued", ledger.queue.len()));
-    }
-    Some(s)
-}
-
 // ------------------------------------------------------------- clicks ----
 
 /// What a click on a row names — everything the action behind it
@@ -885,9 +855,6 @@ pub struct Line {
 pub struct Table {
     pub lines: Vec<Line>,
     pub footer: Option<String>,
-    /// The machine's leases against its limits ([`capacity_line`]), drawn
-    /// dim at the bottom right; `None` while nothing is leased.
-    pub capacity: Option<String>,
 }
 
 impl Table {
@@ -945,7 +912,6 @@ pub fn build_with(
     Table {
         lines,
         footer: feed.and_then(|f| f.footer.clone()),
-        capacity: None,
     }
 }
 
@@ -1383,10 +1349,7 @@ pub fn show(
     if std::mem::take(&mut view.logs_due) {
         poll_logs(&mut view.logs, tracker.rows());
     }
-    let mut table = build_with(feed, tracker.rows(), now, &clock, &view.logs, panel.done());
-    table.capacity = ledger
-        .as_deref()
-        .and_then(|l| capacity_line(&l.ledger, l.limits.as_ref()?));
+    let table = build_with(feed, tracker.rows(), now, &clock, &view.logs, panel.done());
     if table.is_empty() {
         return (None, None);
     }
@@ -1408,9 +1371,7 @@ pub fn show(
     let cell = shared.cell_size(ui.ctx().pixels_per_point());
     // A little air around each row; a table, not a wall of grid.
     let row_h = (cell.y * 1.2).round().max(cell.y);
-    let rows = table.lines.len()
-        + usize::from(table.footer.is_some())
-        + usize::from(table.capacity.is_some());
+    let rows = table.lines.len() + usize::from(table.footer.is_some());
     let frame = pane_frame(shared.theme.bg);
     let want = pane_height(
         rows,
@@ -1553,8 +1514,6 @@ struct Cols {
     x_eta_end: usize,
     x_now: usize,
     x_tok_end: usize,
-    /// Where the last column shown ends.
-    x_end: usize,
 }
 
 impl Cols {
@@ -1621,7 +1580,6 @@ impl Cols {
         let x_eta_end = place(on.eta, ETA_W) + ETA_W;
         let x_now = place(on.now, NOW_W);
         let x_tok_end = place(on.tokens, TOK_W) + TOK_W;
-        let x_end = if any { x } else { cols };
         Cols {
             on: *on,
             idw,
@@ -1633,7 +1591,6 @@ impl Cols {
             x_eta_end,
             x_now,
             x_tok_end,
-            x_end,
         }
     }
 
@@ -1893,11 +1850,6 @@ fn draw_table(
         table.lines.iter().map(|l| layout.segments(l)).collect();
     if let Some(footer) = &table.footer {
         segs.push(vec![(0, cut(footer, cols))]);
-    }
-    // The machine's capacity, right-aligned under TOKENS.
-    if let Some(cap) = &table.capacity {
-        let cap = cut(cap, layout.x_end);
-        segs.push(vec![(right_at(layout.x_end, &cap), cap)]);
     }
     let texts: Vec<String> = segs.iter().map(|s| compose(s)).collect();
     let rects: Vec<egui::Rect> = segs
@@ -2240,9 +2192,6 @@ mod tests {
         let d = compose(&cols.segments(&t.lines[0]));
         assert!(!d.contains("one"), "{d}");
         assert!(d.starts_with("Running  g#1  "), "{d}");
-        // 7 + 3 + 17 + 8 + 10 + 28 + 6, a gap between each.
-        assert_eq!(cols.x_end, 91, "the table is narrower");
-        assert_eq!(all.x_end, 100);
 
         // Everything off: nothing drawn.
         let none = PaneColumns {
@@ -2940,34 +2889,6 @@ mod tests {
         );
         let q = g.rows[0].lease.as_ref().unwrap();
         assert_eq!(queued_note(q), "queued for 1c behind demo#12");
-    }
-
-    #[test]
-    fn the_capacity_line_is_leases_against_limits_and_quiet_when_idle() {
-        let limits = Resolved {
-            cpu_cores: 10,
-            ram: Mem(22 * 1024),
-            gpus: Vec::new(),
-        };
-        assert_eq!(capacity_line(&Ledger::default(), &limits), None);
-        let l = ledger(
-            r#"{"version":1,"leases":[
-              {"id":"a","session":"s","task":"a","cpu":3,"ram_mb":3072,"granted_at":0,"heartbeat_at":0},
-              {"id":"b","session":"s","task":"b","cpu":2,"ram_mb":3072,"granted_at":0,"heartbeat_at":0}],
-             "queue":[{"id":"c","session":"s","task":"c","cpu":1,"queued_at":0,"heartbeat_at":0}]}"#,
-        );
-        assert_eq!(
-            capacity_line(&l, &limits).as_deref(),
-            Some("leased 6G/22G RAM · 5/10 cores · 1 queued")
-        );
-        let gpu = Resolved {
-            gpus: vec![giverny_core::limits::GpuLimit {
-                index: 0,
-                vram: Mem(20 * 1024),
-            }],
-            ..limits
-        };
-        assert!(capacity_line(&l, &gpu).unwrap().contains("gpu0 0/20G"));
     }
 
     #[test]
