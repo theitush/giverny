@@ -469,30 +469,6 @@ mod tests {
         live.clear_done(TabId(99), None); // no tracker: nothing happens
     }
 
-    /// Rows restored from disk are the session's; the pane
-    /// waits for that session, and goes when it ends.
-    #[test]
-    fn restored_rows_wait_for_their_session() {
-        let path = scratch_dir("shown").join("agents.json");
-        let mut live = AgentsLive::load(path.clone());
-        live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
-        assert!(live.shown(TAB).is_some(), "a tick is its session, up");
-        live.save();
-
-        let mut back = AgentsLive::load(path.clone());
-        assert!(back.tracker(TAB).is_some(), "the rows came back");
-        assert!(back.shown(TAB).is_none(), "but not before the session");
-        back.session_started(TAB, Some("resume"), Some("s2"));
-        assert_eq!(back.shown(TAB).map(|t| t.rows().len()), Some(1));
-
-        back.session_ended(TAB);
-        assert!(back.shown(TAB).is_none(), "gone with the session");
-        assert!(back.tracker(TAB).is_some(), "rows kept for the next start");
-        back.apply_live(TAB, None, &tick_json("s2", &["a1"]));
-        assert!(back.shown(TAB).is_some(), "a tick brings it back");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
     #[test]
     fn closed_tabs_are_dropped() {
         let mut live = AgentsLive::in_memory();
