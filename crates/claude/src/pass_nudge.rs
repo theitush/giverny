@@ -25,6 +25,13 @@
 //! marker file under the feed directory's `eta-asked/`, not a feed: creating
 //! the session's feed would claim it from another writer.
 //!
+//! **Only where something tracks the worker.** Both asks are for the pane:
+//! they go out only when the session runs in a Giverny tab
+//! (`$GIVERNY_TAB_ID`, whose pane shows the worker) or has a registered pass
+//! (its feed is this writer's). Anywhere else — a plain `claude` in another
+//! terminal — the hook says nothing to a subagent, which would otherwise try
+//! a `giverny-pass eta` nobody reads and raise a permission prompt for it.
+//!
 //! **Messages and heartbeats**. On every call the hook also
 //! renews the calling session's ledger leases — `session_id` is the
 //! orchestrator's for its own calls and its workers' alike, so a busy pass
@@ -344,9 +351,16 @@ pub fn beat(ledger: &Path, session: &str, now: u64) -> bool {
     true
 }
 
-/// The hook's whole run: `payload` is its stdin, `dir` the feed directory.
+/// Whether this process runs in a Giverny tab: `$GIVERNY_TAB_ID`, which the
+/// app sets in a tab's shell and a hook inherits.
+pub fn in_giverny_tab() -> bool {
+    std::env::var("GIVERNY_TAB_ID").is_ok_and(|t| !t.trim().is_empty())
+}
+
+/// The hook's whole run: `payload` is its stdin, `dir` the feed directory,
+/// `in_tab` whether the session runs in a Giverny tab ([`in_giverny_tab`]).
 /// Returns what to print (the hook reply), or nothing.
-pub fn run(payload: &Value, dir: &Path, now: u64) -> Option<String> {
+pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
     let session = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -358,16 +372,21 @@ pub fn run(payload: &Value, dir: &Path, now: u64) -> Option<String> {
         // The orchestrator's own call: its messages, if any.
         return pass_inbox::deliver(dir, &ledger, session, now).map(|t| reply(&t));
     };
-    worker(&caller, dir, now)
+    worker(&caller, dir, now, in_tab)
 }
 
-/// A worker's call: the estimate asks.
-fn worker(caller: &Caller, dir: &Path, now: u64) -> Option<String> {
+/// A worker's call: the estimate asks, when something tracks it — a Giverny
+/// tab, or a registered pass (this writer's feed for the session).
+fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
+    let file = pass::file_for(dir, &caller.session);
+    let has_feed = file.is_file();
+    if !in_tab && !has_feed {
+        return None; // nothing would show this worker: ask it nothing
+    }
     let description = caller.description();
     let desc = description.as_deref();
-    let file = pass::file_for(dir, &caller.session);
     let mut doc = None;
-    if file.is_file() {
+    if has_feed {
         let _lock = Lock::take(&file).ok()?;
         let mut d: Value = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
         if pass::writer_of(&d) != Some(pass::WRITER) {
@@ -502,7 +521,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("giverny-nudge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // No agent_id: not a worker, and no file is even looked for.
-        assert_eq!(run(&json!({"session_id": "s1"}), &dir, T0), None);
+        assert_eq!(run(&json!({"session_id": "s1"}), &dir, T0, false), None);
         assert_eq!(
             Caller::of(&json!({"session_id": "s1", "agent_id": ""})),
             None
@@ -525,15 +544,19 @@ mod tests {
         let payload = json!({"session_id": "s1", "agent_id": "abc",
                              "transcript_path": t.display().to_string(),
                              "hook_event_name": "PostToolUse"});
-        assert_eq!(run(&payload, &feeds, T0 + MIN), None);
-        let out = run(&payload, &feeds, T0 + 6 * MIN).unwrap();
+        assert_eq!(run(&payload, &feeds, T0 + MIN, false), None);
+        let out = run(&payload, &feeds, T0 + 6 * MIN, false).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
         let ctx = v["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
         assert!(ctx.contains("giverny-pass eta demo#143"), "{ctx}");
-        assert_eq!(run(&payload, &feeds, T0 + 7 * MIN), None, "asked once");
+        assert_eq!(
+            run(&payload, &feeds, T0 + 7 * MIN, false),
+            None,
+            "asked once"
+        );
         let back = feed::read(&f).unwrap();
         assert_eq!(back.rows.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -574,7 +597,7 @@ mod tests {
         // No pass in this session at all: asked on the first call, once, and
         // no feed is made.
         let p = json!({"session_id": "s1", "agent_id": "w1", "hook_event_name": "PostToolUse"});
-        let out = run(&p, &feeds, T0).unwrap();
+        let out = run(&p, &feeds, T0, true).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let ctx = v["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -583,7 +606,7 @@ mod tests {
             ctx.contains("giverny-pass eta agent-w1 <minutes> --agent w1"),
             "{ctx}"
         );
-        assert_eq!(run(&p, &feeds, T0 + MIN), None, "asked once");
+        assert_eq!(run(&p, &feeds, T0 + MIN, true), None, "asked once");
         assert!(!feed::feed_path(&feeds, "s1").exists(), "no feed claimed");
 
         // A pass whose rows are other workers': this one is asked too.
@@ -595,10 +618,10 @@ mod tests {
         )
         .unwrap();
         let p2 = json!({"session_id": "s2", "agent_id": "w2"});
-        assert!(run(&p2, &feeds, T0).is_some());
+        assert!(run(&p2, &feeds, T0, true).is_some());
         // The pass's own worker is not: its row is its estimate.
         let p9 = json!({"session_id": "s2", "agent_id": "w9"});
-        assert_eq!(run(&p9, &feeds, T0 + MIN), None);
+        assert_eq!(run(&p9, &feeds, T0 + MIN, true), None);
 
         // Another writer's feed: none of ours to ask about.
         let g = feed::feed_path(&feeds, "s3");
@@ -608,7 +631,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run(&json!({"session_id": "s3", "agent_id": "w3"}), &feeds, T0),
+            run(
+                &json!({"session_id": "s3", "agent_id": "w3"}),
+                &feeds,
+                T0,
+                true
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outside_a_giverny_tab_only_a_pass_worker_is_asked() {
+        let dir = std::env::temp_dir().join(format!("giverny-nudge-notab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let feeds = dir.join("feeds");
+        // A plain `claude`, no pass: every call of every subagent is silent,
+        // and leaves nothing behind.
+        let p = json!({"session_id": "s1", "agent_id": "w1", "hook_event_name": "PostToolUse"});
+        for k in 0..10 {
+            assert_eq!(run(&p, &feeds, T0 + k * MIN, false), None);
+        }
+        assert!(!feeds.join(ASKED_DIR).exists(), "no marker made");
+        assert!(!feed::feed_path(&feeds, "s1").exists(), "no feed made");
+        // The same worker in a tab is asked.
+        assert!(run(&p, &feeds, T0 + 11 * MIN, true).is_some());
+
+        // A registered pass outside a tab: its row's worker gets the
+        // re-estimate ask, a row-less one the first ask.
+        let f = feed::feed_path(&feeds, "s2");
+        pass::write(
+            &f,
+            &doc(json!([{"key": "a", "stage": "running",
+                         "started": pass::stamp(T0), "agent_id": "w9"}])),
+        )
+        .unwrap();
+        let p9 = json!({"session_id": "s2", "agent_id": "w9"});
+        assert_eq!(run(&p9, &feeds, T0 + MIN, false), None, "too early");
+        let ask = run(&p9, &feeds, T0 + 6 * MIN, false).unwrap();
+        assert!(ask.contains("giverny-pass eta a <minutes left>"), "{ask}");
+        let p2 = json!({"session_id": "s2", "agent_id": "w2"});
+        let ask = run(&p2, &feeds, T0, false).unwrap();
+        assert!(ask.contains("--agent w2"), "{ask}");
+
+        // Another writer's feed is no pass of ours: still silent.
+        let g = feed::feed_path(&feeds, "s3");
+        std::fs::write(
+            &g,
+            r#"{"version":1,"session":"s3","writer":"other/status-writer","rows":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run(
+                &json!({"session_id": "s3", "agent_id": "w3"}),
+                &feeds,
+                T0,
+                false
+            ),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);

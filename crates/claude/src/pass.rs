@@ -94,7 +94,8 @@ guesses have fared. A worker's first `eta` on a running task (its re-estimate,
 made after reading the code) is scored and corrected the same way, against the
 working time that was still to come. `accuracy` shows each track. `nudge` is the
 plugin's hook: it asks a worker to re-estimate five minutes into its task, and
-a subagent with no row, on its first call, for a first estimate.
+a subagent with no row, on its first call, for a first estimate — only in a
+Giverny tab or a session with a pass, and silent anywhere else.
 
 Resources: one ledger for every session on the machine, at
 <feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
@@ -1420,7 +1421,12 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         let mut input = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
         if let Some(payload) = crate::pass_nudge::payload_of(&input)
-            && let Some(out) = crate::pass_nudge::run(&payload, &feed::feed_dir(), now_ms())
+            && let Some(out) = crate::pass_nudge::run(
+                &payload,
+                &feed::feed_dir(),
+                now_ms(),
+                crate::pass_nudge::in_giverny_tab(),
+            )
         {
             println!("{out}");
         }
@@ -2103,7 +2109,7 @@ mod tests {
 
     /// The hook's reply for `session`'s own call, as text.
     fn hook(dir: &Path, session: &str, now: u64) -> Option<String> {
-        let out = crate::pass_nudge::run(&json!({"session_id": session}), dir, now)?;
+        let out = crate::pass_nudge::run(&json!({"session_id": session}), dir, now, true)?;
         let v: Value = serde_json::from_str(&out).unwrap();
         Some(
             v["hookSpecificOutput"]["additionalContext"]
@@ -2255,7 +2261,7 @@ mod tests {
         for k in 1..=25 {
             let worker = json!({"session_id": "busy", "agent_id": "w1"});
             let now = T0 + k * MIN;
-            let _ = crate::pass_nudge::run(&worker, &dir, now);
+            let _ = crate::pass_nudge::run(&worker, &dir, now, true);
             let _ = hook(&dir, "busy", now + 1000);
         }
         let shown = run_as(&dir, "other", "resources", T0 + 25 * MIN).0;

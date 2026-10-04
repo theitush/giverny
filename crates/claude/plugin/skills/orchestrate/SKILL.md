@@ -166,8 +166,9 @@ with no plan behind it: run `giverny-pass start <task> --eta <minutes> --title "
 before the spawn (and `--agent <id>` once you know it). That row has the worker's
 whole time and an estimate corrected from the history. If you forgot, Giverny asks
 the worker itself on its first tool call for a first estimate, which it reports
-with `giverny-pass eta <task> <minutes> --agent <id>`. Any subagent gets that ask,
-pass or no pass, so the pane shows no worker without an ETA for long; but the time
+with `giverny-pass eta <task> <minutes> --agent <id>`. Any subagent in a Giverny tab
+gets that ask, pass or no pass, so the pane shows no worker without an ETA for long
+(outside a tab, only a session with a pass asks: nothing else would show the worker); but the time
 before the ask is not counted, and the figure is not corrected from the history.
 
 ## 3. While it runs
