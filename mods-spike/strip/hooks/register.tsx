@@ -28,7 +28,7 @@ const dur = (ms: number) => {
 
 async function save($: EngineInterface, why: string) {
   const t = await $.clock.now()
-  await $.fs.write(ROWS, JSON.stringify({ updatedMs: t, why, rows: Object.fromEntries(rows) }, null, 1))
+  await $.fs.write(ROWS, JSON.stringify({ updatedMs: t, why, rows: Object.fromEntries(rows), queue: queue.map(q => ({ name: q.name, etaMs: (q.secs + 20) * 1000 })) }, null, 1))
   $.ui.invalidate('ui.render')
 }
 
@@ -147,6 +147,10 @@ export const register: Register = on => {
     const t = await $.clock.now()
     const done = [...rows.values()].filter(r => r.status !== 'running')
     const running = [...rows.values()].filter(r => r.status === 'running').length
+    // mode "tail": Next up and Done ride under the strip's last row instead, so
+    // the band only stands in while no worker runs (the strip is gone then).
+    const mode = (await $.fs.read(`${HERE}/state/mode`).catch(() => '')).trim()
+    if (mode === 'tail' && running > 0) return next(e)
     return (
       <Box flexDirection="column">
         <Box>

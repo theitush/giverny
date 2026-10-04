@@ -89,6 +89,26 @@ else:
         c = ours(t)
         if c is not None:
             out.append({'id': t['id'], 'content': c})
+    if mode == 'tail' and out:
+        # Next up and Done as extra lines of the last running row: the strip
+        # draws them under itself, so the whole pass reads as one block.
+        tail = []
+        q = data.get('queue', [])
+        if q:
+            tail.append(f'{DIM}── next up {len(q)}{R}')
+            for x in q[:4]:
+                tail.append(f'{c256(67)}◌{R} {x["name"]} {DIM}~{dur(x["etaMs"])}{R}')
+            if len(q) > 4:
+                tail.append(f'{DIM}  +{len(q) - 4} more{R}')
+        done = [r for r in rows.values() if r.get('status') != 'running']
+        if done:
+            tail.append(f'{DIM}── done {len(done)}{R}')
+            for r in done[-4:]:
+                took = r.get('endedMs', now) - r.get('startedMs', now)
+                mark = f'{c256(28)}✓{R}' if r.get('status') == 'done' else f'{c256(160)}✗{R}'
+                tail.append(f'{mark} {r.get("name")} {DIM}took {dur(took)} · {r.get("tokens", 0) / 1000:.1f}k tok{R}')
+        if tail:
+            out[-1]['content'] += '\n' + '\n'.join(tail)
     if mode == 'reorder':
         out.reverse()
     elif mode == 'drop1' and out:
