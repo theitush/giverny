@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj
+
+
+❯ /ss-pass 3 3 90
+  ⎿  strip-spike: queued 3, width 3
+
+❯ /ss-install
+  ⎿  strip-spike: wrote subagentStatusLine into
+     /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pass · 3 running ↓ in the strip · 0 next · 0 done                                                                                                           [-]
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 3%  ·  wk 26%
+  ⏸ manual mode on · ← 2 agents
+
+  ● main
+  ◯ strip-spike:worker  t1-parser                                                                                                          57s · ↓ 5.7k tokens
+  ◯ strip-spike:worker  t2-renderer                                                                                                        57s · ↓ 5.7k tokens
+  ◯ strip-spike:worker  I'll run these bash commands one after another:                                                                    56s · ↓ 5.9k tokens

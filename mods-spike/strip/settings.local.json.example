@@ -1,0 +1,8 @@
+{
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "/home/ita/giverny/.claude/worktrees/task-186-mod-spike/mods-spike/strip/bin/strip-rows.py"
+  },
+  "enabledPlugins": { "giverny@giverny": false },
+  "permissions": { "allow": ["Bash(echo:*)", "Bash(sleep:*)"] }
+}

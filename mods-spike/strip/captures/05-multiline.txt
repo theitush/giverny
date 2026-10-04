@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj
+
+
+❯ /ss-pass 3 3 90
+  ⎿  strip-spike: queued 3, width 3
+
+❯ /ss-install
+  ⎿  strip-spike: wrote subagentStatusLine into
+     /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pass · 2 running ↓ in the strip · 0 next · 1 done                                                                                                           [-]
+  ✓ done t1-parser took 1m38s · 1.5k tok
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 3%  ·  wk 26%
+  ⏸ manual mode on · /tasks to see subagents · ← 2 agents
+
+  ● main
+  ◯ line-one of 1
+    line-two of 1
+    line-three of 1
+  ◯ line-one of 2
+    line-two of 2
+    line-three of 2

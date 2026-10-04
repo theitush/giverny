@@ -1,0 +1,5 @@
+{
+  "name": "strip-spike",
+  "version": "0.0.1",
+  "description": "Spike for giverny#186: keep Claude Code's native subagent strip, rewrite its rows with our data through subagentStatusLine, Next up / Done in an AbovePrompt band."
+}

@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj
+
+
+❯ /ss-pass 9 7 240
+  ⎿  strip-spike: queued 9, width 7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pass · 7 running ↓ in the strip · 1 next · 1 done                                                                                                           [-]
+  ◌ next t9-land ~6m20s
+  ✓ done t1-parser took 4m08s · 1.5k tok
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 26%  ·  session: 0  ·  subagents: 37.6k  ·  total: 37.6k
+  ⏸ manual mode on · /tasks to see subagents · ← 2 agents
+
+  ● main
+  ◯ t2-renderer testing 4m08s █████████░ ETA 26s 5.9k tok
+  ◯ t3-ledger testing 4m08s █████████░ ETA 41s 6.2k tok
+  ◯ t4-eta-model testing 4m08s ████████░░ ETA 56s 5.9k tok
+  ◯ t5-band testing 4m08s ████████░░ ETA 1m11s 5.8k tok
+  ◯ t6-inbox testing 4m08s ███████░░░ ETA 1m26s 5.9k tok
+  ↓ 2 more

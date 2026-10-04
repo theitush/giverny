@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj
+
+
+❯ Run these Bash commands one after another, each as its own Bash call:
+  1. echo reading; sleep 90
+  2. touch perm-probe.txt
+  3. echo coding; sleep 90
+  4. echo testing; sleep 90
+     Then reply "DONE t3-ledger".
+
+  Ran 1 shell command
+
+❯ when done, also run: echo hello-from-main
+
+● Running 2 shell commands · 8s…
+  ⎿  $ echo coding; sleep 90 (9s · 2 lines)
+
+
+
+
+
+
+
+✻ Recombobulating… (1m 59s · ↓ 6.0k tokens)
+  ⎿  Tip: Use /feedback to help us improve!
+Pass · 7 running ↓ in the strip · 2 next · 0 done                                                                                                           [-]
+  ◌ next t8-brief ~6m05s
+  ◌ next t9-land ~6m20s
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── t3-ledger ─
+❯ Run these Bash commands one after another, each as its own Bash call:
+  1. echo reading; sleep 90
+  2. touch perm-probe.txt
+  3. echo coding; sleep 90
+  4. echo testing; sleep 90
+  Then reply "DONE t3-ledger".
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 4%  ·  wk 26%  ·  session: 0  ·  subagents: 37.6k  ·  total: 37.6k
+  ⏸ manual mode on
+
+  ◯ main
+  ◯ t1-parser coding 1m58s █████░░░░░ ETA 2m21s 5.8k tok
+  ◯ t2-renderer coding 1m58s ████░░░░░░ ETA 2m36s 5.7k tok
+  ● t3-ledger coding 1m58s ████░░░░░░ ETA 2m51s 6.0k tok
+  ◯ t4-eta-model coding 1m58s ████░░░░░░ ETA 3m06s 5.7k tok
+  ◯ t5-band coding 1m58s ████░░░░░░ ETA 3m21s 5.7k tok
+  ↓ 2 more

@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.289[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj[39m
+
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/ss-pass 3 3 90[39m [49m
+[38;5;246m  ⎿  [39mstrip-spike: queued 3, width 3
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/ss-install[39m [49m
+[38;5;246m  ⎿  [39mstrip-spike: wrote subagentStatusLine into
+     /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1mPass[0m[38;5;246m · 2 running ↓ in the strip · 0 next · 1 done[39m                                                                                                           [38;5;246m[-][39m
+[38;5;34m  ✓ done [39mt1-parser[38;5;246m took 1m38s · 1.5k tok[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mHaiku 4.5  ·  5h 3%  ·  wk 26%[39m
+  [38;5;246m⏸ manual mode on · /tasks to see subagents · ← 2 agents[39m
+
+[1m  ● main[0m
+[38;5;246m  ◯ line-one of 1[39m
+    [38;5;246mline-two of 1[39m
+    [38;5;246mline-three of 1[39m
+[38;5;246m  ◯ line-one of 2[39m
+    [38;5;246mline-two of 2[39m
+    [38;5;246mline-three of 2[39m

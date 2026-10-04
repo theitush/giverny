@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj
+
+
+❯ /ss-pass 3 3 90
+  ⎿  strip-spike: queued 3, width 3
+
+❯ /ss-install
+  ⎿  strip-spike: wrote subagentStatusLine into
+     /tmp/claude-1000/-home-ita-giverny/4e7ea0b2-678e-465d-95fc-26ef0ec42f82/scratchpad/strip-proj/.claude/settings.local.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pass · 3 running ↓ in the strip · 0 next · 0 done                                                                                                           [-]
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5  ·  5h 3%  ·  wk 26%
+  ⏸ manual mode on · ← 2 agents
+
+  ● main
+  ◯ t1-parser coding 1m00s █████░░░░░ ETA 49s 920 tok
+  ◯ t2-renderer coding 1m00s █████░░░░░ ETA 1m04s 906 tok
+  ◯ t3-ledger coding 1m00s ████░░░░░░ ETA 1m19s 1.2k tok
