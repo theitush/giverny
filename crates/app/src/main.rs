@@ -409,6 +409,39 @@ fn scrub_inherited_claude_markers() {
     );
 }
 
+/// `giverny --help`, and what an unknown command prints to stderr.
+const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
+     USAGE:\n  giverny            launch the terminal\n  \
+     giverny doctor     diagnose Claude integration\n  \
+     giverny welcome [from-version]\n                     \
+     print the welcome screen\n  \
+     giverny update     check for a newer release\n  \
+     giverny transcript [--follow] <agent jsonl>\n                     \
+     print a worker's transcript, readable (and follow it)\n  \
+     giverny pass plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
+     write the agents pane's feed (see `giverny pass --help`)\n  \
+     giverny install-desktop [--remove]\n                     \
+     install the desktop entry + icons (needed for the\n                     \
+     taskbar icon on Wayland)\n  \
+     giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny statusline (internal) Claude Code statusline entrypoint\n  \
+     giverny relay --subagent-line\n                     \
+     (internal) Claude Code subagentStatusLine entrypoint\n\n\
+     FLAGS:\n  -V, --version  print the version\n  \
+     -h, --help     print this help";
+
+/// Is `arg`, the first argument, a command this build does not have?
+///
+/// The window takes no arguments, so anything past the known subcommands
+/// used to be ignored and the window opened anyway. A bare word is refused:
+/// it is a command, likely one newer than this binary. Left to open the
+/// window as before: flags (a launcher may add some, e.g. macOS's `-psn_…`),
+/// and anything that reads as a path — one that `exists`, or is spelled with
+/// a separator, `.` or `~` — in case a launcher or file manager hands one over.
+fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
+    !arg.is_empty() && !arg.starts_with(['-', '.', '~']) && !arg.contains(['/', '\\']) && !exists
+}
+
 fn main() -> eframe::Result {
     // The agents pane's feed writer: what the `giverny` plugin's orchestrate
     // skill runs (as `giverny-pass`) to plan, start, re-estimate and land a
@@ -500,28 +533,16 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!(
-                "giverny — a native terminal built around Claude Code\n\n\
-                 USAGE:\n  giverny            launch the terminal\n  \
-                 giverny doctor     diagnose Claude integration\n  \
-                 giverny welcome [from-version]\n                     \
-                 print the welcome screen\n  \
-                 giverny update     check for a newer release\n  \
-                 giverny transcript [--follow] <agent jsonl>\n                     \
-                 print a worker's transcript, readable (and follow it)\n  \
-                 giverny pass plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
-                 write the agents pane's feed (see `giverny pass --help`)\n  \
-                 giverny install-desktop [--remove]\n                     \
-                 install the desktop entry + icons (needed for the\n                     \
-                 taskbar icon on Wayland)\n  \
-                 giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n  \
-                 giverny relay --subagent-line\n                     \
-                 (internal) Claude Code subagentStatusLine entrypoint\n\n\
-                 FLAGS:\n  -V, --version  print the version\n  \
-                 -h, --help     print this help"
-            );
+            println!("{USAGE}");
             return Ok(());
+        }
+        // A word this build does not know: most likely a subcommand added
+        // since it was built (`giverny pass …` run on an older binary). It
+        // must not fall through to opening a window, which would also set up
+        // the Claude accounts from this binary.
+        Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
+            eprintln!("giverny: unknown command '{arg}'\n\n{USAGE}");
+            std::process::exit(2);
         }
         _ => {}
     }
@@ -1071,6 +1092,9 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+    /// The config could not be parsed at startup, so the accounts were not
+    /// set up from it; the first reload that parses does that.
+    accounts_unset: bool,
 }
 
 /// A tab's Claude Code being walked to a worker's view or back to main:
@@ -1188,6 +1212,39 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 /// declares — and read as off in a build that does not declare it.
 fn agents_pane_on(cfg: &config::Config) -> bool {
     bool_setting(cfg, "claude.agents_pane")
+}
+
+/// Can account setup follow this config? Not when a value it reads — the
+/// `[claude]` section — is one that did not fit and was stood in for.
+fn accounts_readable(parsed: &config::Parsed) -> bool {
+    !parsed.invalid_under("claude")
+}
+
+/// Bring every account in line with the config at startup: auto mode, and
+/// the agents pane's subagent line and plugin.
+///
+/// Not when the config could not be parsed, or its `[claude]` values could
+/// not (`config_read` false). The app then runs on defaults there, and following those would rewrite accounts against
+/// what the user configured: turn the agents pane's subagent line and plugin
+/// on where they were turned off, or (in a build whose default is off) strip
+/// them from every account. Once the file parses again, the hot reload
+/// applies what it says.
+fn set_up_accounts(
+    claude: &mut claude_watch::ClaudeWatch,
+    cfg: &config::Config,
+    config_read: bool,
+    base: &Path,
+) {
+    if !config_read {
+        tracing::warn!(
+            "config.toml could not be parsed: Claude account settings left as they are until it is fixed"
+        );
+        return;
+    }
+    if cfg.claude.auto_mode {
+        claude.ensure_auto_mode();
+    }
+    claude.set_agents_pane(agents_pane_on(cfg), base);
 }
 
 fn bool_setting(cfg: &config::Config, key: &str) -> bool {
@@ -1413,7 +1470,21 @@ impl App {
         see_through: bool,
     ) -> Self {
         let paths = Paths::default_dirs();
-        let mut cfg = config::load(paths.base());
+        // A config that cannot be parsed runs on defaults, but those are not
+        // what the user chose, so nothing is written into the accounts from
+        // them (see `set_up_accounts`). Nor when only a value account setup
+        // reads is unusable: one bad value is otherwise just left out.
+        let (mut cfg, config_read) =
+            match config::load_checked(paths.base(), &config::Config::default()) {
+                Ok(parsed) => {
+                    let read = accounts_readable(&parsed);
+                    (parsed.config, read)
+                }
+                Err(err) => {
+                    tracing::error!("config.toml ignored ({err}); running on defaults");
+                    (config::Config::default(), false)
+                }
+            };
         remember_env_accounts(&paths, &mut cfg);
         let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
@@ -1496,6 +1567,7 @@ impl App {
         let (claude, spooled) = claude_watch::ClaudeWatch::new(
             &paths.hook_spool(),
             &cfg.behavior.extra_profile_dirs,
+            config_read,
             move || wake_ctx.request_repaint(),
         );
         // Events spooled while the app was closed: keep session captures.
@@ -1592,6 +1664,7 @@ impl App {
             theme_tick: std::time::Instant::now(),
             cfg,
             last_cfg_check: Instant::now(),
+            accounts_unset: !config_read,
         };
         if let Some(z) = zoom {
             cc.egui_ctx.set_zoom_factor(z);
@@ -1599,11 +1672,7 @@ impl App {
         }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
-        if app.cfg.claude.auto_mode {
-            app.claude.ensure_auto_mode();
-        }
-        app.claude
-            .set_agents_pane(agents_pane_on(&app.cfg), app.paths.base());
+        set_up_accounts(&mut app.claude, &app.cfg, config_read, app.paths.base());
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1881,7 +1950,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(ctx, config::load_or(self.paths.base(), &self.cfg));
+                        self.reload_config(ctx);
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -2577,8 +2646,23 @@ impl App {
             return;
         }
         self.cfg_mtime = mtime;
-        let cfg = config::load_or(self.paths.base(), &self.cfg);
-        self.apply_config(ctx, cfg);
+        self.reload_config(ctx);
+    }
+
+    /// Read `config.toml` again and apply it. A file that does not parse
+    /// changes nothing: the running settings stay.
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        match config::load_checked(self.paths.base(), &self.cfg) {
+            Ok(parsed) => {
+                let read = accounts_readable(&parsed);
+                self.apply_config(ctx, parsed.config);
+                if read && std::mem::take(&mut self.accounts_unset) {
+                    tracing::info!("config.toml parses again: setting up Claude accounts");
+                    set_up_accounts(&mut self.claude, &self.cfg, true, self.paths.base());
+                }
+            }
+            Err(err) => tracing::error!("config.toml ignored ({err}); keeping previous settings"),
+        }
     }
 
     /// Put a theme on the grid, on every open session, and on the chrome.
@@ -5151,6 +5235,86 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare word the binary does not know is a command, and is refused;
+    /// flags and anything that reads as a path still open the window.
+    #[test]
+    fn unknown_words_are_commands_but_paths_and_flags_are_not() {
+        for word in ["pss", "pass2", "plan", "help", "subagent-line"] {
+            assert!(is_unknown_subcommand(word, false), "{word}");
+        }
+        for not_a_command in [
+            "",
+            "-psn_0_12345",
+            "--some-flag",
+            "./here",
+            "..",
+            "~/Dev",
+            "/home/me/project",
+            "proj/sub",
+            "C:\\Users\\me",
+        ] {
+            assert!(
+                !is_unknown_subcommand(not_a_command, false),
+                "{not_a_command}"
+            );
+        }
+        // A bare word naming something that exists is a path, not a command.
+        assert!(!is_unknown_subcommand("project", true));
+    }
+
+    /// One bad value elsewhere still lets account setup follow the config; a
+    /// bad value in what it reads does not.
+    #[test]
+    fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
+        let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
+        assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
+        assert!(accounts_readable(&parse("[claude]\nagents_pane = false\n")));
+        assert!(!accounts_readable(&parse(
+            "[claude]\nagents_pane = \"no\"\n"
+        )));
+        assert!(!accounts_readable(&parse("claude = 5\n")));
+    }
+
+    /// A config that cannot be parsed leaves every account as it was — here
+    /// one read as having the agents pane off, which would otherwise strip the
+    /// account's `subagentStatusLine` — while a parsed one is followed.
+    #[test]
+    fn an_unparseable_config_leaves_the_accounts_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-unread-config-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        let base = root.join("giverny");
+        std::fs::create_dir_all(&account).unwrap();
+        let settings = account.join("settings.json");
+        let before = r#"{"subagentStatusLine":{"type":"command","command":"/opt/giverny relay --subagent-line"},"permissions":{"defaultMode":"default"}}"#;
+        std::fs::write(&settings, before).unwrap();
+
+        let mut watch = claude_watch::ClaudeWatch::for_tests();
+        watch.profiles = vec![giverny_claude::profiles::Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        }];
+        let mut pane_off = config::Config::default();
+        pane_off.claude.agents_pane = false;
+        assert!(!agents_pane_on(&pane_off));
+
+        set_up_accounts(&mut watch, &pane_off, false, &base);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+        assert!(!base.exists(), "nothing written for the plugin either");
+
+        // The same settings from a config that was read: the account follows.
+        set_up_accounts(&mut watch, &pane_off, true, &base);
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(!after.contains("subagentStatusLine"), "{after}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A press on anything else — here a button, as a pane
     /// row or the rail would be — takes egui's focus off the terminal, and
