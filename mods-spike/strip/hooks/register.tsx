@@ -150,7 +150,7 @@ export const register: Register = on => {
     // mode "tail": Next up and Done ride under the strip's last row instead, so
     // the band only stands in while no worker runs (the strip is gone then).
     const mode = (await $.fs.read(`${HERE}/state/mode`).catch(() => '')).trim()
-    if (mode === 'tail' && running > 0) return next(e)
+    if ((mode === 'tail' || mode === 'hint') && running > 0) return next(e)
     return (
       <Box flexDirection="column">
         <Box>
@@ -172,6 +172,34 @@ export const register: Register = on => {
             <Text dimColor> took {dur((r.endedMs ?? t) - r.startedMs)} · {(r.tokens / 1000).toFixed(1)}k tok</Text>
           </Text>
         ))}
+      </Box>
+    )
+  })
+
+  // mode "hint": Next up and Done drawn in the hint line under the prompt,
+  // directly above the native strip, as the mod's own lines (not a worker's).
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const mode = (await $.fs.read(`${HERE}/state/mode`).catch(() => '')).trim()
+    const running = [...rows.values()].filter(r => r.status === 'running').length
+    if (mode !== 'hint' || running === 0) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const t = await $.clock.now()
+    const done = [...rows.values()].filter(r => r.status !== 'running')
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>── next up {queue.length}</Text>
+        {queue.slice(0, 4).map((q, i) => (
+          <Text key={`hq:${i}`} wrap="truncate-end">
+            <Text color="#5f87af">◌ </Text><Text>{q.name}</Text><Text dimColor> ~{dur((q.secs + 20) * 1000)}</Text>
+          </Text>
+        ))}
+        <Text dimColor>── done {done.length}</Text>
+        {done.slice(-4).map(r => (
+          <Text key={`hd:${r.name}`} wrap="truncate-end">
+            <Text color="#008700">✓ </Text><Text>{r.name}</Text><Text dimColor> took {dur((r.endedMs ?? t) - r.startedMs)}</Text>
+          </Text>
+        ))}
+        <Text dimColor>── running ↓</Text>
       </Box>
     )
   })
