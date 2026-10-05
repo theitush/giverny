@@ -105,6 +105,10 @@ pub struct FeedRow {
     pub eta_delta_s: Option<i64>,
     pub landing: Option<String>,
     pub tokens: Option<u64>,
+    /// What a reused worker's task spent, written when it landed: its
+    /// turns' added tokens from its start to its landing. A Done row's
+    /// count, frozen there, whatever the worker does next.
+    pub task_tokens: Option<u64>,
     pub group: Option<String>,
     pub brief: Option<PathBuf>,
     pub open: Option<String>,
@@ -386,6 +390,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         eta_delta_s: i64_field(v, "eta_delta_s"),
         landing: str_field(v, "landing"),
         tokens: u64_field(v, "tokens"),
+        task_tokens: u64_field(v, "task_tokens"),
         group: str_field(v, "group"),
         brief: str_field(v, "brief").map(PathBuf::from),
         open: str_field(v, "open"),
@@ -595,6 +600,26 @@ pub fn names_key(text: &str, key: &str) -> bool {
     })
 }
 
+/// When worker `l` was spawned: the earlier of Claude Code's `startTime` and
+/// its transcript's first turn. A worker woken by a message is listed afresh
+/// with its `startTime` moved to the message; its first turn stays put.
+pub fn spawned_at<L: LiveAgent>(l: &L, log: Option<&WorkerLog>) -> Option<u64> {
+    let first = log.and_then(WorkerLog::first_ms);
+    match (l.started_ms(), first) {
+        (Some(s), Some(f)) => Some(s.min(f)),
+        (s, f) => s.or(f),
+    }
+}
+
+/// Do keys `a` and `b` name one task: either names the other, or they are
+/// one number with and without its `#` (`#204` and the pass row `204`).
+fn same_task(a: &str, b: &str) -> bool {
+    names_key(a, b)
+        || names_key(b, a)
+        || a.strip_prefix('#').is_some_and(|n| n == b)
+        || b.strip_prefix('#').is_some_and(|n| n == a)
+}
+
 /// How long after its worker a feed row must have begun to be a later task
 /// of that worker, keeping its own clock, rather than the spawn the writer
 /// stamped a little early. A writer stamps `started` seconds
@@ -630,6 +655,11 @@ pub struct PaneRow<'a, L> {
     /// that took its tasks at once): rows of one batch share the worker's
     /// cells and are dittoed, rows of different ones never are.
     pub batch: usize,
+    /// When its worker was spawned: the earlier of Claude Code's
+    /// `startTime` and the worker's first turn. Claude Code lists a worker
+    /// woken by a message afresh, its `startTime` moved to that message, so
+    /// its own figure alone would put every task the worker held after it.
+    pub worker_ms: Option<u64>,
 }
 
 impl<L> PaneRow<'_, L> {
@@ -646,6 +676,7 @@ impl<L> PaneRow<'_, L> {
             task_tokens: None,
             after_key: None,
             batch: 0,
+            worker_ms: None,
         }
     }
 }
@@ -693,7 +724,9 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     }
 
     fn row_started_ms(&self) -> Option<u64> {
-        let worker = self.live.and_then(|l| l.started_ms());
+        let worker = self
+            .worker_ms
+            .or_else(|| self.live.and_then(|l| l.started_ms()));
         let Some(f) = self.feed else { return worker };
         let moved = moved_ms(f);
         if let Some(h) = self.handed_ms {
@@ -743,6 +776,12 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     /// (Claude Code's own, as its agents view shows it), else what the feed
     /// wrote.
     pub fn tokens(&self) -> Option<u64> {
+        // Counted when it landed: frozen there.
+        if self.stage == Stage::Done
+            && let Some(t) = self.feed.and_then(|f| f.task_tokens)
+        {
+            return Some(t);
+        }
         if let Some(t) = self.task_tokens {
             return t;
         }
@@ -826,6 +865,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
                 stage: if finished { Stage::Done } else { f.stage() },
                 feed: Some(f),
                 live,
+                worker_ms: live.and_then(|l| spawned_at(l, log(l.agent_id()))),
                 ..PaneRow::bare()
             }
         })
@@ -847,6 +887,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
                 },
                 feed: None,
                 live: Some(l),
+                worker_ms: spawned_at(l, log(l.agent_id())),
                 ..PaneRow::bare()
             });
         }
@@ -907,8 +948,12 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
 ///   is Done there — `start <next> --agent <worker>` is the whole hand-off.
 /// - **Tokens per task.** Each Done batch shows what its turns added, from
 ///   its start (the first from the worker's first turn) to the next batch's;
-///   a Running row keeps the worker's live count. The Done rows of a worker
-///   add up to everything it added, and nothing is counted twice.
+///   a Running later batch, what it added from its own start. The Done rows
+///   of a worker add up to everything it added, and nothing is counted
+///   twice. A count `giverny pass` froze on the row when it landed
+///   (`task_tokens`) is drawn in place of either. The worker's start is its
+///   spawn ([`spawned_at`]), never the later `startTime` Claude Code lists a
+///   worker woken by a message with.
 /// - **Queued on a worker.** A Planned row whose `agent_id` names a worker
 ///   running another task is queued after it.
 fn queue<'w, L: LiveAgent>(
@@ -923,7 +968,7 @@ fn queue<'w, L: LiveAgent>(
             continue;
         }
         let Some(w) = log(l.agent_id()) else { continue };
-        let worker = l.started_ms().unwrap_or(0);
+        let worker = r.worker_ms.unwrap_or(0);
         let Some(m) = w
             .messages()
             .iter()
@@ -983,7 +1028,10 @@ fn queue<'w, L: LiveAgent>(
                         r.next_key = next_key.clone();
                         r.stage = Stage::Done;
                     }
-                    if r.stage == Stage::Done {
+                    // A later task, still running, counts from its own
+                    // start too, never the turns of the tasks before it;
+                    // with no transcript to count, the worker's live count.
+                    if r.stage == Stage::Done || (k > 0 && w.is_some()) {
                         r.task_tokens = Some(w.map(|w| w.added(from, to)));
                     }
                 }
@@ -1030,7 +1078,7 @@ pub fn with_handoffs<'w, L: LiveAgent>(
     let mut out: Option<Feed> = None;
     for l in live {
         let Some(w) = log(l.agent_id()) else { continue };
-        let worker = l.started_ms().unwrap_or(0);
+        let worker = spawned_at(l, Some(w)).unwrap_or(0);
         let handed: Vec<(u64, String)> = w
             .messages()
             .iter()
@@ -1074,10 +1122,7 @@ pub fn with_handoffs<'w, L: LiveAgent>(
             held.push(key);
         }
         for (at, key) in handed {
-            if held
-                .iter()
-                .any(|k| names_key(&key, k) || names_key(k, &key))
-            {
+            if held.iter().any(|k| same_task(&key, k)) {
                 continue;
             }
             let title = w
@@ -1085,7 +1130,7 @@ pub fn with_handoffs<'w, L: LiveAgent>(
                 .iter()
                 .find(|m| m.at_ms == at)
                 .and_then(|m| m.title.clone());
-            match doc.rows.iter_mut().find(|f| names_key(&key, &f.key)) {
+            match doc.rows.iter_mut().find(|f| same_task(&key, &f.key)) {
                 Some(f) => {
                     let waiting = matches!(f.stage(), Stage::Planned | Stage::Running)
                         && f.agent_id.as_deref().is_none_or(|a| a == id);

@@ -173,6 +173,17 @@ impl WorkerLog {
         &self.messages
     }
 
+    /// When the worker first wrote: its first turn or the first message it
+    /// was sent, whichever came first.
+    pub fn first_ms(&self) -> Option<u64> {
+        let turn = self.turns.iter().map(|t| t.at_ms).min();
+        let msg = self.messages.iter().map(|m| m.at_ms).min();
+        match (turn, msg) {
+            (Some(t), Some(m)) => Some(t.min(m)),
+            (t, m) => t.or(m),
+        }
+    }
+
     /// The tokens the turns in `[from_ms, to_ms)` added (`to_ms` `None`:
     /// every turn from `from_ms` on).
     pub fn added(&self, from_ms: u64, to_ms: Option<u64>) -> u64 {

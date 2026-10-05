@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
+use crate::worker_log::WorkerLog;
 use crate::{feed, pass_history, resources};
 
 /// Marks the files this writer owns, so it never rewrites another's.
@@ -546,9 +547,8 @@ fn needs_description(doc: &Value, now: u64) -> bool {
         })
 }
 
-/// The spawn description of `session`'s subagent `agent`, from its
-/// `agent-<id>.meta.json` under the Claude config dir the session runs in.
-fn agent_description(cfg: Option<&Path>, session: &str, agent: &str) -> Option<String> {
+/// `session`'s `subagents/` dir, under the Claude config dir it runs in.
+fn session_subagents(cfg: Option<&Path>, session: &str) -> Option<PathBuf> {
     let cfg = cfg.map(Path::to_path_buf).or_else(|| {
         ["CLAUDE_CONFIG_DIR", "GIVERNY_PROFILE_DIR"]
             .into_iter()
@@ -556,7 +556,73 @@ fn agent_description(cfg: Option<&Path>, session: &str, agent: &str) -> Option<S
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
     })?;
-    let dir = crate::subagents::subagents_dir(&cfg, session)?;
+    crate::subagents::subagents_dir(&cfg, session)
+}
+
+/// The transcript of `session`'s subagent `agent`, read whole.
+fn worker_log(cfg: Option<&Path>, session: &str, agent: &str) -> Option<WorkerLog> {
+    let dir = session_subagents(cfg, session)?;
+    let mut log = WorkerLog::new(crate::subagents::agent_transcript(&dir, agent));
+    log.poll().then_some(log)
+}
+
+/// Freeze what each row that just landed spent, when its worker held other
+/// tasks before or after it: `task_tokens`, its worker's turns from the
+/// row's start (the worker's first turn, for its first task) to its landing.
+/// The pane draws that figure for the Done row from then on, whatever the
+/// worker does next. A worker that held one task keeps its own count, and
+/// a row whose transcript cannot be read is left for the pane to split.
+/// A worker's task that landed before it was handed the next (`land`, then
+/// `start <next> --agent <worker>`) is frozen at that hand-off: `handed` is
+/// that worker.
+fn freeze_tokens(
+    doc: &mut Value,
+    before: &[String],
+    handed: Option<&str>,
+    log: impl Fn(&str) -> Option<WorkerLog>,
+) {
+    let Some(rows) = doc.get_mut("rows").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let began = |r: &Map<String, Value>| ms_of(r, "spawned").or_else(|| ms_of(r, "started"));
+    let starts: Vec<(String, u64)> = rows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|r| stage_of(r) != Some(feed::Stage::Planned))
+        .filter_map(|r| Some((r.get("agent_id")?.as_str()?.to_string(), began(r)?)))
+        .collect();
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+        let agent_now = handed.is_some() && row.get("agent_id").and_then(Value::as_str) == handed;
+        if stage_of(row) != Some(feed::Stage::Done)
+            || (before.iter().any(|k| k == key) && !agent_now)
+            || row.contains_key("task_tokens")
+        {
+            continue;
+        }
+        let (Some(agent), Some(start), Some(end)) = (
+            row.get("agent_id").and_then(Value::as_str),
+            began(row),
+            ms_of(row, "ended"),
+        ) else {
+            continue;
+        };
+        let other = |far: &dyn Fn(u64) -> bool| starts.iter().any(|(a, s)| a == agent && far(*s));
+        let earlier = other(&|s| s.saturating_add(feed::LATER_TASK_MS) <= start);
+        let later = other(&|s| start.saturating_add(feed::LATER_TASK_MS) <= s);
+        if !earlier && !later {
+            continue;
+        }
+        let Some(w) = log(agent) else { continue };
+        let from = if earlier { start } else { 0 };
+        row.insert("task_tokens".into(), json!(w.added(from, Some(end))));
+    }
+}
+
+/// The spawn description of `session`'s subagent `agent`, from its
+/// `agent-<id>.meta.json` under the Claude config dir the session runs in.
+fn agent_description(cfg: Option<&Path>, session: &str, agent: &str) -> Option<String> {
+    let dir = session_subagents(cfg, session)?;
     crate::subagents::read_meta(&dir, agent).description
 }
 
@@ -1267,6 +1333,13 @@ fn run_feed(
             }
             let before = done_keys(&doc);
             let msg = apply(&mut doc, cmd, &flags, now)?;
+            let handed = match cmd {
+                Cmd::Start(_) => flags.agent.as_deref(),
+                _ => None,
+            };
+            freeze_tokens(&mut doc, &before, handed, |agent| {
+                worker_log(flags.claude_dir.as_deref(), session, agent)
+            });
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
             if let Some(h) = &history {
                 learn(&doc, &before, session, h);
@@ -2511,6 +2584,116 @@ mod tests {
         assert!(!said.contains("handed on"), "{said}");
         let f = read_feed_of(&dir, "s1");
         assert_eq!(f.rows[0].stage(), feed::Stage::Running, "not w2's task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A billed reply at `at` that added `n` tokens (all of it fresh input).
+    fn turn(id: &str, at: u64, n: u64) -> String {
+        json!({"type": "assistant", "timestamp": stamp(at),
+            "message": {"id": id, "model": "m",
+                "usage": {"input_tokens": n, "output_tokens": 0}}})
+        .to_string()
+    }
+
+    fn task_tokens(f: &feed::Feed, key: &str) -> Option<u64> {
+        f.rows.iter().find(|r| r.key == key).unwrap().task_tokens
+    }
+
+    /// One worker, three tasks in turn: the first started before the worker
+    /// had an id and handed on by its spawn description, the second landed
+    /// by `land`, the third still running. Each landed row keeps what its own
+    /// span spent, written when it landed, and the worker's later turns
+    /// never reach it.
+    #[test]
+    fn a_landed_task_of_a_reused_worker_keeps_its_own_count() {
+        let dir = scratch("frozen");
+        run_cfg(&dir, "s1", "start parse-fix", None, T0);
+        let cfg = spawned(&dir, "s1", "w1", "parse-fix: the parser");
+        let log = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join("agent-w1.jsonl");
+        let write = |lines: &[String]| std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let mut lines = vec![turn("a", T0 + MIN, 1_000), turn("b", T0 + 10 * MIN, 2_000)];
+        write(&lines);
+
+        let (said, _) = run_cfg(
+            &dir,
+            "s1",
+            "start lex-fix --agent w1",
+            Some(&cfg),
+            T0 + 15 * MIN,
+        );
+        assert!(said.contains("handed on from parse-fix"), "{said}");
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(
+            task_tokens(&f, "parse-fix"),
+            Some(3_000),
+            "its turns, to the hand-off"
+        );
+        assert_eq!(task_tokens(&f, "lex-fix"), None, "still running");
+
+        lines.push(turn("c", T0 + 20 * MIN, 400));
+        write(&lines);
+        run_cfg(&dir, "s1", "land lex-fix", Some(&cfg), T0 + 25 * MIN);
+        lines.push(turn("d", T0 + 30 * MIN, 50_000));
+        write(&lines);
+        run_cfg(
+            &dir,
+            "s1",
+            "start emit-fix --agent w1",
+            Some(&cfg),
+            T0 + 30 * MIN,
+        );
+        lines.push(turn("e", T0 + 40 * MIN, 70_000));
+        write(&lines);
+        run_cfg(&dir, "s1", "eta emit-fix 5", Some(&cfg), T0 + 41 * MIN);
+
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(task_tokens(&f, "parse-fix"), Some(3_000));
+        assert_eq!(
+            task_tokens(&f, "lex-fix"),
+            Some(400),
+            "from its start to its landing"
+        );
+        assert_eq!(task_tokens(&f, "emit-fix"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worker's only task keeps its worker's own count; one landed before
+    /// the worker was handed its next is frozen at that hand-off.
+    #[test]
+    fn a_task_landed_before_its_worker_was_reused_is_frozen_at_the_hand_off() {
+        let dir = scratch("frozen-later");
+        run_cfg(&dir, "s1", "start a --agent w1", None, T0);
+        let cfg = spawned(&dir, "s1", "w1", "a: first");
+        let log = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join("agent-w1.jsonl");
+        std::fs::write(&log, turn("a", T0 + MIN, 1_000) + "\n").unwrap();
+        run_cfg(&dir, "s1", "land a", Some(&cfg), T0 + 10 * MIN);
+        assert_eq!(
+            task_tokens(&read_feed_of(&dir, "s1"), "a"),
+            None,
+            "one task so far"
+        );
+        std::fs::write(
+            &log,
+            [turn("a", T0 + MIN, 1_000), turn("b", T0 + 12 * MIN, 9_000)].join("\n") + "\n",
+        )
+        .unwrap();
+        run_cfg(&dir, "s1", "start b --agent w1", Some(&cfg), T0 + 20 * MIN);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(
+            task_tokens(&f, "a"),
+            Some(1_000),
+            "to its landing, not the hand-off"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
