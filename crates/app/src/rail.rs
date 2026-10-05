@@ -100,6 +100,9 @@ struct RowData {
     sub: String,
     active: bool,
     exited: bool,
+    /// Its shell has been spawned. A tab restored from a previous run has
+    /// none until it is first focused.
+    started: bool,
     color: Color32,
     claude: ClaudeState,
     /// A background shell is alive while Claude itself waits at its prompt.
@@ -196,6 +199,7 @@ fn row_data(
         sub,
         active: app.ws.active == Some(t.id),
         exited: t.exited,
+        started: app.rt.contains_key(&t.id),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.background),
@@ -1004,9 +1008,13 @@ fn tab_row(
         }
         ClaudeState::None => {
             // A plain shell, which most tabs are most of the time: a small
-            // green dot for a live shell, an outline once it has exited.
+            // green dot for a live shell, an outline once it has exited, and
+            // a small dim dot for a restored tab whose shell has not started
+            // yet: green there would claim a shell that is not running.
             if row.exited {
                 p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
+            } else if !row.started {
+                p.circle_filled(dot, 2.5, dim);
             } else {
                 p.circle_filled(dot, 3.5, c.green);
             }
