@@ -1475,7 +1475,7 @@ fn usage_panel(
 }
 
 /// Under the account bars: what Giverny runs now, summed —
-/// `23% CPU  2.0G RAM  40% GPU`, in the bars' lettering. Hovering says
+/// `23% CPU  2.0G RAM  40% GPU`, centred, in the bars' lettering. Hovering says
 /// what is counted. Returns where the line above it goes.
 fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim: Color32) -> f32 {
     let y = ui.cursor().min.y + 0.5;
@@ -1486,8 +1486,8 @@ fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim:
     // what is shown: the figures end at the visible edge.
     rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
     ui.painter_at(rect).text(
-        Pos2::new(rect.min.x + 12.0, rect.center().y),
-        Align2::LEFT_CENTER,
+        rect.center(),
+        Align2::CENTER_CENTER,
         crate::sessions_load::figures(&r.total),
         FontId::monospace(9.5),
         dim,
