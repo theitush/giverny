@@ -380,9 +380,14 @@ pub fn run_statusline(spool: &Path) {
     }
     // No 5h or week usage here: Giverny's sidebar shows both.
     parts.extend(statusline_tokens(&payload));
-    // The whole session's CPU, memory and GPU now, at the right edge.
+    // The whole session's CPU, memory and GPU now, at the right edge: the
+    // running Giverny's last reading, the same figure its agents pane and
+    // sidebar are parts and sums of; measured here only without one (a
+    // plain terminal, or a claude outside its tabs).
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
-    let used = crate::session_use::measure(session_id)
+    let used = crate::use_reading::session_now()
+        .map(|u| u.session())
+        .or_else(|| crate::session_use::measure(session_id))
         .map(|u| crate::session_use::segments(&u).join(crate::session_use::SEP))
         .unwrap_or_default();
     let width = crate::session_use::line_width(std::env::var("COLUMNS").ok().as_deref());

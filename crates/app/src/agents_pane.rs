@@ -57,7 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
 use giverny_claude::resources::{self, Ledger};
-use giverny_claude::run_live::{self, RunLive, TaskLive};
+use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::session_use;
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
@@ -431,9 +431,6 @@ pub struct LedgerView {
     /// `[orchestrator.limits]` resolved for this machine; `None` when the
     /// config could not be read.
     pub limits: Option<Resolved>,
-    /// What each task's running `giverny pass run` commands use now,
-    /// sampled with the ledger.
-    pub live: Vec<TaskLive>,
 }
 
 /// The ledger, read by a thread of its own: the read takes the
@@ -475,7 +472,6 @@ impl LedgerWatch {
 
 fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
     let mut machine: Option<(Machine, Instant)> = None;
-    let mut sampler = run_live::Sampler::default();
     loop {
         let now = now_ms();
         if now.saturating_sub(shared.wanted_ms.load(Ordering::Relaxed)) <= LEDGER_IDLE_MS {
@@ -487,8 +483,7 @@ fn read_ledger_loop(shared: &LedgerShared, ctx: &egui::Context) {
                     m
                 }
             };
-            if let Some(mut view) = read_ledger(&m, now) {
-                view.live = sampler.sample(&run_live::runs_dir(&ledger_file()), now);
+            if let Some(view) = read_ledger(&m, now) {
                 let mut snap = match shared.snap.lock() {
                     Ok(s) => s,
                     Err(p) => p.into_inner(),
@@ -517,11 +512,7 @@ fn read_ledger(machine: &Machine, now: u64) -> Option<LedgerView> {
     };
     ledger.expire(now);
     let limits = Limits::load().ok().map(|l| l.resolve(machine));
-    Some(LedgerView {
-        ledger,
-        limits,
-        live: Vec::new(),
-    })
+    Some(LedgerView { ledger, limits })
 }
 
 fn ledger_file() -> PathBuf {
@@ -1357,10 +1348,12 @@ pub fn show(
             sessions.extend(f.aliases.iter().map(String::as_str));
             sessions.extend(tracker.session_id.as_deref());
             sessions.extend(tracker.aliases.iter().map(String::as_str));
+            // What each row's commands use: the app's one reading, the
+            // one the status line and the sidebar show parts and sums of.
             Some(with_live(
                 with_ledger(f, &sessions, &l.ledger),
                 &sessions,
-                &l.live,
+                &crate::sessions_load::runs(ui.ctx()),
             ))
         }
         _ => None,
