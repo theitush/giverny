@@ -52,6 +52,6 @@
   "statusLine": {
     "command": "/home/ita/giverny/.claude/statusline",
     "type": "command",
-    "refreshInterval": 5
+    "refreshInterval": 1
   }
 }
