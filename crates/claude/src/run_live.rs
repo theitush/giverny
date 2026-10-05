@@ -38,6 +38,23 @@ pub struct TaskLive {
     pub session: String,
     pub task: String,
     pub live: RunLive,
+    /// The worker whose commands the run is under, when one is: that
+    /// worker's own figure already holds the run's.
+    pub agent: Option<String>,
+}
+
+impl RunLive {
+    /// Two disjoint sets of processes' use together.
+    pub fn plus(self, other: RunLive) -> RunLive {
+        RunLive {
+            cpu_pct: (self.cpu_pct + other.cpu_pct).min(100),
+            mem_mb: self.mem_mb + other.mem_mb,
+            gpu_mb: match (self.gpu_mb, other.gpu_mb) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+        }
+    }
 }
 
 /// `<ledger dir>/runs`.

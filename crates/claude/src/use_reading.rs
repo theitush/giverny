@@ -65,6 +65,10 @@ pub struct RunUse {
     pub task: String,
     #[serde(rename = "use")]
     pub used: Use,
+    /// The worker whose commands the run's processes are under, when one
+    /// is ([`crate::worker_pids`]): that worker's figure already holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// One pass.
@@ -78,6 +82,10 @@ pub struct Reading {
     /// Every claude under the app, by pid.
     pub sessions: BTreeMap<u32, Use>,
     pub runs: Vec<RunUse>,
+    /// Each worker's processes (the Bash commands it started, with all
+    /// under them), by agent id; part of its session's.
+    #[serde(default)]
+    pub agents: BTreeMap<String, Use>,
 }
 
 /// What one pass knows about every process, and the GPU.
@@ -128,15 +136,16 @@ impl Table {
         }
     }
 
-    /// The reading: `app`'s tree, each claude in it (`is_claude`), and
-    /// each run's processes (`runs`: session, task, its scope's pids;
-    /// several scopes of one task are summed).
+    /// The reading: `app`'s tree, each claude in it (`is_claude`), each
+    /// run's processes (`runs`: session, task, its scope's pids; several
+    /// scopes of one task are summed), and each worker's (`agents`).
     pub fn reading(
         &self,
         at_ms: u64,
         app: u32,
         is_claude: impl Fn(u32) -> bool,
         runs: &[(String, String, HashSet<u32>)],
+        agents: &HashMap<String, HashSet<u32>>,
     ) -> Reading {
         let tree = subtree(&self.procs, app);
         let sessions = tree
@@ -155,6 +164,10 @@ impl Table {
         let runs = by_task
             .into_iter()
             .map(|((session, task), pids)| RunUse {
+                agent: agents
+                    .iter()
+                    .find(|(_, a)| !a.is_disjoint(&pids))
+                    .map(|(id, _)| id.clone()),
                 session,
                 task,
                 used: self.use_of(&pids),
@@ -166,6 +179,10 @@ impl Table {
             total: self.use_of(&tree),
             sessions,
             runs,
+            agents: agents
+                .iter()
+                .map(|(id, pids)| (id.clone(), self.use_of(pids)))
+                .collect(),
         }
     }
 }
@@ -332,6 +349,7 @@ pub struct Sampler {
     pmon: Option<Pmon>,
     pmon_child: Option<std::process::Child>,
     pmon_at: Option<std::time::Instant>,
+    workers: crate::worker_pids::Attributor,
 }
 
 impl Sampler {
@@ -382,7 +400,10 @@ impl Sampler {
             .copied()
             .filter(|&p| crate::lineage::proc_is_claude(p))
             .collect();
-        Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs))
+        let agents = self
+            .workers
+            .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
+        Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -505,7 +526,7 @@ mod tests {
         let gpu = HashMap::from([(141, 2048), (220, 512), (900, 4096)]);
         let t = table(after, Some(&seen(&before)), Some(gpu));
         let runs = vec![("s1".into(), "demo#1".into(), HashSet::from([140, 141]))];
-        let r = t.reading(42, 100, |p| p == 120 || p == 220, &runs);
+        let r = t.reading(42, 100, |p| p == 120 || p == 220, &runs, &HashMap::new());
         let a = r.sessions[&120];
         let b = r.sessions[&220];
         let run = r.runs[0].used;
@@ -529,10 +550,33 @@ mod tests {
         assert!(!r.sessions.contains_key(&900));
     }
 
+    /// A worker's commands: within its session, and a `pass run` it
+    /// started within it (named as its, so a row adds it once).
+    #[test]
+    fn a_worker_is_within_its_session_and_its_run_within_it() {
+        let before = machine();
+        let mut after = machine();
+        for q in &mut after {
+            q.ticks += if q.pid == 141 { 150 } else { 5 };
+        }
+        let t = table(after, Some(&seen(&before)), None);
+        // The worker started bash 130 (cargo 140 → rustc 141 under it).
+        let agents = HashMap::from([("a1".to_string(), HashSet::from([130, 140, 141]))]);
+        let runs = vec![("s1".into(), "demo#1".into(), HashSet::from([140, 141]))];
+        let r = t.reading(42, 100, |p| p == 120, &runs, &agents);
+        let (run, worker, session) = (r.runs[0].used, r.agents["a1"], r.sessions[&120]);
+        assert_eq!(r.runs[0].agent.as_deref(), Some("a1"));
+        assert_eq!((run.cpu_pct, worker.cpu_pct, session.cpu_pct), (39, 40, 41));
+        for (part, whole) in [(run, worker), (worker, session), (session, r.total)] {
+            assert!(part.cpu_pct <= whole.cpu_pct, "{part:?} {whole:?}");
+            assert!(part.mem_mb <= whole.mem_mb, "{part:?} {whole:?}");
+        }
+    }
+
     #[test]
     fn the_first_pass_has_no_cpu() {
         let t = table(machine(), None, None);
-        let r = t.reading(1, 100, |p| p == 120, &[]);
+        let r = t.reading(1, 100, |p| p == 120, &[], &HashMap::new());
         assert_eq!(r.total.cpu_pct, 0);
         assert!(r.total.mem_mb > 0);
         assert_eq!(r.total.gpu_mb, None);
@@ -592,7 +636,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("giverny.use.json");
         let t = table(machine(), None, None);
-        let r = t.reading(10_000, 100, |p| p == 120, &[]);
+        let r = t.reading(10_000, 100, |p| p == 120, &[], &HashMap::new());
         write_snapshot(&path, &r).unwrap();
         let a = r.sessions[&120];
         assert_eq!(session_from(&path, 120, 10_500), Some(a));
@@ -624,5 +668,37 @@ mod tests {
         assert_eq!(first.total.cpu_pct, 0);
         assert!(first.total.mem_mb > 0);
         assert!(s.sample(me, &none).is_some());
+    }
+}
+
+/// `GIVERNY_USE_DUMP=<app pid> cargo test -p giverny-claude -- --ignored
+/// dump_a_live_tree --nocapture`: take passes over a running app's tree,
+/// read-only, and print what each costs and what it credits.
+#[cfg(all(test, target_os = "linux"))]
+mod dump {
+    #[test]
+    #[ignore]
+    fn dump_a_live_tree() {
+        let Some(app) = std::env::var("GIVERNY_USE_DUMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let runs =
+            crate::run_live::runs_dir(&crate::resources::ledger_path(&crate::feed::feed_dir()));
+        let mut s = super::Sampler::default();
+        for pass in 0..6 {
+            let t = std::time::Instant::now();
+            let r = s.sample(app, &runs).expect("a /proc");
+            let took = t.elapsed();
+            let procs = crate::session_use::subtree(&crate::session_use::proc_table(4), app).len();
+            println!(
+                "pass {pass}: {:.1} ms over {procs} processes\n{}",
+                took.as_secs_f64() * 1000.0,
+                serde_json::to_string_pretty(&r).unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 }

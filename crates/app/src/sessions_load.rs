@@ -9,6 +9,7 @@
 //! ([`giverny_claude::use_reading::snapshot_path`]). So a row never shows
 //! more than its session, nor a session more than the total.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -45,12 +46,8 @@ pub fn latest(ctx: &egui::Context) -> Option<Arc<Reading>> {
         .clone()
 }
 
-/// The last pass's runs, as the agents pane keys them.
-pub fn runs(ctx: &egui::Context) -> Vec<TaskLive> {
-    latest(ctx).map_or_else(Vec::new, |r| task_lives(&r))
-}
-
-fn task_lives(r: &Reading) -> Vec<TaskLive> {
+/// A reading's runs, as the agents pane keys them.
+pub fn task_lives(r: &Reading) -> Vec<TaskLive> {
     r.runs
         .iter()
         .map(|run| TaskLive {
@@ -61,6 +58,24 @@ fn task_lives(r: &Reading) -> Vec<TaskLive> {
                 mem_mb: run.used.mem_mb,
                 gpu_mb: run.used.gpu_mb,
             },
+            agent: run.agent.clone(),
+        })
+        .collect()
+}
+
+/// A reading's workers' use, by agent id, as the agents pane shows it.
+pub fn workers(r: &Reading) -> HashMap<String, RunLive> {
+    r.agents
+        .iter()
+        .map(|(id, u)| {
+            (
+                id.clone(),
+                RunLive {
+                    cpu_pct: u.cpu_pct,
+                    mem_mb: u.mem_mb,
+                    gpu_mb: u.gpu_mb,
+                },
+            )
         })
         .collect()
 }
@@ -138,6 +153,7 @@ mod tests {
                 session: "s1".into(),
                 task: "demo#1".into(),
                 used,
+                agent: Some("a1".into()),
             }],
             ..Reading::default()
         };
@@ -146,6 +162,7 @@ mod tests {
             (t[0].session.as_str(), t[0].task.as_str()),
             ("s1", "demo#1")
         );
+        assert_eq!(t[0].agent.as_deref(), Some("a1"));
         assert_eq!(
             t[0].live,
             RunLive {

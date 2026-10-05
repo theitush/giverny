@@ -393,7 +393,14 @@ pub struct Clock<'a> {
     pub holds: &'a [Hold],
     pub limit: Option<&'a Limit>,
     pub tz: jiff::tz::TimeZone,
+    /// Each worker's processes' use now, by agent id: what a Running row
+    /// with no feed figure of its own shows.
+    pub workers: &'a HashMap<String, RunLive>,
 }
+
+/// No worker measured.
+static NO_WORKERS: std::sync::LazyLock<HashMap<String, RunLive>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 #[cfg(any(test, debug_assertions))]
 impl Clock<'_> {
@@ -402,6 +409,7 @@ impl Clock<'_> {
             holds: &[],
             limit: None,
             tz: jiff::tz::TimeZone::system(),
+            workers: &NO_WORKERS,
         }
     }
 }
@@ -527,6 +535,33 @@ pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
             .iter()
             .find(|t| t.task == row.key && sessions.contains(&t.session.as_str()))
             .map(|t| t.live);
+    }
+    feed
+}
+
+/// `feed` with each row whose worker's processes were measured showing
+/// them: everything its Bash commands started ([`giverny_claude::worker_pids`]),
+/// whether or not they ran under `giverny pass run`. A run of the row's
+/// task under that worker is part of the worker's figure already; one
+/// started elsewhere is added to it.
+pub fn with_workers(
+    mut feed: Feed,
+    sessions: &[&str],
+    live: &[TaskLive],
+    workers: &HashMap<String, RunLive>,
+) -> Feed {
+    for row in &mut feed.rows {
+        let Some(w) = row.agent_id.as_deref().and_then(|id| workers.get(id)) else {
+            continue;
+        };
+        let run = live
+            .iter()
+            .find(|t| t.task == row.key && sessions.contains(&t.session.as_str()));
+        row.live = Some(match run {
+            Some(t) if t.agent.is_some() && t.agent == row.agent_id => *w,
+            Some(t) => w.plus(t.live),
+            None => *w,
+        });
     }
     feed
 }
@@ -1081,7 +1116,11 @@ fn format_row(
     let gpu = session_use::gpu::present();
     let usage = match row.stage {
         Stage::Running => usage_cell(
-            Some(f.and_then(|f| f.live).unwrap_or_default()),
+            Some(
+                f.and_then(|f| f.live)
+                    .or_else(|| row.agent_id().and_then(|id| clock.workers.get(id)).copied())
+                    .unwrap_or_default(),
+            ),
             None,
             oom,
             gpu,
@@ -1329,10 +1368,22 @@ pub fn show(
     view.poll_feed(tracker.session_id.as_deref());
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
+    // What the rows' processes use: the app's one reading, the one the
+    // status line and the sidebar show parts and sums of.
+    let reading = crate::sessions_load::latest(ui.ctx());
+    let runs = reading
+        .as_deref()
+        .map(crate::sessions_load::task_lives)
+        .unwrap_or_default();
+    let workers = reading
+        .as_deref()
+        .map(crate::sessions_load::workers)
+        .unwrap_or_default();
     let clock = Clock {
         holds: &view.holds,
         limit: limit.as_ref(),
         tz: jiff::tz::TimeZone::system(),
+        workers: &workers,
     };
     // Done rows cleared by hand go from the feed too, whoever wrote it.
     let cleared = tracker
@@ -1348,12 +1399,11 @@ pub fn show(
             sessions.extend(f.aliases.iter().map(String::as_str));
             sessions.extend(tracker.session_id.as_deref());
             sessions.extend(tracker.aliases.iter().map(String::as_str));
-            // What each row's commands use: the app's one reading, the
-            // one the status line and the sidebar show parts and sums of.
-            Some(with_live(
-                with_ledger(f, &sessions, &l.ledger),
+            Some(with_workers(
+                with_live(with_ledger(f, &sessions, &l.ledger), &sessions, &runs),
                 &sessions,
-                &crate::sessions_load::runs(ui.ctx()),
+                &runs,
+                &workers,
             ))
         }
         _ => None,
@@ -2784,6 +2834,7 @@ mod tests {
                 mem_mb,
                 gpu_mb,
             },
+            agent: None,
         }
     }
 
@@ -2984,6 +3035,73 @@ mod tests {
             "a Done row keeps its peak"
         );
         assert!(t.lines[2].usage.starts_with("                 0.5G"));
+    }
+
+    /// A worker's commands show in its row with no `pass run` at all; a
+    /// run under that worker is not added twice, one elsewhere is added; a
+    /// worker with no feed row shows its own; a Done row keeps its peak.
+    #[test]
+    fn a_workers_processes_show_in_its_row_without_a_run() {
+        let json = r#"{"session":"s","rows":[
+            {"key":"sim#1","stage":"running","agent_id":"a1","started":1790000000000,"eta_s":1800},
+            {"key":"sim#2","stage":"running","agent_id":"a2","started":1790000000000,"eta_s":1800},
+            {"key":"sim#3","stage":"running","agent_id":"a3","started":1790000000000,"eta_s":1800},
+            {"key":"sim#4","stage":"done","agent_id":"a1","started":1790000000000,"ended":1790000600000,
+             "usage":{"runs":1,"peak_mb":512}}]}"#;
+        let rl = |cpu_pct, mem_mb| RunLive {
+            cpu_pct,
+            mem_mb,
+            gpu_mb: None,
+        };
+        let workers = HashMap::from([
+            ("a1".to_string(), rl(60, 2048)),
+            ("a2".to_string(), rl(30, 1024)),
+        ]);
+        let mut under_a2 = task_live("sim#2", 20, 512);
+        under_a2.agent = Some("a2".into());
+        let elsewhere = task_live("sim#3", 10, 100);
+        let runs = [under_a2, elsewhere];
+        let f = with_workers(
+            with_live(feed(json), &["s"], &runs),
+            &["s"],
+            &runs,
+            &workers,
+        );
+        let row = |k: &str| f.rows.iter().find(|r| r.key == k).unwrap().live;
+        assert_eq!(row("sim#1"), Some(rl(60, 2048)), "no run: the worker's");
+        assert_eq!(row("sim#2"), Some(rl(30, 1024)), "its run is inside it");
+        assert_eq!(
+            row("sim#3"),
+            Some(rl(10, 100)),
+            "no worker figure: the run's"
+        );
+        let t = build(Some(&f), &[], T0 + 60_000);
+        assert!(
+            t.lines[0].usage.contains("60% CPU"),
+            "{:?}",
+            t.lines[0].usage
+        );
+        let done = t.lines.iter().find(|l| l.stage == Stage::Done).unwrap();
+        assert!(
+            done.usage.trim_start().starts_with("0.5G"),
+            "{:?}",
+            done.usage
+        );
+        // A worker with no feed row at all: its row shows the worker's.
+        let live = live(
+            r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
+                "description":"sims","startTime":1789999958000}]}"#,
+        );
+        let clock = Clock {
+            workers: &workers,
+            ..Clock::plain()
+        };
+        let t = build_at(None, &live, T0 + 60_000, &clock, &Logs::new());
+        assert!(
+            t.lines[0].usage.contains("60% CPU"),
+            "{:?}",
+            t.lines[0].usage
+        );
     }
 
     #[test]
@@ -3373,6 +3491,7 @@ mod tests {
             holds,
             limit,
             tz: jiff::tz::TimeZone::UTC,
+            workers: &NO_WORKERS,
         }
     }
 
