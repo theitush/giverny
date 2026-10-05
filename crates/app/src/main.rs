@@ -1590,7 +1590,15 @@ impl App {
             Action::ToggleSettings => {
                 self.settings = match self.settings.take() {
                     Some(_) => None,
-                    None => Some(settings_ui::SettingsState::default()),
+                    // Back on the section last looked at, not the first.
+                    None => Some(settings_ui::SettingsState {
+                        section: giverny_core::settings::Section::ALL
+                            .iter()
+                            .copied()
+                            .find(|s| self.layout.settings_section.as_deref() == Some(s.title()))
+                            .unwrap_or(giverny_core::settings::Section::Appearance),
+                        ..Default::default()
+                    }),
                 };
                 self.focus_terminal = self.settings.is_none();
             }

@@ -124,6 +124,12 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
             footer(ui, &mut actions, &mut close, c);
         });
 
+    // Remembered for the next Ctrl+, — this process and, through the state
+    // file, the next one.
+    if app.layout.settings_section.as_deref() != Some(state.section.title()) {
+        app.layout.settings_section = Some(state.section.title().to_string());
+        app.state_dirty = true;
+    }
     if !close {
         app.settings = Some(state);
     }
