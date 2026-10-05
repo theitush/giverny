@@ -397,6 +397,12 @@ pub struct BehaviorConfig {
     /// Which shell a new tab opens on Windows. Ignored everywhere else,
     /// where `$SHELL` answers the question.
     pub windows_shell: WindowsShell,
+    /// Each tab's shell keeps its own history file, restored with the tab
+    /// (bash, zsh, fish; set through the shell's environment only).
+    pub history_per_tab: bool,
+    /// With `history_per_tab`, bash also appends each command to the
+    /// shell's usual history file.
+    pub history_also_shared: bool,
 }
 
 /// The shell a Windows tab opens. `Auto` prefers WSL — where Claude Code and
@@ -462,6 +468,8 @@ impl Default for BehaviorConfig {
                 .map(|s| s.to_string())
                 .collect(),
             windows_shell: WindowsShell::Auto,
+            history_per_tab: true,
+            history_also_shared: false,
         }
     }
 }

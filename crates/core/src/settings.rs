@@ -331,6 +331,33 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "behavior.history_per_tab",
+        label: "history per terminal",
+        section: Section::Terminal,
+        doc: "Each tab's shell keeps its own history, back when the tab is restored.",
+        note: &[
+            "Set through the environment of the shells Giverny starts (bash,",
+            "zsh, fish); no rc file is touched. An rc that sets HISTFILE itself",
+            "wins. Off leaves the shell's history as the shell has it.",
+            "Applies to shells started from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "behavior.history_also_shared",
+        label: "also add to shell history",
+        section: Section::Terminal,
+        doc: "With history per terminal, also append each command to the usual history (bash).",
+        note: &[
+            "Appends to ~/.bash_history as each command runs; never rewrites it.",
+            "zsh and fish keep only the tab's own history.",
+            "Applies to shells started from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "behavior.notifications",
         label: "desktop notifications",
         section: Section::Terminal,

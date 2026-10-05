@@ -278,7 +278,12 @@ fn body(
         if skip_gpus(cfg, machine, def) {
             continue;
         }
-        row(ui, state, cfg, machine, def, suggestions, actions, c);
+        // Sharing is a refinement of history per terminal: greyed out while
+        // there is no per-terminal history to share from.
+        let enabled = def.key != "behavior.history_also_shared" || cfg.behavior.history_per_tab;
+        ui.add_enabled_ui(enabled, |ui| {
+            row(ui, state, cfg, machine, def, suggestions, actions, c);
+        });
         ui.add_space(10.0);
     }
 }

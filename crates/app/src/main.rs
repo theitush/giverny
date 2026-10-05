@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, Modifiers};
 use giverny_claude::wsl;
 use giverny_core::config;
+use giverny_core::history;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
@@ -1804,6 +1805,7 @@ impl App {
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
+                history::remove(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.agent_views.forget(id);
                 self.focus_terminal = true;
@@ -2164,6 +2166,46 @@ impl App {
         self.reveal_terminal();
     }
 
+    /// The environment that gives this tab's shell its own history (#213);
+    /// empty when the setting is off or the shell is not one that can be
+    /// steered this way. `env` is what the tab already adds on top of ours.
+    fn history_env(
+        &self,
+        id: TabId,
+        shell: Option<&(String, Vec<String>)>,
+        env: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        if !self.cfg.behavior.history_per_tab {
+            return Vec::new();
+        }
+        let Some(kind) = pty::shell_program(shell).and_then(|p| history::ShellKind::of(&p)) else {
+            return Vec::new();
+        };
+        let file = history::history_file(&self.paths, id);
+        // bash and zsh create the file, not the directory it sits in.
+        if let Some(dir) = file.parent()
+            && let Err(err) = std::fs::create_dir_all(dir)
+        {
+            tracing::warn!("no history directory {}: {err}", dir.display());
+            return Vec::new();
+        }
+        let home = dirs::home_dir();
+        history::env(
+            kind,
+            &file,
+            id,
+            self.cfg.behavior.history_also_shared,
+            home.as_deref(),
+            |var| {
+                env.iter()
+                    .rev()
+                    .find(|(k, _)| k == var)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(var).ok())
+            },
+        )
+    }
+
     fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
         let Some(tab) = self.ws.tab(id) else { return };
         let cwd = tab
@@ -2178,8 +2220,14 @@ impl App {
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
         let in_wsl = shape.in_wsl;
+        // A WSL shell is a world of its own — its paths, its home — and is
+        // left with the history it has.
+        if !in_wsl {
+            let history = self.history_env(id, shape.shell.as_ref(), &shape.env);
+            shape.env.extend(history);
+        }
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),
@@ -3975,7 +4023,9 @@ impl App {
     ///   is a click;
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
     /// * `settings <section>` — the settings screen, on that section (its
-    ///   rail title, `agents panel`); `settings` alone closes it.
+    ///   rail title, `agents panel`); `settings` alone closes it;
+    /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
+    ///   closing the active tab, closing the window.
     #[cfg(debug_assertions)]
     fn debug_cmd(&mut self, ctx: &egui::Context) {
         let Ok(file) = std::env::var("GIVERNY_DEBUG_CMD") else {
@@ -4193,6 +4243,38 @@ impl App {
                         let _ = std::fs::write(arg, session.screen_text());
                     }
                 }
+                // `newtab`, `select <n>` (the n-th tab, from 0), `close`,
+                // `quit`: the window's own new tab, tab click, tab close and
+                // window close.
+                "newtab" => {
+                    let category = self
+                        .ws
+                        .active_tab()
+                        .map(|t| t.category)
+                        .or_else(|| self.ws.categories.first().map(|c| c.id));
+                    if let Some(category) = category {
+                        self.apply(
+                            ctx,
+                            Action::NewTab {
+                                category,
+                                cwd: None,
+                            },
+                        );
+                    }
+                }
+                "select" => {
+                    let tab = arg.parse::<usize>().ok().and_then(|n| self.ws.tabs.get(n));
+                    match tab.map(|t| t.id) {
+                        Some(id) => self.apply(ctx, Action::Select(id)),
+                        None => tracing::warn!("debug cmd: no tab {arg}"),
+                    }
+                }
+                "close" => {
+                    if let Some(id) = self.ws.active {
+                        self.apply(ctx, Action::CloseTab(id));
+                    }
+                }
+                "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 _ => tracing::warn!("debug cmd: unknown {line}"),
             }
         }
