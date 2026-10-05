@@ -70,15 +70,20 @@ fn read_loop(shared: &Shared, ctx: &egui::Context) {
     }
 }
 
-/// The line's figures: `45% CPU  4.2G`, and `  gpu 1.2G` with a GPU.
+/// The line's figures: `23% CPU  2.0G RAM`, then `  40% GPU` with a GPU
+/// that reports per-process utilisation, `  1.2G GPU` (its memory) with
+/// one that does not, nothing with none.
+///
 /// Unpadded: the status line pads its figures to fixed widths to hold
 /// them in their columns, which a line read from the left has no use for.
 pub fn figures(u: &AllUse) -> String {
     use giverny_claude::session_use::gb;
     let t = &u.total;
-    let mut s = format!("{}% CPU  {}", t.cpu_pct.min(100), gb(t.mem_mb));
-    if let Some(g) = t.gpu_mb {
-        s.push_str(&format!("  gpu {}", gb(g)));
+    let mut s = format!("{}% CPU  {} RAM", t.cpu_pct.min(100), gb(t.mem_mb));
+    match (u.gpu_pct, t.gpu_mb) {
+        (Some(p), _) => s.push_str(&format!("  {p}% GPU")),
+        (None, Some(g)) => s.push_str(&format!("  {} GPU", gb(g))),
+        (None, None) => {}
     }
     s
 }
@@ -89,23 +94,24 @@ mod tests {
     use giverny_claude::session_use::SessionUse;
 
     #[test]
-    fn the_line_reads_like_the_status_line() {
+    fn the_line_is_cpu_ram_and_gpu_when_there_is_one() {
         let mut u = AllUse {
             sessions: 3,
             total: SessionUse {
-                cpu_pct: 45,
-                mem_mb: 4300,
+                cpu_pct: 23,
+                mem_mb: 2048,
                 gpu_mb: None,
             },
+            gpu_pct: None,
         };
-        assert_eq!(figures(&u), "45% CPU  4.2G");
+        assert_eq!(figures(&u), "23% CPU  2.0G RAM", "no GPU: nothing of it");
         u.total.gpu_mb = Some(1229);
-        assert_eq!(figures(&u), "45% CPU  4.2G  gpu 1.2G");
-        u.total = SessionUse {
-            cpu_pct: 3,
-            mem_mb: 12 * 1024,
-            gpu_mb: Some(12 * 1024),
-        };
-        assert_eq!(figures(&u), "3% CPU  12G  gpu 12G");
+        assert_eq!(
+            figures(&u),
+            "23% CPU  2.0G RAM  1.2G GPU",
+            "no utilisation: memory"
+        );
+        u.gpu_pct = Some(40);
+        assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
     }
 }

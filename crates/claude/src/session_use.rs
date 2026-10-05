@@ -583,6 +583,57 @@ pub struct AllUse {
     /// How many sessions are running.
     pub sessions: usize,
     pub total: SessionUse,
+    /// The sessions' share of the GPUs' compute (`nvidia-smi pmon`'s `sm`
+    /// per process, summed, over the GPUs), percent; `None` with no GPU or
+    /// where per-process utilisation is not reported.
+    pub gpu_pct: Option<u32>,
+}
+
+/// One `nvidia-smi pmon -c 1 -s u` reading: each process's `sm` percent
+/// (summed over GPUs), and how many GPUs answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pmon {
+    pub sm: HashMap<u32, u32>,
+    pub gpus: usize,
+}
+
+/// `pmon`'s table: `# …` headers, then `<gpu> <pid> <type> <sm> <mem> …`
+/// rows, `-` for nothing (a GPU with no process has a row of `-`).
+pub fn parse_pmon(out: &str) -> Pmon {
+    let mut gpus = HashSet::new();
+    let mut sm: HashMap<u32, u32> = HashMap::new();
+    for l in out.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let Some(gpu) = f.first().and_then(|g| g.parse::<u32>().ok()) else {
+            continue;
+        };
+        gpus.insert(gpu);
+        if let (Some(pid), Some(pct)) = (
+            f.get(1).and_then(|p| p.parse::<u32>().ok()),
+            f.get(3).and_then(|p| p.parse::<u32>().ok()),
+        ) {
+            *sm.entry(pid).or_default() += pct;
+        }
+    }
+    Pmon {
+        sm,
+        gpus: gpus.len(),
+    }
+}
+
+/// The share of all the GPUs' compute the processes in `pids` use,
+/// percent, at most 100.
+pub fn gpu_pct(pmon: &Pmon, pids: &HashSet<u32>) -> u32 {
+    if pmon.gpus == 0 {
+        return 0;
+    }
+    let used: u32 = pmon
+        .sm
+        .iter()
+        .filter(|(pid, _)| pids.contains(pid))
+        .map(|(_, pct)| pct)
+        .sum();
+    (used / pmon.gpus as u32).min(100)
 }
 
 /// Sum `roots`' trees. CPU is each session's ticks since `prev` (the last
@@ -624,6 +675,7 @@ pub fn sum_sessions(
             mem_mb: mem_kb.div_ceil(1024),
             gpu_mb: gpu.map(|_| gpu_mb),
         },
+        gpu_pct: None,
     };
     (all, now)
 }
@@ -637,6 +689,11 @@ pub struct AllSessions {
     prev: HashMap<u32, u64>,
     prev_at: Option<std::time::Instant>,
     gpu: Option<(HashMap<u32, u64>, std::time::Instant)>,
+    /// The last `pmon` reading, the one running (it samples for a second
+    /// or so: never waited for), and when the last one was started.
+    pmon: Option<Pmon>,
+    pmon_child: Option<std::process::Child>,
+    pmon_at: Option<std::time::Instant>,
 }
 
 impl AllSessions {
@@ -663,8 +720,8 @@ impl AllSessions {
             .filter(|&pid| crate::lineage::proc_is_claude(pid))
             .collect();
         let roots = session_roots(&procs, |pid| claudes.contains(&pid));
-        let all: HashSet<u32> = roots.iter().flat_map(|&r| subtree(&procs, r)).collect();
-        with_real_memory(&mut procs, &all);
+        let all_pids: HashSet<u32> = roots.iter().flat_map(|&r| subtree(&procs, r)).collect();
+        with_real_memory(&mut procs, &all_pids);
         let now = std::time::Instant::now();
         if self
             .gpu
@@ -702,7 +759,53 @@ impl AllSessions {
         );
         self.prev = ticks;
         self.prev_at = Some(now);
+        let mut all = all;
+        if self.gpu.is_some() {
+            self.poll_pmon(now);
+            all.gpu_pct = self
+                .pmon
+                .as_ref()
+                .filter(|p| p.gpus > 0)
+                .map(|p| gpu_pct(p, &all_pids));
+        }
         Some(all)
+    }
+
+    /// Collect a finished `pmon`, start the next one when due.
+    #[cfg(target_os = "linux")]
+    fn poll_pmon(&mut self, now: std::time::Instant) {
+        use std::io::Read;
+        if let Some(child) = &mut self.pmon_child {
+            match child.try_wait() {
+                Ok(None) => return,
+                Ok(Some(status)) => {
+                    let mut out = String::new();
+                    if let Some(so) = child.stdout.as_mut() {
+                        let _ = so.read_to_string(&mut out);
+                    }
+                    // Unsupported here (some drivers, WSL): no figure.
+                    self.pmon = status.success().then(|| parse_pmon(&out));
+                }
+                Err(_) => self.pmon = None,
+            }
+            self.pmon_child = None;
+        }
+        if self
+            .pmon_at
+            .is_some_and(|at| now.duration_since(at) < Self::GPU_EVERY)
+        {
+            return;
+        }
+        self.pmon_at = Some(now);
+        self.pmon_child = gpu::find_on_path("nvidia-smi").and_then(|smi| {
+            std::process::Command::new(smi)
+                .args(["pmon", "-c", "1", "-s", "u"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()
+        });
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -908,6 +1011,27 @@ mod tests {
         let (all, _) = sum_sessions(&procs, &roots, &prev, 1_000, 100, 4, Some(&gpu));
         assert_eq!(all.total.cpu_pct, 25 + 50);
         assert_eq!(all.total.gpu_mb, Some(1536), "only the sessions' pids");
+    }
+
+    #[test]
+    fn gpu_utilisation_is_the_sessions_share_of_every_gpu() {
+        let out = "# gpu        pid  type    sm   mem   enc   dec   command\n\
+                   # Idx          #   C/G     %     %     %     %   name\n\
+                   \x20   0      4242     C    60    10     -     -   python\n\
+                   \x20   0      5000     C    30     5     -     -   other\n\
+                   \x20   1      4243     C    20     1     -     -   python\n\
+                   \x20   1      6000     G     -     -     -     -   Xorg\n";
+        let p = parse_pmon(out);
+        assert_eq!(p.gpus, 2);
+        assert_eq!(p.sm.get(&4242), Some(&60));
+        assert_eq!(p.sm.get(&6000), None, "`-` is no figure");
+        // 60 + 20 of two GPUs' 200.
+        assert_eq!(gpu_pct(&p, &HashSet::from([4242, 4243])), 40);
+        assert_eq!(gpu_pct(&p, &HashSet::new()), 0);
+        // One idle GPU: a row of dashes still counts it.
+        let idle = parse_pmon("    0          -     -     -     -     -     -   -\n");
+        assert_eq!((idle.gpus, idle.sm.len()), (1, 0));
+        assert_eq!(gpu_pct(&Pmon::default(), &HashSet::from([1])), 0);
     }
 
     #[cfg(target_os = "linux")]
