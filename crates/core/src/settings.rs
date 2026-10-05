@@ -514,31 +514,11 @@ pub const SETTINGS: &[SettingDef] = &[
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
-    SettingDef {
-        key: "agents_panel.done_rows",
-        label: "done rows",
-        section: Section::AgentsPanel,
-        doc: "Which Done rows the agents pane shows: all of them, none, or the newest few.",
-        note: &["\"last\" keeps the newest done_last of them (they sit newest first)."],
-        needs_restart: false,
-        kind: Kind::Choice {
-            default: "all",
-            options: &["all", "hide", "last"],
-        },
-    },
-    SettingDef {
-        key: "agents_panel.done_last",
-        label: "keep the last",
-        section: Section::AgentsPanel,
-        doc: "How many Done rows done_rows = \"last\" keeps.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Int {
-            default: 5,
-            min: 1,
-            max: 100,
-        },
-    },
+    // The columns, in the order the agents pane draws them: Settings shows
+    // their switches in this order, and the pane's test
+    // `the_settings_list_the_columns_in_the_panes_order` keeps the two in step.
+    // `agents_panel.done_rows` / `done_last` have no row here; the pane still
+    // honours them when set by hand.
     SettingDef {
         key: "agents_panel.columns.stage",
         label: "stage",
@@ -562,15 +542,6 @@ pub const SETTINGS: &[SettingDef] = &[
         label: "title",
         section: Section::AgentsPanel,
         doc: "The task's title, or a subagent's description: the column that takes the room left.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "agents_panel.columns.usage",
-        label: "CPU / RAM",
-        section: Section::AgentsPanel,
-        doc: "What the row's `giverny pass run` commands use: live CPU and memory, a Done row's peak.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -607,6 +578,15 @@ pub const SETTINGS: &[SettingDef] = &[
         label: "tokens",
         section: Section::AgentsPanel,
         doc: "The tokens the row has used.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "agents_panel.columns.usage",
+        label: "CPU / RAM",
+        section: Section::AgentsPanel,
+        doc: "What the row's `giverny pass run` commands use: live CPU and memory, a Done row's peak.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -1293,11 +1273,12 @@ mod tests {
         };
         let cfg = set("agents_panel.orchestrate_skill", Value::Bool(false));
         assert!(!cfg.agents_panel.orchestrate_skill);
-        let cfg = set("agents_panel.done_rows", Value::Text("hide".into()));
-        assert_eq!(cfg.agents_panel.done(), DoneRows::Hide);
-        set("agents_panel.done_rows", Value::Text("last".into()));
-        let cfg = set("agents_panel.done_last", Value::Int(3));
-        assert_eq!(cfg.agents_panel.done(), DoneRows::Last(3));
+        // The Done rows have no row in Settings, but a hand-written pair
+        // still loads, unflagged.
+        assert!(by_key("agents_panel.done_rows").is_none());
+        let done = config::parse("[agents_panel]\ndone_rows = \"last\"\ndone_last = 3\n").unwrap();
+        assert!(done.1.is_empty(), "{:?}", done.1);
+        assert_eq!(done.0.agents_panel.done(), DoneRows::Last(3));
         for def in SETTINGS
             .iter()
             .filter(|d| d.key.starts_with("agents_panel.columns."))

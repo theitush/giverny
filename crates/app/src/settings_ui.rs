@@ -296,8 +296,9 @@ fn skip_gpus(
 const COLUMNS: &str = "agents_panel.columns.";
 
 /// Settings → Agents panel, in the order a person reads it: the pane and
-/// the skill, the columns as one row of switches, the Done rows, then the
-/// default lease and the limits under their headings.
+/// the skill, the columns as one row of switches (in the pane's own order,
+/// which is `SETTINGS`'), then the default lease and the limits under their
+/// headings.
 #[allow(clippy::too_many_arguments)]
 fn agents_panel_page(
     ui: &mut egui::Ui,
@@ -334,15 +335,6 @@ fn agents_panel_page(
         .collect();
     columns_row(ui, state, cfg, &columns, actions, c);
     ui.add_space(10.0);
-    // `keep the last` only means something with `done rows = last`.
-    let last = cfg
-        .agents_panel
-        .done_rows
-        .trim()
-        .eq_ignore_ascii_case("last");
-    draw(ui, state, actions, &|d| {
-        d.key == "agents_panel.done_rows" || (last && d.key == "agents_panel.done_last")
-    });
     ui.add_space(8.0);
     heading(ui, "default lease", c);
     draw(ui, state, actions, &|d| {

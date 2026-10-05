@@ -2244,6 +2244,34 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_list_the_columns_in_the_panes_order() {
+        // Settings → Agents panel shows a switch per column in `SETTINGS`'
+        // order; that order must be the one the pane draws them in.
+        let t = build(Some(&feed(DONE_FOUR)), &[], T0);
+        let c = Cols::new(&t, 100);
+        let at: Vec<(&str, usize)> = giverny_core::settings::SETTINGS
+            .iter()
+            .filter_map(|d| d.key.strip_prefix("agents_panel.columns."))
+            .map(|col| {
+                let x = match col {
+                    "stage" => 0,
+                    "id" => c.x_task,
+                    "title" => c.x_task + c.idw + 1,
+                    "elapsed" => c.x_el_end,
+                    "eta" => c.x_eta_end,
+                    "now" => c.x_now,
+                    "tokens" => c.x_tok_end,
+                    "usage" => c.x_use,
+                    other => panic!("a column the pane does not draw: {other}"),
+                };
+                (col, x)
+            })
+            .collect();
+        assert_eq!(at.len(), 8, "{at:?}");
+        assert!(at.windows(2).all(|w| w[0].1 < w[1].1), "{at:?}");
+    }
+
+    #[test]
     fn a_hidden_column_takes_no_width_and_the_rest_stay_aligned() {
         let t = build(Some(&feed(DONE_FOUR)), &[], T0);
         let all = Cols::new(&t, 100);
