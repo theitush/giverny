@@ -1,6 +1,7 @@
-//! The app's one sampler: what Giverny runs, read every [`EVERY`] from a
-//! thread of its own ([`giverny_claude::use_reading::Sampler`]: one pass
-//! over `/proc`, and `nvidia-smi` now and then), so no frame waits on it.
+//! The app's one sampler: what Giverny runs, read every [`EVERY`] (a
+//! second) from a thread of its own
+//! ([`giverny_claude::use_reading::Sampler`]: one pass over `/proc`, and
+//! `nvidia-smi` now and then), so no frame waits on it.
 //!
 //! Every figure shown comes from the same pass, measured the same way: the
 //! sidebar's line is its total (the app and everything under it), the
@@ -17,7 +18,7 @@ use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::use_reading::{Reading, Sampler, Use};
 
 /// How often the pass is taken.
-const EVERY: Duration = Duration::from_secs(2);
+const EVERY: Duration = Duration::from_secs(1);
 
 static LAST: OnceLock<Arc<Mutex<Option<Arc<Reading>>>>> = OnceLock::new();
 
@@ -87,15 +88,24 @@ fn read_loop(last: &Mutex<Option<Arc<Reading>>>, ctx: &egui::Context) {
         &giverny_claude::feed::feed_dir(),
     ));
     let snapshot = giverny_claude::use_reading::snapshot_path();
+    // On a steady beat, whatever a pass costs.
+    let mut next = std::time::Instant::now();
     loop {
         if let Some(r) = sampler.sample(app, &runs_dir) {
+            // Published first, then shown: what the pane and the sidebar
+            // draw is always the reading the status lines can read.
             if let Err(err) = giverny_claude::use_reading::write_snapshot(&snapshot, &r) {
                 tracing::debug!("use sampler: {}: {err}", snapshot.display());
             }
             *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(r));
             ctx.request_repaint();
         }
-        std::thread::sleep(EVERY);
+        next += EVERY;
+        let now = std::time::Instant::now();
+        if next < now {
+            next = now;
+        }
+        std::thread::sleep(next - now);
     }
 }
 

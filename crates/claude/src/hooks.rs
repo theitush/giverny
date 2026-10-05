@@ -336,6 +336,10 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
+/// How often Claude Code reruns our status line, seconds, besides its own
+/// events: the app's sampler's cadence ([`crate::use_reading`]).
+pub const STATUSLINE_REFRESH_S: u64 = 1;
+
 /// Synthetic event name for statusline pushes (not a Claude hook event).
 pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 
@@ -738,6 +742,10 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
                 "type": "command",
                 "command": statusline_command_for(settings_path),
                 "padding": 0,
+                // Rerun every second as well as on Claude Code's own
+                // events, so the session's use keeps step with the app's
+                // sampler (one reading a second) while the session idles.
+                "refreshInterval": STATUSLINE_REFRESH_S,
             }),
         );
     } else {
@@ -911,11 +919,16 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
             })
         });
     let want_statusline = statusline_command_for(settings_path);
-    let statusline_stale = root
-        .get("statusLine")
-        .and_then(|s| s.get("command"))
-        .and_then(|c| c.as_str())
-        .is_some_and(|c| c.contains("giverny") && c != want_statusline);
+    let ours = root.get("statusLine").filter(|s| {
+        s.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("giverny"))
+    });
+    // Ours, but another binary's, or written before it reran every second.
+    let statusline_stale = ours.is_some_and(|s| {
+        s.get("command").and_then(|c| c.as_str()) != Some(want_statusline.as_str())
+            || s.get("refreshInterval").and_then(|r| r.as_u64()) != Some(STATUSLINE_REFRESH_S)
+    });
     let want_subagent_line = subagent_line_command_for(settings_path);
     let subagent_line_stale = root
         .get("subagentStatusLine")
@@ -1231,8 +1244,26 @@ mod tests {
         let path = scratch("statusline");
         set_statusline(&path, true).unwrap();
         assert!(statusline_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["statusLine"]["refreshInterval"], 1,
+            "reruns every second"
+        );
+        assert!(!needs_path_refresh(&path));
+        // Ours from before it reran every second: brought up to date.
+        let mut old = root.clone();
+        old["statusLine"]
+            .as_object_mut()
+            .unwrap()
+            .remove("refreshInterval");
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert!(needs_path_refresh(&path));
         set_statusline(&path, false).unwrap();
         assert!(!statusline_installed_in(&path));
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(root.get("statusLine").is_none(), "goes with ours");
 
         std::fs::write(
             &path,
@@ -1243,6 +1274,7 @@ mod tests {
             set_statusline(&path, true).is_err(),
             "must not clobber a user statusline"
         );
+        assert!(!needs_path_refresh(&path), "nor bring a user's up to date");
     }
 
     /// Claude Code's stdin for one tick, trimmed from a live 2.1.280 capture.

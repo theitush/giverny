@@ -1,6 +1,6 @@
 //! One reading of what Giverny runs, at one moment, measured one way.
 //!
-//! The app reads `/proc` once every couple of seconds ([`Sampler`]) and
+//! The app reads `/proc` once a second ([`Sampler`]) and
 //! derives every figure it shows from that one pass:
 //!
 //! * the **total**: the app and everything under it, every tab, Claude or
@@ -76,6 +76,10 @@ pub struct RunUse {
 pub struct Reading {
     /// When it was taken, ms since the epoch.
     pub at_ms: u64,
+    /// Which pass of the app's sampler it is (the first is 1): two figures
+    /// with the same number are from the same moment.
+    #[serde(default)]
+    pub seq: u64,
     /// The app's pid, the root of [`Reading::total`].
     pub app: u32,
     pub total: Use,
@@ -175,6 +179,7 @@ impl Table {
             .collect();
         Reading {
             at_ms,
+            seq: 0,
             app,
             total: self.use_of(&tree),
             sessions,
@@ -302,8 +307,8 @@ pub fn snapshot_path() -> PathBuf {
 }
 
 /// A reading older than this is not about now: the app samples every
-/// couple of seconds, so it has stopped.
-pub const FRESH_MS: u64 = 3_500;
+/// second, so one tick late is still the last; two, it has stopped.
+pub const FRESH_MS: u64 = 2_500;
 
 /// Write `r` to `path` whole (a reader never sees half of it).
 pub fn write_snapshot(path: &Path, r: &Reading) -> std::io::Result<()> {
@@ -350,6 +355,7 @@ pub struct Sampler {
     pmon_child: Option<std::process::Child>,
     pmon_at: Option<std::time::Instant>,
     workers: crate::worker_pids::Attributor,
+    seq: u64,
 }
 
 impl Sampler {
@@ -403,7 +409,10 @@ impl Sampler {
         let agents = self
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
-        Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents))
+        self.seq += 1;
+        let mut r = table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents);
+        r.seq = self.seq;
+        Some(r)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -667,7 +676,9 @@ mod tests {
         let first = s.sample(me, &none).expect("a /proc");
         assert_eq!(first.total.cpu_pct, 0);
         assert!(first.total.mem_mb > 0);
-        assert!(s.sample(me, &none).is_some());
+        // Each pass numbered, so two figures can be told to be one moment's.
+        assert_eq!(first.seq, 1);
+        assert_eq!(s.sample(me, &none).map(|r| r.seq), Some(2));
     }
 }
 
