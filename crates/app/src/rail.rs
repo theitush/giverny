@@ -333,14 +333,23 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let fg = app.chrome.fg;
 
     // Bottom section first (panel-inside-panel): hooks banner + usage meters.
-    egui::Panel::bottom("rail-bottom")
+    let bottom = egui::Panel::bottom("rail-bottom")
         .resizable(false)
         .show_separator_line(true)
         .show(ui, |ui| {
             update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
-            usage_panel(app, ui, dim, fg, &mut actions);
+            usage_panel(app, ui, dim, fg, &mut actions)
         });
+    // The line over the load row: the one the panel draws over itself,
+    // with the same painter, stroke and span.
+    if let Some(y) = bottom.inner {
+        ui.painter().hline(
+            bottom.response.rect.x_range(),
+            y,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
 
     view_switch(app, ui, &mut actions);
 
@@ -1292,7 +1301,14 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     });
 }
 
-fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+/// Returns where the line over the load row goes, when there is one.
+fn usage_panel(
+    app: &App,
+    ui: &mut Ui,
+    dim: Color32,
+    fg: Color32,
+    actions: &mut Vec<Action>,
+) -> Option<f32> {
     let c = app.chrome;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -1373,7 +1389,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             );
         });
         ui.add_space(6.0);
-        return;
+        return None;
     }
     let now = jiff::Timestamp::now();
     for acc in &app.claude.accounts {
@@ -1454,24 +1470,15 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         }
     }
     ui.add_space(6.0);
-    if let Some(u) = crate::sessions_load::latest(ui.ctx()) {
-        sessions_load_row(ui, &u, dim);
-    }
+    let r = crate::sessions_load::latest(ui.ctx())?;
+    Some(sessions_load_row(ui, &r, dim))
 }
 
-/// Under the account bars: every Claude Code session running now, summed,
-/// `23% CPU  2.0G RAM  40% GPU`, in the bars' lettering. Hovering says
-/// what is counted.
-fn sessions_load_row(ui: &mut Ui, u: &giverny_claude::session_use::AllUse, dim: Color32) {
-    // The line that sets the accounts off from the tabs, drawn the way
-    // the panel draws it (its stroke, across the panel), above this one.
-    let y = ui.cursor().min.y;
-    let across = ui.clip_rect().x_range();
-    ui.painter().hline(
-        across,
-        y + 0.5,
-        ui.visuals().widgets.noninteractive.bg_stroke,
-    );
+/// Under the account bars: what Giverny runs now, summed —
+/// `23% CPU  2.0G RAM  40% GPU`, centred, in the bars' lettering. Hovering says
+/// what is counted. Returns where the line above it goes.
+fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim: Color32) -> f32 {
+    let y = ui.cursor().min.y + 0.5;
     ui.add_space(5.0);
     let width = ui.available_width();
     let (mut rect, resp) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
@@ -1479,26 +1486,29 @@ fn sessions_load_row(ui: &mut Ui, u: &giverny_claude::session_use::AllUse, dim: 
     // what is shown: the figures end at the visible edge.
     rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
     ui.painter_at(rect).text(
-        Pos2::new(rect.min.x + 12.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        crate::sessions_load::figures(u),
+        rect.center(),
+        Align2::CENTER_CENTER,
+        crate::sessions_load::figures(&r.total),
         FontId::monospace(9.5),
         dim,
     );
     ui.add_space(5.0);
-    let gpu = match (u.gpu_pct, u.total.gpu_mb) {
-        (Some(_), _) => ", the GPUs' compute they use",
+    let gpu = match (r.total.gpu_pct, r.total.gpu_mb) {
+        (Some(_), _) => ", the GPUs' compute it uses",
         (None, Some(_)) => ", GPU memory (this GPU reports no per-process utilisation)",
         (None, None) => "",
     };
     resp.on_hover_text(format!(
-        "{} Claude Code session{} running now, each with everything it started\n\
-         (commands, builds, capped `pass run` scopes), summed:\n\
-         CPU as a share of the whole machine, the memory they really use{gpu}.\n\
-         Every claude on this machine counts, in Giverny or not.",
-        u.sessions,
-        if u.sessions == 1 { "" } else { "s" },
+        "Everything Giverny runs now: the app and every tab, Claude or not —\n\
+         {} Claude Code session{} with all they started (commands, builds,\n\
+         `pass run` scopes). CPU as a share of the whole machine, the memory\n\
+         it really uses (shared pages split){gpu}.\n\
+         The agents pane's rows and each session's status line are parts of\n\
+         this same reading.",
+        r.sessions.len(),
+        if r.sessions.len() == 1 { "" } else { "s" },
     ));
+    y
 }
 
 #[allow(clippy::too_many_arguments)]

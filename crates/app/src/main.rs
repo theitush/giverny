@@ -1501,6 +1501,9 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        // What Giverny runs, read once for the sidebar, the agents pane and
+        // every tab's status line.
+        sessions_load::start(&cc.egui_ctx);
         giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
         let see_through = see_through && translucency::confirm(cc);
         shared.opacity = opacity_for(see_through, &cfg);

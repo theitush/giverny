@@ -1,70 +1,84 @@
-//! Every Claude Code session's use right now, summed, for the sidebar's
-//! line under the account bars.
+//! The app's one sampler: what Giverny runs, read every [`EVERY`] from a
+//! thread of its own ([`giverny_claude::use_reading::Sampler`]: one pass
+//! over `/proc`, and `nvidia-smi` now and then), so no frame waits on it.
 //!
-//! A thread of its own reads it ([`giverny_claude::session_use::AllSessions`]:
-//! all of `/proc`, and `nvidia-smi` now and then) every [`EVERY`]; the
-//! sidebar only takes the last reading, so a frame never waits on it. The
-//! thread starts with the first ask and rests while nobody asks (the
-//! sidebar hidden).
+//! Every figure shown comes from the same pass, measured the same way: the
+//! sidebar's line is its total (the app and everything under it), the
+//! agents pane's rows are its runs, and each tab's Claude Code status line
+//! reads its session from the snapshot the pass leaves beside the socket
+//! ([`giverny_claude::use_reading::snapshot_path`]). So a row never shows
+//! more than its session, nor a session more than the total.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use giverny_claude::session_use::{AllSessions, AllUse};
+use giverny_claude::run_live::{RunLive, TaskLive};
+use giverny_claude::use_reading::{Reading, Sampler, Use};
 
-/// How often the sessions are read.
+/// How often the pass is taken.
 const EVERY: Duration = Duration::from_secs(2);
 
-/// Nobody asked for this long: the thread rests.
-const IDLE_MS: u64 = 10_000;
+static LAST: OnceLock<Arc<Mutex<Option<Arc<Reading>>>>> = OnceLock::new();
 
-#[derive(Default)]
-struct Shared {
-    last: Mutex<Option<AllUse>>,
-    wanted_ms: AtomicU64,
-}
-
-static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-/// The last reading, starting the reader on the first ask. `None` until
-/// its first reading, and where there is nothing to read (no `/proc`).
-pub fn latest(ctx: &egui::Context) -> Option<AllUse> {
-    let shared = SHARED.get_or_init(|| {
-        let shared = Arc::new(Shared::default());
-        let (s, ctx) = (shared.clone(), ctx.clone());
+/// Start the sampler (once; later calls do nothing).
+pub fn start(ctx: &egui::Context) {
+    LAST.get_or_init(|| {
+        let last = Arc::new(Mutex::new(None));
+        let (l, ctx) = (last.clone(), ctx.clone());
         if let Err(err) = std::thread::Builder::new()
-            .name("sessions-load".into())
-            .spawn(move || read_loop(&s, &ctx))
+            .name("use-sampler".into())
+            .spawn(move || read_loop(&l, &ctx))
         {
-            tracing::warn!("sessions load: the reader did not start: {err}");
+            tracing::warn!("use sampler: did not start: {err}");
         }
-        shared
+        last
     });
-    shared.wanted_ms.store(now_ms(), Ordering::Relaxed);
-    *shared.last.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn read_loop(shared: &Shared, ctx: &egui::Context) {
-    let mut sampler = AllSessions::default();
+/// The last pass, starting the sampler on the first ask. `None` until its
+/// first pass, and where there is nothing to read (no `/proc`).
+pub fn latest(ctx: &egui::Context) -> Option<Arc<Reading>> {
+    start(ctx);
+    LAST.get()?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The last pass's runs, as the agents pane keys them.
+pub fn runs(ctx: &egui::Context) -> Vec<TaskLive> {
+    latest(ctx).map_or_else(Vec::new, |r| task_lives(&r))
+}
+
+fn task_lives(r: &Reading) -> Vec<TaskLive> {
+    r.runs
+        .iter()
+        .map(|run| TaskLive {
+            session: run.session.clone(),
+            task: run.task.clone(),
+            live: RunLive {
+                cpu_pct: run.used.cpu_pct,
+                mem_mb: run.used.mem_mb,
+                gpu_mb: run.used.gpu_mb,
+            },
+        })
+        .collect()
+}
+
+fn read_loop(last: &Mutex<Option<Arc<Reading>>>, ctx: &egui::Context) {
+    let mut sampler = Sampler::default();
+    let app = std::process::id();
+    let runs_dir = giverny_claude::run_live::runs_dir(&giverny_claude::resources::ledger_path(
+        &giverny_claude::feed::feed_dir(),
+    ));
+    let snapshot = giverny_claude::use_reading::snapshot_path();
     loop {
-        if now_ms().saturating_sub(shared.wanted_ms.load(Ordering::Relaxed)) <= IDLE_MS {
-            let now = sampler.sample();
-            let mut last = shared.last.lock().unwrap_or_else(|p| p.into_inner());
-            if *last != now {
-                *last = now;
-                drop(last);
-                ctx.request_repaint();
+        if let Some(r) = sampler.sample(app, &runs_dir) {
+            if let Err(err) = giverny_claude::use_reading::write_snapshot(&snapshot, &r) {
+                tracing::debug!("use sampler: {}: {err}", snapshot.display());
             }
-        } else {
-            // Rested: the next reading's CPU would span the rest.
-            sampler = AllSessions::default();
+            *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(r));
+            ctx.request_repaint();
         }
         std::thread::sleep(EVERY);
     }
@@ -76,11 +90,10 @@ fn read_loop(shared: &Shared, ctx: &egui::Context) {
 ///
 /// Unpadded: the status line pads its figures to fixed widths to hold
 /// them in their columns, which a line read from the left has no use for.
-pub fn figures(u: &AllUse) -> String {
+pub fn figures(t: &Use) -> String {
     use giverny_claude::session_use::gb;
-    let t = &u.total;
     let mut s = format!("{}% CPU  {} RAM", t.cpu_pct.min(100), gb(t.mem_mb));
-    match (u.gpu_pct, t.gpu_mb) {
+    match (t.gpu_pct, t.gpu_mb) {
         (Some(p), _) => s.push_str(&format!("  {p}% GPU")),
         (None, Some(g)) => s.push_str(&format!("  {} GPU", gb(g))),
         (None, None) => {}
@@ -91,21 +104,18 @@ pub fn figures(u: &AllUse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giverny_claude::session_use::SessionUse;
+    use giverny_claude::use_reading::RunUse;
 
     #[test]
     fn the_line_is_cpu_ram_and_gpu_when_there_is_one() {
-        let mut u = AllUse {
-            sessions: 3,
-            total: SessionUse {
-                cpu_pct: 23,
-                mem_mb: 2048,
-                gpu_mb: None,
-            },
+        let mut u = Use {
+            cpu_pct: 23,
+            mem_mb: 2048,
+            gpu_mb: None,
             gpu_pct: None,
         };
         assert_eq!(figures(&u), "23% CPU  2.0G RAM", "no GPU: nothing of it");
-        u.total.gpu_mb = Some(1229);
+        u.gpu_mb = Some(1229);
         assert_eq!(
             figures(&u),
             "23% CPU  2.0G RAM  1.2G GPU",
@@ -113,5 +123,36 @@ mod tests {
         );
         u.gpu_pct = Some(40);
         assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
+    }
+
+    #[test]
+    fn a_runs_figure_reaches_the_pane_as_it_was_read() {
+        let used = Use {
+            cpu_pct: 39,
+            mem_mb: 928,
+            gpu_mb: Some(2048),
+            gpu_pct: Some(12),
+        };
+        let r = Reading {
+            runs: vec![RunUse {
+                session: "s1".into(),
+                task: "demo#1".into(),
+                used,
+            }],
+            ..Reading::default()
+        };
+        let t = task_lives(&r);
+        assert_eq!(
+            (t[0].session.as_str(), t[0].task.as_str()),
+            ("s1", "demo#1")
+        );
+        assert_eq!(
+            t[0].live,
+            RunLive {
+                cpu_pct: 39,
+                mem_mb: 928,
+                gpu_mb: Some(2048)
+            }
+        );
     }
 }

@@ -5,17 +5,17 @@
 //! `stats`, `started_ms`), and removes it when the command ends. The shim
 //! inside the command's systemd scope adds `cgroup <dir>` to the stats file
 //! as it starts, so a reader finds the scope's cgroup without asking
-//! systemd. The agents pane reads both every couple of seconds ([`Sampler`]):
-//! the cgroup's `memory.current`, and `cpu.stat`'s `usage_usec` between two
-//! reads for CPU, as a share of the machine's cores.
+//! systemd. The app's one sampler ([`crate::use_reading`]) lists them
+//! ([`running`]) every couple of seconds and measures each scope's
+//! processes (`cgroup.procs`) the way it measures everything else it
+//! shows.
 //!
 //! A command run plain (no user systemd) has no cgroup of its own and is
 //! not sampled. A `.live` file whose `run` is gone (killed) is skipped by
 //! readers and swept by the next `run`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -25,9 +25,9 @@ pub struct RunLive {
     /// CPU over the last interval, percent of the whole machine (every
     /// core busy is 100).
     pub cpu_pct: u32,
-    /// The cgroups' `memory.current`, MiB.
+    /// The memory its processes really use (proportional sets), MiB.
     pub mem_mb: u64,
-    /// GPU memory of the cgroups' processes, MiB; `None` when the machine
+    /// GPU memory of its processes, MiB; `None` when the machine
     /// has no NVIDIA GPU (or `nvidia-smi`'s answer is not in yet).
     pub gpu_mb: Option<u64>,
 }
@@ -96,7 +96,6 @@ struct LiveFile {
     session: String,
     pid: u32,
     stats: PathBuf,
-    started_ms: u64,
 }
 
 fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
@@ -107,7 +106,6 @@ fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
         session: s("session")?,
         pid: v.get("pid").and_then(Value::as_u64)? as u32,
         stats: PathBuf::from(s("stats")?),
-        started_ms: v.get("started_ms").and_then(Value::as_u64).unwrap_or(0),
     })
 }
 
@@ -144,27 +142,6 @@ pub fn cgroup_of(stats_text: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `memory.current` (bytes) and `cpu.stat`'s `usage_usec` of a cgroup.
-pub fn read_cgroup(dir: &Path) -> Option<(u64, u64)> {
-    let mem = std::fs::read_to_string(dir.join("memory.current"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let cpu = std::fs::read_to_string(dir.join("cpu.stat"))
-        .ok()
-        .and_then(|t| usage_usec(&t))
-        .unwrap_or(0);
-    Some((mem, cpu))
-}
-
-pub fn usage_usec(cpu_stat: &str) -> Option<u64> {
-    cpu_stat
-        .lines()
-        .find_map(|l| l.strip_prefix("usage_usec "))
-        .and_then(|n| n.trim().parse().ok())
-}
-
 /// The processes in a cgroup (`cgroup.procs`).
 pub fn cgroup_pids(dir: &Path) -> HashSet<u32> {
     std::fs::read_to_string(dir.join("cgroup.procs"))
@@ -172,103 +149,20 @@ pub fn cgroup_pids(dir: &Path) -> HashSet<u32> {
         .unwrap_or_default()
 }
 
-/// CPU used between two reads, percent of `cores` cores, rounded.
-pub fn cpu_pct(used_usec: u64, over_usec: u64, cores: u32) -> u32 {
-    if over_usec == 0 || cores == 0 {
-        return 0;
-    }
-    let p = used_usec as f64 * 100.0 / (over_usec as f64 * cores as f64);
-    p.round().clamp(0.0, 100.0) as u32
-}
-
-/// Reads every running command's cgroup, remembering the last read of each
-/// so CPU is the use since then. One read is a handful of small files per
-/// command: cheap enough every couple of seconds, not every frame.
-#[derive(Debug)]
-pub struct Sampler {
-    cores: u32,
-    prev: HashMap<PathBuf, (u64, Instant)>,
-}
-
-impl Default for Sampler {
-    fn default() -> Self {
-        Sampler {
-            cores: std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(1),
-            prev: HashMap::new(),
-        }
-    }
-}
-
-impl Sampler {
-    /// Every task's use now, from the `.live` files under `runs_dir`.
-    /// `now_ms` (wall clock) gives a command seen for the first time its
-    /// average since it started.
-    pub fn sample(&mut self, runs_dir: &Path, now_ms: u64) -> Vec<TaskLive> {
-        let now = Instant::now();
-        let mut seen = HashMap::new();
-        let mut out: Vec<TaskLive> = Vec::new();
-        // GPU memory per process, from the answer the status line keeps
-        // (asked for afresh when old); none without an NVIDIA GPU.
-        let gpu = crate::session_use::cache_dir().and_then(|d| crate::session_use::gpu::apps(&d));
-        for (_, l) in read_dir(runs_dir) {
-            if !alive(l.pid) {
-                continue;
-            }
-            let Some(cg) = std::fs::read_to_string(&l.stats)
+/// Every running command under `runs_dir` with a scope of its own:
+/// `(session, task, its cgroup)`. A `.live` file whose `run` is gone, or
+/// whose command runs plain (no cgroup), is left out.
+pub fn running(runs_dir: &Path) -> Vec<(String, String, PathBuf)> {
+    read_dir(runs_dir)
+        .into_iter()
+        .filter(|(_, l)| alive(l.pid))
+        .filter_map(|(_, l)| {
+            let cg = std::fs::read_to_string(&l.stats)
                 .ok()
-                .and_then(|t| cgroup_of(&t))
-            else {
-                continue;
-            };
-            let Some((mem, usec)) = read_cgroup(&cg) else {
-                continue;
-            };
-            let pct = match self.prev.get(&cg) {
-                Some(&(u, at)) => cpu_pct(
-                    usec.saturating_sub(u),
-                    now.duration_since(at).as_micros() as u64,
-                    self.cores,
-                ),
-                None => cpu_pct(
-                    usec,
-                    now_ms.saturating_sub(l.started_ms).saturating_mul(1000),
-                    self.cores,
-                ),
-            };
-            let mem_mb = mem.div_ceil(1024 * 1024);
-            let gpu_mb = gpu
-                .as_ref()
-                .map(|apps| crate::session_use::gpu::of(apps, &cgroup_pids(&cg)));
-            seen.insert(cg, (usec, now));
-            match out
-                .iter_mut()
-                .find(|t| t.task == l.task && t.session == l.session)
-            {
-                Some(t) => {
-                    t.live.cpu_pct = (t.live.cpu_pct + pct).min(100);
-                    t.live.mem_mb += mem_mb;
-                    t.live.gpu_mb = match (t.live.gpu_mb, gpu_mb) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (a, b) => a.or(b),
-                    };
-                }
-                None => out.push(TaskLive {
-                    session: l.session,
-                    task: l.task,
-                    live: RunLive {
-                        cpu_pct: pct,
-                        mem_mb,
-                        gpu_mb,
-                    },
-                }),
-            }
-        }
-        self.prev = seen;
-        out.sort_by(|a, b| (&a.session, &a.task).cmp(&(&b.session, &b.task)));
-        out
-    }
+                .and_then(|t| cgroup_of(&t))?;
+            Some((l.session, l.task, cg))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -284,17 +178,12 @@ mod tests {
     }
 
     #[test]
-    fn the_shims_cgroup_line_and_cpu_stat_are_read() {
+    fn the_shims_cgroup_line_is_read() {
         assert_eq!(
             cgroup_of("started\ncgroup /sys/fs/cgroup/a/b.scope\n"),
             Some(PathBuf::from("/sys/fs/cgroup/a/b.scope"))
         );
         assert_eq!(cgroup_of("started\n"), None);
-        assert_eq!(usage_usec("usage_usec 4200\nuser_usec 4000\n"), Some(4200));
-        // One core busy for a second on four: a quarter of the machine.
-        assert_eq!(cpu_pct(1_000_000, 1_000_000, 4), 25);
-        assert_eq!(cpu_pct(9_000_000, 1_000_000, 4), 100);
-        assert_eq!(cpu_pct(5, 0, 4), 0);
     }
 
     /// The pids whose GPU memory a run's cell sums.
@@ -307,44 +196,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cg);
     }
 
-    /// A fake cgroup: the sampler sums a task's commands, keys them by
-    /// session and task, takes CPU between reads, and skips a `.live` file
-    /// whose `run` is gone; `register`'s guard removes its file.
+    /// A running command is listed with its cgroup, a dead run's file is
+    /// not, and `register`'s guard removes its file.
     #[test]
-    fn a_running_command_is_sampled_and_its_file_goes_with_it() {
-        let d = scratch("sample");
+    fn a_running_command_is_listed_and_its_file_goes_with_it() {
+        let d = scratch("running");
         let runs = d.join("runs");
         std::fs::create_dir_all(&runs).unwrap();
         let cg = d.join("cg");
-        std::fs::create_dir_all(&cg).unwrap();
-        std::fs::write(cg.join("memory.current"), (512u64 << 20).to_string()).unwrap();
-        std::fs::write(cg.join("cpu.stat"), "usage_usec 0\n").unwrap();
         let stats = runs.join("1-0.stats");
         std::fs::write(&stats, format!("started\ncgroup {}\n", cg.display())).unwrap();
         let reg = register(&stats, "demo#182", "s1", 1_000).expect("registered");
         assert!(live_path(&stats).exists());
-        // A dead run's file is skipped.
         std::fs::write(
             runs.join("2-0.live"),
             json!({"task":"x","session":"s1","pid":u32::MAX - 1,"stats":stats.display().to_string()})
                 .to_string(),
         )
         .unwrap();
-        let mut s = Sampler {
-            cores: 2,
-            prev: HashMap::new(),
-        };
-        let got = s.sample(&runs, 2_000);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].task, "demo#182");
-        assert_eq!(got[0].session, "s1");
-        assert_eq!(got[0].live.mem_mb, 512);
-        std::fs::write(cg.join("cpu.stat"), "usage_usec 99999999999\n").unwrap();
-        let got = s.sample(&runs, 3_000);
-        assert_eq!(got[0].live.cpu_pct, 100);
+        assert_eq!(
+            running(&runs),
+            [("s1".to_string(), "demo#182".to_string(), cg)]
+        );
         drop(reg);
         assert!(!live_path(&stats).exists());
-        assert!(s.sample(&runs, 4_000).is_empty());
+        assert!(running(&runs).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
