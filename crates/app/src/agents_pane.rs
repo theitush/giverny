@@ -2670,6 +2670,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// giverny#217, the inbar pass: a plain `start` and the task handed
+    /// over in the dispatcher's own words, with no `New task for you`. The
+    /// row with no worker is the worker's from the message, and each task
+    /// counts its own tokens — the next one named only as "a review round
+    /// on #613".
+    #[test]
+    fn a_task_handed_by_message_in_any_words_counts_its_own_tokens() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            sent(
+                T0 - 40 * MIN + 13_000,
+                "#613 verified and landed in Review — thanks. Next you hold acme#614 and nothing else.",
+            ),
+            reply("m2", T0 - 35 * MIN, 5_000, 20_000, 2_000),
+        ];
+        let (dir, rows, logs) = reused_worker("plain-start", &lines, true);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#614","stage":"running","started":{s614}}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{s614}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            s614 = T0 - 40 * MIN,
+        ));
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got: Vec<(Stage, &str, &str, Option<&str>)> = t
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.stage,
+                    l.id.as_str(),
+                    l.tokens.as_str(),
+                    l.click.agent_id.as_deref(),
+                )
+            })
+            .collect();
+        let (k21, k7) = (fmt_tokens(21_000), fmt_tokens(7_000));
+        assert_eq!(
+            got,
+            [
+                (Stage::Running, "acme#614", k7.as_str(), Some("w")),
+                (Stage::Done, "acme#613", k21.as_str(), Some("w")),
+            ]
+        );
+
+        // acme#614 landed (the pass linked it), a round of #613 started
+        // with no worker, and the message names only #614 and #613.
+        let more = [
+            sent(
+                T0 - 20 * MIN + 7_000,
+                "#614 verified and landed in Review. Now a review round on #613.",
+            ),
+            reply("m3", T0 - 10 * MIN, 3_000, 25_000, 500),
+        ];
+        let (dir2, rows, logs) =
+            reused_worker("plain-round", &[&lines[..], &more[..]].concat(), true);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#613-r1","stage":"running","started":{r1}}},
+              {{"key":"acme#614","stage":"done","agent_id":"w","started":{s614},"ended":{e614}}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{s614}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            s614 = T0 - 40 * MIN,
+            e614 = T0 - 25 * MIN,
+            r1 = T0 - 20 * MIN,
+        ));
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got: Vec<(Stage, &str, &str, Option<&str>)> = t
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.stage,
+                    l.id.as_str(),
+                    l.tokens.as_str(),
+                    l.click.agent_id.as_deref(),
+                )
+            })
+            .collect();
+        let k35 = fmt_tokens(3_500);
+        assert_eq!(
+            got,
+            [
+                (Stage::Running, "acme#613-r1", k35.as_str(), Some("w")),
+                (Stage::Done, "acme#614", k7.as_str(), Some("w")),
+                (Stage::Done, "acme#613", k21.as_str(), Some("w")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// No feed at all: the dispatcher sent `New task for you: …` twice and
     /// recorded nothing. Each task still gets its row, the earlier ones Done
     /// with their own span, and the Done counts add up to what the worker

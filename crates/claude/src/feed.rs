@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::worker_log::{self, WorkerLog};
+use crate::worker_log::{self, Message, WorkerLog};
 
 /// The feed format this build reads. Bumped only by an *incompatible* change;
 /// new fields are added without a bump, and readers ignore what they do not
@@ -1055,17 +1055,154 @@ fn queue<'w, L: LiveAgent>(
     }
 }
 
-/// The feed with the hand-offs nothing recorded: a worker
-/// whose dispatcher sent it a message saying it is a **new task** and naming
-/// one (`New task for you: acme#614, …`) holds that task from then, though
-/// the dispatcher never ran `start <task> --agent <worker>`.
+/// How near a Running row's `started` a dispatcher's message must come to
+/// hand that row over: a dispatcher runs `start <task>` and sends the
+/// worker its brief within a minute or two, either way round. A message
+/// sent long before a row started is about something else.
+pub const HANDOFF_WINDOW_MS: u64 = 3 * 60 * 1000;
+
+/// Does `text` name task `key`: as a whole word ([`names_key`]), or by
+/// its bare number — `#829` names the pass row `inbar#829` (and `829`).
+pub fn names_task(text: &str, key: &str) -> bool {
+    if names_key(text, key) {
+        return true;
+    }
+    let num = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+    match key.rsplit_once('#') {
+        Some((repo, n)) if !repo.is_empty() && num(n) => names_key(text, &format!("#{n}")),
+        None if num(key) => names_key(text, &format!("#{key}")),
+        _ => false,
+    }
+}
+
+/// The task a key is a round of: `inbar#828` for `inbar#828-r1`. `None`
+/// for a key that is no task number with a `-suffix`.
+fn round_of(key: &str) -> Option<&str> {
+    let hash = key.rfind('#')?;
+    let digits = key[hash + 1..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(key.len(), |i| hash + 1 + i);
+    (digits > hash + 1 && key[digits..].starts_with('-')).then(|| &key[..digits])
+}
+
+/// A row a dispatcher's message could hand its worker: one no worker holds
+/// yet. `started_ms` is `None` for a Planned row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waiting<'a> {
+    pub key: &'a str,
+    pub started_ms: Option<u64>,
+}
+
+/// Which of the `waiting` rows the dispatcher's message `m` hands its
+/// worker, by index, with no `start --agent` and no set wording
+/// (giverny#217). The first of these that finds any:
 ///
-/// - A feed row with that key still waiting (Planned, or Running with no
-///   worker) is that worker's from the message on: Running, with its
-///   `agent_id` and `started` filled in.
-/// - A key the feed does not have becomes a row of its own, right after the
-///   worker's other rows; and a worker the feed never described gets a row
-///   for the task it was spawned with too, so each task has its own.
+/// 1. the rows it names ([`names_task`]): `Next you hold inbar#829` —
+///    whatever else it names, the rows held already are not waiting;
+/// 2. the one Running row that is a round of a task it names: `a review
+///    round on #828` hands `inbar#828-r1`;
+/// 3. to an `idle` worker (every task it held before the message had
+///    landed by then), the one Running row started within
+///    [`HANDOFF_WINDOW_MS`] of the message.
+///
+/// A Running row is never handed by a message sent more than
+/// [`HANDOFF_WINDOW_MS`] before it started.
+pub fn handed_by(m: &Message, waiting: &[Waiting], idle: bool) -> Vec<usize> {
+    let timely = |w: &Waiting| {
+        w.started_ms
+            .is_none_or(|s| m.at_ms.saturating_add(HANDOFF_WINDOW_MS) >= s)
+    };
+    let named: Vec<usize> = (0..waiting.len())
+        .filter(|&i| timely(&waiting[i]) && names_task(&m.text, waiting[i].key))
+        .collect();
+    if !named.is_empty() {
+        return named;
+    }
+    let only = |pick: &dyn Fn(&Waiting) -> bool| -> Vec<usize> {
+        let found: Vec<usize> = (0..waiting.len())
+            .filter(|&i| waiting[i].started_ms.is_some() && timely(&waiting[i]))
+            .filter(|&i| pick(&waiting[i]))
+            .collect();
+        if found.len() == 1 { found } else { Vec::new() }
+    };
+    let round = only(&|w| round_of(w.key).is_some_and(|t| names_task(&m.text, t)));
+    if !round.is_empty() || !idle {
+        return round;
+    }
+    only(&|w| {
+        w.started_ms
+            .is_some_and(|s| s.abs_diff(m.at_ms) <= HANDOFF_WINDOW_MS)
+    })
+}
+
+/// The feed rows message `m` hands worker `id` ([`handed_by`]), by key:
+/// of the rows no worker holds in `doc` merged with `live`, those it names.
+fn waiting_handed<L: LiveAgent>(
+    doc: Option<&Feed>,
+    live: &[L],
+    id: &str,
+    m: &Message,
+) -> Vec<String> {
+    let Some(doc) = doc else { return Vec::new() };
+    let rows = merge(Some(doc), live);
+    let waiting: Vec<(&FeedRow, Stage)> = rows
+        .iter()
+        .filter_map(|r| {
+            let f = r.feed?;
+            let free = match r.stage {
+                // A Planned row may be queued on this worker already.
+                Stage::Planned => {
+                    f.agent_id.as_deref().is_none_or(|a| a == id)
+                        && r.live.is_none_or(|x| x.agent_id() == id)
+                }
+                Stage::Running => f.agent_id.is_none() && r.live.is_none(),
+                Stage::Done => false,
+            };
+            (free && !f.key.is_empty()).then_some((f, r.stage))
+        })
+        .collect();
+    if waiting.is_empty() {
+        return Vec::new();
+    }
+    // Idle: it held a task, and every one it began before the message had
+    // landed by then.
+    let mine: Vec<&FeedRow> = rows
+        .iter()
+        .filter(|r| r.stage != Stage::Planned && r.agent_id() == Some(id))
+        .filter_map(|r| r.feed)
+        .collect();
+    let idle = !mine.is_empty()
+        && mine
+            .iter()
+            .filter(|f| f.started_ms.is_some_and(|s| s < m.at_ms))
+            .all(|f| f.ended_ms.is_some_and(|e| e <= m.at_ms));
+    let slots: Vec<Waiting> = waiting
+        .iter()
+        .map(|(f, stage)| Waiting {
+            key: &f.key,
+            started_ms: f.started_ms.filter(|_| *stage == Stage::Running),
+        })
+        .collect();
+    handed_by(m, &slots, idle)
+        .into_iter()
+        .map(|i| waiting[i].0.key.clone())
+        .collect()
+}
+
+/// The feed with the hand-offs nothing recorded: a worker whose
+/// dispatcher sent it a message handing it a task holds that task from
+/// then, though the dispatcher never ran `start <task> --agent <worker>`.
+/// A message hands a task when it names a row no worker holds, in any
+/// wording ([`handed_by`]: `Next you hold inbar#829`), or when it says it
+/// is a **new task** and names one (`New task for you: acme#614, …`).
+///
+/// - A waiting feed row it hands (Planned, or Running with no worker) is
+///   that worker's from the message on: Running, with its `agent_id` and
+///   `started` filled in.
+/// - A new task the feed does not have becomes a row of its own, right
+///   after the worker's other rows; and a worker the feed never described
+///   gets a row for the task it was spawned with too, so each task has its
+///   own.
 /// - A key another worker holds, or one already Done, is left alone.
 ///
 /// [`queue`] then closes each earlier task at the next one's start. `None`
@@ -1079,57 +1216,53 @@ pub fn with_handoffs<'w, L: LiveAgent>(
     for l in live {
         let Some(w) = log(l.agent_id()) else { continue };
         let worker = spawned_at(l, Some(w)).unwrap_or(0);
-        let handed: Vec<(u64, String)> = w
-            .messages()
-            .iter()
-            .filter(|m| m.new_task && m.at_ms > worker)
-            .filter_map(|m| Some((m.at_ms, m.key.clone()?)))
-            .collect();
-        if handed.is_empty() {
-            continue;
-        }
-        let doc = out.get_or_insert_with(|| feed.cloned().unwrap_or_default());
         let id = l.agent_id();
-        let is_held = |doc: &Feed| {
-            let rows = merge(Some(doc), live);
+        let mut touched = false;
+        for m in w.messages().iter().filter(|m| m.at_ms > worker) {
+            let picks = waiting_handed(out.as_ref().or(feed), live, id, m);
+            let new_key = match (picks.is_empty(), m.new_task) {
+                (true, true) => m.key.clone(),
+                _ => None,
+            };
+            if picks.is_empty() && new_key.is_none() {
+                continue;
+            }
+            let doc = out.get_or_insert_with(|| feed.cloned().unwrap_or_default());
+            touched = true;
+            let at = m.at_ms;
             // A Planned row is waiting, not held: the hand-off is what
             // starts it.
-            rows.iter()
+            let mut held: Vec<String> = merge(Some(&*doc), live)
+                .iter()
                 .filter(|r| r.stage != Stage::Planned && r.live.is_some_and(|x| x.agent_id() == id))
                 .filter_map(|r| r.feed.map(|f| f.key.clone()))
-                .collect::<Vec<_>>()
-        };
-        let mut held = is_held(doc);
-        let last_of = |doc: &Feed| {
-            doc.rows
-                .iter()
-                .rposition(|f| f.agent_id.as_deref() == Some(id))
-                .map_or(doc.rows.len(), |i| i + 1)
-        };
-        if held.is_empty() {
-            let key = l
-                .description()
-                .and_then(worker_log::first_key)
-                .unwrap_or_default();
-            doc.rows.push(FeedRow {
-                key: key.clone(),
-                stage: Some(Stage::Running),
-                title: l.description().map(str::to_string),
-                agent_id: Some(id.to_string()),
-                started_ms: l.started_ms(),
-                ..FeedRow::default()
-            });
-            held.push(key);
-        }
-        for (at, key) in handed {
+                .collect();
+            if held.is_empty() {
+                let key = l
+                    .description()
+                    .and_then(worker_log::first_key)
+                    .unwrap_or_default();
+                doc.rows.push(FeedRow {
+                    key: key.clone(),
+                    stage: Some(Stage::Running),
+                    title: l.description().map(str::to_string),
+                    agent_id: Some(id.to_string()),
+                    started_ms: l.started_ms(),
+                    ..FeedRow::default()
+                });
+                held.push(key);
+            }
+            for key in &picks {
+                if let Some(f) = doc.rows.iter_mut().find(|f| &f.key == key) {
+                    f.stage = Some(Stage::Running);
+                    f.agent_id = Some(id.to_string());
+                    f.started_ms = Some(f.started_ms.map_or(at, |s| s.min(at)));
+                }
+            }
+            let Some(key) = new_key else { continue };
             if held.iter().any(|k| same_task(&key, k)) {
                 continue;
             }
-            let title = w
-                .messages()
-                .iter()
-                .find(|m| m.at_ms == at)
-                .and_then(|m| m.title.clone());
             match doc.rows.iter_mut().find(|f| same_task(&key, &f.key)) {
                 Some(f) => {
                     let waiting = matches!(f.stage(), Stage::Planned | Stage::Running)
@@ -1142,13 +1275,17 @@ pub fn with_handoffs<'w, L: LiveAgent>(
                     f.started_ms = Some(f.started_ms.map_or(at, |s| s.min(at)));
                 }
                 None => {
-                    let at_row = last_of(doc);
+                    let at_row = doc
+                        .rows
+                        .iter()
+                        .rposition(|f| f.agent_id.as_deref() == Some(id))
+                        .map_or(doc.rows.len(), |i| i + 1);
                     doc.rows.insert(
                         at_row,
                         FeedRow {
-                            key: key.clone(),
+                            key,
                             stage: Some(Stage::Running),
-                            title,
+                            title: m.title.clone(),
                             agent_id: Some(id.to_string()),
                             started_ms: Some(at),
                             ..FeedRow::default()
@@ -1156,10 +1293,11 @@ pub fn with_handoffs<'w, L: LiveAgent>(
                     );
                 }
             }
-            held.push(key);
         }
         // A worker that has finished finished its last task.
-        if !l.running()
+        if touched
+            && !l.running()
+            && let Some(doc) = out.as_mut()
             && let Some(last) = doc
                 .rows
                 .iter_mut()
@@ -1343,6 +1481,57 @@ mod tests {
                 .rows[0]
                 .follows_worker
         );
+    }
+
+    fn msg(at_ms: u64, text: &str) -> Message {
+        Message {
+            at_ms,
+            key: worker_log::first_key(text),
+            new_task: false,
+            title: None,
+            text: text.into(),
+        }
+    }
+
+    /// giverny#217: a message hands a waiting row over in the
+    /// dispatcher's own words — by its key, by the task it is a round of,
+    /// or, to an idle worker, by being sent just as it started.
+    #[test]
+    fn a_message_hands_over_the_waiting_row_it_names() {
+        const M: u64 = 60_000;
+        let t = 100 * M;
+        let w = |key, started_ms| Waiting { key, started_ms };
+        // By key, as a whole word; a bare `#829` names `inbar#829`.
+        let rows = [w("inbar#8290", Some(t)), w("inbar#829", Some(t))];
+        let m = msg(
+            t + 13_000,
+            "#828 landed. Next you hold inbar#829 and nothing else.",
+        );
+        assert_eq!(handed_by(&m, &rows, false), [1]);
+        assert_eq!(handed_by(&msg(t, "next: #829"), &rows, false), [1]);
+        assert!(names_task("on #829.", "829"));
+        assert!(!names_task("on #8290", "inbar#829"));
+        assert!(!names_task("on other#829", "inbar#829"));
+        // A Planned row named is handed too; a message sent long before a
+        // Running row started is not about it.
+        let planned = [w("acme#7", None)];
+        assert_eq!(handed_by(&msg(0, "then acme#7"), &planned, false), [0]);
+        assert!(handed_by(&msg(t - 10 * M, "inbar#829 next"), &rows, false).is_empty());
+        // A round of a named task, when it is the only one.
+        let rounds = [w("inbar#828-r1", Some(t)), w("inbar#831", Some(t))];
+        let m = msg(t + 7_000, "#829 landed. Now a review round on #828.");
+        assert_eq!(handed_by(&m, &rounds, false), [0]);
+        assert_eq!(round_of("inbar#828-r1"), Some("inbar#828"));
+        assert_eq!(round_of("inbar#828"), None);
+        assert_eq!(round_of("lex-fix"), None);
+        // Named nowhere: the one row started just then, to an idle worker
+        // only, and never a pick between two.
+        let m = msg(t + 7_000, "Now the review round, same page.");
+        let one = [w("inbar#831", Some(t)), w("inbar#700", Some(t - 30 * M))];
+        assert_eq!(handed_by(&m, &one, true), [0]);
+        assert!(handed_by(&m, &one, false).is_empty(), "busy");
+        let two = [w("inbar#831", Some(t)), w("inbar#832", Some(t + M))];
+        assert!(handed_by(&m, &two, true).is_empty(), "which one?");
     }
 
     #[test]

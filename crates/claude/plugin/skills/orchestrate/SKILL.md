@@ -211,9 +211,14 @@ giverny-pass start <next task> --agent <worker's agent id>
 
 That lands the worker's earlier task now, with its own measured time, and
 starts the new one with its own clock; the pane shows each task as its own row,
-and each finished row counts only the tokens spent on that task. Begin the
-message with `New task for you: <next task>`, so the pane can tell the hand-off
-apart from a mid-task note even where the `start` was missed.
+and each finished row counts only the tokens spent on that task. A plain
+`start <next task>` (with no `--agent`) works too when the message names the
+task (`Next you hold acme#614`, or `a review round on #613` for `acme#613-r1`):
+the pass and the pane link the row to the worker the message went to, and
+`start` points out the idle worker to pass as `--agent`. Beginning the message
+with `New task for you: <next task>` is no longer required, only recommended:
+it is what tells a hand-off to a worker still busy on its last task apart from
+a mid-task note.
 
 ## 4. Land a task
 

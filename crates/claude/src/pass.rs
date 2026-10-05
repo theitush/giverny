@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
-use crate::worker_log::WorkerLog;
+use crate::worker_log::{self, WorkerLog};
 use crate::{feed, pass_history, resources};
 
 /// Marks the files this writer owns, so it never rewrites another's.
@@ -585,11 +585,14 @@ fn freeze_tokens(
         return;
     };
     let began = |r: &Map<String, Value>| ms_of(r, "spawned").or_else(|| ms_of(r, "started"));
-    let starts: Vec<(String, u64)> = rows
+    let starts: Vec<(String, u64, Option<u64>)> = rows
         .iter()
         .filter_map(Value::as_object)
         .filter(|r| stage_of(r) != Some(feed::Stage::Planned))
-        .filter_map(|r| Some((r.get("agent_id")?.as_str()?.to_string(), began(r)?)))
+        .filter_map(|r| {
+            let agent = r.get("agent_id")?.as_str()?.to_string();
+            Some((agent, began(r)?, ms_of(r, "ended")))
+        })
         .collect();
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
         let key = row.get("key").and_then(Value::as_str).unwrap_or("");
@@ -607,9 +610,18 @@ fn freeze_tokens(
         ) else {
             continue;
         };
-        let other = |far: &dyn Fn(u64) -> bool| starts.iter().any(|(a, s)| a == agent && far(*s));
-        let earlier = other(&|s| s.saturating_add(feed::LATER_TASK_MS) <= start);
-        let later = other(&|s| start.saturating_add(feed::LATER_TASK_MS) <= s);
+        let other = |far: &dyn Fn(u64, Option<u64>) -> bool| {
+            starts.iter().any(|(a, s, e)| a == agent && far(*s, *e))
+        };
+        // Another of its tasks, before or after: one begun well apart, or
+        // one that had landed before the other began, however short.
+        let earlier = other(&|s, e| {
+            s.saturating_add(feed::LATER_TASK_MS) <= start
+                || (s < start && e.is_some_and(|e| e <= start))
+        });
+        let later = other(&|s, _| {
+            start.saturating_add(feed::LATER_TASK_MS) <= s || (start < s && end <= s)
+        });
         if !earlier && !later {
             continue;
         }
@@ -617,6 +629,173 @@ fn freeze_tokens(
         let from = if earlier { start } else { 0 };
         row.insert("task_tokens".into(), json!(w.added(from, Some(end))));
     }
+}
+
+/// Whether any Running row has no worker: only then can a dispatcher's
+/// message have handed one over ([`link_handoffs`]).
+fn has_unworkered(doc: &Value) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|r| !r.contains_key("agent_id") && stage_of(r) == Some(feed::Stage::Running))
+}
+
+/// The hand-offs a dispatcher made by message alone (giverny#217): a plain
+/// `start <task>`, then a `SendMessage` to a worker of this pass naming the
+/// task in any wording. Each Running row with no worker that such a message
+/// hands over ([`feed::handed_by`]) gets that worker's `agent_id`, as
+/// `start <task> --agent <worker>` would have given it, so its tokens are
+/// counted from its own start and frozen when it lands. The workers looked
+/// at are those the feed already names (a reused worker is one), their
+/// messages taken in the order sent. A message counts only when the worker
+/// was idle (every task it held before had landed by then) or it says it is
+/// a new task, which also lands the worker's earlier Running rows at that
+/// message, as `start --agent` does. Returns `(agent, keys)` linked.
+fn link_handoffs(
+    doc: &mut Value,
+    log: impl Fn(&str) -> Option<WorkerLog>,
+) -> Vec<(String, Vec<String>)> {
+    if !has_unworkered(doc) {
+        return Vec::new();
+    }
+    let Some(rows) = doc.get_mut("rows").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let mut agents: Vec<String> = Vec::new();
+    for r in rows.iter().filter_map(Value::as_object) {
+        if let Some(a) = r.get("agent_id").and_then(Value::as_str)
+            && !a.is_empty()
+            && !agents.iter().any(|x| x == a)
+        {
+            agents.push(a.to_string());
+        }
+    }
+    let mut sent: Vec<(String, worker_log::Message)> = Vec::new();
+    for a in &agents {
+        if let Some(w) = log(a) {
+            sent.extend(w.messages().iter().map(|m| (a.clone(), m.clone())));
+        }
+    }
+    sent.sort_by_key(|(_, m)| m.at_ms);
+    let mut linked: Vec<(String, Vec<String>)> = Vec::new();
+    for (agent, m) in &sent {
+        let at = m.at_ms;
+        let mine = |r: &Map<String, Value>| {
+            r.get("agent_id").and_then(Value::as_str) == Some(agent)
+                && stage_of(r) != Some(feed::Stage::Planned)
+        };
+        let idle = rows
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|r| mine(r) && ms_of(r, "started").is_some_and(|s| s < at))
+            .all(|r| ms_of(r, "ended").is_some_and(|e| e <= at));
+        if !idle && !m.new_task {
+            continue;
+        }
+        let waiting: Vec<(usize, String, Option<u64>)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let r = r.as_object()?;
+                let key = r.get("key").and_then(Value::as_str)?;
+                (!r.contains_key("agent_id")
+                    && stage_of(r) == Some(feed::Stage::Running)
+                    && !key.is_empty())
+                .then(|| (i, key.to_string(), ms_of(r, "started")))
+            })
+            .collect();
+        let slots: Vec<feed::Waiting> = waiting
+            .iter()
+            .map(|(_, key, started)| feed::Waiting {
+                key,
+                started_ms: *started,
+            })
+            .collect();
+        let picks = feed::handed_by(m, &slots, idle);
+        if picks.is_empty() {
+            continue;
+        }
+        for &p in &picks {
+            let (i, key) = (waiting[p].0, &waiting[p].1);
+            if !idle {
+                hand_off(rows, i, agent, None, at);
+            }
+            if let Some(r) = rows[i].as_object_mut() {
+                r.insert("agent_id".into(), json!(agent));
+            }
+            match linked.iter_mut().find(|(a, _)| a == agent) {
+                Some((_, keys)) => keys.push(key.clone()),
+                None => linked.push((agent.clone(), vec![key.clone()])),
+            }
+        }
+    }
+    linked
+}
+
+/// `start <task>` with no `--agent`: the workers of this pass that are
+/// idle now — every row they hold has landed, the last within
+/// [`IDLE_HINT_MS`] — newest landing first, with that row's key. One of them
+/// may be about to be handed `task`.
+fn idle_workers(doc: &Value, task: &str, now: u64) -> Vec<(String, String)> {
+    let rows: Vec<&Map<String, Value>> = doc
+        .get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .collect();
+    let mut idle: Vec<(u64, String, String)> = Vec::new();
+    for r in &rows {
+        let Some(a) = r.get("agent_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if a.is_empty() || idle.iter().any(|(_, x, _)| x == a) {
+            continue;
+        }
+        let theirs: Vec<&&Map<String, Value>> = rows
+            .iter()
+            .filter(|r| r.get("agent_id").and_then(Value::as_str) == Some(a))
+            .filter(|r| r.get("key").and_then(Value::as_str) != Some(task))
+            .collect();
+        if theirs
+            .iter()
+            .any(|r| stage_of(r) != Some(feed::Stage::Done))
+        {
+            continue;
+        }
+        let last = theirs
+            .iter()
+            .filter_map(|r| Some((ms_of(r, "ended")?, r.get("key")?.as_str()?)))
+            .max_by_key(|(e, _)| *e);
+        if let Some((ended, key)) = last
+            && now.saturating_sub(ended) <= IDLE_HINT_MS
+        {
+            idle.push((ended, a.to_string(), key.to_string()));
+        }
+    }
+    idle.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+    idle.into_iter().map(|(_, a, k)| (a, k)).collect()
+}
+
+/// How lately a worker's last task must have landed for `start` with no
+/// `--agent` to name it as idle.
+const IDLE_HINT_MS: u64 = 30 * 60 * 1000;
+
+/// The line `start <task>` with no `--agent` adds when a worker of this
+/// pass is idle: hand it over with `--agent`, so its tokens are its own.
+fn idle_hint(task: &str, idle: &[(String, String)]) -> Option<String> {
+    let (agent, key) = idle.first()?;
+    let more = match idle.len() {
+        1 => String::new(),
+        n => format!(" ({} more idle)", n - 1),
+    };
+    Some(format!(
+        "  {agent} is idle since {key} landed{more}: if it takes {task}, start it with \
+         `--agent {agent}` so {task} counts its own tokens (a SendMessage to it naming \
+         {task} links it too)"
+    ))
 }
 
 /// The spawn description of `session`'s subagent `agent`, from its
@@ -1332,14 +1511,30 @@ fn run_feed(
                 flags.agent_desc = agent_description(flags.claude_dir.as_deref(), session, agent);
             }
             let before = done_keys(&doc);
+            let read_log = |agent: &str| worker_log(flags.claude_dir.as_deref(), session, agent);
+            let linked = link_handoffs(&mut doc, read_log);
+            for (agent, _) in &linked {
+                freeze_tokens(&mut doc, &before, Some(agent), read_log);
+            }
             let msg = apply(&mut doc, cmd, &flags, now)?;
             let handed = match cmd {
                 Cmd::Start(_) => flags.agent.as_deref(),
                 _ => None,
             };
-            freeze_tokens(&mut doc, &before, handed, |agent| {
-                worker_log(flags.claude_dir.as_deref(), session, agent)
-            });
+            freeze_tokens(&mut doc, &before, handed, read_log);
+            let mut msg = msg;
+            for (agent, keys) in &linked {
+                msg.push_str(&format!(
+                    "\n  {} handed to {agent} by message: its tokens are its own",
+                    keys.join(", ")
+                ));
+            }
+            if let (Cmd::Start(task), None) = (cmd, &flags.agent)
+                && let Some(hint) = idle_hint(task, &idle_workers(&doc, task, now))
+                && !row_has_agent(&doc, task)
+            {
+                msg = format!("{msg}\n{hint}");
+            }
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
             if let Some(h) = &history {
                 learn(&doc, &before, session, h);
@@ -1359,6 +1554,14 @@ fn run_feed(
             Ok((msg, landed))
         }
     }
+}
+
+/// Whether the row `key` has a worker.
+fn row_has_agent(doc: &Value, key: &str) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| find(rows, key).map(|i| &rows[i]))
+        .is_some_and(|r| r.get("agent_id").is_some())
 }
 
 /// Whether the row `key` names a brief.
@@ -2694,6 +2897,149 @@ mod tests {
             Some(1_000),
             "to its landing, not the hand-off"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dispatcher's `SendMessage` at `at`, as the worker's transcript has it.
+    fn sent_at(at: u64, body: &str) -> String {
+        json!({"type": "user", "timestamp": stamp(at), "isMeta": true,
+            "origin": {"kind": "coordinator"},
+            "message": {"role": "user", "content":
+                format!("The coordinator sent a message while you were working:\n{body}")}})
+        .to_string()
+    }
+
+    fn agent_of(f: &feed::Feed, key: &str) -> Option<String> {
+        f.rows
+            .iter()
+            .find(|r| r.key == key)
+            .unwrap()
+            .agent_id
+            .clone()
+    }
+
+    /// The inbar pass (giverny#217): one worker reused for three tasks with
+    /// a plain `start` each time and the task handed over by a message in
+    /// the dispatcher's own words, the third named only as "a review round
+    /// on #828". Each task still gets the worker and its own count, frozen
+    /// when it lands, however short it was.
+    #[test]
+    fn a_task_handed_by_message_after_a_plain_start_counts_its_own_tokens() {
+        let dir = scratch("handoff-msg");
+        run_cfg(&dir, "s1", "start inbar#828 --agent w1", None, T0);
+        let cfg = spawned(&dir, "s1", "w1", "inbar#828: exit charts");
+        let log = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join("agent-w1.jsonl");
+        let write = |lines: &[String]| std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let mut lines = vec![turn("a", T0 + MIN, 1_000), turn("b", T0 + 5 * MIN, 2_000)];
+        write(&lines);
+        run_cfg(&dir, "s1", "land inbar#828", Some(&cfg), T0 + 8 * MIN);
+
+        // A plain start: the idle worker is pointed out.
+        let (said, _) = run_cfg(&dir, "s1", "start inbar#829", Some(&cfg), T0 + 8 * MIN);
+        assert!(said.contains("w1 is idle since inbar#828 landed"), "{said}");
+        assert!(said.contains("--agent w1"), "{said}");
+        lines.push(sent_at(
+            T0 + 8 * MIN + 13_000,
+            "#828 verified and landed in Review — thanks. Next you hold inbar#829 and \
+             nothing else (not inbar#8290).",
+        ));
+        lines.push(turn("c", T0 + 10 * MIN, 400));
+        write(&lines);
+        let (said, _) = run_cfg(&dir, "s1", "land inbar#829", Some(&cfg), T0 + 12 * MIN);
+        assert!(said.contains("inbar#829 handed to w1 by message"), "{said}");
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "inbar#829").as_deref(), Some("w1"));
+        assert_eq!(
+            task_tokens(&f, "inbar#828"),
+            Some(3_000),
+            "frozen at the hand-off"
+        );
+        assert_eq!(
+            task_tokens(&f, "inbar#829"),
+            Some(400),
+            "four minutes, its own"
+        );
+
+        // The next one is named only by the task it is a round of.
+        run_cfg(&dir, "s1", "start inbar#828-r1", Some(&cfg), T0 + 14 * MIN);
+        lines.push(sent_at(
+            T0 + 14 * MIN + 7_000,
+            "#829 verified and landed in Review. Now a review round on #828 (covers #829 too).",
+        ));
+        lines.push(turn("d", T0 + 16 * MIN, 50));
+        write(&lines);
+        run_cfg(&dir, "s1", "land inbar#828-r1", Some(&cfg), T0 + 17 * MIN);
+        lines.push(turn("e", T0 + 20 * MIN, 90_000));
+        write(&lines);
+        run_cfg(&dir, "s1", "show", Some(&cfg), T0 + 21 * MIN);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "inbar#828-r1").as_deref(), Some("w1"));
+        assert_eq!(task_tokens(&f, "inbar#828-r1"), Some(50));
+        assert_eq!(
+            task_tokens(&f, "inbar#828"),
+            Some(3_000),
+            "frozen stays frozen"
+        );
+        assert_eq!(
+            task_tokens(&f, "inbar#829"),
+            Some(400),
+            "frozen stays frozen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A message to a worker busy on its own task hands nothing over unless
+    /// it says it is a new task; a fresh spawn's row is left for its spawn.
+    #[test]
+    fn a_message_to_a_busy_worker_hands_nothing_over() {
+        let dir = scratch("handoff-busy");
+        run_cfg(&dir, "s1", "start inbar#900 --agent w1", None, T0);
+        let cfg = spawned(&dir, "s1", "w1", "inbar#900: one");
+        let log = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join("agent-w1.jsonl");
+        run_cfg(&dir, "s1", "start inbar#901", Some(&cfg), T0 + 10 * MIN);
+        let lines = [
+            turn("a", T0 + MIN, 1_000),
+            sent_at(
+                T0 + 10 * MIN + 5_000,
+                "FYI inbar#901 is going to a new worker.",
+            ),
+        ];
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let (said, _) = run_cfg(&dir, "s1", "eta inbar#900 5", Some(&cfg), T0 + 11 * MIN);
+        assert!(!said.contains("handed to"), "{said}");
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "inbar#901"), None);
+        assert_eq!(f.rows[0].stage(), feed::Stage::Running, "w1 still on #900");
+
+        // Said to be a new task, it is one: #900 lands at the message.
+        std::fs::write(
+            &log,
+            [
+                lines[0].clone(),
+                lines[1].clone(),
+                sent_at(T0 + 12 * MIN, "New task for you: inbar#901, drop #900."),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        run_cfg(&dir, "s1", "eta inbar#901 5", Some(&cfg), T0 + 13 * MIN);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "inbar#901").as_deref(), Some("w1"));
+        let r900 = f.rows.iter().find(|r| r.key == "inbar#900").unwrap();
+        assert_eq!(r900.stage(), feed::Stage::Done);
+        assert_eq!(r900.ended_ms, Some(T0 + 12 * MIN));
+        assert_eq!(task_tokens(&f, "inbar#900"), Some(1_000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

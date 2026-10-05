@@ -44,6 +44,9 @@ pub struct Message {
     pub new_task: bool,
     /// Its first line, cut short: a row's title when nothing else gives one.
     pub title: Option<String>,
+    /// The whole message, without Claude Code's framing: what
+    /// [`crate::feed::handed_by`] looks for the keys of waiting rows in.
+    pub text: String,
 }
 
 impl Message {
@@ -134,6 +137,7 @@ fn message_of(v: &Value) -> Option<Message> {
         key: first_key(&body),
         new_task,
         title,
+        text: body,
     })
 }
 
