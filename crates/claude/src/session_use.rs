@@ -161,7 +161,8 @@ pub fn line_width(columns: Option<&str>) -> Option<usize> {
 /// `left` with `right` at the right edge of a `width`-column line, at
 /// least [`MIN_GAP`] blanks between; just appended after a [`SEP`] when
 /// the width is unknown. Columns are counted as characters: everything
-/// the line holds (`·`, model names, figures) is one column wide.
+/// the line holds (`·`, model names, figures) is one column wide, and a
+/// colour escape none ([`columns`]).
 pub fn align(left: &str, right: &str, width: Option<usize>) -> String {
     if right.is_empty() {
         return left.to_string();
@@ -175,9 +176,24 @@ pub fn align(left: &str, right: &str, width: Option<usize>) -> String {
     let Some(width) = width else {
         return format!("{left}{SEP}{right}");
     };
-    let used = left.chars().count() + right.chars().count();
+    let used = columns(left) + columns(right);
     let gap = width.saturating_sub(used).max(MIN_GAP);
     format!("{left}{}{right}", " ".repeat(gap))
+}
+
+/// The columns `s` takes on screen: its characters, less its SGR colour
+/// escapes (`ESC [ … m`, giverny#223's red).
+fn columns(s: &str) -> usize {
+    let mut n = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            chars.by_ref().find(|c| *c == 'm');
+        } else {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// The session's use now, for the session named `session_id` (the key of
@@ -688,6 +704,11 @@ mod tests {
         // Nothing to place: the line as it was.
         assert_eq!(align(left, "", Some(80)), left);
         assert_eq!(align("", right, Some(20)).chars().count(), 20);
+        // A red segment's escapes take no column (giverny#223).
+        let red = format!("{left}{SEP}\x1b[31mcache cold\x1b[0m");
+        let line = align(&red, right, Some(80));
+        assert_eq!(line.chars().count(), 80 + "\x1b[31m\x1b[0m".len());
+        assert!(line.ends_with(right));
     }
 
     #[test]
