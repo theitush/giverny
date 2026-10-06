@@ -414,6 +414,7 @@ static NO_WORKERS: std::sync::LazyLock<HashMap<String, RunLive>> =
     std::sync::LazyLock::new(HashMap::new);
 
 /// No agent ETAs.
+#[cfg(any(test, debug_assertions))]
 static NO_ETAS: std::sync::LazyLock<Etas> = std::sync::LazyLock::new(Etas::new);
 
 #[cfg(any(test, debug_assertions))]
