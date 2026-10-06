@@ -134,6 +134,75 @@ fn last_in(buf: &[u8]) -> Option<u64> {
 /// What a transcript says it is carrying now, or `None`: the context of the
 /// last API response in it. Never fails — an unreadable file is `None`.
 pub fn tokens_of(path: &Path) -> Option<u64> {
+    tail_find(path, last_in)
+}
+
+/// The transcript's last reply, as far as the prompt cache goes: when it was
+/// written, the cache TTL it wrote, and what the next request would re-cache
+/// if that TTL has run out — its context plus its own output, which the next
+/// request carries too (giverny#223).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastReply {
+    /// Unix milliseconds.
+    pub at_ms: i64,
+    /// `None` when the reply wrote nothing to the cache, so its TTL is unknown.
+    pub ttl_ms: Option<i64>,
+    pub recache: u64,
+}
+
+/// The last main-conversation reply in a transcript, read from its tail.
+pub fn last_reply(path: &Path) -> Option<LastReply> {
+    tail_find(path, |buf| {
+        buf.split(|&c| c == b'\n').rev().find_map(reply_of)
+    })
+}
+
+fn reply_of(line: &[u8]) -> Option<LastReply> {
+    // Cheap gates before parsing a whole line.
+    line_tokens(line)?;
+    let v: Value = serde_json::from_slice(line).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("assistant")
+        || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let at_ms = v
+        .get("timestamp")?
+        .as_str()?
+        .parse::<jiff::Timestamp>()
+        .ok()?
+        .as_millisecond();
+    let usage = v.get("message")?.get("usage")?;
+    let (a, b, c) = usage_numbers(usage);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let wrote = |k: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    };
+    let ttl_ms = if wrote("ephemeral_1h_input_tokens") {
+        Some(3_600_000)
+    } else if wrote("ephemeral_5m_input_tokens") {
+        Some(300_000)
+    } else {
+        None
+    };
+    Some(LastReply {
+        at_ms,
+        ttl_ms,
+        recache: a + b + c + output,
+    })
+}
+
+/// `find` over a transcript's complete lines, reading back from the tail in
+/// doubling chunks until it answers or the whole file was read.
+fn tail_find<T>(path: &Path, find: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut want = TAIL_START;
@@ -152,7 +221,7 @@ pub fn tokens_of(path: &Path) -> Option<u64> {
                 None => &[],
             }
         };
-        if let Some(n) = last_in(lines) {
+        if let Some(n) = find(lines) {
             return Some(n);
         }
         if whole {
@@ -672,6 +741,67 @@ mod tests {
         // A transcript shorter than the scan is rescanned from the top.
         std::fs::write(&p, asst(json!({"input_tokens": 1})) + "\n").unwrap();
         assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 0);
+    }
+
+    #[test]
+    fn the_last_reply_says_when_it_was_and_what_it_cached() {
+        let d = tmpdir("last-reply");
+        let t = d.join("s.jsonl");
+        let reply = |at: &str, sidechain: bool, usage: Value| {
+            json!({"type": "assistant", "timestamp": at, "isSidechain": sidechain,
+                "message": {"role": "assistant", "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "hi"}], "usage": usage}})
+            .to_string()
+        };
+        let cached = |k: &str| {
+            json!({"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 90_000, "output_tokens": 500,
+                "cache_creation": {k: 1000}})
+        };
+        let lines = [
+            reply(
+                "2026-10-06T10:00:00Z",
+                false,
+                cached("ephemeral_5m_input_tokens"),
+            ),
+            reply(
+                "2026-10-06T11:00:00Z",
+                false,
+                cached("ephemeral_1h_input_tokens"),
+            ),
+            // A sidechain reply after it is not the conversation's.
+            reply(
+                "2026-10-06T12:00:00Z",
+                true,
+                cached("ephemeral_5m_input_tokens"),
+            ),
+            json!({"type": "user", "timestamp": "2026-10-06T12:30:00Z"}).to_string(),
+        ];
+        std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+        let at = "2026-10-06T11:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        assert_eq!(
+            last_reply(&t),
+            Some(LastReply {
+                at_ms: at,
+                ttl_ms: Some(3_600_000),
+                recache: 91_502
+            })
+        );
+        // A reply that wrote nothing to the cache leaves the TTL unknown.
+        std::fs::write(
+            &t,
+            reply(
+                "2026-10-06T10:00:00Z",
+                false,
+                json!({"cache_read_input_tokens": 5}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(last_reply(&t).map(|r| r.ttl_ms), Some(None));
+        assert_eq!(last_reply(&d.join("missing.jsonl")), None);
     }
 
     #[test]

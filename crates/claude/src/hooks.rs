@@ -383,8 +383,10 @@ pub fn run_statusline(spool: &Path) {
         parts.push(model.to_string());
     }
     // No 5h or week usage here: Giverny's sidebar shows both.
-    parts.extend(statusline_tokens(&payload));
-    parts.extend(cache_cold_segment(&payload));
+    let transcript = transcript_of(&payload);
+    parts.extend(statusline_tokens(&payload, transcript.as_deref()));
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
     // The whole session's CPU, memory and GPU now, at the right edge: the
     // running Giverny's last reading, the same figure its agents pane and
     // sidebar are parts and sums of; measured here only without one (a
@@ -403,16 +405,35 @@ pub fn run_statusline(spool: &Path) {
 }
 
 /// Red `cache cold · next msg <n>` once the main conversation's prompt cache
-/// has expired (giverny#223): `<n>` is what the next message re-caches, from
-/// Claude Code's `prompt_cache`. Nothing while it is warm, or when the
-/// provider reports no cache tokens at all.
-fn cache_cold_segment(payload: &serde_json::Value) -> Option<String> {
-    let cache = payload.get("prompt_cache")?;
-    let flag = |key: &str| cache.get(key).and_then(|v| v.as_bool());
-    if flag("caching_observed") != Some(true) || flag("warm") != Some(false) {
-        return None;
-    }
-    let text = match cache.get("recache_tokens_if_cold").and_then(|v| v.as_u64()) {
+/// has expired (giverny#223): `<n>` is what the next message re-caches.
+/// Nothing while it is warm, or when the provider reports no cache tokens.
+///
+/// Claude Code's `prompt_cache` says so once this process has sent a
+/// request; a reopened session has sent none, and carries no `prompt_cache`
+/// until its first message — the very message the warning is for — so then
+/// the transcript's last reply answers: its time, the TTL it wrote, its size.
+fn cache_cold_segment(
+    payload: &serde_json::Value,
+    transcript: Option<&Path>,
+    now_ms: i64,
+) -> Option<String> {
+    let recache = match payload.get("prompt_cache") {
+        Some(cache) => {
+            let flag = |key: &str| cache.get(key).and_then(|v| v.as_bool());
+            if flag("caching_observed") != Some(true) || flag("warm") != Some(false) {
+                return None;
+            }
+            cache.get("recache_tokens_if_cold").and_then(|v| v.as_u64())
+        }
+        None => {
+            let last = crate::tokens::last_reply(transcript?)?;
+            if now_ms < last.at_ms + last.ttl_ms? {
+                return None;
+            }
+            Some(last.recache)
+        }
+    };
+    let text = match recache {
         Some(n) => format!("cache cold · next msg {}", crate::tokens::fmt_tokens(n)),
         None => "cache cold".to_string(),
     };
@@ -427,38 +448,45 @@ const RESET: &str = "\x1b[0m";
 /// status line (giverny#22, giverny#95): this conversation's own tokens, every subagent's
 /// summed, and the two added, counted the way coo's `orchestrate-status`
 /// counts them (see [`crate::tokens`]).
-fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
+fn statusline_tokens(payload: &serde_json::Value, transcript: Option<&Path>) -> Vec<String> {
     use crate::tokens;
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let dirs = tokens::session_subagent_dirs(transcript, config_dir().as_deref(), session_id);
+    let session = tokens::session_tokens(payload, transcript);
+    // What the session spent before its compactions: `(+<n>)` beside its own
+    // count, and in the total.
+    let compacted = transcript.map_or(0, |t| {
+        tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
+    });
+    let (session, subagents, total) =
+        tokens::session_subagents_total(session, compacted, &tokens::subagent_transcripts(&dirs));
+    tokens::segments(session, compacted, subagents, total)
+}
+
+/// This account's Claude config dir.
+fn config_dir() -> Option<PathBuf> {
+    account_dir()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+}
+
+/// The conversation's transcript: `transcript_path` off the status line's
+/// stdin, else the one its session id names, as in coo.
+fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
     let transcript = payload
         .get("transcript_path")
         .and_then(|t| t.as_str())
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(PathBuf::from);
-    let session_id = payload.get("session_id").and_then(|s| s.as_str());
-    let config_dir = account_dir()
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
-    // No `transcript_path` on stdin: the session id names it, as in coo.
-    let transcript = transcript.filter(|t| t.exists()).or_else(|| {
-        let (cfg, sid) = (config_dir.as_ref()?, session_id?);
-        std::fs::read_dir(cfg.join("projects"))
+    transcript.filter(|t| t.exists()).or_else(|| {
+        let sid = payload.get("session_id").and_then(|s| s.as_str())?;
+        std::fs::read_dir(config_dir()?.join("projects"))
             .ok()?
             .flatten()
             .map(|e| e.path().join(format!("{sid}.jsonl")))
             .find(|p| p.is_file())
-    });
-    let dirs =
-        tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
-    let session = tokens::session_tokens(payload, transcript.as_deref());
-    // What the session spent before its compactions: `(+<n>)` beside its own
-    // count, and in the total.
-    let compacted = transcript.as_deref().map_or(0, |t| {
-        tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
-    });
-    let (session, subagents, total) =
-        tokens::session_subagents_total(session, compacted, &tokens::subagent_transcripts(&dirs));
-    tokens::segments(session, compacted, subagents, total)
+    })
 }
 
 // ---- subagentStatusLine: the agents pane's live rows ----------------------
@@ -1068,7 +1096,7 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            cache_cold_segment(&serde_json::json!({ "prompt_cache": cache }))
+            cache_cold_segment(&serde_json::json!({ "prompt_cache": cache }), None, 0)
         };
         assert_eq!(
             cold(serde_json::json!({"recache_tokens_if_cold": 182_340})).as_deref(),
@@ -1082,7 +1110,35 @@ mod tests {
         // Warm, unreported caching, or an older Claude Code: nothing.
         assert_eq!(cold(serde_json::json!({"warm": true})), None);
         assert_eq!(cold(serde_json::json!({"caching_observed": false})), None);
-        assert_eq!(cache_cold_segment(&serde_json::json!({})), None);
+        assert_eq!(cache_cold_segment(&serde_json::json!({}), None, 0), None);
+    }
+
+    #[test]
+    fn a_reopened_session_reads_its_cold_cache_off_the_transcript() {
+        let d = std::env::temp_dir().join(format!("giverny-cache-cold-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t = d.join("s.jsonl");
+        let line = serde_json::json!({"type": "assistant", "timestamp": "2026-10-06T11:00:00Z",
+            "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                    "cache_read_input_tokens": 90_000, "output_tokens": 500,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 1000}}}});
+        std::fs::write(&t, format!("{line}\n")).unwrap();
+        let at: i64 = "2026-10-06T11:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        // No `prompt_cache` on stdin before the reopened session's first request.
+        let none = serde_json::json!({});
+        assert_eq!(cache_cold_segment(&none, Some(&t), at + 3_599_000), None);
+        assert_eq!(
+            cache_cold_segment(&none, Some(&t), at + 3_600_000).as_deref(),
+            Some("\x1b[31mcache cold · next msg 91.5k\x1b[0m")
+        );
+        // Once Claude Code reports the cache, its word wins.
+        let warm = serde_json::json!({"prompt_cache": {"warm": true, "caching_observed": true}});
+        assert_eq!(cache_cold_segment(&warm, Some(&t), at + 7_200_000), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Off Windows — and for a Windows account that is not inside a
