@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, Modifiers};
 use giverny_claude::wsl;
 use giverny_core::config;
+use giverny_core::history;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
@@ -1529,6 +1530,7 @@ impl App {
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
+                history::remove(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.focus_terminal = true;
             }
@@ -1877,6 +1879,54 @@ impl App {
         self.reveal_terminal();
     }
 
+    /// How this tab's shell is started so it keeps its own history:
+    /// arguments for it and environment for Giverny's init file there. `None` when the setting is off, or the shell is not one that
+    /// can be steered this way or already has arguments of its own. `env` is
+    /// what the tab already adds on top of ours.
+    fn history_steer(
+        &self,
+        id: TabId,
+        shell: Option<&(String, Vec<String>)>,
+        env: &[(String, String)],
+    ) -> Option<(String, history::Steer)> {
+        if !self.cfg.behavior.history_per_tab {
+            return None;
+        }
+        if shell.is_some_and(|(_, args)| !args.is_empty()) {
+            return None;
+        }
+        let program = pty::shell_program(shell)?;
+        let kind = history::ShellKind::of(&program)?;
+        let file = history::history_file(&self.paths, id);
+        let init = history::init_dir(&self.paths);
+        // bash and zsh create the file, not the directory it sits in.
+        let ready = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| history::write_init(&init));
+        if let Err(err) = ready {
+            tracing::warn!("no per-tab history for tab {}: {err}", id.0);
+            return None;
+        }
+        let home = dirs::home_dir();
+        let steer = history::steer(
+            kind,
+            &file,
+            id,
+            self.cfg.behavior.history_also_shared,
+            home.as_deref(),
+            &init,
+            |var| {
+                env.iter()
+                    .rev()
+                    .find(|(k, _)| k == var)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(var).ok())
+            },
+        );
+        Some((program, steer))
+    }
+
     fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
         let Some(tab) = self.ws.tab(id) else { return };
         let cwd = tab
@@ -1891,8 +1941,18 @@ impl App {
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
         let in_wsl = shape.in_wsl;
+        // A WSL shell is a world of its own — its paths, its home — and is
+        // left with the history it has.
+        if !in_wsl
+            && let Some((program, steer)) = self.history_steer(id, shape.shell.as_ref(), &shape.env)
+        {
+            if !steer.args.is_empty() {
+                shape.shell = Some((program, steer.args));
+            }
+            shape.env.extend(steer.env);
+        }
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),
