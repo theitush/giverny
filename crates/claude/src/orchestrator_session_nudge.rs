@@ -1,4 +1,4 @@
-//! `giverny pass nudge`: the plugin's `PostToolUse` hook, which asks a
+//! `giverny orchestrator-session nudge`: the plugin's `PostToolUse` hook, which asks a
 //! worker for a fresh estimate once it has been on its task a few minutes.
 //!
 //! A first estimate is made before anyone has read the code. Five minutes in,
@@ -16,10 +16,10 @@
 //! without a re-estimate, the hook's reply puts the request in the worker's
 //! context, once: the row is stamped `reestimate_asked`.
 //!
-//! A subagent that holds no row at all (spawned outside a pass, or any
+//! A subagent that holds no row at all (spawned outside an orchestrator session, or any
 //! subagent at all: an Explore search, a one-off helper) would sit on the pane
 //! as `no ETA`. On its first call the hook asks it, once, for a
-//! first estimate: `giverny-pass eta <task> <min> --agent <id>`,
+//! first estimate: `giverny-orchestrator-session eta <task> <min> --agent <id>`,
 //! which starts its row with that estimate, after which the five-minute
 //! re-estimate above applies to it like any other. That it was asked is a
 //! marker file under the feed directory's `eta-asked/`, not a feed: creating
@@ -27,28 +27,28 @@
 //!
 //! **Only where something tracks the worker.** Both asks are for the pane:
 //! they go out only when the session runs in a Giverny tab
-//! (`$GIVERNY_TAB_ID`, whose pane shows the worker) or has a registered pass
+//! (`$GIVERNY_TAB_ID`, whose pane shows the worker) or has a registered orchestrator session
 //! (its feed is this writer's). Anywhere else — a plain `claude` in another
 //! terminal — the hook says nothing to a subagent, which would otherwise try
-//! a `giverny-pass eta` nobody reads and raise a permission prompt for it.
+//! a `giverny-orchestrator-session eta` nobody reads and raise a permission prompt for it.
 //!
 //! **Messages and heartbeats**. On every call the hook also
 //! renews the calling session's ledger leases — `session_id` is the
-//! orchestrator's for its own calls and its workers' alike, so a busy pass
-//! keeps its leases though it runs no `giverny pass` command — at most every
+//! orchestrator's for its own calls and its workers' alike, so a busy orchestrator session
+//! keeps its leases though it runs no `giverny orchestrator-session` command — at most every
 //! [`resources::BEAT_EVERY_MS`], timed by a marker under
 //! `resources/beats/` so the calls in between cost a `stat`. And on the
 //! orchestrator's own calls (not a worker's: an ask is for whoever holds the
 //! lease) it delivers the session's unread `ask`/`reply` messages
-//! ([`crate::pass_inbox`]), a `stat` of the inbox when there are none. So a
+//! ([`crate::orchestrator_session_inbox`]), a `stat` of the inbox when there are none. So a
 //! call that is not a worker's costs three `stat`s at most, and reads no file.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use crate::pass::{self, Lock};
-use crate::{feed, pass_history, pass_inbox, resources};
+use crate::orchestrator_session::{self, Lock};
+use crate::{feed, orchestrator_session_history, orchestrator_session_inbox, resources};
 
 /// How long into its task a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
@@ -122,7 +122,7 @@ pub fn stamp_agent(doc: &mut Value, agent_id: &str, description: Option<&str>) -
     let mut changed = false;
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
         if !row.contains_key("agent_id")
-            && pass::stage_of(row) == Some(feed::Stage::Running)
+            && orchestrator_session::stage_of(row) == Some(feed::Stage::Running)
             && is_mine(row, agent_id, description)
         {
             row.insert("agent_id".into(), json!(agent_id));
@@ -172,9 +172,9 @@ pub fn first_ask(key: &str, agent_id: &str, description: Option<&str>) -> String
         .unwrap_or_default();
     format!(
         "Giverny: the agents pane shows you as a running worker with no ETA. Run \
-         `giverny-pass eta {key} <minutes> --agent {agent_id}{title}` now, with your best \
+         `giverny-orchestrator-session eta {key} <minutes> --agent {agent_id}{title}` now, with your best \
          guess of how many minutes this will take you, then carry on. If the figure turns \
-         out wrong, run the same `giverny-pass eta {key} <minutes left>` again."
+         out wrong, run the same `giverny-orchestrator-session eta {key} <minutes left>` again."
     )
 }
 
@@ -239,22 +239,25 @@ pub fn check(
     let row = rows
         .iter_mut()
         .filter_map(Value::as_object_mut)
-        .filter(|r| pass::stage_of(r) == Some(feed::Stage::Running))
+        .filter(|r| orchestrator_session::stage_of(r) == Some(feed::Stage::Running))
         .find(|r| is_mine(r, agent_id, description))?;
     // Asked once; a worker that has re-estimated already needs no asking.
     if row.contains_key("reestimate_asked") || row.contains_key("eta_first_s") {
         return None;
     }
-    let started = pass::ms_of(row, "started")?;
-    let upto = pass::ms_of(row, "paused_since").unwrap_or(now);
+    let started = orchestrator_session::ms_of(row, "started")?;
+    let upto = orchestrator_session::ms_of(row, "paused_since").unwrap_or(now);
     let worked = upto.saturating_sub(started);
     if worked < AFTER_MS {
         return None;
     }
-    row.insert("reestimate_asked".into(), json!(pass::stamp(now)));
+    row.insert(
+        "reestimate_asked".into(),
+        json!(orchestrator_session::stamp(now)),
+    );
     let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
     let span = |s: u64| feed::fmt_span(s as i64);
-    let estimate = match pass::u64_of(row, "eta_s") {
+    let estimate = match orchestrator_session::u64_of(row, "eta_s") {
         Some(eta) => format!(
             "Its estimate was {}, so the pane shows about {} left.",
             span(eta),
@@ -265,13 +268,13 @@ pub fn check(
     // How this kind of re-estimate has fared, so the figure itself improves:
     // read only now, once per worker.
     let s = |k: &str| row.get(k).and_then(Value::as_str);
-    let kind = s("title").and_then(pass_history::kind_of);
+    let kind = s("title").and_then(orchestrator_session_history::kind_of);
     let record = history
-        .map(pass_history::load)
+        .map(orchestrator_session_history::load)
         .and_then(|h| {
-            pass_history::track_record(
+            orchestrator_session_history::track_record(
                 &h,
-                pass_history::Track::Reestimate,
+                orchestrator_session_history::Track::Reestimate,
                 s("repo"),
                 kind.as_deref(),
             )
@@ -280,7 +283,7 @@ pub fn check(
         .unwrap_or_default();
     Some(format!(
         "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \
-         the code, re-estimate it once: run `giverny-pass eta {key} <minutes left> --note \
+         the code, re-estimate it once: run `giverny-orchestrator-session eta {key} <minutes left> --note \
          \"<why>\"`, even if the figure stands.{record} Then carry on.",
         span(worked / 1000)
     ))
@@ -395,15 +398,15 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
     beat(&ledger, Some(dir), session, now);
     let Some(caller) = Caller::of(payload) else {
         // The orchestrator's own call: its messages, if any.
-        return pass_inbox::deliver(dir, &ledger, session, now).map(|t| reply(&t));
+        return orchestrator_session_inbox::deliver(dir, &ledger, session, now).map(|t| reply(&t));
     };
     worker(&caller, dir, now, in_tab)
 }
 
 /// A worker's call: the estimate asks, when something tracks it — a Giverny
-/// tab, or a registered pass (this writer's feed for the session).
+/// tab, or a registered orchestrator session (this writer's feed for the session).
 fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
-    let file = pass::file_for(dir, &caller.session);
+    let file = orchestrator_session::file_for(dir, &caller.session);
     let has_feed = file.is_file();
     if !in_tab && !has_feed {
         return None; // nothing would show this worker: ask it nothing
@@ -414,8 +417,8 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String>
     if has_feed {
         let _lock = Lock::take(&file).ok()?;
         let mut d: Value = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
-        if pass::writer_of(&d) != Some(pass::WRITER) {
-            return None; // another writer's pass: its rows, its estimates
+        if orchestrator_session::writer_of(&d) != Some(orchestrator_session::WRITER) {
+            return None; // another writer's feed: its rows, its estimates
         }
         if holds_row(&d, &caller.agent_id, desc) {
             let stamped = stamp_agent(&mut d, &caller.agent_id, desc);
@@ -424,10 +427,10 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String>
                 &caller.agent_id,
                 desc,
                 now,
-                pass_history::path(dir).as_deref(),
+                orchestrator_session_history::path(dir).as_deref(),
             );
             if stamped || ask.is_some() {
-                pass::write(&file, &d).ok()?;
+                orchestrator_session::write(&file, &d).ok()?;
             }
             return ask.map(|a| reply(&a));
         }
@@ -459,14 +462,14 @@ mod tests {
     const MIN: u64 = 60_000;
 
     fn doc(rows: Value) -> Value {
-        json!({"version": 1, "session": "s1", "writer": pass::WRITER, "rows": rows})
+        json!({"version": 1, "session": "s1", "writer": orchestrator_session::WRITER, "rows": rows})
     }
 
     #[test]
     fn a_worker_is_asked_once_five_minutes_in() {
         let mut d = doc(json!([
-            {"key": "auth-fix", "stage": "running", "started": pass::stamp(T0), "eta_s": 1800},
-            {"key": "docs", "stage": "running", "started": pass::stamp(T0)}
+            {"key": "auth-fix", "stage": "running", "started": orchestrator_session::stamp(T0), "eta_s": 1800},
+            {"key": "docs", "stage": "running", "started": orchestrator_session::stamp(T0)}
         ]));
         let desc = Some("auth-fix: fix the token race");
         assert_eq!(
@@ -475,7 +478,10 @@ mod tests {
             "too early"
         );
         let ask = check(&mut d, "w1", desc, T0 + 5 * MIN, None).unwrap();
-        assert!(ask.contains("giverny-pass eta auth-fix"), "{ask}");
+        assert!(
+            ask.contains("giverny-orchestrator-session eta auth-fix"),
+            "{ask}"
+        );
         assert!(ask.contains("30m") && ask.contains("25m left"), "{ask}");
         assert!(d["rows"][0].get("reestimate_asked").is_some());
         assert_eq!(
@@ -492,9 +498,9 @@ mod tests {
     fn the_ask_shows_how_past_re_estimates_fared() {
         let dir = std::env::temp_dir().join(format!("giverny-nudge-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let h = dir.join(pass_history::FILE);
-        for _ in 0..pass_history::MIN_SAMPLES {
-            let rec = pass_history::Record {
+        let h = dir.join(orchestrator_session_history::FILE);
+        for _ in 0..orchestrator_session_history::MIN_SAMPLES {
+            let rec = orchestrator_session_history::Record {
                 key: "g#1".into(),
                 repo: Some("g".into()),
                 kind: Some("BUG".into()),
@@ -502,12 +508,12 @@ mod tests {
                 reest_at_s: Some(300),
                 wall_s: 1500,
                 work_s: 1500,
-                ..pass_history::Record::default()
+                ..orchestrator_session_history::Record::default()
             };
-            pass_history::append(&h, &rec).unwrap();
+            orchestrator_session_history::append(&h, &rec).unwrap();
         }
         let mut d = doc(json!([{"key": "g#2", "stage": "running", "repo": "g",
-            "title": "BUG: x", "started": pass::stamp(T0), "eta_s": 1800}]));
+            "title": "BUG: x", "started": orchestrator_session::stamp(T0), "eta_s": 1800}]));
         let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
         assert!(
             ask.contains(
@@ -521,11 +527,11 @@ mod tests {
 
     #[test]
     fn no_ask_for_a_re_estimated_paused_or_unknown_row() {
-        let started = pass::stamp(T0);
+        let started = orchestrator_session::stamp(T0);
         let mut d = doc(json!([
             {"key": "a", "stage": "running", "started": started, "eta_s": 600, "eta_first_s": 300},
             {"key": "b", "stage": "running", "started": started,
-             "paused_since": pass::stamp(T0 + 2 * MIN)},
+             "paused_since": orchestrator_session::stamp(T0 + 2 * MIN)},
             {"key": "c", "stage": "planned", "eta_s": 600},
             {"key": "d", "stage": "running", "started": started, "agent_id": "other"}
         ]));
@@ -567,8 +573,8 @@ mod tests {
         std::fs::create_dir_all(&feeds).unwrap();
         let f = feed::feed_path(&feeds, "s1");
         let d = doc(json!([{"key": "demo#143", "stage": "running",
-                            "started": pass::stamp(T0), "eta_s": 4500}]));
-        pass::write(&f, &d).unwrap();
+                            "started": orchestrator_session::stamp(T0), "eta_s": 4500}]));
+        orchestrator_session::write(&f, &d).unwrap();
         let payload = json!({"session_id": "s1", "agent_id": "abc",
                              "transcript_path": t.display().to_string(),
                              "hook_event_name": "PostToolUse"});
@@ -579,7 +585,10 @@ mod tests {
         let ctx = v["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
-        assert!(ctx.contains("giverny-pass eta demo#143"), "{ctx}");
+        assert!(
+            ctx.contains("giverny-orchestrator-session eta demo#143"),
+            "{ctx}"
+        );
         assert_eq!(
             run(&payload, &feeds, T0 + 7 * MIN, false),
             None,
@@ -610,7 +619,7 @@ mod tests {
         let ask = first_ask("acme#613", "a1b2", Some("acme#613 \"SD\" graph"));
         assert!(
             ask.contains(
-                "`giverny-pass eta acme#613 <minutes> --agent a1b2 --title \"acme#613 'SD' graph\"`"
+                "`giverny-orchestrator-session eta acme#613 <minutes> --agent a1b2 --title \"acme#613 'SD' graph\"`"
             ),
             "{ask}"
         );
@@ -622,7 +631,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("giverny-nudge-first-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let feeds = dir.join("feeds");
-        // No pass in this session at all: asked on the first call, once, and
+        // No orchestrator session at all: asked on the first call, once, and
         // no feed is made.
         let p = json!({"session_id": "s1", "agent_id": "w1", "hook_event_name": "PostToolUse"});
         let out = run(&p, &feeds, T0, true).unwrap();
@@ -631,23 +640,23 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            ctx.contains("giverny-pass eta agent-w1 <minutes> --agent w1"),
+            ctx.contains("giverny-orchestrator-session eta agent-w1 <minutes> --agent w1"),
             "{ctx}"
         );
         assert_eq!(run(&p, &feeds, T0 + MIN, true), None, "asked once");
         assert!(!feed::feed_path(&feeds, "s1").exists(), "no feed claimed");
 
-        // A pass whose rows are other workers': this one is asked too.
+        // An orchestrator session whose rows are other workers': this one is asked too.
         let f = feed::feed_path(&feeds, "s2");
-        pass::write(
+        orchestrator_session::write(
             &f,
             &doc(json!([{"key": "a", "stage": "running",
-                                     "started": pass::stamp(T0), "agent_id": "w9"}])),
+                                     "started": orchestrator_session::stamp(T0), "agent_id": "w9"}])),
         )
         .unwrap();
         let p2 = json!({"session_id": "s2", "agent_id": "w2"});
         assert!(run(&p2, &feeds, T0, true).is_some());
-        // The pass's own worker is not: its row is its estimate.
+        // The orchestrator session's own worker is not: its row is its estimate.
         let p9 = json!({"session_id": "s2", "agent_id": "w9"});
         assert_eq!(run(&p9, &feeds, T0 + MIN, true), None);
 
@@ -671,11 +680,11 @@ mod tests {
     }
 
     #[test]
-    fn outside_a_giverny_tab_only_a_pass_worker_is_asked() {
+    fn outside_a_giverny_tab_only_an_orchestrator_session_worker_is_asked() {
         let dir = std::env::temp_dir().join(format!("giverny-nudge-notab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let feeds = dir.join("feeds");
-        // A plain `claude`, no pass: every call of every subagent is silent,
+        // A plain `claude`, no orchestrator session: every call of every subagent is silent,
         // and leaves nothing behind.
         let p = json!({"session_id": "s1", "agent_id": "w1", "hook_event_name": "PostToolUse"});
         for k in 0..10 {
@@ -686,24 +695,27 @@ mod tests {
         // The same worker in a tab is asked.
         assert!(run(&p, &feeds, T0 + 11 * MIN, true).is_some());
 
-        // A registered pass outside a tab: its row's worker gets the
+        // A registered orchestrator session outside a tab: its row's worker gets the
         // re-estimate ask, a row-less one the first ask.
         let f = feed::feed_path(&feeds, "s2");
-        pass::write(
+        orchestrator_session::write(
             &f,
             &doc(json!([{"key": "a", "stage": "running",
-                         "started": pass::stamp(T0), "agent_id": "w9"}])),
+                         "started": orchestrator_session::stamp(T0), "agent_id": "w9"}])),
         )
         .unwrap();
         let p9 = json!({"session_id": "s2", "agent_id": "w9"});
         assert_eq!(run(&p9, &feeds, T0 + MIN, false), None, "too early");
         let ask = run(&p9, &feeds, T0 + 6 * MIN, false).unwrap();
-        assert!(ask.contains("giverny-pass eta a <minutes left>"), "{ask}");
+        assert!(
+            ask.contains("giverny-orchestrator-session eta a <minutes left>"),
+            "{ask}"
+        );
         let p2 = json!({"session_id": "s2", "agent_id": "w2"});
         let ask = run(&p2, &feeds, T0, false).unwrap();
         assert!(ask.contains("--agent w2"), "{ask}");
 
-        // Another writer's feed is no pass of ours: still silent.
+        // Another writer's feed is no orchestrator session of ours: still silent.
         let g = feed::feed_path(&feeds, "s3");
         std::fs::write(
             &g,

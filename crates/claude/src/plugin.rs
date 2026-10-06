@@ -2,8 +2,8 @@
 //! carried inside the binary.
 //!
 //! The pane shows Running, Next up with ETAs and Done when an orchestrating
-//! session writes a feed; `giverny pass` writes it, and this plugin's
-//! `orchestrate` skill (`/giverny:orchestrate`) tells Claude how to run a pass
+//! session writes a feed; `giverny orchestrator-session` writes it, and this plugin's
+//! `orchestrate` skill (`/giverny:orchestrate`) tells Claude how to run an orchestrator session
 //! with it. Nothing outside Giverny is needed: no separate skill, no GitHub.
 //!
 //! How it reaches Claude Code, measured on 2.1.283:
@@ -15,16 +15,16 @@
 //! - A directory source is loaded straight from the directory at session
 //!   start, not from a cache, so the files this binary writes are what the
 //!   next session runs. The plugin's version is the binary's.
-//! - Its `bin/` is on the Bash tool's `PATH`, so `giverny-pass` works in any
+//! - Its `bin/` is on the Bash tool's `PATH`, so `giverny-orchestrator-session` works in any
 //!   session and in its subagents without Giverny on `PATH`.
 //! - It coexists with a project's own `/orchestrate` skill: plugin skills are
 //!   namespaced. Its one command, `/giverny:clear-done`, runs
-//!   `giverny-pass clear-done` to clear the agents pane's Done rows.
+//!   `giverny-orchestrator-session clear-done` to clear the agents pane's Done rows.
 //! - Removing the keys unloads it; a missing directory makes Claude Code skip
 //!   it silently.
 //!
 //! - `hooks/hooks.json` carries a `PostToolUse` hook running
-//!   `giverny-pass nudge`: five minutes into a worker's task it
+//!   `giverny-orchestrator-session nudge`: five minutes into a worker's task it
 //!   asks that worker, once, for a fresh estimate; and a subagent that holds
 //!   no row at all is asked on its first call for a first one,
 //!   so every subagent gets an ETA. It returns at once for any call that is
@@ -32,7 +32,7 @@
 //!
 //! The skill is its own switch (`agents_panel.orchestrate_skill`, on by
 //! default): off, the plugin is written without `skills/`, so the hook,
-//! `giverny-pass` and `/giverny:clear-done` the pane needs stay, and only
+//! `giverny-orchestrator-session` and `/giverny:clear-done` the pane needs stay, and only
 //! the skill goes — from every account at once, since they all load this
 //! one directory.
 //!
@@ -66,24 +66,26 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The `giverny-pass` wrapper: runs `<the binary that wrote it> pass`.
+/// The `giverny-orchestrator-session` wrapper: runs `<the binary that wrote
+/// it> orchestrator-session`.
 fn wrapper(exes: &[String]) -> String {
     let list: Vec<String> = exes.iter().map(|e| sh_quote(e)).collect();
     format!(
         "#!/bin/sh\n\
          # Written by Giverny {VERSION}; rewritten each time it starts with the\n\
-         # agents pane on. Runs `giverny pass`: see `giverny pass --help`.\n\
+         # agents pane on. Runs `giverny orchestrator-session`: see\n\
+         # `giverny orchestrator-session --help`.\n\
          for g in {}; do\n  \
-           if [ -x \"$g\" ]; then exec \"$g\" pass \"$@\"; fi\n\
+           if [ -x \"$g\" ]; then exec \"$g\" orchestrator-session \"$@\"; fi\n\
          done\n\
-         if command -v giverny >/dev/null 2>&1; then exec giverny pass \"$@\"; fi\n\
-         echo \"giverny-pass: the Giverny that wrote $0 is gone\" >&2\n\
+         if command -v giverny >/dev/null 2>&1; then exec giverny orchestrator-session \"$@\"; fi\n\
+         echo \"$0: the Giverny that wrote it is gone\" >&2\n\
          exit 127\n",
         list.join(" ")
     )
 }
 
-/// `hooks/hooks.json`: a `PostToolUse` hook, `giverny-pass nudge`, which
+/// `hooks/hooks.json`: a `PostToolUse` hook, `giverny-orchestrator-session nudge`, which
 /// asks a worker five minutes into its task for a fresh estimate,
 /// and a subagent with no row for a first one;
 /// on an orchestrator's own calls it delivers the session's `ask`/`reply`
@@ -98,7 +100,7 @@ fn session_hooks() -> Value {
                 "matcher": "*",
                 "hooks": [{
                     "type": "command",
-                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-pass\" nudge 2>/dev/null || true"
+                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-orchestrator-session\" nudge 2>/dev/null || true"
                 }]
             }]
         }
@@ -115,14 +117,14 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
         "plugins": [{
             "name": PLUGIN,
             "source": "./plugins/giverny",
-            "description": "Orchestrate subagents and show the pass in Giverny's agents pane",
+            "description": "Orchestrate subagents and show them in Giverny's agents pane",
             "version": VERSION
         }]
     });
     let plugin = json!({
         "name": PLUGIN,
         "version": VERSION,
-        "description": "Orchestrate subagents and show the pass in Giverny's agents pane: \
+        "description": "Orchestrate subagents and show them in Giverny's agents pane: \
                         Running, Next up with ETAs, Done",
         "author": { "name": "Giverny" }
     });
@@ -143,6 +145,13 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
             CLEAR_DONE.to_string(),
             false,
         ),
+        (
+            "plugins/giverny/bin/giverny-orchestrator-session",
+            wrapper(exes),
+            true,
+        ),
+        // Its name from when an orchestrator session was a "pass", for the
+        // sessions that loaded the skill under it.
         ("plugins/giverny/bin/giverny-pass", wrapper(exes), true),
         (
             "plugins/giverny/hooks/hooks.json",
@@ -413,7 +422,7 @@ mod tests {
     #[test]
     fn the_skill_is_generic() {
         // What ships to every machine assumes no issue tracker, board or
-        // helper scripts: only Claude Code and `giverny-pass`.
+        // helper scripts: only Claude Code and `giverny-orchestrator-session`.
         let words: Vec<String> = SKILL
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '-')
@@ -433,7 +442,7 @@ mod tests {
             );
         }
         assert!(SKILL.starts_with("---\nname: orchestrate\n"));
-        assert!(SKILL.contains("giverny-pass plan"));
+        assert!(SKILL.contains("giverny-orchestrator-session plan"));
     }
 
     #[test]
@@ -447,15 +456,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest["version"], VERSION);
-        let wrapper = std::fs::read_to_string(d.join("plugins/giverny/bin/giverny-pass")).unwrap();
+        let wrapper =
+            std::fs::read_to_string(d.join("plugins/giverny/bin/giverny-orchestrator-session"))
+                .unwrap();
         assert!(wrapper.contains("'/opt/giverny/giverny'"), "{wrapper}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(d.join("plugins/giverny/bin/giverny-pass"))
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode =
+                std::fs::metadata(d.join("plugins/giverny/bin/giverny-orchestrator-session"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
             assert_eq!(mode & 0o777, 0o755);
         }
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
@@ -485,7 +497,7 @@ mod tests {
         assert!(!d.join("plugins/giverny/skills").exists());
         for kept in [
             "plugins/giverny/hooks/hooks.json",
-            "plugins/giverny/bin/giverny-pass",
+            "plugins/giverny/bin/giverny-orchestrator-session",
             "plugins/giverny/commands/clear-done.md",
             "plugins/giverny/.claude-plugin/plugin.json",
             ".claude-plugin/marketplace.json",
@@ -536,7 +548,10 @@ mod tests {
         let post = &h["hooks"]["PostToolUse"][0];
         assert_eq!(post["matcher"], "*");
         let cmd = post["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("giverny-pass\" nudge"), "{cmd}");
+        assert!(
+            cmd.contains("giverny-orchestrator-session\" nudge"),
+            "{cmd}"
+        );
         #[cfg(unix)]
         {
             let out = std::process::Command::new("sh")

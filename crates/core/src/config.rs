@@ -28,7 +28,7 @@ pub struct Config {
 #[serde(default)]
 pub struct AgentsPanelConfig {
     /// Ship the `/giverny:orchestrate` skill in the plugin the pane
-    /// installs. Off, the plugin keeps its hook and `giverny-pass`; only
+    /// installs. Off, the plugin keeps its hook and `giverny-orchestrator-session`; only
     /// the skill goes.
     pub orchestrate_skill: bool,
     /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
@@ -105,7 +105,7 @@ impl Default for PaneColumns {
 }
 
 /// `[agents_panel.lease]`: the CPU cores and RAM a task's lease holds when
-/// nothing says otherwise — what `giverny pass run` claims for a task that
+/// nothing says otherwise — what `giverny orchestrator-session run` claims for a task that
 /// holds none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -149,7 +149,7 @@ impl DefaultLease {
     }
 }
 
-/// `[orchestrator]`: what orchestrator passes (`/giverny:orchestrate`) on
+/// `[orchestrator]`: what orchestrator sessions (`/giverny:orchestrate`) on
 /// this machine share. Only the limits so far; `claude.agents_pane`, shown
 /// beside them in the settings screen, stays under `[claude]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

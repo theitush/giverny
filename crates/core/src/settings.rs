@@ -487,7 +487,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "setup. On, in each account you installed Giverny's hooks in, it",
             "adds a subagentStatusLine (giverny relay --subagent-line) and the",
             "giverny Claude Code plugin to that account's settings.json, never",
-            "over a line of your own: /giverny:orchestrate runs a pass of",
+            "over a line of your own: /giverny:orchestrate runs a team of",
             "subagents and adds Planned rows, titles, ETAs and landings",
             "(docs/agents-pane.md). Off removes both again.",
             "Done rows stay until /clear or a fresh claude in the tab. The",
@@ -538,7 +538,7 @@ pub const SETTINGS: &[SettingDef] = &[
         note: &[
             "Written only where the agents pane's plugin is (accounts holding",
             "Giverny's hooks, with claude.agents_pane on). Off removes only the",
-            "skill: the plugin keeps giverny-pass, its hook and /giverny:clear-done.",
+            "skill: the plugin keeps giverny-orchestrator-session, its hook and /giverny:clear-done.",
         ],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -615,7 +615,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "agents_panel.columns.usage",
         label: "CPU / RAM",
         section: Section::AgentsPanel,
-        doc: "What the row's `giverny pass run` commands use: live CPU and memory, a Done row's peak.",
+        doc: "What the row's `giverny orchestrator-session run` commands use: live CPU and memory, a Done row's peak.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -626,8 +626,8 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::AgentsPanel,
         doc: "Cores a task's lease holds when nothing says otherwise.",
         note: &[
-            "What `giverny pass run` claims for a task that holds no lease, unless",
-            "--cpu says. `giverny pass resources` prints it.",
+            "What `giverny orchestrator-session run` claims for a task that holds no lease, unless",
+            "--cpu says. `giverny orchestrator-session resources` prints it.",
         ],
         needs_restart: false,
         kind: Kind::Lease {
@@ -651,9 +651,9 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "orchestrator.limits.cpu_cores",
         label: "CPU cores",
         section: Section::AgentsPanel,
-        doc: "Cores all orchestrator passes together may hand to workers. auto = all but 2.",
+        doc: "Cores all orchestrator sessions together may hand to workers. auto = all but 2.",
         note: &[
-            "The resource ledger (`giverny pass claim`) grants workers cores,",
+            "The resource ledger (`giverny orchestrator-session claim`) grants workers cores,",
             "RAM and GPUs out of these limits, across every orchestrator on",
             "this machine, and reads them on each claim: an edit applies to the",
             "next one. A number, or \"auto\" (cores - 2, at least 1).",
@@ -667,7 +667,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "orchestrator.limits.ram",
         label: "RAM",
         section: Section::AgentsPanel,
-        doc: "Memory all orchestrator passes together may hand to workers. auto = 70 %.",
+        doc: "Memory all orchestrator sessions together may hand to workers. auto = 70 %.",
         note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
         needs_restart: false,
         kind: Kind::Limit {
@@ -678,7 +678,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "orchestrator.limits.gpus",
         label: "GPUs",
         section: Section::AgentsPanel,
-        doc: "GPUs and VRAM orchestrator passes may use. auto = 90 % of each GPU's VRAM.",
+        doc: "GPUs and VRAM orchestrator sessions may use. auto = 90 % of each GPU's VRAM.",
         note: &[
             "GPUs are found with nvidia-smi; without it there are none. A list",
             "like [{ index = 0, vram = \"20G\" }] names the GPUs and how much of",
@@ -1337,7 +1337,7 @@ mod tests {
         assert_eq!(
             config::DefaultLease::from_config_str(&text),
             cfg.agents_panel.lease,
-            "pass run reads the same"
+            "orchestrator-session run reads the same"
         );
         // The old keys are where they were.
         assert!(!cfg.claude.agents_pane);

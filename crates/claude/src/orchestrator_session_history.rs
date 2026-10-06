@@ -1,10 +1,10 @@
-//! What `giverny pass` learns its estimates from.
+//! What `giverny orchestrator-session` learns its estimates from.
 //!
 //! Every task that lands appends one line to `history.jsonl` beside the
 //! feeds: its raw estimate (the guess as given, before any correction), its
 //! wall-clock time, and its *working* time — wall time minus the spans it was
 //! paused and the spans its worker said it was waiting. Append-only, one JSON
-//! object per line, so concurrent passes never lose each other's lines and a
+//! object per line, so concurrent orchestrator sessions never lose each other's lines and a
 //! line this version cannot read is skipped, not fatal.
 //!
 //! [`correct`] then scales a new guess by the median working-time ÷ estimate
@@ -31,7 +31,11 @@ use serde::{Deserialize, Serialize};
 pub const FILE: &str = "history.jsonl";
 
 /// Overrides where the history lives (an empty value turns learning off).
-pub const ENV: &str = "GIVERNY_PASS_HISTORY";
+pub const ENV: &str = "GIVERNY_ORCHESTRATOR_SESSION_HISTORY";
+
+/// [`ENV`]'s name from when an orchestrator session was a "pass", still read
+/// when [`ENV`] is unset.
+pub const OLD_ENV: &str = "GIVERNY_PASS_HISTORY";
 
 /// How many matching tasks a level needs before it corrects anything.
 pub const MIN_SAMPLES: usize = 5;
@@ -84,7 +88,7 @@ pub struct Record {
     pub ended: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
-    /// The highest peak memory of the task's `giverny pass run` commands,
+    /// The highest peak memory of the task's `giverny orchestrator-session run` commands,
     /// MiB: the cgroup's `memory.peak` under a systemd
     /// scope, else the largest process's RSS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,10 +165,10 @@ impl Track {
     }
 }
 
-/// Where the history lives: `$GIVERNY_PASS_HISTORY`, else
+/// Where the history lives: `$GIVERNY_ORCHESTRATOR_SESSION_HISTORY`, else
 /// `<feed dir>/history.jsonl`. `None` when the variable is set but empty.
 pub fn path(feed_dir: &Path) -> Option<PathBuf> {
-    match std::env::var_os(ENV) {
+    match std::env::var_os(ENV).or_else(|| std::env::var_os(OLD_ENV)) {
         Some(v) if v.is_empty() => None,
         Some(v) => Some(PathBuf::from(v)),
         None => Some(feed_dir.join(FILE)),
@@ -395,7 +399,7 @@ pub fn score(ratios: &[f64]) -> Option<Score> {
     })
 }
 
-/// `giverny pass accuracy`: every track's error, older half
+/// `giverny orchestrator-session accuracy`: every track's error, older half
 /// against recent half, for all tasks, each repo, and each repo's types with
 /// [`MIN_SAMPLES`] or more. `repo` narrows it to one repo.
 pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
@@ -483,7 +487,7 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
 /// [`peak_hint`] speaks.
 pub const MIN_PEAK_SAMPLES: usize = 3;
 
-/// What the most recent tasks like this one peaked at under `giverny pass
+/// What the most recent tasks like this one peaked at under `giverny orchestrator-session
 /// run`, by the same levels as [`correct`] (repo and kind, repo, all):
 /// `the last 4 BUG tasks in demo peaked at 1.8G (median), 2.6G at most`.
 /// A task the cap killed counts at its peak, which is a floor.

@@ -35,7 +35,7 @@
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click.
 //!
-//! **Resources**: what a row's `giverny pass run`
+//! **Resources**: what a row's `giverny orchestrator-session run`
 //! commands use in a quiet column — live CPU and memory while one runs, the
 //! memory peak once the row is Done, zero when there is neither — its lease from the machine ledger in
 //! its overlay header, a Next up row's place in the ledger's queue in NOW,
@@ -541,7 +541,7 @@ pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
 
 /// `feed` with each row whose worker's processes were measured showing
 /// them: everything its Bash commands started ([`giverny_claude::worker_pids`]),
-/// whether or not they ran under `giverny pass run`. A run of the row's
+/// whether or not they ran under `giverny orchestrator-session run`. A run of the row's
 /// task under that worker is part of the worker's figure already; one
 /// started elsewhere is added to it.
 pub fn with_workers(
@@ -884,7 +884,7 @@ pub struct Line {
     /// (zero between its commands), the memory peak on a Done one (zero when
     /// nothing was measured); empty on a Next up row.
     pub usage: String,
-    /// A `giverny pass run` of the row was killed by its memory cap: the
+    /// A `giverny orchestrator-session run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
     pub click: RowClick,
@@ -1220,18 +1220,20 @@ fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) ->
 }
 
 /// How the dispatcher gives a Running row with no estimate one, as the
-/// overlay header says it: `giverny-pass eta` re-estimates a feed row in
+/// overlay header says it: `giverny-orchestrator-session eta` re-estimates a feed row in
 /// place, and starts a row (Running, with the estimate) for a worker that
 /// has none.
 fn no_eta_hint(key: &str, agent_id: Option<&str>, title: &str) -> String {
     if !key.is_empty() {
-        return format!("no ETA — add one: giverny-pass eta {key} <min> --why scope");
+        return format!(
+            "no ETA — add one: giverny-orchestrator-session eta {key} <min> --why scope"
+        );
     }
     let id = task_key(title).unwrap_or("<task>");
     let agent = agent_id
         .map(|a| format!(" --agent {a}"))
         .unwrap_or_default();
-    format!("no ETA — add one: giverny-pass eta {id} <min>{agent}")
+    format!("no ETA — add one: giverny-orchestrator-session eta {id} <min>{agent}")
 }
 
 /// The first `repo#n` a worker's description names (`acme#613 market SD
@@ -2159,7 +2161,7 @@ mod tests {
 
     #[test]
     fn a_running_row_with_no_estimate_says_so() {
-        // A worker spawned outside a pass: a row, but no ETA.
+        // A worker spawned outside an orchestrator session: a row, but no ETA.
         let rows = live(
             r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
                 "description":"acme#613 market SD graph","startTime":1789999958000}]}"#,
@@ -2175,7 +2177,7 @@ mod tests {
         let hint = &l.click.facts[1];
         assert!(hint.starts_with("no ETA — add one:"), "{hint}");
         assert!(
-            hint.contains("giverny-pass eta acme#613 <min> --agent a1"),
+            hint.contains("giverny-orchestrator-session eta acme#613 <min> --agent a1"),
             "{hint}"
         );
 
@@ -2186,12 +2188,9 @@ mod tests {
         );
         let t = build(Some(&f), &rows, T0);
         assert!(t.lines[0].no_eta);
-        assert!(
-            t.lines[0]
-                .click
-                .facts
-                .contains(&"no ETA — add one: giverny-pass eta g#3 <min> --why scope".into())
-        );
+        assert!(t.lines[0].click.facts.contains(
+            &"no ETA — add one: giverny-orchestrator-session eta g#3 <min> --why scope".into()
+        ));
     }
 
     #[test]
@@ -2670,7 +2669,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// giverny#217, the inbar pass: a plain `start` and the task handed
+    /// giverny#217, the inbar orchestrator session: a plain `start` and the task handed
     /// over in the dispatcher's own words, with no `New task for you`. The
     /// row with no worker is the worker's from the message, and each task
     /// counts its own tokens — the next one named only as "a review round
@@ -2716,7 +2715,7 @@ mod tests {
             ]
         );
 
-        // acme#614 landed (the pass linked it), a round of #613 started
+        // acme#614 landed (the orchestrator session linked it), a round of #613 started
         // with no worker, and the message names only #614 and #613.
         let more = [
             sent(
@@ -2931,7 +2930,7 @@ mod tests {
     // ------------------------------------------------- resources ----
 
     /// A feed with a granted Running row and a queued Next up row, as
-    /// `giverny pass claim` leaves them.
+    /// `giverny orchestrator-session claim` leaves them.
     const LEASED: &str = r#"{"session":"s","rows":[
         {"key":"demo#12","stage":"running","eta_s":1800,"started":1790000000000,
          "lease":{"state":"granted","id":"s:demo#12","cpu":3,"ram_mb":3072,
@@ -3159,7 +3158,7 @@ mod tests {
         assert!(t.lines[2].usage.starts_with("                 0.5G"));
     }
 
-    /// A worker's commands show in its row with no `pass run` at all; a
+    /// A worker's commands show in its row with no `orchestrator-session run` at all; a
     /// run under that worker is not added twice, one elsewhere is added; a
     /// worker with no feed row shows its own; a Done row keeps its peak.
     #[test]
