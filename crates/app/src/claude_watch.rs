@@ -340,9 +340,6 @@ fn merge_registry(
 #[derive(Default)]
 struct ScanResult {
     live: Vec<registry::LiveSession>,
-    /// Every live session started before its `settings.json` was last
-    /// written, so none of them loaded the hooks in it.
-    stale: bool,
 }
 
 /// When one rate-limit window resets, out of a statusline push.
@@ -405,6 +402,12 @@ impl ClaudeWatch {
             leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref());
         if leave_accounts {
             tracing::info!("{LEFT_ALONE}");
+        } else {
+            // Before anything is written: what is written names the link.
+            #[cfg(unix)]
+            if let Err(err) = hooks::point_link() {
+                tracing::warn!("giverny link not pointed here: {err}");
+            }
         }
         Self::adopt_statusline_where_hooked(&profiles, leave_accounts || !config_read);
         let mut watch = ClaudeWatch {
@@ -689,21 +692,7 @@ impl ClaudeWatch {
                 .name("giverny session scan".into())
                 .spawn(move || {
                     let live = registry::scan(dirs);
-                    // Asked here too: it is another `stat` per session, and
-                    // the answer only matters once a scan has happened.
-                    let stale = !live.is_empty()
-                        && live.iter().all(|s| {
-                            let settings = s.config_dir.join("settings.json");
-                            match (
-                                std::fs::metadata(&settings).and_then(|m| m.modified()),
-                                std::time::UNIX_EPOCH
-                                    .checked_add(Duration::from_millis(s.entry.started_at_ms)),
-                            ) {
-                                (Ok(settings_at), Some(started)) => started < settings_at,
-                                _ => false,
-                            }
-                        });
-                    let _ = tx.send(ScanResult { live, stale });
+                    let _ = tx.send(ScanResult { live });
                 })
                 .is_ok()
             {
@@ -1212,14 +1201,6 @@ impl ClaudeWatch {
     /// Do all profiles have the live-usage statusline?
     pub fn statusline_on(&self) -> bool {
         !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
-    }
-
-    /// Claude Code loads `settings.json` when a session starts, so hooks and
-    /// the statusline do nothing for sessions that were already running.
-    /// True when every live session predates the settings file — i.e. the
-    /// user needs to restart claude for any of it to take effect.
-    pub fn sessions_predate_settings(&self) -> bool {
-        self.scanned.stale
     }
 
     /// When the Claude on `account` can work again, if anything says.

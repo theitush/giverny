@@ -304,9 +304,82 @@ pub fn statusline_command_for(settings_path: &Path) -> String {
 }
 
 fn exe_path() -> String {
-    std::env::current_exe()
+    #[cfg(unix)]
+    if let Some(link) = link_path()
+        && is_link_to_a_binary(&link)
+    {
+        return link.display().to_string();
+    }
+    running_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "giverny".into())
+        .unwrap_or_else(|| "giverny".into())
+}
+
+/// This binary's path. Linux names a binary that was rebuilt in place while
+/// it ran `<path> (deleted)` — a path nothing can run, and once it reached
+/// an account's `settings.json` from here.
+pub fn running_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(
+        match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(live) => PathBuf::from(live),
+            None => exe,
+        },
+    )
+}
+
+/// The one path every account's hooks, status lines and plugin name for
+/// Giverny: `<giverny config dir>/bin/giverny`, a link each Giverny points at
+/// itself when it starts ([`point_link`]).
+///
+/// Naming the running binary instead made `settings.json` follow whichever
+/// Giverny started last — a rebuild elsewhere, a test build, a reinstall —
+/// and Claude Code reads hooks when a session starts, so every rewrite left
+/// the running sessions behind. Through the link, a new binary changes the
+/// link and never the settings, and a running session's next hook runs
+/// whichever Giverny is current.
+#[cfg(unix)]
+pub fn link_path() -> Option<PathBuf> {
+    Some(
+        giverny_core::state::Paths::default_dirs()
+            .base()
+            .join("bin")
+            .join("giverny"),
+    )
+}
+
+/// A link (not a file of its own) whose target is there to run.
+#[cfg(unix)]
+fn is_link_to_a_binary(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::metadata(link).is_ok_and(|m| m.is_file())
+}
+
+/// Point [`link_path`] at this binary, so the commands written into each
+/// account name it. Done at startup by the Giverny that looks after the
+/// accounts; a side instance (`GIVERNY_NO_ACCOUNT_SETUP`) leaves it alone.
+#[cfg(unix)]
+pub fn point_link() -> std::io::Result<()> {
+    let (Some(link), Some(exe)) = (link_path(), running_exe()) else {
+        return Ok(());
+    };
+    point_link_at(&link, &exe)
+}
+
+#[cfg(unix)]
+fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
+    if std::fs::read_link(link).is_ok_and(|t| t == exe) {
+        return Ok(());
+    }
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Beside it, then over it: a hook running meanwhile finds the old
+    // binary or the new one, never no file at all.
+    let tmp = link.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::fs::rename(&tmp, link)
 }
 
 /// How this binary is named to whoever will run the hook.
@@ -1153,6 +1226,31 @@ mod tests {
                 .trim_end()
                 .ends_with("statusline")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_link_follows_the_binary() {
+        let d = std::env::temp_dir().join(format!("giverny-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (a, b) = (d.join("a"), d.join("b"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let link = d.join("bin/giverny");
+        assert!(!is_link_to_a_binary(&link), "not there yet");
+        point_link_at(&link, &a).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        assert!(is_link_to_a_binary(&link));
+        point_link_at(&link, &a).unwrap();
+        point_link_at(&link, &b).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), b, "repointed");
+        std::fs::remove_file(&b).unwrap();
+        assert!(
+            !is_link_to_a_binary(&link),
+            "a link to nothing is no binary"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -185,7 +185,15 @@ pub const SKILL_PATH: &str = "plugins/giverny/skills/orchestrate/SKILL.md";
 /// its path from inside WSL (a WSL account's Claude runs it through interop).
 pub fn exe_candidates() -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
+    // The stable link when there is one ([`crate::hooks::link_path`]): the
+    // wrapper then stays byte-identical across rebuilds and reinstalls.
+    #[cfg(unix)]
+    if let Some(link) = crate::hooks::link_path()
+        && link.exists()
+    {
+        return vec![link.display().to_string()];
+    }
+    if let Some(exe) = crate::hooks::running_exe() {
         out.push(exe.display().to_string());
         #[cfg(windows)]
         if let Some(distro) = crate::wsl::default_distro()
