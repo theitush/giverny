@@ -1,5 +1,6 @@
 //! Token counts for the status line:
-//! `session: <n>  ·  subagents: <n>  ·  total: <n>`.
+//! `session: <n> (+<n>)  ·  subagents: <n>  ·  total: <n>`, the `(+<n>)` being
+//! what the session spent before its compactions ([`compacted_tokens`]).
 //!
 //! The count is the one Claude Code's agents view prints beside a subagent —
 //! `latestInputTokens`: input + cache creation + cache read of the **last**
@@ -14,7 +15,9 @@
 //! stdin when Claude Code hands it (`context_window.total_input_tokens`), and
 //! a transcript is read **from its tail** — the last usage is near the end, so
 //! a chunk is read backwards and doubled only while no usage has turned up.
-//! Nothing is cached; a render reads a few tens of KB per subagent.
+//! The one thing cached is the compaction scan, which must read the whole
+//! transcript: it is kept per transcript and carried forward over what was
+//! appended since. Otherwise a render reads a few tens of KB per subagent.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -228,6 +231,140 @@ fn tail_find<T>(path: &Path, find: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
     }
 }
 
+/// What one compaction took off the session: `compactMetadata.preTokens` of a
+/// `compact_boundary` line — Claude Code's own count of the context it had
+/// when it compacted.
+///
+/// Measured on this machine's four compacted transcripts, 2026-09-28: a
+/// compaction stays in the same `.jsonl` under the same `sessionId`, marked by
+/// one `{"type":"system","subtype":"compact_boundary","compactMetadata":{…}}`
+/// line, and `preTokens` sits 56 to 1,047 tokens above the last assistant
+/// usage before it (335,210 against 334,163 in planets `3d917104`) — the
+/// compaction request itself. A boundary with no `preTokens` falls back to
+/// that last usage.
+fn boundary_tokens(line: &[u8]) -> Option<Option<u64>> {
+    find(line, b"\"compact_boundary\"")?;
+    let v: Value = serde_json::from_slice(line).ok()?;
+    if v.get("subtype").and_then(Value::as_str) != Some("compact_boundary") {
+        return None;
+    }
+    Some(
+        v.get("compactMetadata")
+            .and_then(|m| m.get("preTokens"))
+            .and_then(Value::as_f64)
+            .filter(|n| *n > 0.0)
+            .map(|n| n as u64),
+    )
+}
+
+/// A scan of a transcript's compactions up to `offset`: the tokens every
+/// compaction before it took off (`sum`), and the last context set before
+/// `offset` (`last`), which a boundary without `preTokens` stands on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CompactScan {
+    offset: u64,
+    sum: u64,
+    last: u64,
+}
+
+impl CompactScan {
+    /// Carry the scan over `buf`, the bytes from `self.offset` on: whole lines
+    /// only, so a line still being written is read next time.
+    fn feed(&mut self, buf: &[u8]) {
+        let Some(end) = buf.iter().rposition(|&c| c == b'\n') else {
+            return;
+        };
+        for line in buf[..end].split(|&c| c == b'\n') {
+            if let Some(pre) = boundary_tokens(line) {
+                self.sum += pre.unwrap_or(self.last);
+                self.last = 0;
+            } else if let Some(n) = line_tokens(line) {
+                self.last = n;
+            }
+        }
+        self.offset += end as u64 + 1;
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        let mut it = s.split_whitespace().map(|w| w.parse::<u64>().ok());
+        let scan = CompactScan {
+            offset: it.next()??,
+            sum: it.next()??,
+            last: it.next()??,
+        };
+        Some(scan)
+    }
+}
+
+/// The tokens this session spent before its compactions: the context each
+/// `/compact` (manual or automatic) dropped, summed over every one — `0` for a
+/// session that never compacted, or a transcript that cannot be read.
+pub fn compacted_tokens(path: &Path) -> u64 {
+    compacted_tokens_cached(path, None)
+}
+
+/// [`compacted_tokens`], picking up where the last call left off when
+/// `cache` names a directory to keep a scan in: the whole transcript is read
+/// once, and after that only what was appended since (a planets transcript
+/// is 16 MB; the status line runs every turn). A transcript that shrank is
+/// read again from the top.
+pub fn compacted_tokens_cached(path: &Path, cache: Option<&Path>) -> u64 {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let slot = cache.map(|dir| dir.join(cache_name(path)));
+    let mut scan = slot
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| CompactScan::parse(&s))
+        .filter(|s| s.offset <= len)
+        .unwrap_or_default();
+    let before = scan;
+    if scan.offset < len && file.seek(SeekFrom::Start(scan.offset)).is_ok() {
+        let mut buf = Vec::with_capacity((len - scan.offset) as usize);
+        if (&mut file)
+            .take(len - scan.offset)
+            .read_to_end(&mut buf)
+            .is_ok()
+        {
+            scan.feed(&buf);
+        }
+    }
+    if let Some(slot) = slot
+        && scan != before
+    {
+        let _ = std::fs::create_dir_all(slot.parent().unwrap_or(Path::new(".")));
+        let tmp = slot.with_extension("tmp");
+        let body = format!("{} {} {}\n", scan.offset, scan.sum, scan.last);
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &slot);
+        }
+    }
+    scan.sum
+}
+
+/// One cache file per transcript path: its file name (the session id) and a
+/// hash of the whole path, so two config dirs holding the same id never share.
+fn cache_name(path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{stem}-{:016x}.scan", h.finish())
+}
+
+/// Where [`compacted_tokens_cached`] keeps its scans:
+/// `$XDG_CACHE_HOME/giverny/compactions` (`~/.cache/…`).
+pub fn compact_cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("giverny").join("compactions"))
+}
+
 /// The session's own count: `context_window.total_input_tokens` off the status
 /// line's stdin when it is there (the same number, a turn fresher), else its
 /// transcript.
@@ -300,19 +437,25 @@ pub fn subagent_transcripts(dirs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// `(session, subagents, total)`: the session's count, the sum of every
-/// subagent's, and the two added — so the three always add up (giverny#95).
-/// `None` for all three when nothing could be counted; `subagents` is `Some(0)`
-/// when the session has none.
+/// subagent's, and everything added — the session, what it spent before its
+/// compactions (`compacted`) and its subagents — so the parts
+/// always add up (giverny#95). `None` for all three when nothing could be
+/// counted; `subagents` is `Some(0)` when the session has none.
 pub fn session_subagents_total(
     session: Option<u64>,
+    compacted: u64,
     subagents: &[PathBuf],
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
     let workers: Vec<u64> = subagents.iter().filter_map(|p| tokens_of(p)).collect();
-    if session.is_none() && workers.is_empty() {
+    if session.is_none() && compacted == 0 && workers.is_empty() {
         return (None, None, None);
     }
     let sub: u64 = workers.iter().sum();
-    (session, Some(sub), Some(session.unwrap_or(0) + sub))
+    (
+        session,
+        Some(sub),
+        Some(session.unwrap_or(0) + compacted + sub),
+    )
 }
 
 /// Claude Code's compact count — `842`, `13.5k`, `124.8k`, `1.2M` — with a
@@ -333,16 +476,29 @@ pub fn fmt_tokens(n: u64) -> String {
 }
 
 /// The status-line segments: `session: <n>` always once anything was counted,
-/// then `subagents: <n>` and `total: <n>` only when the subagents have tokens
-/// (giverny#95) — with none, the total would only repeat the session.
-pub fn segments(session: Option<u64>, subagents: Option<u64>, total: Option<u64>) -> Vec<String> {
+/// with `(+<n>)` after it once the session has compacted — what it spent
+/// before — then `subagents: <n>` only when the subagents have
+/// tokens and `total: <n>` only when there is something besides the session's
+/// own count to add (giverny#95): otherwise the total would only repeat it.
+pub fn segments(
+    session: Option<u64>,
+    compacted: u64,
+    subagents: Option<u64>,
+    total: Option<u64>,
+) -> Vec<String> {
     let sub = subagents.unwrap_or(0);
-    if session.is_none() && sub == 0 {
+    if session.is_none() && compacted == 0 && sub == 0 {
         return Vec::new();
     }
-    let mut out = vec![format!("session: {}", fmt_tokens(session.unwrap_or(0)))];
+    let mut head = format!("session: {}", fmt_tokens(session.unwrap_or(0)));
+    if compacted > 0 {
+        head += &format!(" (+{})", fmt_tokens(compacted));
+    }
+    let mut out = vec![head];
     if sub > 0 {
         out.push(format!("subagents: {}", fmt_tokens(sub)));
+    }
+    if sub > 0 || compacted > 0 {
         out.push(format!("total: {}", fmt_tokens(total.unwrap_or(0))));
     }
     out
@@ -477,10 +633,11 @@ mod tests {
         let dirs = session_subagent_dirs(Some(&t), Some(&cfg), Some("sid1"));
         let files = subagent_transcripts(&dirs);
         assert_eq!(files.len(), 2);
-        let (s, sub, total) = session_subagents_total(session_tokens(&json!({}), Some(&t)), &files);
+        let (s, sub, total) =
+            session_subagents_total(session_tokens(&json!({}), Some(&t)), 0, &files);
         assert_eq!((s, sub, total), (Some(1000), Some(230), Some(1230)));
         assert_eq!(
-            segments(s, sub, total),
+            segments(s, 0, sub, total),
             vec![
                 "session: 1k".to_string(),
                 "subagents: 230".to_string(),
@@ -488,12 +645,114 @@ mod tests {
             ]
         );
         // A session with no subagent tokens shows only its own count.
-        let (s, sub, total) = session_subagents_total(Some(1000), &[]);
+        let (s, sub, total) = session_subagents_total(Some(1000), 0, &[]);
         assert_eq!((s, sub, total), (Some(1000), Some(0), Some(1000)));
-        assert_eq!(segments(s, sub, total), vec!["session: 1k".to_string()]);
+        assert_eq!(segments(s, 0, sub, total), vec!["session: 1k".to_string()]);
         // No session and no subagents: nothing to say.
-        assert_eq!(session_subagents_total(None, &[]), (None, None, None));
-        assert!(segments(None, None, None).is_empty());
+        assert_eq!(session_subagents_total(None, 0, &[]), (None, None, None));
+        assert!(segments(None, 0, None, None).is_empty());
+    }
+
+    fn boundary(pre: Option<u64>) -> String {
+        let mut meta = json!({"trigger": "manual", "postTokens": 7604});
+        if let Some(n) = pre {
+            meta["preTokens"] = json!(n);
+        }
+        json!({"parentUuid": null, "type": "system", "subtype": "compact_boundary",
+            "content": "Conversation compacted", "compactMetadata": meta, "sessionId": "s"})
+        .to_string()
+    }
+
+    #[test]
+    fn a_session_that_never_compacted_looks_as_before() {
+        let d = tmpdir("nocompact");
+        let p = d.join("s.jsonl");
+        // A user line merely mentioning the subtype is not a boundary.
+        let lines = [
+            asst(json!({"input_tokens": 95_500})),
+            json!({"type": "user", "message": {"content": "grep compact_boundary"}}).to_string(),
+            json!({"type": "user", "message": {"content": "\"compact_boundary\""}}).to_string(),
+        ];
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert_eq!(compacted_tokens(&p), 0);
+        assert_eq!(compacted_tokens(&d.join("missing.jsonl")), 0);
+        let (s, sub, total) = session_subagents_total(Some(95_500), 0, &[]);
+        assert_eq!(
+            segments(s, 0, sub, total),
+            vec!["session: 95.5k".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_compaction_is_summed_and_added_to_the_total() {
+        let d = tmpdir("compact");
+        let p = d.join("s.jsonl");
+        let lines = [
+            asst(json!({"input_tokens": 334_163})),
+            boundary(Some(335_210)),
+            asst(json!({"input_tokens": 52_916})),
+            asst(json!({"input_tokens": 120_000})),
+            // No preTokens: the last context before it stands in.
+            boundary(None),
+            asst(json!({"input_tokens": 95_500})),
+        ];
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let compacted = compacted_tokens(&p);
+        assert_eq!(compacted, 335_210 + 120_000);
+        // The session's own count is still the latest context, untouched.
+        assert_eq!(tokens_of(&p), Some(95_500));
+        let (s, sub, total) = session_subagents_total(tokens_of(&p), compacted, &[]);
+        assert_eq!((s, sub, total), (Some(95_500), Some(0), Some(550_710)));
+        assert_eq!(
+            segments(s, compacted, sub, total),
+            vec![
+                "session: 95.5k (+455.2k)".to_string(),
+                "total: 550.7k".to_string()
+            ]
+        );
+        // With subagents, all three parts are in the total.
+        assert_eq!(
+            segments(Some(95_500), compacted, Some(1000), Some(551_710)),
+            vec![
+                "session: 95.5k (+455.2k)".to_string(),
+                "subagents: 1k".to_string(),
+                "total: 551.7k".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cached_scan_reads_only_what_was_appended() {
+        let d = tmpdir("cache");
+        let cache = d.join("cache");
+        let p = d.join("s.jsonl");
+        let mut body = asst(json!({"input_tokens": 10})) + "\n" + &boundary(Some(300_000)) + "\n";
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 300_000);
+        let slot = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let saved = std::fs::read_to_string(&slot).unwrap();
+        assert!(
+            saved.starts_with(&format!("{} 300000 ", body.len())),
+            "{saved}"
+        );
+        // A half-written line is left for the next read.
+        let second = boundary(Some(5000));
+        std::fs::write(&p, body.clone() + &second[..20]).unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 300_000);
+        body += &(second + "\n");
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 305_000);
+        // The cache really is read: a doctored one is believed while it fits.
+        std::fs::write(&slot, format!("{} 7 0\n", body.len())).unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 7);
+        // A transcript shorter than the scan is rescanned from the top.
+        std::fs::write(&p, asst(json!({"input_tokens": 1})) + "\n").unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 0);
     }
 
     #[test]
