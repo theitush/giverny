@@ -7,7 +7,7 @@
 //! asks: `giverny orchestrator-session ask demo#12 "<why>"` finds the session holding that
 //! lease and drops a message in that session's **inbox**, a JSON-lines file
 //! at `<feed dir>/inbox/<session>.jsonl`. The plugin's `PostToolUse` hook
-//! (`giverny orchestrator-session nudge`) checks the calling session's inbox on every tool
+//! (`giverny hook`) checks the calling session's inbox on every tool
 //! call — one `stat` when it is empty — and hands what it finds to the
 //! session as `additionalContext`, with who asks, what they hold and want,
 //! their Priority and ETA, and the commands to answer: `reply`, `release`, or

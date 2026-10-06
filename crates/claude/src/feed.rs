@@ -118,9 +118,9 @@ pub struct FeedRow {
     /// it, nothing is fetched; without it, a key naming a GitHub issue has
     /// the line read from the issue where `gh` works.
     pub review: Option<String>,
-    /// The row's worker started it itself, asked for a first estimate,
-    /// so no dispatcher will land it: it is Done when its
-    /// worker is.
+    /// The row was started by an `eta` with no `start` before it (a
+    /// dispatcher that forgot it, or a worker of giverny#158's first round),
+    /// so no dispatcher will land it: it is Done when its worker is.
     pub follows_worker: bool,
     /// What the machine ledger answered this row's task: a
     /// copy written by `giverny orchestrator-session claim`, gone on `release`/`land`. The

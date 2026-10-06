@@ -422,10 +422,13 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      print a worker's transcript, readable (and follow it)\n  \
      giverny orchestrator-session plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
      write the agents pane's feed (see `giverny orchestrator-session --help`)\n  \
+     giverny eta <agent-id> <minutes left>\n                     \
+     give a subagent's ETA to the agents pane\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
      giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny hook       (internal) the giverny plugin's hook\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n  \
      giverny relay --subagent-line\n                     \
      (internal) Claude Code subagentStatusLine entrypoint\n\n\
@@ -449,6 +452,15 @@ fn main() -> eframe::Result {
     // skill runs (as `giverny-orchestrator-session`) to plan, start,
     // re-estimate and land an orchestrator session's tasks. It runs inside Claude Code and reads the session id Claude
     // exported, so it goes before the markers are scrubbed.
+    // Any subagent's ETA, and the plugin's hook: inside Claude Code too.
+    match std::env::args().nth(1).as_deref() {
+        Some("eta") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(giverny_claude::agent_eta::main(&args));
+        }
+        Some("hook") => std::process::exit(giverny_claude::plugin_hook::main(true)),
+        _ => {}
+    }
     // `pass` is its name from before it was an orchestrator session, kept
     // for the plugins and skills a running Giverny wrote with it.
     if matches!(

@@ -5,6 +5,7 @@
 //! profiles (`CLAUDE_CONFIG_DIR` dirs), and reads transcripts for session
 //! titles. Never reads credentials, never calls the network.
 
+pub mod agent_eta;
 pub mod feed;
 pub mod hooks;
 pub mod jobs;
@@ -15,6 +16,7 @@ pub mod orchestrator_session_inbox;
 pub mod orchestrator_session_nudge;
 pub mod orchestrator_session_run;
 pub mod plugin;
+pub mod plugin_hook;
 pub mod profiles;
 pub mod registry;
 pub mod resources;

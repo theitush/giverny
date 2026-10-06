@@ -159,18 +159,6 @@ When you spawn one:
   re-estimate into the worker's context, once, unless it has re-estimated
   already. Its answer is the `eta` command.
 
-### A worker spawned outside an orchestrator session
-
-The same goes for *any* worker you spawn for a task, even one-off, mid-conversation,
-with no plan behind it: run `giverny-orchestrator-session start <task> --eta <minutes> --title "<title>"`
-before the spawn (and `--agent <id>` once you know it). That row has the worker's
-whole time and an estimate corrected from the history. If you forgot, Giverny asks
-the worker itself on its first tool call for a first estimate, which it reports
-with `giverny-orchestrator-session eta <task> <minutes> --agent <id>`. Any subagent in a Giverny tab
-gets that ask, orchestrator session or not, so the pane shows no worker without an ETA for long
-(outside a tab, only an orchestrator session asks: nothing else would show the worker); but the time
-before the ask is not counted, and the figure is not corrected from the history.
-
 ## 3. While it runs
 
 - When you learn a task will take longer or shorter, re-estimate it:

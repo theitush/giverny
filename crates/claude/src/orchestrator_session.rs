@@ -98,10 +98,9 @@ kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
 pane counts down from that, and both figures are printed, with how such
 guesses have fared. A worker's first `eta` on a running task (its re-estimate,
 made after reading the code) is scored and corrected the same way, against the
-working time that was still to come. `accuracy` shows each track. `nudge` is the
-plugin's hook: it asks a worker to re-estimate five minutes into its task, and
-a subagent with no row, on its first call, for a first estimate — only in a
-Giverny tab or an orchestrator session, and silent anywhere else.
+working time that was still to come. `accuracy` shows each track. The plugin's
+hook (`giverny hook`) asks a worker to re-estimate five minutes into its task.
+A subagent that is no task here has an agent ETA instead (`giverny eta`).
 
 Resources: one ledger for every session on the machine, at
 <feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
@@ -112,7 +111,7 @@ Resources: one ledger for every session on the machine, at
 in config.toml: 3 cpu, 3G unless set; --cpu/--ram override), waits while it is
 queued, and releases it when the command ends.
 `claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
-Messages go to <feed dir>/inbox/<session>.jsonl; `nudge` delivers
+Messages go to <feed dir>/inbox/<session>.jsonl; the plugin's hook delivers
 them, and renews the calling session's leases, on every tool call.";
 
 /// One `giverny orchestrator-session` command, parsed.
@@ -939,8 +938,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             apply(doc, &Cmd::Start(key.clone()), &sf, now)?;
             let rows = rows_mut(doc)?;
             if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut()) {
-                // Started from `eta`, by a worker asked for a first estimate
-                // or a dispatcher that forgot `start`: none may
+                // Started from `eta`, by a dispatcher that forgot `start`
+                // (or a worker of giverny#158's first round): none may
                 // ever land it, so the pane ends it with its worker.
                 row.insert("follows_worker".into(), json!(true));
                 if is_wait(f.why.as_deref()) {
@@ -1825,20 +1824,8 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         }
     };
     if cmd == Cmd::Nudge {
-        // A hook: whatever happens, it never fails the tool call it rides on.
-        let mut input = String::new();
-        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
-        if let Some(payload) = crate::orchestrator_session_nudge::payload_of(&input)
-            && let Some(out) = crate::orchestrator_session_nudge::run(
-                &payload,
-                &feed::feed_dir(),
-                now_ms(),
-                crate::orchestrator_session_nudge::in_giverny_tab(),
-            )
-        {
-            println!("{out}");
-        }
-        return 0;
+        // The plugin's hook, under the name it had before `giverny hook`.
+        return crate::plugin_hook::main(false);
     }
     if cmd == Cmd::Accuracy {
         // The history is the machine's, not a session's.
@@ -2524,12 +2511,7 @@ mod tests {
 
     /// The hook's reply for `session`'s own call, as text.
     fn hook(dir: &Path, session: &str, now: u64) -> Option<String> {
-        let out = crate::orchestrator_session_nudge::run(
-            &json!({"session_id": session}),
-            dir,
-            now,
-            true,
-        )?;
+        let out = crate::plugin_hook::run(&json!({"session_id": session}), dir, now, true)?;
         let v: Value = serde_json::from_str(&out).unwrap();
         Some(
             v["hookSpecificOutput"]["additionalContext"]
@@ -2684,7 +2666,7 @@ mod tests {
         for k in 1..=25 {
             let worker = json!({"session_id": "busy", "agent_id": "w1"});
             let now = T0 + k * MIN;
-            let _ = crate::orchestrator_session_nudge::run(&worker, &dir, now, true);
+            let _ = crate::plugin_hook::run(&worker, &dir, now, true);
             let _ = hook(&dir, "busy", now + 1000);
         }
         let shown = run_as(&dir, "other", "resources", T0 + 25 * MIN).0;
@@ -2806,7 +2788,7 @@ mod tests {
         let transcript = cfg.join("projects").join("-w").join("s1.jsonl");
         let payload = json!({"session_id": "s1", "agent_id": "w2",
                              "transcript_path": transcript});
-        crate::orchestrator_session_nudge::run(&payload, &dir, T0 + MIN, true);
+        crate::plugin_hook::run(&payload, &dir, T0 + MIN, true);
         let f = read_feed_of(&dir, "s1");
         assert_eq!(f.rows[0].agent_id.as_deref(), Some("w2"));
         // So the hand-off finds it by the id alone, no description read.

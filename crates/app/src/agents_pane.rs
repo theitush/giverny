@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
+use giverny_claude::agent_eta::{self, Etas};
 use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{RunLive, TaskLive};
@@ -106,6 +107,10 @@ const LEASE_SEG: usize = 6;
 struct View {
     feed: FeedCache,
     feed_now: Option<Feed>,
+    /// The session's agent ETAs: the estimates of workers that are no
+    /// orchestrator session's task.
+    etas: agent_eta::Cache,
+    etas_now: Etas,
     feed_session: Option<String>,
     last_poll: Option<Instant>,
     /// The height the pane last sized itself to, while the user has not
@@ -145,6 +150,9 @@ impl View {
         self.last_poll = Some(Instant::now());
         self.feed_session = session.map(str::to_string);
         self.feed_now = session.and_then(|sid| self.feed.poll(&feed::feed_dir(), sid).cloned());
+        self.etas_now = session
+            .map(|sid| self.etas.poll(&feed::feed_dir(), sid).clone())
+            .unwrap_or_default();
         self.logs_due = true;
     }
 }
@@ -396,11 +404,17 @@ pub struct Clock<'a> {
     /// Each worker's processes' use now, by agent id: what a Running row
     /// with no feed figure of its own shows.
     pub workers: &'a HashMap<String, RunLive>,
+    /// Each worker's agent ETA, by agent id: what a row with no feed
+    /// estimate counts down from.
+    pub etas: &'a Etas,
 }
 
 /// No worker measured.
 static NO_WORKERS: std::sync::LazyLock<HashMap<String, RunLive>> =
     std::sync::LazyLock::new(HashMap::new);
+
+/// No agent ETAs.
+static NO_ETAS: std::sync::LazyLock<Etas> = std::sync::LazyLock::new(Etas::new);
 
 #[cfg(any(test, debug_assertions))]
 impl Clock<'_> {
@@ -410,6 +424,7 @@ impl Clock<'_> {
             limit: None,
             tz: jiff::tz::TimeZone::system(),
             workers: &NO_WORKERS,
+            etas: &NO_ETAS,
         }
     }
 }
@@ -1030,7 +1045,7 @@ fn format_row(
     // A feed row's key and title; a live-only row's name and description.
     let (id, title) = match (f, l) {
         (Some(f), _) => (
-            f.key.clone(),
+            shown_key(f),
             f.title
                 .clone()
                 .or_else(|| l.map(|l| l.display_name().to_string()))
@@ -1088,7 +1103,13 @@ fn format_row(
             }
         }
     };
-    let eta_s = f.and_then(|f| f.eta_s);
+    // A worker no feed row carries: its agent ETA, counted from its start.
+    let agent_eta = l
+        .filter(|_| f.is_none())
+        .and_then(|l| clock.etas.get(&l.id))
+        .zip(row_start)
+        .map(|(e, s)| e.total_s(s));
+    let eta_s = f.and_then(|f| f.eta_s).or(agent_eta);
     let eta = match row.stage {
         Stage::Running => match (eta_s, work_s) {
             (Some(eta), Some(work)) => countdown(eta as i64 - work as i64),
@@ -1097,7 +1118,14 @@ fn format_row(
         Stage::Planned => eta_s
             .map(|e| format!("~{}", feed::fmt_span(e as i64)))
             .unwrap_or_default(),
-        Stage::Done => row.eta_delta_s().map(feed::fmt_delta).unwrap_or_default(),
+        Stage::Done => row
+            .eta_delta_s()
+            .or_else(|| {
+                let took_ms = row.ended_ms()?.checked_sub(row_start?)?;
+                Some((took_ms / 1000) as i64 - agent_eta? as i64)
+            })
+            .map(feed::fmt_delta)
+            .unwrap_or_default(),
     };
     let no_eta = row.stage == Stage::Running && eta_s.is_none();
     // What the task holds in the machine ledger is in the overlay header; a
@@ -1157,7 +1185,7 @@ fn format_row(
     if no_eta {
         facts.insert(
             1.min(facts.len()),
-            no_eta_hint(&key, l.map(|l| l.agent_id()), &title),
+            no_eta_hint(&key, l.map(|l| l.agent_id())),
         );
     }
     if let Some(h) = held {
@@ -1219,38 +1247,32 @@ fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) ->
     v.into_iter().flatten().collect()
 }
 
-/// How the dispatcher gives a Running row with no estimate one, as the
-/// overlay header says it: `giverny-orchestrator-session eta` re-estimates a feed row in
-/// place, and starts a row (Running, with the estimate) for a worker that
-/// has none.
-fn no_eta_hint(key: &str, agent_id: Option<&str>, title: &str) -> String {
+/// How a Running row with no estimate gets one, as the overlay header says
+/// it: an orchestrator session's task is re-estimated on its row; any other
+/// worker is given an agent ETA by its id.
+fn no_eta_hint(key: &str, agent_id: Option<&str>) -> String {
     if !key.is_empty() {
         return format!(
             "no ETA — add one: giverny-orchestrator-session eta {key} <min> --why scope"
         );
     }
-    let id = task_key(title).unwrap_or("<task>");
-    let agent = agent_id
-        .map(|a| format!(" --agent {a}"))
-        .unwrap_or_default();
-    format!("no ETA — add one: giverny-orchestrator-session eta {id} <min>{agent}")
+    let agent = agent_id.unwrap_or("<agent-id>");
+    format!("no ETA — add one: giverny-eta {agent} <min>")
 }
 
-/// The first `repo#n` a worker's description names (`acme#613 market SD
-/// graph` → `acme#613`), the id its row would be planned under.
-fn task_key(text: &str) -> Option<&str> {
-    text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
-        .find(|w| {
-            w.split_once('#').is_some_and(|(repo, n)| {
-                !repo.is_empty()
-                    && repo
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || "-_./".contains(c))
-                    && !n.is_empty()
-                    && n.chars().all(|c| c.is_ascii_digit())
-            })
-        })
+/// A feed row's key as the TASK column shows it: none for the
+/// `agent-<id>` a worker with no task once started its own row under
+/// (giverny#158's first round), which names nothing a person knows.
+fn shown_key(f: &feed::FeedRow) -> String {
+    let made_up = f.follows_worker
+        && f.key
+            .strip_prefix("agent-")
+            .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric()));
+    if made_up {
+        String::new()
+    } else {
+        f.key.clone()
+    }
 }
 
 fn outcome_word(o: Outcome) -> String {
@@ -1386,6 +1408,7 @@ pub fn show(
         limit: limit.as_ref(),
         tz: jiff::tz::TimeZone::system(),
         workers: &workers,
+        etas: &view.etas_now,
     };
     // Done rows cleared by hand go from the feed too, whoever wrote it.
     let cleared = tracker
@@ -2176,10 +2199,7 @@ mod tests {
         assert_eq!(Cols::new(&t, 100).segments(l)[ETA_SEG].1, NO_ETA);
         let hint = &l.click.facts[1];
         assert!(hint.starts_with("no ETA — add one:"), "{hint}");
-        assert!(
-            hint.contains("giverny-orchestrator-session eta acme#613 <min> --agent a1"),
-            "{hint}"
-        );
+        assert_eq!(hint, "no ETA — add one: giverny-eta a1 <min>");
 
         // A feed row with no estimate is re-estimated in place.
         let f = feed(
@@ -2342,11 +2362,77 @@ mod tests {
     }
 
     #[test]
-    fn a_task_key_is_the_first_repo_and_number_named() {
-        assert_eq!(task_key("acme#613 market SD graph"), Some("acme#613"));
-        assert_eq!(task_key("Work owner/demo#82: x"), Some("owner/demo#82"));
-        assert_eq!(task_key("fix #12 and acme#3"), Some("acme#3"));
-        assert_eq!(task_key("Fix the board"), None);
+    fn a_worker_with_an_agent_eta_counts_down_under_no_id() {
+        // A plain session's two workers, five minutes in: one estimated.
+        let rows = live(
+            r#"{"session_id":"s","tasks":[
+                {"id":"a1","status":"running","description":"Classify chunk 0",
+                 "startTime":1789999700000},
+                {"id":"a2","status":"running","description":"Classify chunk 1",
+                 "startTime":1789999700000}]}"#,
+        );
+        // Given a minute after the spawn, 8 minutes left: 9 in all, 4 left.
+        let at = 1_789_999_760_000;
+        let etas: Etas = [(
+            "a1".to_string(),
+            agent_eta::Eta {
+                left_s: 480,
+                at_ms: at,
+                first_left_s: 480,
+                first_at_ms: at,
+            },
+        )]
+        .into();
+        let clock = Clock {
+            etas: &etas,
+            ..Clock::plain()
+        };
+        let t = build_at(None, &rows, T0, &clock, &Logs::new());
+        let (one, two) = (&t.lines[0], &t.lines[1]);
+        assert_eq!(
+            (one.id.as_str(), one.title.as_str()),
+            ("", "Classify chunk 0")
+        );
+        assert_eq!(one.eta, countdown(240));
+        assert!(!one.no_eta);
+        assert_eq!((two.id.as_str(), two.eta.as_str()), ("", ""));
+        assert!(two.no_eta, "its own, never its sibling's");
+
+        // Done: how it landed against that estimate.
+        let done = live(
+            r#"{"session_id":"s","tasks":[{"id":"a1","status":"completed",
+                "description":"Classify chunk 0","startTime":1789999700000,
+                "endTime":1790000000000}]}"#,
+        );
+        let t = build_at(None, &done, T0, &clock, &Logs::new());
+        assert_eq!(t.lines[0].eta, feed::fmt_delta(300 - 540));
+
+        // A feed row's estimate wins, and so does its key.
+        let f = feed(r#"{"rows":[{"key":"g#3","stage":"running","agent_id":"a1","eta_s":1800}]}"#);
+        let t = build_at(Some(&f), &rows[..1], T0, &clock, &Logs::new());
+        assert_eq!(t.lines[0].id, "g#3");
+        assert_eq!(t.lines[0].eta, countdown(1800 - 300));
+    }
+
+    #[test]
+    fn a_made_up_agent_key_is_not_drawn() {
+        // A row a worker with no task started under giverny#158's first round.
+        let rows = live(
+            r#"{"session_id":"s","tasks":[{"id":"adfb891dbd4470353","status":"running",
+                "description":"Classify chunk 0","startTime":1789999700000}]}"#,
+        );
+        let f = feed(
+            r#"{"rows":[{"key":"agent-adfb891d","stage":"running","follows_worker":true,
+               "agent_id":"adfb891dbd4470353","title":"Classify chunk 0","eta_s":480}]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        assert_eq!(t.lines[0].id, "");
+        assert_eq!(t.lines[0].title, "Classify chunk 0");
+        // A dispatcher's own key of that shape is drawn.
+        let f = feed(
+            r#"{"rows":[{"key":"agent-x1","stage":"running","agent_id":"adfb891dbd4470353"}]}"#,
+        );
+        assert_eq!(build(Some(&f), &rows, T0).lines[0].id, "agent-x1");
     }
 
     #[test]
@@ -3613,6 +3699,7 @@ mod tests {
             limit,
             tz: jiff::tz::TimeZone::UTC,
             workers: &NO_WORKERS,
+            etas: &NO_ETAS,
         }
     }
 
