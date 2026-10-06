@@ -881,9 +881,6 @@ pub struct App {
     pub drag_hover: Option<egui::Pos2>,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
-    /// Every live claude session started before hooks/statusline were
-    /// installed, so none of them report anything (recomputed periodically).
-    pub stale_sessions: bool,
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -1365,7 +1362,6 @@ impl App {
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
             row_rects: Vec::new(),
-            stale_sessions: false,
             attention: 0,
             frameless,
             see_through,
@@ -2727,7 +2723,6 @@ impl App {
         }
         self.persist_font_size();
         self.track_foreground();
-        self.stale_sessions = self.claude.sessions_predate_settings();
         self.probe_wsl_cwds();
         self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -3764,39 +3759,18 @@ fn doctor() {
     let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
     let live = registry::scan(dirs);
     println!("\nlive claude sessions ({}):", live.len());
-    let mut stale = 0;
     for s in &live {
-        // Sessions that started before settings.json was last written never
-        // loaded our hooks or statusline.
-        let settings_at = std::fs::metadata(s.config_dir.join("settings.json"))
-            .and_then(|m| m.modified())
-            .ok();
-        let started = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_millis(s.entry.started_at_ms));
-        let predates = matches!((settings_at, started), (Some(a), Some(b)) if b < a);
-        if predates {
-            stale += 1;
-        }
         println!(
-            "  pid {:<8} {:<6} {:<26} {:<12} {}",
+            "  pid {:<8} {:<6} {:<26} {}",
             s.entry.pid,
             s.entry.status,
             s.entry.name.as_deref().unwrap_or("-"),
-            if predates { "PRE-HOOKS" } else { "hooked" },
             s.entry.cwd.display()
-        );
-    }
-    if stale > 0 {
-        println!(
-            "\n  ⟳ {stale} session(s) started before hooks/statusline were installed.\n    \
-             Claude Code reads settings.json at session start — exit and re-run\n    \
-             claude in those tabs to get live states and live usage."
         );
     }
 
     println!(
-        "\nnotes\n  · hooks load when a claude session STARTS — restart claude after installing\n  \
-         · notifications fire when claude needs YOU (permission prompts, questions),\n    \
+        "\nnotes\n  · notifications fire when claude needs YOU (permission prompts, questions),\n    \
          not when it merely finishes"
     );
 }
