@@ -2941,6 +2941,13 @@ impl App {
     }
 }
 
+/// The terminal `id` has lost the keyboard to something that is not meant
+/// to hold it, and should take it back: anything but a text field, while no
+/// `overlay` reading keys of its own is open.
+fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
+    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
+}
+
 /// Frames drawn per second, logged every ten seconds at debug level
 /// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
 /// asked for the last one. On a software renderer every frame is CPU, so
@@ -3215,7 +3222,20 @@ impl eframe::App for App {
                 if let Some(session) = &mut rt.session {
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
-                    if self.focus_terminal {
+                    // Typing goes to the terminal. egui drops a widget's
+                    // focus on any press outside it — the rail, the
+                    // taskbar, a header button — and the keys typed after
+                    // that went nowhere until the terminal was clicked
+                    // again. So it takes the keyboard back whenever nothing
+                    // else is meant to hold it: a text field (the search
+                    // bar, a settings input) or an overlay that reads keys
+                    // of its own. Only when it has lost it, since each
+                    // request interrupts IME input.
+                    let overlay = self.palette.is_some()
+                        || self.session_picker.is_some()
+                        || self.keys_overlay.is_some()
+                        || self.rename.is_some();
+                    if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
                     }
@@ -3687,6 +3707,63 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A press on anything else — here a button, as a pane
+    /// row or the rail would be — takes egui's focus off the terminal, and
+    /// the terminal is then told to take it back; a text field keeps it.
+    #[test]
+    fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
+        let ctx = egui::Context::default();
+        let button_at = egui::pos2(20.0, 10.0);
+        let mut text = String::new();
+        let frame = |events: Vec<egui::Event>, with_field: bool, text: &mut String| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut lost = false;
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = ui.button("row");
+                if with_field {
+                    ui.add(egui::TextEdit::singleline(text)).request_focus();
+                }
+                let (_, resp) =
+                    ui.allocate_exact_size(egui::vec2(400.0, 300.0), egui::Sense::click_and_drag());
+                lost = terminal_lost_keys(ui.ctx(), resp.id, false);
+                if lost {
+                    resp.request_focus();
+                }
+            });
+            lost
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: button_at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Unfocused at first: taken.
+        assert!(frame(vec![], false, &mut text));
+        assert!(!frame(vec![], false, &mut text));
+        // A click on the button: lost, and taken back.
+        let lost = frame(
+            vec![egui::Event::PointerMoved(button_at), press(true)],
+            false,
+            &mut text,
+        ) | frame(vec![press(false)], false, &mut text);
+        assert!(lost);
+        assert!(!frame(vec![], false, &mut text));
+        // A text field holding the keyboard keeps it.
+        frame(vec![], true, &mut text);
+        assert!(!frame(vec![], true, &mut text));
+        assert!(ctx.text_edit_focused());
+        // An overlay reading its own keys: left alone.
+        assert!(!terminal_lost_keys(&ctx, egui::Id::new("term"), true));
+    }
 
     #[test]
     fn the_backdrop_tiles_around_the_grid_exactly() {
