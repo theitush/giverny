@@ -355,8 +355,30 @@ pub fn run_statusline(spool: &Path) {
         parts.push(format!("wk {p}%"));
     }
     parts.extend(statusline_tokens(&payload));
+    parts.extend(cache_cold_segment(&payload));
     println!("{}", parts.join("  ·  "));
 }
+
+/// Red `cache cold · next msg <n>` once the main conversation's prompt cache
+/// has expired (giverny#223): `<n>` is what the next message re-caches, from
+/// Claude Code's `prompt_cache`. Nothing while it is warm, or when the
+/// provider reports no cache tokens at all.
+fn cache_cold_segment(payload: &serde_json::Value) -> Option<String> {
+    let cache = payload.get("prompt_cache")?;
+    let flag = |key: &str| cache.get(key).and_then(|v| v.as_bool());
+    if flag("caching_observed") != Some(true) || flag("warm") != Some(false) {
+        return None;
+    }
+    let text = match cache.get("recache_tokens_if_cold").and_then(|v| v.as_u64()) {
+        Some(n) => format!("cache cold · next msg {}", crate::tokens::fmt_tokens(n)),
+        None => "cache cold".to_string(),
+    };
+    Some(format!("{RED}{text}{RESET}"))
+}
+
+/// SGR red and reset, around the status line's alarm segments.
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
 
 /// `session: <n>`, `subagents: <n>` and `total: <n>` for the status line
 /// (giverny#22, giverny#95): this conversation's own tokens, every subagent's
@@ -694,6 +716,31 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cold_prompt_cache_shows_red_with_what_the_next_message_recaches() {
+        let cold = |extra: serde_json::Value| {
+            let mut cache = serde_json::json!({"warm": false, "caching_observed": true});
+            cache
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            cache_cold_segment(&serde_json::json!({ "prompt_cache": cache }))
+        };
+        assert_eq!(
+            cold(serde_json::json!({"recache_tokens_if_cold": 182_340})).as_deref(),
+            Some("\x1b[31mcache cold · next msg 182.3k\x1b[0m")
+        );
+        // Right after a compaction there is no figure.
+        assert_eq!(
+            cold(serde_json::json!({"recache_tokens_if_cold": null})).as_deref(),
+            Some("\x1b[31mcache cold\x1b[0m")
+        );
+        // Warm, unreported caching, or an older Claude Code: nothing.
+        assert_eq!(cold(serde_json::json!({"warm": true})), None);
+        assert_eq!(cold(serde_json::json!({"caching_observed": false})), None);
+        assert_eq!(cache_cold_segment(&serde_json::json!({})), None);
+    }
 
     /// Off Windows — and for a Windows account that is not inside a
     /// distribution — the command is this binary, named as it always was.
