@@ -157,7 +157,7 @@ fn deliver(msg: &RelayMsg, spool: &Path) {
     }
 }
 
-/// Synthetic event name for `giverny pass clear-done` (not a Claude hook
+/// Synthetic event name for `giverny orchestrator-session clear-done` (not a Claude hook
 /// event): clear the agents pane's Done rows in the tab it ran in.
 /// The event carries `session_id` and `at_ms`, the moment the
 /// command ran.

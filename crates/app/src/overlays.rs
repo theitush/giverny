@@ -670,7 +670,7 @@ pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
 
 /// The Review line, boxed in amber under the title: the first thing read.
 /// The Review line a clicked row's overlay shows: a Done row's `review`
-/// text from the feed (what `giverny pass land --review` writes), trimmed.
+/// text from the feed (what `giverny orchestrator-session land --review` writes), trimmed.
 /// Nothing for any other row, or for a blank line; nothing is looked up
 /// anywhere else.
 pub fn review_line(stage: giverny_claude::feed::Stage, review: Option<&str>) -> Option<String> {

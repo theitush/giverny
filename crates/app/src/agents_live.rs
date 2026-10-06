@@ -175,7 +175,7 @@ impl AgentsLive {
         self.dirty = true;
     }
 
-    /// `giverny pass clear-done` in `tab`: drop its Done rows (and hide the
+    /// `giverny orchestrator-session clear-done` in `tab`: drop its Done rows (and hide the
     /// feed's that landed by then), keeping what runs. `at_ms` is when the
     /// command ran, else now.
     pub fn clear_done(&mut self, tab: TabId, at_ms: Option<u64>) {
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(ids(&live), ["wa"], "back in A: A's again");
 
         // A session with no root of its own yet (the agents view's switch)
-        // is the same pass: the rows stay and A becomes an alias.
+        // is the same session: the rows stay and A becomes an alias.
         std::fs::create_dir_all(proj.join("A2")).unwrap();
         std::fs::write(proj.join("A2.jsonl"), "{\"type\":\"mode\"}\n").unwrap();
         live.session_started(TAB, Some("resume"), Some("A2"));

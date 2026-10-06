@@ -1,4 +1,4 @@
-//! What a task's `giverny pass run` commands use right now.
+//! What a task's `giverny orchestrator-session run` commands use right now.
 //!
 //! While a command runs, `run` keeps a small JSON file beside its stats
 //! file, `<ledger dir>/runs/<pid>-<n>.live` (`task`, `session`, `pid`,

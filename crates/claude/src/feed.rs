@@ -118,22 +118,22 @@ pub struct FeedRow {
     /// it, nothing is fetched; without it, a key naming a GitHub issue has
     /// the line read from the issue where `gh` works.
     pub review: Option<String>,
-    /// The row's worker started it itself, asked for a first estimate,
-    /// so no dispatcher will land it: it is Done when its
-    /// worker is.
+    /// The row was started by an `eta` with no `start` before it (a
+    /// dispatcher that forgot it, or a worker of giverny#158's first round),
+    /// so no dispatcher will land it: it is Done when its worker is.
     pub follows_worker: bool,
     /// What the machine ledger answered this row's task: a
-    /// copy written by `giverny pass claim`, gone on `release`/`land`. The
+    /// copy written by `giverny orchestrator-session claim`, gone on `release`/`land`. The
     /// ledger itself (`resources`) is the truth; this is for drawing.
     pub lease: Option<RowLease>,
-    /// What the task's `giverny pass run` commands used.
+    /// What the task's `giverny orchestrator-session run` commands used.
     pub usage: Option<RowUsage>,
-    /// What its running `giverny pass run` commands use now, sampled by the
+    /// What its running `giverny orchestrator-session run` commands use now, sampled by the
     /// pane from their cgroups. Never in the feed file.
     pub live: Option<crate::run_live::RunLive>,
 }
 
-/// A row's `usage` object: the task's `giverny pass run` commands so far,
+/// A row's `usage` object: the task's `giverny orchestrator-session run` commands so far,
 /// measured. Totals over every run, and the last run's command and cap.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowUsage {
@@ -612,7 +612,7 @@ pub fn spawned_at<L: LiveAgent>(l: &L, log: Option<&WorkerLog>) -> Option<u64> {
 }
 
 /// Do keys `a` and `b` name one task: either names the other, or they are
-/// one number with and without its `#` (`#204` and the pass row `204`).
+/// one number with and without its `#` (`#204` and the orchestrator session row `204`).
 fn same_task(a: &str, b: &str) -> bool {
     names_key(a, b)
         || names_key(b, a)
@@ -950,7 +950,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
 ///   its start (the first from the worker's first turn) to the next batch's;
 ///   a Running later batch, what it added from its own start. The Done rows
 ///   of a worker add up to everything it added, and nothing is counted
-///   twice. A count `giverny pass` froze on the row when it landed
+///   twice. A count `giverny orchestrator-session` froze on the row when it landed
 ///   (`task_tokens`) is drawn in place of either. The worker's start is its
 ///   spawn ([`spawned_at`]), never the later `startTime` Claude Code lists a
 ///   worker woken by a message with.
@@ -1062,7 +1062,7 @@ fn queue<'w, L: LiveAgent>(
 pub const HANDOFF_WINDOW_MS: u64 = 3 * 60 * 1000;
 
 /// Does `text` name task `key`: as a whole word ([`names_key`]), or by
-/// its bare number — `#829` names the pass row `inbar#829` (and `829`).
+/// its bare number — `#829` names the orchestrator session row `inbar#829` (and `829`).
 pub fn names_task(text: &str, key: &str) -> bool {
     if names_key(text, key) {
         return true;

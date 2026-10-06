@@ -4,7 +4,7 @@
 //!
 //! The session is the `claude` process the status line command runs under
 //! and every process below it: its Bash commands, their builds, `giverny
-//! pass run` commands (a `systemd-run --scope` execs the command in place,
+//! orchestrator-session run` commands (a `systemd-run --scope` execs the command in place,
 //! so a capped command stays in the tree), background shells. Its
 //! subagents run inside the `claude` process itself.
 //!

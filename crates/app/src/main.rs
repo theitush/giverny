@@ -420,12 +420,15 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      giverny update     check for a newer release\n  \
      giverny transcript [--follow] <agent jsonl>\n                     \
      print a worker's transcript, readable (and follow it)\n  \
-     giverny pass plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
-     write the agents pane's feed (see `giverny pass --help`)\n  \
+     giverny orchestrator-session plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
+     write the agents pane's feed (see `giverny orchestrator-session --help`)\n  \
+     giverny eta <agent-id> <minutes left>\n                     \
+     give a subagent's ETA to the agents pane\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
      giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny hook       (internal) the giverny plugin's hook\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n  \
      giverny relay --subagent-line\n                     \
      (internal) Claude Code subagentStatusLine entrypoint\n\n\
@@ -446,12 +449,26 @@ fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
 
 fn main() -> eframe::Result {
     // The agents pane's feed writer: what the `giverny` plugin's orchestrate
-    // skill runs (as `giverny-pass`) to plan, start, re-estimate and land a
-    // pass's tasks. It runs inside Claude Code and reads the session id Claude
+    // skill runs (as `giverny-orchestrator-session`) to plan, start,
+    // re-estimate and land an orchestrator session's tasks. It runs inside Claude Code and reads the session id Claude
     // exported, so it goes before the markers are scrubbed.
-    if std::env::args().nth(1).as_deref() == Some("pass") {
+    // Any subagent's ETA, and the plugin's hook: inside Claude Code too.
+    match std::env::args().nth(1).as_deref() {
+        Some("eta") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(giverny_claude::agent_eta::main(&args));
+        }
+        Some("hook") => std::process::exit(giverny_claude::plugin_hook::main(true)),
+        _ => {}
+    }
+    // `pass` is its name from before it was an orchestrator session, kept
+    // for the plugins and skills a running Giverny wrote with it.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("orchestrator-session" | "pass")
+    ) {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(giverny_claude::pass::main(
+        std::process::exit(giverny_claude::orchestrator_session::main(
             &args,
             &Paths::default_dirs().hook_spool(),
         ));
@@ -539,7 +556,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         // A word this build does not know: most likely a subcommand added
-        // since it was built (`giverny pass …` run on an older binary). It
+        // since it was built (`giverny orchestrator-session …` run on an older binary). It
         // must not fall through to opening a window, which would also set up
         // the Claude accounts from this binary.
         Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {

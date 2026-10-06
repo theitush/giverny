@@ -35,10 +35,10 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `agents_panel.columns.eta` | `true` | Time left on a Running row, the estimate of a Next up one, how late or early a Done one landed. |
 | `agents_panel.columns.now` | `true` | What the row is doing now: its last tool call, a wait, a queue place. |
 | `agents_panel.columns.tokens` | `true` | The tokens the row has used. |
-| `agents_panel.columns.usage` | `true` | What the row's `giverny pass run` commands use: live CPU and memory, a Done row's peak. |
+| `agents_panel.columns.usage` | `true` | What the row's `giverny orchestrator-session run` commands use: live CPU and memory, a Done row's peak. |
 | `agents_panel.lease.cpu_cores` | `3` | Cores a task's lease holds when nothing says otherwise. |
 | `agents_panel.lease.ram` | `"3G"` | Memory a task's lease holds when nothing says otherwise. |
-| `orchestrator.limits.cpu_cores` | `"auto"` | Cores all orchestrator passes together may hand to workers. auto = all but 2. |
-| `orchestrator.limits.ram` | `"auto"` | Memory all orchestrator passes together may hand to workers. auto = 70 %. |
-| `orchestrator.limits.gpus` | `"auto"` | GPUs and VRAM orchestrator passes may use. auto = 90 % of each GPU's VRAM. |
+| `orchestrator.limits.cpu_cores` | `"auto"` | Cores all orchestrator sessions together may hand to workers. auto = all but 2. |
+| `orchestrator.limits.ram` | `"auto"` | Memory all orchestrator sessions together may hand to workers. auto = 70 %. |
+| `orchestrator.limits.gpus` | `"auto"` | GPUs and VRAM orchestrator sessions may use. auto = 90 % of each GPU's VRAM. |
 | `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |

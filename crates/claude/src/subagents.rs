@@ -245,7 +245,7 @@ const ROOT_SCAN: usize = 500;
 /// user or assistant turn. Claude Code copies a conversation's records
 /// forward when it re-ids a session, so this is the same before and after
 /// where the session id is not; `/clear` starts a new root, and a different
-/// conversation has its own (a key an orchestrator can file its passes by).
+/// conversation has its own (a key an orchestrator can file its sessions by).
 /// `None` for a transcript with no turn of its own yet — a session
 /// just switched to in the agents view holds only headers until its next
 /// turn.
@@ -1176,7 +1176,7 @@ impl Tracker {
         self.rows.clear();
     }
 
-    /// Clear the Done rows by hand (`giverny pass clear-done`),
+    /// Clear the Done rows by hand (`giverny orchestrator-session clear-done`),
     /// keeping the Running ones. A cleared worker stays gone — the next
     /// refresh finds its transcript and notification still on disk — unless
     /// it runs again. Returns how many rows went.
@@ -1226,7 +1226,7 @@ impl Tracker {
 
     /// Bind to a session. A different id keeps the rows and records the old
     /// one as an alias — a resumed or re-id'd conversation is still the same
-    /// pass; call [`Tracker::clear`] as well if it is not.
+    /// session; call [`Tracker::clear`] as well if it is not.
     pub fn set_session(&mut self, session_id: &str) {
         if let Some(cur) = &self.session_id {
             if cur == session_id {

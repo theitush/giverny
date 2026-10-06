@@ -181,7 +181,7 @@ fn planned_without_brief(click: &RowClick) -> String {
     }
     parts.push(
         "No brief was given for this row. The dispatcher adds one with \
-         `giverny-pass plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
+         `giverny-orchestrator-session plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
             .to_string(),
     );
     parts.join("\n\n")

@@ -1,7 +1,7 @@
 //! The machine ledger: what every orchestrator on this machine holds.
 //!
 //! Before a worker starts, its orchestrator *claims* what the worker needs
-//! (`giverny pass claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
+//! (`giverny orchestrator-session claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
 //! is answered *granted*, *granted smaller* (less RAM, down to `--min-ram`)
 //! or *queued* behind whoever holds what it needs. The answer is a
 //! [`Lease`] in one JSON file shared by every session on the machine; it is
@@ -16,7 +16,7 @@
 //! for other writers.
 //!
 //! **Liveness.** A lease or a queued request lives [`TTL_MS`] past its
-//! `heartbeat_at`; every `giverny pass` command from its session refreshes
+//! `heartbeat_at`; every `giverny orchestrator-session` command from its session refreshes
 //! it, and every read drops what has expired, so a dead orchestrator frees
 //! what it held without anyone cleaning up.
 //!
@@ -43,21 +43,21 @@ use giverny_core::limits::{Limits, Load, Machine, Mem, Resolved};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{feed, pass};
+use crate::{feed, orchestrator_session};
 
 /// The ledger format this build reads and writes.
 pub const LEDGER_VERSION: u64 = 1;
 /// A lease or queued request with no heartbeat for this long is gone.
 pub const TTL_MS: u64 = 20 * 60 * 1000;
 /// Heartbeats closer together than this are not written: every `giverny
-/// pass` command beats, and the ledger need not be rewritten for each.
+/// orchestrator-session` command beats, and the ledger need not be rewritten for each.
 pub const BEAT_EVERY_MS: u64 = 30 * 1000;
 /// Overrides where the ledger lives.
 pub const LEDGER_ENV: &str = "GIVERNY_LEDGER";
 /// A granted-smaller RAM figure is rounded down to this (MiB).
 const RAM_STEP_MB: u64 = 256;
 
-/// Exit codes of `giverny pass claim`.
+/// Exit codes of `giverny orchestrator-session claim`.
 pub mod exit {
     pub const GRANTED: i32 = 0;
     pub const ERROR: i32 = 1;
@@ -88,7 +88,7 @@ pub(crate) mod ts {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(ms: &u64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&crate::pass::stamp(*ms))
+        s.serialize_str(&crate::orchestrator_session::stamp(*ms))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -772,7 +772,7 @@ pub fn ask_hint(
         _ => return None,
     };
     Some(format!(
-        "{why}: ask its holder, `giverny pass ask {} \"<why you need it now>\"`",
+        "{why}: ask its holder, `giverny orchestrator-session ask {} \"<why you need it now>\"`",
         first.task
     ))
 }
@@ -836,7 +836,7 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
             "gpus": l.gpus,
             "vram_mb": l.vram_mb,
             "slots": l.slots,
-            "granted_at": pass::stamp(l.granted_at),
+            "granted_at": orchestrator_session::stamp(l.granted_at),
         });
         if state == "smaller" {
             v["wanted_ram_mb"] = json!(req.ram_mb);
@@ -873,7 +873,7 @@ pub struct LedgerLock {
     #[cfg(unix)]
     _file: std::fs::File,
     #[cfg(not(unix))]
-    _lock: pass::Lock,
+    _lock: orchestrator_session::Lock,
 }
 
 impl LedgerLock {
@@ -904,7 +904,7 @@ impl LedgerLock {
         #[cfg(not(unix))]
         {
             Ok(LedgerLock {
-                _lock: pass::Lock::take(&path.with_extension("json"))?,
+                _lock: orchestrator_session::Lock::take(&path.with_extension("json"))?,
             })
         }
     }
@@ -932,7 +932,7 @@ pub fn with_ledger<R>(
     };
     if changed {
         let v = serde_json::to_value(&l).map_err(|e| e.to_string())?;
-        pass::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
+        orchestrator_session::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(out)
 }
@@ -950,7 +950,7 @@ fn landed_tasks(feed_dir: &Path, session: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every `giverny pass` command's heartbeat for `session`. Touches nothing
+/// Every `giverny orchestrator-session` command's heartbeat for `session`. Touches nothing
 /// when there is no ledger yet, and writes only every [`BEAT_EVERY_MS`].
 /// With the feed dir, a lease or queued request of a task whose feed row
 /// has landed is dropped rather than renewed.
@@ -984,7 +984,7 @@ pub fn heartbeat(
         || l.queue.len() != before.queue.len()
     {
         let v = serde_json::to_value(&l).map_err(|e| e.to_string())?;
-        pass::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
+        orchestrator_session::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -1004,13 +1004,13 @@ pub fn release_at(
 }
 
 /// Put `lease` on `session`'s feed row for `task` (or take it off, with
-/// `None`), when the feed is `giverny pass`'s own and has that row.
+/// `None`), when the feed is `giverny orchestrator-session`'s own and has that row.
 pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Value>) {
-    let file = pass::file_for(feed_dir, session);
+    let file = orchestrator_session::file_for(feed_dir, session);
     if !file.exists() {
         return;
     }
-    let Ok(_lock) = pass::Lock::take(&file) else {
+    let Ok(_lock) = orchestrator_session::Lock::take(&file) else {
         return;
     };
     let Some(mut doc) = std::fs::read(&file)
@@ -1019,7 +1019,7 @@ pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Va
     else {
         return;
     };
-    if pass::writer_of(&doc).is_some_and(|w| w != pass::WRITER) {
+    if orchestrator_session::writer_of(&doc).is_some_and(|w| w != orchestrator_session::WRITER) {
         return;
     }
     let Some(row) = doc
@@ -1037,10 +1037,10 @@ pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Va
         Some(v) => row.insert("lease".into(), v),
         None => row.remove("lease"),
     };
-    let _ = pass::write(&file, &doc);
+    let _ = orchestrator_session::write(&file, &doc);
 }
 
-/// `giverny pass resources`: capacity, limits, foreign load, every lease
+/// `giverny orchestrator-session resources`: capacity, limits, foreign load, every lease
 /// and the queue.
 pub fn report(
     l: &Ledger,
