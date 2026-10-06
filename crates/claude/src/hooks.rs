@@ -340,12 +340,9 @@ pub fn running_exe() -> Option<PathBuf> {
 /// whichever Giverny is current.
 #[cfg(unix)]
 pub fn link_path() -> Option<PathBuf> {
-    Some(
-        giverny_core::state::Paths::default_dirs()
-            .base()
-            .join("bin")
-            .join("giverny"),
-    )
+    // Giverny's config dir, as `giverny_core::state::Paths` finds it.
+    let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    Some(base.join("giverny").join("bin").join("giverny"))
 }
 
 /// A link (not a file of its own) whose target is there to run.
