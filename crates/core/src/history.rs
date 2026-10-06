@@ -5,24 +5,33 @@
 //! gives that tab's own last commands rather than whatever any shell on the
 //! machine ran last.
 //!
-//! Done only through the environment Giverny hands the shells it spawns: no
-//! rc file is written, and a shell started anywhere else is untouched. That
-//! is also the limit of it — an rc file that sets `HISTFILE` itself wins, and
+//! No rc file of the user's is written, and a shell started anywhere else is
+//! untouched. The tab's shell is started through a small init file of
+//! Giverny's own ([`write_init`], under `state/shell/`) that runs the user's
+//! usual startup files and sets the history *inside* the shell, unexported
+//! (#216): a shell started from the tab — a nested bash, a zsh in a bash tab
+//! — gets none of it and keeps its own defaults. The startup files run after
+//! the tab's file is named, so an rc that sets `HISTFILE` itself wins, and
 //! the tab simply has the user's usual history, as before.
 //!
-//! - **bash**: `HISTFILE`, plus `history -a` on every prompt (appended to any
-//!   inherited `PROMPT_COMMAND`), so a killed tab keeps what it ran. With
-//!   `also_shared`, each new entry is appended to `~/.bash_history` too.
-//!   The prompt hook checks `HISTFILE` is still the tab's, so it writes
-//!   nothing when an rc has pointed it elsewhere. An rc that *replaces*
-//!   `PROMPT_COMMAND` drops the hook: the file is then written on exit only.
-//! - **zsh**: `HISTFILE` (and `SAVEHIST`/`HISTSIZE` where nothing set them,
-//!   since zsh saves nothing by default). Written when the shell exits:
-//!   per-command writes are a `setopt`, which no environment variable can
-//!   reach. `also_shared` does not apply.
-//! - **fish**: `fish_history` names a session of its own; fish writes every
+//! - **bash**: `--rcfile` ours, which names the file, runs `~/.bashrc`
+//!   (`/etc/bash.bashrc` too, where bash reads it), then adds `history -a` to
+//!   whatever `PROMPT_COMMAND` the rc left — so a killed tab keeps what it
+//!   ran, even under an rc (starship and the like) that sets
+//!   `PROMPT_COMMAND` outright. The hook writes nothing once `HISTFILE` is
+//!   not the tab's. With `also_shared`, each new entry is appended to
+//!   `~/.bash_history` too.
+//! - **zsh**: `ZDOTDIR` pointed at ours, whose `.zshenv` puts the user's
+//!   `ZDOTDIR` straight back, names the file (and `SAVEHIST`/`HISTSIZE`
+//!   where the environment did not, since zsh saves nothing by default),
+//!   then runs the user's `.zshenv`; the rest of zsh's startup is the
+//!   user's. Written when the shell exits: per-command writes are a
+//!   `setopt`, left to the user. `also_shared` does not apply.
+//! - **fish**: `--init-command`, after `config.fish`, sets a `fish_history`
+//!   session of the tab's own where the config set none; fish writes every
 //!   command as it runs. `also_shared` does not apply.
-//! - Anything else (sh, PowerShell, cmd, a WSL shell): left alone.
+//! - Anything else (sh, PowerShell, cmd, a WSL shell), or a shell already
+//!   given arguments of its own: left alone.
 
 use std::path::{Path, PathBuf};
 
@@ -81,63 +90,163 @@ fn fish_file(tab: TabId) -> Option<PathBuf> {
     )
 }
 
-/// The prompt hook bash runs: write this tab's new entries now, not at exit.
-/// Guarded on `HISTFILE` so an rc that moved it elsewhere gets nothing extra.
-const BASH_HOOK: &str = r#"[ "$HISTFILE" = "$GIVERNY_HISTFILE" ] && history -a"#;
+/// Where Giverny keeps the init files it starts shells with.
+pub fn init_dir(paths: &Paths) -> PathBuf {
+    paths.base().join("state").join("shell")
+}
 
-/// The same, also appending the new entries — exactly as bash wrote them,
-/// timestamps included — to the shell's usual history file.
-const BASH_HOOK_SHARED: &str = r#"if [ "$HISTFILE" = "$GIVERNY_HISTFILE" ]; then __giverny_hn=$(wc -l 2>/dev/null <"$HISTFILE"); history -a; tail -n "+$((__giverny_hn+1))" "$HISTFILE" >>"$GIVERNY_HISTFILE_SHARED" 2>/dev/null; fi"#;
+/// bash's `--rcfile`: name the tab's file, run what bash would have run
+/// without us, then hook `history -a` onto whatever prompt command that left.
+///
+/// The variables Giverny passes in are taken in and unset first, so nothing
+/// of this reaches a shell started from the tab. The prompt-command entry
+/// expands to nothing where `__giverny_hf` is unset, so even an inherited,
+/// exported `PROMPT_COMMAND` carries nothing a nested shell trips over.
+pub const BASHRC: &str = r#"# Written by Giverny for its terminal tabs (per-tab history, giverny#213,
+# #216) and rewritten when a tab starts: edits here do not last. It runs your
+# ~/.bashrc; nothing of yours is changed.
+__giverny_hf=${GIVERNY_HISTFILE-}
+__giverny_hf_shared=${GIVERNY_HISTFILE_SHARED-}
+unset GIVERNY_HISTFILE GIVERNY_HISTFILE_SHARED
+if [ -n "$__giverny_hf" ]; then
+    export -n HISTFILE
+    HISTFILE=$__giverny_hf
+fi
+# What bash reads without --rcfile; an HISTFILE set there wins over the tab's.
+if [ -f ~/.bashrc ]; then . ~/.bashrc; fi
+# Write this tab's new entries at every prompt, not only at exit.
+__giverny_history() {
+    [ -n "$__giverny_hf" ] && [ "${HISTFILE-}" = "$__giverny_hf" ] || return 0
+    if [ -n "$__giverny_hf_shared" ]; then
+        local n
+        n=$(wc -l 2>/dev/null <"$HISTFILE")
+        history -a
+        tail -n "+$((n + 1))" "$HISTFILE" >>"$__giverny_hf_shared" 2>/dev/null
+    else
+        history -a
+    fi
+}
+if [ -n "$__giverny_hf" ]; then
+    if [ -n "${PROMPT_COMMAND-}" ]; then
+        PROMPT_COMMAND+=$'\n''${__giverny_hf:+__giverny_history}'
+    else
+        PROMPT_COMMAND='${__giverny_hf:+__giverny_history}'
+    fi
+fi
+"#;
 
-/// Environment that gives a tab's shell its own history.
+/// zsh's `.zshenv` under the `ZDOTDIR` Giverny starts it with: put the
+/// user's `ZDOTDIR` back at once — so `.zprofile`, `.zshrc`, `.zlogin` and
+/// every shell started from the tab are the user's own — name the tab's
+/// file, and run the user's `.zshenv`.
+pub const ZSHENV: &str = r#"# Written by Giverny for its terminal tabs (per-tab history, giverny#213,
+# #216) and rewritten when a tab starts: edits here do not last. It runs your
+# own .zshenv; nothing of yours is changed.
+if [[ -n ${GIVERNY_ZDOTDIR+x} ]]; then
+    ZDOTDIR=$GIVERNY_ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+__giverny_hf=${GIVERNY_HISTFILE-}
+unset GIVERNY_ZDOTDIR GIVERNY_HISTFILE
+if [[ -n $__giverny_hf ]]; then
+    typeset +x HISTFILE
+    HISTFILE=$__giverny_hf
+    # zsh keeps 30 and saves none; sizes from the environment are the user's.
+    [[ ${(t)HISTSIZE} == *export* ]] || HISTSIZE=10000
+    [[ ${(t)SAVEHIST} == *export* ]] || SAVEHIST=10000
+fi
+unset __giverny_hf
+if [[ -f ${ZDOTDIR:-$HOME}/.zshenv ]]; then
+    source "${ZDOTDIR:-$HOME}/.zshenv"
+fi
+"#;
+
+/// The init files, as `(path under the init dir, contents)`.
+const INIT_FILES: [(&str, &str); 2] = [("bashrc", BASHRC), ("zsh/.zshenv", ZSHENV)];
+
+/// Put the init files in `dir`, rewriting only those that differ.
+pub fn write_init(dir: &Path) -> std::io::Result<()> {
+    for (name, contents) in INIT_FILES {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).is_ok_and(|now| now == contents) {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, contents)?;
+    }
+    Ok(())
+}
+
+/// How a tab's shell is started so it keeps its own history: arguments to
+/// start it with, and environment for the init file to take in. Nothing in
+/// `env` is one of the shell's own history variables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Steer {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// What gives a tab's shell its own history, its init files in `init` (see
+/// [`write_init`]).
 ///
 /// `inherited` looks up a variable in the environment the shell would
-/// otherwise get — an inherited `PROMPT_COMMAND` is kept, run first.
-pub fn env(
+/// otherwise get — zsh's `ZDOTDIR`, which the init file puts back.
+pub fn steer(
     kind: ShellKind,
     file: &Path,
     tab: TabId,
     also_shared: bool,
     home: Option<&Path>,
+    init: &Path,
     inherited: impl Fn(&str) -> Option<String>,
-) -> Vec<(String, String)> {
+) -> Steer {
     let file = file.display().to_string();
     match kind {
         ShellKind::Bash => {
-            let shared = also_shared.then(|| home.map(|h| h.join(".bash_history")));
-            let hook = match &shared {
-                Some(Some(_)) => BASH_HOOK_SHARED,
-                _ => BASH_HOOK,
-            };
-            let prompt_command = match inherited("PROMPT_COMMAND").filter(|p| !p.trim().is_empty())
-            {
-                // A newline, not `;`: the inherited one may end in either.
-                Some(prev) => format!("{prev}\n{hook}"),
-                None => hook.to_string(),
-            };
-            let mut env = vec![
-                ("HISTFILE".to_string(), file.clone()),
-                ("GIVERNY_HISTFILE".to_string(), file),
-                ("PROMPT_COMMAND".to_string(), prompt_command),
-            ];
-            if let Some(Some(shared)) = shared {
+            let mut env = vec![("GIVERNY_HISTFILE".to_string(), file)];
+            if also_shared && let Some(home) = home {
                 env.push((
                     "GIVERNY_HISTFILE_SHARED".to_string(),
-                    shared.display().to_string(),
+                    home.join(".bash_history").display().to_string(),
                 ));
             }
-            env
+            Steer {
+                args: vec![
+                    "--rcfile".to_string(),
+                    init.join("bashrc").display().to_string(),
+                ],
+                env,
+            }
         }
         ShellKind::Zsh => {
-            let mut env = vec![("HISTFILE".to_string(), file)];
-            for var in ["HISTSIZE", "SAVEHIST"] {
-                if inherited(var).is_none() {
-                    env.push((var.to_string(), "10000".to_string()));
-                }
+            let mut env = vec![
+                (
+                    "ZDOTDIR".to_string(),
+                    init.join("zsh").display().to_string(),
+                ),
+                ("GIVERNY_HISTFILE".to_string(), file),
+            ];
+            if let Some(user) = inherited("ZDOTDIR") {
+                env.push(("GIVERNY_ZDOTDIR".to_string(), user));
             }
-            env
+            Steer {
+                args: Vec::new(),
+                env,
+            }
         }
-        ShellKind::Fish => vec![("fish_history".to_string(), fish_session(tab))],
+        ShellKind::Fish => Steer {
+            args: vec![
+                "--init-command".to_string(),
+                format!(
+                    "set -q fish_history; or set -g fish_history {}",
+                    fish_session(tab)
+                ),
+            ],
+            env: Vec::new(),
+        },
     }
 }
 
@@ -181,142 +290,304 @@ mod tests {
         );
     }
 
-    /// The hooks, run by a real interactive bash.
-    #[cfg(unix)]
-    #[test]
-    fn bash_writes_per_command_and_shares_only_when_asked() {
-        if !Path::new("/bin/bash").exists() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("giverny-hist-bash-{}", std::process::id()));
+    /// The tab's history variables, which no shell started from the tab
+    /// may inherit (#216).
+    const HISTORY_VARS: [&str; 5] = [
+        "HISTFILE",
+        "PROMPT_COMMAND",
+        "HISTSIZE",
+        "SAVEHIST",
+        "fish_history",
+    ];
+
+    fn steer_of(kind: ShellKind, also_shared: bool, inherited: Option<(&str, &str)>) -> Steer {
+        steer(
+            kind,
+            Path::new("/s/history/3"),
+            TabId(3),
+            also_shared,
+            Some(Path::new("/h")),
+            Path::new("/s/shell"),
+            |k| {
+                inherited
+                    .filter(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            },
+        )
+    }
+
+    /// A scratch directory of the test's own, with the init files in it.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("giverny-hist-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        write_init(&dir.join("init")).unwrap();
+        dir
+    }
+
+    /// The first program of that name on `PATH`.
+    #[cfg(unix)]
+    fn on_path(name: &str) -> Option<PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    }
+
+    /// Run `shell` interactively, steered, with `HOME` at `home` and nothing
+    /// else of this process's environment, feeding it `input`.
+    #[cfg(unix)]
+    fn run_steered(shell: &Path, steer: &Steer, home: &Path, input: &str) {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new(shell);
+        cmd.args(&steer.args)
+            .arg("-i")
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(steer.env.iter().map(|(k, v)| (k, v)))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let _ = child.wait();
+    }
+
+    /// The history variables in an `env` dump.
+    fn leaked(dump: &Path) -> Vec<String> {
+        std::fs::read_to_string(dump)
+            .unwrap()
+            .lines()
+            .filter(|l| {
+                let name = l.split('=').next().unwrap_or_default();
+                HISTORY_VARS.contains(&name) || name.starts_with("GIVERNY_HISTFILE")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The init file, run by a real interactive bash under an rc that sets
+    /// `PROMPT_COMMAND` outright: per-command writes, nothing for a child.
+    #[cfg(unix)]
+    #[test]
+    fn bash_writes_per_command_and_children_inherit_nothing() {
+        let Some(bash) = on_path("bash") else { return };
+        let dir = scratch("bash");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".bashrc"), "PROMPT_COMMAND='echo hi'\n").unwrap();
+        let shared = home.join(".bash_history");
+        std::fs::write(&shared, "older\n").unwrap();
         let run = |also_shared: bool, file: &Path| {
-            let env = env(
+            let steer = steer(
                 ShellKind::Bash,
                 file,
                 TabId(1),
                 also_shared,
-                Some(&dir),
+                Some(&home),
+                &dir.join("init"),
                 |_| None,
             );
-            let mut cmd = std::process::Command::new("/bin/bash");
-            cmd.args(["--norc", "--noprofile", "-i"])
-                .env_clear()
-                .env("HOME", &dir)
-                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-                .envs(env)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            let mut child = cmd.spawn().unwrap();
-            {
-                use std::io::Write;
-                let stdin = child.stdin.as_mut().unwrap();
-                // Killed, not exited: what is in the file got there per command.
-                stdin
-                    .write_all(b"echo one\necho two\nkill -9 $$\n")
-                    .unwrap();
-            }
-            let _ = child.wait();
+            // Killed, not exited: what is in the file got there per command.
+            let input = format!(
+                "echo one\nenv >{}\necho two\nkill -9 $$\n",
+                dir.join("env").display()
+            );
+            run_steered(&bash, &steer, &home, &input);
         };
-        let shared = dir.join(".bash_history");
-        std::fs::write(&shared, "older\n").unwrap();
 
         let a = dir.join("a");
         run(false, &a);
-        assert_eq!(std::fs::read_to_string(&a).unwrap(), "echo one\necho two\n");
+        let env_line = format!("env >{}\n", dir.join("env").display());
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            format!("echo one\n{env_line}echo two\n")
+        );
         assert_eq!(std::fs::read_to_string(&shared).unwrap(), "older\n");
+        assert_eq!(leaked(&dir.join("env")), Vec::<String>::new());
 
         let b = dir.join("b");
         run(true, &b);
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "echo one\necho two\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            format!("echo one\n{env_line}echo two\n")
+        );
         assert_eq!(
             std::fs::read_to_string(&shared).unwrap(),
-            "older\necho one\necho two\n"
+            format!("older\necho one\n{env_line}echo two\n")
         );
+        assert_eq!(leaked(&dir.join("env")), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An rc that names its own `HISTFILE` wins, and the hook then writes
+    /// nothing to the tab's file.
+    #[cfg(unix)]
+    #[test]
+    fn bash_rc_histfile_wins() {
+        let Some(bash) = on_path("bash") else { return };
+        let dir = scratch("bash-rc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let own = dir.join("own");
+        std::fs::write(
+            home.join(".bashrc"),
+            format!("HISTFILE={}\n", own.display()),
+        )
+        .unwrap();
+        let tab = dir.join("tab");
+        let steer = steer(
+            ShellKind::Bash,
+            &tab,
+            TabId(1),
+            false,
+            Some(&home),
+            &dir.join("init"),
+            |_| None,
+        );
+        run_steered(&bash, &steer, &home, "echo one\nexit\n");
+        assert!(!tab.exists(), "the tab's file is untouched");
+        assert!(std::fs::read_to_string(&own).unwrap().contains("echo one"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `.zshenv`, run by a real zsh where one is installed: the tab's
+    /// file is written, the user's `ZDOTDIR` and startup files are theirs
+    /// again, and a child gets no history variable.
+    #[cfg(unix)]
+    #[test]
+    fn zsh_keeps_its_file_and_gives_children_nothing() {
+        let Some(zsh) = on_path("zsh") else { return };
+        let dir = scratch("zsh");
+        let home = dir.join("home");
+        let zdot = home.join("zd");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::write(
+            zdot.join(".zshrc"),
+            format!("print -r -- \"$ZDOTDIR\" >{}\n", dir.join("rc").display()),
+        )
+        .unwrap();
+        let tab = dir.join("tab");
+        let zdot_s = zdot.display().to_string();
+        // The user's own ZDOTDIR, which the tab's environment would carry.
+        let steer = steer(
+            ShellKind::Zsh,
+            &tab,
+            TabId(1),
+            false,
+            Some(&home),
+            &dir.join("init"),
+            |k| (k == "ZDOTDIR").then(|| zdot_s.clone()),
+        );
+        let input = format!("print one\nenv >{}\nexit\n", dir.join("env").display());
+        run_steered(&zsh, &steer, &home, &input);
+        assert!(
+            std::fs::read_to_string(&tab)
+                .unwrap()
+                .starts_with("print one\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rc")).unwrap().trim(),
+            zdot_s,
+            "the user's .zshrc ran, under their ZDOTDIR"
+        );
+        assert_eq!(leaked(&dir.join("env")), Vec::<String>::new());
+        let env = std::fs::read_to_string(dir.join("env")).unwrap();
+        assert!(env.contains(&format!("ZDOTDIR={zdot_s}\n")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn bash_gets_a_file_and_a_prompt_hook() {
-        let f = Path::new("/s/history/3");
-        let env = env(
-            ShellKind::Bash,
-            f,
-            TabId(3),
-            false,
-            Some(Path::new("/h")),
-            |_| None,
+    fn bash_starts_on_the_init_file() {
+        let s = steer_of(ShellKind::Bash, false, None);
+        assert_eq!(s.args, vec!["--rcfile", "/s/shell/bashrc"]);
+        assert_eq!(get(&s.env, "GIVERNY_HISTFILE"), Some("/s/history/3"));
+        assert_eq!(
+            get(&s.env, "GIVERNY_HISTFILE_SHARED"),
+            None,
+            "off by default"
         );
-        assert_eq!(get(&env, "HISTFILE"), Some("/s/history/3"));
-        assert_eq!(get(&env, "GIVERNY_HISTFILE"), Some("/s/history/3"));
-        assert_eq!(get(&env, "PROMPT_COMMAND"), Some(BASH_HOOK));
-        assert_eq!(get(&env, "GIVERNY_HISTFILE_SHARED"), None, "off by default");
     }
 
     #[test]
     fn bash_shared_appends_to_the_usual_file() {
-        let f = Path::new("/s/history/3");
-        let env = env(
-            ShellKind::Bash,
-            f,
-            TabId(3),
-            true,
-            Some(Path::new("/h")),
-            |_| None,
-        );
-        assert_eq!(get(&env, "PROMPT_COMMAND"), Some(BASH_HOOK_SHARED));
+        let s = steer_of(ShellKind::Bash, true, None);
         assert_eq!(
-            get(&env, "GIVERNY_HISTFILE_SHARED"),
+            get(&s.env, "GIVERNY_HISTFILE_SHARED"),
             Some("/h/.bash_history")
         );
         // Append only: the usual file is never truncated or rewritten.
-        assert!(BASH_HOOK_SHARED.contains(r#">>"$GIVERNY_HISTFILE_SHARED""#));
-        assert!(!BASH_HOOK_SHARED.contains(r#" >"$GIVERNY_HISTFILE_SHARED""#));
+        assert!(BASHRC.contains(r#">>"$__giverny_hf_shared""#));
+        assert!(!BASHRC.contains(r#" >"$__giverny_hf_shared""#));
+    }
+
+    /// Nothing the shell or a child of it reads as history is in the
+    /// environment: the init files set it inside the shell.
+    #[test]
+    fn no_history_variable_is_exported() {
+        for kind in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish] {
+            for shared in [false, true] {
+                let s = steer_of(kind, shared, Some(("ZDOTDIR", "/u/zd")));
+                for var in HISTORY_VARS {
+                    assert_eq!(get(&s.env, var), None, "{kind:?} exports {var}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn an_inherited_prompt_command_is_kept_and_runs_first() {
-        let f = Path::new("/s/history/3");
-        let env = env(ShellKind::Bash, f, TabId(3), false, None, |k| {
-            (k == "PROMPT_COMMAND").then(|| "echo hi;".to_string())
-        });
-        assert_eq!(
-            get(&env, "PROMPT_COMMAND"),
-            Some(format!("echo hi;\n{BASH_HOOK}").as_str())
-        );
-    }
-
-    #[test]
-    fn zsh_gets_a_file_and_sizes_only_where_unset() {
-        let f = Path::new("/s/history/3");
-        let env = env(ShellKind::Zsh, f, TabId(3), true, None, |k| {
-            (k == "SAVEHIST").then(|| "500".to_string())
-        });
-        assert_eq!(get(&env, "HISTFILE"), Some("/s/history/3"));
-        assert_eq!(get(&env, "HISTSIZE"), Some("10000"));
-        assert_eq!(get(&env, "SAVEHIST"), None, "the user's own value stands");
-        assert_eq!(get(&env, "PROMPT_COMMAND"), None);
+    fn zsh_starts_on_the_init_dir_and_gets_its_zdotdir_back() {
+        let s = steer_of(ShellKind::Zsh, true, None);
+        assert!(s.args.is_empty());
+        assert_eq!(get(&s.env, "ZDOTDIR"), Some("/s/shell/zsh"));
+        assert_eq!(get(&s.env, "GIVERNY_HISTFILE"), Some("/s/history/3"));
+        assert_eq!(get(&s.env, "GIVERNY_ZDOTDIR"), None, "none to put back");
+        let s = steer_of(ShellKind::Zsh, false, Some(("ZDOTDIR", "/u/zd")));
+        assert_eq!(get(&s.env, "GIVERNY_ZDOTDIR"), Some("/u/zd"));
     }
 
     #[test]
     fn fish_gets_a_session_name_it_accepts() {
-        let env = env(
-            ShellKind::Fish,
-            Path::new("/x"),
-            TabId(42),
-            false,
-            None,
-            |_| None,
+        let s = steer_of(ShellKind::Fish, false, None);
+        assert!(s.env.is_empty());
+        assert_eq!(
+            s.args,
+            vec![
+                "--init-command",
+                "set -q fish_history; or set -g fish_history giverny_3"
+            ]
         );
-        assert_eq!(env, vec![("fish_history".into(), "giverny_42".into())]);
         assert!(
             fish_session(TabId(42))
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
         );
-        assert_eq!(get(&env, "HISTFILE"), None);
+    }
+
+    #[test]
+    fn init_files_are_written_once_and_kept_current() {
+        let dir = scratch("init");
+        let init = dir.join("init");
+        assert_eq!(
+            std::fs::read_to_string(init.join("bashrc")).unwrap(),
+            BASHRC
+        );
+        assert_eq!(
+            std::fs::read_to_string(init.join("zsh/.zshenv")).unwrap(),
+            ZSHENV
+        );
+        std::fs::write(init.join("bashrc"), "stale").unwrap();
+        write_init(&init).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(init.join("bashrc")).unwrap(),
+            BASHRC
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
