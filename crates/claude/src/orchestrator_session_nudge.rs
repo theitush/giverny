@@ -13,6 +13,16 @@
 //! `reestimate_asked`. A worker that holds no task is not this module's: its
 //! estimate is an agent ETA ([`crate::agent_eta`]).
 //!
+//! **Near the end.** Each figure is asked about again as it runs out: once
+//! when [`DEADLINE_LEFT_MS`] of it are left (only a figure that had more than
+//! that when it was given — one given that short is asked about only past
+//! it), and once if the work runs past it. The row is stamped
+//! `deadline_asked` / `overdue_asked` with the `eta_s` the ask was for, so a
+//! figure is asked about once each way and a fresh one starts over. No ask
+//! within [`QUIET_MS`] of the worker's last re-estimate (`eta_at`) or of the
+//! five-minute ask, nor on a paused row. Every ask tells the worker how its
+//! kind's re-estimates fared; none changes its figure.
+//!
 //! **Heartbeats**. On every call the hook also renews the calling session's
 //! ledger leases — `session_id` is the orchestrator's for its own calls and
 //! its workers' alike, so a busy orchestrator session keeps its leases though
@@ -29,6 +39,12 @@ use crate::{feed, orchestrator_session_history, resources};
 
 /// How long into its task a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
+
+/// How much of an estimate is left when the worker is asked about it again.
+pub const DEADLINE_LEFT_MS: u64 = 5 * 60 * 1000;
+
+/// No near-the-end ask this soon after a re-estimate or another ask.
+pub const QUIET_MS: u64 = 3 * 60 * 1000;
 
 /// Whether `row` is this worker's: its `agent_id`, else a key the worker's
 /// spawn description names as a whole word.
@@ -73,8 +89,9 @@ pub fn stamp_agent(doc: &mut Value, agent_id: &str, description: Option<&str>) -
     changed
 }
 
-/// The row this worker holds and whether it is due a nudge at `now`. On a
-/// match the row is stamped and the request returned.
+/// The row this worker holds and whether it is due an ask at `now`: the
+/// five-minute one, else one near or past the end of its estimate
+/// ([`deadline`]). On a match the row is stamped and the request returned.
 pub fn check(
     doc: &mut Value,
     agent_id: &str,
@@ -88,35 +105,51 @@ pub fn check(
         .filter_map(Value::as_object_mut)
         .filter(|r| orchestrator_session::stage_of(r) == Some(feed::Stage::Running))
         .find(|r| is_mine(r, agent_id, description))?;
-    // Asked once; a worker that has re-estimated already needs no asking.
-    if row.contains_key("reestimate_asked") || row.contains_key("eta_first_s") {
+    if row.contains_key("paused_since") {
         return None;
     }
     let started = orchestrator_session::ms_of(row, "started")?;
-    let upto = orchestrator_session::ms_of(row, "paused_since").unwrap_or(now);
-    let worked = upto.saturating_sub(started);
-    if worked < AFTER_MS {
-        return None;
+    let worked = now.saturating_sub(started);
+    // Asked once; a worker that has re-estimated already needs no asking.
+    if !row.contains_key("reestimate_asked") && !row.contains_key("eta_first_s") {
+        if worked < AFTER_MS {
+            return None;
+        }
+        row.insert(
+            "reestimate_asked".into(),
+            json!(orchestrator_session::stamp(now)),
+        );
+        let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
+        let estimate = match orchestrator_session::u64_of(row, "eta_s") {
+            Some(eta) => format!(
+                "Its estimate was {}, so the pane shows about {} left.",
+                span(eta),
+                span(eta.saturating_sub(worked / 1000))
+            ),
+            None => "It has no estimate yet.".to_string(),
+        };
+        return Some(format!(
+            "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \
+             the code, re-estimate it once: run `giverny-orchestrator-session eta {key} <minutes left> --note \
+             \"<why>\"`, even if the figure stands.{} Then carry on.",
+            span(worked / 1000),
+            record(row, history)
+        ));
     }
-    row.insert(
-        "reestimate_asked".into(),
-        json!(orchestrator_session::stamp(now)),
-    );
-    let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
-    let span = |s: u64| feed::fmt_span(s as i64);
-    let estimate = match orchestrator_session::u64_of(row, "eta_s") {
-        Some(eta) => format!(
-            "Its estimate was {}, so the pane shows about {} left.",
-            span(eta),
-            span(eta.saturating_sub(worked / 1000))
-        ),
-        None => "It has no estimate yet.".to_string(),
-    };
-    // How this kind of re-estimate has fared, so the figure itself improves:
-    // read only now, once per worker.
+    deadline(row, started, now, history)
+}
+
+/// `s` seconds as the pane writes them.
+fn span(s: u64) -> String {
+    feed::fmt_span(s as i64)
+}
+
+/// How this kind of re-estimate has fared, so the figure itself improves:
+/// told, never applied. Empty with too little history.
+fn record(row: &Map<String, Value>, history: Option<&Path>) -> String {
     let s = |k: &str| row.get(k).and_then(Value::as_str);
     let kind = s("title").and_then(orchestrator_session_history::kind_of);
-    let record = history
+    history
         .map(orchestrator_session_history::load)
         .and_then(|h| {
             orchestrator_session_history::track_record(
@@ -127,12 +160,66 @@ pub fn check(
             )
         })
         .map(|r| format!(" For calibration, {r}: weigh that in your figure."))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The near-the-end ask on a Running row that is not paused: see the
+/// module's doc. Stamps the row when it asks.
+fn deadline(
+    row: &mut Map<String, Value>,
+    started: u64,
+    now: u64,
+    history: Option<&Path>,
+) -> Option<String> {
+    let eta = orchestrator_session::u64_of(row, "eta_s").filter(|e| *e > 0)?;
+    let recent = |k: &str| {
+        orchestrator_session::ms_of(row, k).is_some_and(|t| now.saturating_sub(t) < QUIET_MS)
+    };
+    if recent("eta_at") || recent("reestimate_asked") {
+        return None;
+    }
+    let worked = now.saturating_sub(started);
+    let left = (eta * 1000) as i64 - worked as i64;
+    // What was left when this figure was given: at `eta_at`, else the start.
+    let given_at = orchestrator_session::ms_of(row, "eta_at")
+        .unwrap_or(started)
+        .max(started);
+    let given_left = (eta * 1000).saturating_sub(given_at - started);
+    let asked = |k: &str| orchestrator_session::u64_of(row, k) == Some(eta);
+    let (stamp, said) = if left < 0 {
+        if asked("overdue_asked") {
+            return None;
+        }
+        (
+            "overdue_asked",
+            format!(
+                "has run {} past its estimate",
+                span(left.unsigned_abs() / 1000)
+            ),
+        )
+    } else if left as u64 <= DEADLINE_LEFT_MS && given_left > DEADLINE_LEFT_MS {
+        if asked("deadline_asked") {
+            return None;
+        }
+        (
+            "deadline_asked",
+            format!(
+                "has about {} left of its estimate",
+                span(left as u64 / 1000)
+            ),
+        )
+    } else {
+        return None;
+    };
+    row.insert(stamp.into(), json!(eta));
+    let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
     Some(format!(
-        "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \
-         the code, re-estimate it once: run `giverny-orchestrator-session eta {key} <minutes left> --note \
-         \"<why>\"`, even if the figure stands.{record} Then carry on.",
-        span(worked / 1000)
+        "Giverny: task `{key}` {said} ({} in all, {} so far). Re-estimate it once: run \
+         `giverny-orchestrator-session eta {key} <minutes left> --note \"<why>\"`, even if \
+         the figure stands.{} Then carry on.",
+        span(eta),
+        span(worked / 1000),
+        record(row, history)
     ))
 }
 
@@ -272,10 +359,65 @@ mod tests {
     }
 
     #[test]
+    fn each_figure_is_asked_about_near_its_end_and_past_it() {
+        let mut d = doc(json!([{"key": "g#7", "stage": "running",
+            "started": orchestrator_session::stamp(T0), "eta_s": 1800,
+            "reestimate_asked": orchestrator_session::stamp(T0 + 5 * MIN)}]));
+        let mut ask = |at: u64| check(&mut d, "w", Some("g#7"), T0 + at, None);
+        assert_eq!(ask(24 * MIN), None, "6m left");
+        let a = ask(25 * MIN).unwrap();
+        assert!(
+            a.contains("task `g#7` has about 5m left of its estimate (30m in all, 25m so far)"),
+            "{a}"
+        );
+        assert!(a.contains("giverny-orchestrator-session eta g#7 <minutes left>"));
+        assert_eq!(ask(26 * MIN), None, "asked once");
+        let a = ask(31 * MIN).unwrap();
+        assert!(a.contains("has run 1m past its estimate"), "{a}");
+        assert_eq!(ask(33 * MIN), None, "once");
+        assert_eq!(d["rows"][0]["deadline_asked"], 1800);
+        assert_eq!(d["rows"][0]["overdue_asked"], 1800);
+
+        // A fresh figure at 33m: 15m more. Quiet a while, then its own asks.
+        d["rows"][0]["eta_s"] = json!(48 * 60);
+        d["rows"][0]["eta_at"] = json!(orchestrator_session::stamp(T0 + 33 * MIN));
+        let mut ask = |at: u64| check(&mut d, "w", Some("g#7"), T0 + at, None);
+        assert_eq!(ask(34 * MIN), None);
+        assert_eq!(ask(42 * MIN), None, "6m left");
+        assert!(ask(43 * MIN).unwrap().contains("about 5m left"));
+        assert!(ask(49 * MIN).unwrap().contains("1m past"));
+        assert_eq!(ask(50 * MIN), None);
+        assert_eq!(d["rows"][0]["deadline_asked"], 48 * 60);
+    }
+
+    #[test]
+    fn a_short_or_fresh_figure_is_let_be_until_it_runs_out() {
+        let t = orchestrator_session::stamp;
+        // 4m left given ten minutes in: never "near", only past it.
+        let mut d = doc(json!([{"key": "s", "stage": "running", "started": t(T0),
+            "eta_s": 14 * 60, "eta_first_s": 14 * 60, "eta_at": t(T0 + 10 * MIN)}]));
+        let mut ask = |at: u64| check(&mut d, "w", Some("s"), T0 + at, None);
+        assert_eq!(ask(11 * MIN), None, "just given");
+        assert_eq!(ask(13 * MIN), None, "short figure, not near");
+        assert!(ask(15 * MIN).unwrap().contains("1m past"));
+        // A 9m start figure: the five-minute ask, then quiet, then near.
+        let mut d = doc(json!([{"key": "q", "stage": "running", "started": t(T0),
+            "eta_s": 9 * 60}]));
+        let mut ask = |at: u64| check(&mut d, "w", Some("q"), T0 + at, None);
+        assert!(ask(5 * MIN).unwrap().contains("Now that you have read"));
+        assert_eq!(ask(7 * MIN), None, "2m left, but just asked");
+        assert!(ask(8 * MIN).unwrap().contains("about 1m left"));
+        // A paused row is asked nothing.
+        let mut d = doc(json!([{"key": "p", "stage": "running", "started": t(T0),
+            "eta_s": 600, "eta_first_s": 600, "paused_since": t(T0 + 9 * MIN)}]));
+        assert_eq!(check(&mut d, "w", Some("p"), T0 + 20 * MIN, None), None);
+    }
+
+    #[test]
     fn no_ask_for_a_re_estimated_paused_or_unknown_row() {
         let started = orchestrator_session::stamp(T0);
         let mut d = doc(json!([
-            {"key": "a", "stage": "running", "started": started, "eta_s": 600, "eta_first_s": 300},
+            {"key": "a", "stage": "running", "started": started, "eta_s": 3600, "eta_first_s": 300},
             {"key": "b", "stage": "running", "started": started,
              "paused_since": orchestrator_session::stamp(T0 + 2 * MIN)},
             {"key": "c", "stage": "planned", "eta_s": 600},

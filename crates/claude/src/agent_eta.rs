@@ -14,8 +14,10 @@
 //! ([`crate::plugin_hook`]) asks the dispatcher right after its `Agent` call
 //! ([`dispatcher_ask`]), and the dispatcher runs `giverny eta <agent-id>
 //! <minutes>`. Five minutes into its work the worker is asked, once, to
-//! correct it ([`worker_ask`]), with the same command. Neither ask is made for
-//! a worker an orchestrator session's row holds: that row is its estimate.
+//! re-estimate ([`worker_ask`]), with the same command, and again as each
+//! figure runs out: once with five minutes of it left, once past it
+//! ([`deadline_ask`]). No ask is made for a worker an orchestrator session's
+//! row holds: that row is its estimate.
 //!
 //! ```json
 //! { "version": 1, "session": "<id>",
@@ -41,6 +43,12 @@ const ASKED_DIR: &str = "asked";
 
 /// How long into its work a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
+
+/// How much of an estimate is left when the worker is asked about it again.
+pub const DEADLINE_LEFT_MS: u64 = 5 * 60 * 1000;
+
+/// No near-the-end ask this soon after a re-estimate or the five-minute ask.
+pub const QUIET_MS: u64 = 3 * 60 * 1000;
 
 /// How long an asked-marker is kept: a worker outlives no day of this.
 const ASKED_KEEP_MS: u64 = 24 * 60 * 60 * 1000;
@@ -372,8 +380,78 @@ pub fn worker_ask(
     ))
 }
 
-/// Make the asked-marker, once: `false` if it was there already or cannot be
-/// made (so a worker is never asked on every call). Markers a day old go now.
+/// What the plugin's hook asks a worker that holds no orchestrator task as
+/// its current figure runs out: once when [`DEADLINE_LEFT_MS`] of it are
+/// left (a figure given with more than that), once when the work has run
+/// past it. Each figure — its `at` — is asked about once each way, by a
+/// marker `asked/<agent>.deadline` holding the last ask (`<at ms> near` or
+/// `<at ms> past`); a fresh figure starts over. Nothing within [`QUIET_MS`]
+/// of the figure being given or of the five-minute ask, nothing before
+/// [`AFTER_MS`] (the five-minute ask comes first), and nothing with no
+/// figure. Told, never applied: the figure is the worker's to give.
+pub fn deadline_ask(
+    dir: &Path,
+    session: &str,
+    agent: &str,
+    spawned_ms: u64,
+    now: u64,
+) -> Option<String> {
+    // Before its five minutes, the five-minute ask is the one to come.
+    if !safe(agent) || now.saturating_sub(spawned_ms) < AFTER_MS {
+        return None;
+    }
+    let e = read(dir, session).get(agent).copied()?;
+    let asked = dir.join(DIR).join(ASKED_DIR);
+    // When the five-minute ask was made: the marker's text, else its mtime.
+    let five = asked.join(agent);
+    let five_min_ask = std::fs::read_to_string(&five)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::fs::metadata(&five)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|t| t.as_millis() as u64)
+        });
+    let quiet = |t: u64| now.saturating_sub(t) < QUIET_MS;
+    if quiet(e.at_ms) || five_min_ask.is_some_and(quiet) {
+        return None;
+    }
+    let end = e.at_ms + e.left_s * 1000;
+    let tag = if now > end {
+        "past"
+    } else if end - now <= DEADLINE_LEFT_MS && e.left_s * 1000 > DEADLINE_LEFT_MS {
+        "near"
+    } else {
+        return None;
+    };
+    let marker = asked.join(format!("{agent}.deadline"));
+    let line = format!("{} {tag}", e.at_ms);
+    if std::fs::read_to_string(&marker).is_ok_and(|m| m.trim() == line) {
+        return None;
+    }
+    // Once a figure is past its end, its "near" ask can never come again.
+    if std::fs::create_dir_all(&asked).is_err() || std::fs::write(&marker, &line).is_err() {
+        return None; // never ask on every call
+    }
+    let span = |ms: u64| crate::feed::fmt_span((ms / 1000) as i64);
+    let said = if tag == "past" {
+        format!("You have run {} past your estimate", span(now - end))
+    } else {
+        format!("About {} is left of your estimate", span(end - now))
+    };
+    Some(format!(
+        "Giverny: {said} ({} in all, {} so far). Re-estimate it once: run \
+         `giverny-eta {agent} <minutes left>`, even if the figure stands. Then carry on.",
+        span(e.total_s(spawned_ms) * 1000),
+        span(now.saturating_sub(spawned_ms))
+    ))
+}
+
+/// Make the asked-marker, once, holding `now`: `false` if it was there
+/// already or cannot be made (so a worker is never asked on every call).
+/// Markers a day old go now.
 fn mark(marker: &Path, now: u64) -> bool {
     let parent = marker.parent().expect("joined");
     if std::fs::create_dir_all(parent).is_err() {
@@ -396,6 +474,9 @@ fn mark(marker: &Path, now: u64) -> bool {
         .write(true)
         .create_new(true)
         .open(marker)
+        .map(|mut f| {
+            let _ = std::io::Write::write_all(&mut f, now.to_string().as_bytes());
+        })
         .is_ok()
 }
 
@@ -556,6 +637,55 @@ mod tests {
         // A worker that corrected its own figure past five minutes is let be.
         set(&dir, "s1", "a3", 60, None, T0 + 5 * MIN).unwrap();
         assert_eq!(worker_ask(&dir, "s1", "a3", T0, T0 + 6 * MIN), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_figure_is_asked_about_near_its_end_and_past_it() {
+        let dir = temp("deadline");
+        let ask = |at: u64| deadline_ask(&dir, "s1", "a1", T0, at);
+        assert_eq!(ask(T0 + 10 * MIN), None, "no figure, no ask");
+        // The dispatcher's 20m, right after the spawn; the five-minute ask.
+        set(&dir, "s1", "a1", 20 * 60, None, T0).unwrap();
+        assert!(worker_ask(&dir, "s1", "a1", T0, T0 + 5 * MIN).is_some());
+        assert_eq!(ask(T0 + 14 * MIN), None, "6m left");
+        let a = ask(T0 + 15 * MIN).unwrap();
+        assert!(
+            a.contains("About 5m is left") && a.contains("20m in all, 15m so far"),
+            "{a}"
+        );
+        assert!(a.contains("`giverny-eta a1 <minutes left>`"), "{a}");
+        assert_eq!(ask(T0 + 16 * MIN), None, "asked once");
+        // Past it: once more.
+        let a = ask(T0 + 21 * MIN).unwrap();
+        assert!(a.contains("run 1m past your estimate"), "{a}");
+        assert_eq!(ask(T0 + 25 * MIN), None, "once");
+        // A fresh figure: quiet a while, then its own asks.
+        set(&dir, "s1", "a1", 12 * 60, None, T0 + 25 * MIN).unwrap();
+        assert_eq!(ask(T0 + 26 * MIN), None);
+        assert_eq!(ask(T0 + 31 * MIN), None, "7m left");
+        assert!(ask(T0 + 32 * MIN).unwrap().contains("About 5m"));
+        assert!(ask(T0 + 38 * MIN).unwrap().contains("past"));
+        assert_eq!(ask(T0 + 39 * MIN), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_or_fresh_figure_is_let_be_until_it_runs_out() {
+        let dir = temp("deadline-short");
+        // 4m given ten minutes in: never "near", only past it.
+        set(&dir, "s1", "a1", 4 * 60, None, T0 + 10 * MIN).unwrap();
+        let ask = |at: u64| deadline_ask(&dir, "s1", "a1", T0, at);
+        assert_eq!(ask(T0 + 11 * MIN), None, "just given");
+        assert_eq!(ask(T0 + 13 * MIN), None, "short figure, not near");
+        assert!(ask(T0 + 15 * MIN).unwrap().contains("1m past"));
+        // Right after the five-minute ask: quiet, even near the end.
+        set(&dir, "s1", "a2", 9 * 60, None, T0).unwrap();
+        assert!(worker_ask(&dir, "s1", "a2", T0, T0 + 5 * MIN).is_some());
+        let ask = |at: u64| deadline_ask(&dir, "s1", "a2", T0, at);
+        assert_eq!(ask(T0 + 6 * MIN), None, "3m left, but just asked");
+        assert!(ask(T0 + 8 * MIN).unwrap().contains("About 1m"));
+        assert_eq!(deadline_ask(&dir, "s1", "../x", T0, T0 + 30 * MIN), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
