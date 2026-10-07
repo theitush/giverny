@@ -1491,6 +1491,34 @@ fn resume_plan(
     }
 }
 
+/// What a tab types to attach to background agent `job`: `claude attach
+/// <id>`, under the job's account named as the resume command names one
+/// ([`resume_plan`]). `None` for a job that is not running or whose id is
+/// not one.
+fn attach_command(job: &giverny_claude::jobs::Job) -> Option<String> {
+    let ok = job.live
+        && !job.id.is_empty()
+        && job.id.len() <= 64
+        && job
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !ok {
+        return None;
+    }
+    let mut command = String::new();
+    if giverny_claude::profiles::must_be_named(&job.config_dir) {
+        let named = match wsl::split_unc(&job.config_dir) {
+            Some((_, unix)) => unix,
+            None => job.config_dir.display().to_string(),
+        };
+        command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
+    }
+    // `command` bypasses shell wrapper functions named `claude`.
+    command.push_str(&format!("command claude attach {}\r", job.id));
+    Some(command)
+}
+
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
 /// to survive the crossing, added to whatever the user already shares.
 ///
@@ -2041,34 +2069,51 @@ impl App {
                 }
             }
             Action::AttachJob(job) => {
-                let Some(sid) = job.resume_target().map(str::to_string) else {
-                    tracing::warn!("job {} has no conversation to attach to", job.id);
+                // A running agent is attached to, wherever the daemon runs
+                // it: `claude --resume` refuses a conversation live
+                // elsewhere, and a job resumed from another one has no
+                // conversation of its own on disk yet.
+                // Its tab, when it has one, is where it is.
+                if let Some(id) = self
+                    .ws
+                    .tabs
+                    .iter()
+                    .find(|t| t.bg_job.as_deref() == Some(job.id.as_str()))
+                    .map(|t| t.id)
+                {
+                    self.apply(ctx, Action::Select(id));
+                    return;
+                }
+                let Some(cmd) = attach_command(&job) else {
+                    tracing::warn!("job {}: nothing to attach to", job.id);
                     return;
                 };
+                // The tab lives in the BACKGROUND list, as the agent's row;
+                // its category only has to exist, and is not opened for it.
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
+                let collapsed = self.ws.category_mut(cat).map(|c| c.collapsed);
                 let id = self.ws.add_tab(cat);
-                if let Some(tab) = self.ws.tab_mut(id) {
-                    // The agent's own directory: `claude --resume` only finds a
-                    // conversation from where it ran.
-                    tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
-                    tab.custom_title = Some(job.name.clone());
+                if let (Some(was), Some(c)) = (collapsed, self.ws.category_mut(cat)) {
+                    c.collapsed = was;
                 }
-                // A conversation that is not on disk cannot be resumed, and a
-                // shell opening on an empty screen looks like a tab that did
-                // nothing. Say what happened, in the agent's own directory.
-                if giverny_claude::registry::find_transcript(&job.config_dir, &sid).is_none() {
-                    tracing::info!("job {}: no transcript for {sid}", job.id);
-                    self.spawn_session(
-                        ctx,
-                        id,
-                        Some(format!(
-                            "\x1b[2mgiverny:\x1b[0m no conversation on disk for this agent\r\n                             \x1b[2m         {sid}\r\n                                      this tab is its directory; the agent itself is still                              wherever it is running.\x1b[0m\r\n\r\n"
-                        )),
-                    );
-                    return;
+                if let Some(tab) = self.ws.tab_mut(id) {
+                    tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
+                    tab.bg_job = Some(job.id.clone());
+                    // What a restart resumes: the job's conversation, which
+                    // attaches to the job again.
+                    tab.claude_session = job.resume_target().map(str::to_string);
+                    tab.claude_config_dir = Some(job.config_dir.clone());
                 }
                 self.spawn_session(ctx, id, None);
-                self.apply(ctx, Action::ResumeSpecific(id, sid, job.config_dir.clone()));
+                // Same deferred injection the resume path uses: give the
+                // shell time to be ready before typing into it.
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(1300),
+                    id,
+                    Inject::Raw(cmd.into_bytes()),
+                ));
+                self.focus_terminal = true;
+                self.state_dirty = true;
             }
             Action::EditConfig => {
                 let editor = std::env::var("VISUAL")
@@ -2157,6 +2202,11 @@ impl App {
                 self.state_dirty = true;
             }
             Action::ReorderTab(tab, category, index) => {
+                // A background agent's tab dragged into a category becomes
+                // one of its tabs.
+                if let Some(t) = self.ws.tab_mut(tab) {
+                    t.bg_job = None;
+                }
                 self.ws.reorder_tab(tab, category, index);
             }
             Action::RunUpdate => {

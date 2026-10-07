@@ -245,6 +245,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                 let rows: Vec<RowData> = app
                     .ws
                     .tabs_in(c.id)
+                    .filter(|t| t.bg_job.is_none())
                     .map(|t| row_data(app, t, color, None))
                     .collect();
                 let (count, busy, needs) = tallies(&rows);
@@ -267,7 +268,7 @@ fn groups(app: &App) -> Vec<GroupData> {
             // order: by name, with the tabs that are in no repository last —
             // they are the leftovers, not a place.
             let mut keys: Vec<Option<PathBuf>> = Vec::new();
-            for t in &app.ws.tabs {
+            for t in app.ws.tabs.iter().filter(|t| t.bg_job.is_none()) {
                 if !keys.contains(&t.git_repo) {
                     keys.push(t.git_repo.clone());
                 }
@@ -288,7 +289,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         .ws
                         .tabs
                         .iter()
-                        .filter(|t| t.git_repo == key)
+                        .filter(|t| t.bg_job.is_none() && t.git_repo == key)
                         .map(|t| row_data(app, t, color, key.as_deref()))
                         .collect();
                     let (count, busy, needs) = tallies(&rows);
@@ -549,18 +550,36 @@ fn view_switch(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
 
 /// Background agents, above the categories. Same grammar as tabs — spinner
 /// while working, flag when it wants you — because it is the same question.
-fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+///
+/// An agent opened from here keeps its place: its tab is drawn here, as its
+/// row, a tab like any other (selected, closed, dragged into a category to
+/// keep), instead of turning up under a category.
+fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
     use giverny_claude::jobs::JobState;
-    if app.claude.jobs.is_empty() {
-        return;
-    }
     let c = app.chrome;
-    let needs: usize = app
+    let tabs: Vec<RowData> = app
+        .ws
+        .tabs
+        .iter()
+        .filter(|t| t.bg_job.is_some())
+        .map(|t| row_data(app, t, c.accent, None))
+        .collect();
+    let opened = |id: &str| app.ws.tabs.iter().any(|t| t.bg_job.as_deref() == Some(id));
+    let jobs: Vec<giverny_claude::jobs::Job> = app
         .claude
         .jobs
         .iter()
-        .filter(|j| j.state.needs_you())
-        .count();
+        .filter(|j| !opened(&j.id))
+        .cloned()
+        .collect();
+    if tabs.is_empty() && jobs.is_empty() {
+        return;
+    }
+    let needs: usize = jobs.iter().filter(|j| j.state.needs_you()).count()
+        + tabs
+            .iter()
+            .filter(|r| r.claude == ClaudeState::NeedsYou)
+            .count();
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -571,7 +590,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .color(dim),
         );
         ui.label(
-            egui::RichText::new(format!("{}", app.claude.jobs.len()))
+            egui::RichText::new(format!("{}", tabs.len() + jobs.len()))
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
@@ -584,8 +603,11 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         }
     });
 
+    for row in &tabs {
+        tab_row(app, ui, row, fg, dim, actions);
+    }
     let turns = spin_turns(ui);
-    for job in &app.claude.jobs {
+    for job in &jobs {
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
@@ -596,18 +618,28 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
             JobState::Done => ("✓".into(), c.accent),
             JobState::Unknown => ("·".into(), dim),
         };
+        // The whole row is the button: its text is not selectable, or each
+        // label takes the click for itself and only the gaps between the
+        // letters reach the row.
         let resp = ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(glyph)
-                    .font(FontId::monospace(11.0))
-                    .color(color),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(glyph)
+                        .font(FontId::monospace(11.0))
+                        .color(color),
+                )
+                .selectable(false),
             );
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(truncate_chars(&job.name, 22))
-                        .font(FontId::monospace(11.5))
-                        .color(if job.live { fg } else { dim }),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(truncate_chars(&job.name, 22))
+                            .font(FontId::monospace(11.5))
+                            .color(if job.live { fg } else { dim }),
+                    )
+                    .selectable(false),
                 );
                 let mut sub = match job.state {
                     JobState::Working if job.live && job.tasks > 0 => {
@@ -630,10 +662,13 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                     };
                 }
                 if !sub.is_empty() {
-                    ui.label(
-                        egui::RichText::new(truncate_chars(&sub, 30))
-                            .font(FontId::monospace(9.5))
-                            .color(dim),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(truncate_chars(&sub, 30))
+                                .font(FontId::monospace(9.5))
+                                .color(dim),
+                        )
+                        .selectable(false),
                     );
                 }
             });
@@ -645,9 +680,10 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        let hover = match job.resume_target() {
-            Some(_) => "open a tab attached to this agent",
-            None => "no conversation recorded for this agent",
+        let hover = if job.live {
+            "open a tab attached to this agent"
+        } else {
+            "this agent is not running"
         };
         let resp = resp.on_hover_text(format!(
             "{}\n{}",
@@ -657,7 +693,7 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .unwrap_or_default(),
             hover
         ));
-        if resp.clicked() && job.resume_target().is_some() {
+        if resp.clicked() && job.live {
             actions.push(Action::AttachJob(Box::new(job.clone())));
         }
     }

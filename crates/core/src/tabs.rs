@@ -60,6 +60,11 @@ pub struct Tab {
     /// the git lookups that would otherwise silently find nothing.
     #[serde(default)]
     pub wsl_distro: Option<String>,
+    /// The background agent this tab was opened on from the rail's
+    /// BACKGROUND list, by its short id: the tab is shown there, as that
+    /// agent's row, not under its category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_job: Option<String>,
     #[serde(skip)]
     pub exited: bool,
 }
@@ -186,6 +191,7 @@ impl Workspace {
                 git_branch: None,
                 git_repo: None,
                 wsl_distro: None,
+                bg_job: None,
                 exited: false,
             },
         );
