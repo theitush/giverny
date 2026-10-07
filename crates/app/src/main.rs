@@ -1496,27 +1496,47 @@ fn resume_plan(
 /// ([`resume_plan`]). `None` for a job that is not running or whose id is
 /// not one.
 fn attach_command(job: &giverny_claude::jobs::Job) -> Option<String> {
-    let ok = job.live
-        && !job.id.is_empty()
-        && job.id.len() <= 64
-        && job
-            .id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    job.live
+        .then(|| attach_line(&job.id, Some(&job.config_dir)))
+        .flatten()
+}
+
+/// `command claude attach <id> && exit`, for a tab opened on background job
+/// `id` (its `bg_job`) under the account at `config_dir`.
+///
+/// The tab is the job's for as long as it shows it: when the attach ends —
+/// detached, quit, Ctrl+C — the shell ends with it and the tab closes
+/// ([`closes_on_exit`]), the job going back to BACKGROUND (giverny#245). An
+/// attach that fails (the job is gone) exits nonzero: the shell stays, with
+/// the error on screen.
+fn attach_line(id: &str, config_dir: Option<&Path>) -> Option<String> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !ok {
         return None;
     }
     let mut command = String::new();
-    if giverny_claude::profiles::must_be_named(&job.config_dir) {
-        let named = match wsl::split_unc(&job.config_dir) {
+    if let Some(dir) = config_dir
+        && giverny_claude::profiles::must_be_named(dir)
+    {
+        let named = match wsl::split_unc(dir) {
             Some((_, unix)) => unix,
-            None => job.config_dir.display().to_string(),
+            None => dir.display().to_string(),
         };
         command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
     }
     // `command` bypasses shell wrapper functions named `claude`.
-    command.push_str(&format!("command claude attach {}\r", job.id));
+    command.push_str(&format!("command claude attach {id} && exit\r"));
     Some(command)
+}
+
+/// Does a tab close by itself when its shell ends this way? Only one opened
+/// from BACKGROUND, and only on a clean exit — its attach ended — never on
+/// a failure or a kill (Giverny closing takes every shell down, and the
+/// tab is restored next time).
+fn closes_on_exit(tab: &giverny_core::tabs::Tab, exit: Option<std::process::ExitStatus>) -> bool {
+    tab.bg_job.is_some() && exit.is_some_and(|s| s.success())
 }
 
 /// `%WSLENV%` for a tab that opens in a distribution: the variables that have
@@ -2099,8 +2119,8 @@ impl App {
                 if let Some(tab) = self.ws.tab_mut(id) {
                     tab.cwd = job.cwd.clone().or_else(dirs::home_dir);
                     tab.bg_job = Some(job.id.clone());
-                    // What a restart resumes: the job's conversation, which
-                    // attaches to the job again.
+                    // A restart attaches to the job again ([`queue_resume`]);
+                    // the conversation is what the tab holds meanwhile.
                     tab.claude_session = job.resume_target().map(str::to_string);
                     tab.claude_config_dir = Some(job.config_dir.clone());
                 }
@@ -2408,8 +2428,11 @@ impl App {
         }
     }
 
-    fn drain_events(&mut self) {
+    /// Apply what each tab's session reported. Returns the tabs to close: a
+    /// BACKGROUND tab whose attach ended ([`closes_on_exit`]).
+    fn drain_events(&mut self) -> Vec<TabId> {
         let mut cwd_updates: Vec<(TabId, PathBuf)> = Vec::new();
+        let mut close = Vec::new();
         for (&id, rt) in &self.rt {
             let Some(session) = &rt.session else { continue };
             while let Ok(ev) = session.events.try_recv() {
@@ -2434,9 +2457,13 @@ impl App {
                     TabEvent::ChildExit(status) => {
                         tracing::info!("tab {id:?} child exited: {status:?}");
                     }
-                    TabEvent::LoopDone(_) => {
+                    TabEvent::LoopDone(exit) => {
                         if let Some(tab) = self.ws.tab_mut(id) {
                             tab.exited = true;
+                            if closes_on_exit(tab, exit) {
+                                tracing::info!("tab {id:?}: attach ended, closing");
+                                close.push(id);
+                            }
                         }
                     }
                 }
@@ -2454,6 +2481,7 @@ impl App {
                 }
             }
         }
+        close
     }
 
     /// Notice a session that stopped because the account ran out of limit,
@@ -3176,6 +3204,22 @@ impl App {
 
     /// Queue the auto-resume command for a freshly restored tab.
     fn queue_resume(&mut self, id: TabId) {
+        // A tab opened from BACKGROUND comes back to its job the way it
+        // first did, and closes the same way when the attach ends. Resuming
+        // the conversation instead is refused while the job runs it.
+        if let Some(tab) = self.ws.tab(id)
+            && let Some(job) = &tab.bg_job
+        {
+            if let Some(cmd) = attach_line(job, tab.claude_config_dir.as_deref()) {
+                tracing::info!("tab {id:?}: attaching to background job {job}");
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(1300),
+                    id,
+                    Inject::Raw(cmd.into_bytes()),
+                ));
+            }
+            return;
+        }
         let Some(sid) = self.session_to_resume(id) else {
             return;
         };
@@ -4663,9 +4707,13 @@ impl eframe::App for App {
                 self.capture = None;
             }
         }
-        self.drain_events();
+        let ended = self.drain_events();
 
         let ctx = ui.ctx().clone();
+        for id in ended {
+            self.apply(&ctx, Action::CloseTab(id));
+            self.state_dirty = true;
+        }
         // A close asked for through the window and one asked for with a
         // signal end the same way, but only the first arrives as an event.
         // Both are written down here: the state file's clean-shutdown marker
@@ -5481,6 +5529,50 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tab opened from BACKGROUND types an attach that ends its shell
+    /// when it ends, and a failed one leaves the shell standing
+    /// (giverny#245).
+    #[test]
+    fn a_background_tab_attaches_and_exits_with_it() {
+        let dir = Path::new("/home/u/.claude");
+        assert_eq!(
+            attach_line("6e7e56e0", Some(dir)).as_deref(),
+            Some("command claude attach 6e7e56e0 && exit\r")
+        );
+        assert_eq!(
+            attach_line("6e7e56e0", None).as_deref(),
+            Some("command claude attach 6e7e56e0 && exit\r")
+        );
+        assert_eq!(
+            attach_line("work", Some(Path::new("/home/u/.claude-work"))).as_deref(),
+            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-work\" command claude attach work && exit\r")
+        );
+        for bad in ["", "a b", "x;rm", "$(id)"] {
+            assert_eq!(attach_line(bad, None), None, "{bad:?}");
+        }
+    }
+
+    /// Only a BACKGROUND tab closes when its shell ends, and only when it
+    /// ended cleanly: not a failed attach, not Giverny taking it down.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_background_tab_closes_and_only_on_a_clean_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok = Some(std::process::ExitStatus::from_raw(0));
+        let failed = Some(std::process::ExitStatus::from_raw(1 << 8));
+        let hung_up = Some(std::process::ExitStatus::from_raw(1)); // SIGHUP
+        let mut ws = Workspace::default();
+        let cat = ws.add_category("agents");
+        let id = ws.add_tab(cat);
+        let tab = ws.tab_mut(id).unwrap();
+        assert!(!closes_on_exit(tab, ok), "a tab of one's own stays");
+        tab.bg_job = Some("6e7e56e0".into());
+        assert!(closes_on_exit(tab, ok));
+        assert!(!closes_on_exit(tab, failed), "the error stays readable");
+        assert!(!closes_on_exit(tab, hung_up), "Giverny closing");
+        assert!(!closes_on_exit(tab, None));
+    }
 
     /// A bare word the binary does not know is a command, and is refused;
     /// flags and anything that reads as a path still open the window.
