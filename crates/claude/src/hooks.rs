@@ -50,6 +50,11 @@ pub fn partly_installed_in(settings_path: &Path) -> bool {
 pub struct RelayMsg {
     /// `$GIVERNY_TAB_ID` as inherited by the hook (absent outside Giverny).
     pub tab_id: Option<String>,
+    /// The background job whose session ran the hook, by short id, in place
+    /// of a tab id ([`crate::lineage::bg_job`]): the app sends it to the tab
+    /// parked on that job (giverny#242).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     /// `$CLAUDE_CONFIG_DIR` — which account profile the session runs under.
     pub config_dir: Option<String>,
     /// The raw hook payload.
@@ -84,31 +89,81 @@ pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("giverny-{uid}.sock"))
 }
 
+/// Who a hook's message is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The tab the session runs in (`$GIVERNY_TAB_ID`).
+    Tab(String),
+    /// A background job's session, by short id: the tab showing it is the
+    /// app's to find. Its inherited tab id is the daemon's, not the tab's.
+    Job(String),
+}
+
+impl Target {
+    /// This hook's addressee, or `None` when there is no one to tell:
+    /// outside Giverny, or in a session that only inherited a tab's identity
+    /// — a claude started inside the tab's claude, or under a multiplexer
+    /// the tab launched — whose hooks would move the tab's state and its
+    /// resume target.
+    pub fn of_this_process() -> Option<Target> {
+        if let Some(job) = crate::lineage::bg_job() {
+            return Some(Target::Job(job));
+        }
+        let tab = std::env::var("GIVERNY_TAB_ID")
+            .ok()
+            .filter(|t| !t.trim().is_empty())?;
+        crate::lineage::of_this_process()
+            .is_tabs()
+            .then_some(Target::Tab(tab))
+    }
+
+    /// Which account the session runs under. A background job's tab
+    /// variables are the daemon's, so its `GIVERNY_PROFILE_DIR` may name
+    /// another Giverny's view of the account; its job directory,
+    /// `<config>/jobs/<id>`, names the account itself.
+    pub fn account(&self) -> Option<String> {
+        match self {
+            Target::Tab(_) => account_dir(),
+            Target::Job(_) => std::env::var("CLAUDE_CONFIG_DIR")
+                .ok()
+                .filter(|dir| !dir.is_empty())
+                .or_else(|| {
+                    let dir = std::env::var(crate::lineage::JOB_DIR_ENV).ok()?;
+                    let config = Path::new(dir.trim()).parent()?.parent()?;
+                    Some(config.display().to_string())
+                }),
+        }
+    }
+
+    /// A message to the app addressed to this target.
+    pub fn msg(self, config_dir: Option<String>, event: serde_json::Value) -> RelayMsg {
+        let (tab_id, job) = match self {
+            Target::Tab(tab) => (Some(tab), None),
+            Target::Job(job) => (None, Some(job)),
+        };
+        RelayMsg {
+            tab_id,
+            job,
+            config_dir,
+            event,
+        }
+    }
+}
+
 /// The `giverny relay` entrypoint. Fast, silent, always exits successfully —
 /// a relay failure must never disturb the Claude session that ran the hook.
 pub fn run_relay(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
-    // Sessions outside Giverny tabs have no tab identity — nothing to relay
-    // (and nothing worth spooling; the stdin read above keeps claude's
-    // pipe-write happy before we bail).
-    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+    // Nothing to relay outside a tab or a background job (and nothing worth
+    // spooling; the stdin read above keeps claude's pipe-write happy before
+    // we bail).
+    let Some(target) = Target::of_this_process() else {
         return;
     };
-    // A session that only inherited the tab's identity — a claude started
-    // inside the tab's claude, or under a multiplexer the tab launched — is
-    // not the tab's: its hooks would move the tab's state and its resume
-    // target.
-    if !crate::lineage::of_this_process().is_tabs() {
-        return;
-    }
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let msg = RelayMsg {
-        tab_id: Some(tab_id),
-        config_dir: account_dir(),
-        event,
-    };
-    deliver(&msg, spool);
+    let account = target.account();
+    deliver(&target.msg(account, event), spool);
 }
 
 /// Which account this session runs under.
@@ -167,22 +222,25 @@ pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
 /// runs in (`$GIVERNY_TAB_ID`). `false` outside a Giverny tab, where there is
 /// no pane to clear. A closed app gets it from the spool at its next launch.
 pub fn send_clear_done(spool: &Path, session: Option<&str>, at_ms: u64) -> bool {
-    let Some(tab_id) = std::env::var("GIVERNY_TAB_ID")
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-    else {
-        return false;
+    // Run from a background job's shell, the command is the job's: its
+    // tab id is the daemon's.
+    let target = match crate::lineage::bg_job() {
+        Some(job) => Target::Job(job),
+        None => match std::env::var("GIVERNY_TAB_ID")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+        {
+            Some(tab) => Target::Tab(tab),
+            None => return false,
+        },
     };
-    let msg = RelayMsg {
-        tab_id: Some(tab_id),
-        config_dir: account_dir(),
-        event: serde_json::json!({
-            "hook_event_name": CLEAR_DONE_EVENT,
-            "session_id": session,
-            "at_ms": at_ms,
-        }),
-    };
-    deliver(&msg, spool);
+    let event = serde_json::json!({
+        "hook_event_name": CLEAR_DONE_EVENT,
+        "session_id": session,
+        "at_ms": at_ms,
+    });
+    let account = target.account();
+    deliver(&target.msg(account, event), spool);
     true
 }
 
@@ -436,10 +494,20 @@ pub fn run_statusline(spool: &Path) {
     if let Some(sid) = payload.get("session_id") {
         event.insert("session_id".into(), sid.clone());
     }
-    let msg = RelayMsg {
-        tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
-        config_dir: account_dir(),
-        event: serde_json::Value::Object(event),
+    // Usage is no tab's, so a session the relay would not speak for still
+    // delivers it; a background job's says which job it is.
+    let target = Target::of_this_process();
+    let msg = match target.clone() {
+        Some(target) => {
+            let account = target.account();
+            target.msg(account, serde_json::Value::Object(event))
+        }
+        None => RelayMsg {
+            tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
+            job: None,
+            config_dir: account_dir(),
+            event: serde_json::Value::Object(event),
+        },
     };
     deliver(&msg, spool);
 
@@ -470,7 +538,8 @@ pub fn run_statusline(spool: &Path) {
         .unwrap_or_default();
     // Which reading this is, for the tab's pane and the sidebar to show
     // the same one as the line goes up (giverny#235).
-    if let (Some((seq, _)), Ok(tab)) = (reading, std::env::var("GIVERNY_TAB_ID")) {
+    // A background job's inherited tab id is not its tab's.
+    if let (Some((seq, _)), Some(Target::Tab(tab))) = (reading, target) {
         let shown = crate::use_reading::Shown {
             seq,
             at_ms: u64::try_from(now_ms).unwrap_or(0),
@@ -675,7 +744,7 @@ pub fn strip_row_tag(text: &str) -> Option<(&str, &str)> {
 /// The message the relay forwards for one `subagentStatusLine` tick.
 pub fn subagent_line_msg(
     payload: serde_json::Value,
-    tab_id: String,
+    target: Target,
     config_dir: Option<String>,
 ) -> RelayMsg {
     let mut event = match payload {
@@ -686,11 +755,7 @@ pub fn subagent_line_msg(
         "hook_event_name".into(),
         serde_json::Value::String(SUBAGENT_LINE_EVENT.into()),
     );
-    RelayMsg {
-        tab_id: Some(tab_id),
-        config_dir,
-        event: serde_json::Value::Object(event),
-    }
+    target.msg(config_dir, serde_json::Value::Object(event))
 }
 
 /// The `giverny relay --subagent-line` entrypoint: Claude Code runs it at
@@ -708,23 +773,27 @@ pub fn subagent_line_msg(
 pub fn run_subagent_line(spool: &Path, pane_on: bool) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
-    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
-        return;
-    };
     // Another session that inherited the tab's identity keeps its own panel
     // and its workers stay out of the tab's pane ([`crate::lineage`]).
-    if !crate::lineage::of_this_process().is_tabs() {
+    let Some(target) = Target::of_this_process() else {
         return;
-    }
+    };
     let payload: serde_json::Value =
         serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let rows = match (pane_on, strip_wanted(spool, &tab_id)) {
+    // The strip is asked for per tab; a background job's tab is the app's
+    // to know, so its panel stays hidden.
+    let strip = match &target {
+        Target::Tab(tab) => strip_wanted(spool, tab),
+        Target::Job(_) => false,
+    };
+    let rows = match (pane_on, strip) {
         (false, _) => StripRows::Native,
         (true, false) => StripRows::Hidden,
         (true, true) => StripRows::Tagged,
     };
     let answer = subagent_line_output(&payload, rows);
-    deliver(&subagent_line_msg(payload, tab_id, account_dir()), spool);
+    let account = target.account();
+    deliver(&subagent_line_msg(payload, target, account), spool);
     print!("{answer}");
 }
 
@@ -1567,7 +1636,7 @@ mod tests {
     #[test]
     fn subagent_line_msg_is_the_stdin_the_parser_reads() {
         let payload: serde_json::Value = serde_json::from_str(SUBAGENT_STDIN).unwrap();
-        let msg = subagent_line_msg(payload, "giverny-4".into(), Some("/c".into()));
+        let msg = subagent_line_msg(payload, Target::Tab("giverny-4".into()), Some("/c".into()));
         assert_eq!(msg.hook_event(), Some(SUBAGENT_LINE_EVENT));
         assert_eq!(msg.session_id(), Some("c923"));
         assert_eq!(msg.tab_id.as_deref(), Some("giverny-4"));

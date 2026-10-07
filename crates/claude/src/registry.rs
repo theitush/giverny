@@ -25,6 +25,11 @@ pub struct SessionEntry {
     /// mtime to tell whether this session loaded Giverny's hooks.
     #[serde(rename = "startedAt", default)]
     pub started_at_ms: u64,
+    /// The background job this interactive session handed its conversation
+    /// to and now shows (`parkedJobId`, Claude Code 2.1.292): the tab is the
+    /// job's, and so are its hooks (giverny#242).
+    #[serde(rename = "parkedJobId", default)]
+    pub parked_job_id: Option<String>,
 }
 
 impl SessionEntry {

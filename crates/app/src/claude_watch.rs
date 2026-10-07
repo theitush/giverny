@@ -194,7 +194,12 @@ pub struct ClaudeWatch {
     cache_dirty: Arc<AtomicBool>,
     pub tabs: HashMap<TabId, ClaudeTab>,
     /// Background agents across every account — the Claudes with no tab.
+    /// One a tab shows is left out ([`ClaudeWatch::shown_in_a_tab`]).
     pub jobs: Vec<Job>,
+    /// Which tab shows each background job, by its short id: the tab whose
+    /// claude parked on it, from the last registry scan. A job's hooks
+    /// carry its id, not a tab's (giverny#242).
+    parked: HashMap<String, TabId>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
@@ -418,6 +423,7 @@ impl ClaudeWatch {
             profiles,
             tabs: HashMap::new(),
             jobs: Vec::new(),
+            parked: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
@@ -524,6 +530,25 @@ impl ClaudeWatch {
         raw.strip_prefix("giverny-")?.parse::<u64>().ok().map(TabId)
     }
 
+    /// The tab a message is for: the one it names, or the one showing the
+    /// background job it came from.
+    pub fn tab_of(&self, msg: &RelayMsg) -> Option<TabId> {
+        Self::tab_id_of(msg).or_else(|| self.parked.get(msg.job.as_deref()?).copied())
+    }
+
+    /// Does a tab show this background job — parked on it, or holding its
+    /// conversation? Then it is the tab's, not one more agent in the
+    /// background list (giverny#243).
+    fn shown_in_a_tab(&self, job: &Job) -> bool {
+        self.parked.contains_key(&job.id)
+            || self.tabs.values().any(|tab| {
+                tab.session_id.as_deref().is_some_and(|sid| {
+                    job.session_id.as_deref() == Some(sid)
+                        || job.resume_session_id.as_deref() == Some(sid)
+                })
+            })
+    }
+
     fn account_of(&self, config_dir: Option<&Path>) -> Option<String> {
         let dir = config_dir?;
         profiles::find(&self.profiles, dir).map(|p| p.name.clone())
@@ -554,7 +579,7 @@ impl ClaudeWatch {
         }
         // Subagent-line ticks carry a tab's live workers, not its state.
         if msg.hook_event() == Some(hooks::SUBAGENT_LINE_EVENT) {
-            if let Some(tab_id) = Self::tab_id_of(msg) {
+            if let Some(tab_id) = self.tab_of(msg) {
                 let config_dir = self.canonical_dir(msg.config_dir.as_deref());
                 self.agents.apply_live(tab_id, config_dir, &msg.event);
             }
@@ -562,13 +587,13 @@ impl ClaudeWatch {
         }
         // `giverny orchestrator-session clear-done`: the tab's Done rows, cleared by hand.
         if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
-            if let Some(tab_id) = Self::tab_id_of(msg) {
+            if let Some(tab_id) = self.tab_of(msg) {
                 let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
                 self.agents.clear_done(tab_id, at);
             }
             return;
         }
-        let Some(tab_id) = Self::tab_id_of(msg) else {
+        let Some(tab_id) = self.tab_of(msg) else {
             return;
         };
         let config_dir = self.canonical_dir(msg.config_dir.as_deref());
@@ -661,7 +686,8 @@ impl ClaudeWatch {
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
         for msg in &msgs {
-            let title = Self::tab_id_of(msg)
+            let title = self
+                .tab_of(msg)
                 .and_then(|id| titles.get(&id).cloned())
                 .unwrap_or_else(|| "tab".into());
             self.handle_msg(msg, active, &title, &mut effects);
@@ -707,9 +733,17 @@ impl ClaudeWatch {
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
             // Finished agents drop off: the list is what still wants
             // watching, not a record of everything that ever ran.
-            self.jobs = jobs::scan(dirs)
+            let jobs = jobs::scan(dirs);
+            // A tab parked on a job shows the conversation the job holds
+            // now, whatever hooks it missed (giverny#242).
+            for job in &jobs {
+                if let (Some(tab), Some(sid)) = (self.parked.get(&job.id), job.resume_target()) {
+                    self.agents.job_holds(*tab, sid);
+                }
+            }
+            self.jobs = jobs
                 .into_iter()
-                .filter(|job| job.worth_watching())
+                .filter(|job| job.worth_watching() && !self.shown_in_a_tab(job))
                 .collect();
         }
 
@@ -749,6 +783,7 @@ impl ClaudeWatch {
             .iter()
             .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
             .collect();
+        self.parked.clear();
         {
             for live in self.scanned.live.clone() {
                 let Some(tab_id) = shell_pids
@@ -759,6 +794,9 @@ impl ClaudeWatch {
                 else {
                     continue;
                 };
+                if let Some(job) = &live.entry.parked_job_id {
+                    self.parked.insert(job.clone(), tab_id);
+                }
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
                 entry.seen_in_scan = true;
@@ -1368,6 +1406,7 @@ impl ClaudeWatch {
             profiles: Vec::new(),
             tabs: HashMap::new(),
             jobs: Vec::new(),
+            parked: HashMap::new(),
             accounts: Vec::new(),
             hooks_installed: true,
             hook_rx: None,
@@ -1531,6 +1570,68 @@ mod tests {
         let fx = feed(&mut w, &m, Some(TabId(1)));
         assert!(fx.notify.is_empty(), "completions must not notify");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+    }
+
+    /// A background job's hooks name the job, not a tab: they reach the tab
+    /// parked on it, and a `/clear` there empties that tab's pane
+    /// (giverny#242). A job no tab shows reaches nothing.
+    #[test]
+    fn a_background_jobs_hooks_reach_the_tab_parked_on_it() {
+        let mut w = ClaudeWatch::for_tests();
+        w.agents.apply_live(
+            TAB,
+            Some("/tmp/giverny-nowhere".into()),
+            &serde_json::json!({"session_id": "s-1", "tasks": [{"id": "a1", "status": "running"}]}),
+        );
+        let clear = msg(r#"{"job":"34c55b2c","config_dir":null,
+            "event":{"hook_event_name":"SessionStart","source":"clear","session_id":"s-2"}}"#);
+
+        feed(&mut w, &clear, None);
+        assert_eq!(
+            w.agents.tracker(TAB).unwrap().rows().len(),
+            1,
+            "no tab is parked on the job yet"
+        );
+
+        w.parked.insert("34c55b2c".into(), TAB);
+        let fx = feed(&mut w, &clear, None);
+        let t = w.agents.tracker(TAB).unwrap();
+        assert!(t.is_empty(), "the job's /clear empties its tab's pane");
+        assert_eq!(t.session_id.as_deref(), Some("s-2"));
+        assert_eq!(fx.captured.len(), 1);
+        assert_eq!(fx.captured[0].0, TAB);
+    }
+
+    /// A job that a tab shows is that tab's, not one more row under
+    /// BACKGROUND (giverny#243).
+    #[test]
+    fn a_job_a_tab_shows_is_not_in_the_background_list() {
+        let mut w = ClaudeWatch::for_tests();
+        let job = |id: &str, sid: &str| giverny_claude::jobs::Job {
+            id: id.into(),
+            name: id.into(),
+            state: giverny_claude::jobs::JobState::Working,
+            detail: None,
+            tasks: 0,
+            queued: 0,
+            cwd: None,
+            session_id: Some(sid.into()),
+            resume_session_id: None,
+            updated_at_ms: 0,
+            config_dir: "/c".into(),
+            live: true,
+            pinned: false,
+        };
+        let parked = job("34c55b2c", "s-parked");
+        let held = job("0a1f39b3", "s-held");
+        let alone = job("29ab7872", "s-alone");
+        assert!(!w.shown_in_a_tab(&parked));
+
+        w.parked.insert("34c55b2c".into(), TAB);
+        w.tabs.entry(TabId(8)).or_default().session_id = Some("s-held".into());
+        assert!(w.shown_in_a_tab(&parked), "parked on in a tab");
+        assert!(w.shown_in_a_tab(&held), "its conversation is a tab's");
+        assert!(!w.shown_in_a_tab(&alone), "no tab shows it");
     }
 
     fn session(status: &str) -> giverny_claude::registry::SessionEntry {

@@ -132,6 +132,14 @@ impl AgentsLive {
         } else if tracker.config_dir.is_none() {
             tracker.config_dir = default_config_dir();
         }
+        // A tick from another conversation is a start this tab never heard
+        // of — a `/clear` whose hook went astray (giverny#242): the table is
+        // that conversation's, as [`AgentsLive::session_started`] would make it.
+        if let Some(sid) = snap.session_id.as_deref()
+            && tracker.continues(sid) == Some(false)
+        {
+            *tracker = Tracker::new(tracker.config_dir.clone());
+        }
         tracker.apply_live(&snap, now_ms());
         self.dirty = true;
     }
@@ -171,6 +179,29 @@ impl AgentsLive {
             *tracker = fresh;
         } else if let Some(sid) = session_id {
             tracker.set_session(sid);
+        }
+        self.dirty = true;
+    }
+
+    /// `tab` shows a background job now holding conversation `session` —
+    /// what the job's own `state.json` says, needing no hook. A conversation
+    /// the table's is not (a `/clear` whose hook never reached the tab,
+    /// giverny#242) starts the table over, bound to it; the same one re-id'd
+    /// is recorded beside the old id.
+    pub fn job_holds(&mut self, tab: TabId, session: &str) {
+        let Some(tracker) = self.trackers.get_mut(&tab) else {
+            return;
+        };
+        match tracker.continues(session) {
+            Some(false) => {
+                let mut fresh = Tracker::new(tracker.config_dir.clone());
+                fresh.set_session(session);
+                *tracker = fresh;
+            }
+            Some(true) if tracker.session_id.as_deref() != Some(session) => {
+                tracker.set_session(session);
+            }
+            _ => return,
         }
         self.dirty = true;
     }
@@ -372,6 +403,77 @@ mod tests {
         assert_eq!(t.session_id.as_deref(), Some("n1"));
         assert!(t.aliases.is_empty(), "and none of the old ids");
         assert_eq!(t.config_dir.as_deref(), Some(Path::new("/nowhere")));
+    }
+
+    /// A `/clear` whose `SessionStart` never reached the tab — a session
+    /// the background daemon hosts, before its hooks found their tab
+    /// (giverny#242) — still empties the pane at the new conversation's
+    /// first tick; a tick from the same conversation re-id'd keeps the rows.
+    #[test]
+    fn a_tick_from_another_conversation_starts_over() {
+        let config =
+            std::env::temp_dir().join(format!("giverny-agents-live-242-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let proj = config.join("projects/-w");
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = |sid: &str, root: &str| {
+            let line = serde_json::json!({"type": "user", "parentUuid": null, "uuid": root});
+            std::fs::write(proj.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+        };
+        transcript("old", "root-1");
+        transcript("forked", "root-1");
+        transcript("cleared", "root-2");
+
+        let mut live = AgentsLive::in_memory();
+        live.apply_live(TAB, Some(config.clone()), &tick_json("old", &["a1"]));
+        live.apply_live(TAB, None, &tick_json("forked", &[]));
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(
+            t.rows().len(),
+            1,
+            "the same conversation keeps its Done row"
+        );
+        assert_eq!(t.aliases, ["old".to_string()]);
+
+        live.apply_live(TAB, None, &tick_json("cleared", &["b1"]));
+        let t = live.tracker(TAB).unwrap();
+        let ids: Vec<&str> = t.rows().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["b1"], "only the cleared conversation's worker");
+        assert_eq!(t.session_id.as_deref(), Some("cleared"));
+        assert!(t.aliases.is_empty());
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// What a background job's `state.json` says it holds now brings the
+    /// tab's table to that conversation, with no hook at all.
+    #[test]
+    fn a_parked_jobs_conversation_is_the_tables() {
+        let config =
+            std::env::temp_dir().join(format!("giverny-agents-live-242b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let proj = config.join("projects/-w");
+        std::fs::create_dir_all(&proj).unwrap();
+        for (sid, root) in [("old", "r1"), ("forked", "r1"), ("cleared", "r2")] {
+            let line = serde_json::json!({"type": "user", "parentUuid": null, "uuid": root});
+            std::fs::write(proj.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+        }
+        let mut live = AgentsLive::in_memory();
+        live.apply_live(TAB, Some(config.clone()), &tick_json("old", &["a1"]));
+
+        live.job_holds(TAB, "forked");
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.rows().len(), 1, "the same conversation keeps its rows");
+        assert_eq!(t.session_id.as_deref(), Some("forked"));
+
+        live.job_holds(TAB, "cleared");
+        let t = live.tracker(TAB).unwrap();
+        assert!(t.is_empty(), "a cleared conversation starts over");
+        assert_eq!(t.session_id.as_deref(), Some("cleared"));
+        assert!(t.aliases.is_empty());
+
+        live.job_holds(TabId(9), "cleared");
+        assert!(live.tracker(TabId(9)).is_none(), "no table, nothing made");
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// A tab resumed into A, then B, then A again shows each

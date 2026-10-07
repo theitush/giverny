@@ -86,6 +86,82 @@ pub fn lineage(
     }
 }
 
+/// The environment variable Claude Code gives a session its background
+/// daemon hosts: that job's directory, `<config>/jobs/<short id>`.
+pub const JOB_DIR_ENV: &str = "CLAUDE_JOB_DIR";
+
+/// The background job whose own session ran this process, by its short id
+/// (the job directory's name), or `None` outside one.
+///
+/// The daemon is detached — its parent is init — so the walk to the app
+/// never ends for such a session, and the tab id it carries is whichever
+/// tab first started the daemon, not the tab showing the job (giverny#242).
+/// The job id is what names it; the app finds the tab parked on it.
+///
+/// A claude started inside the job's shell inherits `CLAUDE_JOB_DIR` too.
+/// The job's own session runs directly under the daemon's `bg-pty-host`; a
+/// nested one runs under a shell, and is not the job.
+pub fn bg_job() -> Option<String> {
+    let dir = std::env::var(JOB_DIR_ENV).ok()?;
+    let id = std::path::Path::new(dir.trim())
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    if id.is_empty() || !runs_as_bg_worker(std::process::id()) {
+        return None;
+    }
+    Some(id)
+}
+
+/// Walk up from `start` to the first claude: is its parent the daemon's
+/// `bg-pty-host`? `None` when no claude is found on the way.
+pub fn under_pty_host(
+    start: u32,
+    parent: impl Fn(u32) -> Option<u32>,
+    is_claude: impl Fn(u32) -> bool,
+    is_pty_host: impl Fn(u32) -> bool,
+) -> Option<bool> {
+    let mut pid = start;
+    for _ in 0..MAX_DEPTH {
+        if is_claude(pid) && !is_pty_host(pid) {
+            return Some(parent(pid).is_some_and(&is_pty_host));
+        }
+        match parent(pid) {
+            Some(p) if p != pid && p != 0 => pid = p,
+            _ => break,
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn runs_as_bg_worker(pid: u32) -> bool {
+    let Some(start) = proc_parent(pid) else {
+        return false;
+    };
+    under_pty_host(start, proc_parent, proc_is_claude, |p| {
+        std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|cmd| is_pty_host_cmdline(&cmd))
+    })
+    .unwrap_or(false)
+}
+
+/// The daemon's pty host, by its command line: it runs with
+/// `--bg-pty-host`, under the process title `claude bg-pty-host` (one
+/// `argv[0]`, as Claude Code 2.1.292 sets it).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_pty_host_cmdline(cmd: &[u8]) -> bool {
+    cmd.split(|b| *b == 0)
+        .enumerate()
+        .any(|(i, arg)| arg == b"--bg-pty-host" || (i == 0 && arg.ends_with(b" bg-pty-host")))
+}
+
+/// Claude Code's background daemon is a Unix one; elsewhere a job directory
+/// is taken at its word.
+#[cfg(not(target_os = "linux"))]
+fn runs_as_bg_worker(_pid: u32) -> bool {
+    true
+}
+
 /// Is a process name Claude Code's? `claude`, or `claude.exe` on Windows.
 pub fn is_claude_name(name: &str) -> bool {
     let name = name.trim();
@@ -274,5 +350,53 @@ mod tests {
         let parent = proc_parent(me).unwrap();
         assert!(!proc_is_claude(me));
         assert_eq!(of_process(me, parent), Lineage::Unknown);
+    }
+
+    /// A process tree as `(pid, parent, is claude, is the daemon's pty host)`.
+    fn bg(tree: &[(u32, u32, bool, bool)], start: u32) -> Option<bool> {
+        let map: HashMap<u32, (u32, bool, bool)> =
+            tree.iter().map(|&(p, pp, c, h)| (p, (pp, c, h))).collect();
+        under_pty_host(
+            start,
+            |p| map.get(&p).map(|e| e.0),
+            |p| map.get(&p).is_some_and(|e| e.1),
+            |p| map.get(&p).is_some_and(|e| e.2),
+        )
+    }
+
+    #[test]
+    fn the_pty_host_is_known_by_its_title_or_its_flag() {
+        assert!(is_pty_host_cmdline(
+            b"claude bg-pty-host\0--bg-pty-host\0/tmp/p.sock\0"
+        ));
+        assert!(is_pty_host_cmdline(b"claude bg-pty-host\0"));
+        assert!(is_pty_host_cmdline(b"/usr/bin/claude\0--bg-pty-host\0/s\0"));
+        assert!(!is_pty_host_cmdline(b"claude bg-spare\0--bg-spare\0/s\0"));
+        assert!(!is_pty_host_cmdline(b"claude\0-p\0what is bg-pty-host\0"));
+    }
+
+    #[test]
+    fn a_background_jobs_own_session_runs_under_the_pty_host() {
+        // init → daemon → bg-pty-host → claude (the job) → sh → relay
+        let job = [
+            (10, 1, true, false),
+            (20, 10, true, true),
+            (30, 20, true, false),
+            (40, 30, false, false),
+        ];
+        assert_eq!(bg(&job, 40), Some(true));
+        // A claude started in the job's shell inherits CLAUDE_JOB_DIR, and
+        // is not the job.
+        let nested = [
+            (10, 1, true, false),
+            (20, 10, true, true),
+            (30, 20, true, false),
+            (35, 30, false, false),
+            (38, 35, true, false),
+            (40, 38, false, false),
+        ];
+        assert_eq!(bg(&nested, 40), Some(false));
+        // No claude at all: nothing to say.
+        assert_eq!(bg(&[(40, 1, false, false)], 40), None);
     }
 }
