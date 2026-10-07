@@ -220,18 +220,31 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 ///
 /// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
 /// below re-launches itself.
-fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
+///
+/// Also returns the wgpu backends to ask for, where eframe's own choice is the
+/// wrong one (see `preferred_backends`).
+fn pick_renderer(gpu_gl: bool) -> (eframe::Renderer, Option<eframe::wgpu::Backends>) {
     match std::env::var("GIVERNY_RENDERER").as_deref() {
         Ok("glow" | "gl" | "opengl") => {
             tracing::info!("renderer: OpenGL (GIVERNY_RENDERER)");
-            eframe::Renderer::Glow
+            (eframe::Renderer::Glow, None)
         }
-        Ok("wgpu") => eframe::Renderer::Wgpu,
+        Ok("wgpu") => (eframe::Renderer::Wgpu, preferred_backends()),
         // OpenGL is known to reach the GPU; wgpu is not asked, because on
         // WSLg its only Vulkan driver is lavapipe (see `wslg`).
-        _ if gpu_gl => eframe::Renderer::Glow,
+        _ if gpu_gl => (eframe::Renderer::Glow, None),
         _ => {
-            let adapter = wgpu_adapter();
+            // The preferred backends only if they reach a GPU; otherwise
+            // whatever eframe would have picked.
+            let preferred = preferred_backends().and_then(|backends| {
+                wgpu_adapter(Some(backends))
+                    .filter(|info| info.device_type != eframe::wgpu::DeviceType::Cpu)
+                    .map(|info| (backends, info))
+            });
+            let (backends, adapter) = match preferred {
+                Some((backends, info)) => (Some(backends), Some(info)),
+                None => (None, wgpu_adapter(None)),
+            };
             let renderer = renderer_for(adapter.as_ref());
             match (&adapter, renderer) {
                 (None, _) => tracing::info!("renderer: OpenGL, wgpu found no adapter"),
@@ -247,7 +260,7 @@ fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
                     info.device_type
                 ),
             }
-            renderer
+            (renderer, backends)
         }
     }
 }
@@ -271,10 +284,35 @@ fn gpu_opengl() -> bool {
     false
 }
 
-/// The adapter eframe's default wgpu setup would choose, asked for the same
-/// way (same backends, same power preference) but without a window yet.
-fn wgpu_adapter() -> Option<eframe::wgpu::AdapterInfo> {
-    let setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+/// The wgpu backends to draw with where eframe's default is the wrong one,
+/// `None` where it is right.
+///
+/// On Windows wgpu lists Vulkan before DirectX 12, and eframe takes the first
+/// GPU adapter it finds. Intel's Vulkan driver presents a window badly: it
+/// flickers as the mouse moves over it, after it opens and again after it has
+/// been hidden for a few minutes, then settles (#236). DirectX 12 is Windows'
+/// own path to the screen and does not. `WGPU_BACKEND` still decides.
+fn preferred_backends() -> Option<eframe::wgpu::Backends> {
+    preferred_backends_for(cfg!(windows), std::env::var_os("WGPU_BACKEND").is_some())
+}
+
+fn preferred_backends_for(windows: bool, env_chose: bool) -> Option<eframe::wgpu::Backends> {
+    (windows && !env_chose).then_some(eframe::wgpu::Backends::DX12)
+}
+
+/// eframe's default wgpu setup, on `backends` instead of its own if given.
+fn wgpu_setup(backends: Option<eframe::wgpu::Backends>) -> eframe::egui_wgpu::WgpuSetupCreateNew {
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    if let Some(backends) = backends {
+        setup.instance_descriptor.backends = backends;
+    }
+    setup
+}
+
+/// The adapter that wgpu setup would choose, asked for the same way (same
+/// backends, same power preference) but without a window yet.
+fn wgpu_adapter(backends: Option<eframe::wgpu::Backends>) -> Option<eframe::wgpu::AdapterInfo> {
+    let setup = wgpu_setup(backends);
     let instance = eframe::wgpu::Instance::new(setup.instance_descriptor);
     let options = eframe::wgpu::RequestAdapterOptions {
         power_preference: setup.power_preference,
@@ -619,7 +657,7 @@ fn main() -> eframe::Result {
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
     let gpu_gl = gpu_opengl();
-    let renderer = pick_renderer(gpu_gl);
+    let (renderer, wgpu_backends) = pick_renderer(gpu_gl);
     let layout = state::load_layout(&paths);
     // The interface zoom the user last left, or — on a first run only — the
     // display's own scale where the platform hides it from winit (#62). Not
@@ -671,11 +709,14 @@ fn main() -> eframe::Result {
     if frameless {
         titlebar::probe_work_areas();
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         renderer,
         viewport,
         ..Default::default()
     };
+    if let Some(backends) = wgpu_backends {
+        options.wgpu_options.wgpu_setup = wgpu_setup(Some(backends)).into();
+    }
     // A hook rather than `catch_unwind`: wgpu's failure panics, and then
     // panics again on the way out, and a panic while panicking aborts the
     // process on the spot — there is nothing left to catch. A hook runs
@@ -5524,6 +5565,16 @@ mod tests {
         assert!(is_software_gl("GDI Generic"));
         assert!(!is_software_gl("D3D12 (Intel(R) Graphics)"));
         assert!(!is_software_gl("Mesa Intel(R) Graphics (MTL)"));
+    }
+
+    #[test]
+    fn windows_draws_on_dx12_unless_wgpu_backend_says_otherwise() {
+        assert_eq!(
+            preferred_backends_for(true, false),
+            Some(eframe::wgpu::Backends::DX12)
+        );
+        assert_eq!(preferred_backends_for(true, true), None);
+        assert_eq!(preferred_backends_for(false, false), None);
     }
 
     #[test]
