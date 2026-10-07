@@ -1,0 +1,89 @@
+#!/bin/sh
+# Cross-build the native Windows giverny.exe from WSL (giverny#239), icons and
+# all, and optionally put it where Ita's Windows Giverny runs from.
+#
+#   build-win                 build the worktree you are in
+#   build-win --install       ...then swap it into %LOCALAPPDATA%\Giverny\bin
+#   build-win -C <worktree>   build another worktree
+#
+# No Windows toolchain needed: Rust's x86_64-pc-windows-gnu target, with zig as
+# the linker through cargo-zigbuild, all inside the repo's .toolchain/. The icon
+# goes in by hand: winresource wants a mingw windres, so its build script only
+# warns, and the bin is relinked with a .res that `zig rc` compiles. The build
+# goes through cargo-shared (the shared folder's one-build lock), and the
+# relink runs under that same lock.
+#
+# --install renames the running exe to giverny.exe.before-<new sha> (Windows
+# allows renaming a running exe) and moves the new one in; the open window keeps the
+# old code until it is reopened. Nothing is deleted.
+#
+# Setup, once: rustup target add x86_64-pc-windows-gnu; zig in .toolchain/zig/;
+# cargo-zigbuild in .toolchain/cargo/bin/ (see giverny#239 for versions).
+set -eu
+R=/home/ita/giverny
+BIN=/mnt/c/Users/ita/AppData/Local/Giverny/bin
+install=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --install) install=1 ;;
+    -C) cd "$2"; shift ;;
+    *) echo "usage: build-win [--install] [-C <worktree>]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+export RUSTUP_HOME=$R/.toolchain/rustup CARGO_HOME=$R/.toolchain/cargo
+export PATH=$R/.toolchain/zig:$R/.toolchain/cargo/bin:$PATH
+export CARGO_TARGET_DIR=$R/.claude/target-shared
+export XDG_CACHE_HOME=$R/.toolchain/cache ZIG_GLOBAL_CACHE_DIR=$R/.toolchain/cache/zig
+for tool in zig cargo-zigbuild; do
+  command -v $tool >/dev/null || { echo "build-win: no $tool in .toolchain (see the setup note above)" >&2; exit 1; }
+done
+
+root=$(git rev-parse --show-toplevel)
+sha=$(git rev-parse --short HEAD)
+res=$R/.toolchain/win-res
+mkdir -p "$res"
+printf '1 ICON "%s"\n2 ICON "%s"\n' "$root/assets/icon/giverny.ico" "$root/assets/icon/attention.ico" > "$res/giverny.rc"
+zig rc /fo "$res/giverny.res" "$res/giverny.rc"
+
+T="--release --target x86_64-pc-windows-gnu -p giverny"
+out=$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/giverny.exe
+stage=$CARGO_TARGET_DIR/win-out/giverny-$sha.exe
+mkdir -p "$(dirname "$stage")"
+# shellcheck disable=SC2086
+systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 -- \
+  $R/.claude/bin/cargo-shared \
+  --then "cargo-zigbuild rustc $T --bin giverny -- -C link-arg=$res/giverny.res && cp '$out' '$stage'" \
+  zigbuild $T
+
+# Both icon groups in the PE resources, or the taskbar shows the generic one.
+python3 - "$stage" <<'EOF'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+pe = struct.unpack_from('<I', b, 0x3c)[0]
+n = struct.unpack_from('<H', b, pe + 6)[0]
+s = pe + 24 + struct.unpack_from('<H', b, pe + 20)[0]
+raw = next(struct.unpack_from('<I', b, s + 40 * i + 20)[0]
+           for i in range(n) if b[s + 40 * i:s + 40 * i + 5] == b'.rsrc')
+def entries(off):
+    nn, ni = struct.unpack_from('<HH', b, raw + off + 12)
+    for k in range(nn + ni):
+        yield struct.unpack_from('<II', b, raw + off + 16 + 8 * k)
+groups = [i for t, sub in entries(0) if t == 14 for i, _ in entries(sub & 0x7fffffff)]
+if sorted(groups) != [1, 2]:
+    sys.exit(f"build-win: icon groups {groups}, want [1, 2]")
+EOF
+echo "build-win: $stage ($sha)"
+
+[ -n "$install" ] || exit 0
+cp "$stage" "$BIN/giverny.new.exe"
+(cd "$BIN" && ./giverny.new.exe --version >/dev/null) || { echo "build-win: the new exe does not run" >&2; exit 1; }
+if [ -e "$BIN/giverny.exe" ]; then
+  keep=$BIN/giverny.exe.before-$sha
+  [ -e "$keep" ] && keep=$keep-$(date +%s)
+  mv "$BIN/giverny.exe" "$keep"
+  echo "build-win: kept the previous exe as $(basename "$keep")"
+fi
+mv "$BIN/giverny.new.exe" "$BIN/giverny.exe"
+echo "build-win: installed $sha; reopen Giverny on Windows to run it"
