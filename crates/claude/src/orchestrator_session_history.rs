@@ -1,25 +1,23 @@
 //! What `giverny orchestrator-session` learns its estimates from.
 //!
 //! Every task that lands appends one line to `history.jsonl` beside the
-//! feeds: its raw estimate (the guess as given, before any correction), its
+//! feeds: its estimate (the guess as given), its
 //! wall-clock time, and its *working* time — wall time minus the spans it was
 //! paused and the spans its worker said it was waiting. Append-only, one JSON
 //! object per line, so concurrent orchestrator sessions never lose each other's lines and a
 //! line this version cannot read is skipped, not fatal.
 //!
-//! [`correct`] then scales a new guess by the median working-time ÷ estimate
-//! ratio over the most recent landed tasks of the same kind: the same repo and
-//! the same type word in the title (`BUG:`, `FEATURE:` …), else the same repo,
-//! else every task. With too little history the guess stands as given.
-//!
-//! Each estimator is scored on its own **track**: the
+//! Nothing is corrected: every figure goes on the pane and into the history
+//! as given. Each estimator is scored on its own **track** — the
 //! dispatcher's guess against the whole working time, and the worker's first
 //! re-estimate (made after reading the code) against the working time that
-//! was still to come when it was made. Each is told how its past estimates
-//! fared ([`track_record`]); the guess is also corrected ([`correct`]), the
-//! re-estimate goes on the pane as given (told, never corrected),
-//! and [`accuracy`] reports every track's error, older against recent, so
-//! whether estimates improve is read from the data.
+//! was still to come when it was made — and is *told* how its past estimates
+//! fared ([`track_record`]): the median working-time ÷ estimate ratio over
+//! the most recent landed tasks of the same kind (the same repo and the same
+//! type word in the title, `BUG:`, `FEATURE:` …, else the same repo, else
+//! every task). Plain arithmetic over the file, nothing else. [`accuracy`]
+//! reports every track's error, older against recent, so whether estimates
+//! improve is read from the data.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,17 +35,10 @@ pub const ENV: &str = "GIVERNY_ORCHESTRATOR_SESSION_HISTORY";
 /// when [`ENV`] is unset.
 pub const OLD_ENV: &str = "GIVERNY_PASS_HISTORY";
 
-/// How many matching tasks a level needs before it corrects anything.
+/// How many matching tasks a level needs before its track record is told.
 pub const MIN_SAMPLES: usize = 5;
 /// How many of the most recent matching tasks the median is taken over.
 pub const RECENT: usize = 20;
-/// The ratio is held inside this range, so one odd history cannot turn a
-/// guess into nonsense. The median of five or more is already robust to one
-/// odd task; the range only stops a history that is nonsense as a whole.
-/// (A ×0.25–×4 range bound in practice: guesses that ran ×0.2 were only
-/// corrected to ×0.25.)
-pub const RATIO_MIN: f64 = 0.1;
-pub const RATIO_MAX: f64 = 10.0;
 
 /// One landed task.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -61,10 +52,12 @@ pub struct Record {
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The guess as given to `plan`/`start --eta`, before correction.
+    /// The guess as given to `plan`/`start --eta`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_s: Option<u64>,
-    /// What the pane counted down from at the start (the corrected figure).
+    /// What the pane counted down from at the start: the guess itself, or
+    /// on lines written before giverny#229, the guess corrected. Kept so old
+    /// lines read; no track scores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_s: Option<u64>,
     /// The last estimate, after any re-estimates.
@@ -117,15 +110,13 @@ pub enum Track {
     /// The dispatcher's guess (`plan`/`start --eta`), as given, against the
     /// whole working time.
     Guess,
-    /// What the pane counted down from at the start: the guess corrected.
-    Start,
     /// The worker's first re-estimate of the time left, as given, against
     /// the working time still to come when it was made.
     Reestimate,
 }
 
 impl Track {
-    pub const ALL: [Track; 3] = [Track::Guess, Track::Start, Track::Reestimate];
+    pub const ALL: [Track; 2] = [Track::Guess, Track::Reestimate];
 
     /// `(estimated, took)` in seconds, when `r` teaches this track anything.
     pub fn pair(self, r: &Record) -> Option<(u64, u64)> {
@@ -135,7 +126,6 @@ impl Track {
         let left = || r.work_s.checked_sub(r.reest_at_s?).filter(|l| *l > 0);
         let (est, took) = match self {
             Track::Guess => (r.estimate_s?, r.work_s),
-            Track::Start => (r.eta_s?, r.work_s),
             Track::Reestimate => (r.reest_s?, left()?),
         };
         (est > 0).then_some((est, took))
@@ -150,7 +140,6 @@ impl Track {
     pub fn noun(self) -> &'static str {
         match self {
             Track::Guess => "guesses",
-            Track::Start => "start figures",
             Track::Reestimate => "re-estimates",
         }
     }
@@ -159,7 +148,6 @@ impl Track {
     pub fn heading(self) -> &'static str {
         match self {
             Track::Guess => "dispatcher's guess, as given",
-            Track::Start => "pane's start figure (the guess corrected)",
             Track::Reestimate => "worker's re-estimate of the time left, as given",
         }
     }
@@ -243,27 +231,6 @@ fn name_of(dir: &Path) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
-/// A corrected estimate and where it came from.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Correction {
-    pub eta_s: u64,
-    pub ratio: f64,
-    pub samples: usize,
-    /// Which level matched: `"FEATURE tasks in demo"`, `"tasks in
-    /// giverny"`, `"tasks"`.
-    pub basis: String,
-}
-
-impl Correction {
-    /// `×0.39 from the last 12 FEATURE tasks in demo`.
-    pub fn describe(&self) -> String {
-        format!(
-            "×{:.2} from the last {} {}",
-            self.ratio, self.samples, self.basis
-        )
-    }
-}
-
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     let n = v.len();
@@ -310,51 +277,10 @@ fn level_ratios(
     None
 }
 
-/// Correct `guess_s` from `history`, trying the task's repo and kind, then
-/// its repo, then everything. `None` when no level has [`MIN_SAMPLES`]
-/// usable tasks: the guess stands.
-pub fn correct(
-    history: &[Record],
-    repo: Option<&str>,
-    kind: Option<&str>,
-    guess_s: u64,
-) -> Option<Correction> {
-    correct_on(history, Track::Guess, repo, kind, guess_s)
-}
-
-/// [`correct`] on any track: a worker's re-estimate is corrected from the
-/// re-estimates' history, not the guesses'.
-pub fn correct_on(
-    history: &[Record],
-    track: Track,
-    repo: Option<&str>,
-    kind: Option<&str>,
-    guess_s: u64,
-) -> Option<Correction> {
-    if guess_s == 0 {
-        return None;
-    }
-    let (ratios, words) = level_ratios(history, track, repo, kind)?;
-    let samples = ratios.len();
-    let ratio = median(ratios).clamp(RATIO_MIN, RATIO_MAX);
-    // Whole minutes, never under one: the pane shows minutes.
-    let mins = ((guess_s as f64 * ratio) / 60.0).round().max(1.0);
-    let noun = match track {
-        Track::Guess | Track::Start => "tasks",
-        Track::Reestimate => "re-estimates",
-    };
-    Some(Correction {
-        eta_s: mins as u64 * 60,
-        ratio,
-        samples,
-        basis: words.replace("{}", noun),
-    })
-}
-
 /// How an estimator's own past estimates fared, for it to see before it
-/// makes the next one: `your last 8 FEATURE guesses in
-/// giverny took ×0.21 of what was said (median): you guess long`. The
-/// median as measured, not clamped. `None` with too little history.
+/// makes the next one: `your last 8 FEATURE guesses in giverny took ×0.21
+/// of what you said (median)`. Told, never applied: the figure it gives next
+/// is the figure the pane shows. `None` with too little history.
 pub fn track_record(
     history: &[Record],
     track: Track,
@@ -364,15 +290,8 @@ pub fn track_record(
     let (ratios, words) = level_ratios(history, track, repo, kind)?;
     let n = ratios.len();
     let r = median(ratios);
-    let lean = if r < 0.8 {
-        "they run long: estimate lower"
-    } else if r > 1.25 {
-        "they run short: estimate higher"
-    } else {
-        "about right"
-    };
     Some(format!(
-        "your last {n} {} took ×{r:.2} of what was said (median): {lean}",
+        "your last {n} {} took ×{r:.2} of what you said (median)",
         words.replace("{}", track.noun())
     ))
 }
@@ -488,7 +407,7 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
 pub const MIN_PEAK_SAMPLES: usize = 3;
 
 /// What the most recent tasks like this one peaked at under `giverny orchestrator-session
-/// run`, by the same levels as [`correct`] (repo and kind, repo, all):
+/// run`, by the same levels as [`track_record`] (repo and kind, repo, all):
 /// `the last 4 BUG tasks in demo peaked at 1.8G (median), 2.6G at most`.
 /// A task the cap killed counts at its peak, which is a floor.
 pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<String> {
@@ -605,13 +524,12 @@ mod tests {
     }
 
     #[test]
-    fn too_little_history_leaves_the_guess() {
+    fn too_little_history_tells_nothing() {
         let h: Vec<Record> = (0..MIN_SAMPLES - 1)
             .map(|_| rec("g", Some("BUG"), 30, 10))
             .collect();
-        assert_eq!(correct(&h, Some("g"), Some("BUG"), 1800), None);
-        assert_eq!(correct(&[], None, None, 1800), None);
-        assert_eq!(correct(&h, Some("g"), Some("BUG"), 0), None);
+        assert_eq!(track_record(&h, Track::Guess, Some("g"), Some("BUG")), None);
+        assert_eq!(track_record(&[], Track::Guess, None, None), None);
     }
 
     #[test]
@@ -623,31 +541,27 @@ mod tests {
             h.push(rec("demo", Some("BUG"), 20, 20));
             h.push(rec("acme", Some("BUG"), 10, 20));
         }
-        let c = correct(&h, Some("demo"), Some("FEATURE"), 3000).unwrap();
-        assert_eq!(c.eta_s, 20 * 60);
-        assert_eq!(c.samples, 5);
-        assert_eq!(c.basis, "FEATURE tasks in demo");
-        assert_eq!(c.describe(), "×0.40 from the last 5 FEATURE tasks in demo");
-
+        let told = |repo, kind| track_record(&h, Track::Guess, repo, kind).unwrap();
+        assert_eq!(
+            told(Some("demo"), Some("FEATURE")),
+            "your last 5 FEATURE guesses in demo took ×0.40 of what you said (median)"
+        );
         // No RESEARCH history in demo: repo alone, median of 0.4 and 1.0.
-        let c = correct(&h, Some("demo"), Some("RESEARCH"), 3000).unwrap();
-        assert_eq!(c.basis, "tasks in demo");
-        assert_eq!(c.samples, 10);
-        assert!((c.ratio - 0.7).abs() < 1e-9, "{}", c.ratio);
-        assert_eq!(c.eta_s, 35 * 60);
-
+        assert_eq!(
+            told(Some("demo"), Some("RESEARCH")),
+            "your last 10 guesses in demo took ×0.70 of what you said (median)"
+        );
         // A repo with no history at all: everything (0.4, 1, 2 → 1).
-        let c = correct(&h, Some("planets"), Some("BUG"), 600).unwrap();
-        assert_eq!(c.basis, "tasks");
-        assert_eq!(c.samples, 15);
-        assert_eq!(c.eta_s, 600);
-
-        // No repo known and no kind: straight to everything.
-        assert_eq!(correct(&h, None, Some("BUG"), 600).unwrap().basis, "tasks");
+        assert_eq!(
+            told(Some("planets"), Some("BUG")),
+            "your last 15 guesses took ×1.00 of what you said (median)"
+        );
+        // No repo known: straight to everything.
+        assert_eq!(told(None, Some("BUG")), told(Some("planets"), None));
     }
 
     #[test]
-    fn only_recent_finished_tasks_with_a_guess_count_and_the_ratio_is_held() {
+    fn only_recent_finished_tasks_with_a_guess_count_and_nothing_is_held() {
         let mut h = Vec::new();
         // Twenty old tasks at 3×, then twenty recent ones at 0.5×.
         for _ in 0..RECENT {
@@ -664,19 +578,28 @@ mod tests {
         let mut review = rec("g", None, 10, 5);
         review.outcome = Some("Review — ita".into());
         h.extend([blocked, guessless, review]);
-        let c = correct(&h, Some("g"), None, 600).unwrap();
-        assert_eq!(c.samples, RECENT);
-        assert!((c.ratio - 0.5).abs() < 1e-9);
-        assert_eq!(c.eta_s, 300);
-
-        // A wild history is clamped.
+        assert_eq!(
+            track_record(&h, Track::Guess, Some("g"), None).unwrap(),
+            "your last 20 guesses in g took ×0.50 of what you said (median)"
+        );
+        // A wild history is told as measured.
         let wild: Vec<Record> = (0..5).map(|_| rec("w", None, 10, 1000)).collect();
-        let c = correct(&wild, Some("w"), None, 600).unwrap();
-        assert_eq!(c.ratio, RATIO_MAX);
-        assert_eq!(c.eta_s, 6000);
-        // Never under a minute.
-        let fast: Vec<Record> = (0..5).map(|_| rec("f", None, 100, 1)).collect();
-        assert_eq!(correct(&fast, Some("f"), None, 90).unwrap().eta_s, 60);
+        assert_eq!(
+            track_record(&wild, Track::Guess, Some("w"), None).unwrap(),
+            "your last 5 guesses in w took ×100.00 of what you said (median)"
+        );
+    }
+
+    #[test]
+    fn old_lines_with_a_corrected_start_figure_still_score_the_guess() {
+        // Before giverny#229 the pane counted down from a corrected `eta_s`;
+        // the guess track reads `estimate_s`, the figure as given.
+        let old: Record = serde_json::from_str(
+            r#"{"key":"x","estimate_s":3000,"eta_s":1200,"wall_s":600,"work_s":600,"outcome":"Done"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.eta_s, Some(1200));
+        assert_eq!(Track::Guess.pair(&old), Some((3000, 600)));
     }
 
     /// A task whose worker re-estimated `left_m` after `at_m` worked.
@@ -702,7 +625,6 @@ mod tests {
         .unwrap();
         assert_eq!(Track::Guess.pair(&old), Some((600, 300)));
         assert_eq!(Track::Reestimate.pair(&old), None);
-        assert_eq!(Track::Start.pair(&old), None);
         // A re-estimate made after the work ended teaches nothing.
         assert_eq!(
             Track::Reestimate.pair(&reest("g", "BUG", 60, 20, 20, 5)),
@@ -711,30 +633,18 @@ mod tests {
     }
 
     #[test]
-    fn re_estimates_are_corrected_from_their_own_history() {
+    fn re_estimates_are_told_from_their_own_history() {
         // Guesses run ×0.2; re-estimates run ×1.5 (workers say too little).
         let h: Vec<Record> = (0..6)
             .map(|_| reest("g", "FEATURE", 100, 20, 5, 10))
             .collect();
-        let c = correct_on(&h, Track::Reestimate, Some("g"), Some("FEATURE"), 600).unwrap();
-        assert_eq!(c.eta_s, 900);
-        assert_eq!(
-            c.describe(),
-            "×1.50 from the last 6 FEATURE re-estimates in g"
-        );
-        let c = correct(&h, Some("g"), Some("FEATURE"), 6000).unwrap();
-        assert!((c.ratio - 0.2).abs() < 1e-9);
-        assert_eq!(c.basis, "FEATURE tasks in g");
-
         assert_eq!(
             track_record(&h, Track::Guess, Some("g"), Some("FEATURE")).unwrap(),
-            "your last 6 FEATURE guesses in g took ×0.20 of what was said (median): \
-             they run long: estimate lower"
+            "your last 6 FEATURE guesses in g took ×0.20 of what you said (median)"
         );
         assert_eq!(
             track_record(&h, Track::Reestimate, Some("x"), None).unwrap(),
-            "your last 6 re-estimates took ×1.50 of what was said (median): \
-             they run short: estimate higher"
+            "your last 6 re-estimates took ×1.50 of what you said (median)"
         );
         assert_eq!(track_record(&h[..4], Track::Guess, None, None), None);
     }

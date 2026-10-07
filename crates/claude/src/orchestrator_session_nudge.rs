@@ -263,8 +263,8 @@ mod tests {
         let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
         assert!(
             ask.contains(
-                "For calibration, your last 5 BUG re-estimates in g took ×2.00 of what was \
-                 said (median): they run short: estimate higher"
+                "For calibration, your last 5 BUG re-estimates in g took ×2.00 of what you \
+                 said (median): weigh that in your figure."
             ),
             "{ask}"
         );

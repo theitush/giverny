@@ -27,9 +27,10 @@ choose:
   row and its worker.
 - a **title**: one line saying what the task is. If the project types its
   tasks, start the title with the type word and a colon (`BUG: …`,
-  `FEATURE: …`): estimates are corrected per type.
-- an **estimate** in minutes for how long its worker will take: your honest
-  guess, not one you have already adjusted.
+  `FEATURE: …`): your track record is told per type.
+- an **estimate** in minutes for how long its worker will take, with your
+  track record (below) taken into account. The figure you give is the figure
+  the pane shows.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another.
@@ -51,42 +52,32 @@ Keep the briefs somewhere that outlives the orchestrator session (a scratch dire
 fine); a relative path is stored absolute. If the prompt changes before the
 spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
-Each `plan` (and `start --eta`) prints what the pane will count down from.
-Giverny keeps a history of every task that landed: its estimate, its wall time
-and its working time (wall time less pauses and waits). Once there are enough
+Each `plan` (and `start --eta`) prints the figure the pane will count down
+from, which is the one you gave, and how your past guesses fared. Giverny
+keeps a history of every task that landed: its estimate, its wall time and its
+working time (wall time less pauses and waits). It takes the most recent 20
 landed tasks like this one (same project and type, else same project, else
-all), your guess is scaled by how long such tasks really took against their
-estimates:
+all; five at least) and tells you the median of working time ÷ estimate:
 
 ```
-planned auth-fix: ~12m (you said 25m; ×0.48 from the last 9 BUG tasks in myapp)
+planned auth-fix: ~25m
+  your last 9 BUG guesses in myapp took ×0.48 of what you said (median)
 ```
 
-The pane shows the corrected figure and the row keeps your guess, so the
-guess's own bias stays measurable. Use the corrected figure when you tell the
-user the plan. With too little history it says `as given`. Pass
-`--repo <name>` when the task belongs to a project other than the directory
-you run in.
-
-Under it, `plan` says how your guesses for such tasks have fared:
-
-```
-  your last 9 BUG guesses in myapp took ×0.48 of what was said (median): they run long: estimate lower
-```
-
-Read it before the next guess, and let it move your raw figure too: the
-correction only fixes the bias it has already seen.
+Nothing is corrected for you: take the factor into account in the figure you
+give, and what you give is what the pane shows and what is scored. With too
+little history the second line says so. Pass `--repo <name>` when the task
+belongs to a project other than the directory you run in.
 
 A worker's re-estimate is scored too, on its own track: its first `eta` on a
 running task (the one Giverny asks for five minutes in, after it has read the
-code) goes on the pane as given, not corrected, and is later checked against
-the working time that was still to come. The ask, and the `eta` output, show
-the worker how its kind's re-estimates have fared, so the figure itself
-improves.
+code) goes on the pane as given and is later checked against the working
+time that was still to come. The ask, and the `eta` output, tell the worker
+how its kind's re-estimates have fared, for it to weigh in its figure.
 
 `giverny-orchestrator-session accuracy` (optionally `--repo <name>`) shows every track,
-older tasks against recent: the dispatcher's guess, the pane's corrected
-start figure, and the worker's re-estimate. When the
+older tasks against recent: the dispatcher's guess and the worker's
+re-estimate. When the
 user asks whether estimates are getting better, answer from it.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.

@@ -90,15 +90,15 @@ pass it on every `plan`; `start` fills it in or replaces it. <dur> is minutes (`
 The session is --session, else $CLAUDE_CODE_SESSION_ID (set inside Claude Code).
 The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.
 
-Estimates learn: every landed task appends its estimate, wall time
+Estimates are told, never corrected: the pane counts down from the figure
+given. Every landed task appends its estimate, wall time
 and working time (wall minus pauses and waits) to history.jsonl beside the feeds
 ($GIVERNY_ORCHESTRATOR_SESSION_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
-scale N by the median working-time/estimate ratio of recent tasks of the same
-kind (repo + the title's type word, as `BUG:`), else the repo, else all; the
-pane counts down from that, and both figures are printed, with how such
-guesses have fared. A worker's first `eta` on a running task (its re-estimate,
-made after reading the code) is scored and corrected the same way, against the
-working time that was still to come. `accuracy` shows each track. The plugin's
+print how such guesses have fared: the median working-time/estimate ratio of
+the last 20 tasks of the same kind (repo + the title's type word, as `BUG:`),
+else the repo, else all. A worker's first `eta` on a running task (its
+re-estimate, made after reading the code) is scored and told the same way,
+against the working time that was still to come. `accuracy` shows each track. The plugin's
 hook (`giverny hook`) asks a worker to re-estimate five minutes into its task.
 A subagent that is no task here has an agent ETA instead (`giverny eta`).
 
@@ -159,10 +159,6 @@ pub struct Flags {
     pub why: Option<String>,
     /// The repo the task is from, when the key and directory do not say.
     pub repo: Option<String>,
-    /// Set by [`run_in`], not parsed: the guess as given, before correction,
-    /// and where the correction came from.
-    pub guess_s: Option<u64>,
-    pub basis: Option<String>,
     /// `claim`: what the worker needs.
     pub cpu: Option<u32>,
     pub ram_mb: Option<u64>,
@@ -478,14 +474,14 @@ fn worked_s(row: &Map<String, Value>, now: u64) -> u64 {
         .saturating_sub(u64_of(row, "wait_s").unwrap_or(0) + open_wait)
 }
 
-/// Record the guess as given beside the (perhaps corrected) `eta_s`.
-fn set_guess(row: &mut Map<String, Value>, f: &Flags) {
-    let Some(eta) = f.eta_s else { return };
-    row.insert("eta_guess_s".into(), json!(f.guess_s.unwrap_or(eta)));
-    match &f.basis {
-        Some(b) => row.insert("eta_basis".into(), json!(b)),
-        None => row.remove("eta_basis"),
-    };
+/// A new estimate on a row drops what a row from before giverny#229 kept
+/// beside its corrected `eta_s`: the raw guess and where the correction came
+/// from. `eta_s` is the guess now.
+fn drop_old_guess(row: &mut Map<String, Value>, f: &Flags) {
+    if f.eta_s.is_some() {
+        row.remove("eta_guess_s");
+        row.remove("eta_basis");
+    }
 }
 
 /// `start <task> --agent <worker>` on a worker already running another
@@ -863,7 +859,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
             row.insert("stage".into(), json!("planned"));
             row.insert("eta_s".into(), json!(f.eta_s.unwrap_or(0)));
-            set_guess(row, f);
+            drop_old_guess(row, f);
             set_str(row, "title", &f.title);
             set_str(row, "note", &f.note);
             set_str(row, "brief", &f.brief);
@@ -903,7 +899,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             if let Some(eta) = f.eta_s {
                 row.insert("eta_s".into(), json!(eta));
             }
-            set_guess(row, f);
+            drop_old_guess(row, f);
             set_str(row, "repo", &f.repo);
             set_str(row, "title", &f.title);
             set_str(row, "agent_id", &f.agent);
@@ -929,12 +925,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             // for `eta` to re-estimate, and an error would teach nothing:
             // start one now, with what is left as its estimate. The time
             // the worker spent before this is not known, so the clock starts
-            // here; and the figure is a re-estimate, which (like every `eta`)
-            // is taken as given, not scaled by the history.
+            // here; and the figure is taken as given, as every figure is.
             let mut sf = f.clone();
             sf.eta_s = Some(*left);
-            sf.guess_s = None;
-            sf.basis = None;
             apply(doc, &Cmd::Start(key.clone()), &sf, now)?;
             let rows = rows_mut(doc)?;
             if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut()) {
@@ -949,7 +942,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             Ok(format!(
                 "{key}: no row in this orchestrator session, so started it now with ~{} left \
                  (as given; `giverny orchestrator-session start {key} --eta <min> --agent <id>` \
-                 before the spawn gives a row its whole time and a corrected estimate)",
+                 before the spawn gives a row its whole time)",
                 feed::fmt_span(*left as i64)
             ))
         }
@@ -1106,14 +1099,9 @@ pub fn show(doc: &Value, now: u64) -> String {
                         }
                     )
                 }
-                feed::Stage::Planned => {
-                    let guess = u64_of(r, "eta_guess_s")
-                        .filter(|g| Some(*g) != eta)
-                        .map(|g| format!(" (said {})", feed::fmt_span(g as i64)))
-                        .unwrap_or_default();
-                    eta.map(|e| format!("~{}{guess}", feed::fmt_span(e as i64)))
-                        .unwrap_or_default()
-                }
+                feed::Stage::Planned => eta
+                    .map(|e| format!("~{}", feed::fmt_span(e as i64)))
+                    .unwrap_or_default(),
                 feed::Stage::Done => {
                     let took = started
                         .zip(ms_of(r, "ended"))
@@ -1525,7 +1513,7 @@ fn run_feed(
             obj.entry("session").or_insert(json!(session));
             let history = orchestrator_session_history::path(dir);
             let mut flags = flags.clone();
-            let said = correct_estimate(&doc, cmd, &mut flags, history.as_deref());
+            let said = tell_record(&doc, cmd, &mut flags, history.as_deref());
             if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
                 && needs_description(&doc, now)
             {
@@ -1604,20 +1592,18 @@ fn no_brief(key: &str) -> String {
     )
 }
 
-/// `plan`/`start` with `--eta N`: scale N from the history.
-/// Sets `flags.eta_s` to the corrected figure, keeping N as `guess_s`, and
-/// fills in the repo the row will remember. A worker's first `eta` on a
-/// Running row is its re-estimate, scaled from the re-estimates' own history
-/// into `flags.left_s`. Returns what to add to the command's
-/// line (both numbers, and how such estimates fared), or `None` for a
-/// command with no estimate.
-fn correct_estimate(
+/// `plan`/`start` with `--eta N`, and a worker's first `eta` on a Running
+/// row (its re-estimate): how such estimates have fared, from the history,
+/// told and never applied — the figure given is the figure stored and shown.
+/// Also fills in the repo the row will remember. Returns what to add to the
+/// command's line, or `None` for a command with no estimate.
+fn tell_record(
     doc: &Value,
     cmd: &Cmd,
     flags: &mut Flags,
     history: Option<&Path>,
 ) -> Option<String> {
-    let (key, track, guess) = match cmd {
+    let (key, track, given) = match cmd {
         Cmd::Plan(key) | Cmd::Start(key) => (
             key,
             orchestrator_session_history::Track::Guess,
@@ -1636,7 +1622,7 @@ fn correct_estimate(
             stage_of(r) == Some(feed::Stage::Running) && !r.contains_key("reest_s")
         })
     {
-        // Not a first re-estimate: a later one, or a plan's, is as given.
+        // Not a first re-estimate: a later one, or a plan's, is not scored.
         return None;
     }
     let row_str = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
@@ -1652,38 +1638,15 @@ fn correct_estimate(
         .map(orchestrator_session_history::load)
         .unwrap_or_default();
     let (repo, kind) = (flags.repo.as_deref(), kind.as_deref());
-    let fix = orchestrator_session_history::correct(&past, repo, kind, guess);
-    let record = orchestrator_session_history::track_record(&past, track, repo, kind)
-        .map(|r| format!("\n  {r}"))
-        .unwrap_or_default();
-    let span = |s: u64| feed::fmt_span(s as i64);
+    let record = orchestrator_session_history::track_record(&past, track, repo, kind);
     if track == orchestrator_session_history::Track::Reestimate {
-        // Told, not corrected: the figure stands.
-        return (!record.is_empty()).then_some(record);
+        return record.map(|r| format!("\n  {r}"));
     }
-    flags.guess_s = Some(guess);
-    Some(match fix {
-        Some(c) => {
-            flags.eta_s = Some(c.eta_s);
-            flags.basis = Some(c.describe());
-            format!(
-                ": ~{} (you said {}; {}){record}",
-                span(c.eta_s),
-                span(guess),
-                c.describe()
-            )
-        }
-        None => {
-            flags.basis = None;
-            let n = past.len();
-            format!(
-                ": ~{} as given ({} landed task{} in the history, too few to correct it)",
-                span(guess),
-                n,
-                if n == 1 { "" } else { "s" }
-            )
-        }
-    })
+    let told = record.unwrap_or_else(|| {
+        let n = past.len();
+        format!("too few landed tasks to tell how such guesses fare ({n} in the history)")
+    });
+    Some(format!(": ~{}\n  {told}", feed::fmt_span(given as i64)))
 }
 
 /// `accuracy`: the history's report.
@@ -1757,6 +1720,8 @@ pub fn record_of(
         title,
         repo: s("repo"),
         session: Some(session.to_string()),
+        // `eta_guess_s`: the raw guess a row from before giverny#229 kept
+        // beside its corrected `eta_s`.
         estimate_s: u64_of(r, "eta_guess_s")
             .or_else(|| u64_of(r, "eta_first_s"))
             .or_else(|| u64_of(r, "eta_s")),
@@ -1993,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workers_first_re_estimate_is_kept_corrected_and_learned() {
+    fn a_workers_first_re_estimate_is_kept_told_and_learned() {
         let dir = scratch("reest");
         let h = dir.join(orchestrator_session_history::FILE);
         // Past FEATURE re-estimates in demo ran ×1.5: 10m said, 15m taken.
@@ -2026,7 +1991,7 @@ mod tests {
         assert_eq!(
             said,
             "demo#9: ~10m left\n  your last 5 FEATURE re-estimates in demo took \
-             ×1.50 of what was said (median): they run short: estimate higher"
+             ×1.50 of what you said (median)"
         );
         let row = |k: &str| {
             let doc: Value =
@@ -2104,7 +2069,7 @@ mod tests {
         assert_eq!(r.key, "acme#613");
         assert_eq!(r.stage(), feed::Stage::Running);
         assert_eq!(r.started_ms, Some(T0));
-        assert_eq!(r.eta_s, Some(40 * 60), "as given, not corrected");
+        assert_eq!(r.eta_s, Some(40 * 60), "as given");
         assert_eq!(r.title.as_deref(), Some("Graph"));
         assert_eq!(r.agent_id.as_deref(), Some("w9"));
         assert!(r.follows_worker, "no dispatcher lands it");
@@ -2272,8 +2237,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_and_start_correct_the_guess_from_history_and_keep_it() {
-        let dir = scratch("correct");
+    fn plan_and_start_keep_the_guess_and_tell_how_such_guesses_fared() {
+        let dir = scratch("told");
         std::fs::create_dir_all(&dir).unwrap();
         let h = dir.join(orchestrator_session_history::FILE);
         // Five landed demo BUGs that took half their guess, and five
@@ -2297,46 +2262,62 @@ mod tests {
         flags.title = Some("BUG: pane flickers".into());
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         assert_eq!(
-            said.lines().next().unwrap(),
-            "planned demo#1: ~20m (you said 40m; ×0.50 from the last 5 BUG tasks in demo)"
+            said.lines().take(2).collect::<Vec<_>>(),
+            [
+                "planned demo#1: ~40m",
+                "  your last 5 BUG guesses in demo took ×0.50 of what you said (median)"
+            ]
         );
         let doc: Value =
             serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
         let row = &doc["rows"][0];
-        assert_eq!(
-            row["eta_s"], 1200,
-            "the pane counts down from the corrected figure"
-        );
-        assert_eq!(row["eta_guess_s"], 2400, "the raw guess is kept");
+        assert_eq!(row["eta_s"], 2400, "the pane counts down from the guess");
+        assert!(row.get("eta_guess_s").is_none() && row.get("eta_basis").is_none());
         assert_eq!(row["repo"], "demo");
-        assert!(run(&dir, "show", T0).unwrap().contains("~20m (said 40m)"));
+        let shown = run(&dir, "show", T0).unwrap();
+        assert!(shown.contains("~40m") && !shown.contains("said"), "{shown}");
 
-        // `start --eta` re-corrects; a FEATURE title picks its own level.
+        // `start --eta` tells again; a FEATURE title picks its own level.
         let (cmd, mut flags) = parse_args(&args("start demo#2 --eta 40")).unwrap();
         flags.title = Some("FEATURE: estimates".into());
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
+        assert!(said.starts_with("started demo#2: ~40m\n"), "{said}");
         assert!(
-            said.lines()
-                .next()
-                .unwrap()
-                .ends_with("~10m (you said 40m; ×0.25 from the last 5 FEATURE tasks in demo)"),
+            said.contains("your last 5 FEATURE guesses in demo took ×0.25"),
             "{said}"
         );
 
         // Another repo: everything (0.25 ×5, 0.5 ×5 → 0.375).
         let said = run(&dir, "plan acme#3 --eta 40", T0).unwrap();
         assert!(
-            said.lines()
-                .next()
-                .unwrap()
-                .ends_with("~15m (you said 40m; ×0.38 from the last 10 tasks)"),
+            said.contains("your last 10 guesses took ×0.38 of what you said (median)"),
             "{said}"
         );
 
-        // No history: the guess stands, and says so.
-        let empty = scratch("correct-empty");
+        // A row planned before giverny#229 kept its raw guess beside a
+        // corrected `eta_s`; a new estimate drops both old fields.
+        let file = feed::feed_path(&dir, "s1");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        doc["rows"][0]["eta_s"] = json!(1200);
+        doc["rows"][0]["eta_guess_s"] = json!(2400);
+        doc["rows"][0]["eta_basis"] = json!("×0.50 from the last 5 BUG tasks in demo");
+        std::fs::write(&file, serde_json::to_vec(&doc).unwrap()).unwrap();
+        run(&dir, "plan demo#1 --eta 30", T0).unwrap();
+        let doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let row = &doc["rows"][0];
+        assert_eq!(row["eta_s"], 1800);
+        assert!(row.get("eta_guess_s").is_none() && row.get("eta_basis").is_none());
+
+        // No history: the guess stands, and the line says there is too little.
+        let empty = scratch("told-empty");
         let said = run(&empty, "plan a --eta 40", T0).unwrap();
-        assert!(said.contains("~40m as given (0 landed tasks"), "{said}");
+        assert!(
+            said.starts_with(
+                "planned a: ~40m\n  too few landed tasks to tell how such guesses fare \
+                 (0 in the history)"
+            ),
+            "{said}"
+        );
         let r = &read_feed(&empty).rows[0];
         assert_eq!(r.eta_s, Some(2400));
         let _ = std::fs::remove_dir_all(&dir);
