@@ -146,7 +146,16 @@ pub fn looks_like_account(dir: &Path) -> bool {
     }
     let has_transcripts =
         std::fs::read_dir(dir.join("projects")).is_ok_and(|mut entries| entries.next().is_some());
-    has_transcripts || read_identity(dir) != (None, None)
+    has_transcripts || has_oauth_account(dir)
+}
+
+/// Does the identity file hold an `oauthAccount` at all? Its fields can be
+/// missing; the entry is what a login writes.
+fn has_oauth_account(config_dir: &Path) -> bool {
+    std::fs::read(identity_path(config_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeJson>(&bytes).ok())
+        .is_some_and(|parsed| parsed.oauth_account.is_some())
 }
 
 /// Directories that could plausibly hold an account, without walking $HOME.
