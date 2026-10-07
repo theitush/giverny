@@ -1046,7 +1046,10 @@ fn format_row(
     // A feed row's key and title; a live-only row's name and description.
     let (id, title) = match (f, l) {
         (Some(f), _) => (
-            shown_key(f),
+            Some(shown_key(f))
+                .filter(|k| !k.is_empty())
+                .or_else(|| l.and_then(|l| l.model.as_deref()).and_then(short_model))
+                .unwrap_or_default(),
             f.title
                 .clone()
                 .or_else(|| l.map(|l| l.display_name().to_string()))
@@ -1054,7 +1057,10 @@ fn format_row(
         ),
         (None, Some(l)) => match (&l.name, &l.description) {
             (Some(n), Some(d)) => (n.clone(), d.clone()),
-            _ => (String::new(), l.display_name().to_string()),
+            _ => (
+                l.model.as_deref().and_then(short_model).unwrap_or_default(),
+                l.display_name().to_string(),
+            ),
         },
         (None, None) => (String::new(), String::new()),
     };
@@ -1264,6 +1270,16 @@ fn no_eta_hint(key: &str, agent_id: Option<&str>) -> String {
 /// A feed row's key as the TASK column shows it: none for the
 /// `agent-<id>` a worker with no task once started its own row under
 /// (giverny#158's first round), which names nothing a person knows.
+/// A model id in Claude Code's short names (`haiku`, `sonnet`, `opus`,
+/// `fable`), without version or date; None for a name of no known family.
+fn short_model(m: &str) -> Option<String> {
+    let m = m.to_ascii_lowercase();
+    ["haiku", "sonnet", "opus", "fable"]
+        .into_iter()
+        .find(|f| m.contains(f))
+        .map(str::to_string)
+}
+
 fn shown_key(f: &feed::FeedRow) -> String {
     let made_up = f.follows_worker
         && f.key
@@ -2434,6 +2450,39 @@ mod tests {
             r#"{"rows":[{"key":"agent-x1","stage":"running","agent_id":"adfb891dbd4470353"}]}"#,
         );
         assert_eq!(build(Some(&f), &rows, T0).lines[0].id, "agent-x1");
+    }
+
+    #[test]
+    fn short_model_names() {
+        assert_eq!(
+            short_model("claude-haiku-4-5-20251001").as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(short_model("claude-opus-5[1m]").as_deref(), Some("opus"));
+        assert_eq!(short_model("Sonnet").as_deref(), Some("sonnet"));
+        assert_eq!(short_model("claude-fable-1").as_deref(), Some("fable"));
+        assert_eq!(short_model("m"), None);
+    }
+
+    #[test]
+    fn an_untasked_row_shows_its_model_and_a_tasked_one_its_key() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[{"id":"adfb891dbd4470353","status":"running",
+                "description":"Classify chunk 0","startTime":1789999700000,
+                "model":"claude-haiku-4-5-20251001"}]}"#,
+        );
+        // No feed: the model stands in for the missing name.
+        assert_eq!(build(None, &rows, T0).lines[0].id, "haiku");
+        // A made-up feed key: the same.
+        let f = feed(
+            r#"{"rows":[{"key":"agent-adfb891d","stage":"running","follows_worker":true,
+               "agent_id":"adfb891dbd4470353"}]}"#,
+        );
+        assert_eq!(build(Some(&f), &rows, T0).lines[0].id, "haiku");
+        // A tasked row keeps its key.
+        let f =
+            feed(r#"{"rows":[{"key":"g#3","stage":"running","agent_id":"adfb891dbd4470353"}]}"#);
+        assert_eq!(build(Some(&f), &rows, T0).lines[0].id, "g#3");
     }
 
     #[test]
