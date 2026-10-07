@@ -196,10 +196,13 @@ pub struct ClaudeWatch {
     /// Background agents across every account — the Claudes with no tab.
     /// One a tab shows is left out ([`ClaudeWatch::shown_in_a_tab`]).
     pub jobs: Vec<Job>,
-    /// Which tab shows each background job, by its short id: the tab whose
-    /// claude parked on it, from the last registry scan. A job's hooks
-    /// carry its id, not a tab's (giverny#242).
-    parked: HashMap<String, TabId>,
+    /// The job each tab's claude parked on (`parkedJobId`), from the last
+    /// registry scan: that claude is a client of the background daemon.
+    parked: HashMap<TabId, String>,
+    /// Which tab shows each background job now, by the job's short id
+    /// ([`jobs_on_screen`]). A job's hooks carry its id, not a tab's
+    /// (giverny#242).
+    viewing: HashMap<String, TabId>,
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
@@ -377,6 +380,46 @@ fn reset_time(window: &serde_json::Value) -> Option<jiff::Timestamp> {
     None
 }
 
+/// Which tab shows each background job, by the job's short id.
+///
+/// A claude parked on a job (`parked`, by tab) is a client of the daemon,
+/// and Claude Code's agents view switches it between jobs without saying so
+/// anywhere on disk: `parkedJobId` keeps naming the first. What does follow
+/// the switch is the tab's title, which Claude Code sets to the shown
+/// session's name. So: the one live job named as the title says, else the
+/// parked one; of several by that name, the parked one or else the most
+/// recently active.
+pub fn jobs_on_screen(
+    parked: &HashMap<TabId, String>,
+    titles: &HashMap<TabId, String>,
+    jobs: &[Job],
+) -> HashMap<String, TabId> {
+    let mut out = HashMap::new();
+    for (&tab, parked_on) in parked {
+        let title = titles.get(&tab).map(|t| bare_title(t)).unwrap_or_default();
+        let named: Vec<&Job> = jobs
+            .iter()
+            .filter(|j| j.live && !title.is_empty() && j.name == title)
+            .collect();
+        let shown = named
+            .iter()
+            .find(|j| &j.id == parked_on)
+            .or(named.first())
+            .map(|j| j.id.clone())
+            .unwrap_or_else(|| parked_on.clone());
+        out.insert(shown, tab);
+    }
+    out
+}
+
+/// A tab title without the status glyph Claude Code puts before the
+/// session's name (`✳`, `◐`, a braille spinner).
+fn bare_title(title: &str) -> &str {
+    title
+        .trim_start_matches(|c: char| c.is_whitespace() || (!c.is_ascii() && !c.is_alphanumeric()))
+        .trim_end()
+}
+
 impl ClaudeWatch {
     /// `config_read` is false when Giverny's config file could not be parsed:
     /// then the startup pass that brings accounts' hook paths and statusline
@@ -424,6 +467,7 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            viewing: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
@@ -533,14 +577,14 @@ impl ClaudeWatch {
     /// The tab a message is for: the one it names, or the one showing the
     /// background job it came from.
     pub fn tab_of(&self, msg: &RelayMsg) -> Option<TabId> {
-        Self::tab_id_of(msg).or_else(|| self.parked.get(msg.job.as_deref()?).copied())
+        Self::tab_id_of(msg).or_else(|| self.viewing.get(msg.job.as_deref()?).copied())
     }
 
-    /// Does a tab show this background job — parked on it, or holding its
+    /// Does a tab show this background job — viewing it, or holding its
     /// conversation? Then it is the tab's, not one more agent in the
     /// background list (giverny#243).
     fn shown_in_a_tab(&self, job: &Job) -> bool {
-        self.parked.contains_key(&job.id)
+        self.viewing.contains_key(&job.id)
             || self.tabs.values().any(|tab| {
                 tab.session_id.as_deref().is_some_and(|sid| {
                     job.session_id.as_deref() == Some(sid)
@@ -613,6 +657,7 @@ impl ClaudeWatch {
                     tab_id,
                     msg.event.get("source").and_then(|v| v.as_str()),
                     msg.session_id(),
+                    config_dir.clone(),
                 );
                 effects
                     .captured
@@ -734,11 +779,29 @@ impl ClaudeWatch {
             // Finished agents drop off: the list is what still wants
             // watching, not a record of everything that ever ran.
             let jobs = jobs::scan(dirs);
-            // A tab parked on a job shows the conversation the job holds
-            // now, whatever hooks it missed (giverny#242).
+            self.viewing = jobs_on_screen(&self.parked, titles, &jobs);
+            // A tab showing a job holds the conversation the job holds now,
+            // whatever hooks it missed: its pane follows it, and a restart
+            // resumes it, which attaches to the job (giverny#242).
             for job in &jobs {
-                if let (Some(tab), Some(sid)) = (self.parked.get(&job.id), job.resume_target()) {
-                    self.agents.job_holds(*tab, sid);
+                let (Some(&tab), Some(sid)) = (self.viewing.get(&job.id), job.resume_target())
+                else {
+                    continue;
+                };
+                self.agents.job_holds(
+                    tab,
+                    sid,
+                    job.forked_from.as_deref(),
+                    Some(job.config_dir.clone()),
+                );
+                let entry = self.tabs.entry(tab).or_default();
+                if entry.session_id.as_deref() != Some(sid) {
+                    entry.session_id = Some(sid.to_string());
+                    effects.captured.push((
+                        tab,
+                        Some(sid.to_string()),
+                        Some(job.config_dir.clone()),
+                    ));
                 }
             }
             self.jobs = jobs
@@ -795,7 +858,7 @@ impl ClaudeWatch {
                     continue;
                 };
                 if let Some(job) = &live.entry.parked_job_id {
-                    self.parked.insert(job.clone(), tab_id);
+                    self.parked.insert(tab_id, job.clone());
                 }
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
@@ -806,14 +869,21 @@ impl ClaudeWatch {
                 // for sessions that started *after* they were installed —
                 // every older session would otherwise be lost on restart
                 // despite the registry naming it the whole time.
-                if entry.session_id.as_deref() != Some(live.entry.session_id.as_str()) {
-                    effects.captured.push((
-                        tab_id,
-                        Some(live.entry.session_id.clone()),
-                        Some(live.config_dir.clone()),
-                    ));
+                //
+                // Not for a claude parked on a background job: the id it
+                // registered is the conversation it handed over, and
+                // resuming that forks it into another job. The tab holds
+                // what the job it shows holds, set by the jobs pass.
+                if live.entry.parked_job_id.is_none() {
+                    if entry.session_id.as_deref() != Some(live.entry.session_id.as_str()) {
+                        effects.captured.push((
+                            tab_id,
+                            Some(live.entry.session_id.clone()),
+                            Some(live.config_dir.clone()),
+                        ));
+                    }
+                    entry.session_id = Some(live.entry.session_id.clone());
                 }
-                entry.session_id = Some(live.entry.session_id.clone());
                 entry.session_name = live.entry.name.clone();
                 if account.is_some() {
                     entry.account = account;
@@ -1407,6 +1477,7 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            viewing: HashMap::new(),
             accounts: Vec::new(),
             hooks_installed: true,
             hook_rx: None,
@@ -1593,7 +1664,7 @@ mod tests {
             "no tab is parked on the job yet"
         );
 
-        w.parked.insert("34c55b2c".into(), TAB);
+        w.viewing.insert("34c55b2c".into(), TAB);
         let fx = feed(&mut w, &clear, None);
         let t = w.agents.tracker(TAB).unwrap();
         assert!(t.is_empty(), "the job's /clear empties its tab's pane");
@@ -1621,17 +1692,74 @@ mod tests {
             config_dir: "/c".into(),
             live: true,
             pinned: false,
+            forked_from: None,
         };
         let parked = job("34c55b2c", "s-parked");
         let held = job("0a1f39b3", "s-held");
         let alone = job("29ab7872", "s-alone");
         assert!(!w.shown_in_a_tab(&parked));
 
-        w.parked.insert("34c55b2c".into(), TAB);
+        w.viewing.insert("34c55b2c".into(), TAB);
         w.tabs.entry(TabId(8)).or_default().session_id = Some("s-held".into());
         assert!(w.shown_in_a_tab(&parked), "parked on in a tab");
         assert!(w.shown_in_a_tab(&held), "its conversation is a tab's");
         assert!(!w.shown_in_a_tab(&alone), "no tab shows it");
+    }
+
+    /// Claude Code's agents view switches a parked claude between jobs and
+    /// says so only in the tab's title: the job named there is the one on
+    /// screen, the parked one when none is.
+    #[test]
+    fn the_job_on_screen_is_the_one_the_title_names() {
+        let job = |id: &str, name: &str, live: bool| Job {
+            id: id.into(),
+            name: name.into(),
+            state: giverny_claude::jobs::JobState::Working,
+            detail: None,
+            tasks: 0,
+            queued: 0,
+            cwd: None,
+            session_id: None,
+            resume_session_id: None,
+            updated_at_ms: 0,
+            config_dir: "/c".into(),
+            live,
+            pinned: false,
+            forked_from: None,
+        };
+        let jobs = [
+            job("970bf052", "Open bugs in panel/orchestrator (2)", true),
+            job("34c55b2c", "Open bugs in panel/orchestrator", true),
+            job("29ab7872", "Winversion", false),
+        ];
+        let parked: HashMap<TabId, String> = [(TAB, "970bf052".to_string())].into();
+        let on = |title: &str| {
+            let titles: HashMap<TabId, String> = [(TAB, title.to_string())].into();
+            let mut v: Vec<(String, TabId)> = jobs_on_screen(&parked, &titles, &jobs)
+                .into_iter()
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(
+            on("◐ Open bugs in panel/orchestrator"),
+            [("34c55b2c".into(), TAB)]
+        );
+        assert_eq!(
+            on("✳ Open bugs in panel/orchestrator (2)"),
+            [("970bf052".into(), TAB)]
+        );
+        assert_eq!(
+            on("⠂ Winversion"),
+            [("970bf052".into(), TAB)],
+            "not a live job"
+        );
+        assert_eq!(
+            on("~/giverny"),
+            [("970bf052".into(), TAB)],
+            "the parked one"
+        );
+        assert_eq!(bare_title("⠐ ✳ Name (2) "), "Name (2)");
     }
 
     fn session(status: &str) -> giverny_claude::registry::SessionEntry {

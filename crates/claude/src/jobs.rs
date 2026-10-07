@@ -95,6 +95,10 @@ pub struct Job {
     pub config_dir: PathBuf,
     /// The daemon is running a worker for it right now.
     pub live: bool,
+    /// The conversation the job was resumed from, for a job started by
+    /// resuming one (`/resume`, `claude --resume` handed to the daemon): its
+    /// earlier workers live under that id, not the job's own.
+    pub forked_from: Option<String>,
     pub pinned: bool,
 }
 
@@ -128,6 +132,36 @@ struct Roster {
 struct RosterWorker {
     #[serde(default)]
     pid: u32,
+    #[serde(default)]
+    dispatch: Option<Dispatch>,
+}
+
+/// How the daemon started a worker, as far as it matters here.
+#[derive(Debug, Deserialize)]
+struct Dispatch {
+    #[serde(default)]
+    launch: Option<Launch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Launch {
+    #[serde(default)]
+    mode: String,
+    /// The conversation resumed: an id, or the path of its transcript.
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
+}
+
+impl RosterWorker {
+    fn forked_from(&self) -> Option<String> {
+        let launch = self.dispatch.as_ref()?.launch.as_ref()?;
+        if launch.mode != "resume" {
+            return None;
+        }
+        let named = launch.session_id.as_deref()?.trim();
+        let stem = Path::new(named).file_stem()?.to_string_lossy().into_owned();
+        (!stem.is_empty()).then_some(stem)
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -152,20 +186,24 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Ids the daemon is currently running a worker for, with a live process.
-fn live_ids(config_dir: &Path) -> Vec<String> {
+/// The jobs the daemon is currently running a worker for, with a live
+/// process, each with the conversation it was resumed from.
+fn live_workers(config_dir: &Path) -> HashMap<String, Option<String>> {
     let path = config_dir.join("daemon").join("roster.json");
     let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
+        return HashMap::new();
     };
     let Ok(roster) = serde_json::from_slice::<Roster>(&bytes) else {
-        return Vec::new();
+        return HashMap::new();
     };
     roster
         .workers
         .into_iter()
         .filter(|(_, w)| pid_alive(w.pid))
-        .map(|(id, _)| id)
+        .map(|(id, w)| {
+            let from = w.forked_from();
+            (id, from)
+        })
         .collect()
 }
 
@@ -188,7 +226,7 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
         let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
             continue;
         };
-        let live = live_ids(&dir);
+        let live = live_workers(&dir);
         let pinned = pinned_ids(&dir);
         for entry in entries.flatten() {
             let path = entry.path();
@@ -215,7 +253,8 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
                 session_id: as_str(&v, "sessionId"),
                 resume_session_id: as_str(&v, "resumeSessionId"),
                 updated_at_ms: as_millis(&v, "updatedAt"),
-                live: live.contains(&id),
+                live: live.contains_key(&id),
+                forked_from: live.get(&id).cloned().flatten(),
                 pinned: pinned.contains(&id),
                 config_dir: dir.clone(),
                 id,
@@ -320,6 +359,39 @@ mod tests {
         // about which ones survive.
         watching.sort_unstable();
         assert_eq!(watching, ["aaaa1111", "bbbb2222"]);
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// A job the daemon started by resuming a conversation says which one:
+    /// its earlier workers are that conversation's (giverny#242).
+    #[test]
+    fn a_resumed_job_names_the_conversation_it_came_from() {
+        let config = scratch("forked");
+        write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
+        write_job(&config, "bbbb2222", r#"{ "state": "working" }"#);
+        write_job(&config, "cccc3333", r#"{ "state": "working" }"#);
+        let me = std::process::id();
+        std::fs::create_dir_all(config.join("daemon")).unwrap();
+        std::fs::write(
+            config.join("daemon").join("roster.json"),
+            format!(
+                r#"{{"workers":{{
+                    "aaaa1111":{{"pid":{me},"dispatch":{{"launch":{{"mode":"resume",
+                        "sessionId":"/home/u/.claude/projects/-w/db5efe33-5a12.jsonl","fork":true}}}}}},
+                    "bbbb2222":{{"pid":{me},"dispatch":{{"launch":{{"mode":"resume","sessionId":"abc-1"}}}}}},
+                    "cccc3333":{{"pid":{me},"dispatch":{{"launch":{{"mode":"prompt","args":[]}}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let jobs = scan([config.clone()]);
+        let from = |id: &str| {
+            jobs.iter()
+                .find(|j| j.id == id)
+                .and_then(|j| j.forked_from.clone())
+        };
+        assert_eq!(from("aaaa1111").as_deref(), Some("db5efe33-5a12"));
+        assert_eq!(from("bbbb2222").as_deref(), Some("abc-1"));
+        assert_eq!(from("cccc3333"), None, "a prompt starts a new one");
         let _ = std::fs::remove_dir_all(&config);
     }
 

@@ -21,7 +21,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use giverny_claude::subagents::{LiveSnapshot, Stage, Tracker};
+use giverny_claude::subagents::{
+    LiveSnapshot, Stage, Tracker, conversation_root, session_transcript,
+};
 use giverny_core::tabs::TabId;
 use serde::{Deserialize, Serialize};
 
@@ -165,9 +167,28 @@ impl AgentsLive {
     /// turn. Every path that loads an existing conversation raises `resume`,
     /// or `fork` when the id changes — the switch recorded in real
     /// transcripts as `SessionStart:fork`.
-    pub fn session_started(&mut self, tab: TabId, source: Option<&str>, session_id: Option<&str>) {
+    ///
+    /// A tab with no table yet gets one for any start that carries a
+    /// conversation in — a `resume`, a `fork` — bound to it, so its finished
+    /// workers show from disk on the next refresh instead of waiting for a
+    /// live one (giverny#242). `config_dir` is the account it runs under.
+    pub fn session_started(
+        &mut self,
+        tab: TabId,
+        source: Option<&str>,
+        session_id: Option<&str>,
+        config_dir: Option<PathBuf>,
+    ) {
         self.up.insert(tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
+            if let Some(sid) = session_id
+                && !matches!(source, Some("clear" | "startup"))
+            {
+                let mut fresh = Tracker::new(config_dir.or_else(default_config_dir));
+                fresh.set_session(sid);
+                self.trackers.insert(tab, fresh);
+                self.dirty = true;
+            }
             return;
         };
         let elsewhere = session_id.is_some_and(|sid| tracker.continues(sid) == Some(false));
@@ -184,24 +205,71 @@ impl AgentsLive {
     }
 
     /// `tab` shows a background job now holding conversation `session` —
-    /// what the job's own `state.json` says, needing no hook. A conversation
-    /// the table's is not (a `/clear` whose hook never reached the tab,
-    /// giverny#242) starts the table over, bound to it; the same one re-id'd
-    /// is recorded beside the old id.
-    pub fn job_holds(&mut self, tab: TabId, session: &str) {
+    /// what the job's own `state.json` says, needing no hook — resumed from
+    /// `origin`, whose earlier workers are the job's history until the job
+    /// starts a conversation of its own. A conversation the table's is not (a
+    /// `/clear` whose hook never reached the tab, a switch to another job)
+    /// starts the table over, bound to it; the same one re-id'd is recorded
+    /// beside the old id. A tab with no table gets one (giverny#242).
+    pub fn job_holds(
+        &mut self,
+        tab: TabId,
+        session: &str,
+        origin: Option<&str>,
+        config_dir: Option<PathBuf>,
+    ) {
+        let config = self
+            .trackers
+            .get(&tab)
+            .and_then(|t| t.config_dir.clone())
+            .or(config_dir)
+            .or_else(default_config_dir);
+        // The origin is this conversation's past only while the session has
+        // no root of its own, or the same root: a `/clear` in the job starts
+        // one that owes the origin nothing.
+        let origin = origin.filter(|o| {
+            *o != session
+                && config.as_deref().is_none_or(|c| {
+                    let root =
+                        |sid: &str| session_transcript(c, sid).and_then(|p| conversation_root(&p));
+                    root(session).is_none_or(|r| root(o) == Some(r))
+                })
+        });
+        let fresh = |config: Option<PathBuf>| {
+            let mut t = Tracker::new(config);
+            if let Some(o) = origin {
+                t.set_session(o);
+            }
+            t.set_session(session);
+            t
+        };
         let Some(tracker) = self.trackers.get_mut(&tab) else {
+            self.trackers.insert(tab, fresh(config));
+            self.dirty = true;
             return;
         };
-        match tracker.continues(session) {
-            Some(false) => {
-                let mut fresh = Tracker::new(tracker.config_dir.clone());
-                fresh.set_session(session);
-                *tracker = fresh;
-            }
-            Some(true) if tracker.session_id.as_deref() != Some(session) => {
+        let probe = tracker
+            .continues(session)
+            .or_else(|| origin.and_then(|o| tracker.continues(o)));
+        match probe {
+            Some(false) => *tracker = fresh(config),
+            Some(true) => {
+                let known = |t: &Tracker, sid: &str| {
+                    t.session_id.as_deref() == Some(sid) || t.aliases.iter().any(|a| a == sid)
+                };
+                if tracker.session_id.as_deref() == Some(session)
+                    && origin.is_none_or(|o| known(tracker, o))
+                {
+                    return;
+                }
+                if let Some(o) = origin
+                    && !known(tracker, o)
+                {
+                    tracker.set_session(o);
+                }
                 tracker.set_session(session);
             }
-            _ => return,
+            None => return,
         }
         self.dirty = true;
     }
@@ -360,12 +428,12 @@ mod tests {
         let mut live = AgentsLive::in_memory();
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
 
-        live.session_started(TAB, Some("resume"), Some("s2"));
+        live.session_started(TAB, Some("resume"), Some("s2"), None);
         let t = live.tracker(TAB).unwrap();
         assert_eq!(t.rows().len(), 1, "a resume keeps the rows");
         assert_eq!(t.aliases, vec!["s1".to_string()]);
 
-        live.session_started(TAB, Some("clear"), Some("s3"));
+        live.session_started(TAB, Some("clear"), Some("s3"), None);
         let t = live.tracker(TAB).unwrap();
         assert!(t.is_empty(), "/clear empties the table");
         assert_eq!(t.session_id.as_deref(), Some("s3"));
@@ -373,8 +441,14 @@ mod tests {
         assert_eq!(t.config_dir.as_deref(), Some(Path::new("/nowhere")));
 
         // A session start in a tab with no workers creates nothing.
-        live.session_started(TabId(9), Some("clear"), Some("x"));
+        live.session_started(TabId(9), Some("clear"), Some("x"), None);
         assert!(live.tracker(TabId(9)).is_none());
+        // A resume brings a conversation in: its table is made, so its
+        // finished workers show from disk (giverny#242).
+        live.session_started(TabId(9), Some("resume"), Some("y"), Some("/c".into()));
+        let t = live.tracker(TabId(9)).expect("a resume makes the table");
+        assert_eq!(t.session_id.as_deref(), Some("y"));
+        assert_eq!(t.config_dir.as_deref(), Some(Path::new("/c")));
     }
 
     /// Quitting claude and starting a fresh one in the tab
@@ -389,7 +463,7 @@ mod tests {
         assert_eq!(live.tracker(TAB).unwrap().rows().len(), 1, "a Done row");
 
         for (source, sid) in [("fork", "s2"), ("resume", "s3"), ("compact", "s4")] {
-            live.session_started(TAB, Some(source), Some(sid));
+            live.session_started(TAB, Some(source), Some(sid), None);
             let t = live.tracker(TAB).unwrap();
             assert_eq!(t.rows().len(), 1, "{source} keeps the rows");
             assert_eq!(t.session_id.as_deref(), Some(sid));
@@ -397,7 +471,7 @@ mod tests {
         assert_eq!(live.tracker(TAB).unwrap().aliases, ["s1", "s2", "s3"]);
 
         live.session_ended(TAB);
-        live.session_started(TAB, Some("startup"), Some("n1"));
+        live.session_started(TAB, Some("startup"), Some("n1"), None);
         let t = live.shown(TAB).expect("the new session is up");
         assert!(t.is_empty(), "a fresh claude shows an empty pane");
         assert_eq!(t.session_id.as_deref(), Some("n1"));
@@ -460,19 +534,35 @@ mod tests {
         let mut live = AgentsLive::in_memory();
         live.apply_live(TAB, Some(config.clone()), &tick_json("old", &["a1"]));
 
-        live.job_holds(TAB, "forked");
+        live.job_holds(TAB, "forked", None, None);
         let t = live.tracker(TAB).unwrap();
         assert_eq!(t.rows().len(), 1, "the same conversation keeps its rows");
         assert_eq!(t.session_id.as_deref(), Some("forked"));
 
-        live.job_holds(TAB, "cleared");
+        live.job_holds(TAB, "cleared", None, None);
         let t = live.tracker(TAB).unwrap();
         assert!(t.is_empty(), "a cleared conversation starts over");
         assert_eq!(t.session_id.as_deref(), Some("cleared"));
         assert!(t.aliases.is_empty());
 
-        live.job_holds(TabId(9), "cleared");
-        assert!(live.tracker(TabId(9)).is_none(), "no table, nothing made");
+        // A tab with no table gets one, for the job's history to show.
+        live.job_holds(TabId(9), "cleared", None, Some(config.clone()));
+        assert_eq!(
+            live.tracker(TabId(9)).unwrap().session_id.as_deref(),
+            Some("cleared")
+        );
+
+        // A job resumed from "old" with no transcript of its own yet: its
+        // past is old's, so old's workers are its rows; a cleared job's
+        // origin is no part of it.
+        live.job_holds(TAB, "job-new", Some("old"), None);
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.session_id.as_deref(), Some("job-new"));
+        assert_eq!(t.aliases, ["old".to_string()], "old's history comes along");
+        live.job_holds(TAB, "cleared", Some("old"), None);
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.session_id.as_deref(), Some("cleared"));
+        assert!(t.aliases.is_empty(), "a cleared job owes old nothing");
         let _ = std::fs::remove_dir_all(&config);
     }
 
@@ -522,13 +612,13 @@ mod tests {
         live.tick(|_| true);
         assert_eq!(ids(&live), ["ra", "wa"]);
 
-        live.session_started(TAB, Some("resume"), Some("B"));
+        live.session_started(TAB, Some("resume"), Some("B"), None);
         live.last_refresh -= REFRESH_INTERVAL;
         live.tick(|_| true);
         assert_eq!(ids(&live), ["wb"], "B's own history, nothing of A's");
         assert!(live.tracker(TAB).unwrap().aliases.is_empty());
 
-        live.session_started(TAB, Some("resume"), Some("A"));
+        live.session_started(TAB, Some("resume"), Some("A"), None);
         live.last_refresh -= REFRESH_INTERVAL;
         live.tick(|_| true);
         assert_eq!(ids(&live), ["wa"], "back in A: A's again");
@@ -537,7 +627,7 @@ mod tests {
         // is the same session: the rows stay and A becomes an alias.
         std::fs::create_dir_all(proj.join("A2")).unwrap();
         std::fs::write(proj.join("A2.jsonl"), "{\"type\":\"mode\"}\n").unwrap();
-        live.session_started(TAB, Some("resume"), Some("A2"));
+        live.session_started(TAB, Some("resume"), Some("A2"), None);
         assert_eq!(ids(&live), ["wa"]);
         assert_eq!(live.tracker(TAB).unwrap().aliases, ["A".to_string()]);
 
@@ -545,9 +635,9 @@ mod tests {
         // empty; `/resume` from there back into A brings A's rows back
         // from disk. Claude Code sends startup, then resume, in that order.
         live.session_ended(TAB);
-        live.session_started(TAB, Some("startup"), Some("N"));
+        live.session_started(TAB, Some("startup"), Some("N"), None);
         assert!(ids(&live).is_empty(), "a fresh claude starts empty");
-        live.session_started(TAB, Some("resume"), Some("A"));
+        live.session_started(TAB, Some("resume"), Some("A"), None);
         live.last_refresh -= REFRESH_INTERVAL;
         live.tick(|_| true);
         assert_eq!(ids(&live), ["wa"], "resumed into A: A's rows again");
