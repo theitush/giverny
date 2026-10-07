@@ -7,10 +7,12 @@
 //!   estimate for it exists (no orchestrator session task holds it, no agent
 //!   ETA names it), the dispatcher is asked, once, to give one
 //!   ([`agent_eta::dispatcher_ask`]). Five minutes into its work a worker is
-//!   asked, once, to correct it: on its orchestrator task's row when it holds
-//!   one ([`orchestrator_session_nudge::check`]), else on its agent ETA
-//!   ([`agent_eta::worker_ask`]). A worker spawned in the foreground blocks
-//!   its dispatcher until it is done, so only that second ask reaches it.
+//!   asked, once, to re-estimate, and again as each figure runs out (five
+//!   minutes left, then past it): on its orchestrator task's row when it
+//!   holds one ([`orchestrator_session_nudge::check`]), else on its agent ETA
+//!   ([`agent_eta::worker_ask`], [`agent_eta::deadline_ask`]). A worker
+//!   spawned in the foreground blocks its dispatcher until it is done, so
+//!   only the worker's asks reach it.
 //! - **An orchestrator session's upkeep.** Its leases are renewed
 //!   ([`orchestrator_session_nudge::beat`]) and, on the dispatcher's own
 //!   calls, its unread `ask`/`reply` messages delivered
@@ -25,7 +27,8 @@
 //!
 //! **Cheap when idle.** A call that is not a spawn and not a worker's costs a
 //! few `stat`s and reads no file; a worker's call before its five minutes, a
-//! `stat` of its spawn metadata. Whatever happens the hook exits 0, so it
+//! `stat` of its spawn metadata, and after them a read of its small agent-ETA
+//! file. Whatever happens the hook exits 0, so it
 //! never fails the tool call it rides on.
 
 use std::path::{Path, PathBuf};
@@ -256,13 +259,9 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool, agent_etas: bool)
     if !agent_etas {
         return None;
     }
-    agent_eta::worker_ask(
-        dir,
-        &caller.session,
-        &caller.agent_id,
-        caller.spawned_ms()?,
-        now,
-    )
+    let spawned = caller.spawned_ms()?;
+    agent_eta::worker_ask(dir, &caller.session, &caller.agent_id, spawned, now)
+        .or_else(|| agent_eta::deadline_ask(dir, &caller.session, &caller.agent_id, spawned, now))
 }
 
 /// The `PostToolUse` reply carrying `text` into the caller's context.
@@ -439,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_with_no_task_corrects_its_agent_eta_five_minutes_in() {
+    fn a_worker_with_no_task_re_estimates_its_agent_eta_five_minutes_in_and_at_its_end() {
         let dir = temp("worker");
         let feeds = dir.join("feeds");
         let p = worker_payload(&dir, "s1", "w1", "Classify chunk 0", T0);
@@ -448,7 +447,14 @@ mod tests {
         let ctx = context(&run(&p, &feeds, T0 + 5 * MIN, true).unwrap());
         assert!(ctx.contains("`giverny-eta w1 <minutes left>`"), "{ctx}");
         assert!(ctx.contains("was 8m"), "{ctx}");
-        assert_eq!(run(&p, &feeds, T0 + 9 * MIN, true), None, "asked once");
+        assert_eq!(run(&p, &feeds, T0 + 7 * MIN, true), None, "asked once");
+        // Past the 8m: asked once more.
+        let ctx = context(&run(&p, &feeds, T0 + 9 * MIN, true).unwrap());
+        assert!(
+            ctx.contains("1m past") && ctx.contains("giverny-eta w1"),
+            "{ctx}"
+        );
+        assert_eq!(run(&p, &feeds, T0 + 10 * MIN, true), None, "once");
         // Outside a tab, with no orchestrator session: silent, nothing made.
         let q = worker_payload(&dir, "s2", "w2", "x", T0);
         for k in 0..10 {

@@ -148,7 +148,10 @@ When you spawn one:
 
   About five minutes into the task, Giverny's plugin puts a request for that
   re-estimate into the worker's context, once, unless it has re-estimated
-  already. Its answer is the `eta` command.
+  already. It asks again as each figure runs out: once when five minutes of
+  it are left, and once if the work runs past it, unless the worker has just
+  re-estimated. Each ask tells the worker how its kind's re-estimates have
+  fared; none changes its figure. Its answer is the `eta` command.
 
 ## 3. While it runs
 

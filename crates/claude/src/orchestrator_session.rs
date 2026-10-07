@@ -896,6 +896,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                     "waiting_since",
                     "wait_s",
                     "reestimate_asked",
+                    "eta_at",
+                    "deadline_asked",
+                    "overdue_asked",
                 ] {
                     row.remove(k);
                 }
@@ -903,6 +906,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             };
             if let Some(eta) = f.eta_s {
                 row.insert("eta_s".into(), json!(eta));
+                // When the figure was given: the hook's near-the-end ask
+                // leaves a fresh one alone a while.
+                row.insert("eta_at".into(), json!(stamp(now)));
             }
             drop_old_guess(row, f);
             set_str(row, "repo", &f.repo);
@@ -976,6 +982,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                 row.insert("eta_first_s".into(), json!(first));
             }
             row.insert("eta_s".into(), json!(eta));
+            if stage == Some(feed::Stage::Running) {
+                row.insert("eta_at".into(), json!(stamp(now)));
+            }
             set_str(row, "note", &f.note);
             if stage == Some(feed::Stage::Running) {
                 if is_wait(f.why.as_deref()) {
@@ -2047,6 +2056,11 @@ mod tests {
         assert_eq!(row("reest_s"), 600, "kept as given");
         assert_eq!(row("reest_at_s"), 4 * 60, "four minutes worked");
         assert_eq!(row("eta_s"), 4 * 60 + 600, "not corrected");
+        assert_eq!(
+            row("eta_at"),
+            json!(stamp(T0 + 6 * MIN)),
+            "when it was given"
+        );
         // A later eta is taken as given and leaves the re-estimate alone.
         let said = run(&dir, "eta demo#9 10", T0 + 8 * MIN).unwrap();
         assert_eq!(said, "demo#9: ~10m left");
