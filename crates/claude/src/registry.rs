@@ -30,9 +30,23 @@ pub struct SessionEntry {
     /// job's, and so are its hooks (giverny#242).
     #[serde(rename = "parkedJobId", default)]
     pub parked_job_id: Option<String>,
+    /// `bg` for a background job's worker, which the daemon runs and no
+    /// tab does (`interactive` otherwise).
+    #[serde(default)]
+    pub kind: String,
+    /// The background job a worker runs (`jobId`).
+    #[serde(rename = "jobId", default)]
+    pub job_id: Option<String>,
 }
 
 impl SessionEntry {
+    /// A background job's worker: the daemon's process, never a tab's. A
+    /// tab attached to the job holds the same conversation, and must not
+    /// take the worker for its own claude by it (giverny#243).
+    pub fn job_worker(&self) -> bool {
+        self.kind == "bg" || self.job_id.is_some()
+    }
+
     /// The agent is working: thinking, or running a tool call. Measured, not
     /// assumed — a session stays `busy` through minutes of back-to-back Bash
     /// calls.
@@ -350,6 +364,13 @@ mod tests {
         assert!(e.busy());
         assert_eq!(e.name.as_deref(), Some("dev-13"));
         assert_eq!(e.cwd, PathBuf::from("/home/u/dev"));
+        assert!(!e.job_worker());
+        let worker: SessionEntry = serde_json::from_str(
+            r#"{"pid":2209118,"sessionId":"6e7e56e0-1dca","kind":"bg","jobId":"6e7e56e0","status":"idle"}"#,
+        )
+        .unwrap();
+        assert!(worker.job_worker());
+        assert_eq!(worker.job_id.as_deref(), Some("6e7e56e0"));
     }
 
     #[test]

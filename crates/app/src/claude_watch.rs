@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use giverny_claude::attach;
 use giverny_claude::hooks::{self, RelayMsg};
 use giverny_claude::jobs::{self, Job};
 use giverny_claude::profiles::{self, Profile};
@@ -46,6 +47,17 @@ pub struct ClaudeTab {
     pub background: bool,
     last_hook: Option<Instant>,
     seen_in_scan: bool,
+}
+
+impl ClaudeTab {
+    /// Is a claude running in this tab now: seen in the last scan, or heard
+    /// from in the last few seconds.
+    fn has_claude(&self) -> bool {
+        self.seen_in_scan
+            || self
+                .last_hook
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+    }
 }
 
 pub struct AccountPanel {
@@ -199,6 +211,10 @@ pub struct ClaudeWatch {
     /// The job each tab's claude parked on (`parkedJobId`), from the last
     /// registry scan: that claude is a client of the background daemon.
     parked: HashMap<TabId, String>,
+    /// What each tab's `claude attach` names (an id, a conversation, a
+    /// name), from the last process scan: that claude shows the job and
+    /// writes no registry entry to say so (giverny#243).
+    attached: HashMap<TabId, String>,
     /// Which tab shows each background job now, by the job's short id
     /// ([`jobs_on_screen`]). A job's hooks carry its id, not a tab's
     /// (giverny#242).
@@ -348,6 +364,9 @@ fn merge_registry(
 #[derive(Default)]
 struct ScanResult {
     live: Vec<registry::LiveSession>,
+    /// What each tab's `claude attach` names, for a tab running one
+    /// ([`attach::under`]).
+    attached: HashMap<TabId, String>,
 }
 
 /// When one rate-limit window resets, out of a statusline push.
@@ -467,6 +486,7 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            attached: HashMap::new(),
             viewing: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
@@ -580,16 +600,41 @@ impl ClaudeWatch {
         Self::tab_id_of(msg).or_else(|| self.viewing.get(msg.job.as_deref()?).copied())
     }
 
+    /// The job each tab shows, by what runs in it: a claude parked on one
+    /// (`parkedJobId`), a `claude attach` (its argument resolved against
+    /// `jobs`, as Claude Code resolves it), or — for a tab opened from
+    /// BACKGROUND (`opened`, its `bg_job`) with no claude seen in it yet —
+    /// the job it was opened for. [`jobs_on_screen`] then follows the title.
+    fn jobs_by_tab(&self, opened: &HashMap<TabId, String>, jobs: &[Job]) -> HashMap<TabId, String> {
+        let mut on = self.parked.clone();
+        for (&tab, target) in &self.attached {
+            if let Some(job) = attach::resolve(target, jobs) {
+                on.insert(tab, job.id.clone());
+            }
+        }
+        for (&tab, job) in opened {
+            if !self.tabs.get(&tab).is_some_and(|t| t.seen_in_scan) {
+                on.entry(tab).or_insert_with(|| job.clone());
+            }
+        }
+        on
+    }
+
     /// Does a tab show this background job — viewing it, or holding its
     /// conversation? Then it is the tab's, not one more agent in the
     /// background list (giverny#243).
+    ///
+    /// Only a tab with a claude in it now holds a conversation: one that
+    /// detached from the job keeps the id it last held, and the job is back
+    /// in the background.
     fn shown_in_a_tab(&self, job: &Job) -> bool {
         self.viewing.contains_key(&job.id)
             || self.tabs.values().any(|tab| {
-                tab.session_id.as_deref().is_some_and(|sid| {
-                    job.session_id.as_deref() == Some(sid)
-                        || job.resume_session_id.as_deref() == Some(sid)
-                })
+                tab.has_claude()
+                    && tab.session_id.as_deref().is_some_and(|sid| {
+                        job.session_id.as_deref() == Some(sid)
+                            || job.resume_session_id.as_deref() == Some(sid)
+                    })
             })
     }
 
@@ -720,6 +765,7 @@ impl ClaudeWatch {
         shell_pids: &HashMap<TabId, u32>,
         active: Option<TabId>,
         titles: &HashMap<TabId, String>,
+        opened: &HashMap<TabId, String>,
     ) -> WatchEffects {
         let mut effects = WatchEffects::default();
         self.remember_peaks();
@@ -758,12 +804,17 @@ impl ClaudeWatch {
         if self.scan_rx.is_none() && self.last_scan.elapsed() >= Duration::from_secs(1) {
             self.last_scan = Instant::now();
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
+            let shells = shell_pids.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             if std::thread::Builder::new()
                 .name("giverny session scan".into())
                 .spawn(move || {
                     let live = registry::scan(dirs);
-                    let _ = tx.send(ScanResult { live });
+                    let attached = shells
+                        .into_iter()
+                        .filter_map(|(tab, shell)| Some((tab, attach::under(shell)?)))
+                        .collect();
+                    let _ = tx.send(ScanResult { live, attached });
                 })
                 .is_ok()
             {
@@ -779,35 +830,7 @@ impl ClaudeWatch {
             // Finished agents drop off: the list is what still wants
             // watching, not a record of everything that ever ran.
             let jobs = jobs::scan(dirs);
-            self.viewing = jobs_on_screen(&self.parked, titles, &jobs);
-            // A tab showing a job holds the conversation the job holds now,
-            // whatever hooks it missed: its pane follows it, and a restart
-            // resumes it, which attaches to the job (giverny#242).
-            for job in &jobs {
-                let (Some(&tab), Some(sid)) = (self.viewing.get(&job.id), job.resume_target())
-                else {
-                    continue;
-                };
-                self.agents.job_holds(
-                    tab,
-                    sid,
-                    job.forked_from.as_deref(),
-                    Some(job.config_dir.clone()),
-                );
-                let entry = self.tabs.entry(tab).or_default();
-                if entry.session_id.as_deref() != Some(sid) {
-                    entry.session_id = Some(sid.to_string());
-                    effects.captured.push((
-                        tab,
-                        Some(sid.to_string()),
-                        Some(job.config_dir.clone()),
-                    ));
-                }
-            }
-            self.jobs = jobs
-                .into_iter()
-                .filter(|job| job.worth_watching() && !self.shown_in_a_tab(job))
-                .collect();
+            self.apply_jobs(jobs, titles, opened, &mut effects);
         }
 
         // Re-read the caches when the file says so, when a refresh we asked
@@ -826,6 +849,44 @@ impl ClaudeWatch {
         }
 
         effects
+    }
+
+    /// Fold a jobs scan in: which tab shows which job, what those tabs
+    /// hold, and what is left for BACKGROUND.
+    fn apply_jobs(
+        &mut self,
+        jobs: Vec<Job>,
+        titles: &HashMap<TabId, String>,
+        opened: &HashMap<TabId, String>,
+        effects: &mut WatchEffects,
+    ) {
+        let on = self.jobs_by_tab(opened, &jobs);
+        self.viewing = jobs_on_screen(&on, titles, &jobs);
+        // A tab showing a job holds the conversation the job holds now,
+        // whatever hooks it missed: its pane follows it, and a restart
+        // resumes it, which attaches to the job (giverny#242).
+        for job in &jobs {
+            let (Some(&tab), Some(sid)) = (self.viewing.get(&job.id), job.resume_target()) else {
+                continue;
+            };
+            self.agents.job_holds(
+                tab,
+                sid,
+                job.forked_from.as_deref(),
+                Some(job.config_dir.clone()),
+            );
+            let entry = self.tabs.entry(tab).or_default();
+            if entry.session_id.as_deref() != Some(sid) {
+                entry.session_id = Some(sid.to_string());
+                effects
+                    .captured
+                    .push((tab, Some(sid.to_string()), Some(job.config_dir.clone())));
+            }
+        }
+        self.jobs = jobs
+            .into_iter()
+            .filter(|job| job.worth_watching() && !self.shown_in_a_tab(job))
+            .collect();
     }
 
     /// Fold the last scan into per-tab state.
@@ -847,8 +908,19 @@ impl ClaudeWatch {
             .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
             .collect();
         self.parked.clear();
+        self.attached = self.scanned.attached.clone();
+        for &tab in self.attached.keys() {
+            // A claude is there, showing a job: the job's hooks own its
+            // state, as a parked one's would.
+            self.tabs.entry(tab).or_default().seen_in_scan = true;
+        }
         {
             for live in self.scanned.live.clone() {
+                // A job's worker is the daemon's; the tab showing the job is
+                // found by its attach or its park, not by the conversation.
+                if live.entry.job_worker() {
+                    continue;
+                }
                 let Some(tab_id) = shell_pids
                     .iter()
                     .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
@@ -1477,6 +1549,7 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            attached: HashMap::new(),
             viewing: HashMap::new(),
             accounts: Vec::new(),
             hooks_installed: true,
@@ -1702,8 +1775,123 @@ mod tests {
         w.viewing.insert("34c55b2c".into(), TAB);
         w.tabs.entry(TabId(8)).or_default().session_id = Some("s-held".into());
         assert!(w.shown_in_a_tab(&parked), "parked on in a tab");
+        assert!(
+            !w.shown_in_a_tab(&held),
+            "a tab with no claude in it holds nothing"
+        );
+        w.tabs.entry(TabId(8)).or_default().seen_in_scan = true;
         assert!(w.shown_in_a_tab(&held), "its conversation is a tab's");
         assert!(!w.shown_in_a_tab(&alone), "no tab shows it");
+    }
+
+    fn bg_job(id: &str, name: &str, sid: &str) -> Job {
+        Job {
+            id: id.into(),
+            name: name.into(),
+            state: giverny_claude::jobs::JobState::Working,
+            detail: None,
+            tasks: 0,
+            queued: 0,
+            cwd: None,
+            session_id: Some(sid.into()),
+            resume_session_id: None,
+            updated_at_ms: 0,
+            config_dir: "/c".into(),
+            live: true,
+            pinned: false,
+            forked_from: None,
+        }
+    }
+
+    fn background(w: &ClaudeWatch) -> Vec<&str> {
+        let mut ids: Vec<&str> = w.jobs.iter().map(|j| j.id.as_str()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// A `claude attach` under a tab's shell — typed, a BACKGROUND click's,
+    /// or a restart's resume re-exec'd as one — writes no registry entry.
+    /// The job it names, by any name `claude attach` takes, is that tab's:
+    /// out of BACKGROUND, its hooks routed there; back once it detaches
+    /// (giverny#243).
+    #[test]
+    fn a_tab_attached_to_a_job_shows_it_and_gets_its_hooks() {
+        let mut w = ClaudeWatch::for_tests();
+        let jobs = vec![
+            bg_job("6e7e56e0", "count rust lines giverny#243", "s-6e"),
+            bg_job("34c55b2c", "Open bugs in panel/orchestrator", "s-34"),
+        ];
+        let titles: HashMap<TabId, String> = [(TAB, "~/giverny".to_string())].into();
+        let none = HashMap::new();
+        let mut fx = WatchEffects::default();
+        let hook = msg(r#"{"job":"6e7e56e0","config_dir":null,
+            "event":{"hook_event_name":"UserPromptSubmit","session_id":"s-6e"}}"#);
+        // The daemon's worker for the job registers the job's conversation;
+        // it is nobody's tab, whatever tab holds that conversation.
+        w.scanned.live.push(registry::LiveSession {
+            entry: serde_json::from_str(
+                r#"{"pid":1,"sessionId":"s-6e","kind":"bg","jobId":"6e7e56e0","status":"idle"}"#,
+            )
+            .expect("worker entry"),
+            config_dir: "/c".into(),
+        });
+
+        w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+        assert_eq!(background(&w), ["34c55b2c", "6e7e56e0"]);
+        assert_eq!(w.tab_of(&hook), None, "no tab shows it");
+
+        for target in ["6e7e56e0", "6e7e", "s-6e", "rust lines"] {
+            w.scanned.attached = [(TAB, target.to_string())].into();
+            w.merge_scan(&HashMap::new(), &mut fx);
+            w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+            assert_eq!(background(&w), ["34c55b2c"], "attached by {target:?}");
+            assert_eq!(w.tab_of(&hook), Some(TAB), "attached by {target:?}");
+        }
+        assert_eq!(
+            w.tabs[&TAB].session_id.as_deref(),
+            Some("s-6e"),
+            "a restart resumes, and so attaches to, the job"
+        );
+        feed(&mut w, &hook, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "its hook is the tab's");
+        w.merge_scan(&HashMap::new(), &mut fx);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "an attach is a claude");
+
+        // Detached: the next scan finds no attach, and the hooks are old.
+        w.scanned.attached.clear();
+        w.tabs.get_mut(&TAB).unwrap().last_hook = Some(Instant::now() - Duration::from_secs(10));
+        w.merge_scan(&HashMap::new(), &mut fx);
+        w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+        assert_eq!(
+            background(&w),
+            ["34c55b2c", "6e7e56e0"],
+            "back in BACKGROUND"
+        );
+        assert_eq!(w.tab_of(&hook), None);
+    }
+
+    /// A tab opened from BACKGROUND shows its job before the scan sees the
+    /// `claude attach` typed into it, and an attach seen there wins.
+    #[test]
+    fn a_tab_opened_from_background_shows_its_job_at_once() {
+        let mut w = ClaudeWatch::for_tests();
+        let jobs = vec![
+            bg_job("6e7e56e0", "count rust lines giverny#243", "s-6e"),
+            bg_job("34c55b2c", "Open bugs in panel/orchestrator", "s-34"),
+        ];
+        let titles: HashMap<TabId, String> = [(TAB, "~".to_string())].into();
+        let opened: HashMap<TabId, String> = [(TAB, "6e7e56e0".to_string())].into();
+        let mut fx = WatchEffects::default();
+        w.apply_jobs(jobs.clone(), &titles, &opened, &mut fx);
+        assert_eq!(background(&w), ["34c55b2c"]);
+        assert_eq!(w.viewing.get("6e7e56e0"), Some(&TAB));
+
+        // Its claude switched jobs in the agents view and re-attached.
+        w.scanned.attached = [(TAB, "34c55b2c".to_string())].into();
+        w.merge_scan(&HashMap::new(), &mut fx);
+        w.apply_jobs(jobs, &titles, &opened, &mut fx);
+        assert_eq!(w.viewing.get("34c55b2c"), Some(&TAB));
+        assert_eq!(w.viewing.get("6e7e56e0"), None);
     }
 
     /// Claude Code's agents view switches a parked claude between jobs and

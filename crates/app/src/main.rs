@@ -4723,7 +4723,17 @@ impl eframe::App for App {
             }
         }
 
-        let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        // A tab opened from BACKGROUND shows its job from the start, before
+        // the process scan sees its `claude attach`.
+        let opened: HashMap<TabId, String> = self
+            .ws
+            .tabs
+            .iter()
+            .filter_map(|t| Some((t.id, t.bg_job.clone()?)))
+            .collect();
+        let effects = self
+            .claude
+            .tick(&shell_pids, self.ws.active, &titles, &opened);
         self.show_attention(&ctx, frame);
         self.watch_for_limits();
         for (id, session, config_dir) in effects.captured {
