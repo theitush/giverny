@@ -6,6 +6,7 @@
 //! titles. Never reads credentials, never calls the network.
 
 pub mod agent_eta;
+pub mod continuation;
 pub mod feed;
 pub mod hooks;
 pub mod jobs;

@@ -141,17 +141,24 @@ struct View {
 
 impl View {
     /// Re-read the feed for `session`, at most once a [`POLL`] (or at once
-    /// when the session changed).
-    fn poll_feed(&mut self, session: Option<&str>) {
+    /// when the session changed). A session Claude Code re-id'd is looked
+    /// up by its earlier ids too, newest first, until its files name the
+    /// new one (giverny#105).
+    fn poll_feed(&mut self, session: Option<&str>, aliases: &[String]) {
         let changed = self.feed_session.as_deref() != session;
         if !changed && self.last_poll.is_some_and(|t| t.elapsed() < POLL) {
             return;
         }
         self.last_poll = Some(Instant::now());
         self.feed_session = session.map(str::to_string);
-        self.feed_now = session.and_then(|sid| self.feed.poll(&feed::feed_dir(), sid).cloned());
+        let ids: Vec<&str> = session
+            .into_iter()
+            .chain(aliases.iter().rev().map(String::as_str))
+            .collect();
+        let dir = feed::feed_dir();
+        self.feed_now = session.and_then(|_| self.feed.poll_any(&dir, &ids).cloned());
         self.etas_now = session
-            .map(|sid| self.etas.poll(&feed::feed_dir(), sid).clone())
+            .map(|_| self.etas.poll_any(&dir, &ids).clone())
             .unwrap_or_default();
         self.logs_due = true;
     }
@@ -1390,7 +1397,7 @@ pub fn show(
         return (None, None);
     };
     let view = views.tabs.entry(tab).or_default();
-    view.poll_feed(tracker.session_id.as_deref());
+    view.poll_feed(tracker.session_id.as_deref(), &tracker.aliases);
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
     // What the rows' processes use: the app's one reading, the one the

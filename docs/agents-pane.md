@@ -226,7 +226,9 @@ Claude Code reports each live subagent itself (id, name, status, start time, tok
 
    The status line's `subagents` and `total` are per agent, each transcript read once; they are never the rows added up, so none of this changes them.
 
-`aliases` are not part of the row merge; they only decide which file belongs to a tab. Giverny looks for `<current session id>.json` first, and if there is none, for the most recently modified `*.json` whose `session` or `aliases` contains the current id.
+`aliases` are not part of the row merge; they only decide which file belongs to a tab. Giverny looks for `<current session id>.json` first, and if there is none, for the most recently modified `*.json` whose `session` or `aliases` contains the current id. If none does, it tries the tab's earlier ids the same way, newest first, so a session Claude Code just re-id'd keeps its rows.
+
+`giverny orchestrator-session` keeps a conversation in one file across those re-ids. Each file it writes records its transcript's root record (`root`, the `uuid` of its first turn, which Claude Code copies forward under a new id). A session that no file names yet adopts the file whose root is its own. The file keeps its name, the new id becomes its `session`, and the old one moves to `aliases`, so the plan, the clocks and the history carry on. `/clear` starts a new root, and so a new file. The agent-ETA files below work the same way.
 
 ## Agent ETAs
 

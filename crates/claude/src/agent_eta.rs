@@ -29,6 +29,7 @@ use std::time::SystemTime;
 
 use serde_json::{Map, Value, json};
 
+use crate::continuation;
 use crate::orchestrator_session::{self, Lock};
 
 /// Under the feed directory: a directory, so the pane's search for feeds
@@ -113,9 +114,49 @@ pub fn parse(bytes: &[u8]) -> Etas {
 
 /// A session's estimates; none when the file is missing or unreadable.
 pub fn read(dir: &Path, session: &str) -> Etas {
-    std::fs::read(path(dir, session))
+    find(dir, session)
+        .and_then(|f| std::fs::read(f).ok())
         .map(|b| parse(&b))
         .unwrap_or_default()
+}
+
+/// The file holding `session`'s estimates: its own, else one that names it
+/// as an alias — the conversation's file under an earlier id, which a
+/// session re-id'd mid-run adopted ([`crate::continuation`]). The newest,
+/// if several do.
+pub fn find(dir: &Path, session: &str) -> Option<PathBuf> {
+    let own = path(dir, session);
+    if own.is_file() {
+        return Some(own);
+    }
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir.join(DIR)).ok()?.flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let names = std::fs::read(&p)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .is_some_and(|d| continuation::names(&d, session));
+        if !names {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The first of `sessions` (a conversation's ids, the current one first)
+/// with a file: [`find`] for each in turn.
+pub fn find_any(dir: &Path, sessions: &[&str]) -> Option<PathBuf> {
+    sessions.iter().find_map(|s| find(dir, s))
 }
 
 /// Whether `id` can name a file: an agent id is hex, a session id a UUID.
@@ -136,13 +177,36 @@ pub fn set(
     note: Option<&str>,
     now: u64,
 ) -> Result<Eta, String> {
+    set_in(dir, None, session, agent, left_s, note, now)
+}
+
+/// [`set`], reading transcripts under the Claude config dir `cfg` (else
+/// [`continuation::config_dir`]): a session no file names yet takes its
+/// conversation's file under an earlier id, which it then names.
+pub fn set_in(
+    dir: &Path,
+    cfg: Option<&Path>,
+    session: &str,
+    agent: &str,
+    left_s: u64,
+    note: Option<&str>,
+    now: u64,
+) -> Result<Eta, String> {
     if !safe(session) {
         return Err(format!("not a session id: {session}"));
     }
     if !safe(agent) {
         return Err(format!("not an agent id: {agent}"));
     }
-    let file = path(dir, session);
+    let root_cell = std::cell::OnceCell::new();
+    let root = || {
+        root_cell
+            .get_or_init(|| continuation::root_of(cfg, session))
+            .as_deref()
+    };
+    let file = find(dir, session)
+        .or_else(|| continuation::continued(&dir.join(DIR), session, root()?, cfg, |_| true))
+        .unwrap_or_else(|| path(dir, session));
     let parent = file.parent().expect("joined");
     std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     let _lock = Lock::take(&file)?;
@@ -151,6 +215,11 @@ pub fn set(
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({ "version": 1, "session": session }));
+    // The conversation's file under an earlier id is this id's now.
+    continuation::adopt(&mut doc, session);
+    if doc.get("root").is_none() {
+        continuation::stamp_root(&mut doc, root());
+    }
     let obj = doc.as_object_mut().expect("filtered to objects");
     let agents = obj
         .entry("agents")
@@ -181,30 +250,54 @@ pub fn set(
 /// a poll when nothing moved.
 #[derive(Debug, Default)]
 pub struct Cache {
-    session: String,
+    sessions: Vec<String>,
+    file: Option<PathBuf>,
     stamp: Option<(SystemTime, u64)>,
     etas: Etas,
 }
 
 impl Cache {
     pub fn poll(&mut self, dir: &Path, session: &str) -> &Etas {
-        if self.session != session {
+        self.poll_any(dir, &[session])
+    }
+
+    /// The estimates of a conversation known by `sessions` (its current id
+    /// first, then the ids it had before a re-id): the file of the first
+    /// that has one, followed while it stays, searched for again when it
+    /// goes — or when the conversation's own id gets a file.
+    pub fn poll_any(&mut self, dir: &Path, sessions: &[&str]) -> &Etas {
+        if self
+            .sessions
+            .iter()
+            .map(String::as_str)
+            .ne(sessions.iter().copied())
+        {
             *self = Cache {
-                session: session.into(),
+                sessions: sessions.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             };
         }
-        let file = path(dir, session);
-        let stamp = std::fs::metadata(&file)
-            .ok()
-            .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
+        let stamp_of = |p: &Path| {
+            std::fs::metadata(p)
+                .ok()
+                .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
+        };
+        let own = sessions.first().map(|s| path(dir, s));
+        let keep = self.file.as_ref().filter(|f| {
+            f.is_file() && (own.as_ref() == Some(*f) || !own.as_ref().is_some_and(|o| o.is_file()))
+        });
+        if keep.is_none() {
+            self.file = find_any(dir, sessions);
+        }
+        let stamp = self.file.as_deref().and_then(stamp_of);
         if stamp != self.stamp {
             self.stamp = stamp;
-            self.etas = if stamp.is_some() {
-                read(dir, session)
-            } else {
-                Etas::new()
-            };
+            self.etas = self
+                .file
+                .as_deref()
+                .and_then(|f| std::fs::read(f).ok())
+                .map(|b| parse(&b))
+                .unwrap_or_default();
         }
         &self.etas
     }
@@ -477,5 +570,58 @@ mod tests {
         assert!(a(&["a1"]).is_err());
         assert!(a(&["a1", "soon"]).is_err());
         assert!(a(&["a1", "8", "--why", "x"]).is_err());
+    }
+
+    /// giverny#228: a session re-id'd mid-run keeps its workers'
+    /// estimates. The pane finds them by the old id until the next
+    /// `giverny eta`, which adopts the file under the new one.
+    #[test]
+    fn a_re_id_session_adopts_its_conversations_estimates() {
+        use crate::continuation::tests::transcript;
+        let dir = temp("reid");
+        let cfg = dir.join("claude");
+        transcript(&cfg, "old", "root-1");
+        let c = Some(cfg.as_path());
+        set_in(&dir, c, "old", "a1", 15 * 60, None, T0).unwrap();
+        set_in(&dir, c, "old", "a2", 5 * 60, None, T0).unwrap();
+
+        // Right after the re-id: nothing under the new id yet; the pane
+        // looks it up by the old one too.
+        transcript(&cfg, "new", "root-1");
+        assert!(read(&dir, "new").is_empty());
+        let mut cache = Cache::default();
+        assert_eq!(cache.poll_any(&dir, &["new", "old"]).len(), 2);
+
+        // The dispatcher's next estimate, under the new id.
+        set_in(&dir, c, "new", "a1", 9 * 60, None, T0 + 6 * MIN).unwrap();
+        set_in(&dir, c, "new", "a3", 4 * 60, None, T0 + 6 * MIN).unwrap();
+        assert!(!path(&dir, "new").exists(), "no second file");
+        for id in ["new", "old"] {
+            let e = read(&dir, id);
+            assert_eq!(e.len(), 3, "{id}: every worker, once");
+            assert_eq!(
+                e["a1"].first_left_s,
+                15 * 60,
+                "{id}: the first estimate stands"
+            );
+            assert_eq!(e["a1"].left_s, 9 * 60);
+        }
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path(&dir, "old")).unwrap()).unwrap();
+        assert_eq!(doc["session"], "new");
+        assert_eq!(doc["aliases"], json!(["old"]));
+        assert_eq!(doc["root"], "root-1");
+        assert_eq!(
+            cache.poll_any(&dir, &["new", "old"]).len(),
+            3,
+            "the pane follows"
+        );
+
+        // `/clear` starts a new conversation and a new file.
+        transcript(&cfg, "cleared", "root-2");
+        set_in(&dir, c, "cleared", "a9", 60, None, T0).unwrap();
+        assert_eq!(read(&dir, "cleared").len(), 1);
+        assert_eq!(read(&dir, "new").len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

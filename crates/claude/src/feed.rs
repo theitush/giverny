@@ -502,7 +502,7 @@ pub fn find(dir: &Path, session: &str) -> Option<(PathBuf, Feed)> {
 /// [`poll`]: FeedCache::poll
 #[derive(Debug, Default)]
 pub struct FeedCache {
-    session: String,
+    sessions: Vec<String>,
     path: Option<PathBuf>,
     stamp: Option<(SystemTime, u64)>,
     feed: Option<Feed>,
@@ -517,9 +517,22 @@ impl FeedCache {
     /// or length changed, searched for afresh if it vanished or the session
     /// changed.
     pub fn poll(&mut self, dir: &Path, session: &str) -> Option<&Feed> {
-        if self.session != session {
+        self.poll_any(dir, &[session])
+    }
+
+    /// [`FeedCache::poll`] for a conversation known by `sessions`: its
+    /// current id first, then the ids it had before Claude Code re-id'd it.
+    /// The feed is the first of them that [`find`] finds — the old id's
+    /// until the writer adopts it under the new one, which names both.
+    pub fn poll_any(&mut self, dir: &Path, sessions: &[&str]) -> Option<&Feed> {
+        if self
+            .sessions
+            .iter()
+            .map(String::as_str)
+            .ne(sessions.iter().copied())
+        {
             *self = FeedCache {
-                session: session.into(),
+                sessions: sessions.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             };
         }
@@ -528,9 +541,20 @@ impl FeedCache {
                 .ok()
                 .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
         };
+        // A feed found by an old id gives way to one the current id gets
+        // a file of its own for (a writer that could not adopt the old).
+        let own = sessions.first().map(|s| feed_path(dir, s));
+        let outdated = self.path.is_some()
+            && self.path != own
+            && own.as_ref().is_some_and(|o| o.is_file())
+            && !self
+                .feed
+                .as_ref()
+                .is_some_and(|f| sessions.first().is_some_and(|s| f.names(s)));
         let fresh = self
             .path
             .as_deref()
+            .filter(|_| !outdated)
             .and_then(|p| stamp_of(p).map(|s| (p.to_path_buf(), s)));
         match fresh {
             Some((_, s)) if Some(s) == self.stamp => {}
@@ -546,7 +570,7 @@ impl FeedCache {
                 self.path = None;
                 self.stamp = None;
                 self.feed = None;
-                if let Some((p, f)) = find(dir, session) {
+                if let Some((p, f)) = sessions.iter().find_map(|s| find(dir, s)) {
                     self.stamp = stamp_of(&p);
                     self.path = Some(p);
                     self.feed = Some(f);
@@ -2037,6 +2061,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cache.poll(&dir, "t").unwrap().rows[0].key, "t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#105: a tab whose session was re-id'd finds the feed by its
+    /// old id until the writer adopts it, and a file of the new id's own
+    /// takes over from one found by an old id.
+    #[test]
+    fn cache_follows_a_re_id_session_by_its_old_ids() {
+        let dir = scratch("cache-reid");
+        let mut cache = FeedCache::new();
+        std::fs::write(
+            feed_path(&dir, "old"),
+            r#"{"session":"old","rows":[{"key":"a","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        let ids = ["new", "old"];
+        assert_eq!(cache.poll_any(&dir, &ids).unwrap().rows[0].key, "a");
+        // Adopted: same file, now naming both.
+        std::fs::write(
+            feed_path(&dir, "old"),
+            r#"{"session":"new","aliases":["old"],"rows":[{"key":"aa","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.poll_any(&dir, &ids).unwrap().rows[0].key, "aa");
+        // A writer that started the new id afresh: its own file wins.
+        std::fs::write(
+            feed_path(&dir, "other"),
+            r#"{"session":"other","rows":[{"key":"o","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        let ids = ["other2", "other"];
+        assert_eq!(cache.poll_any(&dir, &ids).unwrap().rows[0].key, "o");
+        std::fs::write(
+            feed_path(&dir, "other2"),
+            r#"{"session":"other2","rows":[{"key":"n","stage":"planned"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.poll_any(&dir, &ids).unwrap().rows[0].key, "n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use crate::worker_log::{self, WorkerLog};
-use crate::{feed, orchestrator_session_history, resources};
+use crate::{continuation, feed, orchestrator_session_history, resources};
 
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/orchestrator_session";
@@ -553,21 +553,24 @@ fn needs_description(doc: &Value, now: u64) -> bool {
 
 /// `session`'s `subagents/` dir, under the Claude config dir it runs in.
 fn session_subagents(cfg: Option<&Path>, session: &str) -> Option<PathBuf> {
-    let cfg = cfg.map(Path::to_path_buf).or_else(|| {
-        ["CLAUDE_CONFIG_DIR", "GIVERNY_PROFILE_DIR"]
-            .into_iter()
-            .find_map(|v| std::env::var_os(v).filter(|d| !d.is_empty()))
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
-    })?;
+    let cfg = cfg
+        .map(Path::to_path_buf)
+        .or_else(continuation::config_dir)?;
     crate::subagents::subagents_dir(&cfg, session)
 }
 
-/// The transcript of `session`'s subagent `agent`, read whole.
-fn worker_log(cfg: Option<&Path>, session: &str, agent: &str) -> Option<WorkerLog> {
-    let dir = session_subagents(cfg, session)?;
-    let mut log = WorkerLog::new(crate::subagents::agent_transcript(&dir, agent));
-    log.poll().then_some(log)
+/// The transcript of subagent `agent`, read whole: under the first of
+/// `sessions` (the conversation's ids, now and before a re-id) that has it.
+fn worker_log(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<WorkerLog> {
+    sessions.iter().find_map(|session| {
+        let dir = session_subagents(cfg, session)?;
+        let path = crate::subagents::agent_transcript(&dir, agent);
+        if !path.exists() {
+            return None;
+        }
+        let mut log = WorkerLog::new(path);
+        log.poll().then_some(log)
+    })
 }
 
 /// Freeze what each row that just landed spent, when its worker held other
@@ -804,9 +807,11 @@ fn idle_hint(task: &str, idle: &[(String, String)]) -> Option<String> {
 
 /// The spawn description of `session`'s subagent `agent`, from its
 /// `agent-<id>.meta.json` under the Claude config dir the session runs in.
-fn agent_description(cfg: Option<&Path>, session: &str, agent: &str) -> Option<String> {
-    let dir = session_subagents(cfg, session)?;
-    crate::subagents::read_meta(&dir, agent).description
+fn agent_description(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<String> {
+    sessions.iter().find_map(|session| {
+        let dir = session_subagents(cfg, session)?;
+        crate::subagents::read_meta(&dir, agent).description
+    })
 }
 
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
@@ -1194,6 +1199,40 @@ pub fn file_for(dir: &Path, session: &str) -> PathBuf {
         .unwrap_or_else(|| feed::feed_path(dir, session))
 }
 
+/// A session no feed names yet takes its conversation's feed under an
+/// earlier id, when this writer wrote it: Claude Code re-ids a session on a
+/// resume, the agents view's switch and the move into a background host
+/// ([`continuation`]). The file keeps its name; the new id becomes its
+/// `session` and the old one an alias, so the pane, the hook and workers
+/// still holding the old id all find it.
+fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
+    if feed::find(dir, session).is_some() {
+        return;
+    }
+    let Some(root) = continuation::root_of(cfg, session) else {
+        return;
+    };
+    let mine = |d: &Value| writer_of(d) == Some(WRITER);
+    let Some(file) = continuation::continued(dir, session, &root, cfg, mine) else {
+        return;
+    };
+    let Ok(_lock) = Lock::take(&file) else {
+        return;
+    };
+    let Some(mut doc) = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .filter(|d| d.is_object() && mine(d))
+    else {
+        return;
+    };
+    continuation::adopt(&mut doc, session);
+    continuation::stamp_root(&mut doc, Some(&root));
+    if let Err(e) = write(&file, &doc) {
+        eprintln!("giverny orchestrator-session: {}: {e}", file.display());
+    }
+}
+
 /// Run one command against `dir` for `session` at `now`. The output line,
 /// or why not.
 pub fn run_in(
@@ -1219,6 +1258,7 @@ pub fn run_in_code(
     if session.is_empty() || session.contains(['/', '\\']) || session.starts_with('.') {
         return Err(format!("not a session id: {session:?}"));
     }
+    adopt_continued(dir, session, flags.claude_dir.as_deref());
     let ledger = resources::ledger_path(dir);
     // Every command from a session keeps its leases alive.
     if *cmd != Cmd::Path
@@ -1472,6 +1512,7 @@ fn run_feed(
     flags: &Flags,
     now: u64,
 ) -> Result<(String, Vec<String>), String> {
+    let cfg = flags.claude_dir.as_deref();
     let file = file_for(dir, session);
     if *cmd == Cmd::Path {
         return Ok((file.display().to_string(), Vec::new()));
@@ -1511,16 +1552,20 @@ fn run_feed(
             obj.insert("writer".into(), json!(WRITER));
             obj.entry("version").or_insert(json!(feed::FEED_VERSION));
             obj.entry("session").or_insert(json!(session));
+            if doc.get("root").is_none() {
+                continuation::stamp_root(&mut doc, continuation::root_of(cfg, session).as_deref());
+            }
+            let sessions = continuation::ids(&doc);
             let history = orchestrator_session_history::path(dir);
             let mut flags = flags.clone();
             let said = tell_record(&doc, cmd, &mut flags, history.as_deref());
             if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
                 && needs_description(&doc, now)
             {
-                flags.agent_desc = agent_description(flags.claude_dir.as_deref(), session, agent);
+                flags.agent_desc = agent_description(cfg, &sessions, agent);
             }
             let before = done_keys(&doc);
-            let read_log = |agent: &str| worker_log(flags.claude_dir.as_deref(), session, agent);
+            let read_log = |agent: &str| worker_log(cfg, &sessions, agent);
             let linked = link_handoffs(&mut doc, read_log);
             for (agent, _) in &linked {
                 freeze_tokens(&mut doc, &before, Some(agent), read_log);
@@ -3098,5 +3143,95 @@ mod tests {
         let (cmd, flags) = parse_args(&args("plan a --eta 5")).unwrap();
         assert!(run_in(&dir, "../x", &cmd, &flags, T0).is_err());
         assert!(run_in(&dir, "", &cmd, &flags, T0).is_err());
+    }
+
+    /// giverny#105: Claude Code re-ids the session mid-run. The next
+    /// command under the new id adopts the conversation's file — every row
+    /// kept, none duplicated — and a `/clear` (a new root) starts afresh.
+    #[test]
+    fn a_re_id_session_adopts_its_conversations_feed() {
+        use crate::continuation::tests::transcript;
+        let dir = scratch("reid");
+        let cfg = spawned(&dir, "old", "w1", "fix-a: the first task");
+        transcript(&cfg, "old", "root-1");
+        let c = Some(cfg.as_path());
+        run_cfg(&dir, "old", "plan fix-a --eta 20 --title A", c, T0);
+        run_cfg(&dir, "old", "plan fix-b --eta 5 --title B", c, T0);
+        run_cfg(&dir, "old", "start fix-a --agent w1", c, T0 + MIN);
+        run_cfg(&dir, "old", "plan fix-c --eta 3 --title C", c, T0);
+        run_cfg(&dir, "old", "start fix-c", c, T0 + MIN);
+        run_cfg(&dir, "old", "land fix-c", c, T0 + 2 * MIN);
+        let old_file = feed::feed_path(&dir, "old");
+        let doc: Value = serde_json::from_slice(&std::fs::read(&old_file).unwrap()).unwrap();
+        assert_eq!(doc["root"], "root-1", "the root is recorded");
+
+        // The same conversation under a new id (its records copied forward).
+        transcript(&cfg, "new", "root-1");
+        let (out, code) = run_cfg(&dir, "new", "eta fix-a 12", c, T0 + 3 * MIN);
+        assert_eq!(code, 0, "{out}");
+        assert!(!feed::feed_path(&dir, "new").exists(), "no second file");
+        let f = feed::read(&old_file).unwrap();
+        assert_eq!(f.session.as_deref(), Some("new"));
+        assert_eq!(f.aliases, ["old"]);
+        let keys: Vec<(&str, feed::Stage)> =
+            f.rows.iter().map(|r| (r.key.as_str(), r.stage())).collect();
+        assert_eq!(
+            keys,
+            [
+                ("fix-a", feed::Stage::Running),
+                ("fix-b", feed::Stage::Planned),
+                ("fix-c", feed::Stage::Done)
+            ]
+        );
+        let a = &f.rows[0];
+        assert_eq!(a.title.as_deref(), Some("A"));
+        assert_eq!(a.agent_id.as_deref(), Some("w1"));
+        assert_eq!(a.started_ms, Some(T0 + MIN), "the row keeps its start");
+        // Both ids find it: the pane's tab and a worker that kept the old one.
+        assert_eq!(feed::find(&dir, "old").unwrap().0, old_file);
+        assert_eq!(feed::find(&dir, "new").unwrap().0, old_file);
+        // A worker holding the old id still lands its row in it.
+        run_cfg(&dir, "old", "land fix-a", c, T0 + 4 * MIN);
+        let f = feed::read(&old_file).unwrap();
+        assert_eq!(f.rows[0].stage(), feed::Stage::Done);
+        assert_eq!(
+            f.session.as_deref(),
+            Some("new"),
+            "an alias does not take it back"
+        );
+
+        // `/clear`: a new conversation, a new file.
+        transcript(&cfg, "cleared", "root-2");
+        run_cfg(
+            &dir,
+            "cleared",
+            "plan fix-d --eta 5 --title D",
+            c,
+            T0 + 5 * MIN,
+        );
+        let fresh = feed::read(&feed::feed_path(&dir, "cleared")).unwrap();
+        assert_eq!(fresh.rows.len(), 1);
+        assert!(fresh.aliases.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another writer's feed is never adopted, whatever its root.
+    #[test]
+    fn a_re_id_leaves_another_writers_feed_alone() {
+        use crate::continuation::tests::transcript;
+        let dir = scratch("reid-other");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("claude");
+        transcript(&cfg, "old", "root-1");
+        transcript(&cfg, "new", "root-1");
+        let theirs = r#"{"version":1,"session":"old","root":"root-1","writer":"other/status-writer","rows":[]}"#;
+        std::fs::write(feed::feed_path(&dir, "old"), theirs).unwrap();
+        run_cfg(&dir, "new", "plan x --eta 5 --title X", Some(&cfg), T0);
+        assert_eq!(
+            std::fs::read_to_string(feed::feed_path(&dir, "old")).unwrap(),
+            theirs
+        );
+        assert!(feed::feed_path(&dir, "new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
