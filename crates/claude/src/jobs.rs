@@ -100,6 +100,11 @@ pub struct Job {
     /// earlier workers live under that id, not the job's own.
     pub forked_from: Option<String>,
     pub pinned: bool,
+    /// Nothing has been asked of it: no name and no intent. What Claude
+    /// Code makes of a client's own fresh session when that client is
+    /// pointed at another job (a `claude --resume` of a job's conversation):
+    /// a placeholder to park on, not an agent (giverny#243).
+    pub untouched: bool,
 }
 
 impl Job {
@@ -110,8 +115,12 @@ impl Job {
     /// agents that finished, crashed, or were last seen days ago — and a row
     /// reading "working" for something with no process is a lie that costs
     /// whoever clicks it a terminal with nothing in it.
+    ///
+    /// Nor one nothing was ever asked of ([`Job::untouched`]): a placeholder
+    /// a resumed client parked on outlives that client, idle, waiting for a
+    /// first prompt nobody will send it.
     pub fn worth_watching(&self) -> bool {
-        self.live && self.state != JobState::Done
+        self.live && self.state != JobState::Done && !self.untouched
     }
 
     /// What to resume to attach a tab to this agent.
@@ -256,6 +265,8 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<Job> {
                 live: live.contains_key(&id),
                 forked_from: live.get(&id).cloned().flatten(),
                 pinned: pinned.contains(&id),
+                untouched: as_str(&v, "name").is_none()
+                    && as_str(&v, "intent").is_none_or(|i| i.trim().is_empty()),
                 config_dir: dir.clone(),
                 id,
             });
@@ -284,6 +295,34 @@ mod tests {
         let dir = config.join("jobs").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("state.json"), body).unwrap();
+    }
+
+    /// The placeholder a resumed client parks on has nothing asked of it.
+    #[test]
+    fn a_job_with_no_name_and_no_intent_is_untouched() {
+        let config = scratch("untouched");
+        write_job(
+            &config,
+            "f68bc6cd",
+            r#"{"state":"working","detail":"(idle — send a prompt to start)","intent":"",
+                "sessionId":"f68bc6cd-7c66","resumeSessionId":"f68bc6cd-7c66"}"#,
+        );
+        write_job(
+            &config,
+            "6e7e56e0",
+            r#"{"state":"working","name":"count rust lines","intent":"Test session"}"#,
+        );
+        write_job(
+            &config,
+            "29ab7872",
+            r#"{"state":"done","intent":"yh do those also plz"}"#,
+        );
+        let jobs = scan([config.clone()]);
+        let untouched = |id: &str| jobs.iter().find(|j| j.id == id).unwrap().untouched;
+        assert!(untouched("f68bc6cd"));
+        assert!(!untouched("6e7e56e0"));
+        assert!(!untouched("29ab7872"), "asked for, if not named yet");
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[test]
@@ -332,10 +371,26 @@ mod tests {
     #[test]
     fn only_a_running_agent_is_worth_watching() {
         let config = scratch("finished");
-        write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
-        write_job(&config, "bbbb2222", r#"{ "state": "blocked" }"#);
-        write_job(&config, "cccc3333", r#"{ "state": "done" }"#);
-        write_job(&config, "dddd4444", r#"{ "state": "working" }"#);
+        write_job(
+            &config,
+            "aaaa1111",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "bbbb2222",
+            r#"{ "state": "blocked", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "cccc3333",
+            r#"{ "state": "done", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "dddd4444",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
         // The daemon is running workers for three of them; the fourth has a
         // state file and nothing behind it.
         let me = std::process::id();
@@ -367,9 +422,21 @@ mod tests {
     #[test]
     fn a_resumed_job_names_the_conversation_it_came_from() {
         let config = scratch("forked");
-        write_job(&config, "aaaa1111", r#"{ "state": "working" }"#);
-        write_job(&config, "bbbb2222", r#"{ "state": "working" }"#);
-        write_job(&config, "cccc3333", r#"{ "state": "working" }"#);
+        write_job(
+            &config,
+            "aaaa1111",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "bbbb2222",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
+        write_job(
+            &config,
+            "cccc3333",
+            r#"{ "state": "working", "intent": "go" }"#,
+        );
         let me = std::process::id();
         std::fs::create_dir_all(config.join("daemon")).unwrap();
         std::fs::write(

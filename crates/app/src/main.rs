@@ -1497,19 +1497,21 @@ fn resume_plan(
 /// not one.
 fn attach_command(job: &giverny_claude::jobs::Job) -> Option<String> {
     job.live
-        .then(|| attach_line(&job.id, Some(&job.config_dir)))
+        .then(|| attach_line(&job.id, Some(&job.config_dir), true))
         .flatten()
 }
 
-/// `command claude attach <id> && exit`, for a tab opened on background job
-/// `id` (its `bg_job`) under the account at `config_dir`.
+/// `command claude attach <id>`, under the account at `config_dir`, for a
+/// tab showing background job `id`.
 ///
-/// The tab is the job's for as long as it shows it: when the attach ends —
+/// `exit` (a tab opened from BACKGROUND, its `bg_job`) adds `&& exit`: the
+/// tab is the job's for as long as it shows it, so when the attach ends —
 /// detached, quit, Ctrl+C — the shell ends with it and the tab closes
 /// ([`closes_on_exit`]), the job going back to BACKGROUND (giverny#245). An
 /// attach that fails (the job is gone) exits nonzero: the shell stays, with
-/// the error on screen.
-fn attach_line(id: &str, config_dir: Option<&Path>) -> Option<String> {
+/// the error on screen. A tab of one's own that held a job's conversation
+/// attaches without it, and keeps its shell when the attach ends.
+fn attach_line(id: &str, config_dir: Option<&Path>, exit: bool) -> Option<String> {
     let ok = !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
@@ -1527,7 +1529,8 @@ fn attach_line(id: &str, config_dir: Option<&Path>) -> Option<String> {
         command.push_str(&format!("CLAUDE_CONFIG_DIR=\"{named}\" "));
     }
     // `command` bypasses shell wrapper functions named `claude`.
-    command.push_str(&format!("command claude attach {id} && exit\r"));
+    let then = if exit { " && exit" } else { "" };
+    command.push_str(&format!("command claude attach {id}{then}\r"));
     Some(command)
 }
 
@@ -3210,7 +3213,7 @@ impl App {
         if let Some(tab) = self.ws.tab(id)
             && let Some(job) = &tab.bg_job
         {
-            if let Some(cmd) = attach_line(job, tab.claude_config_dir.as_deref()) {
+            if let Some(cmd) = attach_line(job, tab.claude_config_dir.as_deref(), true) {
                 tracing::info!("tab {id:?}: attaching to background job {job}");
                 self.pending_inject.push((
                     Instant::now() + Duration::from_millis(1300),
@@ -3262,8 +3265,21 @@ impl App {
     /// across profiles (self-heals a lost account association), and the
     /// conversation's own recorded cwd (`claude --resume` only finds a
     /// session from the directory it ran in).
+    ///
+    /// A conversation a running background job holds is attached to
+    /// instead. `claude --resume` of it makes Claude Code fork the client's
+    /// own fresh session into a new, empty job and park on that: one more
+    /// row in BACKGROUND for every restart (giverny#243).
     fn resume_command(&self, sid: &str, id: TabId) -> Option<Vec<u8>> {
         let tab = self.ws.tab(id)?;
+        if let Some(job) = self.claude.live_job_holding(sid) {
+            tracing::info!(
+                "tab {id:?}: {sid} is background job {}'s; attaching",
+                job.id
+            );
+            return attach_line(&job.id, Some(&job.config_dir), tab.bg_job.is_some())
+                .map(String::into_bytes);
+        }
         let all_dirs: Vec<PathBuf> = self
             .claude
             .profiles
@@ -5537,19 +5553,24 @@ mod tests {
     fn a_background_tab_attaches_and_exits_with_it() {
         let dir = Path::new("/home/u/.claude");
         assert_eq!(
-            attach_line("6e7e56e0", Some(dir)).as_deref(),
+            attach_line("6e7e56e0", Some(dir), true).as_deref(),
             Some("command claude attach 6e7e56e0 && exit\r")
         );
         assert_eq!(
-            attach_line("6e7e56e0", None).as_deref(),
+            attach_line("6e7e56e0", None, true).as_deref(),
             Some("command claude attach 6e7e56e0 && exit\r")
         );
         assert_eq!(
-            attach_line("work", Some(Path::new("/home/u/.claude-work"))).as_deref(),
+            attach_line("6e7e56e0", None, false).as_deref(),
+            Some("command claude attach 6e7e56e0\r"),
+            "a tab of one's own keeps its shell"
+        );
+        assert_eq!(
+            attach_line("work", Some(Path::new("/home/u/.claude-work")), true).as_deref(),
             Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-work\" command claude attach work && exit\r")
         );
         for bad in ["", "a b", "x;rm", "$(id)"] {
-            assert_eq!(attach_line(bad, None), None, "{bad:?}");
+            assert_eq!(attach_line(bad, None, true), None, "{bad:?}");
         }
     }
 

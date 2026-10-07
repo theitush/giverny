@@ -211,6 +211,11 @@ pub struct ClaudeWatch {
     /// The job each tab's claude parked on (`parkedJobId`), from the last
     /// registry scan: that claude is a client of the background daemon.
     parked: HashMap<TabId, String>,
+    /// The session of each tab's parked claude itself — the client, not
+    /// the job — from the same scan.
+    parked_by: HashMap<TabId, String>,
+    /// Every job of the last jobs scan, shown or not.
+    all_jobs: Vec<Job>,
     /// What each tab's `claude attach` names (an id, a conversation, a
     /// name), from the last process scan: that claude shows the job and
     /// writes no registry entry to say so (giverny#243).
@@ -407,11 +412,13 @@ fn reset_time(window: &serde_json::Value) -> Option<jiff::Timestamp> {
 /// the switch is the tab's title, which Claude Code sets to the shown
 /// session's name. So: the one live job named as the title says, else the
 /// parked one; of several by that name, the parked one or else the most
-/// recently active.
+/// recently active. A placeholder (`placeholders`) is never the fallback: a
+/// tab whose title names no job shows none.
 pub fn jobs_on_screen(
     parked: &HashMap<TabId, String>,
     titles: &HashMap<TabId, String>,
     jobs: &[Job],
+    placeholders: &HashSet<String>,
 ) -> HashMap<String, TabId> {
     let mut out = HashMap::new();
     for (&tab, parked_on) in parked {
@@ -425,8 +432,10 @@ pub fn jobs_on_screen(
             .find(|j| &j.id == parked_on)
             .or(named.first())
             .map(|j| j.id.clone())
-            .unwrap_or_else(|| parked_on.clone());
-        out.insert(shown, tab);
+            .or_else(|| (!placeholders.contains(parked_on)).then(|| parked_on.clone()));
+        if let Some(shown) = shown {
+            out.insert(shown, tab);
+        }
     }
     out
 }
@@ -486,6 +495,8 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            parked_by: HashMap::new(),
+            all_jobs: Vec::new(),
             attached: HashMap::new(),
             viewing: HashMap::new(),
             accounts: Vec::new(),
@@ -511,6 +522,10 @@ impl ClaudeWatch {
             ),
             leave_accounts,
         };
+        // Before any tab is restored: a tab holding a running job's
+        // conversation attaches to the job, which takes knowing the jobs
+        // ([`ClaudeWatch::live_job_holding`]).
+        watch.all_jobs = jobs::scan(watch.profiles.iter().map(|p| p.config_dir.clone()));
         watch.refresh_usage();
         (watch, spooled)
     }
@@ -861,8 +876,9 @@ impl ClaudeWatch {
         effects: &mut WatchEffects,
     ) {
         let on = self.jobs_by_tab(opened, &jobs);
+        let placeholders = self.placeholders(&jobs);
         let before: HashSet<TabId> = self.viewing.values().copied().collect();
-        self.viewing = jobs_on_screen(&on, titles, &jobs);
+        self.viewing = jobs_on_screen(&on, titles, &jobs, &placeholders);
         // A tab that stopped showing a job, with no claude of its own in it
         // now: its pane goes, as at a `SessionEnd` (giverny#244).
         for tab in before {
@@ -894,9 +910,41 @@ impl ClaudeWatch {
             }
         }
         self.jobs = jobs
-            .into_iter()
-            .filter(|job| job.worth_watching() && !self.shown_in_a_tab(job))
+            .iter()
+            .filter(|job| {
+                job.worth_watching() && !self.shown_in_a_tab(job) && !placeholders.contains(&job.id)
+            })
+            .cloned()
             .collect();
+        self.all_jobs = jobs;
+    }
+
+    /// The jobs a tab's claude parked on only as a placeholder: untouched
+    /// (no name, no intent) and forked from that very claude's own session.
+    /// A `claude --resume` of a job's conversation does this — Claude Code
+    /// makes the client's fresh session a job, parks on it and shows the
+    /// other one — and the placeholder is neither an agent to list under
+    /// BACKGROUND nor what the tab shows (giverny#243).
+    fn placeholders(&self, jobs: &[Job]) -> HashSet<String> {
+        self.parked
+            .iter()
+            .filter_map(|(tab, id)| {
+                let job = jobs.iter().find(|j| &j.id == id)?;
+                let client = self.parked_by.get(tab)?;
+                (job.untouched && job.forked_from.as_deref() == Some(client.as_str()))
+                    .then(|| job.id.clone())
+            })
+            .collect()
+    }
+
+    /// The running background job whose conversation `session` is — the one
+    /// it holds now, or its own — from the last jobs scan.
+    pub fn live_job_holding(&self, session: &str) -> Option<&Job> {
+        self.all_jobs.iter().find(|j| {
+            j.live
+                && (j.resume_session_id.as_deref() == Some(session)
+                    || j.session_id.as_deref() == Some(session))
+        })
     }
 
     /// Fold the last scan into per-tab state.
@@ -918,6 +966,7 @@ impl ClaudeWatch {
             .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
             .collect();
         self.parked.clear();
+        self.parked_by.clear();
         self.attached = self.scanned.attached.clone();
         for &tab in self.attached.keys() {
             // A claude is there, showing a job: the job's hooks own its
@@ -941,6 +990,7 @@ impl ClaudeWatch {
                 };
                 if let Some(job) = &live.entry.parked_job_id {
                     self.parked.insert(tab_id, job.clone());
+                    self.parked_by.insert(tab_id, live.entry.session_id.clone());
                 }
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
@@ -1559,6 +1609,8 @@ impl ClaudeWatch {
             tabs: HashMap::new(),
             jobs: Vec::new(),
             parked: HashMap::new(),
+            parked_by: HashMap::new(),
+            all_jobs: Vec::new(),
             attached: HashMap::new(),
             viewing: HashMap::new(),
             accounts: Vec::new(),
@@ -1776,6 +1828,7 @@ mod tests {
             live: true,
             pinned: false,
             forked_from: None,
+            untouched: false,
         };
         let parked = job("34c55b2c", "s-parked");
         let held = job("0a1f39b3", "s-held");
@@ -1810,7 +1863,87 @@ mod tests {
             live: true,
             pinned: false,
             forked_from: None,
+            untouched: false,
         }
+    }
+
+    /// A `claude --resume` of a running job's conversation (a restart's):
+    /// Claude Code makes the client's own fresh session an untouched job,
+    /// parks on it, and shows the job asked for. The placeholder is not one
+    /// more agent under BACKGROUND, gets no hooks, and is never what the
+    /// tab shows; the conversation is the job's, so a restart attaches
+    /// (giverny#243).
+    #[test]
+    fn a_resumes_placeholder_job_is_nobodys() {
+        let mut w = ClaudeWatch::for_tests();
+        let mut placeholder = bg_job("f68bc6cd", "f68bc6cd", "f68bc6cd-7c66");
+        placeholder.untouched = true;
+        placeholder.forked_from = Some("f705f9e7-19c5".into());
+        let mut real = bg_job(
+            "34c55b2c",
+            "Open bugs in panel/orchestrator",
+            "34c55b2c-d6db",
+        );
+        real.resume_session_id = Some("1ec991d3-fec9".into());
+        let jobs = vec![
+            placeholder,
+            real,
+            bg_job("6e7e56e0", "count rust lines", "s-6e"),
+        ];
+        w.parked.insert(TAB, "f68bc6cd".into());
+        w.parked_by.insert(TAB, "f705f9e7-19c5".into());
+        w.tabs.entry(TAB).or_default().seen_in_scan = true;
+        let none = HashMap::new();
+        let mut fx = WatchEffects::default();
+        let hook = msg(r#"{"job":"f68bc6cd","config_dir":null,
+            "event":{"hook_event_name":"UserPromptSubmit","session_id":"f68bc6cd-7c66"}}"#);
+
+        let titles: HashMap<TabId, String> =
+            [(TAB, "◐ Open bugs in panel/orchestrator".to_string())].into();
+        w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+        assert_eq!(
+            background(&w),
+            ["6e7e56e0"],
+            "neither the shown job nor the placeholder"
+        );
+        assert_eq!(w.viewing.get("34c55b2c"), Some(&TAB));
+        assert_eq!(
+            w.tab_of(&hook),
+            None,
+            "the placeholder's hooks are no tab's"
+        );
+
+        let titles: HashMap<TabId, String> = [(TAB, "~/giverny".to_string())].into();
+        w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+        assert!(w.viewing.is_empty(), "a placeholder is never the fallback");
+        assert!(!background(&w).contains(&"f68bc6cd"));
+        // Its client gone, it is still nobody's agent.
+        w.parked.clear();
+        w.parked_by.clear();
+        w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
+        assert!(!background(&w).contains(&"f68bc6cd"), "untouched");
+        w.parked.insert(TAB, "f68bc6cd".into());
+        w.parked_by.insert(TAB, "f705f9e7-19c5".into());
+
+        // Not a placeholder: a job someone asked for, or another session's.
+        let mut asked = jobs.clone();
+        asked[0].untouched = false;
+        w.apply_jobs(asked, &titles, &none, &mut fx);
+        assert_eq!(w.viewing.get("f68bc6cd"), Some(&TAB));
+        w.parked_by.insert(TAB, "someone-else".into());
+        w.apply_jobs(jobs, &titles, &none, &mut fx);
+        assert_eq!(w.viewing.get("f68bc6cd"), Some(&TAB));
+
+        // What a restart asks: whose conversation is this?
+        assert_eq!(
+            w.live_job_holding("1ec991d3-fec9").map(|j| j.id.as_str()),
+            Some("34c55b2c")
+        );
+        assert_eq!(
+            w.live_job_holding("34c55b2c-d6db").map(|j| j.id.as_str()),
+            Some("34c55b2c")
+        );
+        assert!(w.live_job_holding("f705f9e7-19c5").is_none());
     }
 
     fn background(w: &ClaudeWatch) -> Vec<&str> {
@@ -1929,6 +2062,7 @@ mod tests {
             live,
             pinned: false,
             forked_from: None,
+            untouched: false,
         };
         let jobs = [
             job("970bf052", "Open bugs in panel/orchestrator (2)", true),
@@ -1938,9 +2072,10 @@ mod tests {
         let parked: HashMap<TabId, String> = [(TAB, "970bf052".to_string())].into();
         let on = |title: &str| {
             let titles: HashMap<TabId, String> = [(TAB, title.to_string())].into();
-            let mut v: Vec<(String, TabId)> = jobs_on_screen(&parked, &titles, &jobs)
-                .into_iter()
-                .collect();
+            let mut v: Vec<(String, TabId)> =
+                jobs_on_screen(&parked, &titles, &jobs, &HashSet::new())
+                    .into_iter()
+                    .collect();
             v.sort_by(|a, b| a.0.cmp(&b.0));
             v
         };

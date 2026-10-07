@@ -214,6 +214,7 @@ mod tests {
             config_dir: "/c".into(),
             live,
             forked_from: None,
+            untouched: false,
             pinned: false,
         }
     }
