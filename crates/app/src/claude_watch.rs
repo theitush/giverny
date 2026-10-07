@@ -861,7 +861,17 @@ impl ClaudeWatch {
         effects: &mut WatchEffects,
     ) {
         let on = self.jobs_by_tab(opened, &jobs);
+        let before: HashSet<TabId> = self.viewing.values().copied().collect();
         self.viewing = jobs_on_screen(&on, titles, &jobs);
+        // A tab that stopped showing a job, with no claude of its own in it
+        // now: its pane goes, as at a `SessionEnd` (giverny#244).
+        for tab in before {
+            if !self.viewing.values().any(|&t| t == tab)
+                && !self.tabs.get(&tab).is_some_and(ClaudeTab::has_claude)
+            {
+                self.agents.session_ended(tab);
+            }
+        }
         // A tab showing a job holds the conversation the job holds now,
         // whatever hooks it missed: its pane follows it, and a restart
         // resumes it, which attaches to the job (giverny#242).
@@ -1852,6 +1862,10 @@ mod tests {
             Some("s-6e"),
             "a restart resumes, and so attaches to, the job"
         );
+        assert!(
+            w.agents.shown(TAB).is_some(),
+            "its pane shows the job's feed (giverny#244)"
+        );
         feed(&mut w, &hook, None);
         assert_eq!(w.state_of(TAB), ClaudeState::Busy, "its hook is the tab's");
         w.merge_scan(&HashMap::new(), &mut fx);
@@ -1868,6 +1882,7 @@ mod tests {
             "back in BACKGROUND"
         );
         assert_eq!(w.tab_of(&hook), None);
+        assert!(w.agents.shown(TAB).is_none(), "the job's pane went with it");
     }
 
     /// A tab opened from BACKGROUND shows its job before the scan sees the

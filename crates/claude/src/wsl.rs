@@ -159,10 +159,14 @@ pub fn tab_cwds_in(distro: &str) -> Vec<(String, String)> {
 }
 
 /// Every process that belongs to a tab, with its parent and its directory.
-/// `sh`, not `bash`: this runs in whatever the distribution has.
+/// `sh`, not `bash`: this runs in whatever the distribution has. Not a
+/// background job's (`CLAUDE_JOB_DIR`): its `GIVERNY_TAB_ID` is whichever
+/// tab started the job's daemon (giverny#244).
 #[cfg(any(windows, test))]
 const TAB_CWD_SCRIPT: &str = r#"for d in /proc/[0-9]*; do
-id=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^GIVERNY_TAB_ID=//p' | head -n1)
+env=$(tr '\0' '\n' 2>/dev/null < "$d/environ") || continue
+case "$env" in *CLAUDE_JOB_DIR=*) continue ;; esac
+id=$(printf '%s\n' "$env" | sed -n 's/^GIVERNY_TAB_ID=//p' | head -n1)
 [ -n "$id" ] || continue
 cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
 [ -n "$cwd" ] || continue
@@ -666,6 +670,37 @@ mod tests {
             assert!(!tab.is_empty());
             assert!(cwd.starts_with('/'), "{cwd}");
         }
+    }
+
+    /// A background job's processes carry the `GIVERNY_TAB_ID` of whatever
+    /// started its daemon; the probe leaves them out (giverny#244).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_leaves_out_a_background_jobs_processes() {
+        let spawn = |tab: &str, job: bool| {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("5").env("GIVERNY_TAB_ID", tab);
+            // The test may itself run inside a job.
+            match job {
+                true => c.env("CLAUDE_JOB_DIR", "/home/u/.claude/jobs/6e7e56e0"),
+                false => c.env_remove("CLAUDE_JOB_DIR"),
+            };
+            c.spawn().expect("sleep")
+        };
+        let tab = format!("giverny-mine{}", std::process::id());
+        let daemon = format!("giverny-daemon{}", std::process::id());
+        let mut mine = spawn(&tab, false);
+        let mut job = spawn(&daemon, true);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(TAB_CWD_SCRIPT)
+            .output()
+            .expect("sh");
+        let _ = (mine.kill(), job.kill(), mine.wait(), job.wait());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let tabs: Vec<String> = parse_tab_cwds(&text).into_iter().map(|(t, _)| t).collect();
+        assert!(tabs.contains(&tab), "{tabs:?}");
+        assert!(!tabs.contains(&daemon), "{tabs:?}");
     }
 
     /// The pid list rides along with the same sweep, and is not mistaken for

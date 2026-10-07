@@ -21,12 +21,15 @@ use serde_json::{Value, json};
 use crate::subagents::{conversation_root, session_transcript};
 
 /// The Claude config dir this process's session runs under:
-/// `$CLAUDE_CONFIG_DIR`, else `$GIVERNY_PROFILE_DIR`, else `~/.claude`.
+/// `$CLAUDE_CONFIG_DIR`, else a background job's own account, else
+/// `$GIVERNY_PROFILE_DIR` (not inside a job, where it is the daemon's), else
+/// `~/.claude`.
 pub fn config_dir() -> Option<PathBuf> {
-    ["CLAUDE_CONFIG_DIR", "GIVERNY_PROFILE_DIR"]
-        .into_iter()
-        .find_map(|v| std::env::var_os(v).filter(|d| !d.is_empty()))
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
         .map(PathBuf::from)
+        .or_else(crate::lineage::job_account)
+        .or_else(|| crate::lineage::giverny_var("GIVERNY_PROFILE_DIR").map(PathBuf::from))
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
 }
 

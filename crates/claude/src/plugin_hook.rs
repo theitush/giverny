@@ -145,12 +145,17 @@ pub fn payload_of(input: &str) -> Option<Value> {
     Some(Value::Object(m))
 }
 
-/// Whether this process runs for a Giverny tab's own session:
-/// `$GIVERNY_TAB_ID`, which the app sets in a tab's shell and a hook
+/// Whether this process runs for a session a Giverny pane shows: a tab's
+/// own — `$GIVERNY_TAB_ID`, which the app sets in a tab's shell and a hook
 /// inherits, and no other claude between it and the tab's
-/// ([`crate::lineage`]) — a claude nested in the tab is not the tab's.
+/// ([`crate::lineage`]), as a claude nested in the tab is not the tab's —
+/// or a background job's own session, which the tab showing the job shows
+/// (giverny#244). A claude nested in a job is neither.
 pub fn in_giverny_tab() -> bool {
-    std::env::var("GIVERNY_TAB_ID").is_ok_and(|t| !t.trim().is_empty())
+    if crate::lineage::in_bg_job() {
+        return crate::lineage::bg_job().is_some();
+    }
+    crate::lineage::giverny_var("GIVERNY_TAB_ID").is_some()
         && crate::lineage::of_this_process().is_tabs()
 }
 

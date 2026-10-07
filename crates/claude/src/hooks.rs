@@ -109,9 +109,9 @@ impl Target {
         if let Some(job) = crate::lineage::bg_job() {
             return Some(Target::Job(job));
         }
-        let tab = std::env::var("GIVERNY_TAB_ID")
-            .ok()
-            .filter(|t| !t.trim().is_empty())?;
+        // A claude started inside a job's shell: no tab's, and the tab id it
+        // inherited is the daemon's (giverny#244).
+        let tab = crate::lineage::giverny_var("GIVERNY_TAB_ID")?;
         crate::lineage::of_this_process()
             .is_tabs()
             .then_some(Target::Tab(tab))
@@ -124,14 +124,7 @@ impl Target {
     pub fn account(&self) -> Option<String> {
         match self {
             Target::Tab(_) => account_dir(),
-            Target::Job(_) => std::env::var("CLAUDE_CONFIG_DIR")
-                .ok()
-                .filter(|dir| !dir.is_empty())
-                .or_else(|| {
-                    let dir = std::env::var(crate::lineage::JOB_DIR_ENV).ok()?;
-                    let config = Path::new(dir.trim()).parent()?.parent()?;
-                    Some(config.display().to_string())
-                }),
+            Target::Job(_) => account_dir(),
         }
     }
 
@@ -174,12 +167,15 @@ pub fn run_relay(spool: &Path) {
 /// session itself cannot name: `GIVERNY_PROFILE_DIR` is the tab telling us
 /// which one that is, and inside WSL it is the only way the answer crosses
 /// back at all.
+///
+/// Inside a background job the tab's word is the daemon's, so the job's
+/// directory, `<config>/jobs/<id>`, names the account instead.
 fn account_dir() -> Option<String> {
     std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
         .filter(|dir| !dir.is_empty())
-        .or_else(|| std::env::var("GIVERNY_PROFILE_DIR").ok())
-        .filter(|dir| !dir.is_empty())
+        .or_else(|| crate::lineage::job_account().map(|d| d.display().to_string()))
+        .or_else(|| crate::lineage::giverny_var("GIVERNY_PROFILE_DIR"))
 }
 
 /// Send one message to the app: unix socket when available, else append to
@@ -226,10 +222,7 @@ pub fn send_clear_done(spool: &Path, session: Option<&str>, at_ms: u64) -> bool 
     // tab id is the daemon's.
     let target = match crate::lineage::bg_job() {
         Some(job) => Target::Job(job),
-        None => match std::env::var("GIVERNY_TAB_ID")
-            .ok()
-            .filter(|t| !t.trim().is_empty())
-        {
+        None => match crate::lineage::giverny_var("GIVERNY_TAB_ID") {
             Some(tab) => Target::Tab(tab),
             None => return false,
         },
@@ -503,7 +496,7 @@ pub fn run_statusline(spool: &Path) {
             target.msg(account, serde_json::Value::Object(event))
         }
         None => RelayMsg {
-            tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
+            tab_id: crate::lineage::giverny_var("GIVERNY_TAB_ID"),
             job: None,
             config_dir: account_dir(),
             event: serde_json::Value::Object(event),

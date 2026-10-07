@@ -44,9 +44,16 @@ pub fn default_dir() -> PathBuf {
 }
 
 /// `$GIVERNY_FEED_DIR` when set and non-empty, else [`default_dir`].
+/// Inside a background job always [`default_dir`]: the variable there is
+/// whichever Giverny started the job's daemon, not the one showing it
+/// ([`crate::lineage::giverny_var_in`], giverny#244).
 pub fn feed_dir() -> PathBuf {
-    std::env::var_os(DIR_ENV)
-        .filter(|v| !v.is_empty())
+    feed_dir_in(&|name| std::env::var(name).ok())
+}
+
+/// [`feed_dir`], reading the environment through `get`.
+pub fn feed_dir_in(get: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    crate::lineage::giverny_var_in(DIR_ENV, get)
         .map(PathBuf::from)
         .unwrap_or_else(default_dir)
 }
@@ -1374,6 +1381,23 @@ pub fn fmt_delta(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer inside a background job writes where this platform's
+    /// Giverny reads, whatever feed directory the job's daemon inherited
+    /// (giverny#244).
+    #[test]
+    fn a_jobs_feeds_go_to_this_platforms_directory() {
+        let windows = "/mnt/c/Users/ita/AppData/Roaming/giverny/feeds";
+        let in_job = |name: &str| match name {
+            DIR_ENV => Some(windows.to_string()),
+            "CLAUDE_JOB_DIR" => Some("/home/ita/.claude/jobs/34c55b2c".to_string()),
+            _ => None,
+        };
+        assert_eq!(feed_dir_in(&in_job), default_dir());
+        let in_tab = |name: &str| (name == DIR_ENV).then(|| "/tmp/feeds".to_string());
+        assert_eq!(feed_dir_in(&in_tab), PathBuf::from("/tmp/feeds"));
+        assert_eq!(feed_dir_in(&|_: &str| None), default_dir());
+    }
 
     #[test]
     fn done_rows_cleared_by_hand_are_the_ones_landed_by_then() {

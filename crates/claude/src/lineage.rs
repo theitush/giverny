@@ -24,6 +24,8 @@
 //! that session's — it has nothing to judge by and trusts the tab id, as
 //! before.
 
+use std::path::PathBuf;
+
 /// The app's process id, exported to every tab's shell.
 pub const APP_PID_ENV: &str = "GIVERNY_PID";
 
@@ -89,6 +91,59 @@ pub fn lineage(
 /// The environment variable Claude Code gives a session its background
 /// daemon hosts: that job's directory, `<config>/jobs/<short id>`.
 pub const JOB_DIR_ENV: &str = "CLAUDE_JOB_DIR";
+
+/// The directory of the background job whose process tree this runs in
+/// (`$CLAUDE_JOB_DIR`), as `get` reads the environment. Set for the job's
+/// own session and inherited by everything it starts.
+pub fn job_dir_in(get: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    get(JOB_DIR_ENV)
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `$name`, when this process may take it from Giverny: set, not blank, and
+/// not inside a background job.
+///
+/// The daemon that runs background jobs is detached, and keeps the
+/// environment of whatever started it: a tab of some Giverny, a Windows
+/// build's, one long closed. Its `GIVERNY_TAB_ID` names that tab, its
+/// `GIVERNY_FEED_DIR` that Giverny's feeds (`/mnt/c/…` for a Windows one),
+/// its `GIVERNY_PROFILE_DIR` that Giverny's view of the account. Nothing in a
+/// job's process tree was told any of it by the Giverny showing the job, so
+/// none of it is used there: the job is addressed by its id, and the feeds
+/// go to this platform's own directory (giverny#244).
+pub fn giverny_var_in(name: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if job_dir_in(get).is_some() {
+        return None;
+    }
+    get(name).filter(|v| !v.trim().is_empty())
+}
+
+/// The account a background job runs under: its directory is
+/// `<config>/jobs/<id>`.
+pub fn job_account_in(get: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    Some(job_dir_in(get)?.parent()?.parent()?.to_path_buf())
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Does this process run inside a background job ([`job_dir_in`])?
+pub fn in_bg_job() -> bool {
+    job_dir_in(&env).is_some()
+}
+
+/// [`giverny_var_in`] for this process.
+pub fn giverny_var(name: &str) -> Option<String> {
+    giverny_var_in(name, &env)
+}
+
+/// [`job_account_in`] for this process.
+pub fn job_account() -> Option<PathBuf> {
+    job_account_in(&env)
+}
 
 /// The background job whose own session ran this process, by its short id
 /// (the job directory's name), or `None` outside one.
@@ -252,6 +307,58 @@ fn of_process(pid: u32, app: u32) -> Lineage {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An environment as a lookup, for the `_in` functions.
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// The live case: a job whose daemon a Windows Giverny started. None of
+    /// its Giverny variables are taken; the job's directory names the
+    /// account (giverny#244).
+    #[test]
+    fn inside_a_job_the_daemons_giverny_variables_are_not_taken() {
+        let daemons = [
+            ("GIVERNY_TAB_ID", "giverny-65"),
+            (
+                "GIVERNY_FEED_DIR",
+                "/mnt/c/Users/ita/AppData/Roaming/giverny/feeds",
+            ),
+            (
+                "GIVERNY_PROFILE_DIR",
+                r"\\wsl.localhost\Ubuntu\home\ita\.claude",
+            ),
+            ("CLAUDE_JOB_DIR", "/home/ita/.claude/jobs/34c55b2c"),
+        ];
+        let get = env_of(&daemons);
+        assert_eq!(
+            job_dir_in(&get),
+            Some(PathBuf::from("/home/ita/.claude/jobs/34c55b2c"))
+        );
+        for name in ["GIVERNY_TAB_ID", "GIVERNY_FEED_DIR", "GIVERNY_PROFILE_DIR"] {
+            assert_eq!(giverny_var_in(name, &get), None, "{name}");
+        }
+        assert_eq!(
+            job_account_in(&get),
+            Some(PathBuf::from("/home/ita/.claude"))
+        );
+
+        let tabs = [("GIVERNY_TAB_ID", "giverny-57"), ("GIVERNY_FEED_DIR", " ")];
+        let get = env_of(&tabs);
+        assert_eq!(job_dir_in(&get), None);
+        assert_eq!(
+            giverny_var_in("GIVERNY_TAB_ID", &get).as_deref(),
+            Some("giverny-57")
+        );
+        assert_eq!(giverny_var_in("GIVERNY_FEED_DIR", &get), None, "blank");
+        assert_eq!(job_account_in(&get), None);
+        let blank = [("CLAUDE_JOB_DIR", ""), ("GIVERNY_TAB_ID", "giverny-57")];
+        assert!(giverny_var_in("GIVERNY_TAB_ID", &env_of(&blank)).is_some());
+    }
 
     /// A process tree as `(pid, parent, is claude)`.
     fn walk(tree: &[(u32, u32, bool)], start: u32, app: u32) -> Lineage {

@@ -211,6 +211,11 @@ impl AgentsLive {
     /// `/clear` whose hook never reached the tab, a switch to another job)
     /// starts the table over, bound to it; the same one re-id'd is recorded
     /// beside the old id. A tab with no table gets one (giverny#242).
+    ///
+    /// The job runs, so its session is up: the pane shows from now, not
+    /// from the first hook or status tick that reaches the tab — a job
+    /// shown by `claude attach` sends no `SessionStart`, and an orchestrator
+    /// that has only planned has no workers to tick (giverny#244).
     pub fn job_holds(
         &mut self,
         tab: TabId,
@@ -218,6 +223,7 @@ impl AgentsLive {
         origin: Option<&str>,
         config_dir: Option<PathBuf>,
     ) {
+        self.up.insert(tab);
         let config = self
             .trackers
             .get(&tab)
@@ -545,10 +551,11 @@ mod tests {
         assert_eq!(t.session_id.as_deref(), Some("cleared"));
         assert!(t.aliases.is_empty());
 
-        // A tab with no table gets one, for the job's history to show.
+        // A tab with no table gets one, for the job's history to show,
+        // and its pane shows at once: the job is up (giverny#244).
         live.job_holds(TabId(9), "cleared", None, Some(config.clone()));
         assert_eq!(
-            live.tracker(TabId(9)).unwrap().session_id.as_deref(),
+            live.shown(TabId(9)).unwrap().session_id.as_deref(),
             Some("cleared")
         );
 
