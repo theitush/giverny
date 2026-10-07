@@ -114,9 +114,8 @@ pub struct FeedRow {
     pub open: Option<String>,
     pub note: Option<String>,
     /// What a person has to look at before a Done row counts
-    /// (`<who> — <what> — <where>`): the top line of the row's overlay. With
-    /// it, nothing is fetched; without it, a key naming a GitHub issue has
-    /// the line read from the issue where `gh` works.
+    /// (`<who> — <what> — <where>`): the top line of the row's overlay. The
+    /// line comes only from `land --review`; without it the row has no Review line.
     pub review: Option<String>,
     /// The row was started by an `eta` with no `start` before it (a
     /// dispatcher that forgot it, or a worker of giverny#158's first round),
