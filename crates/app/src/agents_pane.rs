@@ -1400,6 +1400,7 @@ fn cut(s: &str, max: usize) -> String {
 pub fn show(
     views: &mut Views,
     tab: TabId,
+    reading: Option<&giverny_claude::use_reading::Reading>,
     tracker: Option<&Tracker>,
     viewed: Option<&str>,
     header: Option<&str>,
@@ -1416,15 +1417,12 @@ pub fn show(
     view.poll_feed(tracker.session_id.as_deref(), &tracker.aliases);
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
-    // What the rows' processes use: the app's one reading, the one the
-    // status line and the sidebar show parts and sums of.
-    let reading = crate::sessions_load::latest(ui.ctx());
+    // What the rows' processes use: the reading the tab's status line
+    // shows, which the sidebar shows the sum of (`sessions_load::for_tab`).
     let runs = reading
-        .as_deref()
         .map(crate::sessions_load::task_lives)
         .unwrap_or_default();
     let workers = reading
-        .as_deref()
         .map(crate::sessions_load::workers)
         .unwrap_or_default();
     let clock = Clock {

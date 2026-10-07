@@ -1445,7 +1445,8 @@ fn usage_panel(
         }
     }
     ui.add_space(6.0);
-    let r = crate::sessions_load::latest(ui.ctx())?;
+    // The reading the active tab's status line shows (`App::use_now`).
+    let r = app.use_now.clone()?;
     Some(sessions_load_row(ui, &r, dim))
 }
 

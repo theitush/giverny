@@ -1066,6 +1066,12 @@ pub struct App {
     /// Each tab's agents pane view state (`claude.agents_pane`); the rows
     /// are `claude.agents`'.
     pub agent_views: agents_pane::Views,
+    /// Which use reading each tab's figures are drawn from, and this
+    /// frame's for the active tab: the one its status line shows
+    /// (`sessions_load::for_tab`), so the line, the pane and the sidebar
+    /// agree.
+    use_follow: sessions_load::Follow,
+    pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
     /// The overlay an agents-pane row opens: a brief, or a worker's
     /// transcript (`overlays::BriefOverlay`).
     pub brief: Option<overlays::BriefOverlay>,
@@ -1669,6 +1675,8 @@ impl App {
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
             agent_views: agents_pane::Views::default(),
+            use_follow: sessions_load::Follow::default(),
+            use_now: None,
             brief: None,
             brief_row: None,
             session_rect: None,
@@ -4680,6 +4688,18 @@ impl eframe::App for App {
                 });
         }
 
+        // The use figures this frame draws, read before the rail and the
+        // pane so both show the reading the active tab's status line does.
+        self.use_now = match self.ws.active {
+            Some(tab) => {
+                let session = self.rt.get(&tab).and_then(|rt| rt.session.as_ref());
+                sessions_load::for_tab(&ctx, &mut self.use_follow, &tab_env_id(tab), || {
+                    session.map(|s| s.screen_text())
+                })
+            }
+            None => sessions_load::latest(&ctx),
+        };
+
         egui::Panel::left("rail")
             .resizable(true)
             .default_size(
@@ -4835,6 +4855,7 @@ impl eframe::App for App {
                 let (click, line) = agents_pane::show(
                     &mut self.agent_views,
                     active,
+                    self.use_now.as_deref(),
                     // Only once the tab's session is up.
                     self.claude.agents.shown(active),
                     viewed.as_deref(),

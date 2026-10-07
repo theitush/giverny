@@ -462,11 +462,22 @@ pub fn run_statusline(spool: &Path) {
     // sidebar are parts and sums of; measured here only without one (a
     // plain terminal, or a claude outside its tabs).
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
-    let used = crate::use_reading::session_now()
-        .map(|u| u.session())
+    let reading = crate::use_reading::session_now();
+    let used = reading
+        .map(|(_, u)| u.session())
         .or_else(|| crate::session_use::measure(session_id))
         .map(|u| crate::session_use::segments(&u).join(crate::session_use::SEP))
         .unwrap_or_default();
+    // Which reading this is, for the tab's pane and the sidebar to show
+    // the same one as the line goes up (giverny#235).
+    if let (Some((seq, _)), Ok(tab)) = (reading, std::env::var("GIVERNY_TAB_ID")) {
+        let shown = crate::use_reading::Shown {
+            seq,
+            at_ms: u64::try_from(now_ms).unwrap_or(0),
+            text: used.clone(),
+        };
+        let _ = crate::use_reading::write_shown(&crate::use_reading::shown_dir(), &tab, &shown);
+    }
     let width = crate::session_use::line_width(std::env::var("COLUMNS").ok().as_deref());
     println!(
         "{}",
