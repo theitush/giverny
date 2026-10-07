@@ -133,10 +133,20 @@ fn profile_for(config_dir: PathBuf) -> Profile {
 /// Does this directory look like a Claude account, rather than something
 /// that merely sits at a plausible path?
 ///
-/// Claude Code writes an identity file and a session registry; requiring one
-/// of them keeps an empty `~/.claude-old` out of the account list.
+/// Logged in, or used: an identity file that names an account, or a
+/// transcript. Neither the identity file nor the session registry is enough
+/// by itself — Claude Code writes both at its first startup, before any
+/// login, so a Windows Claude Code opened once and closed at the login prompt
+/// showed up in the rail as an account called `.claude`, forever without
+/// usage, above the WSL accounts actually in use. An empty `~/.claude-old`
+/// stays out for the same reason.
 pub fn looks_like_account(dir: &Path) -> bool {
-    dir.is_dir() && (identity_path(dir).is_file() || dir.join("sessions").is_dir())
+    if !dir.is_dir() {
+        return false;
+    }
+    let has_transcripts =
+        std::fs::read_dir(dir.join("projects")).is_ok_and(|mut entries| entries.next().is_some());
+    has_transcripts || read_identity(dir) != (None, None)
 }
 
 /// Directories that could plausibly hold an account, without walking $HOME.
@@ -319,10 +329,29 @@ mod tests {
         account(&real, "a@b.c");
         assert!(looks_like_account(&real));
 
-        // A session registry counts too: a config dir used but never logged in.
-        let fresh = root.join(".claude-fresh");
-        std::fs::create_dir_all(fresh.join("sessions")).unwrap();
-        assert!(looks_like_account(&fresh));
+        // A transcript counts too: a config dir used but never logged in.
+        let used = root.join(".claude-used");
+        std::fs::create_dir_all(used.join("projects").join("-home-x")).unwrap();
+        assert!(looks_like_account(&used));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What Claude Code leaves when it is opened once and closed at the login
+    /// prompt: an identity file with no account in it and an empty session
+    /// registry. Seen as `@.claude` in the rail of a Windows Giverny whose
+    /// accounts live in WSL.
+    #[test]
+    fn a_config_dir_opened_but_never_logged_in_is_not_an_account() {
+        let root = scratch("unlogged");
+        let dir = root.join(".claude");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        std::fs::write(
+            dir.with_extension("json"),
+            r#"{"firstStartTime":"2026-09-10T11:17:00Z","userID":"x"}"#,
+        )
+        .unwrap();
+        assert!(!looks_like_account(&dir));
         let _ = std::fs::remove_dir_all(&root);
     }
 
