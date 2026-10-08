@@ -194,13 +194,21 @@ giverny-orchestrator-session start <next task> --agent <worker's agent id>
 That lands the worker's earlier task now, with its own measured time, and
 starts the new one with its own clock; the pane shows each task as its own row,
 and each finished row counts only the tokens spent on that task. A plain
-`start <next task>` (with no `--agent`) works too when the message names the
-task (`Next you hold acme#614`, or `a review round on #613` for `acme#613-r1`):
-the orchestrator session and the pane link the row to the worker the message went to, and
-`start` points out the idle worker to pass as `--agent`. Beginning the message
-with `New task for you: <next task>` is no longer required, only recommended:
-it is what tells a hand-off to a worker still busy on its last task apart from
-a mid-task note.
+`start <next task>` (with no `--agent`) works too when the message assigns the
+task: it begins `New task for you: <next task>`, or names the task right after
+a holding phrase (`Next you hold acme#614`, `Your next task is acme#614`, or `a
+review round on #613` for `acme#613-r1`). The orchestrator session and the pane
+then link the row to the worker the message went to, and `start` points out the
+idle worker to pass as `--agent`. A task the message only mentions
+(`another worker now holds acme#615`) is never linked to it, and a row a
+worker already holds — or that a worker was spawned for — is never moved by a
+message; `start`/`eta --agent` is how to move one. Beginning the message with
+`New task for you: <next task>` is what tells a hand-off to a worker still busy
+on its last task apart from a mid-task note.
+
+A Running row whose worker has finished says so on its row (`worker finished —
+not landed`), and so does one with no worker at all (`no worker running`):
+land it, or hand it to the worker that holds it.
 
 ## 4. Land a task
 

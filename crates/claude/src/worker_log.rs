@@ -273,6 +273,21 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// When a transcript's worker first wrote: the first `timestamp` among its
+/// opening lines, read without the rest of the file.
+pub fn first_written_ms(path: &Path) -> Option<u64> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .lines()
+        .take(8)
+        .map_while(Result::ok)
+        .find_map(|l| {
+            let v: Value = serde_json::from_str(&l).ok()?;
+            v.get("timestamp").and_then(Value::as_str).and_then(ms_of)
+        })
+}
+
 fn ms_of(s: &str) -> Option<u64> {
     s.parse::<jiff::Timestamp>()
         .ok()

@@ -649,9 +649,86 @@ fn has_unworkered(doc: &Value) -> bool {
         .any(|r| !r.contains_key("agent_id") && stage_of(r) == Some(feed::Stage::Running))
 }
 
+/// A subagent of this session as its spawn left it: its id, the Agent
+/// tool's `description`, and when its transcript was first written.
+#[derive(Debug, Clone)]
+struct Spawn {
+    agent: String,
+    description: String,
+    at_ms: Option<u64>,
+}
+
+/// Every subagent of the conversation's `sessions` that has a spawn
+/// description.
+fn spawns(cfg: Option<&Path>, sessions: &[String]) -> Vec<Spawn> {
+    let mut out: Vec<Spawn> = Vec::new();
+    for session in sessions {
+        let Some(dir) = session_subagents(cfg, session) else {
+            continue;
+        };
+        for agent in crate::subagents::list_agent_ids(&dir) {
+            if out.iter().any(|s| s.agent == agent) {
+                continue;
+            }
+            let Some(description) = crate::subagents::read_meta(&dir, &agent).description else {
+                continue;
+            };
+            let at_ms =
+                worker_log::first_written_ms(&crate::subagents::agent_transcript(&dir, &agent));
+            out.push(Spawn {
+                agent,
+                description,
+                at_ms,
+            });
+        }
+    }
+    out
+}
+
+/// Give each Running row with no worker the one worker spawned for it: the
+/// subagent whose spawn description names its key and that first wrote no
+/// earlier than [`feed::HANDOFF_WINDOW_MS`] before the row started. The
+/// hook does the same at the worker's first tool call; done here too, the
+/// row is that worker's before any message to another worker that names it
+/// can be read as handing it over (giverny#258). Returns the keys stamped.
+fn stamp_spawns(doc: &mut Value, spawns: &[Spawn]) -> Vec<String> {
+    let Some(rows) = doc.get_mut("rows").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let mut stamped = Vec::new();
+    for r in rows.iter_mut().filter_map(Value::as_object_mut) {
+        if r.contains_key("agent_id") || stage_of(r) != Some(feed::Stage::Running) {
+            continue;
+        }
+        let Some(key) = r
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
+        let started = ms_of(r, "started");
+        let theirs: Vec<&Spawn> = spawns
+            .iter()
+            .filter(|s| feed::names_key(&s.description, key))
+            .filter(|s| match (s.at_ms, started) {
+                (Some(at), Some(st)) => at.saturating_add(feed::HANDOFF_WINDOW_MS) >= st,
+                _ => true,
+            })
+            .collect();
+        if let [one] = theirs.as_slice() {
+            stamped.push(key.to_string());
+            r.insert("agent_id".into(), json!(one.agent));
+        }
+    }
+    stamped
+}
+
 /// The hand-offs a dispatcher made by message alone (giverny#217): a plain
-/// `start <task>`, then a `SendMessage` to a worker of this session naming the
-/// task in any wording. Each Running row with no worker that such a message
+/// `start <task>`, then a `SendMessage` to a worker of this session that
+/// assigns the task ([`feed::assigns`]: `New task for you: <task>`, `Next
+/// you hold <task>`) — a message that only mentions it hands nothing
+/// (giverny#258). Each Running row with no worker that such a message
 /// hands over ([`feed::handed_by`]) gets that worker's `agent_id`, as
 /// `start <task> --agent <worker>` would have given it, so its tokens are
 /// counted from its own start and frozen when it lands. The workers looked
@@ -800,8 +877,8 @@ fn idle_hint(task: &str, idle: &[(String, String)]) -> Option<String> {
     };
     Some(format!(
         "  {agent} is idle since {key} landed{more}: if it takes {task}, start it with \
-         `--agent {agent}` so {task} counts its own tokens (a SendMessage to it naming \
-         {task} links it too)"
+         `--agent {agent}` so {task} counts its own tokens (a SendMessage to it that \
+         begins `New task for you: {task}` links it too)"
     ))
 }
 
@@ -1575,6 +1652,9 @@ fn run_feed(
             }
             let before = done_keys(&doc);
             let read_log = |agent: &str| worker_log(cfg, &sessions, agent);
+            if has_unworkered(&doc) {
+                stamp_spawns(&mut doc, &spawns(cfg, &sessions));
+            }
             let linked = link_handoffs(&mut doc, read_log);
             for (agent, _) in &linked {
                 freeze_tokens(&mut doc, &before, Some(agent), read_log);
@@ -3114,6 +3194,103 @@ mod tests {
         assert_eq!(r900.stage(), feed::Stage::Done);
         assert_eq!(r900.ended_ms, Some(T0 + 12 * MIN));
         assert_eq!(task_tokens(&f, "inbar#900"), Some(1_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#258, replayed from the inbar orchestrator session: `start
+    /// inbar#856` and `start inbar#865` with no `--agent`, the idle worker of
+    /// #855 handed #865 by a message that says in passing that "another
+    /// worker now holds inbar#856", #856's own worker spawned a moment
+    /// later, then `start inbar#865 --agent`. #856 stays its own worker's;
+    /// a real hand-off by message still links.
+    #[test]
+    fn a_task_named_in_passing_stays_with_its_own_worker() {
+        let dir = scratch("handoff-passing");
+        run_cfg(&dir, "s1", "start inbar#855 --agent a1bbcad", None, T0);
+        let cfg = spawned(
+            &dir,
+            "s1",
+            "a1bbcad",
+            "Work inbar#855 #862 Ofer-shaped harness",
+        );
+        let subs = cfg.join("projects").join("-w").join("s1").join("subagents");
+        let log = subs.join("agent-a1bbcad.jsonl");
+        let mut lines = vec![turn("a", T0 + MIN, 1_000)];
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        run_cfg(&dir, "s1", "land inbar#855", Some(&cfg), T0 + 14 * MIN);
+        let at = T0 + 14 * MIN + 30_000;
+        run_cfg(&dir, "s1", "start inbar#856 --eta 45", Some(&cfg), at);
+        run_cfg(&dir, "s1", "start inbar#865 --eta 60", Some(&cfg), at);
+        lines.push(sent_at(
+            at + 5_000,
+            "New task for you: inbar#865, the bridge you filed. Your brief is \
+             /tmp/scratchpad/brief-865.md. Read it and follow it exactly; it overrides anything \
+             from #855 where they differ. #855 and #862 are committed and pushed as 82dfb5e. \
+             Another worker now holds inbar#856 and imports levers855.mjs at the same time as you.",
+        ));
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+        // Before #856's worker exists: the message links #865 alone.
+        let (said, _) = run_cfg(&dir, "s1", "eta inbar#865 59", Some(&cfg), at + 6_000);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(
+            agent_of(&f, "inbar#865").as_deref(),
+            Some("a1bbcad"),
+            "{said}"
+        );
+        assert_eq!(agent_of(&f, "inbar#856"), None, "only mentioned");
+
+        // #856's worker is spawned; the dispatcher records #865's hand-off.
+        spawned(&dir, "s1", "a9ebade", "Work inbar#856 lever ablation");
+        std::fs::write(
+            subs.join("agent-a9ebade.jsonl"),
+            turn("z", at + 9_000, 500) + "\n",
+        )
+        .unwrap();
+        run_cfg(
+            &dir,
+            "s1",
+            "start inbar#865 --agent a1bbcad",
+            Some(&cfg),
+            at + 10_000,
+        );
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "inbar#856").as_deref(), Some("a9ebade"));
+        assert_eq!(agent_of(&f, "inbar#865").as_deref(), Some("a1bbcad"));
+        let r856 = f.rows.iter().find(|r| r.key == "inbar#856").unwrap();
+        assert_eq!(r856.stage(), feed::Stage::Running);
+
+        // a1bbcad lands #865 and is handed the next task the way the skill
+        // says: a plain start and `New task for you: …`.
+        run_cfg(&dir, "s1", "land inbar#865", Some(&cfg), at + 11 * MIN);
+        run_cfg(&dir, "s1", "start inbar#870", Some(&cfg), at + 12 * MIN);
+        lines.push(sent_at(
+            at + 12 * MIN + 5_000,
+            "New task for you: inbar#870. inbar#856 is still a9ebade's.",
+        ));
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let (said, _) = run_cfg(&dir, "s1", "eta inbar#870 30", Some(&cfg), at + 13 * MIN);
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(
+            agent_of(&f, "inbar#870").as_deref(),
+            Some("a1bbcad"),
+            "{said}"
+        );
+        assert_eq!(agent_of(&f, "inbar#856").as_deref(), Some("a9ebade"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spawn description from an earlier run of the same task does not
+    /// claim a row started long after it.
+    #[test]
+    fn an_old_spawn_does_not_claim_a_new_row() {
+        let dir = scratch("handoff-old-spawn");
+        let cfg = spawned(&dir, "s1", "old", "Work inbar#900 first try");
+        let subs = cfg.join("projects").join("-w").join("s1").join("subagents");
+        std::fs::write(subs.join("agent-old.jsonl"), turn("a", T0, 10) + "\n").unwrap();
+        run_cfg(&dir, "s1", "start inbar#900", Some(&cfg), T0 + 60 * MIN);
+        run_cfg(&dir, "s1", "eta inbar#900 30", Some(&cfg), T0 + 61 * MIN);
+        assert_eq!(agent_of(&read_feed_of(&dir, "s1"), "inbar#900"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
