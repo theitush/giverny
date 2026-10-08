@@ -478,8 +478,16 @@ fn insert(root: &mut toml::Value, keys: &[&str], value: toml::Value) {
     }
 }
 
+/// `None` only when there is no file. Any other failure to read it (a byte
+/// that is not UTF-8, no permission, an editor holding it mid-save) is an
+/// error like a file that does not parse: taking it for a first run would
+/// write the template over the user's file.
 fn read(path: &Path, previous: &Config) -> Option<Result<Parsed, String>> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => return Some(Err(format!("cannot read it: {err}"))),
+    };
     Some(match parse_over(&text, previous) {
         Ok(parsed) => {
             if !parsed.unknown.is_empty() {
@@ -524,7 +532,8 @@ pub fn load_or(base: &Path, previous: &Config) -> Config {
 /// Values stood in are not what the user configured, so a caller that would
 /// write them somewhere else (an account's `settings.json`, say) must not
 /// treat them as if they were. A missing file is not an error: it is the
-/// first run, and gets the template and defaults as [`load`] does.
+/// first run, and gets the template and defaults as [`load`] does. A file
+/// that is there but cannot be read is an error, and is never overwritten.
 pub fn load_checked(base: &Path, previous: &Config) -> Result<Parsed, String> {
     let path = config_path(base);
     match read(&path, previous) {
@@ -630,6 +639,27 @@ mod tests {
         assert!(load_checked(&fresh, &Config::default()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    /// A file that is there but cannot be read is not a first run: it is
+    /// reported, the running settings stay, and it is never overwritten
+    /// with the template.
+    #[test]
+    fn an_unreadable_config_is_an_error_and_left_alone() {
+        let dir = scratch("unreadable");
+        let bytes = b"[font]\nsize = 21.0 # caf\xe9\n";
+        std::fs::write(config_path(&dir), bytes).unwrap();
+        assert!(load_checked(&dir, &Config::default()).is_err());
+        let previous = Config {
+            font: FontConfig {
+                size: 17.0,
+                ..FontConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(load_or(&dir, &previous).font.size, 17.0);
+        assert_eq!(std::fs::read(config_path(&dir)).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const ONE_BAD_VALUE: &str = "[font]\nsize = \"big\"\nfamily = \"Iosevka\"\n\
