@@ -312,7 +312,7 @@ impl Default for BehaviorConfig {
                 .map(|s| s.to_string())
                 .collect(),
             windows_shell: WindowsShell::Auto,
-            history_per_tab: true,
+            history_per_tab: false,
             history_also_shared: false,
         }
     }

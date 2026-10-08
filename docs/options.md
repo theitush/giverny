@@ -14,7 +14,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
 | `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
-| `behavior.history_per_tab` | `true` | Each tab's shell keeps its own history, back when the tab is restored. |
+| `behavior.history_per_tab` | `false` | Each tab's shell keeps its own history, back when the tab is restored. |
 | `behavior.history_also_shared` | `false` | With history per terminal, also append each command to the usual history (bash). |
 | `behavior.notifications` | `true` | Notify when Claude needs you in a background tab. |
 | `behavior.prefer_x11` | `false` | Run under X11/XWayland instead of Wayland. Takes effect on restart. |

@@ -312,7 +312,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "from here on.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: true },
+        kind: Kind::Bool { default: false },
     },
     SettingDef {
         key: "behavior.history_also_shared",
