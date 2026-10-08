@@ -62,6 +62,11 @@ const MATCH_MIN: usize = 8;
 /// over as many rows as it takes, so the first row holds the start of its
 /// first line. The input box at the bottom starts with `❯` too, right under a
 /// rule and unshaded: whatever is being typed there is not the prompt sent.
+///
+/// The top row does not count: it is the one the bar covers. Scrolled back,
+/// Claude Code pins the turn's prompt there itself, in its own colours, and
+/// counting it hid the bar and let that row take its place, a different
+/// grey, every time the view moved off the bottom.
 pub fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
     let Some(first) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return false;
@@ -69,7 +74,7 @@ pub fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
     let want: Vec<char> = one_line(first, usize::MAX).chars().collect();
     let k = want.len().min(MATCH_CHARS);
     let mut under_rule = false;
-    for (text, shaded) in rows {
+    for (text, shaded) in rows.iter().skip(1) {
         let row = text.trim();
         let in_input = under_rule && !shaded;
         under_rule = !row.is_empty() && row.chars().all(|c| c == '─');
@@ -276,7 +281,7 @@ mod tests {
         rows.extend(INPUT_BOX);
         assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
         // Another prompt on screen is not this one.
-        let mut rows = vec![("❯ count down from 5", true)];
+        let mut rows = vec![("", false), ("❯ count down from 5", true)];
         rows.extend(INPUT_BOX);
         assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
     }
@@ -286,16 +291,37 @@ mod tests {
         let prompt = "List the numbers 1 to 60, one per line, each followed by its English name.";
         // Wrapped at the terminal's width, mid-sentence.
         let rows = screen(&[
+            ("● earlier", false),
             ("❯ List the numbers 1 to 60, one per line, each", true),
             ("  followed by its English name.", true),
         ]);
         assert!(on_screen(prompt, &rows));
         // Wrapped early, at a word, in a narrow terminal.
-        let rows = screen(&[("❯ List the numbers 1 to", true), ("  60, one per", true)]);
+        let rows = screen(&[
+            ("", false),
+            ("❯ List the numbers 1 to", true),
+            ("  60, one per", true),
+        ]);
         assert!(on_screen(prompt, &rows));
         // Only its tail on screen: the start scrolled off.
         let rows = screen(&[("  followed by its English name.", true)]);
         assert!(!on_screen(prompt, &rows));
+    }
+
+    #[test]
+    fn the_top_row_is_under_the_bar() {
+        // Scrolled back in Claude Code: it pins the turn's prompt on the top
+        // row itself. The bar covers that row, in its own colour.
+        let mut rows = vec![("❯ List the numbers 1 to 80", true), ("20 400", false)];
+        rows.extend(INPUT_BOX);
+        assert!(!on_screen("List the numbers 1 to 80", &screen(&rows)));
+        // One row lower, it is the prompt itself, in view.
+        let mut rows = vec![
+            ("❯ an older prompt", true),
+            ("❯ List the numbers 1 to 80", true),
+        ];
+        rows.extend(INPUT_BOX);
+        assert!(on_screen("List the numbers 1 to 80", &screen(&rows)));
     }
 
     #[test]
@@ -309,6 +335,7 @@ mod tests {
         assert!(!on_screen("fix the build", &rows));
         // A sent prompt right under a rule is still shaded, and still counts.
         let rows = screen(&[
+            ("● output", false),
             ("────────────────────────────────────────", false),
             ("❯ fix the build", true),
         ]);
