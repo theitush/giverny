@@ -359,6 +359,7 @@ mod tests {
     }
 
     /// The history variables in an `env` dump.
+    #[cfg(unix)]
     fn leaked(dump: &Path) -> Vec<String> {
         std::fs::read_to_string(dump)
             .unwrap()

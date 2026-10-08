@@ -222,6 +222,7 @@ pub struct ClaudeWatch {
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
     /// When the link was last checked for a target that is gone.
+    #[cfg(unix)]
     last_link_check: Instant,
     /// The Claude processes, by account and pid, that were running when
     /// their account's hooks were first installed. Claude Code reads hooks
@@ -267,6 +268,7 @@ const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
 const LOOK_AGAIN_INTERVAL: Duration = Duration::from_secs(45);
 /// How often the link is checked for a target that is gone: a build that
 /// pointed it at itself, then was deleted (`cargo clean`).
+#[cfg(unix)]
 const LINK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A bool two threads share. `AtomicBool` in a name that says what it is for.
@@ -432,6 +434,7 @@ impl ClaudeWatch {
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
             leave_accounts,
+            #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
         };
@@ -1312,6 +1315,7 @@ impl ClaudeWatch {
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: Vec::new(),
             leave_accounts: false,
+            #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),

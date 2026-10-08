@@ -975,8 +975,6 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
     ))
 }
 
-/// Environment every tab's shell inherits, so `claude` behaves the way the
-/// settings screen says however it is started — typed, resumed, or attached.
 /// Can account setup follow this config? Not when a value it reads — the
 /// `[claude]` section — is one that did not fit and was stood in for.
 fn accounts_readable(parsed: &config::Parsed) -> bool {
@@ -1007,6 +1005,8 @@ fn set_up_accounts(
     }
 }
 
+/// Environment every tab's shell inherits, so `claude` behaves the way the
+/// settings screen says however it is started — typed, resumed, or attached.
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if claude.skip_resume_summary {
