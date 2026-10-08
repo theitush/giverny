@@ -231,6 +231,22 @@ impl Workspace {
         self.recent.retain(|&x| x != id && Some(x) != self.active);
     }
 
+    /// Close every tab opened from BACKGROUND. Such a tab is a view onto a
+    /// background agent, gone when the attach ends; restored after a restart
+    /// it would attach again and so start a job the restart had stopped
+    /// (giverny#245). A live agent is in BACKGROUND anyway.
+    pub fn drop_background_tabs(&mut self) {
+        let ids: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| t.bg_job.is_some())
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.close_tab(id);
+        }
+    }
+
     pub fn tab(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|t| t.id == id)
     }
@@ -429,6 +445,21 @@ mod tests {
 
     /// Closing the current tab goes back to where you were before it, not
     /// to its neighbour in the rail (giverny#247).
+    #[test]
+    fn tabs_opened_from_background_do_not_come_back() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let bg = ws.add_tab(cat);
+        ws.tab_mut(bg).unwrap().bg_job = Some("34c55b2c".into());
+        ws.set_active(a);
+        ws.set_active(bg);
+        ws.drop_background_tabs();
+        assert!(ws.tab(bg).is_none());
+        assert!(ws.tab(a).is_some());
+        assert_eq!(ws.active, Some(a));
+    }
+
     #[test]
     fn closing_the_active_tab_goes_back_to_the_last_one_used() {
         let mut ws = Workspace::default();

@@ -1656,6 +1656,10 @@ impl App {
             .unwrap_or_default();
         let mut ws = restored
             .map(|st| st.workspace)
+            .map(|mut ws| {
+                ws.drop_background_tabs();
+                ws
+            })
             .filter(|ws| !ws.tabs.is_empty())
             .unwrap_or_default();
 
@@ -3207,9 +3211,10 @@ impl App {
 
     /// Queue the auto-resume command for a freshly restored tab.
     fn queue_resume(&mut self, id: TabId) {
-        // A tab opened from BACKGROUND comes back to its job the way it
-        // first did, and closes the same way when the attach ends. Resuming
-        // the conversation instead is refused while the job runs it.
+        // A tab opened from BACKGROUND is not restored after a restart
+        // (`drop_background_tabs`); one respawned goes back to its job the
+        // way it first did, and closes the same way when the attach ends.
+        // Resuming the conversation instead is refused while the job runs it.
         if let Some(tab) = self.ws.tab(id)
             && let Some(job) = &tab.bg_job
         {
