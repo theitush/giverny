@@ -3253,12 +3253,19 @@ impl eframe::App for App {
                         response.request_focus();
                         self.focus_terminal = false;
                     }
-                    // The prompt that started the turn, once a long answer
-                    // has scrolled it out of sight.
-                    match self.claude.prompt_of(active) {
-                        Some(prompt)
-                            if !prompt_bar::on_screen(prompt, &session.viewport_rows()) =>
-                        {
+                    // The prompt whose turn is in view, once its own row
+                    // has scrolled out of sight.
+                    let pinned = self.claude.prompts_of(active).and_then(|history| {
+                        let rows = session.viewport_rows();
+                        prompt_bar::owner(history, &rows, |matches| {
+                            session.find_above(prompt_bar::SEARCH_ABOVE, |row, shaded| {
+                                matches(row, shaded)
+                            })
+                        })
+                        .map(|i| history[i].as_str())
+                    });
+                    match pinned {
+                        Some(prompt) => {
                             let row = session.size().cell_height as f32 / ctx.pixels_per_point();
                             if prompt_bar::show(
                                 &ctx,
@@ -3271,7 +3278,7 @@ impl eframe::App for App {
                                 self.focus_terminal = true;
                             }
                         }
-                        _ => prompt_bar::hide(&ctx, active),
+                        None => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {

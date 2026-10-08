@@ -280,29 +280,45 @@ fn tail_title(path: &Path) -> Option<String> {
     (!best.is_empty()).then_some(best)
 }
 
-/// The last prompt the user sent in a transcript, for a session whose prompt
-/// no hook reported: one adopted mid-way, or resumed after a restart.
-///
-/// Claude Code writes `lastPrompt` lines for this, but cut at 200 characters
-/// with an ellipsis and with line breaks flattened. The prompt itself is the
-/// last user message, and is taken in full when the tail still holds one that
-/// `lastPrompt` agrees with. Otherwise `lastPrompt` stands: it is the one
-/// that says which message was typed rather than a command's output or a
-/// notification, and a cut prompt beats none.
+/// The last prompt the user sent in a transcript: the last of
+/// [`prompt_history`].
 pub fn last_prompt(path: &Path) -> Option<String> {
+    prompt_history(path).pop()
+}
+
+/// The prompts the user sent in a transcript, oldest first, for a session
+/// whose prompts no hook reported: one adopted mid-way, or resumed after a
+/// restart. Read from the tail, so a very long session gives its later turns.
+///
+/// The prompts are the user messages that are not tool results, notes Claude
+/// Code adds (`isMeta`, compaction summaries) or things it wraps in a tag (a
+/// command, a notification, `!` shell input).
+///
+/// The last one is checked against Claude Code's own `lastPrompt` marker,
+/// which is cut at 200 characters with an ellipsis and has its line breaks
+/// flattened. The message the marker agrees with is taken in full; when none
+/// does, the marker itself ends the list: it is the one that says which
+/// message was typed (a `!` command's, say), and a cut prompt beats none.
+pub fn prompt_history(path: &Path) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
-    // Bigger than the title's: one long answer with tool output in it pushes
-    // the message that started the turn a long way back.
-    const TAIL: u64 = 512 * 1024;
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
-    let mut bytes = Vec::new();
-    file.take(TAIL).read_to_end(&mut bytes).ok()?;
-    // The seek can land inside a character; only the first line is cut.
-    let buf = String::from_utf8_lossy(&bytes);
+    // Long answers with tool output in them push the messages that started
+    // their turns a long way back.
+    const TAIL: u64 = 2 * 1024 * 1024;
+    let Some(buf) = (|| {
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(TAIL).read_to_end(&mut bytes).ok()?;
+        // The seek can land inside a character; only the first line is cut.
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    })() else {
+        return Vec::new();
+    };
 
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    let flag =
+        |v: &serde_json::Value, name: &str| v.get(name).and_then(|m| m.as_bool()) == Some(true);
     let mut marker: Option<String> = None;
     let mut typed: Vec<String> = Vec::new();
     for line in buf.lines() {
@@ -320,32 +336,40 @@ pub fn last_prompt(path: &Path) -> Option<String> {
             continue;
         }
         if v.get("type").and_then(|t| t.as_str()) != Some("user")
-            || v.get("isMeta").and_then(|m| m.as_bool()) == Some(true)
+            || flag(&v, "isMeta")
+            || flag(&v, "isCompactSummary")
         {
             continue;
         }
         if let Some(text) = v.get("message").and_then(|m| user_text(m.get("content")?)) {
-            typed.push(text);
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                typed.push(text);
+            }
         }
     }
-    let prompt = match marker {
-        Some(m) => {
-            let stem = m.strip_suffix('…').filter(|_| m.chars().count() > 200);
-            typed
-                .into_iter()
-                .rev()
-                .find(|t| {
-                    let t = flat(t);
-                    t == m || stem.is_some_and(|stem| t.starts_with(stem))
-                })
-                .unwrap_or(m)
-        }
-        // No marker at all (an older Claude Code): the last message that
-        // does not look like something Claude Code wrapped in a tag.
-        None => typed.into_iter().rev().find(|t| !t.starts_with('<'))?,
-    };
-    let prompt = prompt.trim().to_string();
-    (!prompt.is_empty()).then_some(prompt)
+    // The last prompt: the message the marker names, in full.
+    let last = marker.map(|m| {
+        let stem = m.strip_suffix('…').filter(|_| m.chars().count() > 200);
+        typed
+            .iter()
+            .rev()
+            .find(|t| {
+                let t = flat(t);
+                t == m || stem.is_some_and(|stem| t.starts_with(stem))
+            })
+            .cloned()
+            .unwrap_or_else(|| m.trim().to_string())
+    });
+    let mut prompts: Vec<String> = typed.into_iter().filter(|t| !t.starts_with('<')).collect();
+    // A marker no listed message agrees with names one Claude Code wrapped
+    // (`!` shell input): it is the latest prompt.
+    if let Some(last) = last.filter(|l| !l.is_empty())
+        && !prompts.contains(&last)
+    {
+        prompts.push(last);
+    }
+    prompts
 }
 
 /// The text of a user message, or `None` when it is a tool result.
@@ -568,6 +592,40 @@ mod tests {
             ],
         );
         assert_eq!(last_prompt(&path).as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn prompt_history_lists_the_typed_prompts_in_order() {
+        let path = transcript(
+            "history",
+            &[
+                user(serde_json::json!("first")),
+                serde_json::json!({"type": "assistant", "message": {"content": "ok"}}),
+                user(serde_json::json!([{"type": "tool_result", "content": "out"}])),
+                user(serde_json::json!("<command-name>/model</command-name>")),
+                serde_json::json!({"type": "user", "isCompactSummary": true,
+                    "message": {"content": "This session is being continued"}}),
+                user(serde_json::json!("second\nwith a second line")),
+                marker("second with a second line"),
+                user(serde_json::json!("third")),
+                marker("third"),
+            ],
+        );
+        assert_eq!(
+            prompt_history(&path),
+            vec!["first", "second\nwith a second line", "third"]
+        );
+        // `!` shell input: the wrapped message is not listed, the marker ends it.
+        let path = transcript(
+            "history-bash",
+            &[
+                user(serde_json::json!("first")),
+                user(serde_json::json!("<bash-input>ls</bash-input>")),
+                marker("!  ls"),
+            ],
+        );
+        assert_eq!(prompt_history(&path), vec!["first", "!  ls"]);
+        assert!(prompt_history(Path::new("/nonexistent/x.jsonl")).is_empty());
     }
 
     #[test]

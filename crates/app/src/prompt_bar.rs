@@ -59,47 +59,94 @@ const MATCH_CHARS: usize = 40;
 /// A wrapped row can end early, at a word; this much of a prompt's start on
 /// it still counts.
 const MATCH_MIN: usize = 8;
+/// How far up the scrollback the prompt of the turn in view is looked for.
+/// A turn's answer is rarely longer; past it, the latest prompt is shown.
+pub const SEARCH_ABOVE: usize = 5000;
 
-/// Is this prompt on screen? `rows` are the terminal's visible rows, top to
-/// bottom, each with whether its first cell is shaded.
+/// Does a `❯` row, with the `❯` taken off, start this prompt?
+///
+/// The row holds the start of the prompt's first line, its whitespace as the
+/// terminal laid it out, and maybe cut short: by a wrap at a word, or with an
+/// ellipsis where Claude Code pins it on the top row.
+fn starts(prompt: &str, rest: &str) -> bool {
+    let Some(first) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return false;
+    };
+    let want: Vec<char> = one_line(first, usize::MAX).chars().collect();
+    let got: Vec<char> = one_line(rest.trim().trim_end_matches('…'), usize::MAX)
+        .chars()
+        .collect();
+    let k = want.len().min(MATCH_CHARS);
+    if got.len() >= k {
+        k > 0 && got[..k] == want[..k]
+    } else {
+        got.len() >= MATCH_MIN && want.starts_with(&got)
+    }
+}
+
+/// Which of `history` (oldest first) a row shows as a sent prompt, if any:
+/// the most recent one it starts, when two start the same way.
+pub fn prompt_of_row(history: &[String], row: &str) -> Option<usize> {
+    let row = row.trim();
+    let rest = row.strip_prefix('❯').or_else(|| row.strip_prefix('>'))?;
+    (0..history.len())
+        .rev()
+        .find(|&i| starts(&history[i], rest))
+}
+
+/// Is a prompt the user sent in view? `rows` are the terminal's visible rows,
+/// top to bottom, each with whether its first cell is shaded.
 ///
 /// Claude Code shows a sent prompt as `❯ <prompt>` on a shaded row, wrapped
 /// over as many rows as it takes, so the first row holds the start of its
-/// first line. The input box at the bottom starts with `❯` too, right under a
-/// rule and unshaded: whatever is being typed there is not the prompt sent.
+/// first line. A shaded `❯` row is a sent prompt whoever's it is; an unshaded
+/// one counts when it starts one of `history`. The input box at the bottom
+/// starts with `❯` too, right under a rule and unshaded: whatever is being
+/// typed there is not a prompt sent.
 ///
 /// The top row does not count: it is the one the bar covers. Scrolled back,
 /// Claude Code pins the turn's prompt there itself, in its own colours, and
 /// counting it hid the bar and let that row take its place, a different
 /// grey, every time the view moved off the bottom.
-pub fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
-    let Some(first) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
-        return false;
-    };
-    let want: Vec<char> = one_line(first, usize::MAX).chars().collect();
-    let k = want.len().min(MATCH_CHARS);
+pub fn prompt_in_view(history: &[String], rows: &[(String, bool)]) -> bool {
     let mut under_rule = false;
     for (text, shaded) in rows.iter().skip(1) {
         let row = text.trim();
         let in_input = under_rule && !shaded;
         under_rule = !row.is_empty() && row.chars().all(|c| c == '─');
-        if in_input {
+        if in_input || !(row.starts_with('❯') || row.starts_with('>')) {
             continue;
         }
-        let Some(rest) = row.strip_prefix('❯').or_else(|| row.strip_prefix('>')) else {
-            continue;
-        };
-        let got: Vec<char> = one_line(rest, usize::MAX).chars().collect();
-        let found = if got.len() >= k {
-            got[..k] == want[..k]
-        } else {
-            got.len() >= MATCH_MIN && want.starts_with(&got)
-        };
-        if found {
+        if (*shaded && row.starts_with('❯')) || prompt_of_row(history, row).is_some() {
             return true;
         }
     }
     false
+}
+
+/// The prompt to pin, as an index into `history` (oldest first): the one
+/// whose turn the view is in. `None` when there is none to pin, or when a
+/// prompt is in view and so needs no bar.
+///
+/// The owner is the nearest prompt above the view. Claude Code in fullscreen
+/// scrolls itself, the terminal holds only what is on screen, and scrolled
+/// back it pins the owner on the top row: that row names it. Otherwise
+/// `above` searches the terminal's own scrollback, nearest row first, with the
+/// matcher it is given. Failing both, it is the latest prompt.
+pub fn owner(
+    history: &[String],
+    rows: &[(String, bool)],
+    above: impl FnOnce(&dyn Fn(&str, bool) -> Option<usize>) -> Option<usize>,
+) -> Option<usize> {
+    if history.is_empty() || prompt_in_view(history, rows) {
+        return None;
+    }
+    let pinned = rows
+        .first()
+        .and_then(|(top, _)| prompt_of_row(history, top));
+    pinned
+        .or_else(|| above(&|row, _| prompt_of_row(history, row)))
+        .or(Some(history.len() - 1))
 }
 
 fn open_id(tab: TabId) -> egui::Id {
@@ -278,6 +325,11 @@ mod tests {
         );
     }
 
+    /// Is this one prompt on screen: [`prompt_in_view`] for a history of one.
+    fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
+        prompt_in_view(&[prompt.to_string()], rows)
+    }
+
     fn screen(rows: &[(&str, bool)]) -> Vec<(String, bool)> {
         rows.iter().map(|(t, s)| (format!("{t:<60}"), *s)).collect()
     }
@@ -307,10 +359,13 @@ mod tests {
         let mut rows = vec![("27 twenty-seven", false), ("28 twenty-eight", false)];
         rows.extend(INPUT_BOX);
         assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
-        // Another prompt on screen is not this one.
+        // Another prompt sent in view: the view is in its turn, not ours.
         let mut rows = vec![("", false), ("❯ count down from 5", true)];
         rows.extend(INPUT_BOX);
-        assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
+        assert!(on_screen("List the numbers 1 to 60", &screen(&rows)));
+        // A menu's `❯` (unshaded, not a prompt) is not a prompt in view.
+        let rows = screen(&[("", false), ("❯ 1. Yes", false), ("  2. No", false)]);
+        assert!(!on_screen("List the numbers 1 to 60", &rows));
     }
 
     #[test]
@@ -351,6 +406,95 @@ mod tests {
         assert!(on_screen("List the numbers 1 to 80", &screen(&rows)));
     }
 
+    fn history(prompts: &[&str]) -> Vec<String> {
+        prompts.iter().map(|p| p.to_string()).collect()
+    }
+
+    const TURNS: [&str; 3] = [
+        "List the numbers 1 to 60 with their English names",
+        "Now the squares of 1 to 80, one per line\nNo other text.",
+        "And the cubes of 1 to 70",
+    ];
+
+    /// No search above: the terminal has no scrollback (Claude fullscreen).
+    fn nothing_above(_: &dyn Fn(&str, bool) -> Option<usize>) -> Option<usize> {
+        None
+    }
+
+    #[test]
+    fn claude_pinning_a_turn_names_its_prompt() {
+        let h = history(&TURNS);
+        // Scrolled back into turn 2: Claude pins its prompt on the top row,
+        // cut to the width.
+        let rows = screen(&[
+            ("❯ Now the squares of 1 to 80, one per l…", true),
+            ("20 400", false),
+            ("21 441", false),
+        ]);
+        assert_eq!(owner(&h, &rows, nothing_above), Some(1));
+        // Into turn 1's.
+        let rows = screen(&[
+            ("❯ List the numbers 1 to 60 with", true),
+            ("7 seven", false),
+        ]);
+        assert_eq!(owner(&h, &rows, nothing_above), Some(0));
+    }
+
+    #[test]
+    fn scrollback_is_searched_for_the_nearest_prompt_above() {
+        let h = history(&TURNS);
+        let rows = screen(&[("31 961", false), ("32 1024", false)]);
+        // Nearest first: turn 2's answer, then its prompt, then older turns.
+        let above = screen(&[
+            ("30 900", false),
+            ("1 1", false),
+            ("❯ Now the squares of 1 to 80, one per line", true),
+            ("● sixty", false),
+            ("❯ List the numbers 1 to 60 with their English names", true),
+        ]);
+        let search = |m: &dyn Fn(&str, bool) -> Option<usize>| {
+            above.iter().find_map(|(text, shaded)| m(text, *shaded))
+        };
+        assert_eq!(owner(&h, &rows, search), Some(1));
+    }
+
+    #[test]
+    fn with_nothing_to_go_by_it_is_the_latest_prompt() {
+        let h = history(&TURNS);
+        let rows = screen(&[("31 29791", false), ("32 32768", false)]);
+        assert_eq!(owner(&h, &rows, nothing_above), Some(2));
+        // A pinned row that is no known prompt does not decide it.
+        let rows = screen(&[("❯ something else entirely, typed", true), ("x", false)]);
+        assert_eq!(owner(&h, &rows, nothing_above), Some(2));
+        assert_eq!(owner(&[], &rows, nothing_above), None);
+    }
+
+    #[test]
+    fn a_prompt_in_view_means_no_bar() {
+        let h = history(&TURNS);
+        let rows = screen(&[
+            ("❯ Now the squares of 1 to 80, one per l…", true),
+            ("❯ And the cubes of 1 to 70", true),
+            ("1 1", false),
+        ]);
+        assert_eq!(owner(&h, &rows, nothing_above), None);
+    }
+
+    #[test]
+    fn two_prompts_starting_alike_go_to_the_latest() {
+        let h = history(&[
+            "fix the build please, then run the tests",
+            "x",
+            "fix the build please, then lint",
+        ]);
+        assert_eq!(prompt_of_row(&h, "❯ fix the build please, then"), Some(2));
+        assert_eq!(
+            prompt_of_row(&h, "❯ fix the build please, then run"),
+            Some(0)
+        );
+        assert_eq!(prompt_of_row(&h, "fix the build"), None, "no ❯, no prompt");
+    }
+
     #[test]
     fn the_same_text_in_the_input_box_is_not_the_prompt() {
         let rows = screen(&[
@@ -367,7 +511,6 @@ mod tests {
             ("❯ fix the build", true),
         ]);
         assert!(on_screen("fix the build", &rows));
-        assert!(!on_screen("", &rows), "no prompt, nothing to find");
     }
 
     /// One opaque colour, in every theme: nothing under the bar shows
