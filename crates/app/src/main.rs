@@ -1422,6 +1422,15 @@ impl App {
         app
     }
 
+    /// A brand-new tab. Tab ids start over when the state file is lost, so
+    /// a history file can outlive its tab (one whose shell outlasted the
+    /// close, say): a new tab with that id starts without it.
+    fn new_tab(&mut self, category: CategoryId) -> TabId {
+        let id = self.ws.add_tab(category);
+        history::remove(&self.paths, id);
+        id
+    }
+
     /// Write one tab's scrollback, skipping the write when the screen has not
     /// changed since the last one — an idle tab would otherwise cost an fsync
     /// a minute for a file already holding exactly those bytes.
@@ -1507,7 +1516,7 @@ impl App {
                     .or_else(|| self.ws.active_tab().and_then(|t| t.cwd.clone()))
                     .or_else(dirs::home_dir)
                     .unwrap_or_else(|| PathBuf::from("/"));
-                let id = self.ws.add_tab(category);
+                let id = self.new_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
                 self.reveal_terminal();
@@ -1528,7 +1537,10 @@ impl App {
                     // first would only see it written again.
                     let paths = self.paths.clone();
                     std::thread::spawn(move || {
-                        session.shutdown();
+                        // Longer than the 500 ms an app exit allows: this
+                        // thread holds nothing up, and a shell that is slow
+                        // to go would write its file after the removal.
+                        session.shutdown_within(Duration::from_secs(10));
                         history::remove(&paths, id);
                     });
                 } else {
@@ -1702,7 +1714,7 @@ impl App {
                     return;
                 };
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
-                let id = self.ws.add_tab(cat);
+                let id = self.new_tab(cat);
                 if let Some(tab) = self.ws.tab_mut(id) {
                     // The agent's own directory: `claude --resume` only finds a
                     // conversation from where it ran.
@@ -1737,7 +1749,7 @@ impl App {
                     .map(|t| t.category)
                     .or_else(|| self.ws.categories.first().map(|c| c.id));
                 if let Some(cat) = cat {
-                    let id = self.ws.add_tab(cat);
+                    let id = self.new_tab(cat);
                     self.ws.tab_mut(id).unwrap().cwd = dirs::home_dir();
                     self.spawn_session(ctx, id, None);
                     // Same deferred injection the resume path uses: give the
@@ -1876,7 +1888,7 @@ impl App {
             .or_else(|| self.ws.categories.first().map(|c| c.id));
         let Some(category) = category else { return };
         splash::mark_seen(self.paths.base());
-        let id = self.ws.add_tab(category);
+        let id = self.new_tab(category);
         if let Some(tab) = self.ws.tab_mut(id) {
             tab.cwd = dirs::home_dir();
         }

@@ -358,10 +358,17 @@ impl TermSession {
     }
 
     /// Ask the io loop to stop and join it.
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
+        self.shutdown_within(std::time::Duration::from_millis(500));
+    }
+
+    /// [`Session::shutdown`], waiting up to `wait` for the io thread, which
+    /// drops the pty and with it waits for the shell to exit. True when it
+    /// did: the shell is gone, and has written whatever it writes on SIGHUP.
+    pub fn shutdown_within(mut self, wait: std::time::Duration) -> bool {
         let _ = self.sender.send(Msg::Shutdown);
         let Some(handle) = self.handle.take() else {
-            return;
+            return true;
         };
         // Waited for, but not indefinitely. The io thread almost always
         // returns at once; an io thread blocked writing to a pty whose child
@@ -377,9 +384,7 @@ impl TermSession {
                 let _ = handle.join();
                 let _ = done.send(());
             });
-        if watcher.is_ok() {
-            let _ = waited.recv_timeout(std::time::Duration::from_millis(500));
-        }
+        watcher.is_ok() && waited.recv_timeout(wait).is_ok()
     }
 }
 
