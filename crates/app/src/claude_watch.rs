@@ -45,6 +45,10 @@ pub struct ClaudeTab {
     /// A background shell is alive in this session while the agent itself is
     /// at its prompt. Not a working state — marked, never animated.
     pub background: bool,
+    /// The user's most recent prompt in this session, in full: from the
+    /// `UserPromptSubmit` hook, or read back from the transcript for a
+    /// session no hook has reported a prompt for.
+    pub last_prompt: Option<String>,
     last_hook: Option<Instant>,
     seen_in_scan: bool,
 }
@@ -57,6 +61,16 @@ impl ClaudeTab {
             || self
                 .last_hook
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+    }
+
+    /// The conversation this tab holds. A different one — `/clear`, a
+    /// `/resume`, a new `claude` — has not been asked anything yet, as far as
+    /// this tab knows.
+    fn set_session(&mut self, session: Option<String>) {
+        if self.session_id != session {
+            self.last_prompt = None;
+        }
+        self.session_id = session;
     }
 }
 
@@ -255,7 +269,17 @@ pub struct ClaudeWatch {
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
+    /// Sessions whose transcript has been asked for its last prompt, so each
+    /// is read once, and what the readers found: `(session, prompt)`.
+    prompts_asked: HashSet<String>,
+    prompts_found: (
+        crossbeam_channel::Sender<FoundPrompt>,
+        crossbeam_channel::Receiver<FoundPrompt>,
+    ),
 }
+
+/// `(session, prompt)`, read from a transcript.
+type FoundPrompt = (String, String);
 
 /// The environment variable that makes this a side instance.
 pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
@@ -521,6 +545,8 @@ impl ClaudeWatch {
                     .join("agents.json"),
             ),
             leave_accounts,
+            prompts_asked: HashSet::new(),
+            prompts_found: crossbeam_channel::unbounded(),
         };
         // Before any tab is restored: a tab holding a running job's
         // conversation attaches to the job, which takes knowing the jobs
@@ -712,7 +738,7 @@ impl ClaudeWatch {
         match msg.hook_event() {
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
-                entry.session_id = msg.session_id().map(str::to_string);
+                entry.set_session(msg.session_id().map(str::to_string));
                 self.agents.session_started(
                     tab_id,
                     msg.event.get("source").and_then(|v| v.as_str()),
@@ -723,7 +749,12 @@ impl ClaudeWatch {
                     .captured
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
             }
-            Some("UserPromptSubmit") => entry.state = ClaudeState::Busy,
+            Some("UserPromptSubmit") => {
+                entry.state = ClaudeState::Busy;
+                if let Some(prompt) = msg.prompt().map(str::trim).filter(|p| !p.is_empty()) {
+                    entry.last_prompt = Some(prompt.to_string());
+                }
+            }
             // A tool call is work happening now, whoever asked for it. It is
             // what tells a tab apart from the turn that ended before it: a
             // session carrying on after a permission was granted, or an agent
@@ -765,7 +796,7 @@ impl ClaudeWatch {
             Some("SessionEnd") => {
                 self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
-                entry.session_id = None;
+                entry.set_session(None);
                 entry.session_name = None;
                 effects.captured.push((tab_id, None, None));
             }
@@ -803,6 +834,8 @@ impl ClaudeWatch {
         if !titles.is_empty() {
             self.agents.tick(|id| titles.contains_key(&id));
         }
+
+        self.apply_found_prompts();
 
         // Registry scan: baseline busy/idle + identity, ~1 Hz, off-thread.
         if let Some(rx) = &self.scan_rx {
@@ -903,7 +936,7 @@ impl ClaudeWatch {
             );
             let entry = self.tabs.entry(tab).or_default();
             if entry.session_id.as_deref() != Some(sid) {
-                entry.session_id = Some(sid.to_string());
+                entry.set_session(Some(sid.to_string()));
                 effects
                     .captured
                     .push((tab, Some(sid.to_string()), Some(job.config_dir.clone())));
@@ -973,6 +1006,7 @@ impl ClaudeWatch {
             // state, as a parked one's would.
             self.tabs.entry(tab).or_default().seen_in_scan = true;
         }
+        let mut ask_prompts: Vec<(String, PathBuf)> = Vec::new();
         {
             for live in self.scanned.live.clone() {
                 // A job's worker is the daemon's; the tab showing the job is
@@ -1014,9 +1048,10 @@ impl ClaudeWatch {
                             Some(live.config_dir.clone()),
                         ));
                     }
-                    entry.session_id = Some(live.entry.session_id.clone());
+                    entry.set_session(Some(live.entry.session_id.clone()));
                 }
                 entry.session_name = live.entry.name.clone();
+
                 if account.is_some() {
                     entry.account = account;
                 }
@@ -1028,7 +1063,22 @@ impl ClaudeWatch {
                 // hooks-installed check would freeze such tabs; per-tab
                 // evidence keeps the registry driving exactly those.
                 let hooks_own = entry.last_hook.is_some();
+                let was = entry.state;
                 entry.state = merge_registry(entry.state, hooks_own, &live.entry);
+                // Adopted mid-way or resumed after a restart, no hook has said
+                // what was asked, but the transcript has. A session with no
+                // hooks at all never will: each turn it starts is read again.
+                let sid = &live.entry.session_id;
+                let new_turn =
+                    !hooks_own && was != ClaudeState::Busy && entry.state == ClaudeState::Busy;
+                if new_turn {
+                    self.prompts_asked.remove(sid);
+                }
+                if (entry.last_prompt.is_none() || new_turn)
+                    && self.prompts_asked.insert(sid.clone())
+                {
+                    ask_prompts.push((sid.clone(), live.config_dir.clone()));
+                }
             }
             // Sessions gone from the registry: clear unless hooks spoke recently.
             for tab in self.tabs.values_mut() {
@@ -1045,6 +1095,7 @@ impl ClaudeWatch {
                 }
             }
         }
+        self.read_prompts(ask_prompts);
     }
 
     /// A statusline push: official `rate_limits` for one account.
@@ -1601,6 +1652,50 @@ impl ClaudeWatch {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
 
+    /// The prompt to pin above this tab: its last one, while Claude runs.
+    pub fn prompt_of(&self, tab: TabId) -> Option<&str> {
+        let tab = self.tabs.get(&tab)?;
+        if tab.state == ClaudeState::None {
+            return None;
+        }
+        tab.last_prompt.as_deref()
+    }
+
+    /// Read these sessions' last prompts from their transcripts, off the UI
+    /// thread: for an account inside WSL the file is across a share.
+    fn read_prompts(&self, sessions: Vec<(String, PathBuf)>) {
+        if sessions.is_empty() {
+            return;
+        }
+        let tx = self.prompts_found.0.clone();
+        let _ = std::thread::Builder::new()
+            .name("giverny last prompt".into())
+            .spawn(move || {
+                for (session, dir) in sessions {
+                    if let Some(prompt) = registry::find_transcript(&dir, &session)
+                        .and_then(|path| registry::last_prompt(&path))
+                    {
+                        let _ = tx.send((session, prompt));
+                    }
+                }
+            });
+    }
+
+    /// Prompts read back from transcripts. A hook that reported one since is
+    /// newer, and wins; a tab no hook speaks for takes the latest read.
+    fn apply_found_prompts(&mut self) {
+        let found: Vec<FoundPrompt> = self.prompts_found.1.try_iter().collect();
+        for (session, prompt) in found {
+            for tab in self.tabs.values_mut() {
+                if tab.session_id.as_deref() == Some(session.as_str())
+                    && (tab.last_prompt.is_none() || tab.last_hook.is_none())
+                {
+                    tab.last_prompt = Some(prompt.clone());
+                }
+            }
+        }
+    }
+
     /// Test seam: a watcher with no listener and no profiles.
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
@@ -1628,6 +1723,8 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: Vec::new(),
+            prompts_asked: HashSet::new(),
+            prompts_found: crossbeam_channel::unbounded(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),
@@ -2105,6 +2202,128 @@ mod tests {
             r#"{{"pid":1,"sessionId":"s-1","status":"{status}"}}"#
         ))
         .expect("session fixture")
+    }
+
+    #[test]
+    fn the_last_prompt_is_kept_per_tab() {
+        let mut w = ClaudeWatch::for_tests();
+        let other = |event: &str, extra: &str| {
+            msg(&format!(
+                r#"{{"tab_id":"giverny-8","config_dir":"/home/u/.claude-work",
+                    "event":{{"hook_event_name":"{event}","session_id":"s-2"{extra}}}}}"#
+            ))
+        };
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), None, "nothing asked yet");
+
+        feed(
+            &mut w,
+            &hook(
+                "UserPromptSubmit",
+                r#","prompt":"fix the build\nthen test""#,
+            ),
+            Some(TAB),
+        );
+        feed(
+            &mut w,
+            &other("UserPromptSubmit", r#","prompt":"other account""#),
+            Some(TAB),
+        );
+        assert_eq!(w.prompt_of(TAB), Some("fix the build\nthen test"));
+        assert_eq!(w.prompt_of(TabId(8)), Some("other account"));
+
+        // Still shown once the turn is over; replaced by the next prompt.
+        feed(&mut w, &hook("Stop", ""), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), Some("fix the build\nthen test"));
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"  and lint  ""#),
+            Some(TAB),
+        );
+        assert_eq!(w.prompt_of(TAB), Some("and lint"));
+        // A payload without one leaves the last one standing.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), Some("and lint"));
+
+        // Claude gone: no bar, and the next session starts with none.
+        feed(&mut w, &hook("SessionEnd", ""), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), None);
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), None);
+        assert_eq!(w.prompt_of(TabId(8)), Some("other account"));
+    }
+
+    #[test]
+    fn a_new_conversation_in_the_tab_drops_the_old_prompt() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"old""#),
+            Some(TAB),
+        );
+        let resumed = msg(r#"{"tab_id":"giverny-7","config_dir":null,
+            "event":{"hook_event_name":"SessionStart","session_id":"s-9"}}"#);
+        feed(&mut w, &resumed, Some(TAB));
+        assert_eq!(w.prompt_of(TAB), None);
+    }
+
+    /// A session no hook has reported a prompt for — adopted mid-way, or
+    /// resumed after a restart — has it read back from its transcript.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_session_reads_its_prompt_from_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("giverny-adopt-{}", std::process::id()));
+        let proj = dir.join("projects").join("-home-u-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s-1.jsonl"),
+            concat!(
+                r#"{"type":"user","message":{"content":"what changed\nsince friday"}}"#,
+                "\n",
+                r#"{"type":"last-prompt","lastPrompt":"what changed since friday"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut w = ClaudeWatch::for_tests();
+        let me = std::process::id();
+        let mut live = session("busy");
+        live.pid = me;
+        w.scanned = ScanResult {
+            live: vec![registry::LiveSession {
+                entry: live,
+                config_dir: dir.clone(),
+            }],
+            ..ScanResult::default()
+        };
+        let shells = HashMap::from([(TAB, me)]);
+        w.merge_scan(&shells, &mut WatchEffects::default());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.prompt_of(TAB).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            w.apply_found_prompts();
+        }
+        assert_eq!(w.prompt_of(TAB), Some("what changed\nsince friday"));
+
+        // Read once per session, not on every scan.
+        w.merge_scan(&shells, &mut WatchEffects::default());
+        assert!(w.prompts_asked.contains("s-1"));
+
+        // A hook's prompt is newer than the transcript's and is not replaced.
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"from the hook""#),
+            Some(TAB),
+        );
+        w.prompts_found
+            .0
+            .send(("s-1".into(), "stale".into()))
+            .unwrap();
+        w.apply_found_prompts();
+        assert_eq!(w.prompt_of(TAB), Some("from the hook"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod prompt_bar;
 mod rail;
 mod sessions_load;
 mod settings_ui;
@@ -4987,6 +4988,14 @@ impl eframe::App for App {
                 // full-screen app worth starting again.
                 self.queue_resume(active);
                 self.queue_app_restore(active);
+            }
+
+            // The prompt that started the turn, which a long answer scrolls
+            // out of sight.
+            if let Some(prompt) = self.claude.prompt_of(active)
+                && prompt_bar::show(ui, &self.chrome, opacity, active, prompt)
+            {
+                self.focus_terminal = true;
             }
 
             // What the tab shows: read first, so the pane, the header and

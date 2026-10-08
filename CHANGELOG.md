@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.1 — 2026-10-07
+
+Both fixes are [@theitush](https://github.com/theitush)'s, from running the
+native Windows build.
+
+- On Windows, Giverny draws through DirectX 12 rather than Vulkan. wgpu offers
+  Vulkan first, and Intel's Vulkan driver made the window flicker as the mouse
+  moved over it. Where DirectX 12 has no GPU adapter, the old choice stands,
+  and `WGPU_BACKEND` still decides when it is set.
+
+- A Claude config directory that was opened but never logged in is no longer
+  an account. A Windows Claude Code closed at the login prompt leaves
+  `C:\Users\<you>\.claude` behind, and the rail showed it as `@.claude` with no
+  usage, above the real accounts in WSL. A directory now counts when it has a
+  login or a transcript. Directories you name yourself (`CLAUDE_CONFIG_DIR`,
+  `behavior.extra_profile_dirs`) are still shown either way.
+
 ## v1.2.0 — 2026-10-02
 
 - A new theme, `catppuccin-mauve`: Catppuccin Mocha as the Colloid GTK theme
