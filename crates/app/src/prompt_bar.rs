@@ -74,14 +74,6 @@ pub fn show(ui: &mut egui::Ui, chrome: &Chrome, opacity: f32, tab: TabId, prompt
     );
 
     let font = FontId::monospace(12.0);
-    let left = rect.min.x + 10.0;
-    let label = p.text(
-        egui::pos2(left, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        "you ›",
-        font.clone(),
-        chrome.dim,
-    );
     let marker = if open { "▴" } else { "▾" };
     let marker_rect = p.text(
         egui::pos2(rect.max.x - 10.0, rect.center().y),
@@ -91,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, chrome: &Chrome, opacity: f32, tab: TabId, prompt
         chrome.dim,
     );
 
-    let text_left = label.max.x + 8.0;
+    let text_left = rect.min.x + 10.0;
     let width = (marker_rect.min.x - 10.0 - text_left).max(0.0);
     let mut job = egui::text::LayoutJob::single_section(
         one_line(prompt, LINE_CHARS),
@@ -140,7 +132,7 @@ pub fn show(ui: &mut egui::Ui, chrome: &Chrome, opacity: f32, tab: TabId, prompt
                         bottom: 8,
                     })
                     .show(ui, |ui| {
-                        let inner = rect.width() - 23.0;
+                        let inner = rect.width() - 25.0;
                         ui.set_width(inner);
                         egui::ScrollArea::vertical()
                             .max_height(max_height)
