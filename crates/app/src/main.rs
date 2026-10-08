@@ -988,7 +988,9 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
 /// following those would rewrite accounts against what the user configured.
-/// Once the file parses again, the hot reload applies what it says.
+/// Once the file parses again, the hot reload applies what it says. Hook
+/// paths and the status line read nothing from the config, so
+/// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
 fn set_up_accounts(
     claude: &mut claude_watch::ClaudeWatch,
     cfg: &config::Config,
@@ -1311,7 +1313,6 @@ impl App {
         let (claude, spooled) = claude_watch::ClaudeWatch::new(
             &paths.hook_spool(),
             &cfg.behavior.extra_profile_dirs,
-            config_read,
             move || wake_ctx.request_repaint(),
         );
         // Events spooled while the app was closed: keep session captures.

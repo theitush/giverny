@@ -1259,6 +1259,25 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
             );
         });
     }
+    // Hooks were just installed for the first time, and Claude Code reads
+    // them when a session starts: the sessions already running report
+    // nothing. Only those; the hint goes when the last of them ends.
+    let without = app.claude.sessions_without_hooks();
+    if without > 0 {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("⟳ restart claude for live states")
+                    .font(FontId::monospace(10.0))
+                    .color(c.amber),
+            )
+            .on_hover_text(format!(
+                "{without} claude session(s) started before the hooks were installed\n\
+                 and report no states until restarted; new sessions have them."
+            ));
+        });
+    }
     if app.claude.hooks_installed || app.hooks_banner_dismissed {
         return;
     }

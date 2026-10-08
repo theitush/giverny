@@ -330,6 +330,20 @@ fn is_link_to_a_binary(link: &Path) -> bool {
         && std::fs::metadata(link).is_ok_and(|m| m.is_file())
 }
 
+/// Does [`link_path`] name a binary that is gone? A build that pointed it at
+/// itself and was then deleted (`cargo clean`) leaves every session's hooks
+/// running nothing, until a Giverny points it somewhere real again.
+#[cfg(unix)]
+pub fn link_is_dangling() -> bool {
+    link_path().is_some_and(|link| is_dangling(&link))
+}
+
+#[cfg(unix)]
+fn is_dangling(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && !std::fs::metadata(link).is_ok_and(|m| m.is_file())
+}
+
 /// Point [`link_path`] at this binary, so the commands written into each
 /// account name it. Done at startup by the Giverny that looks after the
 /// accounts; a side instance (`GIVERNY_NO_ACCOUNT_SETUP`) leaves it alone.
@@ -921,6 +935,13 @@ mod tests {
         assert!(
             !is_link_to_a_binary(&link),
             "a link to nothing is no binary"
+        );
+        assert!(is_dangling(&link), "and is taken back");
+        point_link_at(&link, &a).unwrap();
+        assert!(!is_dangling(&link));
+        assert!(
+            !is_dangling(&d.join("nothing")),
+            "no link is not a dangling one"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
