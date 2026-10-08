@@ -8,7 +8,7 @@
 //! the bar and the full prompt both float over the grid, so neither showing
 //! them nor hiding them resizes the PTY and makes Claude redraw.
 
-use eframe::egui::{self, FontId, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontId, Rect, Sense, Stroke, Vec2};
 use giverny_core::tabs::TabId;
 
 use crate::chrome::{Chrome, mix};
@@ -62,6 +62,11 @@ const MATCH_MIN: usize = 8;
 /// over as many rows as it takes, so the first row holds the start of its
 /// first line. The input box at the bottom starts with `❯` too, right under a
 /// rule and unshaded: whatever is being typed there is not the prompt sent.
+///
+/// The top row does not count: it is the one the bar covers. Scrolled back,
+/// Claude Code pins the turn's prompt there itself, in its own colours, and
+/// counting it hid the bar and let that row take its place, a different
+/// grey, every time the view moved off the bottom.
 pub fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
     let Some(first) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return false;
@@ -69,7 +74,7 @@ pub fn on_screen(prompt: &str, rows: &[(String, bool)]) -> bool {
     let want: Vec<char> = one_line(first, usize::MAX).chars().collect();
     let k = want.len().min(MATCH_CHARS);
     let mut under_rule = false;
-    for (text, shaded) in rows {
+    for (text, shaded) in rows.iter().skip(1) {
         let row = text.trim();
         let in_input = under_rule && !shaded;
         under_rule = !row.is_empty() && row.chars().all(|c| c == '─');
@@ -102,6 +107,13 @@ pub fn hide(ctx: &egui::Context, tab: TabId) {
     ctx.data_mut(|d| d.remove::<bool>(open_id(tab)));
 }
 
+/// The bar's one colour: the same closed or open, hovered or not, at the
+/// bottom or scrolled back. Opaque, so the grid scrolling under it never
+/// shows through.
+pub fn fill(chrome: &Chrome) -> Color32 {
+    mix(chrome.panel, chrome.fg, 0.10)
+}
+
 /// Draw the bar for `tab` over the top row of the terminal at `over`, `row`
 /// points high. Returns true when it was clicked, so the caller can hand the
 /// keyboard back to the terminal.
@@ -110,6 +122,9 @@ pub fn hide(ctx: &egui::Context, tab: TabId) {
 /// scrolls in and out of view, and a bar that took a row of the layout would
 /// resize the terminal each time, and make Claude redraw. The row it covers
 /// is never the prompt's: the bar is only up while the prompt is off screen.
+///
+/// Open, the bar *becomes* the whole prompt, one panel from the same top
+/// edge: the line it showed is the panel's first, not a second copy above it.
 pub fn show(
     ctx: &egui::Context,
     chrome: &Chrome,
@@ -121,110 +136,101 @@ pub fn show(
     let open_id = open_id(tab);
     let mut open = ctx.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
     let height = row.max(16.0);
-    let size = Vec2::new(over.width(), height);
-    let fill = mix(chrome.panel, chrome.fg, 0.10);
+    let fill = fill(chrome);
+    let rule = mix(chrome.panel, chrome.fg, 0.25);
+    let font = FontId::monospace(12.0);
+    // Where the one line's text starts, and the room the marker keeps.
+    const LEFT: f32 = 10.0;
+    const RIGHT: f32 = 26.0;
 
-    let bar = egui::Area::new(open_id.with("bar"))
-        .order(egui::Order::Middle)
+    let shown = egui::Area::new(open_id.with("bar"))
+        .order(if open {
+            egui::Order::Foreground
+        } else {
+            egui::Order::Middle
+        })
         .fixed_pos(over.min)
         .constrain(false)
+        // egui fades an area in each time it reappears, and this one
+        // reappears every time the prompt scrolls out of view: mid-scroll the
+        // bar was half see-through, a different colour each frame.
+        .fade_in(false)
         .show(ctx, |ui| {
-            // Clicks only: a focusable bar would take the keyboard from the
-            // terminal under it.
-            let (rect, response) = ui.allocate_exact_size(size, Sense::CLICK);
-            let hovered = response.hovered();
-            let p = ui.painter_at(rect);
-            let fill = if hovered || open {
-                mix(chrome.panel, chrome.fg, 0.16)
-            } else {
-                fill
-            };
-            p.rect_filled(rect, 0.0, fill);
-            // An accent edge, as the rail marks its active tab: this is
-            // yours, not Claude's output. A hairline under it keeps it apart
-            // from the row below.
-            p.rect_filled(
-                Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
-                0.0,
-                chrome.accent,
-            );
-            p.hline(
-                rect.x_range(),
-                rect.max.y - 0.5,
-                Stroke::new(1.0, mix(chrome.panel, chrome.fg, 0.25)),
-            );
-
-            let font = FontId::monospace(12.0);
-            let marker = if open { "▴" } else { "▾" };
-            let marker_rect = p.text(
-                egui::pos2(rect.max.x - 10.0, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                marker,
-                font.clone(),
-                chrome.dim,
-            );
-            let text_left = rect.min.x + 10.0;
-            let width = (marker_rect.min.x - 10.0 - text_left).max(0.0);
-            let mut job = egui::text::LayoutJob::single_section(
-                one_line(prompt, LINE_CHARS),
-                egui::TextFormat::simple(font, chrome.fg),
-            );
-            job.wrap = egui::text::TextWrapping {
-                max_width: width,
-                max_rows: 1,
-                break_anywhere: true,
-                overflow_character: Some('…'),
-            };
-            let galley = p.layout_job(job);
-            let y = rect.center().y - galley.size().y / 2.0;
-            p.galley(egui::pos2(text_left, y), galley, chrome.fg);
-            response.on_hover_cursor(egui::CursorIcon::PointingHand)
-        });
-    let rect = bar.response.rect;
-    let clicked = bar.inner.clicked();
-    if clicked {
-        open = !open;
-    }
-
-    if open {
-        // Never taller than most of the terminal: the answer is still there
-        // to be read under it.
-        let max_height = (over.height() * 0.6).max(60.0);
-        let font = FontId::monospace(12.0);
-        let popup = egui::Area::new(open_id.with("full"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(rect.left_bottom())
-            .show(ctx, |ui| {
+            let rect = if open {
+                // The prompt in full, its first line where the bar's was.
+                let max_height = (over.height() * 0.6).max(60.0);
+                let pad = ((height - 14.0) / 2.0).round().clamp(1.0, 8.0) as i8;
                 egui::Frame::new()
                     .fill(fill)
-                    .stroke(Stroke::new(1.0, mix(chrome.panel, chrome.fg, 0.25)))
                     .inner_margin(egui::Margin {
-                        left: 13,
-                        right: 10,
-                        top: 6,
-                        bottom: 8,
+                        left: LEFT as i8,
+                        right: RIGHT as i8,
+                        top: pad,
+                        bottom: pad.max(6),
                     })
                     .show(ui, |ui| {
-                        ui.set_width(rect.width() - 25.0);
+                        ui.set_width(over.width() - LEFT - RIGHT);
                         egui::ScrollArea::vertical()
                             .max_height(max_height)
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(prompt).font(font).color(chrome.fg),
+                                        egui::RichText::new(prompt)
+                                            .font(font.clone())
+                                            .color(chrome.fg),
                                     )
                                     .wrap()
-                                    .selectable(true),
+                                    .selectable(false),
                                 );
                             });
-                    });
-            });
+                    })
+                    .response
+                    .rect
+            } else {
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(over.width(), height), Sense::hover());
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, 0.0, fill);
+                let mut job = egui::text::LayoutJob::single_section(
+                    one_line(prompt, LINE_CHARS),
+                    egui::TextFormat::simple(font.clone(), chrome.fg),
+                );
+                job.wrap = egui::text::TextWrapping {
+                    max_width: (rect.width() - LEFT - RIGHT).max(0.0),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                let galley = p.layout_job(job);
+                let y = rect.center().y - galley.size().y / 2.0;
+                p.galley(egui::pos2(rect.min.x + LEFT, y), galley, chrome.fg);
+                rect
+            };
+            let p = ui.painter();
+            // A hairline under it keeps it apart from the row below.
+            p.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, rule));
+            p.text(
+                egui::pos2(rect.max.x - 10.0, rect.min.y + height / 2.0),
+                egui::Align2::RIGHT_CENTER,
+                if open { "▴" } else { "▾" },
+                font.clone(),
+                chrome.dim,
+            );
+            // Clicks only, anywhere on it: a focusable bar would take the
+            // keyboard from the terminal under it.
+            ui.interact(rect, open_id.with("click"), Sense::CLICK)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        });
+    let rect = shown.response.rect;
+    let clicked = shown.inner.clicked();
+    if clicked {
+        open = !open;
+    } else if open {
         // A click anywhere else puts it away, as a menu would.
         let elsewhere = ctx.input(|i| i.pointer.any_click())
-            && !clicked
             && ctx
                 .input(|i| i.pointer.interact_pos())
-                .is_some_and(|pos| !popup.response.rect.contains(pos) && !rect.contains(pos));
+                .is_some_and(|pos| !rect.contains(pos));
         if elsewhere {
             open = false;
         }
@@ -275,7 +281,7 @@ mod tests {
         rows.extend(INPUT_BOX);
         assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
         // Another prompt on screen is not this one.
-        let mut rows = vec![("❯ count down from 5", true)];
+        let mut rows = vec![("", false), ("❯ count down from 5", true)];
         rows.extend(INPUT_BOX);
         assert!(!on_screen("List the numbers 1 to 60", &screen(&rows)));
     }
@@ -285,16 +291,37 @@ mod tests {
         let prompt = "List the numbers 1 to 60, one per line, each followed by its English name.";
         // Wrapped at the terminal's width, mid-sentence.
         let rows = screen(&[
+            ("● earlier", false),
             ("❯ List the numbers 1 to 60, one per line, each", true),
             ("  followed by its English name.", true),
         ]);
         assert!(on_screen(prompt, &rows));
         // Wrapped early, at a word, in a narrow terminal.
-        let rows = screen(&[("❯ List the numbers 1 to", true), ("  60, one per", true)]);
+        let rows = screen(&[
+            ("", false),
+            ("❯ List the numbers 1 to", true),
+            ("  60, one per", true),
+        ]);
         assert!(on_screen(prompt, &rows));
         // Only its tail on screen: the start scrolled off.
         let rows = screen(&[("  followed by its English name.", true)]);
         assert!(!on_screen(prompt, &rows));
+    }
+
+    #[test]
+    fn the_top_row_is_under_the_bar() {
+        // Scrolled back in Claude Code: it pins the turn's prompt on the top
+        // row itself. The bar covers that row, in its own colour.
+        let mut rows = vec![("❯ List the numbers 1 to 80", true), ("20 400", false)];
+        rows.extend(INPUT_BOX);
+        assert!(!on_screen("List the numbers 1 to 80", &screen(&rows)));
+        // One row lower, it is the prompt itself, in view.
+        let mut rows = vec![
+            ("❯ an older prompt", true),
+            ("❯ List the numbers 1 to 80", true),
+        ];
+        rows.extend(INPUT_BOX);
+        assert!(on_screen("List the numbers 1 to 80", &screen(&rows)));
     }
 
     #[test]
@@ -308,11 +335,24 @@ mod tests {
         assert!(!on_screen("fix the build", &rows));
         // A sent prompt right under a rule is still shaded, and still counts.
         let rows = screen(&[
+            ("● output", false),
             ("────────────────────────────────────────", false),
             ("❯ fix the build", true),
         ]);
         assert!(on_screen("fix the build", &rows));
         assert!(!on_screen("", &rows), "no prompt, nothing to find");
+    }
+
+    /// One opaque colour, in every theme: nothing under the bar shows
+    /// through it as the grid scrolls.
+    #[test]
+    fn the_bar_is_one_opaque_colour() {
+        use giverny_term::render::theme::Theme;
+        for name in Theme::NAMES {
+            let chrome = Chrome::from_theme(&Theme::by_name(name));
+            assert_eq!(fill(&chrome).a(), 255, "{name}");
+            assert_ne!(fill(&chrome), chrome.panel, "{name}: apart from the panel");
+        }
     }
 
     #[test]
