@@ -419,6 +419,7 @@ pub struct Clock<'a> {
 }
 
 /// No worker measured.
+#[cfg(any(test, debug_assertions))]
 static NO_WORKERS: std::sync::LazyLock<HashMap<String, RunLive>> =
     std::sync::LazyLock::new(HashMap::new);
 
