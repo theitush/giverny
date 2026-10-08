@@ -1521,12 +1521,20 @@ impl App {
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
-                    // Join off the UI thread; the loop exits quickly.
-                    std::thread::spawn(move || session.shutdown());
+                    // Join off the UI thread; the loop exits quickly. The
+                    // history goes once the shell has: zsh writes its file
+                    // on the SIGHUP that shutdown sends, so removing it
+                    // first would only see it written again.
+                    let paths = self.paths.clone();
+                    std::thread::spawn(move || {
+                        session.shutdown();
+                        history::remove(&paths, id);
+                    });
+                } else {
+                    history::remove(&self.paths, id);
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
-                history::remove(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.focus_terminal = true;
             }
