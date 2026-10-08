@@ -164,6 +164,7 @@ mod tests {
             tokens: tokens.into(),
             usage: String::new(),
             oom: false,
+            flag: false,
             click: RowClick {
                 stage: Stage::Running,
                 key: String::new(),

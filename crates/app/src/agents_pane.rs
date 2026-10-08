@@ -95,6 +95,8 @@ const MIN_TITLE: usize = 12;
 pub const NO_ETA: &str = "no ETA";
 /// Where in [`Cols::segments`] the ETA cell sits.
 const ETA_SEG: usize = 3;
+/// Where in [`Cols::segments`] the NOW cell sits.
+const NOW_SEG: usize = 4;
 /// Where in [`Cols::segments`] the use cell sits.
 const LEASE_SEG: usize = 6;
 
@@ -910,6 +912,9 @@ pub struct Line {
     /// A `giverny orchestrator-session run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
+    /// A Running row with nothing running it ([`unworked`]): its worker has
+    /// finished, or it has none. NOW says which, in the warning colour.
+    pub flag: bool,
     pub click: RowClick,
 }
 
@@ -1171,8 +1176,14 @@ fn format_row(
         Stage::Planned => String::new(),
     };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
+    let flag = (row.stage == Stage::Running)
+        .then(|| unworked(row, now_ms))
+        .flatten();
     let now = match row.stage {
-        // The limit first: a row the writer paused for it says why.
+        // What is not running comes first: a Running row whose worker has
+        // finished, or that has none, says so before anything else.
+        Stage::Running if flag.is_some() => flag.clone().unwrap_or_default(),
+        // The limit next: a row the writer paused for it says why.
         Stage::Running => match (limit, paused) {
             (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
             (None, Some(p)) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
@@ -1222,6 +1233,7 @@ fn format_row(
         tokens,
         usage,
         oom,
+        flag: flag.is_some(),
         click: RowClick {
             stage: row.stage,
             key,
@@ -1239,6 +1251,41 @@ fn format_row(
         },
     }
 }
+
+/// What a Running row's NOW says when nothing is running it (giverny#258):
+/// the feed says the task runs, but its worker has finished — handed back,
+/// failed, killed or stopped (on an API error, that error) — and nobody
+/// has landed it; or it has no
+/// worker at all, [`feed::HANDOFF_WINDOW_MS`] after it started (a
+/// dispatcher runs `start` a moment before the spawn), and no command of
+/// its own runs either. `None` while a worker works on it.
+fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<String> {
+    if let Some(l) = row.live {
+        if l.running() {
+            return None;
+        }
+        // Ended on an API error it never wrote past: that error is why.
+        if let Some(s) = l.stops.last().filter(|s| s.to_ms.is_none()) {
+            return Some(format!("stopped: {}", s.reason));
+        }
+        let how = match l.outcome {
+            Some(Outcome::Failed) => "failed",
+            Some(Outcome::Killed) => "killed",
+            Some(Outcome::Stopped) => "stopped",
+            _ => "finished",
+        };
+        return Some(format!("worker {how} — {NOT_LANDED}"));
+    }
+    let f = row.feed?;
+    let started = f.started_ms?;
+    let fresh = now_ms < started.saturating_add(feed::HANDOFF_WINDOW_MS);
+    (!fresh && f.live.is_none()).then(|| NO_WORKER.to_string())
+}
+
+/// The end of [`unworked`]'s line for a finished worker.
+const NOT_LANDED: &str = "not landed";
+/// [`unworked`]'s line for a Running row nothing works on.
+pub const NO_WORKER: &str = "no worker running";
 
 /// The overlay header's facts, from the row's own cells before any ditto.
 fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) -> Vec<String> {
@@ -2057,9 +2104,11 @@ fn draw_table(
             // The use cell takes its row's colour, but a run killed by the
             // memory cap is flagged in amber, as a missing ETA is in dim.
             let oom = k == LEASE_SEG && line.is_some_and(|l| l.oom);
+            // So is a Running row that nothing runs.
+            let flag = k == NOW_SEG && line.is_some_and(|l| l.flag);
             let ink = if missing {
                 chrome.dim
-            } else if oom {
+            } else if oom || flag {
                 chrome.amber
             } else {
                 color
@@ -2964,6 +3013,72 @@ mod tests {
         assert_eq!(last.tokens, "3.7k");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// giverny#258: what the pane draws for a Running row that nothing
+    /// runs. A row linked to a worker that has finished — here acme#615,
+    /// which a hand-off message to `w` only mentioned — stays Running, as
+    /// its writer says, and says its worker finished and it has not landed;
+    /// a Running row with no worker at all says so once a spawn would have
+    /// come; one just started, or whose worker works, says nothing of it.
+    #[test]
+    fn a_running_row_that_nothing_runs_says_so() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            sent(
+                T0 - 30 * MIN,
+                "New task for you: acme#614, the bridge. Another worker now holds acme#615 \
+                 and reads the same file.",
+            ),
+            reply("m2", T0 - 20 * MIN, 5_000, 20_000, 2_000),
+        ];
+        let (dir, rows, logs) = reused_worker("finished", &lines, false);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#615","stage":"running","agent_id":"w","started":{s},"eta_s":3600}},
+              {{"key":"acme#617","stage":"running","started":{old},"eta_s":3600}},
+              {{"key":"acme#618","stage":"running","started":{new},"eta_s":3600}},
+              {{"key":"acme#614","stage":"done","agent_id":"w","started":{s},"ended":{e}}}
+            ]}}"#,
+            s = T0 - 30 * MIN,
+            e = T0 - 6 * MIN,
+            old = T0 - 10 * MIN,
+            new = T0 - MIN,
+        ));
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let line = |id: &str| t.lines.iter().find(|l| l.id == id).unwrap();
+        let got = line("acme#615");
+        assert_eq!(got.stage, Stage::Running, "the feed's stage, never Done");
+        assert_eq!(got.now, "worker finished — not landed");
+        assert!(got.flag);
+        assert!(
+            got.click
+                .facts
+                .iter()
+                .any(|f| f == "worker finished — not landed")
+        );
+        assert_eq!(got.now.chars().count(), NOW_W, "fits NOW");
+        let none = line("acme#617");
+        assert_eq!((none.stage, none.now.as_str()), (Stage::Running, NO_WORKER));
+        assert!(none.flag);
+        assert_eq!(none.click.agent_id, None, "only mentioned: not w's");
+        let fresh = line("acme#618");
+        assert_eq!((fresh.now.as_str(), fresh.flag), ("", false));
+        assert!(!line("acme#614").flag, "a Done row is not flagged");
+
+        // A worker that failed says how; one that works says nothing of it.
+        let (dir2, mut rows, logs) = reused_worker("failed", &lines, false);
+        rows[0].outcome = Some(Outcome::Failed);
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
+        assert_eq!(got.now, "worker failed — not landed");
+        let (dir3, rows, logs) = reused_worker("working", &lines, true);
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
+        assert!(!got.flag, "{got:?}");
+        for d in [dir, dir2, dir3] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     /// Claude Code lists a worker woken by a message afresh, its
