@@ -45,12 +45,21 @@ pub struct ClaudeTab {
     /// A background shell is alive in this session while the agent itself is
     /// at its prompt. Not a working state — marked, never animated.
     pub background: bool,
-    /// The user's most recent prompt in this session, in full: from the
-    /// `UserPromptSubmit` hook, or read back from the transcript for a
-    /// session no hook has reported a prompt for.
-    pub last_prompt: Option<String>,
+    /// The user's prompts in this session, oldest first, in full (at most
+    /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
+    /// from the transcript for a session adopted mid-way or resumed.
+    pub prompts: Vec<String>,
     last_hook: Option<Instant>,
     seen_in_scan: bool,
+}
+
+/// How many of a session's prompts a tab keeps.
+pub const PROMPT_HISTORY: usize = 200;
+
+/// Keep only the newest [`PROMPT_HISTORY`] prompts.
+fn cap_history(prompts: &mut Vec<String>) {
+    let over = prompts.len().saturating_sub(PROMPT_HISTORY);
+    prompts.drain(..over);
 }
 
 impl ClaudeTab {
@@ -68,7 +77,7 @@ impl ClaudeTab {
     /// this tab knows.
     fn set_session(&mut self, session: Option<String>) {
         if self.session_id != session {
-            self.last_prompt = None;
+            self.prompts.clear();
         }
         self.session_id = session;
     }
@@ -278,8 +287,20 @@ pub struct ClaudeWatch {
     ),
 }
 
-/// `(session, prompt)`, read from a transcript.
-type FoundPrompt = (String, String);
+/// `(session, prompts)`, read from a transcript.
+type FoundPrompt = (String, Vec<String>);
+
+/// A transcript's prompts, then those a hook reported that the read does not
+/// already end with: the read can land before or after a hook's prompt
+/// reaches the transcript.
+fn merge_history(read: &[String], heard: &[String]) -> Vec<String> {
+    // The longest tail of the read that the heard prompts start with.
+    let overlap = (0..=heard.len().min(read.len()))
+        .rev()
+        .find(|&n| read[read.len() - n..] == heard[..n])
+        .unwrap_or(0);
+    read.iter().chain(&heard[overlap..]).cloned().collect()
+}
 
 /// The environment variable that makes this a side instance.
 pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
@@ -752,7 +773,8 @@ impl ClaudeWatch {
             Some("UserPromptSubmit") => {
                 entry.state = ClaudeState::Busy;
                 if let Some(prompt) = msg.prompt().map(str::trim).filter(|p| !p.is_empty()) {
-                    entry.last_prompt = Some(prompt.to_string());
+                    entry.prompts.push(prompt.to_string());
+                    cap_history(&mut entry.prompts);
                 }
             }
             // A tool call is work happening now, whoever asked for it. It is
@@ -1074,8 +1096,7 @@ impl ClaudeWatch {
                 if new_turn {
                     self.prompts_asked.remove(sid);
                 }
-                if (entry.last_prompt.is_none() || new_turn)
-                    && self.prompts_asked.insert(sid.clone())
+                if (entry.prompts.is_empty() || new_turn) && self.prompts_asked.insert(sid.clone())
                 {
                     ask_prompts.push((sid.clone(), live.config_dir.clone()));
                 }
@@ -1654,11 +1675,16 @@ impl ClaudeWatch {
 
     /// The prompt to pin above this tab: its last one, while Claude runs.
     pub fn prompt_of(&self, tab: TabId) -> Option<&str> {
+        self.prompts_of(tab)?.last().map(String::as_str)
+    }
+
+    /// This tab's prompts, oldest first, while Claude runs and has had one.
+    pub fn prompts_of(&self, tab: TabId) -> Option<&[String]> {
         let tab = self.tabs.get(&tab)?;
-        if tab.state == ClaudeState::None {
+        if tab.state == ClaudeState::None || tab.prompts.is_empty() {
             return None;
         }
-        tab.last_prompt.as_deref()
+        Some(&tab.prompts)
     }
 
     /// Read these sessions' last prompts from their transcripts, off the UI
@@ -1672,26 +1698,32 @@ impl ClaudeWatch {
             .name("giverny last prompt".into())
             .spawn(move || {
                 for (session, dir) in sessions {
-                    if let Some(prompt) = registry::find_transcript(&dir, &session)
-                        .and_then(|path| registry::last_prompt(&path))
-                    {
-                        let _ = tx.send((session, prompt));
+                    let prompts = registry::find_transcript(&dir, &session)
+                        .map(|path| registry::prompt_history(&path))
+                        .unwrap_or_default();
+                    if !prompts.is_empty() {
+                        let _ = tx.send((session, prompts));
                     }
                 }
             });
     }
 
-    /// Prompts read back from transcripts. A hook that reported one since is
-    /// newer, and wins; a tab no hook speaks for takes the latest read.
+    /// Prompt histories read back from transcripts. A tab no hook speaks for
+    /// takes the read as it is; one a hook has told of prompts since keeps
+    /// those, after the ones read.
     fn apply_found_prompts(&mut self) {
         let found: Vec<FoundPrompt> = self.prompts_found.1.try_iter().collect();
-        for (session, prompt) in found {
+        for (session, read) in found {
             for tab in self.tabs.values_mut() {
-                if tab.session_id.as_deref() == Some(session.as_str())
-                    && (tab.last_prompt.is_none() || tab.last_hook.is_none())
-                {
-                    tab.last_prompt = Some(prompt.clone());
+                if tab.session_id.as_deref() != Some(session.as_str()) {
+                    continue;
                 }
+                tab.prompts = if tab.last_hook.is_none() {
+                    read.clone()
+                } else {
+                    merge_history(&read, &tab.prompts)
+                };
+                cap_history(&mut tab.prompts);
             }
         }
     }
@@ -2254,6 +2286,46 @@ mod tests {
     }
 
     #[test]
+    fn every_prompt_is_kept_in_order() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        for p in ["one", "two", "three"] {
+            feed(
+                &mut w,
+                &hook("UserPromptSubmit", &format!(r#","prompt":"{p}""#)),
+                Some(TAB),
+            );
+        }
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["one", "two", "three"]);
+        assert_eq!(w.prompt_of(TAB), Some("three"));
+
+        let mut long: Vec<String> = (0..PROMPT_HISTORY + 5).map(|i| i.to_string()).collect();
+        cap_history(&mut long);
+        assert_eq!(long.len(), PROMPT_HISTORY);
+        assert_eq!(long[0], "5", "the oldest go first");
+    }
+
+    #[test]
+    fn a_read_history_and_the_hooks_meet_once() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // The read already has the prompt a hook told of.
+        assert_eq!(
+            merge_history(&s(&["a", "b", "c"]), &s(&["c"])),
+            s(&["a", "b", "c"])
+        );
+        // It was read before the hook's prompt reached the transcript.
+        assert_eq!(
+            merge_history(&s(&["a", "b"]), &s(&["c"])),
+            s(&["a", "b", "c"])
+        );
+        assert_eq!(
+            merge_history(&s(&["a", "b"]), &s(&["b", "c"])),
+            s(&["a", "b", "c"])
+        );
+        assert_eq!(merge_history(&s(&[]), &s(&["c"])), s(&["c"]));
+    }
+
+    #[test]
     fn a_new_conversation_in_the_tab_drops_the_old_prompt() {
         let mut w = ClaudeWatch::for_tests();
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
@@ -2319,7 +2391,7 @@ mod tests {
         );
         w.prompts_found
             .0
-            .send(("s-1".into(), "stale".into()))
+            .send(("s-1".into(), vec!["stale".into()]))
             .unwrap();
         w.apply_found_prompts();
         assert_eq!(w.prompt_of(TAB), Some("from the hook"));
