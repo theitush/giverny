@@ -272,11 +272,25 @@ fn exe_path() -> String {
     if let Some(link) = link_path()
         && is_link_to_a_binary(&link)
     {
-        return link.display().to_string();
+        return command_word(&link);
     }
     running_exe()
-        .map(|p| p.display().to_string())
+        .map(|p| command_word(&p))
         .unwrap_or_else(|| "giverny".into())
+}
+
+/// A path as the first word of a hook command. On macOS the link lives
+/// under `~/Library/Application Support`, and an unquoted space there split
+/// every hook and the status line into a command that does not exist.
+/// Windows-native commands are not run by a POSIX shell, so they are left as
+/// they are.
+fn command_word(path: &Path) -> String {
+    let path = path.display().to_string();
+    if cfg!(windows) {
+        path
+    } else {
+        shell_quote(&path)
+    }
 }
 
 /// This binary's path. Linux names a binary that was rebuilt in place while
@@ -357,9 +371,8 @@ fn exe_for(settings_path: &Path) -> String {
 }
 
 /// A path as one word for the shell Claude Code runs hook commands with.
-/// Windows paths under `/mnt/c` land in `Program Files` often enough that
-/// this is not hypothetical.
-#[cfg(windows)]
+/// Windows paths under `/mnt/c` land in `Program Files`, and macOS's config
+/// dir in `Application Support`, so this is not hypothetical.
 fn shell_quote(path: &str) -> String {
     if path
         .chars()
@@ -908,6 +921,40 @@ mod tests {
         assert!(
             !is_link_to_a_binary(&link),
             "a link to nothing is no binary"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// macOS's config dir is `~/Library/Application Support`: the hook
+    /// command must still run the binary there, through the shell Claude
+    /// Code runs it with.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_a_space_runs_as_one_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("giverny-quote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("Application Support/giverny's bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("giverny");
+        std::fs::write(&exe, "#!/bin/sh\necho \"ran $1\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = format!("{} relay", command_word(&exe));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ran relay\n",
+            "{command}"
+        );
+        assert_eq!(
+            command_word(Path::new("/home/x/.config/giverny/bin/giverny")),
+            "/home/x/.config/giverny/bin/giverny",
+            "a plain path is written as before"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
