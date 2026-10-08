@@ -336,7 +336,14 @@ pub fn compacted_tokens_cached(path: &Path, cache: Option<&Path>) -> u64 {
     if let Some(slot) = slot
         && scan != before
     {
-        let _ = std::fs::create_dir_all(slot.parent().unwrap_or(Path::new(".")));
+        let dir = slot.parent().unwrap_or(Path::new("."));
+        let _ = std::fs::create_dir_all(dir);
+        // A new transcript: a moment to drop the scans nobody has read in a
+        // month, so the directory does not grow by one file per session
+        // forever.
+        if !slot.exists() {
+            prune_scans(dir, SCAN_KEPT_FOR);
+        }
         let tmp = slot.with_extension("tmp");
         let body = format!("{} {} {}\n", scan.offset, scan.sum, scan.last);
         if std::fs::write(&tmp, body).is_ok() {
@@ -348,15 +355,42 @@ pub fn compacted_tokens_cached(path: &Path, cache: Option<&Path>) -> u64 {
 
 /// One cache file per transcript path: its file name (the session id) and a
 /// hash of the whole path, so two config dirs holding the same id never share.
+/// FNV-1a rather than `DefaultHasher`, whose output may change with any Rust
+/// release and would orphan every scan.
 fn cache_name(path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    format!("{stem}-{:016x}.scan", h.finish())
+    format!("{stem}-{h:016x}.scan")
+}
+
+/// How long a scan nobody reads is kept.
+const SCAN_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Remove the scans in `dir` last written longer ago than `kept_for`. A
+/// session that is resumed after that is scanned again from the top.
+fn prune_scans(dir: &Path, kept_for: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > kept_for);
+        if old && path.extension().is_some_and(|e| e == "scan") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Where [`compacted_tokens_cached`] keeps its scans:
@@ -753,6 +787,50 @@ mod tests {
         // A transcript shorter than the scan is rescanned from the top.
         std::fs::write(&p, asst(json!({"input_tokens": 1})) + "\n").unwrap();
         assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 0);
+    }
+
+    /// The cache's names survive a toolchain bump, and a scan nobody has
+    /// read in a month is dropped when a new transcript is first scanned.
+    #[test]
+    fn scans_keep_their_names_and_old_ones_go() {
+        assert_eq!(
+            cache_name(Path::new("/home/x/.claude/projects/p/abc.jsonl")),
+            format!("abc-{:016x}.scan", {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in "/home/x/.claude/projects/p/abc.jsonl".bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                h
+            })
+        );
+
+        let d = tmpdir("prune");
+        let cache = d.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let (old, recent, other) = (
+            cache.join("old-1.scan"),
+            cache.join("recent-2.scan"),
+            cache.join("notes.txt"),
+        );
+        for f in [&old, &recent, &other] {
+            std::fs::write(f, "1 0 0\n").unwrap();
+        }
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 3600);
+        for f in [&old, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        let p = d.join("new.jsonl");
+        std::fs::write(&p, boundary(Some(9)) + "\n").unwrap();
+        assert_eq!(compacted_tokens_cached(&p, Some(&cache)), 9);
+        assert!(!old.exists(), "a month-old scan goes");
+        assert!(recent.exists(), "a recent one stays");
+        assert!(other.exists(), "and nothing but scans is touched");
     }
 
     #[test]
