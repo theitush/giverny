@@ -4990,14 +4990,6 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
-            // The prompt that started the turn, which a long answer scrolls
-            // out of sight.
-            if let Some(prompt) = self.claude.prompt_of(active)
-                && prompt_bar::show(ui, &self.chrome, opacity, active, prompt)
-            {
-                self.focus_terminal = true;
-            }
-
             // What the tab shows: read first, so the pane, the header and
             // the picture below agree in every frame.
             let now = Instant::now();
@@ -5105,6 +5097,29 @@ impl eframe::App for App {
                     if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
+                    }
+                    // The prompt that started the turn, once a long answer
+                    // has scrolled it out of sight.
+                    match self.claude.prompt_of(active) {
+                        // Not over a worker's view: its header is up there,
+                        // and the prompt is the main session's.
+                        Some(prompt)
+                            if header.is_none()
+                                && !prompt_bar::on_screen(prompt, &session.viewport_rows()) =>
+                        {
+                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                            if prompt_bar::show(
+                                &ctx,
+                                &self.chrome,
+                                response.rect,
+                                row,
+                                active,
+                                prompt,
+                            ) {
+                                self.focus_terminal = true;
+                            }
+                        }
+                        _ => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
