@@ -594,9 +594,13 @@ impl TabView {
         // Something the app draws over the grid in a layer of its own (a bar
         // pinned to its top row) takes the pointer there: a click on it is
         // not a click in the program.
-        let ctx = ui.ctx().clone();
+        // Asked once, before reading the events: the context is locked
+        // while they are read.
         let own = ui.layer_id();
-        let covered = |pos: Pos2| ctx.layer_id_at(pos).is_some_and(|l| l != own);
+        let covered = ui
+            .input(|i| i.pointer.latest_pos())
+            .and_then(|pos| ui.ctx().layer_id_at(pos))
+            .is_some_and(|layer| layer != own);
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
@@ -609,7 +613,7 @@ impl TabView {
                         if !rect.contains(*pos) && *pressed {
                             continue;
                         }
-                        if *pressed && covered(*pos) {
+                        if *pressed && covered {
                             self.swallowed_press = true;
                             continue;
                         }
@@ -627,7 +631,7 @@ impl TabView {
                         }
                     }
                     EguiEvent::PointerMoved(pos) => {
-                        if !rect.contains(*pos) || covered(*pos) {
+                        if !rect.contains(*pos) || covered {
                             continue;
                         }
                         let any_down = i.pointer.any_down();
