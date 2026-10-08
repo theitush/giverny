@@ -282,14 +282,20 @@ fn exe_path() -> String {
 /// A path as the first word of a hook command. On macOS the link lives
 /// under `~/Library/Application Support`, and an unquoted space there split
 /// every hook and the status line into a command that does not exist.
-/// Windows-native commands are not run by a POSIX shell, so they are left as
-/// they are.
 fn command_word(path: &Path) -> String {
-    let path = path.display().to_string();
-    if cfg!(windows) {
-        path
+    word_for_shell(&path.display().to_string(), cfg!(windows))
+}
+
+/// Claude Code on Windows runs hook commands with Git Bash, or PowerShell
+/// where Git Bash is not installed. Bash takes `\` as an escape, so
+/// `C:\Users\…` arrives as `C:Users…`; forward slashes run in both shells,
+/// and need no quoting unless the path has a space. A quoted path only
+/// suits Git Bash (PowerShell wants `& '…'`), but it is the default.
+fn word_for_shell(path: &str, windows: bool) -> String {
+    if windows {
+        shell_quote(&path.replace('\\', "/"))
     } else {
-        shell_quote(&path)
+        shell_quote(path)
     }
 }
 
@@ -357,7 +363,12 @@ pub fn point_link() -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
-    if std::fs::read_link(link).is_ok_and(|t| t == exe) {
+    // The binary itself, not a path to it: Giverny started through the link
+    // (macOS reports the path it was started by) would otherwise point the
+    // link at itself, and every hook would run nothing.
+    // A binary copied to the link's own path is left alone the same way.
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if exe == link || std::fs::read_link(link).is_ok_and(|t| t == exe) {
         return Ok(());
     }
     if let Some(dir) = link.parent() {
@@ -367,7 +378,7 @@ fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
     // binary or the new one, never no file at all.
     let tmp = link.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::os::unix::fs::symlink(&exe, &tmp)?;
     std::fs::rename(&tmp, link)
 }
 
@@ -919,8 +930,10 @@ mod tests {
     fn the_link_follows_the_binary() {
         let d = std::env::temp_dir().join(format!("giverny-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let (a, b) = (d.join("a"), d.join("b"));
         std::fs::create_dir_all(&d).unwrap();
+        // The binary is named by its real path (macOS's /tmp is a link).
+        let d = d.canonicalize().unwrap();
+        let (a, b) = (d.join("a"), d.join("b"));
         std::fs::write(&a, "").unwrap();
         std::fs::write(&b, "").unwrap();
         let link = d.join("bin/giverny");
@@ -943,6 +956,12 @@ mod tests {
             !is_dangling(&d.join("nothing")),
             "no link is not a dangling one"
         );
+
+        // Started through the link, the binary is still the one it names,
+        // never the link itself.
+        point_link_at(&link, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        assert!(is_link_to_a_binary(&link));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -976,6 +995,15 @@ mod tests {
             command_word(Path::new("/home/x/.config/giverny/bin/giverny")),
             "/home/x/.config/giverny/bin/giverny",
             "a plain path is written as before"
+        );
+        // Windows: forward slashes, which Git Bash and PowerShell both run.
+        assert_eq!(
+            word_for_shell(r"C:\Users\ita\AppData\Local\Giverny\bin\giverny.exe", true),
+            "C:/Users/ita/AppData/Local/Giverny/bin/giverny.exe"
+        );
+        assert_eq!(
+            word_for_shell(r"C:\Users\Jane Doe\giverny.exe", true),
+            "'C:/Users/Jane Doe/giverny.exe'"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
