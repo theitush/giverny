@@ -1524,7 +1524,7 @@ mod tests {
                 entry: live,
                 config_dir: dir.clone(),
             }],
-            stale: false,
+            ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
         w.merge_scan(&shells, &mut WatchEffects::default());
