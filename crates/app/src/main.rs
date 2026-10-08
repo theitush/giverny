@@ -3245,14 +3245,6 @@ impl eframe::App for App {
                 self.queue_app_restore(active);
             }
 
-            // The prompt that started the turn, which a long answer scrolls
-            // out of sight.
-            if let Some(prompt) = self.claude.prompt_of(active)
-                && prompt_bar::show(ui, &self.chrome, opacity, active, prompt)
-            {
-                self.focus_terminal = true;
-            }
-
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
                     let response = rt.view.show(ui, &mut self.shared, session);
@@ -3260,6 +3252,26 @@ impl eframe::App for App {
                     if self.focus_terminal {
                         response.request_focus();
                         self.focus_terminal = false;
+                    }
+                    // The prompt that started the turn, once a long answer
+                    // has scrolled it out of sight.
+                    match self.claude.prompt_of(active) {
+                        Some(prompt)
+                            if !prompt_bar::on_screen(prompt, &session.viewport_rows()) =>
+                        {
+                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                            if prompt_bar::show(
+                                &ctx,
+                                &self.chrome,
+                                response.rect,
+                                row,
+                                active,
+                                prompt,
+                            ) {
+                                self.focus_terminal = true;
+                            }
+                        }
+                        _ => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
