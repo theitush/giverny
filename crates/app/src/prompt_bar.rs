@@ -20,25 +20,30 @@ const LINE_CHARS: usize = 400;
 /// A prompt as one line: line breaks and runs of whitespace become single
 /// spaces, and anything past `max` characters becomes an ellipsis.
 pub fn one_line(prompt: &str, max: usize) -> String {
+    one_line_cut(prompt, max).0
+}
+
+/// [`one_line`], and whether it had to cut.
+fn one_line_cut(prompt: &str, max: usize) -> (String, bool) {
     let mut out = String::new();
     let mut count = 0;
     for word in prompt.split_whitespace() {
         if count > 0 {
             if count == max {
-                return cut(out);
+                return (cut(out), true);
             }
             out.push(' ');
             count += 1;
         }
         for ch in word.chars() {
             if count == max {
-                return cut(out);
+                return (cut(out), true);
             }
             out.push(ch);
             count += 1;
         }
     }
-    out
+    (out, false)
 }
 
 fn cut(mut text: String) -> String {
@@ -107,6 +112,13 @@ pub fn hide(ctx: &egui::Context, tab: TabId) {
     ctx.data_mut(|d| d.remove::<bool>(open_id(tab)));
 }
 
+/// Is there more to the prompt than the bar shows? Only then does a click
+/// open it: a prompt of one line that fits has nothing more to show.
+/// `cut` is whether the line shown was cut short, by the width or the cap.
+pub fn expandable(prompt: &str, cut: bool) -> bool {
+    cut || prompt.lines().filter(|l| !l.trim().is_empty()).count() > 1
+}
+
 /// The bar's one colour: the same closed or open, hovered or not, at the
 /// bottom or scrolled back. Opaque, so the grid scrolling under it never
 /// shows through.
@@ -139,9 +151,30 @@ pub fn show(
     let fill = fill(chrome);
     let rule = mix(chrome.panel, chrome.fg, 0.25);
     let font = FontId::monospace(12.0);
-    // Where the one line's text starts, and the room the marker keeps.
+    // Where the one line's text starts, and the room the marker keeps. The
+    // room is kept whether or not there is a marker, so a prompt that fits
+    // is decided at the same width either way.
     const LEFT: f32 = 10.0;
     const RIGHT: f32 = 26.0;
+
+    // The one line, laid out at this width: whether it was cut is what
+    // says there is more to see, and a resize can change the answer.
+    let (line, capped) = one_line_cut(prompt, LINE_CHARS);
+    let mut job = egui::text::LayoutJob::single_section(
+        line,
+        egui::TextFormat::simple(font.clone(), chrome.fg),
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: (over.width() - LEFT - RIGHT).max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ctx.fonts_mut(|f| f.layout_job(job));
+    let more = expandable(prompt, capped || galley.elided);
+    if !more {
+        open = false;
+    }
 
     let shown = egui::Area::new(open_id.with("bar"))
         .order(if open {
@@ -191,17 +224,6 @@ pub fn show(
                     ui.allocate_exact_size(Vec2::new(over.width(), height), Sense::hover());
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, fill);
-                let mut job = egui::text::LayoutJob::single_section(
-                    one_line(prompt, LINE_CHARS),
-                    egui::TextFormat::simple(font.clone(), chrome.fg),
-                );
-                job.wrap = egui::text::TextWrapping {
-                    max_width: (rect.width() - LEFT - RIGHT).max(0.0),
-                    max_rows: 1,
-                    break_anywhere: true,
-                    overflow_character: Some('…'),
-                };
-                let galley = p.layout_job(job);
                 let y = rect.center().y - galley.size().y / 2.0;
                 p.galley(egui::pos2(rect.min.x + LEFT, y), galley, chrome.fg);
                 rect
@@ -209,6 +231,14 @@ pub fn show(
             let p = ui.painter();
             // A hairline under it keeps it apart from the row below.
             p.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, rule));
+            // Clicks only, anywhere on it: a focusable bar would take the
+            // keyboard from the terminal under it. Sensed even with nothing to
+            // open, so the click hands the keyboard back to the terminal; it
+            // just does nothing else, and does not look like it would.
+            let response = ui.interact(rect, open_id.with("click"), Sense::CLICK);
+            if !more {
+                return response;
+            }
             p.text(
                 egui::pos2(rect.max.x - 10.0, rect.min.y + height / 2.0),
                 egui::Align2::RIGHT_CENTER,
@@ -216,14 +246,11 @@ pub fn show(
                 font.clone(),
                 chrome.dim,
             );
-            // Clicks only, anywhere on it: a focusable bar would take the
-            // keyboard from the terminal under it.
-            ui.interact(rect, open_id.with("click"), Sense::CLICK)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
+            response.on_hover_cursor(egui::CursorIcon::PointingHand)
         });
     let rect = shown.response.rect;
     let clicked = shown.inner.clicked();
-    if clicked {
+    if clicked && more {
         open = !open;
     } else if open {
         // A click anywhere else puts it away, as a menu would.
@@ -353,6 +380,22 @@ mod tests {
             assert_eq!(fill(&chrome).a(), 255, "{name}");
             assert_ne!(fill(&chrome), chrome.panel, "{name}: apart from the panel");
         }
+    }
+
+    #[test]
+    fn only_a_prompt_with_more_to_show_opens() {
+        assert!(!expandable("fix the build", false), "fits: nothing to open");
+        assert!(
+            !expandable("  fix the build \n\n", false),
+            "blank lines are not more"
+        );
+        assert!(expandable("fix the build", true), "cut to the width");
+        assert!(
+            expandable("fix the build\nthen test", false),
+            "a second line"
+        );
+        assert_eq!(one_line_cut("abcdefg", 6), ("abcdef…".to_string(), true));
+        assert_eq!(one_line_cut("abc", 6), ("abc".to_string(), false));
     }
 
     #[test]
