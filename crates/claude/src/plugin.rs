@@ -37,6 +37,13 @@
 //! the skill goes — from every account at once, since they all load this
 //! one directory.
 //!
+//! - A plugin cannot grant permissions: of a plugin's own `settings.json`
+//!   Claude Code keeps only `agent` and `subagentStatusLine`, and a skill's
+//!   `allowed-tools` lasts one turn of the session that ran the skill — never
+//!   a worker's. So the account's `settings.json` carries [`ALLOW_RULES`] in
+//!   `permissions.allow` beside the two keys, or a worker's `eta`, `run` and
+//!   `claim` each stop on a permission prompt (giverny#263).
+//!
 //! The settings keys follow the house rules the other management-panel key does:
 //! written only with `claude.management_panel` on, never over a
 //! marketplace called `giverny` that is not ours, removed when the setting
@@ -49,6 +56,20 @@ use serde_json::{Value, json};
 pub const MARKETPLACE: &str = "giverny";
 pub const PLUGIN: &str = "giverny";
 pub const PLUGIN_ID: &str = "giverny@giverny";
+/// The Bash permission rules that let every session run the plugin's
+/// launchers, and the subcommand they wrap, without asking.
+///
+/// Claude Code splits a command at `&&`, `;` and `|` and matches each part on
+/// its own, and its read-only commands (`cd` within the project, `tail`,
+/// `grep`, …) need no rule; so `cd <worktree> && giverny-manage run …` and
+/// `giverny-manage eta … 2>&1 | tail -3` pass on the first rule alone.
+/// `giverny-hook` runs as a hook, not through Bash, and needs none.
+pub const ALLOW_RULES: &[&str] = &[
+    "Bash(giverny-manage:*)",
+    "Bash(giverny-eta:*)",
+    "Bash(giverny manage:*)",
+];
+
 /// The marketplace directory's name under Giverny's config base.
 pub const DIR_NAME: &str = "claude-plugin";
 /// The plugin's version: the binary's.
@@ -317,10 +338,12 @@ pub fn installed_in(settings_path: &Path) -> bool {
 /// On: `extraKnownMarketplaces.giverny` points at `dir` (refused when a
 /// marketplace of that name is someone else's) and `enabledPlugins`
 /// gains `giverny@giverny: true` unless the user already set it — a user who
-/// ran `claude plugin disable` keeps it disabled. Off: both are removed, only
+/// ran `claude plugin disable` keeps it disabled. `permissions.allow` gains
+/// whichever of [`ALLOW_RULES`] it lacks, at its end; the user's own rules
+/// keep their order. Off: both are removed, only
 /// when ours, a map we emptied goes with them, and Claude Code's own record
 /// of the marketplace (`plugins/known_marketplaces.json`) loses its entry
-/// too, as `claude plugin marketplace remove` would.
+/// too, as `claude plugin marketplace remove` would; so do our allow rules.
 pub fn set_plugin(settings_path: &Path, dir: &Path, enable: bool) -> anyhow::Result<bool> {
     let changed = set_keys(settings_path, dir, enable)?;
     if !enable && let Some(config) = settings_path.parent() {
@@ -336,6 +359,8 @@ fn set_keys(settings_path: &Path, dir: &Path, enable: bool) -> anyhow::Result<bo
         Err(_) if !enable => return Ok(false),
         Err(_) => json!({}),
     };
+    // What is there now: a file this would not change is not written.
+    let before = root.clone();
     let obj = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings root is not an object"))?;
@@ -349,16 +374,7 @@ fn set_keys(settings_path: &Path, dir: &Path, enable: bool) -> anyhow::Result<bo
         anyhow::bail!("a marketplace called `giverny` is already configured — leaving it alone");
     }
     let want = json!({ "source": { "source": "directory", "path": dir_for(settings_path, dir) } });
-    let enabled = obj.get("enabledPlugins").and_then(|m| m.get(PLUGIN_ID));
-    match (enable, &current) {
-        (true, Some(e)) if *e == want && enabled.is_some() => return Ok(false),
-        (false, None) if enabled.is_none() => return Ok(false),
-        _ => {}
-    }
-    let backup = settings_path.with_extension("json.giverny-bak");
-    if settings_path.exists() && !backup.exists() {
-        let _ = std::fs::copy(settings_path, &backup);
-    }
+    set_allow_rules(obj, enable);
     if enable {
         let m = obj
             .entry("extraKnownMarketplaces")
@@ -385,6 +401,13 @@ fn set_keys(settings_path: &Path, dir: &Path, enable: bool) -> anyhow::Result<bo
             }
         }
     }
+    if root == before && settings_path.exists() {
+        return Ok(false);
+    }
+    let backup = settings_path.with_extension("json.giverny-bak");
+    if settings_path.exists() && !backup.exists() {
+        let _ = std::fs::copy(settings_path, &backup);
+    }
     let tmp = settings_path.with_extension("json.tmp");
     if let Some(d) = settings_path.parent() {
         std::fs::create_dir_all(d)?;
@@ -392,6 +415,50 @@ fn set_keys(settings_path: &Path, dir: &Path, enable: bool) -> anyhow::Result<bo
     std::fs::write(&tmp, serde_json::to_vec_pretty(&root)?)?;
     std::fs::rename(&tmp, settings_path)?;
     Ok(true)
+}
+
+/// Append the [`ALLOW_RULES`] `permissions.allow` lacks, or take them out
+/// again; every other rule stays where it is. A `permissions` or `allow`
+/// that is not the shape Claude Code reads is the user's to fix, and is left
+/// alone. Off, an `allow` or `permissions` that only we filled goes too.
+fn set_allow_rules(obj: &mut serde_json::Map<String, Value>, enable: bool) {
+    if enable {
+        let Some(perms) = obj
+            .entry("permissions")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        else {
+            return;
+        };
+        let Some(list) = perms
+            .entry("allow")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        else {
+            return;
+        };
+        for rule in ALLOW_RULES {
+            if !list.iter().any(|v| v.as_str() == Some(rule)) {
+                list.push(json!(rule));
+            }
+        }
+        return;
+    }
+    let Some(perms) = obj.get_mut("permissions").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(list) = perms.get_mut("allow").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let had = list.len();
+    list.retain(|v| !v.as_str().is_some_and(|r| ALLOW_RULES.contains(&r)));
+    if had == list.len() || !list.is_empty() {
+        return;
+    }
+    perms.remove("allow");
+    if perms.is_empty() {
+        obj.remove("permissions");
+    }
 }
 
 /// Drop our entry from Claude Code's `known_marketplaces.json`, which it
@@ -634,6 +701,111 @@ mod tests {
         assert!(installed_in(&s));
         assert!(set_plugin(&s, &dir, false).unwrap());
         assert_eq!(std::fs::read_to_string(&s).unwrap().trim(), "{}");
+    }
+
+    fn allow_list(s: &Path) -> Vec<String> {
+        let v: Value = serde_json::from_slice(&std::fs::read(s).unwrap()).unwrap();
+        v["permissions"]["allow"]
+            .as_array()
+            .map(|a| a.iter().map(|r| r.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_fresh_account_gets_the_allow_rules() {
+        let d = scratch("allow-fresh");
+        let s = d.join("settings.json");
+        let dir = d.join("giverny").join(DIR_NAME);
+        assert!(set_plugin(&s, &dir, true).unwrap());
+        assert_eq!(allow_list(&s), ALLOW_RULES);
+        assert!(!set_plugin(&s, &dir, true).unwrap(), "no-op writes nothing");
+        assert!(set_plugin(&s, &dir, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&s).unwrap().trim(), "{}");
+    }
+
+    #[test]
+    fn the_users_allow_rules_keep_their_place() {
+        let d = scratch("allow-mine");
+        let s = d.join("settings.json");
+        let dir = d.join("giverny").join(DIR_NAME);
+        let mine = r#"{"permissions":{"allow":["mcp__playwright__*","Bash(ls:*)"],"deny":["Bash(rm:*)"],"defaultMode":"auto"},"model":"opus"}"#;
+        std::fs::write(&s, mine).unwrap();
+        assert!(set_plugin(&s, &dir, true).unwrap());
+        let mut want = vec!["mcp__playwright__*".to_string(), "Bash(ls:*)".to_string()];
+        want.extend(ALLOW_RULES.iter().map(|r| r.to_string()));
+        assert_eq!(allow_list(&s), want, "ours go at the end, theirs stay put");
+        let v: Value = serde_json::from_slice(&std::fs::read(&s).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["deny"][0], "Bash(rm:*)");
+        assert_eq!(v["permissions"]["defaultMode"], "auto");
+        assert!(!set_plugin(&s, &dir, true).unwrap(), "no-op writes nothing");
+
+        assert!(set_plugin(&s, &dir, false).unwrap());
+        let v: Value = serde_json::from_slice(&std::fs::read(&s).unwrap()).unwrap();
+        let orig: Value = serde_json::from_str(mine).unwrap();
+        assert_eq!(v, orig, "off takes out only ours");
+    }
+
+    #[test]
+    fn rules_already_there_are_not_added_twice() {
+        let d = scratch("allow-there");
+        let s = d.join("settings.json");
+        let dir = d.join("giverny").join(DIR_NAME);
+        // One of ours already there (and not first), the others missing.
+        let mine = format!(
+            r#"{{"permissions":{{"allow":["{}","Bash(ls:*)"]}}}}"#,
+            ALLOW_RULES[1]
+        );
+        std::fs::write(&s, &mine).unwrap();
+        assert!(set_plugin(&s, &dir, true).unwrap());
+        let got = allow_list(&s);
+        assert_eq!(got[..2], [ALLOW_RULES[1], "Bash(ls:*)"]);
+        for rule in ALLOW_RULES {
+            assert_eq!(got.iter().filter(|r| r == rule).count(), 1, "{got:?}");
+        }
+        assert_eq!(got.len(), ALLOW_RULES.len() + 1);
+
+        // All there and the plugin's keys too: nothing to write.
+        let bytes = std::fs::read(&s).unwrap();
+        assert!(!set_plugin(&s, &dir, true).unwrap());
+        assert_eq!(std::fs::read(&s).unwrap(), bytes);
+
+        // The plugin's keys there but a rule gone: put back, nothing else.
+        let mut v: Value = serde_json::from_slice(&bytes).unwrap();
+        v["permissions"]["allow"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|r| r != ALLOW_RULES[0]);
+        std::fs::write(&s, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(set_plugin(&s, &dir, true).unwrap());
+        assert_eq!(allow_list(&s).len(), ALLOW_RULES.len() + 1);
+    }
+
+    #[test]
+    fn unreadable_settings_and_odd_permissions_are_left_alone() {
+        let d = scratch("allow-odd");
+        let s = d.join("settings.json");
+        let dir = d.join("giverny").join(DIR_NAME);
+        let broken = r#"{"permissions":{"allow":["Bash(ls:*)",]}"#;
+        std::fs::write(&s, broken).unwrap();
+        assert!(set_plugin(&s, &dir, true).is_err());
+        assert!(set_plugin(&s, &dir, false).is_err());
+        assert_eq!(std::fs::read_to_string(&s).unwrap(), broken);
+        assert!(!s.with_extension("json.giverny-bak").exists());
+
+        // Valid JSON, but not the shape Claude Code reads: the plugin still
+        // loads, and the user's odd value is theirs to fix.
+        for odd in [
+            r#"{"permissions":"ask"}"#,
+            r#"{"permissions":{"allow":"Bash(ls:*)"}}"#,
+        ] {
+            std::fs::write(&s, odd).unwrap();
+            assert!(set_plugin(&s, &dir, true).unwrap());
+            assert!(installed_in(&s));
+            let v: Value = serde_json::from_slice(&std::fs::read(&s).unwrap()).unwrap();
+            let orig: Value = serde_json::from_str(odd).unwrap();
+            assert_eq!(v["permissions"], orig["permissions"]);
+            assert!(!set_plugin(&s, &dir, true).unwrap(), "no-op writes nothing");
+        }
     }
 
     #[test]
