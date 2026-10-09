@@ -34,8 +34,12 @@ usage: giverny manage <command> [args] [--session <id>]
 
   plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE] [--repo R]
                               queue a task (a Next up row) with its estimate
-  start <task> [--eta <dur>] [--title T] [--agent <id>] [--note N] [--brief FILE]
-               [--repo R]     the task's worker is starting now (Running)
+  start <task> [--eta <dur>] [--title T] [--agent <id> [--heavy-ok]] [--note N]
+               [--brief FILE] [--repo R]
+                              the task's worker is starting now (Running);
+                              --agent hands it to a worker that already holds
+                              another task, refused for one carrying over 100k
+                              context unless --heavy-ok
   eta   <task> <dur left> [--note N] [--why wait|blocked|scope|load|ready]
                               [--title T] [--agent <id>] [--repo R]
                               re-estimate: this much is left from now (a task
@@ -145,6 +149,9 @@ pub struct Flags {
     pub note: Option<String>,
     pub brief: Option<String>,
     pub agent: Option<String>,
+    /// `start --agent`: hand the task to a worker over
+    /// [`REUSE_MAX_TOKENS`] all the same.
+    pub heavy_ok: bool,
     pub outcome: Option<String>,
     pub review: Option<String>,
     pub session: Option<String>,
@@ -263,6 +270,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
                 );
             }
             "--agent" => flags.agent = Some(val("--agent")?),
+            "--heavy-ok" => flags.heavy_ok = true,
             "--outcome" => flags.outcome = Some(val("--outcome")?),
             "--review" => flags.review = Some(val("--review")?),
             "--session" => flags.session = Some(val("--session")?),
@@ -856,18 +864,106 @@ fn idle_workers(doc: &Value, task: &str, now: u64) -> Vec<(String, String)> {
 /// `--agent` to name it as idle.
 const IDLE_HINT_MS: u64 = 30 * 60 * 1000;
 
-/// The line `start <task>` with no `--agent` adds when a worker of this
-/// manager session is idle: hand it over with `--agent`, so its tokens are its own.
-fn idle_hint(task: &str, idle: &[(String, String)]) -> Option<String> {
-    let (agent, key) = idle.first()?;
-    let more = match idle.len() {
-        1 => String::new(),
-        n => format!(" ({} more idle)", n - 1),
+/// The most context a worker may carry and still be handed a next task
+/// (giverny#280). Every turn of a reused worker re-reads its whole context,
+/// so a heavy one makes the next task slow and dear, and its old context
+/// crowds the new one: above this a fresh worker with a full brief is
+/// better. `start --agent` refuses a worker over it unless `--heavy-ok`, and
+/// a plain `start` never suggests one.
+pub const REUSE_MAX_TOKENS: u64 = 100_000;
+
+/// Whether a worker carrying `context` is too heavy to reuse. An unknown
+/// context (no transcript to read) is not.
+fn too_heavy(context: Option<u64>) -> bool {
+    context.is_some_and(|n| n > REUSE_MAX_TOKENS)
+}
+
+/// The context worker `agent` carries now, as the panel's TOKENS column and
+/// the status line count it ([`crate::tokens::tokens_of`]): its transcript's
+/// last API response, under the first of `sessions` that has it.
+fn worker_context(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<u64> {
+    sessions.iter().find_map(|session| {
+        let dir = session_subagents(cfg, session)?;
+        crate::tokens::tokens_of(&crate::subagents::agent_transcript(&dir, agent))
+    })
+}
+
+/// An idle worker for [`idle_hint`]: its id, the key of the task it landed
+/// last, and the context it carries.
+type Idle = (String, String, Option<u64>);
+
+/// The lines `start <task>` with no `--agent` adds when workers of this
+/// manager session are idle: the newest-landed one under
+/// [`REUSE_MAX_TOKENS`] to hand it over with `--agent`, so its tokens are its
+/// own, and the ones over it named as better left alone.
+fn idle_hint(task: &str, idle: &[Idle]) -> Option<String> {
+    let ctx = |c: &Option<u64>| match c {
+        Some(n) => format!(", carrying {} context", crate::tokens::fmt_tokens(*n)),
+        None => String::new(),
     };
-    Some(format!(
-        "  {agent} is idle since {key} landed{more}: if it takes {task}, start it with \
-         `--agent {agent}` so {task} counts its own tokens (a SendMessage to it that \
-         begins `New task for you: {task}` links it too)"
+    let limit = crate::tokens::fmt_tokens(REUSE_MAX_TOKENS);
+    let (heavy, light): (Vec<&Idle>, Vec<&Idle>) = idle.iter().partition(|w| too_heavy(w.2));
+    let mut lines = Vec::new();
+    if let Some((agent, key, c)) = light.first() {
+        let more = match light.len() {
+            1 => String::new(),
+            n => format!(" ({} more idle under {limit})", n - 1),
+        };
+        lines.push(format!(
+            "  {agent} is idle since {key} landed{c}{more}: if {task} is in code it has read \
+             or follows on from {key}, start it with `--agent {agent}` so {task} counts its \
+             own tokens (a SendMessage to it that begins `New task for you: {task}` links it \
+             too); otherwise spawn a fresh worker",
+            c = ctx(c)
+        ));
+    }
+    if !heavy.is_empty() {
+        let names: Vec<String> = heavy
+            .iter()
+            .map(|(a, k, c)| format!("{a} (since {k} landed{})", ctx(c)))
+            .collect();
+        let (who, verb) = match names.len() {
+            1 => (names[0].clone(), "is"),
+            _ => (names.join(", "), "are"),
+        };
+        lines.push(format!(
+            "  {who} {verb} idle but over the {limit} reuse limit: every turn of a reused \
+             worker re-reads its whole context, so spawn a fresh worker with a full brief \
+             for {task}"
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// `start <task> --agent <worker>`'s guard: refuse a worker over
+/// [`REUSE_MAX_TOKENS`] unless `--heavy-ok`, saying how heavy it is; with
+/// `--heavy-ok`, the note to add. A worker already holding `task` is not
+/// being reused, and one whose context cannot be read is let through.
+fn heavy_guard(
+    task: &str,
+    agent: &str,
+    context: Option<u64>,
+    heavy_ok: bool,
+) -> Result<Option<String>, String> {
+    let Some(n) = context.filter(|_| too_heavy(context)) else {
+        return Ok(None);
+    };
+    let (size, limit) = (
+        crate::tokens::fmt_tokens(n),
+        crate::tokens::fmt_tokens(REUSE_MAX_TOKENS),
+    );
+    if heavy_ok {
+        return Ok(Some(format!(
+            "  {agent} carries {size} context, over the {limit} reuse limit: handed {task} \
+             anyway (--heavy-ok)"
+        )));
+    }
+    Err(format!(
+        "{agent} carries {size} context, over the {limit} reuse limit: every turn of a \
+         reused worker re-reads its whole context, so {task} would run slow and dear with \
+         that old context crowding it. Spawn a fresh worker with a full brief and \
+         `start {task}` without --agent; if {task} really needs what {agent} has read, pass \
+         --heavy-ok"
     ))
 }
 
@@ -1621,6 +1717,19 @@ fn run_feed(
             let sessions = continuation::ids(&doc);
             let history = manage_history::path(dir);
             let mut flags = flags.clone();
+            let heavy_note = match (cmd, &flags.agent) {
+                (Cmd::Start(task), Some(agent))
+                    if row_agent(&doc, task) != Some(agent.as_str()) =>
+                {
+                    heavy_guard(
+                        task,
+                        agent,
+                        worker_context(cfg, &sessions, agent),
+                        flags.heavy_ok,
+                    )?
+                }
+                _ => None,
+            };
             let said = tell_record(&doc, cmd, &mut flags, history.as_deref());
             if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
                 && needs_description(&doc, now)
@@ -1650,10 +1759,21 @@ fn run_feed(
                 ));
             }
             if let (Cmd::Start(task), None) = (cmd, &flags.agent)
-                && let Some(hint) = idle_hint(task, &idle_workers(&doc, task, now))
-                && !row_has_agent(&doc, task)
+                && row_agent(&doc, task).is_none()
             {
-                msg = format!("{msg}\n{hint}");
+                let idle: Vec<Idle> = idle_workers(&doc, task, now)
+                    .into_iter()
+                    .map(|(a, k)| {
+                        let c = worker_context(cfg, &sessions, &a);
+                        (a, k, c)
+                    })
+                    .collect();
+                if let Some(hint) = idle_hint(task, &idle) {
+                    msg = format!("{msg}\n{hint}");
+                }
+            }
+            if let Some(note) = heavy_note {
+                msg = format!("{msg}\n{note}");
             }
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
             if let Some(h) = &history {
@@ -1676,12 +1796,13 @@ fn run_feed(
     }
 }
 
-/// Whether the row `key` has a worker.
-fn row_has_agent(doc: &Value, key: &str) -> bool {
+/// The worker the row `key` has, if it has one.
+fn row_agent<'a>(doc: &'a Value, key: &str) -> Option<&'a str> {
     doc.get("rows")
         .and_then(Value::as_array)
         .and_then(|rows| find(rows, key).map(|i| &rows[i]))
-        .is_some_and(|r| r.get("agent_id").is_some())
+        .and_then(|r| r.get("agent_id"))
+        .and_then(Value::as_str)
 }
 
 /// Whether the row `key` names a brief.
@@ -3096,6 +3217,151 @@ mod tests {
             "frozen stays frozen"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An assistant turn as Claude Code writes it in a worker's transcript,
+    /// carrying `context` tokens (mostly cache reads, as a long-lived
+    /// worker's are).
+    fn real_turn(at: u64, context: u64) -> String {
+        json!({"type": "assistant", "timestamp": stamp(at), "agentId": "w",
+            "message": {"id": format!("msg_{at}"), "model": "claude-opus-5-5",
+                "role": "assistant", "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1_038,
+                    "cache_read_input_tokens": context - 1_040,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 1_038,
+                        "ephemeral_1h_input_tokens": 0},
+                    "output_tokens": 8, "service_tier": "standard"}}})
+        .to_string()
+    }
+
+    /// Two workers of one manager session, each landed with a task: `w1`
+    /// light, `w2` 312k tokens deep. Returns the Claude config dir.
+    fn light_and_heavy(dir: &Path) -> PathBuf {
+        let cfg = spawned(dir, "s1", "w1", "lex-fix: the lexer");
+        spawned(dir, "s1", "w2", "parse-fix: the parser");
+        run_cfg(dir, "s1", "start lex-fix --agent w1", Some(&cfg), T0);
+        run_cfg(dir, "s1", "start parse-fix --agent w2", Some(&cfg), T0);
+        let sub = cfg.join("projects").join("-w").join("s1").join("subagents");
+        std::fs::write(
+            sub.join("agent-w1.jsonl"),
+            real_turn(T0 + MIN, 42_000) + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("agent-w2.jsonl"),
+            [
+                real_turn(T0 + MIN, 90_000),
+                real_turn(T0 + 9 * MIN, 312_000),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        run_cfg(dir, "s1", "land lex-fix", Some(&cfg), T0 + 5 * MIN);
+        run_cfg(dir, "s1", "land parse-fix", Some(&cfg), T0 + 10 * MIN);
+        cfg
+    }
+
+    fn try_cfg(dir: &Path, l: &str, cfg: &Path, now: u64) -> Result<String, String> {
+        let (cmd, mut flags) = parse_args(&args(l)).unwrap();
+        flags.claude_dir = Some(cfg.to_path_buf());
+        run_in_code(dir, "s1", &cmd, &flags, now, Some(&machine())).map(|(m, _)| m)
+    }
+
+    /// A plain `start` names the idle worker under the reuse limit, with its
+    /// context, and names the one over it as better left alone (giverny#280).
+    #[test]
+    fn start_suggests_only_a_light_idle_worker() {
+        assert_eq!(REUSE_MAX_TOKENS, 100_000);
+        let dir = scratch("reuse-hint");
+        let cfg = light_and_heavy(&dir);
+        let said = try_cfg(&dir, "start emit-fix", &cfg, T0 + 11 * MIN).unwrap();
+        assert!(
+            said.contains("w1 is idle since lex-fix landed, carrying 42k context"),
+            "{said}"
+        );
+        assert!(said.contains("--agent w1"), "{said}");
+        assert!(!said.contains("--agent w2"), "{said}");
+        assert!(
+            said.contains("w2 (since parse-fix landed, carrying 312k context) is idle but over the 100k reuse limit"),
+            "{said}"
+        );
+        assert!(
+            said.contains("spawn a fresh worker with a full brief for emit-fix"),
+            "{said}"
+        );
+
+        // With only the heavy one idle, nothing is suggested for reuse.
+        let sub = cfg.join("projects").join("-w").join("s1").join("subagents");
+        std::fs::write(
+            sub.join("agent-w1.jsonl"),
+            real_turn(T0 + MIN, 150_000) + "\n",
+        )
+        .unwrap();
+        let said = try_cfg(&dir, "start type-fix", &cfg, T0 + 12 * MIN).unwrap();
+        assert!(!said.contains("--agent"), "{said}");
+        assert!(
+            said.contains("w2 (since parse-fix landed, carrying 312k context), w1 (since lex-fix landed, carrying 150k context) are idle but over"),
+            "{said}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `start --agent` on a worker over the limit is refused, naming its
+    /// context, and changes nothing; `--heavy-ok` goes ahead; a light one, and
+    /// a worker already holding the task, pass as before (giverny#280).
+    #[test]
+    fn start_agent_refuses_a_heavy_worker_unless_heavy_ok() {
+        let dir = scratch("reuse-guard");
+        let cfg = light_and_heavy(&dir);
+        let before = std::fs::read(feed::feed_path(&dir, "s1")).unwrap();
+        let err = try_cfg(&dir, "start emit-fix --agent w2", &cfg, T0 + 11 * MIN).unwrap_err();
+        assert!(
+            err.contains("w2 carries 312k context, over the 100k reuse limit"),
+            "{err}"
+        );
+        assert!(err.contains("--heavy-ok"), "{err}");
+        assert_eq!(
+            std::fs::read(feed::feed_path(&dir, "s1")).unwrap(),
+            before,
+            "nothing written"
+        );
+        assert!(
+            !read_feed_of(&dir, "s1")
+                .rows
+                .iter()
+                .any(|r| r.key == "emit-fix")
+        );
+
+        let said = try_cfg(
+            &dir,
+            "start emit-fix --agent w2 --heavy-ok",
+            &cfg,
+            T0 + 11 * MIN,
+        )
+        .unwrap();
+        assert!(said.starts_with("started emit-fix"), "{said}");
+        assert!(said.contains("w2 carries 312k context"), "{said}");
+        assert_eq!(
+            agent_of(&read_feed_of(&dir, "s1"), "emit-fix").as_deref(),
+            Some("w2")
+        );
+        // Its own task again: not a reuse.
+        let said = try_cfg(&dir, "start emit-fix --agent w2", &cfg, T0 + 12 * MIN).unwrap();
+        assert!(said.contains("running already"), "{said}");
+
+        let said = try_cfg(&dir, "start type-fix --agent w1", &cfg, T0 + 12 * MIN).unwrap();
+        assert!(said.starts_with("started type-fix"), "{said}");
+        assert!(!said.contains("reuse limit"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heavy_ok_parses() {
+        let (_, f) = parse_args(&args("start t --agent w --heavy-ok")).unwrap();
+        assert!(f.heavy_ok);
+        let (_, f) = parse_args(&args("start t --agent w")).unwrap();
+        assert!(!f.heavy_ok);
     }
 
     /// A message to a worker busy on its own task hands nothing over unless

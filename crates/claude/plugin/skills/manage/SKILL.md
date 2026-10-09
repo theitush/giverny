@@ -1,6 +1,6 @@
 ---
 name: manage
-description: Run a piece of work as a manager session of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's management panel as Running, Next up with ETAs, and Done. Invoke it whenever the user says "manage" — "manage this", "manage that task", "and manage it plz", "/manage" — before doing any of the work yourself; "manage" means this skill, not a project's own orchestrate or dispatch skill. Also use it when asked to fan work out to subagents or work through a list of tasks in parallel.
+description: Run a piece of work as a manager session of subagents, one per task (a light worker reused for a next task in code it has already read), several at once where their files do not overlap, and show it in Giverny's management panel as Running, Next up with ETAs, and Done. Invoke it whenever the user says "manage" — "manage this", "manage that task", "and manage it plz", "/manage" — before doing any of the work yourself; "manage" means this skill, not a project's own orchestrate or dispatch skill. Also use it when asked to fan work out to subagents or work through a list of tasks in parallel.
 ---
 
 # Manage a session
@@ -116,9 +116,18 @@ giverny-manage start auth-fix
 ```
 
 Then spawn **one subagent for this task** with the Agent tool. One task, one
-agent is the default. Reuse a worker instead when that saves tokens or simply
-makes sense: the next task is in code it has already read, or follows on from
-what it just did. Hand it over as in [Giving a worker its next task](#giving-a-worker-its-next-task),
+agent is the default. Reuse a worker instead only when **both** hold:
+
+- it is **light**: under 100k tokens of context (the TOKENS column; `start`
+  prints it for each idle worker), and
+- the next task is **in the files it has already read, or follows on from what
+  it just did**.
+
+Otherwise spawn a fresh worker with a full brief. Every turn of a reused worker
+re-reads its whole context, so a worker 300k tokens deep makes the next task
+slow and expensive on every turn, and its old context crowds the new task. A
+fresh worker that reads a few files costs far less than that. Hand a reused
+worker over as in [Giving a worker its next task](#giving-a-worker-its-next-task),
 never as a second task folded into the first.
 
 When you spawn one:
@@ -184,12 +193,19 @@ When you spawn one:
 
 ### Giving a worker its next task
 
-To hand a worker that knows the code its next task with `SendMessage` instead
-of spawning a new one, record the hand-off in the same breath as the message:
+Only a light worker (under 100k tokens of context) whose next task is in code
+it has read gets one; see [Start a task](#2-start-a-task) for why. To hand
+such a worker its next task with `SendMessage` instead of spawning a new one,
+record the hand-off in the same breath as the message, and run it **before**
+you send the message:
 
 ```bash
 giverny-manage start <next task> --agent <worker's agent id>
 ```
+
+`start --agent` refuses a worker over the limit, naming its context: spawn a
+fresh worker then. Pass `--heavy-ok` only when the task truly needs what that
+worker has in its context and a brief cannot carry it.
 
 That lands the worker's earlier task now, with its own measured time, and
 starts the new one with its own clock; the pane shows each task as its own row,
@@ -199,7 +215,8 @@ task: it begins `New task for you: <next task>`, or names the task right after
 a holding phrase (`Next you hold acme#614`, `Your next task is acme#614`, or `a
 review round on #613` for `acme#613-r1`). The manager session and the pane
 then link the row to the worker the message went to, and `start` points out the
-idle worker to pass as `--agent`. A task the message only mentions
+idle worker to pass as `--agent`, with its context, and names any idle worker
+over the limit as one to leave alone. A task the message only mentions
 (`another worker now holds acme#615`) is never linked to it, and a row a
 worker already holds — or that a worker was spawned for — is never moved by a
 message; `start`/`eta --agent` is how to move one. Beginning the message with
