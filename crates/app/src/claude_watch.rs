@@ -18,7 +18,7 @@ use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
-use crate::agents_live::AgentsLive;
+use crate::management_live::ManagementLive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClaudeState {
@@ -273,8 +273,8 @@ pub struct ClaudeWatch {
     late_in_flight: Arc<AtomicFlag>,
     extra_dirs: Vec<PathBuf>,
     /// Each tab's subagents, from relayed `subagentStatusLine` ticks — what
-    /// the agents pane draws. See [`AgentsLive::tracker`].
-    pub agents: AgentsLive,
+    /// the management panel draws. See [`ManagementLive::tracker`].
+    pub agents: ManagementLive,
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
@@ -311,7 +311,7 @@ pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 /// Each account's `settings.json` names one Giverny binary for its hooks,
 /// status lines and plugin, and every Giverny adopts the accounts it finds:
 /// it points those entries at *its own* executable and follows *its own*
-/// `agents_pane` setting. A second Giverny started to test a build — even
+/// `management_panel` setting. A second Giverny started to test a build — even
 /// with a config and runtime dir of its own — therefore re-points the live
 /// instance's sessions at the test binary, or strips the subagent line and
 /// the plugin (and `plugins/known_marketplaces.json`) out from under it.
@@ -559,7 +559,7 @@ impl ClaudeWatch {
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: extra_dirs.to_vec(),
             // Beside the spool: Giverny's own state dir.
-            agents: AgentsLive::load(
+            agents: ManagementLive::load(
                 spool
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
@@ -736,7 +736,7 @@ impl ClaudeWatch {
             }
             return;
         }
-        // `giverny orchestrator-session clear-done`: the tab's Done rows, cleared by hand.
+        // `giverny manage clear-done`: the tab's Done rows, cleared by hand.
         if msg.hook_event() == Some(hooks::CLEAR_DONE_EVENT) {
             if let Some(tab_id) = self.tab_of(msg) {
                 let at = msg.event.get("at_ms").and_then(|v| v.as_u64());
@@ -1441,7 +1441,7 @@ impl ClaudeWatch {
         }
     }
 
-    /// Follow the `claude.agents_pane` setting in every account: on installs
+    /// Follow the `claude.management_panel` setting in every account: on installs
     /// `subagentStatusLine` (`giverny relay --subagent-line`), which feeds the
     /// pane and hides Claude Code's own subagent panel; off removes it, and
     /// Claude Code draws its panel natively again. Called at startup too, so
@@ -1455,15 +1455,15 @@ impl ClaudeWatch {
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
     /// keys go and so does the directory. `skill` is
-    /// `agents_panel.orchestrate_skill`: off, the plugin is written without
-    /// its orchestrate skill.
+    /// `management_panel.manage_skill`: off, the plugin is written without
+    /// its manage skill.
     ///
     /// The setting is on by default, so it is not consent by itself: the
     /// keys are written only into an account that already holds our hooks
     /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
     /// it is for the live-usage statusline. Every other account is left
     /// byte-identical. Off removes only what is ours, wherever it is.
-    pub fn set_agents_pane(&mut self, enable: bool, skill: bool, base: &Path) {
+    pub fn set_management_panel(&mut self, enable: bool, skill: bool, base: &Path) {
         if self.leave_accounts {
             return;
         }
@@ -1760,7 +1760,7 @@ impl ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
             cache_dirty: Arc::new(AtomicBool::new(false)),
-            agents: AgentsLive::in_memory(),
+            agents: ManagementLive::in_memory(),
             leave_accounts: false,
         }
     }
@@ -2008,11 +2008,7 @@ mod tests {
         let mut placeholder = bg_job("f68bc6cd", "f68bc6cd", "f68bc6cd-7c66");
         placeholder.untouched = true;
         placeholder.forked_from = Some("f705f9e7-19c5".into());
-        let mut real = bg_job(
-            "34c55b2c",
-            "Open bugs in panel/orchestrator",
-            "34c55b2c-d6db",
-        );
+        let mut real = bg_job("34c55b2c", "Open bugs in panel/manager", "34c55b2c-d6db");
         real.resume_session_id = Some("1ec991d3-fec9".into());
         let jobs = vec![
             placeholder,
@@ -2028,7 +2024,7 @@ mod tests {
             "event":{"hook_event_name":"UserPromptSubmit","session_id":"f68bc6cd-7c66"}}"#);
 
         let titles: HashMap<TabId, String> =
-            [(TAB, "◐ Open bugs in panel/orchestrator".to_string())].into();
+            [(TAB, "◐ Open bugs in panel/manager".to_string())].into();
         w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
         assert_eq!(
             background(&w),
@@ -2091,7 +2087,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         let jobs = vec![
             bg_job("6e7e56e0", "count rust lines giverny#243", "s-6e"),
-            bg_job("34c55b2c", "Open bugs in panel/orchestrator", "s-34"),
+            bg_job("34c55b2c", "Open bugs in panel/manager", "s-34"),
         ];
         let titles: HashMap<TabId, String> = [(TAB, "~/giverny".to_string())].into();
         let none = HashMap::new();
@@ -2154,7 +2150,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         let jobs = vec![
             bg_job("6e7e56e0", "count rust lines giverny#243", "s-6e"),
-            bg_job("34c55b2c", "Open bugs in panel/orchestrator", "s-34"),
+            bg_job("34c55b2c", "Open bugs in panel/manager", "s-34"),
         ];
         let titles: HashMap<TabId, String> = [(TAB, "~".to_string())].into();
         let opened: HashMap<TabId, String> = [(TAB, "6e7e56e0".to_string())].into();
@@ -2194,8 +2190,8 @@ mod tests {
             untouched: false,
         };
         let jobs = [
-            job("970bf052", "Open bugs in panel/orchestrator (2)", true),
-            job("34c55b2c", "Open bugs in panel/orchestrator", true),
+            job("970bf052", "Open bugs in panel/manager (2)", true),
+            job("34c55b2c", "Open bugs in panel/manager", true),
             job("29ab7872", "Winversion", false),
         ];
         let parked: HashMap<TabId, String> = [(TAB, "970bf052".to_string())].into();
@@ -2209,11 +2205,11 @@ mod tests {
             v
         };
         assert_eq!(
-            on("◐ Open bugs in panel/orchestrator"),
+            on("◐ Open bugs in panel/manager"),
             [("34c55b2c".into(), TAB)]
         );
         assert_eq!(
-            on("✳ Open bugs in panel/orchestrator (2)"),
+            on("✳ Open bugs in panel/manager (2)"),
             [("970bf052".into(), TAB)]
         );
         assert_eq!(
@@ -3031,8 +3027,8 @@ mod tests {
         assert!(w.set_statusline(false).is_err());
         w.set_auto_mode(true);
         w.ensure_auto_mode();
-        w.set_agents_pane(true, true, &base);
-        w.set_agents_pane(false, true, &base);
+        w.set_management_panel(true, true, &base);
+        w.set_management_panel(false, true, &base);
         let after = (
             std::fs::read(&settings).unwrap(),
             std::fs::read(&known).unwrap(),
@@ -3042,7 +3038,7 @@ mod tests {
 
         // The installed instance, same calls: the account does change.
         w.leave_accounts = false;
-        w.set_agents_pane(false, true, &base);
+        w.set_management_panel(false, true, &base);
         w.set_auto_mode(true);
         assert_ne!(std::fs::read(&settings).unwrap(), before.0);
 
@@ -3081,7 +3077,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         w.profiles = vec![plain.clone(), hooked.clone()];
         w.leave_accounts = false;
-        w.set_agents_pane(true, true, &base);
+        w.set_management_panel(true, true, &base);
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(
             !plain.config_dir.join("settings.json.giverny-bak").exists(),
@@ -3095,15 +3091,15 @@ mod tests {
 
         // The skill off: only the skill goes; the plugin and the pane's
         // keys stay, and the plain account is still untouched.
-        w.set_agents_pane(true, false, &base);
+        w.set_management_panel(true, false, &base);
         assert!(!skill.exists());
         assert!(giverny_claude::plugin::installed_in(&hooked_settings));
         assert!(hooks::subagent_line_installed_in(&hooked_settings));
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
-        w.set_agents_pane(true, true, &base);
+        w.set_management_panel(true, true, &base);
         assert!(skill.exists());
 
-        w.set_agents_pane(false, true, &base);
+        w.set_management_panel(false, true, &base);
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(!hooks::subagent_line_installed_in(&hooked_settings));
         assert!(!giverny_claude::plugin::installed_in(&hooked_settings));

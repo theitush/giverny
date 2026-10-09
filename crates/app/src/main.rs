@@ -1,8 +1,6 @@
 //! Giverny — a native terminal built around Claude Code.
 
 mod agent_open;
-mod agents_live;
-mod agents_pane;
 mod capture;
 mod chrome;
 mod claude_watch;
@@ -10,6 +8,8 @@ mod desktop;
 mod hover_open;
 mod icon;
 mod keymap;
+mod management_live;
+mod management_panel;
 mod oom;
 mod overlays;
 mod prompt_bar;
@@ -459,10 +459,10 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      giverny update     check for a newer release\n  \
      giverny transcript [--follow] <agent jsonl>\n                     \
      print a worker's transcript, readable (and follow it)\n  \
-     giverny orchestrator-session plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
-     write the agents pane's feed (see `giverny orchestrator-session --help`)\n  \
+     giverny manage plan|start|eta|land|pause|resume|drop|show|clear-done ...\n                     \
+     write the management panel's feed (see `giverny manage --help`)\n  \
      giverny eta <agent-id> <minutes left>\n                     \
-     give a subagent's ETA to the agents pane\n  \
+     give a subagent's ETA to the management panel\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
@@ -487,9 +487,9 @@ fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
 }
 
 fn main() -> eframe::Result {
-    // The agents pane's feed writer: what the `giverny` plugin's orchestrate
-    // skill runs (as `giverny-orchestrator-session`) to plan, start,
-    // re-estimate and land an orchestrator session's tasks. It runs inside Claude Code and reads the session id Claude
+    // The management panel's feed writer: what the `giverny` plugin's manage
+    // skill runs (as `giverny-manage`) to plan, start,
+    // re-estimate and land a manager session's tasks. It runs inside Claude Code and reads the session id Claude
     // exported, so it goes before the markers are scrubbed.
     // Any subagent's ETA, and the plugin's hook: inside Claude Code too.
     match std::env::args().nth(1).as_deref() {
@@ -497,17 +497,12 @@ fn main() -> eframe::Result {
             let args: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(giverny_claude::agent_eta::main(&args));
         }
-        Some("hook") => std::process::exit(giverny_claude::plugin_hook::main(true)),
+        Some("hook") => std::process::exit(giverny_claude::plugin_hook::main()),
         _ => {}
     }
-    // `pass` is its name from before it was an orchestrator session, kept
-    // for the plugins and skills a running Giverny wrote with it.
-    if matches!(
-        std::env::args().nth(1).as_deref(),
-        Some("orchestrator-session" | "pass")
-    ) {
+    if std::env::args().nth(1).as_deref() == Some("manage") {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(giverny_claude::orchestrator_session::main(
+        std::process::exit(giverny_claude::manage::main(
             &args,
             &Paths::default_dirs().hook_spool(),
         ));
@@ -525,7 +520,10 @@ fn main() -> eframe::Result {
             if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
             {
                 let cfg = config::load(paths.base());
-                giverny_claude::hooks::run_subagent_line(&paths.hook_spool(), agents_pane_on(&cfg));
+                giverny_claude::hooks::run_subagent_line(
+                    &paths.hook_spool(),
+                    management_panel_on(&cfg),
+                );
             } else {
                 giverny_claude::hooks::run_relay(&paths.hook_spool());
             }
@@ -553,7 +551,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         // A worker's transcript, readable and live: what a Running or Done
-        // row of the agents pane opens.
+        // row of the management panel opens.
         Some("transcript") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             let follow = args.iter().any(|a| a == "--follow" || a == "-f");
@@ -595,7 +593,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         // A word this build does not know: most likely a subcommand added
-        // since it was built (`giverny orchestrator-session …` run on an older binary). It
+        // since it was built (`giverny manage …` run on an older binary). It
         // must not fall through to opening a window, which would also set up
         // the Claude accounts from this binary.
         Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
@@ -840,13 +838,13 @@ pub enum Action {
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
     ToggleRepoCollapse(PathBuf),
-    /// A row of the agents pane was clicked: Running and Done open the
+    /// A row of the management panel was clicked: Running and Done open the
     /// worker, Planned shows its brief (`agent_open`).
-    AgentRowClicked(TabId, Box<agents_pane::RowClick>),
+    AgentRowClicked(TabId, Box<management_panel::RowClick>),
     /// The worker overlay's Open in Claude Code: attach the
     /// row's running worker in its parent tab.
-    OpenWorkerInClaude(TabId, Box<agents_pane::RowClick>),
-    /// Esc, or the terminal's "back to orchestrator" button, in a tab
+    OpenWorkerInClaude(TabId, Box<management_panel::RowClick>),
+    /// Esc, or the terminal's "back to manager" button, in a tab
     /// showing a worker's view: walk its Claude Code back to the main view.
     BackToMain(TabId),
 }
@@ -1105,38 +1103,38 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
-    /// Each tab's agents pane view state (`claude.agents_pane`); the rows
+    /// Each tab's management panel view state (`claude.management_panel`); the rows
     /// are `claude.agents`'.
-    pub agent_views: agents_pane::Views,
+    pub agent_views: management_panel::Views,
     /// Which use reading each tab's figures are drawn from, and this
     /// frame's for the active tab: the one its status line shows
     /// (`sessions_load::for_tab`), so the line, the pane and the sidebar
     /// agree.
     use_follow: sessions_load::Follow,
     pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
-    /// The overlay an agents-pane row opens: a brief, or a worker's
+    /// The overlay a management-panel row opens: a brief, or a worker's
     /// transcript (`overlays::BriefOverlay`).
     pub brief: Option<overlays::BriefOverlay>,
     /// The tab and row that opened `brief`, when a row did: a second click
     /// on that row closes it.
-    brief_row: Option<(TabId, agents_pane::RowClick)>,
+    brief_row: Option<(TabId, management_panel::RowClick)>,
     /// The terminal session's rect last frame: where that overlay goes.
     pub session_rect: Option<egui::Rect>,
     /// Tabs opened for a worker (a Done row's follower, a row's open
     /// command): painted on the worker background, like a subagent view.
     worker_tabs: HashSet<TabId>,
-    /// A Running agents-pane row being attached: keys typed into its parent
+    /// A Running management-panel row being attached: keys typed into its parent
     /// tab's Claude Code, one per frame, to open the worker's view.
     attach: Option<AttachJob>,
     /// Tabs whose relay is asked to leave Claude Code's agent strip drawn
     /// (`hooks::show_strip`), and when the ask was last written: the
-    /// strip is the keyboard path into a worker's view, which the agents
-    /// pane otherwise hides.
+    /// strip is the keyboard path into a worker's view, which the management
+    /// panel otherwise hides.
     strip_asks: HashMap<TabId, Instant>,
-    /// The pointer over the active tab's agents pane, as the pane saw it
+    /// The pointer over the active tab's management panel, as the pane saw it
     /// last frame (`Views::take_hover`), and the watch deciding when a
     /// rest on a Running row starts its open early.
-    hover: Option<(TabId, Option<agents_pane::RowClick>)>,
+    hover: Option<(TabId, Option<management_panel::RowClick>)>,
     hover_watch: Option<(TabId, hover_open::Watch)>,
     /// Since when the active tab's screen has held still.
     screen_still: Option<(TabId, hover_open::Still)>,
@@ -1236,7 +1234,7 @@ const STRIP_ASK_RENEW: Duration = Duration::from_secs(30);
 
 /// The terminal's back button, longest first: the first that
 /// fits the blank cells where the strip's `main` was is drawn.
-const BACK_LABELS: &[&str] = &["↺ back to orchestrator", "↺ orchestrator", "↺ back"];
+const BACK_LABELS: &[&str] = &["↺ back to manager", "↺ manager", "↺ back"];
 
 /// Automated per-tab injections. All stand down once the user has typed.
 #[derive(Debug, Clone)]
@@ -1271,16 +1269,16 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
-/// Is the agents pane on? Read by its settings key rather than a struct
+/// Is the management panel on? Read by its settings key rather than a struct
 /// field, so the relay and the installer follow whatever the settings table
 /// declares — and read as off in a build that does not declare it.
-fn agents_pane_on(cfg: &config::Config) -> bool {
-    bool_setting(cfg, "claude.agents_pane")
+fn management_panel_on(cfg: &config::Config) -> bool {
+    bool_setting(cfg, "claude.management_panel")
 }
 
-/// Does the agents pane's plugin carry the orchestrate skill?
-fn orchestrate_skill_on(cfg: &config::Config) -> bool {
-    cfg.agents_panel.orchestrate_skill
+/// Does the management panel's plugin carry the manage skill?
+fn manage_skill_on(cfg: &config::Config) -> bool {
+    cfg.management_panel.manage_skill
 }
 
 /// Can account setup follow this config? Not when a value it reads — the
@@ -1290,11 +1288,11 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
 }
 
 /// Bring every account in line with the config at startup: auto mode, and
-/// the agents pane's subagent line and plugin.
+/// the management panel's subagent line and plugin.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and following those would rewrite accounts against
-/// what the user configured: turn the agents pane's subagent line and plugin
+/// what the user configured: turn the management panel's subagent line and plugin
 /// on where they were turned off, or (in a build whose default is off) strip
 /// them from every account. Once the file parses again, the hot reload
 /// applies what it says.
@@ -1313,7 +1311,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
-    claude.set_agents_pane(agents_pane_on(cfg), orchestrate_skill_on(cfg), base);
+    claude.set_management_panel(management_panel_on(cfg), manage_skill_on(cfg), base);
 }
 
 fn bool_setting(cfg: &config::Config, key: &str) -> bool {
@@ -1615,7 +1613,7 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
-        // What Giverny runs, read once for the sidebar, the agents pane and
+        // What Giverny runs, read once for the sidebar, the management panel and
         // every tab's status line.
         sessions_load::start(&cc.egui_ctx);
         giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
@@ -1771,7 +1769,7 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
-            agent_views: agents_pane::Views::default(),
+            agent_views: management_panel::Views::default(),
             use_follow: sessions_load::Follow::default(),
             use_now: None,
             brief: None,
@@ -2013,10 +2011,10 @@ impl App {
                     Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
                     Err(e) => tracing::error!("hook install: {e}"),
                 }
-                // The hooks are the consent the agents pane's keys wait for.
-                self.claude.set_agents_pane(
-                    agents_pane_on(&self.cfg),
-                    orchestrate_skill_on(&self.cfg),
+                // The hooks are the consent the management panel's keys wait for.
+                self.claude.set_management_panel(
+                    management_panel_on(&self.cfg),
+                    manage_skill_on(&self.cfg),
                     self.paths.base(),
                 );
             }
@@ -2923,12 +2921,12 @@ impl App {
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
         }
-        if agents_pane_on(&cfg) != agents_pane_on(&self.cfg)
-            || orchestrate_skill_on(&cfg) != orchestrate_skill_on(&self.cfg)
+        if management_panel_on(&cfg) != management_panel_on(&self.cfg)
+            || manage_skill_on(&cfg) != manage_skill_on(&self.cfg)
         {
-            self.claude.set_agents_pane(
-                agents_pane_on(&cfg),
-                orchestrate_skill_on(&cfg),
+            self.claude.set_management_panel(
+                management_panel_on(&cfg),
+                manage_skill_on(&cfg),
                 self.paths.base(),
             );
         }
@@ -3392,8 +3390,8 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
-        // Where an orchestrator in this tab writes its agents-pane feed
-        // (`docs/agents-pane.md`) — the directory this app reads.
+        // Where a manager in this tab writes its management-panel feed
+        // (`docs/management-panel.md`) — the directory this app reads.
         env.push((
             giverny_claude::feed::DIR_ENV.into(),
             giverny_claude::feed::feed_dir().display().to_string(),
@@ -3492,16 +3490,16 @@ impl App {
         }
     }
 
-    /// A click on an agents-pane row of tab `parent`: the worker overlay
+    /// A click on a management-panel row of tab `parent`: the worker overlay
     /// (Running live, Done at its end), or a Planned row's brief.
     fn open_agent_row(
         &mut self,
         ctx: &egui::Context,
         parent: TabId,
-        click: &agents_pane::RowClick,
+        click: &management_panel::RowClick,
     ) {
         // The row the tab already shows, clicked again, is the way back to
-        // the orchestrator.
+        // the manager.
         let overlay = self
             .brief
             .as_ref()
@@ -3509,17 +3507,17 @@ impl App {
             .filter(|(tab, _)| *tab == parent)
             .map(|(_, row)| row);
         let viewed = self.viewed_worker(parent);
-        let toggle = agents_pane::toggle(click, viewed.as_deref(), overlay);
-        tracing::info!("agents pane: row {} clicked: {toggle:?}", click.name);
+        let toggle = management_panel::toggle(click, viewed.as_deref(), overlay);
+        tracing::info!("management panel: row {} clicked: {toggle:?}", click.name);
         match toggle {
-            agents_pane::Toggle::Open => {}
-            agents_pane::Toggle::Close => {
+            management_panel::Toggle::Open => {}
+            management_panel::Toggle::Close => {
                 self.brief = None;
                 self.brief_row = None;
                 self.focus_terminal = true;
                 return;
             }
-            agents_pane::Toggle::Home => {
+            management_panel::Toggle::Home => {
                 self.walk_home(ctx, parent);
                 return;
             }
@@ -3550,7 +3548,7 @@ impl App {
         let plan = agent_open::plan(click);
         let button = self.overlay_button(parent, click);
         // A Done row's task may have landed in Review: the line its
-        // orchestrator wrote (`land --review`) goes at the top of the overlay.
+        // manager wrote (`land --review`) goes at the top of the overlay.
         let review = overlays::review_line(click.stage, click.review.as_deref());
         self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
         if self.brief.is_some() {
@@ -3639,7 +3637,7 @@ impl App {
         &self,
         parent: TabId,
         agent_id: &str,
-        click: &agents_pane::RowClick,
+        click: &management_panel::RowClick,
     ) -> Option<String> {
         self.claude
             .agents
@@ -3654,7 +3652,11 @@ impl App {
     }
 
     /// The worker overlay's footer for this row.
-    fn overlay_button(&self, parent: TabId, click: &agents_pane::RowClick) -> overlays::Button {
+    fn overlay_button(
+        &self,
+        parent: TabId,
+        click: &management_panel::RowClick,
+    ) -> overlays::Button {
         use overlays::Button;
         let no_tab = "This tab has no live terminal to type into.";
         match agent_open::offer(click) {
@@ -3677,7 +3679,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         parent: TabId,
-        click: &agents_pane::RowClick,
+        click: &management_panel::RowClick,
     ) {
         let title = agent_open::title_of(click);
         let Some(agent_id) = click.agent_id.clone() else {
@@ -3706,20 +3708,20 @@ impl App {
         parent: TabId,
         title: &str,
         agent_id: &str,
-        click: &agents_pane::RowClick,
+        click: &management_panel::RowClick,
     ) -> bool {
         if !self.tab_is_live(parent) {
             return false;
         }
         // The Agent call's description is what Claude Code's list shows.
         let Some(description) = self.worker_description(parent, agent_id, click) else {
-            tracing::info!("agents pane: no description for {agent_id}");
+            tracing::info!("management panel: no description for {agent_id}");
             return false;
         };
         // What the strip may call the worker when its rows are not tagged
         // with ids (an older relay): the found row is checked against the
-        // view's prompt rule, which names the description. With the agents
-        // pane on, the relay tags each row with its agent id while the
+        // view's prompt rule, which names the description. With the management
+        // panel on, the relay tags each row with its agent id while the
         // walk asks for the strip, and the id finds it.
         let aliases: Vec<String> = self
             .claude
@@ -3766,7 +3768,7 @@ impl App {
         // Asked now, not next frame: every frame of the relay's tick counts.
         self.sync_strip_asks();
         // And nudged now, for the same reason.
-        if self.cfg.claude.agents_pane
+        if self.cfg.claude.management_panel
             && let Some(job) = &mut self.attach
             && let Some(session) = self.rt.get(&parent).and_then(|rt| rt.session.as_ref())
             && job.nudge.tick(Instant::now(), true) == Some(agent_open::Width::Narrow)
@@ -3779,7 +3781,7 @@ impl App {
     }
 
     /// Esc or the back button in a tab on a worker's view:
-    /// walk it back to the orchestrator's view. A walk already under way
+    /// walk it back to the manager's view. A walk already under way
     /// finishes first.
     fn back_to_main(&mut self, ctx: &egui::Context, tab: TabId) {
         if self.attach.is_some() || !self.tab_is_live(tab) {
@@ -3787,7 +3789,7 @@ impl App {
         }
         self.attach = Some(AttachJob::new(
             tab,
-            "Back to the orchestrator".into(),
+            "Back to the manager".into(),
             agent_open::Walk::home(Instant::now()),
         ));
         ctx.request_repaint();
@@ -3795,12 +3797,12 @@ impl App {
 
     /// Keep the relay's asks to show Claude Code's agent strip
     /// in step with what needs it: a walk on its way into a worker's view,
-    /// until it is done. Everything else leaves the strip to the agents
-    /// pane — a Running worker opens straight into its view,
+    /// until it is done. Everything else leaves the strip to the management
+    /// panel — a Running worker opens straight into its view,
     /// and the walk brings the relay's run forward itself (`Nudge`).
     fn sync_strip_asks(&mut self) {
         let mut want: HashSet<TabId> = HashSet::new();
-        if !self.cfg.claude.agents_pane {
+        if !self.cfg.claude.management_panel {
             // The relay hides nothing: there is nothing to ask for.
         } else {
             if let Some(job) = &self.attach
@@ -3826,7 +3828,9 @@ impl App {
                     Ok(()) => {
                         self.strip_asks.insert(tab, now);
                     }
-                    Err(err) => tracing::warn!("agents pane: could not ask for the strip: {err}"),
+                    Err(err) => {
+                        tracing::warn!("management panel: could not ask for the strip: {err}")
+                    }
                 }
             }
         }
@@ -3839,7 +3843,7 @@ impl App {
         for tab in done {
             self.strip_asks.remove(&tab);
             if let Err(err) = giverny_claude::hooks::show_strip(&spool, &tab_env_id(tab), false) {
-                tracing::warn!("agents pane: could not hide the strip again: {err}");
+                tracing::warn!("management panel: could not hide the strip again: {err}");
             }
         }
     }
@@ -3849,7 +3853,7 @@ impl App {
     /// tab's picture is let go.
     fn process_attach(&mut self, ctx: &egui::Context) {
         use agent_open::Tick;
-        let pane_on = self.cfg.claude.agents_pane;
+        let pane_on = self.cfg.claude.management_panel;
         let Some(job) = &mut self.attach else {
             return;
         };
@@ -3934,13 +3938,13 @@ impl App {
                     }
                 }
                 Tick::Stuck(why) => {
-                    tracing::info!("agents pane: walk stopped: {why:?}");
+                    tracing::info!("management panel: walk stopped: {why:?}");
                     if job.nudge.is_narrow() {
                         session.nudge_width(false);
                     }
                     let text = match job.driver.goal {
                         agent_open::Goal::Main => format!(
-                            "Giverny could not walk this tab back to the orchestrator's view \
+                            "Giverny could not walk this tab back to the manager's view \
                              ({why:?}). Press ↓ at the prompt until the agent list under it is \
                              selected, then Enter on `main`."
                         ),
@@ -3961,7 +3965,7 @@ impl App {
         if finished {
             let tab = job.tab;
             tracing::info!(
-                "agents pane: walk to {} shown after {:?}",
+                "management panel: walk to {} shown after {:?}",
                 job.driver.target(),
                 job.started.elapsed()
             );
@@ -3991,8 +3995,10 @@ impl App {
         // Debug builds: `GIVERNY_NO_HOVER_OPEN=1` turns it off, for timing
         // the click alone.
         let off = cfg!(debug_assertions) && std::env::var_os("GIVERNY_NO_HOVER_OPEN").is_some();
-        let free =
-            !off && self.cfg.claude.agents_pane && self.attach.is_none() && self.brief.is_none();
+        let free = !off
+            && self.cfg.claude.management_panel
+            && self.attach.is_none()
+            && self.brief.is_none();
         let on_pane = hover
             .as_ref()
             .filter(|(tab, _)| Some(*tab) == active && self.tab_is_live(*tab))
@@ -4020,7 +4026,7 @@ impl App {
         // frame, pointer or not, so a rest on a row can arm at once. A walk
         // or a pre-arm changes the screen itself; the count starts after.
         let tracked = active.filter(|_| {
-            self.cfg.claude.agents_pane && self.attach.is_none() && self.prearm.is_none()
+            self.cfg.claude.management_panel && self.attach.is_none() && self.prearm.is_none()
         });
         let session = tracked.and_then(|t| self.rt.get(&t)?.session.as_ref());
         let (Some(tab), Some(session)) = (tracked, session) else {
@@ -4077,7 +4083,7 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
         row_id: Option<String>,
-        on_pane: Option<(TabId, Option<agents_pane::RowClick>)>,
+        on_pane: Option<(TabId, Option<management_panel::RowClick>)>,
     ) {
         let Some(pre) = &mut self.prearm else {
             return;
@@ -4134,7 +4140,7 @@ impl App {
     }
 
     /// Debug builds only: `GIVERNY_DEBUG_CLICK=<row key>[:button]` clicks
-    /// the active tab's agents-pane row with that key a few seconds in, and
+    /// the active tab's management-panel row with that key a few seconds in, and
     /// with `:button` presses the overlay's footer button a few seconds
     /// later — the path after a pointer click, driven in-process, so it can
     /// be watched with `GIVERNY_CAPTURE` without synthetic input events.
@@ -4170,7 +4176,7 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let table = agents_pane::build(feed.as_ref(), tracker.rows(), now);
+            let table = management_panel::build(feed.as_ref(), tracker.rows(), now);
             match table.lines.into_iter().find(|l| l.id == key) {
                 Some(line) => {
                     tracing::info!("debug click: {key} ({:?})", line.stage);
@@ -4199,7 +4205,7 @@ impl App {
     /// input it stands for, in-process, so a real window can be
     /// driven and watched without synthetic input events:
     ///
-    /// * `click <row>` — select the tab whose agents pane has the row (its
+    /// * `click <row>` — select the tab whose management panel has the row (its
     ///   id, worker id, name or key) and click it;
     /// * `open` — the overlay's Open in Claude Code;
     /// * `esc` — an Esc key press, into the terminal as typed;
@@ -4209,11 +4215,11 @@ impl App {
     /// * `key <enter|up|down>` — that key press, as typed;
     /// * `dump <file>` — the active tab's screen text into the file;
     /// * `drag <row> <col> <row> <col>` — a pointer drag over the active
-    ///   tab's agents pane, cell to cell; the same cell twice
+    ///   tab's management panel, cell to cell; the same cell twice
     ///   is a click;
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
     /// * `settings <section>` — the settings screen, on that section (its
-    ///   rail title, `agents panel`); `settings` alone closes it;
+    ///   rail title, `management panel`); `settings` alone closes it;
     /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
     ///   closing the active tab, closing the window.
     #[cfg(debug_assertions)]
@@ -4246,7 +4252,7 @@ impl App {
                     let tabs: Vec<TabId> = self.ws.tabs.iter().map(|t| t.id).collect();
                     let hit = tabs.into_iter().find_map(|tab| {
                         let tracker = self.claude.agents.tracker(tab)?;
-                        let table = agents_pane::build(None, tracker.rows(), now);
+                        let table = management_panel::build(None, tracker.rows(), now);
                         let row = table.lines.into_iter().find(|l| {
                             l.id == arg
                                 || l.click.agent_id.as_deref() == Some(arg)
@@ -4311,7 +4317,7 @@ impl App {
                         None => tracing::warn!("debug cmd: no back button on screen"),
                     }
                 }
-                // `hover <row>`: the pointer onto that agents-pane row (its
+                // `hover <row>`: the pointer onto that management-panel row (its
                 // feed key, agent id or name) and left there; `press <row>`
                 // clicks it there; `unhover` moves it onto the terminal.
                 "hover" | "press" | "unhover" => {
@@ -4470,7 +4476,7 @@ impl App {
         }
     }
 
-    /// Carry out an agents-pane plan: the overlay, or (a Running row with
+    /// Carry out a management-panel plan: the overlay, or (a Running row with
     /// only an `open` command) a new tab.
     fn carry_out_open(
         &mut self,
@@ -5020,10 +5026,10 @@ impl eframe::App for App {
             let header_id = header_label
                 .as_deref()
                 .and_then(|l| self.worker_id(active, l));
-            // The agents pane takes the bottom of the terminal's area.
+            // The management panel takes the bottom of the terminal's area.
             let mut header = None;
-            if self.cfg.claude.agents_pane {
-                let (click, line) = agents_pane::show(
+            if self.cfg.claude.management_panel {
+                let (click, line) = management_panel::show(
                     &mut self.agent_views,
                     active,
                     self.use_now.as_deref(),
@@ -5031,13 +5037,13 @@ impl eframe::App for App {
                     self.claude.agents.shown(active),
                     viewed.as_deref(),
                     header_id.as_deref(),
-                    agents_pane::limit_for(
+                    management_panel::limit_for(
                         &self.claude,
                         active,
                         self.limited.get(&active).map(|w| w.reopens),
                         jiff::Timestamp::now(),
                     ),
-                    &self.cfg.agents_panel,
+                    &self.cfg.management_panel,
                     &self.chrome,
                     &mut self.shared,
                     ui,
@@ -5050,13 +5056,13 @@ impl eframe::App for App {
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
-                // With the agents pane on, Giverny stands in for Claude
+                // With the management panel on, Giverny stands in for Claude
                 // Code's strip: its `main` row is not drawn, and a worker's
                 // view gets a way back.
                 rt.view.marks_for = self
                     .cfg
                     .claude
-                    .agents_pane
+                    .management_panel
                     .then_some(agent_open::row_marks as fn(&str) -> _);
                 rt.view.button_labels = BACK_LABELS;
                 rt.view.button_fill = self.chrome.accent;
@@ -5667,15 +5673,17 @@ mod tests {
     fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
         let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
         assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
-        assert!(accounts_readable(&parse("[claude]\nagents_pane = false\n")));
+        assert!(accounts_readable(&parse(
+            "[claude]\nmanagement_panel = false\n"
+        )));
         assert!(!accounts_readable(&parse(
-            "[claude]\nagents_pane = \"no\"\n"
+            "[claude]\nmanagement_panel = \"no\"\n"
         )));
         assert!(!accounts_readable(&parse("claude = 5\n")));
     }
 
     /// A config that cannot be parsed leaves every account as it was — here
-    /// one read as having the agents pane off, which would otherwise strip the
+    /// one read as having the management panel off, which would otherwise strip the
     /// account's `subagentStatusLine` — while a parsed one is followed.
     #[test]
     fn an_unparseable_config_leaves_the_accounts_alone() {
@@ -5699,8 +5707,8 @@ mod tests {
             account_uuid: None,
         }];
         let mut pane_off = config::Config::default();
-        pane_off.claude.agents_pane = false;
-        assert!(!agents_pane_on(&pane_off));
+        pane_off.claude.management_panel = false;
+        assert!(!management_panel_on(&pane_off));
 
         set_up_accounts(&mut watch, &pane_off, false, &base);
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);

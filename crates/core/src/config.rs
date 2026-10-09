@@ -16,21 +16,21 @@ pub struct Config {
     pub usage: UsageConfig,
     pub claude: ClaudeConfig,
     pub update: UpdateConfig,
-    pub orchestrator: OrchestratorConfig,
-    pub agents_panel: AgentsPanelConfig,
+    pub manager: ManagerConfig,
+    pub management_panel: ManagementPanelConfig,
 }
 
-/// `[agents_panel]`: the rest of Settings → Agents panel. The pane's own
-/// switch stays `claude.agents_pane` and the machine's budget
-/// `[orchestrator.limits]`, where they always were. Every default is the
+/// `[management_panel]`: the rest of Settings → Management panel. The pane's own
+/// switch stays `claude.management_panel` and the machine's budget
+/// `[manager.limits]`, where they always were. Every default is the
 /// behaviour from before these keys existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AgentsPanelConfig {
-    /// Ship the `/giverny:orchestrate` skill in the plugin the pane
-    /// installs. Off, the plugin keeps its hook and `giverny-orchestrator-session`; only
+pub struct ManagementPanelConfig {
+    /// Ship the `/giverny:manage` skill in the plugin the pane
+    /// installs. Off, the plugin keeps its hook and `giverny-manage`; only
     /// the skill goes.
-    pub orchestrate_skill: bool,
+    pub manage_skill: bool,
     /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
     /// newest [`Self::done_last`]).
     pub done_rows: String,
@@ -42,10 +42,10 @@ pub struct AgentsPanelConfig {
     pub lease: DefaultLease,
 }
 
-impl Default for AgentsPanelConfig {
+impl Default for ManagementPanelConfig {
     fn default() -> Self {
-        AgentsPanelConfig {
-            orchestrate_skill: true,
+        ManagementPanelConfig {
+            manage_skill: true,
             done_rows: "all".into(),
             done_last: 5,
             columns: PaneColumns::default(),
@@ -54,7 +54,7 @@ impl Default for AgentsPanelConfig {
     }
 }
 
-/// Which Done rows the agents pane shows.
+/// Which Done rows the management panel shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoneRows {
     All,
@@ -63,7 +63,7 @@ pub enum DoneRows {
     Last(usize),
 }
 
-impl AgentsPanelConfig {
+impl ManagementPanelConfig {
     /// `done_rows` and `done_last` as one value; an unknown word shows all.
     pub fn done(&self) -> DoneRows {
         match self.done_rows.trim().to_ascii_lowercase().as_str() {
@@ -74,7 +74,7 @@ impl AgentsPanelConfig {
     }
 }
 
-/// `[agents_panel.columns]`: the pane's columns, every one on by default.
+/// `[management_panel.columns]`: the pane's columns, every one on by default.
 /// A column switched off takes no width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,8 +104,8 @@ impl Default for PaneColumns {
     }
 }
 
-/// `[agents_panel.lease]`: the CPU cores and RAM a task's lease holds when
-/// nothing says otherwise — what `giverny orchestrator-session run` claims for a task that
+/// `[management_panel.lease]`: the CPU cores and RAM a task's lease holds when
+/// nothing says otherwise — what `giverny manage run` claims for a task that
 /// holds none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -124,14 +124,14 @@ impl Default for DefaultLease {
 }
 
 impl DefaultLease {
-    /// `[agents_panel.lease]` from a `config.toml`'s text; the defaults when
+    /// `[management_panel.lease]` from a `config.toml`'s text; the defaults when
     /// the table is absent or does not read (a lease is never refused over
     /// a typo elsewhere, nor over one here: the default stands in).
     pub fn from_config_str(text: &str) -> DefaultLease {
         let Ok(doc) = toml::from_str::<toml::Table>(text) else {
             return DefaultLease::default();
         };
-        doc.get("agents_panel")
+        doc.get("management_panel")
             .and_then(|a| a.get("lease"))
             .and_then(|l| l.clone().try_into::<DefaultLease>().ok())
             .map(|l| DefaultLease {
@@ -149,13 +149,13 @@ impl DefaultLease {
     }
 }
 
-/// `[orchestrator]`: what orchestrator sessions (`/giverny:orchestrate`) on
-/// this machine share. Only the limits so far; `claude.agents_pane`, shown
+/// `[manager]`: what manager sessions (`/giverny:manage`) on
+/// this machine share. Only the limits so far; `claude.management_panel`, shown
 /// beside them in the settings screen, stays under `[claude]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OrchestratorConfig {
-    /// `[orchestrator.limits]`, read by the resource ledger on every claim
+pub struct ManagerConfig {
+    /// `[manager.limits]`, read by the resource ledger on every claim
     /// (`giverny_claude::resources`), so an edit applies to the next one.
     pub limits: crate::limits::Limits,
 }
@@ -174,7 +174,7 @@ pub struct ClaudeConfig {
     pub resume_after_limit: bool,
     /// Show the tab's subagents in a table under the terminal. On by
     /// default.
-    pub agents_pane: bool,
+    pub management_panel: bool,
 }
 
 impl Default for ClaudeConfig {
@@ -183,7 +183,7 @@ impl Default for ClaudeConfig {
             auto_mode: false,
             skip_resume_summary: false,
             resume_after_limit: false,
-            agents_pane: true,
+            management_panel: true,
         }
     }
 }
@@ -791,7 +791,7 @@ mod tests {
     const ONE_BAD_VALUE: &str = "[font]\nsize = \"big\"\nfamily = \"Iosevka\"\n\
         [theme]\nname = \"ink\"\n\
         [behavior]\nscrollback_lines = 500\nnotifications = false\n\
-        [claude]\nagents_pane = false\nauto_mode = true\n";
+        [claude]\nmanagement_panel = false\nauto_mode = true\n";
 
     /// One value of the wrong type costs that value, not the file: every
     /// other key, in its section and in the others, still applies, and the
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(cfg.theme.name, "ink");
         assert_eq!(cfg.behavior.scrollback_lines, 500);
         assert!(!cfg.behavior.notifications);
-        assert!(!cfg.claude.agents_pane);
+        assert!(!cfg.claude.management_panel);
         assert!(cfg.claude.auto_mode);
         let names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, ["font.size"]);
@@ -835,15 +835,15 @@ mod tests {
     #[test]
     fn bad_values_are_found_at_any_depth() {
         let text = "titles = 5\n[font]\nsize = 15.0\n\
-            [orchestrator.limits]\nram = \"lots\"\ncpu_cores = 3\n";
+            [manager.limits]\nram = \"lots\"\ncpu_cores = 3\n";
         let parsed = parse_over(text, &Config::default()).unwrap();
         let mut names: Vec<&str> = parsed.invalid.iter().map(|(k, _)| k.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["orchestrator.limits.ram", "titles"]);
+        assert_eq!(names, ["manager.limits.ram", "titles"]);
         assert_eq!(parsed.config.font.size, 15.0);
         assert_eq!(
-            parsed.config.orchestrator.limits.cpu_cores,
-            crate::limits::Limits::from_config_str("[orchestrator.limits]\ncpu_cores = 3\n")
+            parsed.config.manager.limits.cpu_cores,
+            crate::limits::Limits::from_config_str("[manager.limits]\ncpu_cores = 3\n")
                 .unwrap()
                 .cpu_cores
         );
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!((d.cpu_cores, d.ram), (3, Mem::gb(3)), "today's 3 cpu, 3G");
         assert_eq!(DefaultLease::from_config_str(""), d);
         assert_eq!(DefaultLease::from_config_str("[font]\nsize = 1\n"), d);
-        let set = "[agents_panel.lease]\ncpu_cores = 2\nram = \"1.5G\"\n";
+        let set = "[management_panel.lease]\ncpu_cores = 2\nram = \"1.5G\"\n";
         assert_eq!(
             DefaultLease::from_config_str(set),
             DefaultLease {
@@ -903,13 +903,13 @@ mod tests {
             }
         );
         // A bare number is GiB, as everywhere; one key alone keeps the other.
-        let one = DefaultLease::from_config_str("[agents_panel.lease]\nram = 4\n");
+        let one = DefaultLease::from_config_str("[management_panel.lease]\nram = 4\n");
         assert_eq!((one.cpu_cores, one.ram), (3, Mem::gb(4)));
         // Unreadable: the default, never a refused run.
-        let bad = "[agents_panel.lease]\ncpu_cores = \"lots\"\n";
+        let bad = "[management_panel.lease]\ncpu_cores = \"lots\"\n";
         assert_eq!(DefaultLease::from_config_str(bad), d);
         assert_eq!(
-            DefaultLease::from_config_str("[agents_panel.lease]\ncpu_cores = 0\n").cpu_cores,
+            DefaultLease::from_config_str("[management_panel.lease]\ncpu_cores = 0\n").cpu_cores,
             1
         );
     }
@@ -992,56 +992,53 @@ mod tests {
     #[test]
     fn unknown_keys_keep_the_known_ones() {
         let (cfg, unknown) = parse(
-            "[claude]\nauto_mode = true\nfuture_key = 1\n[orchestrator]\nx = 2\n[font]\nsize = 20.0\n",
+            "[claude]\nauto_mode = true\nfuture_key = 1\n[manager]\nx = 2\n[font]\nsize = 20.0\n",
         )
         .unwrap();
         assert!(cfg.claude.auto_mode);
         assert_eq!(cfg.font.size, 20.0);
-        assert_eq!(unknown, ["claude.future_key", "orchestrator.x"]);
+        assert_eq!(unknown, ["claude.future_key", "manager.x"]);
     }
 
     #[test]
-    fn a_config_with_the_dropped_orchestrate_key_still_loads_whole() {
-        // `claude.orchestrate_by_default` is dropped; a file that
-        // still sets it keeps every other setting, the old key just ignored.
-        let text = "[font]\nsize = 15.0\n[claude]\nauto_mode = true\nagents_pane = false\n\
-                    orchestrate_by_default = true\nresume_after_limit = true\n";
+    fn a_config_with_a_dropped_key_still_loads_whole() {
+        // A key this build no longer has (`claude.retired_switch`): a file
+        // that still sets it keeps every other setting, the old key just ignored.
+        let text = "[font]\nsize = 15.0\n[claude]\nauto_mode = true\nmanagement_panel = false\n\
+                    retired_switch = true\nresume_after_limit = true\n";
         let (cfg, unknown) = parse(text).unwrap();
-        assert_eq!(unknown, ["claude.orchestrate_by_default"]);
+        assert_eq!(unknown, ["claude.retired_switch"]);
         assert_eq!(cfg.font.size, 15.0);
         assert!(cfg.claude.auto_mode);
         assert!(cfg.claude.resume_after_limit);
-        assert!(!cfg.claude.agents_pane, "an explicit off stays off");
+        assert!(!cfg.claude.management_panel, "an explicit off stays off");
         // The same through a live reload, over a running config.
         let dir = scratch("dropped-key");
         std::fs::write(config_path(&dir), text).unwrap();
         let cfg = load_or(&dir, &Config::default());
         assert_eq!(cfg.font.size, 15.0);
-        assert!(!cfg.claude.agents_pane);
+        assert!(!cfg.claude.management_panel);
         let _ = std::fs::remove_dir_all(&dir);
-        // Unset, the agents pane is on.
+        // Unset, the management panel is on.
         let (cfg, _) = parse("[claude]\nauto_mode = true\n").unwrap();
-        assert!(cfg.claude.agents_pane);
-        assert!(Config::default().claude.agents_pane);
+        assert!(cfg.claude.management_panel);
+        assert!(Config::default().claude.management_panel);
     }
 
     #[test]
-    fn orchestrator_limits_mount_in_config_and_match_the_ledger() {
+    fn manager_limits_mount_in_config_and_match_the_ledger() {
         use crate::limits::{Auto, Limits, Mem};
-        let text = "[orchestrator.limits]\ncpu_cores = 6\nram = \"12G\"\ngpus = []\n";
+        let text = "[manager.limits]\ncpu_cores = 6\nram = \"12G\"\ngpus = []\n";
         let (cfg, unknown) = parse(text).unwrap();
         assert!(unknown.is_empty(), "{unknown:?}");
-        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(6));
-        assert_eq!(cfg.orchestrator.limits.ram, Auto::Set(Mem::gb(12)));
-        assert_eq!(cfg.orchestrator.limits.gpus, Auto::Set(vec![]));
+        assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(6));
+        assert_eq!(cfg.manager.limits.ram, Auto::Set(Mem::gb(12)));
+        assert_eq!(cfg.manager.limits.gpus, Auto::Set(vec![]));
         // One parse path: the ledger reads what the Config reads.
-        assert_eq!(
-            Limits::from_config_str(text).unwrap(),
-            cfg.orchestrator.limits
-        );
+        assert_eq!(Limits::from_config_str(text).unwrap(), cfg.manager.limits);
         // Absent: all auto, both ways.
         let (cfg, _) = parse("[font]\nsize = 14.0\n").unwrap();
-        assert_eq!(cfg.orchestrator.limits, Limits::default());
+        assert_eq!(cfg.manager.limits, Limits::default());
     }
 
     #[test]
@@ -1058,13 +1055,13 @@ mod tests {
         // the file still applies.
         std::fs::write(
             config_path(&dir),
-            "[font]\nsize = \"big\"\n[claude]\nauto_mode = true\nagents_pane = false\n",
+            "[font]\nsize = \"big\"\n[claude]\nauto_mode = true\nmanagement_panel = false\n",
         )
         .unwrap();
         let kept = load_or(&dir, &prev);
         assert_eq!(kept.font.size, 31.0);
         assert!(kept.claude.auto_mode);
-        assert!(!kept.claude.agents_pane);
+        assert!(!kept.claude.management_panel);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

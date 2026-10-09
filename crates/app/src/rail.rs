@@ -1513,9 +1513,9 @@ fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim:
     resp.on_hover_text(format!(
         "Everything Giverny runs now: the app and every tab, Claude or not —\n\
          {} Claude Code session{} with all they started (commands, builds,\n\
-         `orchestrator-session run` scopes). CPU as a share of the whole machine, the memory\n\
+         `manage run` scopes). CPU as a share of the whole machine, the memory\n\
          it really uses (shared pages split){gpu}.\n\
-         The agents pane's rows and each session's status line are parts of\n\
+         The management panel's rows and each session's status line are parts of\n\
          this same reading.",
         r.sessions.len(),
         if r.sessions.len() == 1 { "" } else { "s" },

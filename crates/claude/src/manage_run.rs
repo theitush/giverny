@@ -1,4 +1,4 @@
-//! `giverny orchestrator-session run <task> -- <cmd…>`: a worker's heavy command, held to
+//! `giverny manage run <task> -- <cmd…>`: a worker's heavy command, held to
 //! its task's granted lease and measured.
 //!
 //! **The cap.** On Linux with a user systemd the command runs in a scope of
@@ -10,8 +10,8 @@
 //! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease is advisory.
 //!
 //! **The lease.** The task's lease in the ledger ([`resources`]). With none,
-//! `run` claims one itself — the default lease (`[agents_panel.lease]`,
-//! Settings → Agents panel; 3 cores and 3G unless changed there) unless
+//! `run` claims one itself — the default lease (`[management_panel.lease]`,
+//! Settings → Management panel; 3 cores and 3G unless changed there) unless
 //! `--cpu`/`--ram` say —
 //! waits while that is queued (the row waiting, as `eta --why wait`), and
 //! releases it when the command ends. Refused (larger than the limits): the
@@ -23,7 +23,7 @@
 //! its row waiting until it has it.
 //!
 //! **Heartbeat.** Leases expire 20 minutes after their session's last
-//! `giverny orchestrator-session` command; while the command runs, `run` beats the
+//! `giverny manage` command; while the command runs, `run` beats the
 //! session's leases every [`HEARTBEAT_EVERY`].
 //!
 //! **Measured.** Peak memory: the scope cgroup's `memory.peak` (read by a
@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use giverny_core::limits::Mem;
 use serde_json::{Map, Value, json};
 
-use crate::orchestrator_session::{self, Flags};
-use crate::{orchestrator_session_history, resources, run_live};
+use crate::manage::{self, Flags};
+use crate::{manage_history, resources, run_live};
 
 /// How often a running command's session leases are beaten (the TTL is 20m).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -60,7 +60,7 @@ const STATS_ENV: &str = "GIVERNY_RUN_STATS";
 /// Runs the command inside its scope, then reads the scope's cgroup while
 /// it still exists. `started` first, so an empty file means the scope never
 /// ran (systemd-run failed) and the command can be run plain instead.
-const SHIM: &str = r#"# giverny orchestrator-session run: run the command in its systemd scope, then
+const SHIM: &str = r#"# giverny manage run: run the command in its systemd scope, then
 # record the scope's peak memory and OOM kills while the scope still exists.
 s="$GIVERNY_RUN_STATS"
 cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
@@ -185,7 +185,7 @@ pub fn scope_args(
     }
     a.push(format!("--unit={unit}"));
     a.push(format!(
-        "--description=giverny orchestrator-session run {}",
+        "--description=giverny manage run {}",
         task.replace('%', "%%")
     ));
     let mut prop = |p: String| {
@@ -257,7 +257,7 @@ pub struct Opts {
     pub ignore_signals: bool,
 }
 
-/// `giverny orchestrator-session run`, from [`orchestrator_session::run_in_code`].
+/// `giverny manage run`, from [`manage::run_in_code`].
 pub fn run(
     dir: &Path,
     ledger: &Path,
@@ -275,7 +275,7 @@ pub fn run(
 }
 
 fn say(task: &str, s: &str) {
-    eprintln!("giverny orchestrator-session run {task}: {s}");
+    eprintln!("giverny manage run {task}: {s}");
 }
 
 /// [`run`] with its knobs.
@@ -308,7 +308,7 @@ pub fn run_with(
     })();
     // Whatever happened, a lease `run` claimed goes back.
     if claimed {
-        let now = orchestrator_session::now_ms();
+        let now = manage::now_ms();
         match resources::release_at(ledger, session, task, now) {
             Ok(_) => resources::annotate_row(dir, session, task, None),
             Err(e) => say(
@@ -318,15 +318,9 @@ pub fn run_with(
         }
     }
     let (m, cap) = held?;
-    let _ = resources::heartbeat(ledger, None, session, orchestrator_session::now_ms());
-    let recorded = orchestrator_session::edit_row(dir, session, task, |row| {
-        record_usage(
-            row,
-            &m,
-            &cap,
-            &flags.command,
-            orchestrator_session::now_ms(),
-        )
+    let _ = resources::heartbeat(ledger, None, session, manage::now_ms());
+    let recorded = manage::edit_row(dir, session, task, |row| {
+        record_usage(row, &m, &cap, &flags.command, manage::now_ms())
     });
     say(task, &summary(&m, &cap));
     if m.oom_kills > 0 {
@@ -334,8 +328,8 @@ pub fn run_with(
         say(
             task,
             &format!(
-                "the {} memory cap killed it (OOM). Ask for more: `giverny orchestrator-session release {task}` \
-                 then `giverny orchestrator-session claim {task} --ram {more}` (or have the orchestrator do it), \
+                "the {} memory cap killed it (OOM). Ask for more: `giverny manage release {task}` \
+                 then `giverny manage claim {task} --ram {more}` (or have the manager do it), \
                  and run it again",
                 Mem(cap.ram_mb)
             ),
@@ -349,7 +343,7 @@ pub fn run_with(
     if !recorded {
         say(
             task,
-            "no row for it in this orchestrator session, so the usage is on no row and will not reach the history",
+            "no row for it in this manager session, so the usage is on no row and will not reach the history",
         );
     }
     Ok((String::new(), m.exit))
@@ -391,7 +385,7 @@ fn lease_for(
     flags: &Flags,
     cap: Option<&resources::Capacity>,
 ) -> Result<Option<(resources::Lease, bool)>, String> {
-    let now = orchestrator_session::now_ms();
+    let now = manage::now_ms();
     if let Some(l) = resources::with_ledger(ledger, now, |l| l.lease(session, task).cloned())? {
         return Ok(Some((l, false)));
     }
@@ -406,7 +400,7 @@ fn lease_for(
     };
     let repo = flags.repo.clone().or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
-        orchestrator_session_history::repo_of(task, &cwd)
+        manage_history::repo_of(task, &cwd)
     });
     let mut waiting = false;
     let mut said = false;
@@ -415,7 +409,7 @@ fn lease_for(
             Some(c) => c.clone(),
             None => resources::Capacity::detect()?,
         };
-        let now = orchestrator_session::now_ms();
+        let now = manage::now_ms();
         let out = resources::with_ledger(ledger, now, |l| {
             l.claim(&capacity, session, task, repo.as_deref(), &req, now)
         })?;
@@ -432,7 +426,7 @@ fn lease_for(
             resources::Outcome::Refused(why) => {
                 say(task, &format!("held no lease and cannot claim one: {why}"));
                 if waiting {
-                    orchestrator_session::mark_waiting(dir, session, task, None, now);
+                    manage::mark_waiting(dir, session, task, None, now);
                 }
                 return Ok(None);
             }
@@ -445,11 +439,11 @@ fn lease_for(
                     said = true;
                 }
                 if !waiting {
-                    waiting = orchestrator_session::mark_waiting(
+                    waiting = manage::mark_waiting(
                         dir,
                         session,
                         task,
-                        Some("giverny orchestrator-session run: queued for a lease"),
+                        Some("giverny manage run: queued for a lease"),
                         now,
                     );
                 }
@@ -458,13 +452,7 @@ fn lease_for(
         };
         if let Some(got) = got {
             if waiting {
-                orchestrator_session::mark_waiting(
-                    dir,
-                    session,
-                    task,
-                    None,
-                    orchestrator_session::now_ms(),
-                );
+                manage::mark_waiting(dir, session, task, None, manage::now_ms());
             }
             return Ok(Some(got));
         }
@@ -557,19 +545,15 @@ fn lock_slots(
             None => {
                 say(
                     task,
-                    &format!(
-                        "slot {s} is held by another `giverny orchestrator-session run`; waiting for it"
-                    ),
+                    &format!("slot {s} is held by another `giverny manage run`; waiting for it"),
                 );
                 if !waiting {
-                    waiting = orchestrator_session::mark_waiting(
+                    waiting = manage::mark_waiting(
                         dir,
                         session,
                         task,
-                        Some(&format!(
-                            "giverny orchestrator-session run: waiting for slot {s}"
-                        )),
-                        orchestrator_session::now_ms(),
+                        Some(&format!("giverny manage run: waiting for slot {s}")),
+                        manage::now_ms(),
                     );
                 }
                 lock_slot(ledger, s, true)?.ok_or("slot lock not taken")?
@@ -578,13 +562,7 @@ fn lock_slots(
         held.push(lock);
     }
     if waiting {
-        orchestrator_session::mark_waiting(
-            dir,
-            session,
-            task,
-            None,
-            orchestrator_session::now_ms(),
-        );
+        manage::mark_waiting(dir, session, task, None, manage::now_ms());
     }
     Ok(held)
 }
@@ -600,10 +578,8 @@ impl Heartbeat {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
-                if let Err(e) =
-                    resources::heartbeat(&ledger, None, &session, orchestrator_session::now_ms())
-                {
-                    eprintln!("giverny orchestrator-session run: heartbeat: {e}");
+                if let Err(e) = resources::heartbeat(&ledger, None, &session, manage::now_ms()) {
+                    eprintln!("giverny manage run: heartbeat: {e}");
                 }
             }
         });
@@ -674,8 +650,8 @@ fn execute(
                 cap.describe()
             ),
         );
-        // Seen by the agents pane while it runs.
-        let live = run_live::register(&stats, task, session, orchestrator_session::now_ms());
+        // Seen by the management panel while it runs.
+        let live = run_live::register(&stats, task, session, manage::now_ms());
         let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals);
         drop(live);
         let st = std::fs::read_to_string(&stats)
@@ -839,7 +815,7 @@ impl Drop for IgnoreSignals {
     }
 }
 
-/// Add one run to the row's `usage` (see `docs/agents-pane.md`, **Row**).
+/// Add one run to the row's `usage` (see `docs/management-panel.md`, **Row**).
 pub fn record_usage(
     row: &mut Map<String, Value>,
     m: &Measured,
@@ -852,7 +828,7 @@ pub fn record_usage(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let get = |u: &Map<String, Value>, k: &str| orchestrator_session::u64_of(u, k).unwrap_or(0);
+    let get = |u: &Map<String, Value>, k: &str| manage::u64_of(u, k).unwrap_or(0);
     let runs = get(&u, "runs") + 1;
     u.insert("runs".into(), json!(runs));
     match m.peak_mb {
@@ -887,7 +863,7 @@ pub fn record_usage(
             u.remove(k);
         }
     }
-    u.insert("last_at".into(), json!(orchestrator_session::stamp(now)));
+    u.insert("last_at".into(), json!(manage::stamp(now)));
     row.insert("usage".into(), Value::Object(u));
 }
 
@@ -895,7 +871,7 @@ pub fn record_usage(
 mod tests {
     use super::*;
     use crate::feed;
-    use crate::orchestrator_session::{Cmd, parse_args, run_in_code};
+    use crate::manage::{Cmd, parse_args, run_in_code};
 
     const MIN: u64 = 60_000;
 
@@ -931,15 +907,7 @@ mod tests {
     fn cmd(dir: &Path, line: &str) -> (String, i32) {
         let a: Vec<String> = line.split_whitespace().map(String::from).collect();
         let (c, f) = parse_args(&a).unwrap();
-        run_in_code(
-            dir,
-            "s1",
-            &c,
-            &f,
-            orchestrator_session::now_ms(),
-            Some(&machine()),
-        )
-        .unwrap()
+        run_in_code(dir, "s1", &c, &f, manage::now_ms(), Some(&machine())).unwrap()
     }
 
     fn plain(every_ms: u64) -> Opts {
@@ -964,7 +932,7 @@ mod tests {
     }
 
     /// `CARGO_BUILD_JOBS` a command sees: the cap's cores, unless this
-    /// test itself runs with it set (as under `giverny orchestrator-session run`).
+    /// test itself runs with it set (as under `giverny manage run`).
     fn jobs(cpu: u32) -> String {
         std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| cpu.to_string())
     }
@@ -1084,7 +1052,7 @@ mod tests {
         assert_eq!((u.runs, u.last_exit), (2, Some(137)));
         // Landing carries the peak into the history.
         cmd(&dir, "land demo#7");
-        let h = orchestrator_session_history::load(&dir.join(orchestrator_session_history::FILE));
+        let h = manage_history::load(&dir.join(manage_history::FILE));
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].peak_mb, u.peak_mb);
         assert!(
@@ -1154,7 +1122,7 @@ mod tests {
     fn a_running_command_keeps_its_lease_alive() {
         let dir = scratch("beat");
         let ledger_path = resources::ledger_path(&dir);
-        let t0 = orchestrator_session::now_ms() - 10 * MIN;
+        let t0 = manage::now_ms() - 10 * MIN;
         resources::with_ledger(&ledger_path, t0, |l| {
             l.claim(
                 &machine(),
@@ -1170,7 +1138,7 @@ mod tests {
         })
         .unwrap();
         // Stamps are whole seconds.
-        let before = orchestrator_session::now_ms() / 1000 * 1000;
+        let before = manage::now_ms() / 1000 * 1000;
         assert_eq!(run(&dir, "t", &[], "sleep 0.5", plain(50)), 0);
         let hb = ledger(&dir).lease("s1", "t").unwrap().heartbeat_at;
         assert!(hb >= before, "beaten while it ran: {hb} < {before}");

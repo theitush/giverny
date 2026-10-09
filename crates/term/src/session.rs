@@ -362,7 +362,7 @@ impl TermSession {
     /// [`Session::screen_text`] with every dim cell blanked: what a program
     /// drew at full strength. A prompt's placeholder is drawn dim, so this is
     /// how "the prompt has a draft in it" is told from "the prompt shows its
-    /// hint" (the agents pane's attach, `agent_open`).
+    /// hint" (the management panel's attach, `agent_open`).
     pub fn screen_text_undimmed(&self) -> String {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line, Point};

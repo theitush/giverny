@@ -1,23 +1,23 @@
-//! The machine ledger: what every orchestrator on this machine holds.
+//! The machine ledger: what every manager on this machine holds.
 //!
-//! Before a worker starts, its orchestrator *claims* what the worker needs
-//! (`giverny orchestrator-session claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
+//! Before a worker starts, its manager *claims* what the worker needs
+//! (`giverny manage claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
 //! is answered *granted*, *granted smaller* (less RAM, down to `--min-ram`)
 //! or *queued* behind whoever holds what it needs. The answer is a
 //! [`Lease`] in one JSON file shared by every session on the machine; it is
-//! the "hello" orchestrators say to each other, and the source of truth when
+//! the "hello" managers say to each other, and the source of truth when
 //! they talk or when a worker's commands are capped to its
 //! grant.
 //!
 //! **The file.** `<feed dir>/resources/ledger.json` (`$GIVERNY_LEDGER`
 //! overrides), every read-modify-write under an exclusive `flock` on the
 //! sibling `ledger.lock`, the write itself atomic (temp name, rename). Its
-//! format is [`Ledger`]; `docs/agents-pane.md` (**Resources**) describes it
+//! format is [`Ledger`]; `docs/management-panel.md` (**Resources**) describes it
 //! for other writers.
 //!
 //! **Liveness.** A lease or a queued request lives [`TTL_MS`] past its
-//! `heartbeat_at`; every `giverny orchestrator-session` command from its session refreshes
-//! it, and every read drops what has expired, so a dead orchestrator frees
+//! `heartbeat_at`; every `giverny manage` command from its session refreshes
+//! it, and every read drops what has expired, so a dead manager frees
 //! what it held without anyone cleaning up.
 //!
 //! **The grant rule** ([`Ledger::try_fit`]): a request fits when
@@ -34,7 +34,7 @@
 //! granted only when it fits in what is left after every request queued
 //! ahead of it is set aside ([`Ledger::with_reserved`]): a small task may
 //! go past a big one that is waiting, never take what the big one waits
-//! for. A queued orchestrator polls by running the same `claim` again,
+//! for. A queued manager polls by running the same `claim` again,
 //! which also keeps its place alive.
 
 use std::path::{Path, PathBuf};
@@ -43,21 +43,21 @@ use giverny_core::limits::{Limits, Load, Machine, Mem, Resolved};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{feed, orchestrator_session};
+use crate::{feed, manage};
 
 /// The ledger format this build reads and writes.
 pub const LEDGER_VERSION: u64 = 1;
 /// A lease or queued request with no heartbeat for this long is gone.
 pub const TTL_MS: u64 = 20 * 60 * 1000;
 /// Heartbeats closer together than this are not written: every `giverny
-/// orchestrator-session` command beats, and the ledger need not be rewritten for each.
+/// manage` command beats, and the ledger need not be rewritten for each.
 pub const BEAT_EVERY_MS: u64 = 30 * 1000;
 /// Overrides where the ledger lives.
 pub const LEDGER_ENV: &str = "GIVERNY_LEDGER";
 /// A granted-smaller RAM figure is rounded down to this (MiB).
 const RAM_STEP_MB: u64 = 256;
 
-/// Exit codes of `giverny orchestrator-session claim`.
+/// Exit codes of `giverny manage claim`.
 pub mod exit {
     pub const GRANTED: i32 = 0;
     pub const ERROR: i32 = 1;
@@ -88,7 +88,7 @@ pub(crate) mod ts {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(ms: &u64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&crate::orchestrator_session::stamp(*ms))
+        s.serialize_str(&crate::manage::stamp(*ms))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -200,13 +200,13 @@ pub struct Capacity {
     /// Which limits were `auto` (for `resources` to say so).
     pub configured: Limits,
     pub load: Load,
-    /// `[agents_panel.lease]`: what a task gets when nothing says otherwise.
+    /// `[management_panel.lease]`: what a task gets when nothing says otherwise.
     pub default_lease: giverny_core::config::DefaultLease,
 }
 
 impl Capacity {
     /// This machine now, under the limits in Giverny's `config.toml`
-    /// (`[orchestrator.limits]`), all `auto` when it has none.
+    /// (`[manager.limits]`), all `auto` when it has none.
     pub fn detect() -> Result<Capacity, String> {
         let machine = Machine::detect();
         let configured = Limits::load()?;
@@ -615,7 +615,7 @@ impl Ledger {
 
     /// Shrink `session`'s lease for `task` in place to the figures given
     /// (`None` keeps that one), when at least one is smaller than held and
-    /// none larger: the orchestrator asked to make room. The
+    /// none larger: the manager asked to make room. The
     /// lease before and after; `None` when there is no such lease or the
     /// figures do not shrink it. A lease is never grown here: what it gives
     /// up may already be granted to another.
@@ -772,7 +772,7 @@ pub fn ask_hint(
         _ => return None,
     };
     Some(format!(
-        "{why}: ask its holder, `giverny orchestrator-session ask {} \"<why you need it now>\"`",
+        "{why}: ask its holder, `giverny manage ask {} \"<why you need it now>\"`",
         first.task
     ))
 }
@@ -836,7 +836,7 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
             "gpus": l.gpus,
             "vram_mb": l.vram_mb,
             "slots": l.slots,
-            "granted_at": orchestrator_session::stamp(l.granted_at),
+            "granted_at": manage::stamp(l.granted_at),
         });
         if state == "smaller" {
             v["wanted_ram_mb"] = json!(req.ram_mb);
@@ -873,7 +873,7 @@ pub struct LedgerLock {
     #[cfg(unix)]
     _file: std::fs::File,
     #[cfg(not(unix))]
-    _lock: orchestrator_session::Lock,
+    _lock: manage::Lock,
 }
 
 impl LedgerLock {
@@ -904,7 +904,7 @@ impl LedgerLock {
         #[cfg(not(unix))]
         {
             Ok(LedgerLock {
-                _lock: orchestrator_session::Lock::take(&path.with_extension("json"))?,
+                _lock: manage::Lock::take(&path.with_extension("json"))?,
             })
         }
     }
@@ -932,7 +932,7 @@ pub fn with_ledger<R>(
     };
     if changed {
         let v = serde_json::to_value(&l).map_err(|e| e.to_string())?;
-        orchestrator_session::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
+        manage::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(out)
 }
@@ -950,7 +950,7 @@ fn landed_tasks(feed_dir: &Path, session: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every `giverny orchestrator-session` command's heartbeat for `session`. Touches nothing
+/// Every `giverny manage` command's heartbeat for `session`. Touches nothing
 /// when there is no ledger yet, and writes only every [`BEAT_EVERY_MS`].
 /// With the feed dir, a lease or queued request of a task whose feed row
 /// has landed is dropped rather than renewed.
@@ -984,7 +984,7 @@ pub fn heartbeat(
         || l.queue.len() != before.queue.len()
     {
         let v = serde_json::to_value(&l).map_err(|e| e.to_string())?;
-        orchestrator_session::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
+        manage::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -1004,13 +1004,13 @@ pub fn release_at(
 }
 
 /// Put `lease` on `session`'s feed row for `task` (or take it off, with
-/// `None`), when the feed is `giverny orchestrator-session`'s own and has that row.
+/// `None`), when the feed is `giverny manage`'s own and has that row.
 pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Value>) {
-    let file = orchestrator_session::file_for(feed_dir, session);
+    let file = manage::file_for(feed_dir, session);
     if !file.exists() {
         return;
     }
-    let Ok(_lock) = orchestrator_session::Lock::take(&file) else {
+    let Ok(_lock) = manage::Lock::take(&file) else {
         return;
     };
     let Some(mut doc) = std::fs::read(&file)
@@ -1019,7 +1019,7 @@ pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Va
     else {
         return;
     };
-    if orchestrator_session::writer_of(&doc).is_some_and(|w| w != orchestrator_session::WRITER) {
+    if manage::writer_of(&doc).is_some_and(|w| w != manage::WRITER) {
         return;
     }
     let Some(row) = doc
@@ -1037,10 +1037,10 @@ pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Va
         Some(v) => row.insert("lease".into(), v),
         None => row.remove("lease"),
     };
-    let _ = orchestrator_session::write(&file, &doc);
+    let _ = manage::write(&file, &doc);
 }
 
-/// `giverny orchestrator-session resources`: capacity, limits, foreign load, every lease
+/// `giverny manage resources`: capacity, limits, foreign load, every lease
 /// and the queue.
 pub fn report(
     l: &Ledger,
@@ -1084,7 +1084,7 @@ pub fn report(
         auto(cap.configured.gpus.get().is_none()),
     ));
     out.push_str(&format!(
-        "default   {} cores, {} RAM a task (Settings → Agents panel)\n",
+        "default   {} cores, {} RAM a task (Settings → Management panel)\n",
         cap.default_lease.cpu_cores, cap.default_lease.ram
     ));
     out.push_str(&format!(

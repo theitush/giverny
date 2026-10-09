@@ -1,6 +1,6 @@
 //! Overlay windows: the fuzzy tab palette (Ctrl+Shift+P), the past-session
 //! picker (right-click a tab → sessions…), and the worker overlay an
-//! agents-pane row opens.
+//! management-panel row opens.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use giverny_claude::registry::PastSession;
 use giverny_claude::transcript;
 use giverny_core::tabs::TabId;
 
-use crate::agents_pane::RowClick;
+use crate::management_panel::RowClick;
 use crate::{Action, App};
 
 // ---- fuzzy tab palette -----------------------------------------------------
@@ -263,7 +263,7 @@ fn humanize(d: std::time::Duration) -> String {
     }
 }
 
-// ---- worker overlay (agents pane: a row's brief or transcript) -------------
+// ---- worker overlay (management panel: a row's brief or transcript) -------------
 
 /// Read-only text over the terminal session: a
 /// Planned row's brief, a Running worker's transcript followed live, a Done
@@ -281,7 +281,7 @@ pub struct BriefOverlay {
     pub source: Option<PathBuf>,
     /// The row's state in words (landing, timing, tokens).
     pub facts: Vec<String>,
-    /// A Done row's Review line, as its orchestrator wrote it: drawn at
+    /// A Done row's Review line, as its manager wrote it: drawn at
     /// the top, set apart, because it is what a person has to read.
     pub review: Option<String>,
     pub content: Content,
@@ -670,7 +670,7 @@ pub fn copy_on_release(ctx: &egui::Context, key: egui::Id, rect: egui::Rect) {
 
 /// The Review line, boxed in amber under the title: the first thing read.
 /// The Review line a clicked row's overlay shows: a Done row's `review`
-/// text from the feed (what `giverny orchestrator-session land --review` writes), trimmed.
+/// text from the feed (what `giverny manage land --review` writes), trimmed.
 /// Nothing for any other row, or for a blank line; nothing is looked up
 /// anywhere else.
 pub fn review_line(stage: giverny_claude::feed::Stage, review: Option<&str>) -> Option<String> {
@@ -1072,7 +1072,7 @@ mod tests {
         (drawn.unwrap(), copied, galleys)
     }
 
-    const LONG_TITLE: &str = "demo#83 · BUG: agents pane: a running task splits into two rows \
+    const LONG_TITLE: &str = "demo#83 · BUG: management panel: a running task splits into two rows \
          when the feed row has no agent_id and the worker's own row carries the tokens, so the \
          pane shows one row with no tokens and one with no task number";
 

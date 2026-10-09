@@ -3,7 +3,7 @@
 //! While a tab's Claude Code shows a worker's view, a slim band at the top
 //! of the terminal says what that worker is on: its task id and full title,
 //! wrapped rather than cut, then its elapsed time, ETA, current activity and
-//! tokens — the cells of its agents-pane row, as the pane drew them this
+//! tokens — the cells of its management-panel row, as the pane drew them this
 //! frame, so both change together. It is drawn over the terminal rather
 //! than beside it, so it never resizes the grid (a resize would have Claude
 //! Code repaint under it). A small `×` closes it for that view; the
@@ -14,8 +14,8 @@ use egui::{FontId, Rect, Sense, Ui};
 
 use giverny_core::tabs::TabId;
 
-use crate::agents_pane::Line;
 use crate::chrome::Chrome;
+use crate::management_panel::Line;
 
 /// Room kept free at the band's right end for its `×`.
 const CLOSE_W: f32 = 22.0;
@@ -34,7 +34,7 @@ pub fn facts(line: &Line) -> String {
     if !line.eta.is_empty() {
         out.push(format!("ETA {}", line.eta));
     } else if line.no_eta {
-        out.push(crate::agents_pane::NO_ETA.to_string());
+        out.push(crate::management_panel::NO_ETA.to_string());
     }
     if !line.now.is_empty() {
         out.push(line.now.clone());
@@ -149,7 +149,7 @@ pub fn show(ui: &mut Ui, term: Rect, line: &Line, chrome: &Chrome, tab: TabId) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents_pane::RowClick;
+    use crate::management_panel::RowClick;
     use giverny_claude::feed::Stage;
 
     fn line(elapsed: &str, eta: &str, now: &str, tokens: &str) -> Line {

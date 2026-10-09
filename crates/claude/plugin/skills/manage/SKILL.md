@@ -1,13 +1,13 @@
 ---
-name: orchestrate
-description: Run a piece of work as an orchestrator session of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's agents pane as Running, Next up with ETAs, and Done. Use when asked to orchestrate, fan work out to subagents, or work through a list of tasks in parallel.
+name: manage
+description: Run a piece of work as a manager session of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's management panel as Running, Next up with ETAs, and Done. Use when asked to manage, fan work out to subagents, or work through a list of tasks in parallel.
 ---
 
-# Orchestrate a session
+# Manage a session
 
 You are the dispatcher. You split the work into tasks, give each task its own
-subagent, and keep the orchestrator session's state in Giverny's agents pane with
-`giverny-orchestrator-session`. The pane reads what `giverny-orchestrator-session` writes: every row you plan
+subagent, and keep the manager session's state in Giverny's management panel with
+`giverny-manage`. The pane reads what `giverny-manage` writes: every row you plan
 shows under **Next up** with its estimate, a started row counts its time under
 **Running**, and a landed row shows under **Done** with how it came out against
 its estimate. Your own clock is not needed: every command stamps the time it
@@ -22,7 +22,7 @@ this skill only says how to run it and keep the pane true.
 Break the work into tasks a single subagent can finish on its own. For each,
 choose:
 
-- a **task name**: short, unique in this orchestrator session, letters, digits and `-` (`auth-fix`,
+- a **task name**: short, unique in this manager session, letters, digits and `-` (`auth-fix`,
   `docs-api`, `12`). It is the row's name in the pane, and the link between the
   row and its worker.
 - a **title**: one line saying what the task is. If the project types its
@@ -44,11 +44,11 @@ worker will be told before it starts. Every `plan` gets one; a `plan` without
 Record every task, in the order you mean to run it:
 
 ```bash
-giverny-orchestrator-session plan auth-fix --eta 25 --title "Fix the token refresh race" --brief briefs/auth-fix.md
-giverny-orchestrator-session plan docs-api --eta 15 --title "Document the new endpoints" --brief briefs/docs-api.md
+giverny-manage plan auth-fix --eta 25 --title "Fix the token refresh race" --brief briefs/auth-fix.md
+giverny-manage plan docs-api --eta 15 --title "Document the new endpoints" --brief briefs/docs-api.md
 ```
 
-Keep the briefs somewhere that outlives the orchestrator session (a scratch directory is
+Keep the briefs somewhere that outlives the manager session (a scratch directory is
 fine); a relative path is stored absolute. If the prompt changes before the
 spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
@@ -75,7 +75,7 @@ code) goes on the pane as given and is later checked against the working
 time that was still to come. The ask, and the `eta` output, tell the worker
 how its kind's re-estimates have fared, for it to weigh in its figure.
 
-`giverny-orchestrator-session accuracy` (optionally `--repo <name>`) shows every track,
+`giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess and the worker's
 re-estimate. When the
 user asks whether estimates are getting better, answer from it.
@@ -86,16 +86,16 @@ Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
 First claim what its worker needs from the machine. Every Giverny session
 shares one ledger of CPU, RAM, GPUs and exclusive slots, so a claim is how two
-orchestrators stay out of each other's way. You claim, because the lease is
+managers stay out of each other's way. You claim, because the lease is
 yours; workers never do.
 
 ```bash
-giverny-orchestrator-session claim auth-fix --cpu 3 --ram 3G
+giverny-manage claim auth-fix --cpu 3 --ram 3G
 ```
 
 Size it from the hint `claim` prints once there is history (`the last 4 BUG
 tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the default
-lease (Settings → Agents panel; `giverny-orchestrator-session resources` prints it). Add
+lease (Settings → Management panel; `giverny-manage resources` prints it). Add
 `--slot <name>` for something only one task at a time may use (a shared build
 folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU. The answer is one line and an exit code:
 
@@ -104,15 +104,15 @@ folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU. Th
 - `queued` (4): something it needs is held. Start another planned task from a
   free lane instead, and re-run the same `claim` now and then until it is
   granted (nothing calls back). When it says the wait is longer than the task
-  itself and suggests `ask`, send `giverny-orchestrator-session ask <holder's task> "<why, the
+  itself and suggests `ask`, send `giverny-manage ask <holder's task> "<why, the
   priority, how long you need it>"` and keep polling; the holder may release.
-- `refused` (5): larger than this machine's limits (Settings → Agents panel →
+- `refused` (5): larger than this machine's limits (Settings → Management panel →
   Limits). Ask for less, or tell the user.
 
 Then, once granted, stamp the task and spawn its worker in the same breath:
 
 ```bash
-giverny-orchestrator-session start auth-fix
+giverny-manage start auth-fix
 ```
 
 Then spawn **one subagent for this task** with the Agent tool. One task, one
@@ -134,13 +134,13 @@ When you spawn one:
   > You are the worker for task `<task>`. Work only on this task and only in the
   > files it needs. Once you have read the code (Giverny will ask you about
   > five minutes in), re-estimate once with how many minutes are left, even
-  > if the figure stands: `giverny-orchestrator-session eta <task> <minutes> --note "<why>"`.
+  > if the figure stands: `giverny-manage eta <task> <minutes> --note "<why>"`.
   > Do the same whenever the estimate turns out wrong. When you are waiting on
   > something that is not the work (a build slot, a lock, a person), say so
   > with `--why wait`; your next `eta` without it ends the wait. Do not run
-  > `giverny-orchestrator-session start` or `giverny-orchestrator-session land`; the dispatcher does. Run heavy
+  > `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy
   > commands (builds, test suites, anything that eats CPU or memory) as
-  > `giverny-orchestrator-session run <task> -- <command>`: it keeps them inside what was
+  > `giverny-manage run <task> -- <command>`: it keeps them inside what was
   > granted and measures them. Never set CPU or memory caps by hand. If `run`
   > says the memory cap killed your command (OOM), do not retry it: report that
   > to the dispatcher, who claims more. End with a short report: what you did,
@@ -156,31 +156,31 @@ When you spawn one:
 ## 3. While it runs
 
 - When you learn a task will take longer or shorter, re-estimate it:
-  `giverny-orchestrator-session eta <task> <minutes left>`.
+  `giverny-manage eta <task> <minutes left>`.
 - If a worker has to wait on something outside the work (a person, a quota, a
-  build slot), stop its clock with `giverny-orchestrator-session pause <task> --note "<why>"`
-  and restart it with `giverny-orchestrator-session resume <task>`. Paused spans, and spans a
+  build slot), stop its clock with `giverny-manage pause <task> --note "<why>"`
+  and restart it with `giverny-manage resume <task>`. Paused spans, and spans a
   worker marked with `eta --why wait`, are left out of the working time the
   history learns from; the pane still shows the wall time.
-- A task you decide not to do comes out of the plan: `giverny-orchestrator-session drop <task>`.
-- A worker that reports an OOM needs a bigger lease: `giverny-orchestrator-session release
+- A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
+- A worker that reports an OOM needs a bigger lease: `giverny-manage release
   <task>`, then `claim` it again with more `--ram`, then send the worker on
   (`run` takes the new grant). A held lease never grows through `claim`. Once,
   not in a loop: if the bigger claim fails too, tell the user.
-- **Another orchestrator may ask for your resources.** When a line like
-  `Giverny: another orchestrator on this machine asks for resources (message
+- **Another manager may ask for your resources.** When a line like
+  `Giverny: another manager on this machine asks for resources (message
   mXXXXXX, …)` arrives in your context, weigh its priority and time left
   against your task's, then answer, always, even with no:
-  - give way: `giverny-orchestrator-session release <task>` frees everything, slots included
+  - give way: `giverny-manage release <task>` frees everything, slots included
     (the worker's next `run` claims afresh and waits its turn), or
-    `giverny-orchestrator-session claim <task> --cpu <fewer> --ram <less>` shrinks in place and
+    `giverny-manage claim <task> --cpu <fewer> --ram <less>` shrinks in place and
     keeps the slots (a `run` already going keeps its cap; the next one uses the
     new grant), which does not help an asker waiting for your slot: release for that;
-  - `giverny-orchestrator-session reply <id> "<answer>"`, then carry on.
+  - `giverny-manage reply <id> "<answer>"`, then carry on.
 
   The same hook tells you when a reply to your own ask arrives: re-run your
   `claim` at once.
-- `giverny-orchestrator-session show` prints the orchestrator session as it stands.
+- `giverny-manage show` prints the manager session as it stands.
 
 ### Giving a worker its next task
 
@@ -188,7 +188,7 @@ To hand a worker that knows the code its next task with `SendMessage` instead
 of spawning a new one, record the hand-off in the same breath as the message:
 
 ```bash
-giverny-orchestrator-session start <next task> --agent <worker's agent id>
+giverny-manage start <next task> --agent <worker's agent id>
 ```
 
 That lands the worker's earlier task now, with its own measured time, and
@@ -197,7 +197,7 @@ and each finished row counts only the tokens spent on that task. A plain
 `start <next task>` (with no `--agent`) works too when the message assigns the
 task: it begins `New task for you: <next task>`, or names the task right after
 a holding phrase (`Next you hold acme#614`, `Your next task is acme#614`, or `a
-review round on #613` for `acme#613-r1`). The orchestrator session and the pane
+review round on #613` for `acme#613-r1`). The manager session and the pane
 then link the row to the worker the message went to, and `start` points out the
 idle worker to pass as `--agent`. A task the message only mentions
 (`another worker now holds acme#615`) is never linked to it, and a row a
@@ -216,9 +216,9 @@ When a worker reports, check its work yourself before you call it done (read
 the diff, run the tests). Then land it, with one of:
 
 ```bash
-giverny-orchestrator-session land auth-fix                                   # done
-giverny-orchestrator-session land auth-fix --outcome Blocked --note "needs the API key"
-giverny-orchestrator-session land ui-empty-state --review "<who> — <what to look at> — <where>"
+giverny-manage land auth-fix                                   # done
+giverny-manage land auth-fix --outcome Blocked --note "needs the API key"
+giverny-manage land ui-empty-state --review "<who> — <what to look at> — <where>"
 ```
 
 Use `--review` when the work is finished but a person has to look at it before
@@ -233,15 +233,15 @@ Then start the next planned task whose lane is free, until none are left.
 
 When every task has landed, tell the user what landed, what is blocked or
 waiting for review, and what was left undone. Leave the rows: the pane keeps
-them as the orchestrator session's record. `giverny-orchestrator-session clear` removes them when the user
+them as the manager session's record. `giverny-manage clear` removes them when the user
 asks.
 
-## If `giverny-orchestrator-session` is missing
+## If `giverny-manage` is missing
 
 The command comes with Giverny. If running it fails with "command not found",
-carry on without it: the orchestration works the same, the pane just shows the
+carry on without it: the management works the same, the pane just shows the
 workers without the plan and the estimates.
 
-If it is there but has no `claim` (an older Giverny: `giverny-orchestrator-session` prints its
+If it is there but has no `claim` (an older Giverny: `giverny-manage` prints its
 usage with no `claim` in it), skip claiming, `run`, `ask` and `reply`, and carry
 on as before; workers run their commands themselves.

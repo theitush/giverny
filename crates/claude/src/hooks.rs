@@ -212,13 +212,13 @@ fn deliver(msg: &RelayMsg, spool: &Path) {
     }
 }
 
-/// Synthetic event name for `giverny orchestrator-session clear-done` (not a Claude hook
-/// event): clear the agents pane's Done rows in the tab it ran in.
+/// Synthetic event name for `giverny manage clear-done` (not a Claude hook
+/// event): clear the management panel's Done rows in the tab it ran in.
 /// The event carries `session_id` and `at_ms`, the moment the
 /// command ran.
 pub const CLEAR_DONE_EVENT: &str = "GivernyClearDone";
 
-/// Ask the app to clear the agents pane's Done rows in the tab this process
+/// Ask the app to clear the management panel's Done rows in the tab this process
 /// runs in (`$GIVERNY_TAB_ID`). `false` outside a Giverny tab, where there is
 /// no pane to clear. A closed app gets it from the spool at its next launch.
 pub fn send_clear_done(spool: &Path, session: Option<&str>, at_ms: u64) -> bool {
@@ -523,7 +523,7 @@ pub fn run_statusline(spool: &Path) {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
     // The whole session's CPU, memory and GPU now, at the right edge: the
-    // running Giverny's last reading, the same figure its agents pane and
+    // running Giverny's last reading, the same figure its management panel and
     // sidebar are parts and sums of; measured here only without one (a
     // plain terminal, or a claude outside its tabs).
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
@@ -636,7 +636,7 @@ fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
     })
 }
 
-// ---- subagentStatusLine: the agents pane's live rows ----------------------
+// ---- subagentStatusLine: the management panel's live rows ----------------------
 
 /// Synthetic event name for relayed `subagentStatusLine` input (not a Claude
 /// hook event). The message's `event` is Claude Code's stdin verbatim —
@@ -660,9 +660,9 @@ fn is_our_subagent_line(command: &str) -> bool {
 /// How the relay has Claude Code draw its own subagent panel this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripRows {
-    /// Every row as Claude Code draws it (the agents pane is off).
+    /// Every row as Claude Code draws it (the management panel is off).
     Native,
-    /// No row at all: the agents pane stands in for the panel.
+    /// No row at all: the management panel stands in for the panel.
     Hidden,
     /// Every row drawn, each opened by its agent id in brackets
     /// ([`tag_strip_row`]), for a walk to a worker's view.
@@ -758,7 +758,7 @@ pub fn subagent_line_msg(
 /// The `giverny relay --subagent-line` entrypoint: Claude Code runs it at
 /// least every five seconds while a session has live workers, with the list
 /// on stdin. Inside a Giverny tab it forwards that list to the app (the
-/// agents pane's Running rows) and, when `pane_on`, hides every row of Claude
+/// management panel's Running rows) and, when `pane_on`, hides every row of Claude
 /// Code's own panel — or, while the app has asked for the panel
 /// ([`show_strip`]), draws each row tagged with its agent id. Outside a tab,
 /// or in a session that is not the tab's own ([`crate::lineage`]), it does
@@ -800,7 +800,7 @@ pub fn run_subagent_line(spool: &Path, pane_on: bool) {
 pub const STRIP_WANTED_FOR: Duration = Duration::from_secs(90);
 
 /// The file that asks the relay to leave Claude Code's own subagent panel
-/// drawn in tab `tab_id`, though the agents pane is on: beside the spool,
+/// drawn in tab `tab_id`, though the management panel is on: beside the spool,
 /// one per tab.
 pub fn strip_flag(spool: &Path, tab_id: &str) -> PathBuf {
     spool.with_file_name("show-strip").join(tab_id)
@@ -1197,7 +1197,7 @@ pub fn install_into(settings_path: &Path) -> anyhow::Result<bool> {
 
 /// Remove our relay entries from one settings file.
 ///
-/// The agents pane's `subagentStatusLine` goes with them when it is ours: it
+/// The management panel's `subagentStatusLine` goes with them when it is ours: it
 /// is `relay --subagent-line`, the same relay, and a relay left behind after
 /// an uninstall runs a binary nobody asked to keep. One the user configured
 /// themselves is never touched.
@@ -1708,7 +1708,7 @@ mod tests {
         assert!(!subagent_line_installed_in(&path));
     }
 
-    /// Uninstalling takes the agents pane's line with the hooks — it is the
+    /// Uninstalling takes the management panel's line with the hooks — it is the
     /// same relay — and leaves a user's own line where it was.
     #[test]
     fn uninstall_takes_our_subagent_line_and_leaves_theirs() {

@@ -7,8 +7,8 @@
 //!   not (the sidebar's line);
 //! * each **session**: a claude process and everything under it, keyed by
 //!   the claude's pid (its status line);
-//! * each **run**: the processes in a `giverny orchestrator-session run` scope's cgroup
-//!   (the agents pane's rows). A scope's command is a descendant of the
+//! * each **run**: the processes in a `giverny manage run` scope's cgroup
+//!   (the management panel's rows). A scope's command is a descendant of the
 //!   claude that ran it (`systemd-run --scope` execs it in place), so a run
 //!   is part of its session, and a session part of the total.
 //!
@@ -64,7 +64,7 @@ impl Use {
     }
 }
 
-/// One `giverny orchestrator-session run` task's commands' use (its scopes summed).
+/// One `giverny manage run` task's commands' use (its scopes summed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunUse {
     pub session: String,
@@ -570,7 +570,7 @@ mod tests {
         }
     }
 
-    /// app → shell → claude A → bash → `orchestrator-session run` scope (cargo → rustc),
+    /// app → shell → claude A → bash → `manage run` scope (cargo → rustc),
     /// app → shell → claude B; and a process outside the app.
     fn machine() -> Vec<Proc> {
         vec![
@@ -639,7 +639,7 @@ mod tests {
         assert!(!r.sessions.contains_key(&900));
     }
 
-    /// A worker's commands: within its session, and a `orchestrator-session run` it
+    /// A worker's commands: within its session, and a `manage run` it
     /// started within it (named as its, so a row adds it once).
     #[test]
     fn a_worker_is_within_its_session_and_its_run_within_it() {

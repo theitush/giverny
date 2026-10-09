@@ -1,10 +1,10 @@
-//! `giverny orchestrator-session ask` / `reply`: orchestrators talk when the ledger cannot
+//! `giverny manage ask` / `reply`: managers talk when the ledger cannot
 //! grant.
 //!
 //! The ledger ([`crate::resources`]) answers *queued behind demo#12*; it
-//! cannot say whether demo#12's orchestrator would hand over its cargo
+//! cannot say whether demo#12's manager would hand over its cargo
 //! slot for a two-minute test of a higher-Priority task. So the queued one
-//! asks: `giverny orchestrator-session ask demo#12 "<why>"` finds the session holding that
+//! asks: `giverny manage ask demo#12 "<why>"` finds the session holding that
 //! lease and drops a message in that session's **inbox**, a JSON-lines file
 //! at `<feed dir>/inbox/<session>.jsonl`. The plugin's `PostToolUse` hook
 //! (`giverny hook`) checks the calling session's inbox on every tool
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::feed;
-use crate::orchestrator_session::{self, Lock};
+use crate::manage::{self, Lock};
 use crate::resources::{self, Ledger};
 
 /// Where the inboxes live, under the feed directory.
@@ -196,7 +196,7 @@ pub fn take(feed_dir: &Path, ledger: &Path, session: &str, now: u64) -> Vec<Mess
         return msgs;
     }
     let l = read_ledger(ledger, now);
-    let stamp = orchestrator_session::stamp(now);
+    let stamp = manage::stamp(now);
     let (live, dead): (Vec<_>, Vec<_>) =
         msgs.into_iter().partition(|m| is_live(m, l.as_ref(), now));
     let seen = seen_path(feed_dir, session);
@@ -282,7 +282,7 @@ pub fn resolve(l: &Ledger, me: &str, target: &str) -> Result<(String, Option<Str
         [] => {
             return Err(format!(
                 "no lease or queued task named `{target}` in the ledger \
-                 (`giverny orchestrator-session resources` lists them), and it is no session id"
+                 (`giverny manage resources` lists them), and it is no session id"
             ));
         }
         _ => return Err(format!("`{target}` is the start of several session ids")),
@@ -337,7 +337,7 @@ fn own_task(l: &Ledger, me: &str) -> Option<String> {
     }
 }
 
-/// `giverny orchestrator-session ask <task-or-session> "<msg>" [--task <mine>] [--priority P]`.
+/// `giverny manage ask <task-or-session> "<msg>" [--task <mine>] [--priority P]`.
 #[allow(clippy::too_many_arguments)]
 pub fn ask(
     feed_dir: &Path,
@@ -398,13 +398,13 @@ pub fn ask(
         ),
     };
     Ok(format!(
-        "asked {whom}: message {}. It reaches that orchestrator on its next tool call, \
+        "asked {whom}: message {}. It reaches that manager on its next tool call, \
          and its reply reaches this session the same way; the message lives {life}",
         msg.id
     ))
 }
 
-/// `giverny orchestrator-session reply <msg-id> "<text>"`.
+/// `giverny manage reply <msg-id> "<text>"`.
 pub fn reply(
     feed_dir: &Path,
     ledger: &Path,
@@ -527,13 +527,13 @@ pub fn render(m: &Message, me: &str, ledger: Option<&Ledger>, now: u64) -> Strin
             };
             let t = about.unwrap_or("<task>");
             format!(
-                "Giverny: another orchestrator on this machine asks for resources \
+                "Giverny: another manager on this machine asks for resources \
                  (message {id}, {ago}). From {from}. {lease_line} It says: \"{text}\"\n\
                  Weigh its Priority and time left against yours. If you give way, do it first:\n\
-                 - free it: `giverny-orchestrator-session release {t}` (a worker's next `giverny-orchestrator-session run {t}` \
+                 - free it: `giverny-manage release {t}` (a worker's next `giverny-manage run {t}` \
                  claims afresh and waits its turn)\n\
-                 - or shrink it in place: `giverny-orchestrator-session claim {t} --cpu <fewer> --ram <less>`\n\
-                 Then always answer, even to say no: `giverny-orchestrator-session reply {id} \"<your answer>\"`, \
+                 - or shrink it in place: `giverny-manage claim {t} --cpu <fewer> --ram <less>`\n\
+                 Then always answer, even to say no: `giverny-manage reply {id} \"<your answer>\"`, \
                  and carry on.",
                 id = m.id,
                 ago = ago(now, m.at),
@@ -560,7 +560,7 @@ pub fn render(m: &Message, me: &str, ledger: Option<&Ledger>, now: u64) -> Strin
             let retry = match &m.about {
                 Some(t) => format!(
                     " If it freed what you wait for, re-run your claim now \
-                     (`giverny-orchestrator-session claim {t} …`, the same flags)."
+                     (`giverny-manage claim {t} …`, the same flags)."
                 ),
                 None => String::new(),
             };
@@ -731,10 +731,7 @@ mod tests {
         let gone = render(&m, "a", Some(&l), T0 + 10_000);
         assert!(gone.contains("t12 has released its lease"), "{gone}");
         assert!(gone.contains("just now"), "{gone}");
-        assert!(
-            gone.contains("giverny-orchestrator-session claim t5"),
-            "{gone}"
-        );
+        assert!(gone.contains("giverny-manage claim t5"), "{gone}");
     }
 
     #[test]

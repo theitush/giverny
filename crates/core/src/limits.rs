@@ -1,14 +1,14 @@
-//! What all orchestrators on this machine together may use.
+//! What all managers on this machine together may use.
 //!
 //! [`Limits`] is the setting: CPU cores, RAM and GPUs, each `"auto"` unless
 //! the person set a figure. It is serde-ready to sit in `config.toml` as
-//! `[orchestrator.limits]`; [`Limits::resolve`] turns every `auto` into a
+//! `[manager.limits]`; [`Limits::resolve`] turns every `auto` into a
 //! number for the [`Machine`] it runs on (cores − 2, 70 % of RAM, 90 % of
 //! each GPU's VRAM). [`Load`] is what the machine is doing right now, so a
 //! grant can count programs that are not Giverny's.
 //!
 //! ```toml
-//! [orchestrator.limits]
+//! [manager.limits]
 //! cpu_cores = "auto"        # or 8
 //! ram       = "auto"        # or "16G", "512M"; a bare number is GiB
 //! gpus      = "auto"        # or [{ index = 0, vram = "20G" }]; [] = none
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Cores held back from orchestrators by `cpu_cores = "auto"`.
+/// Cores held back from managers by `cpu_cores = "auto"`.
 pub const AUTO_CORES_SPARE: u32 = 2;
 /// The share of RAM `ram = "auto"` hands out, in percent.
 pub const AUTO_RAM_PCT: u64 = 70;
@@ -80,7 +80,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Auto<T> {
             Ok(Raw::Word(_)) => Ok(Auto::Auto),
             Ok(Raw::Val(v)) => Ok(Auto::Set(v)),
             Err(_) => Err(serde::de::Error::custom(
-                "expected \"auto\" or a value (see [orchestrator.limits])",
+                "expected \"auto\" or a value (see [manager.limits])",
             )),
         }
     }
@@ -164,7 +164,7 @@ impl<'de> Deserialize<'de> for Mem {
     }
 }
 
-/// One GPU orchestrators may use: its index (as `nvidia-smi` numbers it)
+/// One GPU managers may use: its index (as `nvidia-smi` numbers it)
 /// and how much of its VRAM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuLimit {
@@ -172,7 +172,7 @@ pub struct GpuLimit {
     pub vram: Mem,
 }
 
-/// `[orchestrator.limits]`: the whole machine's budget for orchestrators.
+/// `[manager.limits]`: the whole machine's budget for managers.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
@@ -216,24 +216,24 @@ impl Limits {
         }
     }
 
-    /// `[orchestrator.limits]` from the TOML text of a `config.toml`; all
+    /// `[manager.limits]` from the TOML text of a `config.toml`; all
     /// `auto` when the table is absent. An unreadable table is an error, so
     /// a typo is said rather than silently ignored.
     ///
-    /// Read through [`crate::config::OrchestratorConfig`], the same type
+    /// Read through [`crate::config::ManagerConfig`], the same type
     /// `Config` mounts, so the ledger and the settings screen cannot read
-    /// the table two ways. Only the `[orchestrator]` table is looked at: a
+    /// the table two ways. Only the `[manager]` table is looked at: a
     /// bad value elsewhere in the file is the settings screen's business,
     /// not a reason to refuse a claim.
     pub fn from_config_str(text: &str) -> Result<Limits, String> {
         let doc: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-        let Some(o) = doc.get("orchestrator") else {
+        let Some(o) = doc.get("manager") else {
             return Ok(Limits::default());
         };
         o.clone()
-            .try_into::<crate::config::OrchestratorConfig>()
+            .try_into::<crate::config::ManagerConfig>()
             .map(|o| o.limits)
-            .map_err(|e| format!("[orchestrator.limits]: {e}"))
+            .map_err(|e| format!("[manager.limits]: {e}"))
     }
 
     /// The limits in `config.toml` at `path`; all `auto` when the file or
@@ -535,7 +535,7 @@ mod tests {
             Limits::default()
         );
         let l = Limits::from_config_str(
-            "[orchestrator.limits]\ncpu_cores = 8\nram = \"16G\"\n\
+            "[manager.limits]\ncpu_cores = 8\nram = \"16G\"\n\
              gpus = [{ index = 0, vram = \"20G\" }]\n",
         )
         .unwrap();
@@ -548,10 +548,10 @@ mod tests {
                 vram: Mem::gb(20)
             }])
         );
-        let l = Limits::from_config_str("[orchestrator.limits]\nram = \"AUTO\"\nram_x = 1\n");
+        let l = Limits::from_config_str("[manager.limits]\nram = \"AUTO\"\nram_x = 1\n");
         assert!(l.is_ok(), "unknown keys are ignored: {l:?}");
         assert_eq!(l.unwrap().ram, Auto::Auto);
-        assert!(Limits::from_config_str("[orchestrator.limits]\nram = \"lots\"\n").is_err());
+        assert!(Limits::from_config_str("[manager.limits]\nram = \"lots\"\n").is_err());
         // Missing file: auto.
         assert_eq!(
             Limits::load_from(Path::new("/nonexistent/giverny/config.toml")).unwrap(),

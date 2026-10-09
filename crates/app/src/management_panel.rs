@@ -1,13 +1,13 @@
-//! The agents pane: a table under a tab's terminal listing that tab's Claude
+//! The management panel: a table under a tab's terminal listing that tab's Claude
 //! Code subagents — Running, Planned and Done — one row each.
 //!
-//! Off by default (`claude.agents_pane`); off, nothing here runs. On, it is
+//! Off by default (`claude.management_panel`); off, nothing here runs. On, it is
 //! drawn only in a tab whose session has rows, as a resizable bottom panel
 //! inside the terminal's area.
 //!
 //! The rows are a [`Tracker`] (Claude Code's own data: live list,
 //! transcripts, notifications) merged with the optional feed file
-//! ([`feed::merge`], `docs/agents-pane.md`). This module owns only the look:
+//! ([`feed::merge`], `docs/management-panel.md`). This module owns only the look:
 //! the columns STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one but TASK a
 //! fixed width, no header row, the whole row tinted by its stage, a
 //! stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done row's
@@ -17,7 +17,7 @@
 //! line's model row.
 //!
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker —
-//! `ClaudeWatch::agents` (`agents_live.rs`), fed by the relay, persisted,
+//! `ClaudeWatch::agents` (`management_live.rs`), fed by the relay, persisted,
 //! emptied on `/clear` and refreshed once a second — and keeps only what the
 //! pane itself needs per tab: the feed it last read.
 //!
@@ -26,7 +26,7 @@
 //! stops and its ETA holds instead of counting down past zero, and NOW says
 //! `5h limit → 13:00`. The pane remembers each such span ([`Hold`]) and
 //! both clocks carry on from where they stopped once the limit resets. A
-//! feed row the orchestrator has paused (`paused_since`) is held
+//! feed row the manager has paused (`paused_since`) is held
 //! the same way, and reads `paused since 12:58`. Planned ETAs are durations
 //! and hold by themselves; a Done row is measured history and never moves.
 //!
@@ -35,7 +35,7 @@
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click.
 //!
-//! **Resources**: what a row's `giverny orchestrator-session run`
+//! **Resources**: what a row's `giverny manage run`
 //! commands use in a quiet column — live CPU and memory while one runs, the
 //! memory peak once the row is Done, zero when there is neither — its lease from the machine ledger in
 //! its overlay header, a Next up row's place in the ledger's queue in NOW,
@@ -62,7 +62,7 @@ use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::session_use;
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
-use giverny_core::config::{AgentsPanelConfig, DoneRows, PaneColumns};
+use giverny_core::config::{DoneRows, ManagementPanelConfig, PaneColumns};
 use giverny_core::limits::{Limits, Machine, Mem, Resolved};
 use giverny_core::tabs::TabId;
 use giverny_term::widget::RenderShared;
@@ -110,7 +110,7 @@ struct View {
     feed: FeedCache,
     feed_now: Option<Feed>,
     /// The session's agent ETAs: the estimates of workers that are no
-    /// orchestrator session's task.
+    /// manager session's task.
     etas: agent_eta::Cache,
     etas_now: Etas,
     feed_session: Option<String>,
@@ -462,7 +462,7 @@ const MACHINE_EVERY: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, PartialEq)]
 pub struct LedgerView {
     pub ledger: Ledger,
-    /// `[orchestrator.limits]` resolved for this machine; `None` when the
+    /// `[manager.limits]` resolved for this machine; `None` when the
     /// config could not be read.
     pub limits: Option<Resolved>,
 }
@@ -492,10 +492,10 @@ impl LedgerWatch {
             let shared = Arc::new(LedgerShared::default());
             let (s, ctx) = (shared.clone(), ctx.clone());
             if let Err(err) = std::thread::Builder::new()
-                .name("agents-pane-ledger".into())
+                .name("management-panel-ledger".into())
                 .spawn(move || read_ledger_loop(&s, &ctx))
             {
-                tracing::warn!("agents pane: the ledger reader did not start: {err}");
+                tracing::warn!("management panel: the ledger reader did not start: {err}");
             }
             shared
         });
@@ -567,7 +567,7 @@ pub fn with_live(mut feed: Feed, sessions: &[&str], live: &[TaskLive]) -> Feed {
 
 /// `feed` with each row whose worker's processes were measured showing
 /// them: everything its Bash commands started ([`giverny_claude::worker_pids`]),
-/// whether or not they ran under `giverny orchestrator-session run`. A run of the row's
+/// whether or not they ran under `giverny manage run`. A run of the row's
 /// task under that worker is part of the worker's figure already; one
 /// started elsewhere is added to it.
 pub fn with_workers(
@@ -868,7 +868,7 @@ impl RowClick {
 }
 
 /// What a row click does: a click on the row the tab is
-/// already showing takes it back to the orchestrator.
+/// already showing takes it back to the manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toggle {
     /// Open the row: its worker's view, its overlay, its brief.
@@ -910,7 +910,7 @@ pub struct Line {
     /// (zero between its commands), the memory peak on a Done one (zero when
     /// nothing was measured); empty on a Next up row.
     pub usage: String,
-    /// A `giverny orchestrator-session run` of the row was killed by its memory cap: the
+    /// A `giverny manage run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
     /// A Running row with nothing running it ([`unworked`]): its worker has
@@ -957,7 +957,7 @@ pub fn build_at(
 }
 
 /// [`build_at`], showing only the Done rows `done` keeps
-/// (`agents_panel.done_rows`). Rows are dropped before they are formatted,
+/// (`management_panel.done_rows`). Rows are dropped before they are formatted,
 /// so a `"` never stands for a row that is not drawn.
 pub fn build_with(
     feed: Option<&Feed>,
@@ -1310,13 +1310,11 @@ fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) ->
 }
 
 /// How a Running row with no estimate gets one, as the overlay header says
-/// it: an orchestrator session's task is re-estimated on its row; any other
+/// it: a manager session's task is re-estimated on its row; any other
 /// worker is given an agent ETA by its id.
 fn no_eta_hint(key: &str, agent_id: Option<&str>) -> String {
     if !key.is_empty() {
-        return format!(
-            "no ETA — add one: giverny-orchestrator-session eta {key} <min> --why scope"
-        );
+        return format!("no ETA — add one: giverny-manage eta {key} <min> --why scope");
     }
     let agent = agent_id.unwrap_or("<agent-id>");
     format!("no ETA — add one: giverny-eta {agent} <min>")
@@ -1453,7 +1451,7 @@ pub fn show(
     viewed: Option<&str>,
     header: Option<&str>,
     limit: Option<Limit>,
-    panel: &AgentsPanelConfig,
+    panel: &ManagementPanelConfig,
     chrome: &Chrome,
     shared: &mut RenderShared,
     ui: &mut Ui,
@@ -1540,7 +1538,7 @@ pub fn show(
     let min_h = row_h * 1.5;
     let max_h = (ui.available_height() * 0.5).max(row_h * 3.0);
     let fit = want.clamp(min_h, max_h);
-    let id = egui::Id::new(("agents_pane", tab));
+    let id = egui::Id::new(("management_panel", tab));
     follow_rows(ui.ctx(), id, &mut view.fit, fit);
 
     let mut clicked = None;
@@ -1686,7 +1684,7 @@ fn table_cols(width: f32, cell_w: f32, ppp: f32, bar_lane: f32) -> usize {
 
 /// Where each column of a row starts or ends, in characters, for a table
 /// laid out in `cols` columns. A column switched off
-/// (`[agents_panel.columns]`) takes no width: the rest close up, each a
+/// (`[management_panel.columns]`) takes no width: the rest close up, each a
 /// [`GAP`] from the one before, and TASK takes what is left.
 struct Cols {
     on: PaneColumns,
@@ -2256,7 +2254,7 @@ mod tests {
 
     #[test]
     fn a_running_row_with_no_estimate_says_so() {
-        // A worker spawned outside an orchestrator session: a row, but no ETA.
+        // A worker spawned outside a manager session: a row, but no ETA.
         let rows = live(
             r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
                 "description":"acme#613 market SD graph","startTime":1789999958000}]}"#,
@@ -2280,9 +2278,12 @@ mod tests {
         );
         let t = build(Some(&f), &rows, T0);
         assert!(t.lines[0].no_eta);
-        assert!(t.lines[0].click.facts.contains(
-            &"no ETA — add one: giverny-orchestrator-session eta g#3 <min> --why scope".into()
-        ));
+        assert!(
+            t.lines[0]
+                .click
+                .facts
+                .contains(&"no ETA — add one: giverny-manage eta g#3 <min> --why scope".into())
+        );
     }
 
     #[test]
@@ -2325,7 +2326,7 @@ mod tests {
         assert_eq!(keys(DoneRows::Last(2)), ["g#1", "g#2", "g#6", "g#5"]);
         assert_eq!(keys(DoneRows::Last(9)), keys(DoneRows::All));
         // The config's words come to the same.
-        let mut panel = AgentsPanelConfig::default();
+        let mut panel = ManagementPanelConfig::default();
         assert_eq!(panel.done(), DoneRows::All);
         panel.done_rows = "last".into();
         panel.done_last = 1;
@@ -2336,13 +2337,13 @@ mod tests {
 
     #[test]
     fn the_settings_list_the_columns_in_the_panes_order() {
-        // Settings → Agents panel shows a switch per column in `SETTINGS`'
+        // Settings → Management panel shows a switch per column in `SETTINGS`'
         // order; that order must be the one the pane draws them in.
         let t = build(Some(&feed(DONE_FOUR)), &[], T0);
         let c = Cols::new(&t, 100);
         let at: Vec<(&str, usize)> = giverny_core::settings::SETTINGS
             .iter()
-            .filter_map(|d| d.key.strip_prefix("agents_panel.columns."))
+            .filter_map(|d| d.key.strip_prefix("management_panel.columns."))
             .map(|col| {
                 let x = match col {
                     "stage" => 0,
@@ -2860,7 +2861,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// giverny#217, the inbar orchestrator session: a plain `start` and the task handed
+    /// giverny#217, the inbar manager session: a plain `start` and the task handed
     /// over in the dispatcher's own words, with no `New task for you`. The
     /// row with no worker is the worker's from the message, and each task
     /// counts its own tokens — the next one named only as "a review round
@@ -2906,7 +2907,7 @@ mod tests {
             ]
         );
 
-        // acme#614 landed (the orchestrator session linked it), a round of #613 started
+        // acme#614 landed (the manager session linked it), a round of #613 started
         // with no worker, and the message names only #614 and #613.
         let more = [
             sent(
@@ -3187,7 +3188,7 @@ mod tests {
     // ------------------------------------------------- resources ----
 
     /// A feed with a granted Running row and a queued Next up row, as
-    /// `giverny orchestrator-session claim` leaves them.
+    /// `giverny manage claim` leaves them.
     const LEASED: &str = r#"{"session":"s","rows":[
         {"key":"demo#12","stage":"running","eta_s":1800,"started":1790000000000,
          "lease":{"state":"granted","id":"s:demo#12","cpu":3,"ram_mb":3072,
@@ -3415,7 +3416,7 @@ mod tests {
         assert!(t.lines[2].usage.starts_with("                 0.5G"));
     }
 
-    /// A worker's commands show in its row with no `orchestrator-session run` at all; a
+    /// A worker's commands show in its row with no `manage run` at all; a
     /// run under that worker is not added twice, one elsewhere is added; a
     /// worker with no feed row shows its own; a Done row keeps its peak.
     #[test]

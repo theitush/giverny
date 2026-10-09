@@ -4,7 +4,7 @@
 //! `claude` the tab's claude starts in its shell and one started inside a
 //! terminal multiplexer the tab launched. Those are not the tab's session:
 //! their hooks must not move the tab's state or name its resume target, and
-//! their workers must not land in the tab's agents pane or lose their own
+//! their workers must not land in the tab's management panel or lose their own
 //! subagent panel to it.
 //!
 //! The tab exports the app's process id ([`APP_PID_ENV`]). The tab's own

@@ -4,7 +4,7 @@
 //! own `agent-<id>.jsonl` instead: what it said, each tool it called (one
 //! line, the argument that says what it is doing), and the first lines of
 //! what came back. Thinking, attachments and bookkeeping lines are left out.
-//! Two views use it: the overlay a Running or Done row of the agents pane
+//! Two views use it: the overlay a Running or Done row of the management panel
 //! opens, which keeps the task text whole, and
 //! `giverny transcript [--follow]`, which folds it to watch in a terminal.
 //!
