@@ -618,6 +618,7 @@ mod tests {
                 load1: Some(0.0),
             },
             default_lease: Default::default(),
+            mem_use: Default::default(),
         }
     }
 

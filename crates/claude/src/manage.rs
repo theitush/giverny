@@ -191,6 +191,7 @@ impl Flags {
             slots: self.slots.clone(),
             min_ram_mb: self.min_ram_mb,
             priority: self.priority.clone(),
+            peak_mb: None,
         }
     }
 }
@@ -1469,11 +1470,14 @@ pub fn run_in_code(
         Cmd::Resources => {
             let cap = match cap {
                 Some(c) => c.clone(),
-                None => resources::Capacity::detect()?,
+                None => resources::Capacity::detect(&ledger)?,
             };
             let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
-            let out =
-                resources::with_ledger(&ledger, now, |l| resources::report(l, &cap, now, &eta))?;
+            let peaks = Peaks::load(dir);
+            let out = resources::with_ledger(&ledger, now, |l| {
+                l.fill_peaks(&|x| peaks.of_lease(x));
+                resources::report(l, &cap, now, &eta)
+            })?;
             return Ok((out, 0));
         }
         _ => {}
@@ -1524,16 +1528,21 @@ fn claim(
 ) -> Result<(String, i32), String> {
     let cap = match cap {
         Some(c) => c.clone(),
-        None => resources::Capacity::detect()?,
+        None => resources::Capacity::detect(ledger)?,
     };
-    let req = flags.request();
     let repo = flags.repo.clone().or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
         manage_history::repo_of(task, &cwd)
     });
+    let peaks = Peaks::load(dir);
+    let req = resources::Request {
+        peak_mb: peaks.expected(session, task, repo.as_deref()),
+        ..flags.request()
+    };
     // Figures given on a held lease, each no larger, shrink it in place: the
     // answer to an ask. Otherwise it is a claim as ever.
     let (out, shrunk) = resources::with_ledger(ledger, now, |l| {
+        l.fill_peaks(&|x| peaks.of_lease(x));
         if let Some(s) = l.shrink(session, task, flags.cpu, flags.ram_mb, flags.vram_mb, now) {
             l.heartbeat(session, now);
             return (resources::Outcome::Held(s.1.clone()), Some(s.0));
@@ -1573,26 +1582,63 @@ fn claim(
         line.push_str(&format!("; {hint}"));
     }
     if !matches!(out, resources::Outcome::Refused(_))
-        && let Some(hint) = size_hint(dir, session, task, repo.as_deref())
+        && let Some(hint) = peaks.hint(session, task, repo.as_deref())
     {
         line.push_str(&format!(" ({hint})"));
     }
     Ok((line, out.exit_code()))
 }
 
-/// What past tasks like this one peaked at under `giverny manage run`,
-/// for `claim` to say beside its answer: `the last 4 BUG
-/// tasks in demo peaked at 1.8G (median), 2.6G at most`.
-fn size_hint(dir: &Path, session: &str, task: &str, repo: Option<&str>) -> Option<String> {
-    let history = manage_history::path(dir)?;
-    let title = feed::find(dir, session).and_then(|(_, f)| {
-        f.rows
-            .into_iter()
-            .find(|r| r.key == task)
-            .and_then(|r| r.title)
-    });
-    let kind = title.as_deref().and_then(manage_history::kind_of);
-    manage_history::peak_hint(&manage_history::load(&history), repo, kind.as_deref())
+/// What past tasks peaked at under `giverny manage run`: the history,
+/// read once, and the feeds that give a task its kind.
+pub(crate) struct Peaks<'a> {
+    dir: &'a Path,
+    history: Vec<manage_history::Record>,
+}
+
+impl<'a> Peaks<'a> {
+    pub(crate) fn load(dir: &'a Path) -> Peaks<'a> {
+        let history = manage_history::path(dir)
+            .map(|p| manage_history::load(&p))
+            .unwrap_or_default();
+        Peaks { dir, history }
+    }
+
+    /// The type word of `session`'s row for `task` (`BUG`, …).
+    fn kind(&self, session: &str, task: &str) -> Option<String> {
+        let title = feed::find(self.dir, session).and_then(|(_, f)| {
+            f.rows
+                .into_iter()
+                .find(|r| r.key == task)
+                .and_then(|r| r.title)
+        })?;
+        manage_history::kind_of(&title)
+    }
+
+    /// For `claim` to say beside its answer: `the last 4 BUG tasks in demo
+    /// peaked at 1.8G (median), 2.6G at most`.
+    pub(crate) fn hint(&self, session: &str, task: &str, repo: Option<&str>) -> Option<String> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let kind = self.kind(session, task);
+        manage_history::peak_hint(&self.history, repo, kind.as_deref())
+    }
+
+    /// What admission counts the task at (giverny#281): the high end of
+    /// what tasks like it peaked at.
+    pub(crate) fn expected(&self, session: &str, task: &str, repo: Option<&str>) -> Option<u64> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let kind = self.kind(session, task);
+        manage_history::expected_peak_mb(&self.history, repo, kind.as_deref())
+    }
+
+    /// [`Peaks::expected`] for a lease already in the ledger.
+    pub(crate) fn of_lease(&self, l: &resources::Lease) -> Option<u64> {
+        self.expected(&l.session, &l.task, l.repo.as_deref())
+    }
 }
 
 /// Change `session`'s feed row for `task` under the feed's lock, when the
@@ -2616,6 +2662,7 @@ mod tests {
                 load1: Some(0.0),
             },
             default_lease: Default::default(),
+            mem_use: Default::default(),
         }
     }
 
@@ -2681,6 +2728,39 @@ mod tests {
             run_as(&dir, "b", "release t2", T0 + 22 * MIN).0,
             "t2 held no lease"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#281: a claim counts at its kind's measured peak, so 3G
+    /// leases that peak at 1.3G leave room for more than the limit ÷ 3G.
+    #[test]
+    fn claim_counts_a_task_at_its_kinds_peak() {
+        let dir = scratch("claim-peak");
+        let h = dir.join(manage_history::FILE);
+        for mb in [1000, 1300, 1200] {
+            let rec = manage_history::Record {
+                key: "demo#1".into(),
+                repo: Some("demo".into()),
+                kind: Some("BUG".into()),
+                peak_mb: Some(mb),
+                ..manage_history::Record::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        // Six 3G leases are 18G, past the 16G limit; at 1.3G each, 7.8G.
+        for n in 2..=7 {
+            let key = format!("demo#{n}");
+            run_as(&dir, "a", &format!("plan {key} --eta 10 --title BUG:x"), T0);
+            let (msg, code) = run_as(&dir, "a", &format!("claim {key} --ram 3G"), T0);
+            assert_eq!(code, resources::exit::GRANTED, "{msg}");
+            assert!(
+                msg.contains("1 cpu, 3G, counted at its kind's peak 1.3G"),
+                "{msg}"
+            );
+        }
+        let shown = run_as(&dir, "a", "resources", T0).0;
+        assert!(shown.contains("memory    7.6G counted of 16G"), "{shown}");
+        assert!(shown.contains("counts 1.3G"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

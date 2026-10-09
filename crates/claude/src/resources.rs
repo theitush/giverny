@@ -23,8 +23,17 @@
 //! **The grant rule** ([`Ledger::try_fit`]): a request fits when
 //! - its CPU ≤ the limit − Σ live leases, and ≤ the machine's cores − Σ
 //!   leases − the 1-minute load average that the leases do not explain;
-//! - its RAM ≤ the limit − Σ live leases, and ≤ `MemAvailable` − headroom
-//!   ([`ram_headroom`]): how other programs' load counts;
+//! - its memory fits by **expected peaks**, not by the sum of leases
+//!   (giverny#281): every task, running or about to, counts at its expected
+//!   peak — the high end of its kind's measured history (p90, as `claim`
+//!   summarises it, [`crate::manage_history::expected_peak_mb`]), else its
+//!   lease, else the default lease — or at what it really uses now when
+//!   that is more ([`MemUse`]). The new task's expected peak must fit under
+//!   the limit (the slice's `MemoryMax`) less a headroom
+//!   ([`ram_headroom`]), the claudes' own memory in the slice, and every
+//!   other task so counted; and under `MemAvailable` less the headroom and
+//!   what the running tasks may still grow by before their peaks: how
+//!   other programs' load counts;
 //! - each GPU it asks for has the VRAM free under that GPU's limit;
 //! - none of its slots (`cargo:/path/to/target`, any name) is held: slots
 //!   are exclusive.
@@ -36,7 +45,19 @@
 //! go past a big one that is waiting, never take what the big one waits
 //! for. A queued manager polls by running the same `claim` again,
 //! which also keeps its place alive.
+//!
+//! **Leases are protections.** Since giverny#262 the kernel holds the one
+//! ceiling (the slice's `MemoryMax`) and a lease's RAM is its commands'
+//! `MemoryLow`. Admitting by expected peaks lets the leases' sum exceed the
+//! slice; that is safe because a protection only covers memory in use, so
+//! what the kernel is asked to protect is at most Σ min(lease, use) ≤
+//! Σ max(expected peak, use), which admission keeps under the limit. Only
+//! a task that outgrows its history can push the slice to its ceiling; then
+//! the kernel reclaims from whoever is above its protection, and if it
+//! must kill, kills a command (never a claude, [`crate::tab_cap`]), which
+//! `run` reports and the history learns from.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use giverny_core::limits::{Limits, Load, Machine, Mem, Resolved};
@@ -127,6 +148,11 @@ pub struct Request {
     /// The task's Priority (`asap`, `high`, `medium`, `low`): queued ahead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// What tasks like this one peak at (the high end of their history),
+    /// MiB: what admission counts it at. `None`: too little history, so it
+    /// counts at its RAM (or the default lease when it asks none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_mb: Option<u64>,
 }
 
 /// What one session's task holds.
@@ -150,6 +176,10 @@ pub struct Lease {
     pub vram_mb: u64,
     #[serde(default)]
     pub slots: Vec<String>,
+    /// The expected peak it was admitted at, MiB, when its kind's history
+    /// gave one; else it counts at `ram_mb` (or the default lease).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_mb: Option<u64>,
     #[serde(with = "ts")]
     pub granted_at: u64,
     #[serde(with = "ts")]
@@ -202,12 +232,15 @@ pub struct Capacity {
     pub load: Load,
     /// `[management_panel.lease]`: what a task gets when nothing says otherwise.
     pub default_lease: giverny_core::config::DefaultLease,
+    /// What the slice really holds now.
+    pub mem_use: MemUse,
 }
 
 impl Capacity {
     /// This machine now, under the limits in Giverny's `config.toml`
-    /// (`[manager.limits]`), all `auto` when it has none.
-    pub fn detect() -> Result<Capacity, String> {
+    /// (`[manager.limits]`), all `auto` when it has none, with what the
+    /// running commands of the ledger at `ledger` use.
+    pub fn detect(ledger: &Path) -> Result<Capacity, String> {
         let machine = Machine::detect();
         let configured = Limits::load()?;
         Ok(Capacity {
@@ -216,7 +249,96 @@ impl Capacity {
             load: Load::sample(),
             machine,
             default_lease: giverny_core::config::DefaultLease::load(),
+            mem_use: MemUse::sample(&crate::run_live::runs_dir(ledger)),
         })
+    }
+
+    /// What admission counts `l` at: its expected peak (else its RAM, else
+    /// the default lease), or what it uses now when that is more.
+    pub fn counted_mb(&self, l: &Lease) -> u64 {
+        let expected = l.peak_mb.unwrap_or(if l.ram_mb > 0 {
+            l.ram_mb
+        } else {
+            self.default_lease.ram.0
+        });
+        expected.max(self.mem_use.of(&l.id))
+    }
+}
+
+/// Memory the slice's processes cannot give back (no swap): a cgroup's
+/// `memory.current` less its page cache (`file` in `memory.stat`), MiB.
+/// The page cache is left out because the kernel reclaims it first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemUse {
+    /// Each lease's running `giverny manage run` commands, summed, by
+    /// lease id (`<session>:<task>`).
+    pub by_lease: HashMap<String, u64>,
+    /// The rest of the slice: the claudes themselves (and their plain
+    /// commands), which no lease counts.
+    pub other_mb: u64,
+}
+
+impl MemUse {
+    pub fn of(&self, lease_id: &str) -> u64 {
+        self.by_lease.get(lease_id).copied().unwrap_or(0)
+    }
+
+    /// The running commands under `runs_dir` (their scopes' cgroups, from
+    /// [`crate::run_live::running`]) and [`crate::tab_cap::SLICE`] now.
+    /// Nothing where there is no such cgroup (no user systemd, not Linux).
+    pub fn sample(runs_dir: &Path) -> MemUse {
+        let mut by_lease: HashMap<String, u64> = HashMap::new();
+        let mut in_runs = 0;
+        for (session, task, cg) in crate::run_live::running(runs_dir) {
+            if let Some(mb) = held_mb(&cg) {
+                *by_lease.entry(lease_id(&session, &task)).or_default() += mb;
+                in_runs += mb;
+            }
+        }
+        let other_mb = slice_dir()
+            .and_then(|d| held_mb(&d))
+            .map_or(0, |mb| mb.saturating_sub(in_runs));
+        MemUse { by_lease, other_mb }
+    }
+}
+
+/// `memory.current` − `file` of the cgroup at `dir`, MiB.
+fn held_mb(dir: &Path) -> Option<u64> {
+    let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let file = std::fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|t| stat_field(&t, "file"))
+        .unwrap_or(0);
+    Some(current.saturating_sub(file) / (1024 * 1024))
+}
+
+/// One `memory.stat` field, bytes.
+fn stat_field(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once(' ')?;
+        (k == name).then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
+/// The slice's cgroup under this user's systemd manager, when it exists.
+fn slice_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let d = PathBuf::from(format!(
+            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/giverny.slice/{}",
+            crate::tab_cap::SLICE
+        ));
+        d.is_dir().then_some(d)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -229,8 +351,11 @@ pub struct Free {
     pub vram_mb: Vec<(u32, u64)>,
     /// Load average beyond what the leases explain.
     pub foreign_cpu: f64,
-    /// RAM grantable by `MemAvailable` alone, when known.
+    /// RAM grantable by `MemAvailable` alone, when known: less the
+    /// headroom and what the running tasks may still grow by.
     pub mem_room_mb: Option<u64>,
+    /// What every lease counts at, summed ([`Capacity::counted_mb`]).
+    pub counted_mb: u64,
 }
 
 /// A fitting grant: the RAM and GPUs it gets.
@@ -238,6 +363,8 @@ pub struct Free {
 pub struct Fit {
     pub ram_mb: u64,
     pub gpus: Vec<u32>,
+    /// What admission counted it at, MiB.
+    pub counted_mb: u64,
 }
 
 /// The answer to a claim.
@@ -365,7 +492,15 @@ impl Ledger {
     /// What is free now under `cap`.
     pub fn free(&self, cap: &Capacity) -> Free {
         let leased_cpu: u32 = self.leases.iter().map(|l| l.cpu).sum();
-        let leased_ram: u64 = self.leases.iter().map(|l| l.ram_mb).sum();
+        let counted_mb: u64 = self.leases.iter().map(|l| cap.counted_mb(l)).sum();
+        // What the leases may still grow by before their peaks: not yet
+        // taken out of `MemAvailable`.
+        let growth_mb: u64 = self
+            .leases
+            .iter()
+            .map(|l| cap.counted_mb(l).saturating_sub(cap.mem_use.of(&l.id)))
+            .sum();
+        let headroom = ram_headroom(&cap.machine).0;
         let foreign_cpu = cap
             .load
             .load1
@@ -377,12 +512,14 @@ impl Ledger {
         let mem_room_mb = cap
             .load
             .mem_available
-            .map(|a| a.0.saturating_sub(ram_headroom(&cap.machine).0));
+            .map(|a| a.0.saturating_sub(headroom).saturating_sub(growth_mb));
         let ram_mb = cap
             .limits
             .ram
             .0
-            .saturating_sub(leased_ram)
+            .saturating_sub(headroom)
+            .saturating_sub(cap.mem_use.other_mb)
+            .saturating_sub(counted_mb)
             .min(mem_room_mb.unwrap_or(u64::MAX));
         let vram_mb = cap
             .limits
@@ -404,7 +541,26 @@ impl Ledger {
             vram_mb,
             foreign_cpu,
             mem_room_mb,
+            counted_mb,
         }
+    }
+
+    /// What `req` counts at when it holds `ram_mb`: its expected peak, else
+    /// that RAM, else the default lease — never more than an empty slice
+    /// has room for, so a task whose kind once peaked near the limit still
+    /// starts on an idle box.
+    fn counted_for(cap: &Capacity, req: &Request, ram_mb: u64) -> u64 {
+        let expected = req.peak_mb.unwrap_or(if ram_mb > 0 {
+            ram_mb
+        } else {
+            cap.default_lease.ram.0
+        });
+        expected.min(
+            cap.limits
+                .ram
+                .0
+                .saturating_sub(ram_headroom(&cap.machine).0),
+        )
     }
 
     /// Does `req` fit now? `Ok(Fit)` with what it would get, else what is
@@ -415,10 +571,16 @@ impl Ledger {
         if req.cpu > free.cpu {
             short.push("cpu".to_string());
         }
-        let ram_mb = if req.ram_mb <= free.ram_mb {
+        // The lease's RAM is the commands' protection; what must fit is
+        // the task's expected peak. A smaller grant helps only a task with
+        // no history, which counts at its RAM.
+        let ram_mb = if Ledger::counted_for(cap, req, req.ram_mb) <= free.ram_mb {
             req.ram_mb
         } else {
-            let floor = req.min_ram_mb.unwrap_or(u64::MAX);
+            let floor = req
+                .min_ram_mb
+                .filter(|_| req.peak_mb.is_none() && req.ram_mb > 0)
+                .unwrap_or(u64::MAX);
             let room = free.ram_mb / RAM_STEP_MB * RAM_STEP_MB;
             if floor <= room {
                 room
@@ -447,6 +609,7 @@ impl Ledger {
         if short.is_empty() {
             Ok(Fit {
                 ram_mb,
+                counted_mb: Ledger::counted_for(cap, req, ram_mb),
                 gpus: gpus
                     .into_iter()
                     .take(req.gpu as usize)
@@ -488,6 +651,7 @@ impl Ledger {
                 gpus,
                 vram_mb: r.vram_mb,
                 slots: r.slots.clone(),
+                peak_mb: Some(Ledger::counted_for(cap, r, r.ram_mb)),
                 granted_at: w.queued_at,
                 heartbeat_at: w.heartbeat_at,
             });
@@ -582,6 +746,7 @@ impl Ledger {
                     gpus: fit.gpus,
                     vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
                     slots: req.slots.clone(),
+                    peak_mb: req.peak_mb.map(|_| fit.counted_mb),
                     granted_at: now,
                     heartbeat_at: now,
                 };
@@ -650,6 +815,20 @@ impl Ledger {
         Some((before, l.clone()))
     }
 
+    /// Give each lease admitted before its kind had a history (or before
+    /// giverny#281) the expected peak `peak` finds for it now, so it stops
+    /// counting at its whole lease. True when any changed.
+    pub fn fill_peaks(&mut self, peak: &dyn Fn(&Lease) -> Option<u64>) -> bool {
+        let mut changed = false;
+        for l in self.leases.iter_mut().filter(|l| l.peak_mb.is_none()) {
+            if let Some(p) = peak(l) {
+                l.peak_mb = Some(p);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Release `session`'s `task`: its lease and any place in the queue.
     /// The lease released, if there was one.
     pub fn release(&mut self, session: &str, task: &str, now: u64) -> Option<Lease> {
@@ -668,7 +847,8 @@ impl Ledger {
 fn blocks(l: &Lease, req: &Request, short: &[String]) -> bool {
     short.iter().any(|s| match s.as_str() {
         "cpu" => l.cpu > 0,
-        "ram" => l.ram_mb > 0,
+        // Every lease counts at some memory (its peak, RAM or the default).
+        "ram" => true,
         "gpu" => !l.gpus.is_empty(),
         s => s.strip_prefix("slot ").is_some_and(|slot| {
             l.slots.iter().any(|x| x == slot) && req.slots.iter().any(|x| x == slot)
@@ -777,6 +957,15 @@ pub fn ask_hint(
     ))
 }
 
+/// `, counted at its kind's peak 1.2G` when admission counted a lease at
+/// an expected peak other than its RAM.
+fn counted(l: &Lease) -> String {
+    match l.peak_mb {
+        Some(p) if p != l.ram_mb => format!(", counted at its kind's peak {}", Mem(p)),
+        _ => String::new(),
+    }
+}
+
 /// The line `claim` prints.
 pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<i64>) -> String {
     let holder = |l: &Lease| {
@@ -786,11 +975,12 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
         format!("{} ({}{left})", l.task, l.describe())
     };
     match o {
-        Outcome::Granted(l) => format!("granted {task}: {}", l.describe()),
+        Outcome::Granted(l) => format!("granted {task}: {}{}", l.describe(), counted(l)),
         Outcome::Held(l) => format!("{task} holds its lease already: {}", l.describe()),
         Outcome::GrantedSmaller { lease, wanted_mb } => format!(
-            "granted smaller {task}: {} (asked {}, more is not free)",
+            "granted smaller {task}: {}{} (asked {}, more is not free)",
             lease.describe(),
+            counted(lease),
             Mem(*wanted_mb)
         ),
         Outcome::Queued {
@@ -1102,6 +1292,14 @@ pub fn report(
         ram_headroom(m),
     ));
     out.push_str(&format!(
+        "memory    {} counted of {}: the leases at their expected peaks (or use, \
+         or lease), {} for the claudes, {} headroom\n",
+        Mem(free.counted_mb),
+        lim.ram,
+        Mem(cap.mem_use.other_mb),
+        ram_headroom(m),
+    ));
+    out.push_str(&format!(
         "free now  {} cores, {} RAM{}\n",
         free.cpu,
         Mem(free.ram_mb),
@@ -1119,8 +1317,15 @@ pub fn report(
             let left = eta(&x.session, &x.task)
                 .map(|s| format!(", ~{} left", feed::fmt_span(s.max(0))))
                 .unwrap_or_default();
+            let using = cap.mem_use.of(&x.id);
+            let counts = cap.counted_mb(x);
+            let mem = if using > 0 {
+                format!("  counts {}, using {}", Mem(counts), Mem(using))
+            } else {
+                format!("  counts {}", Mem(counts))
+            };
             out.push_str(&format!(
-                "  {:<16} {}  session {}  beat {} ago{left}\n",
+                "  {:<16} {}{mem}  session {}  beat {} ago{left}\n",
                 x.task,
                 x.describe(),
                 short_session(&x.session),
@@ -1182,6 +1387,7 @@ mod tests {
             },
             machine,
             default_lease: Default::default(),
+            mem_use: Default::default(),
         }
     }
 
@@ -1197,11 +1403,12 @@ mod tests {
     fn two_sessions_past_the_limit_queue_and_a_release_unblocks() {
         let c = cap();
         let mut l = Ledger::default();
-        let a = l.claim(&c, "a", "t1", None, &req(6, 8), T0);
+        let a = l.claim(&c, "a", "t1", None, &req(6, 7), T0);
         assert!(matches!(a, Outcome::Granted(_)), "{a:?}");
-        let b = l.claim(&c, "b", "t2", None, &req(6, 8), T0);
+        let b = l.claim(&c, "b", "t2", None, &req(6, 7), T0);
         assert!(matches!(b, Outcome::Granted(_)), "{b:?}");
-        // The limit (12 cores, 16 G) is full: a third waits behind both.
+        // The limit (12 cores, 16 G less 1.15 G headroom) is full: a third
+        // waits behind both.
         let q = l.claim(&c, "b", "t3", None, &req(2, 2), T0 + MIN);
         let Outcome::Queued {
             position, blockers, ..
@@ -1216,7 +1423,7 @@ mod tests {
         let q2 = l.claim(&c, "a", "t4", None, &req(1, 1), T0 + 2 * MIN);
         assert!(matches!(q2, Outcome::Queued { position: 2, .. }), "{q2:?}");
         // Once t1 is released, t4 may go first only with what is left after
-        // t3's share is set aside (6 cores, 8 G free; t3 wants 2 and 2 G).
+        // t3's share is set aside (6 cores, 7.85 G free; t3 wants 2 and 2 G).
         assert!(l.release("a", "t1", T0 + 3 * MIN).is_some());
         let big = l.claim(&c, "a", "t4", None, &req(5, 1), T0 + 3 * MIN);
         assert!(
@@ -1336,6 +1543,154 @@ mod tests {
         let l = Ledger::default();
         assert_eq!(l.free(&c).cpu, 5);
         assert!(l.try_fit(&c, &req(6, 1)).is_err());
+    }
+
+    /// A lease as a 3G default, its kind peaking at `peak_mb`.
+    fn idle(l: &mut Ledger, c: &Capacity, task: &str, peak_mb: Option<u64>) {
+        let r = Request {
+            peak_mb,
+            ..req(1, 3)
+        };
+        let g = l.claim(c, "other", task, Some("demo"), &r, T0);
+        assert!(matches!(g, Outcome::Granted(_)), "{task}: {g:?}");
+    }
+
+    /// giverny#281: five 3G leases whose tasks peak at 1.2G leave room on a
+    /// 16G limit, though their leases alone add up to 15G.
+    #[test]
+    fn idle_leases_admit_a_new_task_by_their_expected_peaks() {
+        let c = cap();
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            idle(&mut l, &c, t, Some(1229));
+        }
+        assert_eq!(l.leases.iter().map(|x| x.ram_mb).sum::<u64>(), 15 * 1024);
+        let free = l.free(&c);
+        assert_eq!(free.counted_mb, 5 * 1229);
+        let new = Request {
+            peak_mb: Some(1229),
+            ..req(1, 3)
+        };
+        let g = l.claim(&c, "s", "new", Some("demo"), &new, T0);
+        let Outcome::Granted(lease) = &g else {
+            panic!("{g:?}")
+        };
+        // The lease is the 3G asked (its protection); it counts at its peak.
+        assert_eq!((lease.ram_mb, lease.peak_mb), (3 * 1024, Some(1229)));
+        assert_eq!(
+            outcome_line("new", &g, &|_, _| None),
+            "granted new: 1 cpu, 3G, counted at its kind's peak 1.2G"
+        );
+
+        // Leases granted before their kind had a history (or before #281)
+        // count at their whole RAM until the history gives them a peak:
+        // four take 12G, the claudes 2G, so 0.85G is left.
+        let mut c = cap();
+        c.mem_use.other_mb = 2048;
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d"] {
+            idle(&mut l, &c, t, None);
+        }
+        let q = l.claim(&c, "s", "new", Some("demo"), &new, T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        assert!(l.fill_peaks(&|x| (x.repo.as_deref() == Some("demo")).then_some(1229)));
+        assert!(!l.fill_peaks(&|_| Some(1)), "a peak once given stays");
+        let g = l.claim(&c, "s", "new", Some("demo"), &new, T0);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        assert!(l.queue.is_empty());
+
+        // A lease of no RAM and no history counts at the default lease.
+        let c = cap();
+        let mut l = Ledger::default();
+        l.claim(&c, "s", "slot", None, &req(1, 0), T0);
+        assert_eq!(l.free(&c).counted_mb, 3 * 1024);
+    }
+
+    /// giverny#281: what is really committed still queues a task — peaks
+    /// that fill the slice, a task already above its peak, the claudes' own
+    /// memory, other programs.
+    #[test]
+    fn a_really_full_box_still_queues() {
+        let new = Request {
+            peak_mb: Some(1229),
+            ..req(1, 3)
+        };
+        // Tasks that peak at 3.5G: four fill 16G less the headroom.
+        let c = cap();
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d"] {
+            idle(&mut l, &c, t, Some(3584));
+        }
+        let q = l.claim(&c, "s", "new", None, &new, T0);
+        let Outcome::Queued {
+            short, blockers, ..
+        } = &q
+        else {
+            panic!("{q:?}")
+        };
+        assert_eq!(short, &vec!["ram".to_string()]);
+        assert_eq!(blockers.len(), 4);
+
+        // Five idle 1.2G peaks leave room, until one runs at 9G: a task
+        // above its peak counts at its real use.
+        let mut c = cap();
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            idle(&mut l, &c, t, Some(1229));
+        }
+        assert!(l.try_fit(&c, &new).is_ok());
+        c.mem_use.by_lease.insert(lease_id("other", "a"), 9 * 1024);
+        assert_eq!(l.free(&c).counted_mb, 4 * 1229 + 9 * 1024);
+        assert_eq!(l.try_fit(&c, &new), Err(vec!["ram".to_string()]));
+        // A task using less than its peak still counts at its peak.
+        c.mem_use.by_lease.insert(lease_id("other", "a"), 100);
+        assert!(l.try_fit(&c, &new).is_ok());
+
+        // The claudes themselves hold 8G of the slice.
+        let mut c = cap();
+        c.mem_use.other_mb = 8 * 1024;
+        assert_eq!(l.try_fit(&c, &new), Err(vec!["ram".to_string()]));
+
+        // Other programs leave 5G available: the idle leases may still grow
+        // by their peaks (3 × 1.2G), so 5G − 1.15G − 3.6G is too little…
+        let mut c = cap();
+        c.load.mem_available = Some(Mem::gb(5));
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c"] {
+            idle(&mut l, &c, t, Some(1229));
+        }
+        assert_eq!(l.try_fit(&c, &new), Err(vec!["ram".to_string()]));
+        // …unless they already use what they will peak at.
+        for t in ["a", "b", "c"] {
+            c.mem_use.by_lease.insert(lease_id("other", t), 1229);
+        }
+        assert!(l.try_fit(&c, &new).is_ok());
+    }
+
+    /// What a run's scope holds is its memory less its page cache.
+    #[test]
+    fn a_runs_memory_is_read_from_its_scope_without_the_page_cache() {
+        let dir = std::env::temp_dir().join(format!("giverny-memuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runs = dir.join("runs");
+        let cg = dir.join("scope");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("memory.current"), format!("{}\n", 3u64 << 30)).unwrap();
+        std::fs::write(
+            cg.join("memory.stat"),
+            format!("anon {}\nfile {}\nkernel 0\n", 2u64 << 30, 1u64 << 30),
+        )
+        .unwrap();
+        assert_eq!(held_mb(&cg), Some(2048));
+        let stats = runs.join("1-0.stats");
+        std::fs::write(&stats, format!("started\ncgroup {}\n", cg.display())).unwrap();
+        let _live = crate::run_live::register(&stats, "demo#7", "s1", T0).unwrap();
+        let u = MemUse::sample(&runs);
+        assert_eq!(u.of("s1:demo#7"), 2048);
+        assert_eq!(u.of("s1:other"), 0);
+        assert_eq!(held_mb(&dir.join("none")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

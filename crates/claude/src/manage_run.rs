@@ -416,24 +416,27 @@ fn lease_for(
         Some(c) => c.default_lease,
         None => giverny_core::config::DefaultLease::load(),
     };
-    let req = resources::Request {
-        cpu: flags.cpu.unwrap_or(default.cpu_cores),
-        ram_mb: flags.ram_mb.unwrap_or(default.ram.0),
-        ..flags.request()
-    };
     let repo = flags.repo.clone().or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
         manage_history::repo_of(task, &cwd)
     });
+    let peaks = manage::Peaks::load(dir);
+    let req = resources::Request {
+        cpu: flags.cpu.unwrap_or(default.cpu_cores),
+        ram_mb: flags.ram_mb.unwrap_or(default.ram.0),
+        peak_mb: peaks.expected(session, task, repo.as_deref()),
+        ..flags.request()
+    };
     let mut waiting = false;
     let mut said = false;
     loop {
         let capacity = match cap {
             Some(c) => c.clone(),
-            None => resources::Capacity::detect()?,
+            None => resources::Capacity::detect(ledger)?,
         };
         let now = manage::now_ms();
         let out = resources::with_ledger(ledger, now, |l| {
+            l.fill_peaks(&|x| peaks.of_lease(x));
             l.claim(&capacity, session, task, repo.as_deref(), &req, now)
         })?;
         resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
@@ -931,6 +934,7 @@ mod tests {
                 load1: Some(0.0),
             },
             default_lease: Default::default(),
+            mem_use: Default::default(),
         }
     }
 
