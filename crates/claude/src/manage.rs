@@ -33,7 +33,14 @@ pub const USAGE: &str = "\
 usage: giverny manage <command> [args] [--session <id>]
 
   plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE] [--repo R]
-                              queue a task (a Next up row) with its estimate
+               [--after <task>]
+                              queue a task (a Next up row) with its estimate;
+                              --after: it waits for that task to land
+                              (`--after \"\"` clears it)
+  hold  <task> --why \"<reason>\"
+                              a planned task waits on the dispatcher's own
+                              call: the reason shows on its row; tell the user
+  unhold <task>               end the hold (also `release-hold`)
   start <task> [--eta <dur>] [--title T] [--agent <id> [--heavy-ok]] [--note N]
                [--brief FILE] [--repo R]
                               the task's worker is starting now (Running);
@@ -123,6 +130,10 @@ pub enum Cmd {
     Pause(String),
     Resume(String),
     Drop(String),
+    /// A planned task waits on the dispatcher, for the reason in `--why`.
+    Hold(String),
+    /// End a hold.
+    Unhold(String),
     Show,
     Path,
     ClearDone,
@@ -159,6 +170,8 @@ pub struct Flags {
     pub why: Option<String>,
     /// The repo the task is from, when the key and directory do not say.
     pub repo: Option<String>,
+    /// `plan --after`: the task this one waits for (empty clears it).
+    pub after: Option<String>,
     /// `claim`: what the worker needs.
     pub cpu: Option<u32>,
     pub ram_mb: Option<u64>,
@@ -277,6 +290,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--session" => flags.session = Some(val("--session")?),
             "--why" => flags.why = Some(val("--why")?),
             "--repo" => flags.repo = Some(val("--repo")?),
+            "--after" => flags.after = Some(val("--after")?.trim().to_string()),
             "--cpu" => flags.cpu = Some(parse_count("--cpu", &val("--cpu")?)?),
             "--gpu" => flags.gpu = Some(parse_count("--gpu", &val("--gpu")?)?),
             "--ram" => flags.ram_mb = Some(parse_mem("--ram", &val("--ram")?)?),
@@ -316,6 +330,8 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "pause" => Cmd::Pause(task()?),
         "resume" => Cmd::Resume(task()?),
         "drop" => Cmd::Drop(task()?),
+        "hold" => Cmd::Hold(task()?),
+        "unhold" | "release-hold" => Cmd::Unhold(task()?),
         "show" => Cmd::Show,
         "path" => Cmd::Path,
         "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
@@ -343,6 +359,12 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
     };
     if matches!(cmd, Cmd::Plan(_)) && flags.eta_s.is_none() {
         return Err("`plan` needs --eta: the pane's Next up rows show it".into());
+    }
+    if matches!(cmd, Cmd::Hold(_)) && flags.why.as_deref().is_none_or(|w| w.trim().is_empty()) {
+        return Err(
+            "`hold` needs --why \"<reason>\": a planned task waits only on a reason that shows"
+                .into(),
+        );
     }
     if matches!(cmd, Cmd::Run(_)) && flags.command.is_empty() {
         return Err(format!(
@@ -988,7 +1010,9 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Land(k)
         | Cmd::Pause(k)
         | Cmd::Resume(k)
-        | Cmd::Drop(k) => k.clone(),
+        | Cmd::Drop(k)
+        | Cmd::Hold(k)
+        | Cmd::Unhold(k) => k.clone(),
         Cmd::Show
         | Cmd::Path
         | Cmd::Clear
@@ -1016,12 +1040,37 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                     stage_word(s)
                 ));
             }
+            // A task waits only on one that is in the plan: a typo would
+            // be a silent wait.
+            let after = f.after.as_deref().filter(|a| !a.is_empty());
+            if let Some(a) = after {
+                if a == key {
+                    return Err(format!("`{key}` cannot wait for itself"));
+                }
+                if find(rows, a).is_none() {
+                    return Err(format!(
+                        "no task `{a}` in this manager session to wait for: plan it first"
+                    ));
+                }
+            }
             let i = at.unwrap_or_else(|| {
                 rows.push(json!({ "key": key }));
                 rows.len() - 1
             });
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
             row.insert("stage".into(), json!("planned"));
+            // When it joined the plan: the pane flags a Next up row left
+            // idle a while with nothing recorded to wait on.
+            row.entry("planned").or_insert(json!(stamp(now)));
+            match (f.after.as_deref(), after) {
+                (_, Some(a)) => {
+                    row.insert("after".into(), json!(a));
+                }
+                (Some(_), None) => {
+                    row.remove("after");
+                }
+                _ => {}
+            }
             row.insert("eta_s".into(), json!(f.eta_s.unwrap_or(0)));
             drop_old_guess(row, f);
             set_str(row, "title", &f.title);
@@ -1058,6 +1107,10 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                     "eta_at",
                     "deadline_asked",
                     "overdue_asked",
+                    "after",
+                    "held",
+                    "held_at",
+                    "unheld",
                 ] {
                     row.remove(k);
                 }
@@ -1219,6 +1272,34 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             rows.remove(i);
             Ok(format!("dropped {key}"))
         }
+        Cmd::Hold(_) => {
+            let i = at.ok_or_else(missing)?;
+            if stage != Some(feed::Stage::Planned) {
+                return Err(format!(
+                    "`{key}` is not planned: only a Next up row is held (`pause` stops a running one)"
+                ));
+            }
+            let why = f.why.as_deref().unwrap_or("").trim().to_string();
+            let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+            row.insert("held".into(), json!(why));
+            row.insert("held_at".into(), json!(stamp(now)));
+            row.remove("unheld");
+            Ok(format!(
+                "held {key}: {why} (the row says so; tell the user, and `giverny manage unhold {key}` ends it)"
+            ))
+        }
+        Cmd::Unhold(_) => {
+            let i = at.ok_or_else(missing)?;
+            let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+            if row.remove("held").is_none() {
+                return Err(format!("`{key}` is not held"));
+            }
+            row.remove("held_at");
+            row.insert("unheld".into(), json!(stamp(now)));
+            Ok(format!(
+                "released the hold on {key}: start it once its lane and lease are free"
+            ))
+        }
         Cmd::Show
         | Cmd::Path
         | Cmd::Clear
@@ -1231,6 +1312,31 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Ask(..)
         | Cmd::Reply(..) => unreachable!(),
     }
+}
+
+/// What a Next up row waits on, as `show` says it: the dispatcher's hold,
+/// the task it is planned after (until that lands), a queued lease.
+fn planned_wait(r: &Map<String, Value>, rows: &[Value]) -> Option<String> {
+    if let Some(why) = r.get("held").and_then(Value::as_str) {
+        return Some(format!("held: {why}"));
+    }
+    if let Some(a) = r.get("after").and_then(Value::as_str) {
+        let landed = rows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|o| o.get("key").and_then(Value::as_str) == Some(a))
+            .is_none_or(|o| stage_of(o) == Some(feed::Stage::Done));
+        if !landed {
+            return Some(format!("after {a}"));
+        }
+    }
+    let lease = r.get("lease")?;
+    (lease.get("state").and_then(Value::as_str) == Some("queued")).then(|| {
+        match lease.get("position").and_then(Value::as_u64) {
+            Some(p) => format!("lease #{p} in queue"),
+            None => "lease in queue".into(),
+        }
+    })
 }
 
 /// The rows as text, in the pane's section order.
@@ -1271,9 +1377,15 @@ pub fn show(doc: &Value, now: u64) -> String {
                         }
                     )
                 }
-                feed::Stage::Planned => eta
-                    .map(|e| format!("~{}", feed::fmt_span(e as i64)))
-                    .unwrap_or_default(),
+                feed::Stage::Planned => {
+                    let est = eta
+                        .map(|e| format!("~{}", feed::fmt_span(e as i64)))
+                        .unwrap_or_default();
+                    match planned_wait(r, &rows) {
+                        Some(w) => format!("{est}, {w}"),
+                        None => est,
+                    }
+                }
                 feed::Stage::Done => {
                     let took = started
                         .zip(ms_of(r, "ended"))
@@ -2185,6 +2297,85 @@ mod tests {
         let shown = run(&dir, "show", T0 + 61 * MIN).unwrap();
         assert!(shown.contains("auth-fix"), "{shown}");
         assert!(shown.contains("(+5m)"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#282: a planned task waits only on what its row says.
+    #[test]
+    fn a_planned_task_says_what_it_waits_for() {
+        let dir = scratch("waits");
+        assert!(
+            parse_args(&args("hold a")).is_err(),
+            "a hold needs its reason"
+        );
+        assert!(parse_args(&args("hold a --why")).is_err());
+        assert_eq!(
+            parse_args(&args("release-hold a")).unwrap().0,
+            Cmd::Unhold("a".into())
+        );
+        run(&dir, "plan first --eta 10", T0).unwrap();
+        assert!(
+            run(&dir, "plan b --eta 10 --after nosuch", T0).is_err(),
+            "a typo is never a silent wait"
+        );
+        assert!(run(&dir, "plan b --eta 10 --after b", T0).is_err());
+        run(&dir, "plan b --eta 10 --after first", T0).unwrap();
+        run(&dir, "plan c --eta 10", T0).unwrap();
+        let said = run_line(&dir, "s1", r#"hold c --why "a quiet machine""#, T0 + MIN)
+            .unwrap()
+            .0;
+        assert!(said.contains("tell the user"), "{said}");
+        let f = read_feed(&dir);
+        assert_eq!(f.rows[1].after.as_deref(), Some("first"));
+        assert_eq!(f.rows[1].planned_ms, Some(T0));
+        assert_eq!(f.rows[2].held.as_deref(), Some("a quiet machine"));
+        let shown = run(&dir, "show", T0 + MIN).unwrap();
+        assert!(shown.contains("~10m, after first"), "{shown}");
+        assert!(shown.contains("~10m, held: a quiet machine"), "{shown}");
+
+        // Re-planning keeps when it joined the plan; `--after ""` clears.
+        run(&dir, r#"plan b --eta 20"#, T0 + 2 * MIN).unwrap();
+        assert_eq!(read_feed(&dir).rows[1].after.as_deref(), Some("first"));
+        assert_eq!(read_feed(&dir).rows[1].planned_ms, Some(T0));
+        run_line(&dir, "s1", r#"plan b --eta 20 --after """#, T0 + 2 * MIN).unwrap();
+        assert_eq!(read_feed(&dir).rows[1].after, None);
+
+        // The task before it landed: no longer a wait.
+        run(&dir, "plan b --eta 20 --after first", T0 + 2 * MIN).unwrap();
+        run(&dir, "start first", T0 + 2 * MIN).unwrap();
+        assert!(
+            run(&dir, "show", T0 + 3 * MIN)
+                .unwrap()
+                .contains("after first")
+        );
+        assert!(
+            run_line(&dir, "s1", r#"hold first --why x"#, T0 + 3 * MIN).is_err(),
+            "only a Next up row is held"
+        );
+        run(&dir, "land first", T0 + 4 * MIN).unwrap();
+        assert!(
+            !run(&dir, "show", T0 + 5 * MIN)
+                .unwrap()
+                .contains("after first")
+        );
+
+        // Ending a hold stamps when, and a second `unhold` says there is none.
+        run(&dir, "unhold c", T0 + 6 * MIN).unwrap();
+        let f = read_feed(&dir);
+        assert_eq!(
+            (f.rows[2].held.as_deref(), f.rows[2].unheld_ms),
+            (None, Some(T0 + 6 * MIN))
+        );
+        assert!(run(&dir, "unhold c", T0 + 6 * MIN).is_err());
+
+        // Starting a held row ends its hold with the rest of the plan's fields.
+        run_line(&dir, "s1", r#"hold c --why "after lunch""#, T0 + 7 * MIN).unwrap();
+        run(&dir, "start c", T0 + 8 * MIN).unwrap();
+        let f = read_feed(&dir);
+        assert_eq!(
+            (f.rows[2].held.as_deref(), f.rows[2].unheld_ms),
+            (None, None)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

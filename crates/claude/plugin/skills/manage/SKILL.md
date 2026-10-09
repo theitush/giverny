@@ -33,7 +33,8 @@ choose:
   the pane shows.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
-lanes may run at the same time; tasks sharing files run one after another.
+lanes may run at the same time; tasks sharing files run one after another: plan
+each one after the task ahead of it in its lane (`--after <task>`).
 
 Write each task's **brief** to a file: the prompt you will give its worker
 (see [Start a task](#2-start-a-task)), or at least the task's own text. Its
@@ -46,6 +47,10 @@ Record every task, in the order you mean to run it:
 ```bash
 giverny-manage plan auth-fix --eta 25 --title "Fix the token refresh race" --brief briefs/auth-fix.md
 giverny-manage plan docs-api --eta 15 --title "Document the new endpoints" --brief briefs/docs-api.md
+```
+
+```bash
+giverny-manage plan auth-tests --eta 10 --title "Test the refresh race" --after auth-fix --brief briefs/auth-tests.md
 ```
 
 Keep the briefs somewhere that outlives the manager session (a scratch directory is
@@ -82,6 +87,25 @@ user asks whether estimates are getting better, answer from it.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
+### A planned task never waits silently
+
+Start every planned task whose lane is free and whose claim is granted, right
+away. A planned task may wait on only three things, and each shows on its
+**Next up** row:
+
+- **a lease**: its `claim` was queued (`queued for 3G behind …`);
+- **another task**: it was planned `--after` that task (`after auth-fix`),
+  until that one lands;
+- **a hold you record**, with its reason, and tell the user about:
+  `giverny-manage hold <task> --why "<reason>"` (`held: <reason>`);
+  `giverny-manage unhold <task>` ends it. Hold only for a reason that will
+  end: a person to answer, a review, a fix to land elsewhere. "A quieter
+  machine" is not one: the ledger already decides that, so claim and let it
+  queue.
+
+A Next up row with none of these that sits five minutes is flagged in amber
+(`not started (idle 12m)`): start it, or record what it waits for.
+
 ## 2. Start a task
 
 First claim what its worker needs from the machine. Every Giverny session
@@ -101,8 +125,8 @@ folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU. Th
 
 - `granted` (0): go on.
 - `granted smaller` (3, only with `--min-ram`): go on, with what it says.
-- `queued` (4): something it needs is held. Start another planned task from a
-  free lane instead, and re-run the same `claim` now and then until it is
+- `queued` (4): something it needs is held; its row says so. Start another
+  planned task from a free lane instead, and re-run the same `claim` now and then until it is
   granted (nothing calls back). When it says the wait is longer than the task
   itself and suggests `ask`, send `giverny-manage ask <holder's task> "<why, the
   priority, how long you need it>"` and keep polling; the holder may release.
@@ -244,7 +268,8 @@ irreversible change. The text is one line naming who, what exactly, and where
 to see it; the pane shows it at the top of the row.
 
 Landing also gives the task's lease back; there is nothing else to release.
-Then start the next planned task whose lane is free, until none are left.
+Then start, at once, every planned task whose lane is now free (those planned
+`--after` it among them), until none are left.
 
 ## 5. Finish
 

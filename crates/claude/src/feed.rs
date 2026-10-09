@@ -128,6 +128,16 @@ pub struct FeedRow {
     /// dispatcher that forgot it, or a worker of giverny#158's first round),
     /// so no dispatcher will land it: it is Done when its worker is.
     pub follows_worker: bool,
+    /// When the row joined the plan (`giverny manage plan`).
+    pub planned_ms: Option<u64>,
+    /// Planned rows: the task this one waits for, until it lands
+    /// (`plan --after`).
+    pub after: Option<String>,
+    /// Planned rows: the dispatcher holds it, for this reason (`hold --why`).
+    pub held: Option<String>,
+    /// When a hold was last ended (`unhold`): the row's idle clock starts
+    /// there.
+    pub unheld_ms: Option<u64>,
     /// What the machine ledger answered this row's task: a
     /// copy written by `giverny manage claim`, gone on `release`/`land`. The
     /// ledger itself (`resources`) is the truth; this is for drawing.
@@ -403,6 +413,10 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         note: str_field(v, "note"),
         review: str_field(v, "review"),
         follows_worker: v.get("follows_worker").and_then(Value::as_bool) == Some(true),
+        planned_ms: millis_field(v, "planned"),
+        after: str_field(v, "after"),
+        held: str_field(v, "held"),
+        unheld_ms: millis_field(v, "unheld"),
         lease: parse_lease(v),
         usage: parse_usage(v),
         live: None,
