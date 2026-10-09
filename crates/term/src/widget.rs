@@ -134,6 +134,9 @@ pub struct TabView {
     cached: Option<CachedFrame>,
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
+    /// A press that landed on something drawn over the grid (an overlay in a
+    /// layer above it) and so was not reported; its release is not either.
+    swallowed_press: bool,
     last_blink: bool,
     /// When the cursor blink (re)started: on focus, and on every keystroke,
     /// so the cursor is solid while typing. `None` while unfocused.
@@ -216,6 +219,7 @@ impl Default for TabView {
             cached: None,
             had_focus: false,
             last_motion_cell: None,
+            swallowed_press: false,
             last_blink: true,
             blink_from: None,
             search: None,
@@ -587,6 +591,16 @@ impl TabView {
         mode: TermMode,
     ) {
         let mut out: Vec<u8> = Vec::new();
+        // Something the app draws over the grid in a layer of its own (a bar
+        // pinned to its top row) takes the pointer there: a click on it is
+        // not a click in the program.
+        // Asked once, before reading the events: the context is locked
+        // while they are read.
+        let own = ui.layer_id();
+        let covered = ui
+            .input(|i| i.pointer.latest_pos())
+            .and_then(|pos| ui.ctx().layer_id_at(pos))
+            .is_some_and(|layer| layer != own);
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
@@ -597,6 +611,13 @@ impl TabView {
                         modifiers,
                     } => {
                         if !rect.contains(*pos) && *pressed {
+                            continue;
+                        }
+                        if *pressed && covered {
+                            self.swallowed_press = true;
+                            continue;
+                        }
+                        if !*pressed && std::mem::take(&mut self.swallowed_press) {
                             continue;
                         }
                         let Some(code) = button_code(*button) else {
@@ -610,7 +631,7 @@ impl TabView {
                         }
                     }
                     EguiEvent::PointerMoved(pos) => {
-                        if !rect.contains(*pos) {
+                        if !rect.contains(*pos) || covered {
                             continue;
                         }
                         let any_down = i.pointer.any_down();
