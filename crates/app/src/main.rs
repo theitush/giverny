@@ -3531,7 +3531,9 @@ impl App {
             return;
         }
         // A Running worker opens straight into its view: no
-        // overlay. The overlay is what is left when that cannot start.
+        // overlay. The overlay is what is left when that cannot start, and
+        // what a finished worker not yet landed opens at once: Claude Code
+        // lists it no more, so there is no view to walk to (giverny#274).
         if let (giverny_claude::feed::Stage::Running, Some(agent_id)) =
             (click.stage, click.agent_id.as_deref())
             && matches!(

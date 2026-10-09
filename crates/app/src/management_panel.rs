@@ -835,6 +835,12 @@ pub struct RowClick {
     pub key: String,
     /// The Claude Code subagent id, when a worker holds the row.
     pub agent_id: Option<String>,
+    /// A Running row whose worker has finished — handed back, failed,
+    /// killed or stopped — and nobody has landed it (NOW says `worker
+    /// finished — not landed`). Claude Code has dropped that worker from
+    /// its agent list, so there is no view to walk into: a click opens its
+    /// transcript as a Done row's does (giverny#274).
+    pub finished: bool,
     /// The worker's name or description, for a tab title.
     pub name: String,
     /// The worker's `agent-<id>.jsonl`, once known.
@@ -1239,6 +1245,7 @@ fn format_row(
             stage: row.stage,
             key,
             agent_id: row.agent_id().map(str::to_string),
+            finished: row.stage == Stage::Running && l.is_some_and(|l| !l.running()),
             name: l
                 .map(|l| l.display_name().to_string())
                 .or_else(|| f.and_then(|f| f.title.clone()))
@@ -2147,6 +2154,7 @@ mod tests {
             stage,
             key: key.into(),
             agent_id: agent.map(Into::into),
+            finished: false,
             name: "w".into(),
             transcript: None,
             open: None,
@@ -3060,6 +3068,7 @@ mod tests {
                 .any(|f| f == "worker finished — not landed")
         );
         assert_eq!(got.now.chars().count(), NOW_W, "fits NOW");
+        assert!(got.click.finished, "a click opens it as Done (giverny#274)");
         let none = line("acme#617");
         assert_eq!((none.stage, none.now.as_str()), (Stage::Running, NO_WORKER));
         assert!(none.flag);
@@ -3078,6 +3087,7 @@ mod tests {
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
         assert!(!got.flag, "{got:?}");
+        assert!(!got.click.finished, "a working worker is walked into");
         for d in [dir, dir2, dir3] {
             let _ = std::fs::remove_dir_all(&d);
         }

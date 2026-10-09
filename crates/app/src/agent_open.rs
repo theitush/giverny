@@ -16,6 +16,10 @@
 //!   a one-column [`Nudge`] of the pty's width brings the relay's run
 //!   forward so the hold is short. Only when that cannot start does the
 //!   row open the overlay below.
+//! * A Running row whose worker has **finished** but is not landed yet
+//!   ([`RowClick::finished`]) is not walked into: Claude Code has dropped
+//!   that worker from its list, so a walk could only wait out [`DEADLINE`]
+//!   and say it may have left (giverny#274). It opens as a Done row does.
 //! * **Done** workers (and a Running one that cannot be opened) open an
 //!   overlay over the current terminal showing the
 //!   worker's transcript, rendered as `giverny transcript` renders it: a
@@ -109,7 +113,9 @@ pub fn plan(click: &RowClick) -> Plan {
         .filter(|c| !c.is_empty());
     match click.stage {
         Stage::Running | Stage::Done => {
-            let live = click.stage == Stage::Running;
+            // A finished worker's transcript is final: opened at its end,
+            // on the report, as a Done row's is.
+            let live = click.stage == Stage::Running && !click.finished;
             if let Some(t) = &click.transcript {
                 return Plan::Watch {
                     title,
@@ -187,10 +193,11 @@ fn planned_without_brief(click: &RowClick) -> String {
     parts.join("\n\n")
 }
 
-/// What the overlay for this click offers.
+/// What the overlay for this click offers. A finished worker is no longer
+/// in Claude Code's list, so there is nothing to open it in.
 pub fn offer(click: &RowClick) -> Offer {
     match (click.stage, agent_id(click)) {
-        (Stage::Running, Some(id)) => Offer::OpenInClaude {
+        (Stage::Running, Some(id)) if !click.finished => Offer::OpenInClaude {
             agent_id: id.to_string(),
         },
         _ => Offer::Nothing,
@@ -1498,6 +1505,7 @@ mod tests {
             stage,
             key: "acme#158".into(),
             agent_id: Some("a93".into()),
+            finished: false,
             name: "Wren".into(),
             transcript: None,
             open: None,
@@ -1541,6 +1549,35 @@ mod tests {
         assert_eq!(offer(&c), Offer::Nothing);
         c.stage = Stage::Planned;
         assert_eq!(offer(&c), Offer::Nothing);
+    }
+
+    /// giverny#274: a Running row whose worker has finished is not in
+    /// Claude Code's list any more. It offers no walk into it, and opens
+    /// its transcript at the end, as a Done row does.
+    #[test]
+    fn a_finished_worker_on_a_running_row_opens_as_done() {
+        let mut c = click(Stage::Running);
+        c.finished = true;
+        assert_eq!(offer(&c), Offer::Nothing);
+        c.transcript = Some("/t/agent-a93.jsonl".into());
+        assert_eq!(
+            plan(&c),
+            Plan::Watch {
+                title: "acme#158 · Wren".into(),
+                transcript: "/t/agent-a93.jsonl".into(),
+                live: false,
+            }
+        );
+        // No transcript: not "click again in a moment", which never comes.
+        c.transcript = None;
+        let Plan::Show {
+            body: Body::Text(why),
+            ..
+        } = plan(&c)
+        else {
+            panic!("{:?}", plan(&c));
+        };
+        assert!(why.contains("No transcript was found"), "{why}");
     }
 
     #[test]
