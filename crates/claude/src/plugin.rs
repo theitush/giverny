@@ -29,7 +29,10 @@
 //!   ([`crate::plugin_hook`]): a dispatcher that just started a worker with
 //!   no estimate is asked for one, and five minutes into its work the worker
 //!   is asked, once, to correct it, so every subagent gets an ETA. Any other
-//!   call costs a few `stat`s.
+//!   call costs a few `stat`s. The same launcher runs as a `PreToolUse` hook
+//!   on Bash: a command that would leave its tab's resource cap
+//!   (`systemd-run`, `systemctl --user set-property`, a write into
+//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]).
 //!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/`, so the hook, the
@@ -88,11 +91,21 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// dispatcher for the estimate of a worker it just started, and a worker
 /// five minutes in to correct it; on a manager's own calls it delivers
 /// the session's `ask`/`reply` messages and renews its resource leases;
-/// quiet and exit 0 whatever happens.
+/// quiet and exit 0 whatever happens. The same launcher is a `PreToolUse`
+/// hook on Bash, which refuses a command that would leave its tab's
+/// resource cap ([`crate::bash_guard`]).
 fn session_hooks() -> Value {
     json!({
-        "description": "Giverny: ETAs for subagents, and manager sessions' upkeep",
+        "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
+                        and Bash commands kept inside their tab's resource cap",
         "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-hook\" 2>/dev/null || true"
+                }]
+            }],
             "PostToolUse": [{
                 "matcher": "*",
                 "hooks": [{
@@ -559,6 +572,10 @@ mod tests {
         assert_eq!(post["matcher"], "*");
         let cmd = post["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("bin/giverny-hook\""), "{cmd}");
+        // The Bash guard is the same launcher, before Bash calls only.
+        let pre = &h["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "Bash");
+        assert_eq!(pre["hooks"][0]["command"].as_str(), Some(cmd));
         #[cfg(unix)]
         {
             let out = std::process::Command::new("sh")

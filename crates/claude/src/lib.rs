@@ -7,6 +7,7 @@
 
 pub mod agent_eta;
 pub mod attach;
+pub mod bash_guard;
 pub mod continuation;
 pub mod feed;
 pub mod hooks;
@@ -25,6 +26,7 @@ pub mod resources;
 pub mod run_live;
 pub mod session_use;
 pub mod subagents;
+pub mod tab_cap;
 pub mod tokens;
 pub mod transcript;
 pub mod usage;

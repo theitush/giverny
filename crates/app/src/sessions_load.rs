@@ -138,7 +138,8 @@ pub fn workers(r: &Reading) -> HashMap<String, RunLive> {
 }
 
 fn read_loop(last: &Mutex<Recent>, ctx: &egui::Context) {
-    let mut sampler = Sampler::default();
+    // Each pass also caps every tab's claude (giverny#262).
+    let mut sampler = Sampler::capping_tabs();
     let app = std::process::id();
     let runs_dir = giverny_claude::run_live::runs_dir(&giverny_claude::resources::ledger_path(
         &giverny_claude::feed::feed_dir(),

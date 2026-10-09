@@ -1,12 +1,20 @@
-//! `giverny manage run <task> -- <cmd…>`: a worker's heavy command, held to
+//! `giverny manage run <task> -- <cmd…>`: a worker's heavy command, given
 //! its task's granted lease and measured.
 //!
 //! **The cap.** On Linux with a user systemd the command runs in a scope of
-//! its own: `systemd-run --user --scope -p MemoryMax=<ram> -p
-//! MemorySwapMax=0 -p CPUQuota=<cpu×100>%` (and `OOMPolicy=continue`, so the
-//! scope outlives a kill and can be read), visible in `systemctl --user
-//! status giverny-run-…` while it runs. `CARGO_BUILD_JOBS=<cpu>` is exported
-//! unless set. Anywhere else (no user systemd, macOS, Windows,
+//! its own, in the slice every Claude tab's claude sits in
+//! ([`crate::tab_cap::SLICE`]): `systemd-run --user --scope
+//! --slice=giverny-claude.slice -p CPUWeight=<cpu×100> -p MemoryLow=<ram>
+//! -p MemoryHigh=<2×ram>` (and `OOMPolicy=continue`, so the scope outlives
+//! a kill and can be read), visible in `systemctl --user status
+//! giverny-run-…` while it runs. The grant is a guarantee, not a ceiling:
+//! the slice's hard `CPUQuota`/`MemoryMax` at `[manager.limits]` is the one
+//! ceiling, and inside it the command may use idle cores and free memory;
+//! under contention the CPU splits by weight, its grant's RAM is protected
+//! from reclaim, and above twice its grant it is slowed (reclaimed), never
+//! killed. When the slice does run out, the command (`oom_score_adj` 500)
+//! is killed before any claude. `CARGO_BUILD_JOBS=<cpu>` is exported unless
+//! set. Anywhere else (no user systemd, macOS, Windows,
 //! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease is advisory.
 //!
 //! **The lease.** The task's lease in the ledger ([`resources`]). With none,
@@ -67,7 +75,9 @@ cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
 [ -n "$cg" ] || cg=/nonexistent
 d="/sys/fs/cgroup$cg"
 [ -n "$s" ] && printf 'started\ncgroup %s\n' "$d" > "$s" 2>/dev/null
-"$@"
+# The command goes first when the slice runs out of memory, before any
+# claude and before this shim, which still has to read the cgroup.
+sh -c 'echo 500 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"' sh "$@"
 rc=$?
 if [ -n "$s" ]; then
   {
@@ -183,6 +193,8 @@ pub fn scope_args(
     if expand_flag {
         a.push("--expand-environment=no".into());
     }
+    // Beside the Claude tabs, inside the machine's budget (giverny#262).
+    a.push(format!("--slice={}", crate::tab_cap::SLICE));
     a.push(format!("--unit={unit}"));
     a.push(format!(
         "--description=giverny manage run {}",
@@ -192,21 +204,30 @@ pub fn scope_args(
         a.push("-p".into());
         a.push(p);
     };
+    // Guarantees from the grant; the slice is the hard ceiling. A soft
+    // `MemoryHigh` at twice the grant keeps one runaway from taking the
+    // whole slice from its neighbours: above it the kernel reclaims and
+    // slows the command, and never kills it.
     if cap.ram_mb > 0 {
-        prop(format!("MemoryMax={}M", cap.ram_mb));
-        prop("MemorySwapMax=0".into());
+        prop(format!("MemoryLow={}M", cap.ram_mb));
+        prop(format!("MemoryHigh={}M", high_mb(cap)));
     }
     if cap.cpu > 0 {
-        prop(format!("CPUQuota={}%", cap.cpu * 100));
+        prop(format!("CPUWeight={}", crate::tab_cap::cpu_weight(cap.cpu)));
     }
-    // A kill by the cap stops only the command: the shim lives on to read
-    // the cgroup, and the scope is not torn down under it.
+    // A kill when the slice runs out stops only the command: the shim lives
+    // on to read the cgroup, and the scope is not torn down under it.
     prop("OOMPolicy=continue".into());
     a.push("--".into());
     a.push("sh".into());
     a.push(shim.display().to_string());
     a.extend(cmd.iter().cloned());
     a
+}
+
+/// Where a run's memory is throttled: twice its grant.
+pub fn high_mb(cap: &Cap) -> u64 {
+    cap.ram_mb * 2
 }
 
 /// What the shim read of the scope.
@@ -328,16 +349,18 @@ pub fn run_with(
         say(
             task,
             &format!(
-                "the {} memory cap killed it (OOM). Ask for more: `giverny manage release {task}` \
-                 then `giverny manage claim {task} --ram {more}` (or have the manager do it), \
-                 and run it again",
+                "killed (OOM): the Claude work on this machine together ran out of the memory \
+                 the limits allow ({}), and this command was the one to go. Its lease was {}. \
+                 Ask for more: `giverny manage release {task}` then `giverny manage claim \
+                 {task} --ram {more}` (or have the manager do it), and run it again",
+                crate::tab_cap::SLICE,
                 Mem(cap.ram_mb)
             ),
         );
     } else if m.capped && m.signal == Some(9) && cap.ram_mb > 0 {
         say(
             task,
-            "killed by SIGKILL: perhaps the memory cap, perhaps someone else",
+            "killed by SIGKILL: perhaps the slice's memory ceiling, perhaps someone else",
         );
     }
     if !recorded {
@@ -639,6 +662,12 @@ fn execute(
         let shim = shim_path(ledger)?;
         let stats = stats_path(ledger)?;
         let unit = unit_name(task, std::process::id());
+        if let Err(err) = crate::tab_cap::cap_slice_now() {
+            say(
+                task,
+                &format!("{} not capped: {err}", crate::tab_cap::SLICE),
+            );
+        }
         let mut c = Command::new("systemd-run");
         c.args(scope_args(expand_flag, &unit, task, cap, &shim, cmd))
             .env(STATS_ENV, &stats);
@@ -646,8 +675,9 @@ fn execute(
         say(
             task,
             &format!(
-                "capped at {} in {unit}.scope (`systemctl --user status {unit}.scope`)",
-                cap.describe()
+                "leased {} in {unit}.scope, in {} (`systemctl --user status {unit}.scope`)",
+                cap.describe(),
+                crate::tab_cap::SLICE
             ),
         );
         // Seen by the management panel while it runs.
@@ -987,8 +1017,9 @@ mod tests {
         let s = a.join(" ");
         assert!(s.starts_with("--user --scope --quiet --collect --expand-environment=no"));
         assert!(s.contains("--unit=giverny-run-demo_161-42"), "{s}");
+        assert!(s.contains("--slice=giverny-claude.slice"), "{s}");
         assert!(
-            s.contains("-p MemoryMax=3072M -p MemorySwapMax=0 -p CPUQuota=300%"),
+            s.contains("-p MemoryLow=3072M -p MemoryHigh=6144M -p CPUWeight=300"),
             "{s}"
         );
         assert!(s.contains("-p OOMPolicy=continue"), "{s}");
@@ -1003,7 +1034,9 @@ mod tests {
             &cmd,
         )
         .join(" ");
-        assert!(!a.contains("MemoryMax") && !a.contains("expand"), "{a}");
+        assert!(!a.contains("Memory") && !a.contains("expand"), "{a}");
+        // The slice is the one hard ceiling.
+        assert!(!s.contains("MemoryMax") && !s.contains("CPUQuota"), "{s}");
         assert_eq!(slot_file("cargo:/x/t"), "cargo_3a_2fx_2ft.lock");
         assert_eq!(
             parse_stats("started\npeak 3221225472\noom_kill 2\n"),

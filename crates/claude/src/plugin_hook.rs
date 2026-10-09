@@ -1,6 +1,9 @@
 //! `giverny hook`: the plugin's `PostToolUse` hook, which runs on every tool
 //! call of every session the plugin is loaded in — the dispatcher's and its
 //! workers' alike — and hands each part of its work to the side that owns it.
+//! The same command is the plugin's `PreToolUse` Bash hook, which refuses a
+//! command that would leave its tab's resource cap ([`guard`],
+//! [`crate::bash_guard`]) and does nothing else.
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -265,11 +268,65 @@ pub fn reply(text: &str) -> String {
     .to_string()
 }
 
+/// A `PreToolUse` payload's Bash command; `None` for any other payload
+/// (read whole only when it names that event: the others carry a tool's
+/// whole response).
+pub fn pre_bash(input: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        command: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pre {
+        hook_event_name: Option<String>,
+        tool_name: Option<String>,
+        tool_input: Option<Input>,
+    }
+    if !input.contains("\"PreToolUse\"") {
+        return None;
+    }
+    let p: Pre = serde_json::from_str(input).ok()?;
+    if p.hook_event_name.as_deref() != Some("PreToolUse") {
+        return None;
+    }
+    if p.tool_name.as_deref() != Some("Bash") {
+        return Some(String::new());
+    }
+    Some(p.tool_input?.command.unwrap_or_default())
+}
+
+/// The `PreToolUse` reply refusing a Bash `command` that would leave its
+/// tab's resource cap ([`crate::bash_guard`]), or nothing. Only in a
+/// Giverny tab (`in_tab`, asked only for a command it would refuse), whose
+/// claude runs capped: a claude elsewhere has no cap to leave.
+pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
+    let why = crate::bash_guard::verdict(command)?;
+    if !in_tab() {
+        return None;
+    }
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": why
+            }
+        })
+        .to_string(),
+    )
+}
+
 /// `giverny hook`: the payload on stdin, the reply (if any) on stdout, exit 0
 /// whatever happens.
 pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    if let Some(command) = pre_bash(&input) {
+        if let Some(out) = guard(&command, in_giverny_tab) {
+            println!("{out}");
+        }
+        return 0;
+    }
     if let Some(payload) = payload_of(&input)
         && let Some(out) = run(
             &payload,
@@ -337,6 +394,42 @@ mod tests {
                "tool_response": {"isAsync": background, "status": status, "agentId": agent,
                                  "description": desc, "prompt": "…"}})
         .to_string()
+    }
+
+    #[test]
+    fn a_bash_command_that_leaves_its_cap_is_refused_in_a_tab() {
+        let pre = |cmd: &str| {
+            json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                   "tool_input": {"command": cmd, "description": "x"}})
+            .to_string()
+        };
+        let cmd = pre_bash(&pre("systemd-run --user --scope make")).unwrap();
+        assert_eq!(cmd, "systemd-run --user --scope make");
+        let out = guard(&cmd, || true).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("giverny-manage run")
+        );
+        // Outside a tab there is no cap to leave.
+        assert_eq!(guard(&cmd, || false), None);
+        // A capped run passes, and the tab is not even asked.
+        let ok = pre_bash(&pre("giverny-manage run t -- cargo build")).unwrap();
+        assert_eq!(guard(&ok, || panic!("not asked")), None);
+        // Another tool's PreToolUse: nothing to check; a PostToolUse: not ours.
+        let read = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
+                          "tool_input": {"file_path": "/x"}})
+        .to_string();
+        assert_eq!(pre_bash(&read).as_deref(), Some(""));
+        assert_eq!(guard("", || true), None);
+        assert_eq!(
+            pre_bash(&spawn_input("s1", "a1", "systemd-run PreToolUse", true)),
+            None
+        );
     }
 
     #[test]
