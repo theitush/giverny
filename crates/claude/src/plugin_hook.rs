@@ -3,7 +3,9 @@
 //! workers' alike — and hands each part of its work to the side that owns it.
 //! The same command is the plugin's `PreToolUse` Bash hook, which refuses a
 //! command that would leave its tab's resource cap ([`guard`],
-//! [`crate::bash_guard`]) and does nothing else.
+//! [`crate::bash_guard`]) and does nothing else, and the plugin's
+//! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
+//! `giverny:manage` skill ([`crate::manage_trigger`]).
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -321,6 +323,12 @@ pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
 pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
+        if let Some(out) = crate::manage_trigger::reply(&prompt) {
+            println!("{out}");
+        }
+        return 0;
+    }
     if let Some(command) = pre_bash(&input) {
         if let Some(out) = guard(&command, in_giverny_tab) {
             println!("{out}");

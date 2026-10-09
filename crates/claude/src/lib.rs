@@ -18,6 +18,7 @@ pub mod manage_history;
 pub mod manage_inbox;
 pub mod manage_nudge;
 pub mod manage_run;
+pub mod manage_trigger;
 pub mod plugin;
 pub mod plugin_hook;
 pub mod profiles;
