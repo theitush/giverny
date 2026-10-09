@@ -2749,6 +2749,17 @@ mod tests {
         lines: &[String],
         running: bool,
     ) -> (PathBuf, Vec<SubagentRow>, Logs) {
+        spawned_worker(name, "acme#613 market SD graph", lines, running)
+    }
+
+    /// A worker `w` spawned at `T0 - 60m` as `description`, and its
+    /// transcript.
+    fn spawned_worker(
+        name: &str,
+        description: &str,
+        lines: &[String],
+        running: bool,
+    ) -> (PathBuf, Vec<SubagentRow>, Logs) {
         let dir =
             std::env::temp_dir().join(format!("giverny-pane-141-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2758,7 +2769,7 @@ mod tests {
         let status = if running { "running" } else { "completed" };
         let mut rows = live(&format!(
             r#"{{"session_id":"s","tasks":[{{"id":"w","status":"{status}",
-                "description":"acme#613 market SD graph","startTime":{},
+                "description":"{description}","startTime":{},
                 "tokenCount":156313}}]}}"#,
             T0 - 60 * MIN
         ));
@@ -2867,6 +2878,58 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// giverny#278, this repo's manager session: `266-anim` landed, then
+    /// `start 267-use --agent w`, then `New task for you: 267-use
+    /// (giverny#267)`. The message's first `#` key is not the feed's key,
+    /// yet it is the task `start` gave the worker: one Running row with the
+    /// feed's ETA and its own clock, never a second keyed `giverny#267`
+    /// whose ELAPSED is dittoed one second and not the next.
+    #[test]
+    fn a_worker_reused_by_start_agent_holds_one_row_for_its_new_task() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            sent(
+                T0 - 10 * MIN,
+                "New task for you: 267-use (giverny#267). Your #266 work is merged \
+                 into agents-pane; thanks. Read and follow the brief.",
+            ),
+            reply("m2", T0 - 5 * MIN, 8_000, 21_000, 3_000),
+        ];
+        let (dir, rows, logs) = spawned_worker(
+            "start-agent",
+            "266-anim: rail animation switch",
+            &lines,
+            true,
+        );
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"266-anim","stage":"done","agent_id":"w","started":{s266},
+                "ended":{e266},"eta_s":1500,"landing":"Review — ita"}},
+              {{"key":"267-use","stage":"running","agent_id":"w","started":{s267},
+                "eta_s":3600}}
+            ]}}"#,
+            s266 = T0 - 60 * MIN,
+            e266 = T0 - 11 * MIN,
+            s267 = T0 - 10 * MIN - 20_000,
+        ));
+        for tick in 0..6 {
+            let now = T0 + tick * 1_000;
+            let t = build_at(Some(&f), &rows, now, &Clock::plain(), &logs);
+            let ids: Vec<(Stage, &str)> =
+                t.lines.iter().map(|l| (l.stage, l.id.as_str())).collect();
+            assert_eq!(
+                ids,
+                [(Stage::Running, "267-use"), (Stage::Done, "266-anim")],
+                "{t:?}"
+            );
+            let run = &t.lines[0];
+            assert!(run.eta.starts_with('~'), "the feed's ETA: {:?}", run.eta);
+            assert_ne!(run.elapsed, "\"", "its own clock");
+            assert!(!t.lines[1].elapsed.contains('"'), "{:?}", t.lines[1]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// giverny#217, the inbar manager session: a plain `start` and the task handed

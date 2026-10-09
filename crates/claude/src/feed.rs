@@ -1378,10 +1378,15 @@ pub fn with_handoffs<'w, L: LiveAgent>(
                 }
             }
             let Some(key) = new_key else { continue };
-            if held.iter().any(|k| same_task(&key, k)) {
+            // Its task is a feed row it names by its key or assigns by the
+            // feed's own: `New task for you: 267-use (giverny#267)` is the
+            // `267-use` that `start --agent` gave the worker, never a
+            // `giverny#267` beside it (giverny#278).
+            let names = |k: &str| same_task(&key, k) || (!k.is_empty() && assigns(m, k));
+            if held.iter().any(|k| names(k)) {
                 continue;
             }
-            match doc.rows.iter_mut().find(|f| same_task(&key, &f.key)) {
+            match doc.rows.iter_mut().find(|f| names(&f.key)) {
                 Some(f) => {
                     let waiting = matches!(f.stage(), Stage::Planned | Stage::Running)
                         && f.agent_id.as_deref().is_none_or(|a| a == id);
