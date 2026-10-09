@@ -39,18 +39,15 @@ All of this is [@theitush](https://github.com/theitush)'s, merged from #3.
 - The status line's `session:` count keeps what was spent before each
   `/compact`, as `session: 41.2k (+310.5k)`, and `total:` includes it.
 
-- The status line can also warn in red when the prompt cache has gone cold
-  (`cache cold · next msg 182.3k`). It only shows if Claude Code redraws the
-  status line while the session is idle, which Giverny does not set up yet.
+- The status line can also warn in red when the prompt cache has gone cold,
+  with how many tokens the next message will cache again. It only shows if
+  Claude Code redraws the status line while the session is idle, which
+  Giverny does not set up yet.
 
-- Ctrl+click opens links and files under WSL.
-
-- The terminal takes the keyboard back after a click on the rail, the taskbar
-  or a header button.
-
-- Settings reopens on the section you last viewed.
-
-- A restored tab's dot stays dim until its shell has started.
+- Smaller fixes. Ctrl+click opens links and files under WSL. The terminal
+  takes the keyboard back after a click on the rail, the taskbar or a header
+  button. Settings reopens on the section you last viewed. A restored tab's
+  dot stays dim until its shell has started.
 
 ## v1.2.1 — 2026-10-07
 
