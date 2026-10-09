@@ -280,6 +280,115 @@ fn tail_title(path: &Path) -> Option<String> {
     (!best.is_empty()).then_some(best)
 }
 
+/// The last prompt the user sent in a transcript: the last of
+/// [`prompt_history`].
+pub fn last_prompt(path: &Path) -> Option<String> {
+    prompt_history(path).pop()
+}
+
+/// The prompts the user sent in a transcript, oldest first, for a session
+/// whose prompts no hook reported: one adopted mid-way, or resumed after a
+/// restart. Read from the tail, so a very long session gives its later turns.
+///
+/// The prompts are the user messages that are not tool results, notes Claude
+/// Code adds (`isMeta`, compaction summaries) or things it wraps in a tag (a
+/// command, a notification, `!` shell input).
+///
+/// The last one is checked against Claude Code's own `lastPrompt` marker,
+/// which is cut at 200 characters with an ellipsis and has its line breaks
+/// flattened. The message the marker agrees with is taken in full; when none
+/// does, the marker itself ends the list: it is the one that says which
+/// message was typed (a `!` command's, say), and a cut prompt beats none.
+pub fn prompt_history(path: &Path) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    // Long answers with tool output in them push the messages that started
+    // their turns a long way back.
+    const TAIL: u64 = 2 * 1024 * 1024;
+    let Some(buf) = (|| {
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(TAIL).read_to_end(&mut bytes).ok()?;
+        // The seek can land inside a character; only the first line is cut.
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    })() else {
+        return Vec::new();
+    };
+
+    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    let flag =
+        |v: &serde_json::Value, name: &str| v.get(name).and_then(|m| m.as_bool()) == Some(true);
+    let mut marker: Option<String> = None;
+    let mut typed: Vec<String> = Vec::new();
+    for line in buf.lines() {
+        let has_marker = line.contains("\"lastPrompt\"");
+        if !has_marker && !line.contains("\"user\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if has_marker {
+            if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+                marker = Some(p.to_string());
+            }
+            continue;
+        }
+        if v.get("type").and_then(|t| t.as_str()) != Some("user")
+            || flag(&v, "isMeta")
+            || flag(&v, "isCompactSummary")
+        {
+            continue;
+        }
+        if let Some(text) = v.get("message").and_then(|m| user_text(m.get("content")?)) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                typed.push(text);
+            }
+        }
+    }
+    // The last prompt: the message the marker names, in full.
+    let last = marker.map(|m| {
+        let stem = m.strip_suffix('…').filter(|_| m.chars().count() > 200);
+        typed
+            .iter()
+            .rev()
+            .find(|t| {
+                let t = flat(t);
+                t == m || stem.is_some_and(|stem| t.starts_with(stem))
+            })
+            .cloned()
+            .unwrap_or_else(|| m.trim().to_string())
+    });
+    let mut prompts: Vec<String> = typed.into_iter().filter(|t| !t.starts_with('<')).collect();
+    // A marker no listed message agrees with names one Claude Code wrapped
+    // (`!` shell input): it is the latest prompt.
+    if let Some(last) = last.filter(|l| !l.is_empty())
+        && !prompts.contains(&last)
+    {
+        prompts.push(last);
+    }
+    prompts
+}
+
+/// The text of a user message, or `None` when it is a tool result.
+fn user_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let items = content.as_array()?;
+    let mut parts = Vec::new();
+    for item in items {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("text") => parts.push(item.get("text")?.as_str()?.to_string()),
+            Some("tool_result") => return None,
+            _ => {}
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 /// Walk `/proc/<pid>/stat` parent links; true when `ancestor` is in the chain.
 /// Maps a claude process to the Giverny tab whose shell spawned it.
 #[cfg(target_os = "linux")]
@@ -438,6 +547,123 @@ mod tests {
         );
         assert!(find_transcript(&dir, "0000-not-there").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn transcript(name: &str, lines: &[serde_json::Value]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("giverny-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.jsonl"));
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn user(content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": content}})
+    }
+
+    fn marker(prompt: &str) -> serde_json::Value {
+        serde_json::json!({"type": "last-prompt", "lastPrompt": prompt, "sessionId": "s"})
+    }
+
+    #[test]
+    fn last_prompt_is_the_full_message_the_marker_names() {
+        let long = format!("first line\nsecond line {}", "x".repeat(300));
+        // Claude Code's own marker: flattened and cut at 200 characters.
+        let cut: String = long
+            .replace('\n', " ")
+            .chars()
+            .take(200)
+            .collect::<String>()
+            + "…";
+        let path = transcript(
+            "full",
+            &[
+                user(serde_json::json!("an earlier prompt")),
+                user(serde_json::json!(long)),
+                user(serde_json::json!([{"type": "tool_result", "content": "output"}])),
+                serde_json::json!({"type": "user", "isMeta": true,
+                    "message": {"content": "<local-command-caveat>…"}}),
+                user(serde_json::json!(
+                    "<task-notification>done</task-notification>"
+                )),
+                serde_json::json!({"type": "assistant", "message": {"content": "sure"}}),
+                marker(&cut),
+            ],
+        );
+        assert_eq!(last_prompt(&path).as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn prompt_history_lists_the_typed_prompts_in_order() {
+        let path = transcript(
+            "history",
+            &[
+                user(serde_json::json!("first")),
+                serde_json::json!({"type": "assistant", "message": {"content": "ok"}}),
+                user(serde_json::json!([{"type": "tool_result", "content": "out"}])),
+                user(serde_json::json!("<command-name>/model</command-name>")),
+                serde_json::json!({"type": "user", "isCompactSummary": true,
+                    "message": {"content": "This session is being continued"}}),
+                user(serde_json::json!("second\nwith a second line")),
+                marker("second with a second line"),
+                user(serde_json::json!("third")),
+                marker("third"),
+            ],
+        );
+        assert_eq!(
+            prompt_history(&path),
+            vec!["first", "second\nwith a second line", "third"]
+        );
+        // `!` shell input: the wrapped message is not listed, the marker ends it.
+        let path = transcript(
+            "history-bash",
+            &[
+                user(serde_json::json!("first")),
+                user(serde_json::json!("<bash-input>ls</bash-input>")),
+                marker("!  ls"),
+            ],
+        );
+        assert_eq!(prompt_history(&path), vec!["first", "!  ls"]);
+        assert!(prompt_history(Path::new("/nonexistent/x.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn last_prompt_falls_back_to_the_marker() {
+        // `!` bash mode: the message is wrapped, the marker is what was typed.
+        let path = transcript(
+            "bash",
+            &[
+                user(serde_json::json!("<bash-input>ls</bash-input>")),
+                marker("!  ls"),
+            ],
+        );
+        assert_eq!(last_prompt(&path).as_deref(), Some("!  ls"));
+
+        // Text-and-image prompts arrive as an array.
+        let path = transcript(
+            "array",
+            &[
+                user(serde_json::json!([{"type": "text", "text": "look at this"},
+                                         {"type": "image"}])),
+                marker("look at this"),
+            ],
+        );
+        assert_eq!(last_prompt(&path).as_deref(), Some("look at this"));
+
+        // No marker: the last plain message.
+        let path = transcript(
+            "old",
+            &[
+                user(serde_json::json!("fix the build")),
+                user(serde_json::json!("<command-name>/clear</command-name>")),
+            ],
+        );
+        assert_eq!(last_prompt(&path).as_deref(), Some("fix the build"));
+
+        let path = transcript("empty", &[serde_json::json!({"type": "mode"})]);
+        assert_eq!(last_prompt(&path), None);
+        assert_eq!(last_prompt(Path::new("/nonexistent/x.jsonl")), None);
     }
 
     #[cfg(target_os = "linux")]

@@ -334,6 +334,58 @@ impl TermSession {
         out
     }
 
+    /// The rows on screen right now, top to bottom, scrollback position
+    /// included: each row's text, and whether its first cell has a background
+    /// of its own (Claude Code shades a sent prompt; its input box it does
+    /// not).
+    pub fn viewport_rows(&self) -> Vec<(String, bool)> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let term = self.term.lock();
+        let grid = term.grid();
+        let offset = grid.display_offset() as i32;
+        (0..grid.screen_lines() as i32)
+            .map(|row| {
+                let line = Line(row - offset);
+                let text: String = (0..grid.columns())
+                    .map(|c| grid[Point::new(line, Column(c))].c)
+                    .collect();
+                let shaded =
+                    grid[Point::new(line, Column(0))].bg != Color::Named(NamedColor::Background);
+                (text, shaded)
+            })
+            .collect()
+    }
+
+    /// Walk the rows above the top of the view, nearest first, at most `max`
+    /// of them, until `found` returns something. Each row comes as its text
+    /// and whether its first cell is shaded, as in [`Self::viewport_rows`].
+    pub fn find_above<T>(
+        &self,
+        max: usize,
+        mut found: impl FnMut(&str, bool) -> Option<T>,
+    ) -> Option<T> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let term = self.term.lock();
+        let grid = term.grid();
+        let top = -(grid.display_offset() as i32);
+        let oldest = -(grid.history_size() as i32);
+        let mut text = String::with_capacity(grid.columns());
+        for line in (oldest..top).rev().take(max).map(Line) {
+            text.clear();
+            text.extend((0..grid.columns()).map(|c| grid[Point::new(line, Column(c))].c));
+            let shaded =
+                grid[Point::new(line, Column(0))].bg != Color::Named(NamedColor::Background);
+            if let Some(hit) = found(&text, shaded) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
     /// Snap the viewport back to the live (bottom) position.
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
