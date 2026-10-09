@@ -80,6 +80,38 @@ pub fn build_env(cfg: &SpawnCfg) -> HashMap<String, String> {
     env
 }
 
+/// The program a tab with this shell override runs, where it can be known
+/// without spawning: the override's, else (on unix) the default shell.
+/// `None` on Windows with no override, where the choice is made at spawn.
+pub fn shell_program(shell: Option<&(String, Vec<String>)>) -> Option<String> {
+    if let Some((prog, _)) = shell {
+        return Some(prog.clone());
+    }
+    #[cfg(unix)]
+    {
+        Some(default_unix_shell())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// `$SHELL` → common fallbacks.
+#[cfg(unix)]
+fn default_unix_shell() -> String {
+    let from_env = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty() && Path::new(s).exists());
+    from_env.unwrap_or_else(|| {
+        ["/bin/zsh", "/usr/bin/zsh", "/bin/bash", "/bin/sh"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "/bin/sh".into())
+    })
+}
+
 /// Resolve the shell to run: explicit override → `$SHELL` → common fallbacks.
 pub fn resolve_shell(cfg: &SpawnCfg) -> Shell {
     if let Some((prog, args)) = &cfg.shell {
@@ -87,17 +119,7 @@ pub fn resolve_shell(cfg: &SpawnCfg) -> Shell {
     }
     #[cfg(unix)]
     {
-        let from_env = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty() && Path::new(s).exists());
-        let prog = from_env.unwrap_or_else(|| {
-            ["/bin/zsh", "/usr/bin/zsh", "/bin/bash", "/bin/sh"]
-                .iter()
-                .find(|p| Path::new(p).exists())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "/bin/sh".into())
-        });
-        Shell::new(prog, vec![])
+        Shell::new(default_unix_shell(), vec![])
     }
     #[cfg(windows)]
     {

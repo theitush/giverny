@@ -268,9 +268,118 @@ pub fn statusline_command_for(settings_path: &Path) -> String {
 }
 
 fn exe_path() -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "giverny".into())
+    #[cfg(unix)]
+    if let Some(link) = link_path()
+        && is_link_to_a_binary(&link)
+    {
+        return command_word(&link);
+    }
+    running_exe()
+        .map(|p| command_word(&p))
+        .unwrap_or_else(|| "giverny".into())
+}
+
+/// A path as the first word of a hook command. On macOS the link lives
+/// under `~/Library/Application Support`, and an unquoted space there split
+/// every hook and the status line into a command that does not exist.
+fn command_word(path: &Path) -> String {
+    word_for_shell(&path.display().to_string(), cfg!(windows))
+}
+
+/// Claude Code on Windows runs hook commands with Git Bash, or PowerShell
+/// where Git Bash is not installed. Bash takes `\` as an escape, so
+/// `C:\Users\…` arrives as `C:Users…`; forward slashes run in both shells,
+/// and need no quoting unless the path has a space. A quoted path only
+/// suits Git Bash (PowerShell wants `& '…'`), but it is the default.
+fn word_for_shell(path: &str, windows: bool) -> String {
+    if windows {
+        shell_quote(&path.replace('\\', "/"))
+    } else {
+        shell_quote(path)
+    }
+}
+
+/// This binary's path. Linux names a binary that was rebuilt in place while
+/// it ran `<path> (deleted)` — a path nothing can run, and once it reached
+/// an account's `settings.json` from here.
+pub fn running_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(
+        match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(live) => PathBuf::from(live),
+            None => exe,
+        },
+    )
+}
+
+/// The one path every account's hooks, status lines and plugin name for
+/// Giverny: `<giverny config dir>/bin/giverny`, a link each Giverny points at
+/// itself when it starts ([`point_link`]).
+///
+/// Naming the running binary instead made `settings.json` follow whichever
+/// Giverny started last — a rebuild elsewhere, a test build, a reinstall —
+/// and Claude Code reads hooks when a session starts, so every rewrite left
+/// the running sessions behind. Through the link, a new binary changes the
+/// link and never the settings, and a running session's next hook runs
+/// whichever Giverny is current.
+#[cfg(unix)]
+pub fn link_path() -> Option<PathBuf> {
+    // Giverny's config dir, as `giverny_core::state::Paths` finds it.
+    let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    Some(base.join("giverny").join("bin").join("giverny"))
+}
+
+/// A link (not a file of its own) whose target is there to run.
+#[cfg(unix)]
+fn is_link_to_a_binary(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::metadata(link).is_ok_and(|m| m.is_file())
+}
+
+/// Does [`link_path`] name a binary that is gone? A build that pointed it at
+/// itself and was then deleted (`cargo clean`) leaves every session's hooks
+/// running nothing, until a Giverny points it somewhere real again.
+#[cfg(unix)]
+pub fn link_is_dangling() -> bool {
+    link_path().is_some_and(|link| is_dangling(&link))
+}
+
+#[cfg(unix)]
+fn is_dangling(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && !std::fs::metadata(link).is_ok_and(|m| m.is_file())
+}
+
+/// Point [`link_path`] at this binary, so the commands written into each
+/// account name it. Done at startup by the Giverny that looks after the
+/// accounts; a side instance (`GIVERNY_NO_ACCOUNT_SETUP`) leaves it alone.
+#[cfg(unix)]
+pub fn point_link() -> std::io::Result<()> {
+    let (Some(link), Some(exe)) = (link_path(), running_exe()) else {
+        return Ok(());
+    };
+    point_link_at(&link, &exe)
+}
+
+#[cfg(unix)]
+fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
+    // The binary itself, not a path to it: Giverny started through the link
+    // (macOS reports the path it was started by) would otherwise point the
+    // link at itself, and every hook would run nothing.
+    // A binary copied to the link's own path is left alone the same way.
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if exe == link || std::fs::read_link(link).is_ok_and(|t| t == exe) {
+        return Ok(());
+    }
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Beside it, then over it: a hook running meanwhile finds the old
+    // binary or the new one, never no file at all.
+    let tmp = link.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&exe, &tmp)?;
+    std::fs::rename(&tmp, link)
 }
 
 /// How this binary is named to whoever will run the hook.
@@ -287,9 +396,8 @@ fn exe_for(settings_path: &Path) -> String {
 }
 
 /// A path as one word for the shell Claude Code runs hook commands with.
-/// Windows paths under `/mnt/c` land in `Program Files` often enough that
-/// this is not hypothetical.
-#[cfg(windows)]
+/// Windows paths under `/mnt/c` land in `Program Files`, and macOS's config
+/// dir in `Application Support`, so this is not hypothetical.
 fn shell_quote(path: &str) -> String {
     if path
         .chars()
@@ -354,41 +462,96 @@ pub fn run_statusline(spool: &Path) {
     if let Some(p) = pct("seven_day") {
         parts.push(format!("wk {p}%"));
     }
-    parts.extend(statusline_tokens(&payload));
+    let transcript = transcript_of(&payload);
+    parts.extend(statusline_tokens(&payload, transcript.as_deref()));
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
     println!("{}", parts.join("  ·  "));
 }
 
-/// `session: <n>`, `subagents: <n>` and `total: <n>` for the status line
-/// (giverny#22, giverny#95): this conversation's own tokens, every subagent's
+/// Red `cache cold · next msg <n>` once the main conversation's prompt cache
+/// has expired: `<n>` is what the next message re-caches.
+/// Nothing while it is warm, or when the provider reports no cache tokens.
+///
+/// Claude Code's `prompt_cache` says so once this process has sent a
+/// request; a reopened session has sent none, and carries no `prompt_cache`
+/// until its first message — the very message the warning is for — so then
+/// the transcript's last reply answers: its time, the TTL it wrote, its size.
+fn cache_cold_segment(
+    payload: &serde_json::Value,
+    transcript: Option<&Path>,
+    now_ms: i64,
+) -> Option<String> {
+    let recache = match payload.get("prompt_cache") {
+        Some(cache) => {
+            let flag = |key: &str| cache.get(key).and_then(|v| v.as_bool());
+            if flag("caching_observed") != Some(true) || flag("warm") != Some(false) {
+                return None;
+            }
+            cache.get("recache_tokens_if_cold").and_then(|v| v.as_u64())
+        }
+        None => {
+            let last = crate::tokens::last_reply(transcript?)?;
+            if now_ms < last.at_ms + last.ttl_ms? {
+                return None;
+            }
+            Some(last.recache)
+        }
+    };
+    let text = match recache {
+        Some(n) => format!("cache cold · next msg {}", crate::tokens::fmt_tokens(n)),
+        None => "cache cold".to_string(),
+    };
+    Some(format!("{RED}{text}{RESET}"))
+}
+
+/// SGR red and reset, around the status line's alarm segments.
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+/// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the
+/// status line (giverny#22, giverny#95): this conversation's own tokens, every subagent's
 /// summed, and the two added, counted the way coo's `orchestrate-status`
 /// counts them (see [`crate::tokens`]).
-fn statusline_tokens(payload: &serde_json::Value) -> Vec<String> {
+fn statusline_tokens(payload: &serde_json::Value, transcript: Option<&Path>) -> Vec<String> {
     use crate::tokens;
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let dirs = tokens::session_subagent_dirs(transcript, config_dir().as_deref(), session_id);
+    let session = tokens::session_tokens(payload, transcript);
+    // What the session spent before its compactions: `(+<n>)` beside its own
+    // count, and in the total.
+    let compacted = transcript.map_or(0, |t| {
+        tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
+    });
+    let (session, subagents, total) =
+        tokens::session_subagents_total(session, compacted, &tokens::subagent_transcripts(&dirs));
+    tokens::segments(session, compacted, subagents, total)
+}
+
+/// This account's Claude config dir.
+fn config_dir() -> Option<PathBuf> {
+    account_dir()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+}
+
+/// The conversation's transcript: `transcript_path` off the status line's
+/// stdin, else the one its session id names, as in coo.
+fn transcript_of(payload: &serde_json::Value) -> Option<PathBuf> {
     let transcript = payload
         .get("transcript_path")
         .and_then(|t| t.as_str())
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(PathBuf::from);
-    let session_id = payload.get("session_id").and_then(|s| s.as_str());
-    let config_dir = account_dir()
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
-    // No `transcript_path` on stdin: the session id names it, as in coo.
-    let transcript = transcript.filter(|t| t.exists()).or_else(|| {
-        let (cfg, sid) = (config_dir.as_ref()?, session_id?);
-        std::fs::read_dir(cfg.join("projects"))
+    transcript.filter(|t| t.exists()).or_else(|| {
+        let sid = payload.get("session_id").and_then(|s| s.as_str())?;
+        std::fs::read_dir(config_dir()?.join("projects"))
             .ok()?
             .flatten()
             .map(|e| e.path().join(format!("{sid}.jsonl")))
             .find(|p| p.is_file())
-    });
-    let dirs =
-        tokens::session_subagent_dirs(transcript.as_deref(), config_dir.as_deref(), session_id);
-    let session = tokens::session_tokens(payload, transcript.as_deref());
-    let (session, subagents, total) =
-        tokens::session_subagents_total(session, &tokens::subagent_transcripts(&dirs));
-    tokens::segments(session, subagents, total)
+    })
 }
 
 /// Is the Giverny statusline configured in this settings file?
@@ -695,6 +858,59 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_cold_prompt_cache_shows_red_with_what_the_next_message_recaches() {
+        let cold = |extra: serde_json::Value| {
+            let mut cache = serde_json::json!({"warm": false, "caching_observed": true});
+            cache
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            cache_cold_segment(&serde_json::json!({ "prompt_cache": cache }), None, 0)
+        };
+        assert_eq!(
+            cold(serde_json::json!({"recache_tokens_if_cold": 182_340})).as_deref(),
+            Some("\x1b[31mcache cold · next msg 182.3k\x1b[0m")
+        );
+        // Right after a compaction there is no figure.
+        assert_eq!(
+            cold(serde_json::json!({"recache_tokens_if_cold": null})).as_deref(),
+            Some("\x1b[31mcache cold\x1b[0m")
+        );
+        // Warm, unreported caching, or an older Claude Code: nothing.
+        assert_eq!(cold(serde_json::json!({"warm": true})), None);
+        assert_eq!(cold(serde_json::json!({"caching_observed": false})), None);
+        assert_eq!(cache_cold_segment(&serde_json::json!({}), None, 0), None);
+    }
+
+    #[test]
+    fn a_reopened_session_reads_its_cold_cache_off_the_transcript() {
+        let d = std::env::temp_dir().join(format!("giverny-cache-cold-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t = d.join("s.jsonl");
+        let line = serde_json::json!({"type": "assistant", "timestamp": "2026-10-06T11:00:00Z",
+            "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                    "cache_read_input_tokens": 90_000, "output_tokens": 500,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 1000}}}});
+        std::fs::write(&t, format!("{line}\n")).unwrap();
+        let at: i64 = "2026-10-06T11:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        // No `prompt_cache` on stdin before the reopened session's first request.
+        let none = serde_json::json!({});
+        assert_eq!(cache_cold_segment(&none, Some(&t), at + 3_599_000), None);
+        assert_eq!(
+            cache_cold_segment(&none, Some(&t), at + 3_600_000).as_deref(),
+            Some("\x1b[31mcache cold · next msg 91.5k\x1b[0m")
+        );
+        // Once Claude Code reports the cache, its word wins.
+        let warm = serde_json::json!({"prompt_cache": {"warm": true, "caching_observed": true}});
+        assert_eq!(cache_cold_segment(&warm, Some(&t), at + 7_200_000), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Off Windows — and for a Windows account that is not inside a
     /// distribution — the command is this binary, named as it always was.
     #[test]
@@ -707,6 +923,89 @@ mod tests {
                 .trim_end()
                 .ends_with("statusline")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_link_follows_the_binary() {
+        let d = std::env::temp_dir().join(format!("giverny-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // The binary is named by its real path (macOS's /tmp is a link).
+        let d = d.canonicalize().unwrap();
+        let (a, b) = (d.join("a"), d.join("b"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let link = d.join("bin/giverny");
+        assert!(!is_link_to_a_binary(&link), "not there yet");
+        point_link_at(&link, &a).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        assert!(is_link_to_a_binary(&link));
+        point_link_at(&link, &a).unwrap();
+        point_link_at(&link, &b).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), b, "repointed");
+        std::fs::remove_file(&b).unwrap();
+        assert!(
+            !is_link_to_a_binary(&link),
+            "a link to nothing is no binary"
+        );
+        assert!(is_dangling(&link), "and is taken back");
+        point_link_at(&link, &a).unwrap();
+        assert!(!is_dangling(&link));
+        assert!(
+            !is_dangling(&d.join("nothing")),
+            "no link is not a dangling one"
+        );
+
+        // Started through the link, the binary is still the one it names,
+        // never the link itself.
+        point_link_at(&link, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        assert!(is_link_to_a_binary(&link));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// macOS's config dir is `~/Library/Application Support`: the hook
+    /// command must still run the binary there, through the shell Claude
+    /// Code runs it with.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_a_space_runs_as_one_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("giverny-quote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("Application Support/giverny's bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("giverny");
+        std::fs::write(&exe, "#!/bin/sh\necho \"ran $1\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = format!("{} relay", command_word(&exe));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ran relay\n",
+            "{command}"
+        );
+        assert_eq!(
+            command_word(Path::new("/home/x/.config/giverny/bin/giverny")),
+            "/home/x/.config/giverny/bin/giverny",
+            "a plain path is written as before"
+        );
+        // Windows: forward slashes, which Git Bash and PowerShell both run.
+        assert_eq!(
+            word_for_shell(r"C:\Users\ita\AppData\Local\Giverny\bin\giverny.exe", true),
+            "C:/Users/ita/AppData/Local/Giverny/bin/giverny.exe"
+        );
+        assert_eq!(
+            word_for_shell(r"C:\Users\Jane Doe\giverny.exe", true),
+            "'C:/Users/Jane Doe/giverny.exe'"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

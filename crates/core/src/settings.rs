@@ -299,6 +299,35 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "behavior.history_per_tab",
+        label: "history per terminal",
+        section: Section::Terminal,
+        doc: "Each tab's shell keeps its own history, back when the tab is restored.",
+        note: &[
+            "Set inside the shells Giverny starts (bash, zsh, fish) by a",
+            "start-up file of its own that runs your usual rc; no rc file of",
+            "yours is touched, and a shell started from the tab keeps its own",
+            "history. An rc that sets HISTFILE itself wins. Off leaves the",
+            "shell's history as the shell has it. Applies to shells started",
+            "from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
+        key: "behavior.history_also_shared",
+        label: "also add to shell history",
+        section: Section::Terminal,
+        doc: "With history per terminal, also append each command to the usual history (bash).",
+        note: &[
+            "Appends to ~/.bash_history as each command runs; never rewrites it.",
+            "zsh and fish keep only the tab's own history.",
+            "Applies to shells started from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "behavior.notifications",
         label: "desktop notifications",
         section: Section::Terminal,
@@ -698,8 +727,8 @@ mod tests {
 
     #[test]
     fn every_option_resolves_against_a_live_config() {
-        // `deny_unknown_fields` catches keys the struct lacks; this catches
-        // keys the struct has under a different path.
+        // Unknown keys are tolerated, so this checks
+        // every option resolves under the path the settings table names.
         let cfg = Config::default();
         for def in SETTINGS {
             let value = current(&cfg, def);

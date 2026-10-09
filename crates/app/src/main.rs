@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, Modifiers};
 use giverny_claude::wsl;
 use giverny_core::config;
+use giverny_core::history;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
@@ -442,6 +443,33 @@ fn scrub_inherited_claude_markers() {
     );
 }
 
+/// `giverny --help`, and what an unknown command prints to stderr.
+const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
+     USAGE:\n  giverny            launch the terminal\n  \
+     giverny doctor     diagnose Claude integration\n  \
+     giverny welcome [from-version]\n                     \
+     print the welcome screen\n  \
+     giverny update     check for a newer release\n  \
+     giverny install-desktop [--remove]\n                     \
+     install the desktop entry + icons (needed for the\n                     \
+     taskbar icon on Wayland)\n  \
+     giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+     FLAGS:\n  -V, --version  print the version\n  \
+     -h, --help     print this help";
+
+/// Is `arg`, the first argument, a command this build does not have?
+///
+/// The window takes no arguments, so anything past the known subcommands
+/// used to be ignored and the window opened anyway. A bare word is refused:
+/// it is a command, likely one newer than this binary. Left to open the
+/// window as before: flags (a launcher may add some, e.g. macOS's `-psn_…`),
+/// and anything that reads as a path — one that `exists`, or is spelled with
+/// a separator, `.` or `~` — in case a launcher or file manager hands one over.
+fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
+    !arg.is_empty() && !arg.starts_with(['-', '.', '~']) && !arg.contains(['/', '\\']) && !exists
+}
+
 fn main() -> eframe::Result {
     scrub_inherited_claude_markers();
 
@@ -492,22 +520,15 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!(
-                "giverny — a native terminal built around Claude Code\n\n\
-                 USAGE:\n  giverny            launch the terminal\n  \
-                 giverny doctor     diagnose Claude integration\n  \
-                 giverny welcome [from-version]\n                     \
-                 print the welcome screen\n  \
-                 giverny update     check for a newer release\n  \
-                 giverny install-desktop [--remove]\n                     \
-                 install the desktop entry + icons (needed for the\n                     \
-                 taskbar icon on Wayland)\n  \
-                 giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
-                 FLAGS:\n  -V, --version  print the version\n  \
-                 -h, --help     print this help"
-            );
+            println!("{USAGE}");
             return Ok(());
+        }
+        // A word this build does not know: a typo, or a subcommand added
+        // since it was built. It must not fall through to opening a window,
+        // which would also set up the Claude accounts from this binary.
+        Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
+            eprintln!("giverny: unknown command '{arg}'\n\n{USAGE}");
+            std::process::exit(2);
         }
         _ => {}
     }
@@ -901,9 +922,6 @@ pub struct App {
     pub drag_hover: Option<egui::Pos2>,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
-    /// Every live claude session started before hooks/statusline were
-    /// installed, so none of them report anything (recomputed periodically).
-    pub stale_sessions: bool,
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -962,6 +980,9 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+    /// The config could not be parsed at startup, so the accounts were not
+    /// set up from it; the first reload that parses does that.
+    accounts_unset: bool,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -993,6 +1014,36 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
         surface.surface.as_ptr(),
         move || wake.request_repaint(),
     ))
+}
+
+/// Can account setup follow this config? Not when a value it reads — the
+/// `[claude]` section — is one that did not fit and was stood in for.
+fn accounts_readable(parsed: &config::Parsed) -> bool {
+    !parsed.invalid_under("claude")
+}
+
+/// Bring every account in line with the config at startup: auto mode.
+///
+/// Not when the config could not be parsed, or its `[claude]` values could
+/// not (`config_read` false). The app then runs on defaults there, and
+/// following those would rewrite accounts against what the user configured.
+/// Once the file parses again, the hot reload applies what it says. Hook
+/// paths and the status line read nothing from the config, so
+/// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
+fn set_up_accounts(
+    claude: &mut claude_watch::ClaudeWatch,
+    cfg: &config::Config,
+    config_read: bool,
+) {
+    if !config_read {
+        tracing::warn!(
+            "config.toml could not be parsed: Claude account settings left as they are until it is fixed"
+        );
+        return;
+    }
+    if cfg.claude.auto_mode {
+        claude.ensure_auto_mode();
+    }
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1206,7 +1257,21 @@ impl App {
         see_through: bool,
     ) -> Self {
         let paths = Paths::default_dirs();
-        let mut cfg = config::load(paths.base());
+        // A config that cannot be parsed runs on defaults, but those are not
+        // what the user chose, so nothing is written into the accounts from
+        // them (see `set_up_accounts`). Nor when only a value account setup
+        // reads is unusable: one bad value is otherwise just left out.
+        let (mut cfg, config_read) =
+            match config::load_checked(paths.base(), &config::Config::default()) {
+                Ok(parsed) => {
+                    let read = accounts_readable(&parsed);
+                    (parsed.config, read)
+                }
+                Err(err) => {
+                    tracing::error!("config.toml ignored ({err}); running on defaults");
+                    (config::Config::default(), false)
+                }
+            };
         remember_env_accounts(&paths, &mut cfg);
         let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
@@ -1339,7 +1404,6 @@ impl App {
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
             row_rects: Vec::new(),
-            stale_sessions: false,
             attention: 0,
             frameless,
             see_through,
@@ -1373,6 +1437,7 @@ impl App {
             theme_tick: std::time::Instant::now(),
             cfg,
             last_cfg_check: Instant::now(),
+            accounts_unset: !config_read,
         };
         if let Some(z) = zoom {
             cc.egui_ctx.set_zoom_factor(z);
@@ -1380,9 +1445,7 @@ impl App {
         }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
-        if app.cfg.claude.auto_mode {
-            app.claude.ensure_auto_mode();
-        }
+        set_up_accounts(&mut app.claude, &app.cfg, config_read);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1398,6 +1461,15 @@ impl App {
         // otherwise.
         app.save_state();
         app
+    }
+
+    /// A brand-new tab. Tab ids start over when the state file is lost, so
+    /// a history file can outlive its tab (one whose shell outlasted the
+    /// close, say): a new tab with that id starts without it.
+    fn new_tab(&mut self, category: CategoryId) -> TabId {
+        let id = self.ws.add_tab(category);
+        history::remove(&self.paths, id);
+        id
     }
 
     /// Write one tab's scrollback, skipping the write when the screen has not
@@ -1485,7 +1557,7 @@ impl App {
                     .or_else(|| self.ws.active_tab().and_then(|t| t.cwd.clone()))
                     .or_else(dirs::home_dir)
                     .unwrap_or_else(|| PathBuf::from("/"));
-                let id = self.ws.add_tab(category);
+                let id = self.new_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
                 self.reveal_terminal();
@@ -1500,8 +1572,20 @@ impl App {
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
-                    // Join off the UI thread; the loop exits quickly.
-                    std::thread::spawn(move || session.shutdown());
+                    // Join off the UI thread; the loop exits quickly. The
+                    // history goes once the shell has: zsh writes its file
+                    // on the SIGHUP that shutdown sends, so removing it
+                    // first would only see it written again.
+                    let paths = self.paths.clone();
+                    std::thread::spawn(move || {
+                        // Longer than the 500 ms an app exit allows: this
+                        // thread holds nothing up, and a shell that is slow
+                        // to go would write its file after the removal.
+                        session.shutdown_within(Duration::from_secs(10));
+                        history::remove(&paths, id);
+                    });
+                } else {
+                    history::remove(&self.paths, id);
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
@@ -1631,7 +1715,15 @@ impl App {
             Action::ToggleSettings => {
                 self.settings = match self.settings.take() {
                     Some(_) => None,
-                    None => Some(settings_ui::SettingsState::default()),
+                    // Back on the section last looked at, not the first.
+                    None => Some(settings_ui::SettingsState {
+                        section: giverny_core::settings::Section::ALL
+                            .iter()
+                            .copied()
+                            .find(|s| self.layout.settings_section.as_deref() == Some(s.title()))
+                            .unwrap_or(giverny_core::settings::Section::Appearance),
+                        ..Default::default()
+                    }),
                 };
                 self.focus_terminal = self.settings.is_none();
             }
@@ -1651,7 +1743,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(ctx, config::load(self.paths.base()));
+                        self.reload_config(ctx);
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -1663,7 +1755,7 @@ impl App {
                     return;
                 };
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
-                let id = self.ws.add_tab(cat);
+                let id = self.new_tab(cat);
                 if let Some(tab) = self.ws.tab_mut(id) {
                     // The agent's own directory: `claude --resume` only finds a
                     // conversation from where it ran.
@@ -1698,7 +1790,7 @@ impl App {
                     .map(|t| t.category)
                     .or_else(|| self.ws.categories.first().map(|c| c.id));
                 if let Some(cat) = cat {
-                    let id = self.ws.add_tab(cat);
+                    let id = self.new_tab(cat);
                     self.ws.tab_mut(id).unwrap().cwd = dirs::home_dir();
                     self.spawn_session(ctx, id, None);
                     // Same deferred injection the resume path uses: give the
@@ -1837,12 +1929,60 @@ impl App {
             .or_else(|| self.ws.categories.first().map(|c| c.id));
         let Some(category) = category else { return };
         splash::mark_seen(self.paths.base());
-        let id = self.ws.add_tab(category);
+        let id = self.new_tab(category);
         if let Some(tab) = self.ws.tab_mut(id) {
             tab.cwd = dirs::home_dir();
         }
         self.spawn_session(ctx, id, Some(splash::render(welcome)));
         self.reveal_terminal();
+    }
+
+    /// How this tab's shell is started so it keeps its own history:
+    /// arguments for it and environment for Giverny's init file there. `None` when the setting is off, or the shell is not one that
+    /// can be steered this way or already has arguments of its own. `env` is
+    /// what the tab already adds on top of ours.
+    fn history_steer(
+        &self,
+        id: TabId,
+        shell: Option<&(String, Vec<String>)>,
+        env: &[(String, String)],
+    ) -> Option<(String, history::Steer)> {
+        if !self.cfg.behavior.history_per_tab {
+            return None;
+        }
+        if shell.is_some_and(|(_, args)| !args.is_empty()) {
+            return None;
+        }
+        let program = pty::shell_program(shell)?;
+        let kind = history::ShellKind::of(&program)?;
+        let file = history::history_file(&self.paths, id);
+        let init = history::init_dir(&self.paths);
+        // bash and zsh create the file, not the directory it sits in.
+        let ready = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| history::write_init(&init));
+        if let Err(err) = ready {
+            tracing::warn!("no per-tab history for tab {}: {err}", id.0);
+            return None;
+        }
+        let home = dirs::home_dir();
+        let steer = history::steer(
+            kind,
+            &file,
+            id,
+            self.cfg.behavior.history_also_shared,
+            home.as_deref(),
+            &init,
+            |var| {
+                env.iter()
+                    .rev()
+                    .find(|(k, _)| k == var)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(var).ok())
+            },
+        );
+        Some((program, steer))
     }
 
     fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
@@ -1859,8 +1999,18 @@ impl App {
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
         let in_wsl = shape.in_wsl;
+        // A WSL shell is a world of its own — its paths, its home — and is
+        // left with the history it has.
+        if !in_wsl
+            && let Some((program, steer)) = self.history_steer(id, shape.shell.as_ref(), &shape.env)
+        {
+            if !steer.args.is_empty() {
+                shape.shell = Some((program, steer.args));
+            }
+            shape.env.extend(steer.env);
+        }
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),
@@ -2343,8 +2493,23 @@ impl App {
             return;
         }
         self.cfg_mtime = mtime;
-        let cfg = config::load(self.paths.base());
-        self.apply_config(ctx, cfg);
+        self.reload_config(ctx);
+    }
+
+    /// Read `config.toml` again and apply it. A file that does not parse
+    /// changes nothing: the running settings stay.
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        match config::load_checked(self.paths.base(), &self.cfg) {
+            Ok(parsed) => {
+                let read = accounts_readable(&parsed);
+                self.apply_config(ctx, parsed.config);
+                if read && std::mem::take(&mut self.accounts_unset) {
+                    tracing::info!("config.toml parses again: setting up Claude accounts");
+                    set_up_accounts(&mut self.claude, &self.cfg, true);
+                }
+            }
+            Err(err) => tracing::error!("config.toml ignored ({err}); keeping previous settings"),
+        }
     }
 
     /// Put a theme on the grid, on every open session, and on the chrome.
@@ -2620,7 +2785,6 @@ impl App {
         }
         self.persist_font_size();
         self.track_foreground();
-        self.stale_sessions = self.claude.sessions_predate_settings();
         self.probe_wsl_cwds();
         self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -2974,6 +3138,13 @@ impl App {
     }
 }
 
+/// The terminal `id` has lost the keyboard to something that is not meant
+/// to hold it, and should take it back: anything but a text field, while no
+/// `overlay` reading keys of its own is open.
+fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
+    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
+}
+
 /// Frames drawn per second, logged every ten seconds at debug level
 /// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
 /// asked for the last one. On a software renderer every frame is CPU, so
@@ -3248,7 +3419,20 @@ impl eframe::App for App {
                 if let Some(session) = &mut rt.session {
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
-                    if self.focus_terminal {
+                    // Typing goes to the terminal. egui drops a widget's
+                    // focus on any press outside it — the rail, the
+                    // taskbar, a header button — and the keys typed after
+                    // that went nowhere until the terminal was clicked
+                    // again. So it takes the keyboard back whenever nothing
+                    // else is meant to hold it: a text field (the search
+                    // bar, a settings input) or an overlay that reads keys
+                    // of its own. Only when it has lost it, since each
+                    // request interrupts IME input.
+                    let overlay = self.palette.is_some()
+                        || self.session_picker.is_some()
+                        || self.keys_overlay.is_some()
+                        || self.rename.is_some();
+                    if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
                     }
@@ -3637,39 +3821,18 @@ fn doctor() {
     let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
     let live = registry::scan(dirs);
     println!("\nlive claude sessions ({}):", live.len());
-    let mut stale = 0;
     for s in &live {
-        // Sessions that started before settings.json was last written never
-        // loaded our hooks or statusline.
-        let settings_at = std::fs::metadata(s.config_dir.join("settings.json"))
-            .and_then(|m| m.modified())
-            .ok();
-        let started = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_millis(s.entry.started_at_ms));
-        let predates = matches!((settings_at, started), (Some(a), Some(b)) if b < a);
-        if predates {
-            stale += 1;
-        }
         println!(
-            "  pid {:<8} {:<6} {:<26} {:<12} {}",
+            "  pid {:<8} {:<6} {:<26} {}",
             s.entry.pid,
             s.entry.status,
             s.entry.name.as_deref().unwrap_or("-"),
-            if predates { "PRE-HOOKS" } else { "hooked" },
             s.entry.cwd.display()
-        );
-    }
-    if stale > 0 {
-        println!(
-            "\n  ⟳ {stale} session(s) started before hooks/statusline were installed.\n    \
-             Claude Code reads settings.json at session start — exit and re-run\n    \
-             claude in those tabs to get live states and live usage."
         );
     }
 
     println!(
-        "\nnotes\n  · hooks load when a claude session STARTS — restart claude after installing\n  \
-         · notifications fire when claude needs YOU (permission prompts, questions),\n    \
+        "\nnotes\n  · notifications fire when claude needs YOU (permission prompts, questions),\n    \
          not when it merely finishes"
     );
 }
@@ -3720,6 +3883,138 @@ fn fresh_nonce(salt: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare word the binary does not know is a command, and is refused;
+    /// flags and anything that reads as a path still open the window.
+    #[test]
+    fn unknown_words_are_commands_but_paths_and_flags_are_not() {
+        for word in ["doctr", "upgrade", "plan", "help", "status-line"] {
+            assert!(is_unknown_subcommand(word, false), "{word}");
+        }
+        for not_a_command in [
+            "",
+            "-psn_0_12345",
+            "--some-flag",
+            "./here",
+            "..",
+            "~/Dev",
+            "/home/me/project",
+            "proj/sub",
+            "C:\\Users\\me",
+        ] {
+            assert!(
+                !is_unknown_subcommand(not_a_command, false),
+                "{not_a_command}"
+            );
+        }
+        // A bare word naming something that exists is a path, not a command.
+        assert!(!is_unknown_subcommand("project", true));
+    }
+
+    /// One bad value elsewhere still lets account setup follow the config; a
+    /// bad value in what it reads does not.
+    #[test]
+    fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
+        let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
+        assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
+        assert!(accounts_readable(&parse("[claude]\nauto_mode = false\n")));
+        assert!(!accounts_readable(&parse("[claude]\nauto_mode = \"no\"\n")));
+        assert!(!accounts_readable(&parse("claude = 5\n")));
+    }
+
+    /// A config that cannot be parsed leaves every account as it was —
+    /// here one auto mode would otherwise be written into — while a parsed
+    /// one is followed.
+    #[test]
+    fn an_unparseable_config_leaves_the_accounts_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-unread-config-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        std::fs::create_dir_all(&account).unwrap();
+        let settings = account.join("settings.json");
+        let before = r#"{"theme":"dark"}"#;
+        std::fs::write(&settings, before).unwrap();
+
+        let mut watch = claude_watch::ClaudeWatch::for_tests();
+        watch.profiles = vec![giverny_claude::profiles::Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        }];
+        let mut auto = config::Config::default();
+        auto.claude.auto_mode = true;
+
+        set_up_accounts(&mut watch, &auto, false);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+
+        // The same settings from a config that was read: the account follows.
+        set_up_accounts(&mut watch, &auto, true);
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(after.contains("defaultMode"), "{after}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A press on anything else — here a button, as the rail
+    /// would be — takes egui's focus off the terminal, and
+    /// the terminal is then told to take it back; a text field keeps it.
+    #[test]
+    fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
+        let ctx = egui::Context::default();
+        let button_at = egui::pos2(20.0, 10.0);
+        let mut text = String::new();
+        let frame = |events: Vec<egui::Event>, with_field: bool, text: &mut String| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut lost = false;
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = ui.button("row");
+                if with_field {
+                    ui.add(egui::TextEdit::singleline(text)).request_focus();
+                }
+                let (_, resp) =
+                    ui.allocate_exact_size(egui::vec2(400.0, 300.0), egui::Sense::click_and_drag());
+                lost = terminal_lost_keys(ui.ctx(), resp.id, false);
+                if lost {
+                    resp.request_focus();
+                }
+            });
+            lost
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: button_at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Unfocused at first: taken.
+        assert!(frame(vec![], false, &mut text));
+        assert!(!frame(vec![], false, &mut text));
+        // A click on the button: lost, and taken back.
+        let lost = frame(
+            vec![egui::Event::PointerMoved(button_at), press(true)],
+            false,
+            &mut text,
+        ) | frame(vec![press(false)], false, &mut text);
+        assert!(lost);
+        assert!(!frame(vec![], false, &mut text));
+        // A text field holding the keyboard keeps it.
+        frame(vec![], true, &mut text);
+        assert!(!frame(vec![], true, &mut text));
+        assert!(ctx.text_edit_focused());
+        // An overlay reading its own keys: left alone.
+        assert!(!terminal_lost_keys(&ctx, egui::Id::new("term"), true));
+    }
 
     #[test]
     fn the_backdrop_tiles_around_the_grid_exactly() {

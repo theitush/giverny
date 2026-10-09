@@ -100,6 +100,9 @@ struct RowData {
     sub: String,
     active: bool,
     exited: bool,
+    /// Its shell has been spawned. A tab restored from a previous run has
+    /// none until it is first focused.
+    started: bool,
     color: Color32,
     claude: ClaudeState,
     /// A background shell is alive while Claude itself waits at its prompt.
@@ -196,6 +199,7 @@ fn row_data(
         sub,
         active: app.ws.active == Some(t.id),
         exited: t.exited,
+        started: app.rt.contains_key(&t.id),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.background),
@@ -1004,9 +1008,13 @@ fn tab_row(
         }
         ClaudeState::None => {
             // A plain shell, which most tabs are most of the time: a small
-            // green dot for a live shell, an outline once it has exited.
+            // green dot for a live shell, an outline once it has exited, and
+            // a small dim dot for a restored tab whose shell has not started
+            // yet: green there would claim a shell that is not running.
             if row.exited {
                 p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
+            } else if !row.started {
+                p.circle_filled(dot, 2.5, dim);
             } else {
                 p.circle_filled(dot, 3.5, c.green);
             }
@@ -1240,24 +1248,6 @@ fn banner_button(
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     let c = app.chrome;
-    // Installed, but every running session predates it — claude reads
-    // settings at startup, so none of them will report anything.
-    if app.claude.hooks_installed && app.stale_sessions {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("⟳ restart claude for live states")
-                    .font(FontId::monospace(10.0))
-                    .color(c.amber),
-            )
-            .on_hover_text(
-                "hooks and the usage statusline load when a claude session starts.\n\
-                 every running session began before they were installed —\n\
-                 exit and re-run claude in a tab to activate them.",
-            );
-        });
-    }
     if app.claude.hooks_installed && !app.claude.relay_listening() {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1267,6 +1257,25 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
                     .font(FontId::monospace(10.0))
                     .color(c.poppy),
             );
+        });
+    }
+    // Hooks were just installed for the first time, and Claude Code reads
+    // them when a session starts: the sessions already running report
+    // nothing. Only those; the hint goes when the last of them ends.
+    let without = app.claude.sessions_without_hooks();
+    if without > 0 {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("⟳ restart claude for live states")
+                    .font(FontId::monospace(10.0))
+                    .color(c.amber),
+            )
+            .on_hover_text(format!(
+                "{without} claude session(s) started before the hooks were installed\n\
+                 and report no states until restarted; new sessions have them."
+            ));
         });
     }
     if app.claude.hooks_installed || app.hooks_banner_dismissed {
@@ -1337,32 +1346,24 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             actions.push(Action::ToggleSettings);
         }
     });
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        let live = app.claude.hooks_installed && app.claude.relay_listening();
-        ui.label(
-            egui::RichText::new(if live { "● claude states live" } else { "○ states degraded" })
-                .font(FontId::monospace(9.5))
-                .color(if live { c.accent } else { c.poppy }),
-        )
-        .on_hover_text(if live {
-            "hooks installed and the relay is connected\n(restart a claude session for its hooks to load)"
-        } else {
-            "install hooks below, or run `giverny doctor` in a tab"
-        });
-        // Only surfaced when off — it is on by default wherever hooks are.
-        if !app.claude.statusline_on()
-            && ui
+    // No "states live" line: working is the normal case and says nothing.
+    // What is wrong says so above it (`hooks_banner`): no hooks, or no relay.
+    // Only surfaced when off — it is on by default wherever hooks are.
+    if !app.claude.statusline_on() {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            if ui
                 .small_button("enable live usage")
                 .on_hover_text(
                     "adds a compact statusline to claude that pushes usage to Giverny\n\
                      (official rate_limits field — no API calls)",
                 )
                 .clicked()
-        {
-            actions.push(Action::ToggleStatusline(true));
-        }
-    });
+            {
+                actions.push(Action::ToggleStatusline(true));
+            }
+        });
+    }
     if app.claude.accounts.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
@@ -1422,14 +1423,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                         .font(FontId::monospace(9.0))
                         .color(if m > 30 { c.amber } else { dim }),
                     );
-                    if acc.statusline_on {
-                        resp.on_hover_text(
-                            "from claude's on-disk cache.\nlive updates start when a claude \
-                             session is restarted\n(settings load at session start)",
-                        );
-                    } else {
-                        resp.on_hover_text("from claude's on-disk cache");
-                    }
+                    resp.on_hover_text("from claude's on-disk cache");
                 }
                 _ => {}
             }
