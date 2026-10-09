@@ -402,11 +402,15 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
 /// [`peak_hint`] speaks.
 pub const MIN_PEAK_SAMPLES: usize = 3;
 
-/// What the most recent tasks like this one peaked at under `giverny manage
-/// run`, by the same levels as [`track_record`] (repo and kind, repo, all):
-/// `the last 4 BUG tasks in demo peaked at 1.8G (median), 2.6G at most`.
-/// A task the cap killed counts at its peak, which is a floor.
-pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<String> {
+/// The measured peaks of the most recent tasks like this one, by the same
+/// levels as [`track_record`] (repo and kind, repo, all): the narrowest
+/// with [`MIN_PEAK_SAMPLES`], newest first, with how to name the level
+/// (`BUG tasks in demo`).
+fn peak_sample(
+    history: &[Record],
+    repo: Option<&str>,
+    kind: Option<&str>,
+) -> Option<(String, Vec<u64>)> {
     let levels: [(Option<&str>, Option<&str>); 3] = [(repo, kind), (repo, None), (None, None)];
     for (i, (r, k)) in levels.into_iter().enumerate() {
         if (i == 0 && (r.is_none() || k.is_none())) || (i == 1 && r.is_none()) {
@@ -428,17 +432,37 @@ pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> 
             (Some(r), None) => format!("tasks in {r}"),
             _ => "tasks".to_string(),
         };
-        let max = peaks.iter().copied().max().unwrap_or(0);
-        let med = median(peaks.iter().map(|p| *p as f64).collect()).round() as u64;
-        let mem = |m: u64| giverny_core::limits::Mem(m).to_string();
-        return Some(format!(
-            "the last {} {what} peaked at {} (median), {} at most",
-            peaks.len(),
-            mem(med),
-            mem(max)
-        ));
+        return Some((what, peaks));
     }
     None
+}
+
+/// What the most recent tasks like this one peaked at under `giverny manage
+/// run`, by the same levels as [`track_record`] (repo and kind, repo, all):
+/// `the last 4 BUG tasks in demo peaked at 1.8G (median), 2.6G at most`.
+/// A task the cap killed counts at its peak, which is a floor.
+pub fn peak_hint(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<String> {
+    let (what, peaks) = peak_sample(history, repo, kind)?;
+    let max = peaks.iter().copied().max().unwrap_or(0);
+    let med = median(peaks.iter().map(|p| *p as f64).collect()).round() as u64;
+    let mem = |m: u64| giverny_core::limits::Mem(m).to_string();
+    Some(format!(
+        "the last {} {what} peaked at {} (median), {} at most",
+        peaks.len(),
+        mem(med),
+        mem(max)
+    ))
+}
+
+/// The high end of what tasks like this one peak at, MiB: the 90th
+/// percentile (nearest rank) of the peaks [`peak_hint`] summarises. What the
+/// ledger counts a task at when it admits memory (giverny#281). `None`
+/// with too little history.
+pub fn expected_peak_mb(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<u64> {
+    let (_, mut peaks) = peak_sample(history, repo, kind)?;
+    peaks.sort_unstable();
+    let rank = (peaks.len() * 9).div_ceil(10).max(1);
+    peaks.get(rank - 1).copied()
 }
 
 #[cfg(test)]
@@ -479,6 +503,11 @@ mod tests {
             peak_hint(&h, Some("demo"), Some("BUG")).as_deref(),
             Some("the last 3 BUG tasks in demo peaked at 1.8G (median), 2.6G at most")
         );
+        // The ledger counts the high end: p90 by nearest rank, here the max of 3.
+        assert_eq!(expected_peak_mb(&h, Some("demo"), Some("BUG")), Some(2662));
+        let ten: Vec<Record> = (1..=10).map(|i| peak("demo", "BUG", i * 100)).collect();
+        assert_eq!(expected_peak_mb(&ten, Some("demo"), Some("BUG")), Some(900));
+        assert_eq!(expected_peak_mb(&ten[..2], Some("demo"), Some("BUG")), None);
         // Tasks with no measured peak say nothing; nor does too little.
         assert_eq!(peak_hint(&[rec("x", None, 1, 1)], None, None), None);
         assert_eq!(
