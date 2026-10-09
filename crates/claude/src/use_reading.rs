@@ -91,6 +91,12 @@ pub struct Reading {
     pub total: Use,
     /// Every claude under the app, by pid.
     pub sessions: BTreeMap<u32, Use>,
+    /// Each tab's Claude Code, by the pid of the app's child it runs under
+    /// (the tab's shell): every claude there with all it started, its
+    /// `manage run` scopes too, counted once (a claude a claude started is
+    /// in the outer one's). Only tabs with a claude in them (giverny#267).
+    #[serde(default)]
+    pub tabs: BTreeMap<u32, Use>,
     pub runs: Vec<RunUse>,
     /// Each worker's processes (the Bash commands it started, with all
     /// under them), by agent id; part of its session's.
@@ -158,12 +164,17 @@ impl Table {
         agents: &HashMap<String, HashSet<u32>>,
     ) -> Reading {
         let tree = subtree(&self.procs, app);
-        let sessions = tree
+        let claudes: BTreeMap<u32, HashSet<u32>> = tree
             .iter()
             .copied()
             .filter(|&p| is_claude(p))
-            .map(|p| (p, self.use_of(&subtree(&self.procs, p))))
+            .map(|p| (p, subtree(&self.procs, p)))
             .collect();
+        let sessions = claudes
+            .iter()
+            .map(|(&p, pids)| (p, self.use_of(pids)))
+            .collect();
+        let tabs = self.tabs(app, &claudes);
         let mut by_task: BTreeMap<(String, String), HashSet<u32>> = BTreeMap::new();
         for (session, task, pids) in runs {
             by_task
@@ -189,12 +200,43 @@ impl Table {
             app,
             total: self.use_of(&tree),
             sessions,
+            tabs,
             runs,
             agents: agents
                 .iter()
                 .map(|(id, pids)| (id.clone(), self.use_of(pids)))
                 .collect(),
         }
+    }
+}
+
+impl Table {
+    /// [`Reading::tabs`]: each outermost claude's processes, gathered under
+    /// the child of `app` above it.
+    fn tabs(&self, app: u32, claudes: &BTreeMap<u32, HashSet<u32>>) -> BTreeMap<u32, Use> {
+        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        let mut by_tab: BTreeMap<u32, HashSet<u32>> = BTreeMap::new();
+        'claude: for (&claude, pids) in claudes {
+            let mut at = claude;
+            for _ in 0..256 {
+                let Some(&up) = parent.get(&at) else {
+                    continue 'claude;
+                };
+                if up == app {
+                    by_tab.entry(at).or_default().extend(pids);
+                    continue 'claude;
+                }
+                if claudes.contains_key(&up) || up == at {
+                    // Inside another claude: counted in that one's.
+                    continue 'claude;
+                }
+                at = up;
+            }
+        }
+        by_tab
+            .into_iter()
+            .map(|(tab, pids)| (tab, self.use_of(&pids)))
+            .collect()
     }
 }
 
@@ -653,6 +695,36 @@ mod tests {
             assert!(part.mem_mb <= whole.mem_mb, "{part:?} {whole:?}");
         }
         assert!(!r.sessions.contains_key(&900));
+        // Each tab's figure is its claude's: shells 110 and 210 are the
+        // app's children, and a tab is the sum of the claudes under it.
+        assert_eq!(r.tabs.keys().copied().collect::<Vec<_>>(), vec![110, 210]);
+        assert_eq!((r.tabs[&110], r.tabs[&210]), (a, b));
+    }
+
+    /// A claude started by a claude is in its tab once, inside the outer
+    /// one's figure; two claudes side by side in one tab are summed.
+    #[test]
+    fn a_tab_counts_each_of_its_claudes_once() {
+        let before = machine();
+        let mut after = machine();
+        for q in &mut after {
+            q.ticks += 10;
+        }
+        let t = table(after, Some(&seen(&before)), None);
+        // 141 is a claude inside claude 120: still one tab, the same figure.
+        let r = t.reading(42, 100, |p| [120, 141].contains(&p), &[], &HashMap::new());
+        assert_eq!(r.tabs.len(), 1);
+        assert_eq!(r.tabs[&110], r.sessions[&120]);
+        // 130 and 220 side by side under one shell (220 moved there).
+        let mut procs = machine();
+        procs.retain(|q| q.pid != 210);
+        procs.iter_mut().find(|q| q.pid == 220).unwrap().ppid = 110;
+        let t = table(procs, None, None);
+        let r = t.reading(42, 100, |p| [130, 220].contains(&p), &[], &HashMap::new());
+        // 130 → 140 → 141 and 220, in KiB.
+        let both = (3_000u64 + 50_000 + 900_000 + 250_000).div_ceil(1024);
+        assert_eq!(r.tabs[&110].mem_mb, both);
+        assert_eq!(r.tabs.len(), 1);
     }
 
     /// A worker's commands: within its session, and a `manage run` it
