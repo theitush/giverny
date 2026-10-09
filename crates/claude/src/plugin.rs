@@ -32,12 +32,16 @@
 //!   call costs a few `stat`s. The same launcher runs as a `PreToolUse` hook
 //!   on Bash: a command that would leave its tab's resource cap
 //!   (`systemd-run`, `systemctl --user set-property`, a write into
-//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]).
+//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]). And with the
+//!   skill in, it runs as a `UserPromptSubmit` hook: a prompt that asks to
+//!   manage ("manage that task") gets context telling Claude to invoke
+//!   `giverny:manage` first, since a skill picked only by its description
+//!   loses to "manage" read as a plain verb ([`crate::manage_trigger`]).
 //!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
-//! default): off, the plugin is written without `skills/`, so the hook, the
-//! launchers and `/giverny:clear-done` the pane needs stay, and only
-//! the skill goes — from every account at once, since they all load this
+//! default): off, the plugin is written without `skills/` and without its
+//! prompt hook, so the tool hooks, the launchers and `/giverny:clear-done`
+//! the pane needs stay, and only the skill goes — from every account at once, since they all load this
 //! one directory.
 //!
 //! - A plugin cannot grant permissions: of a plugin's own `settings.json`
@@ -114,27 +118,28 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// the session's `ask`/`reply` messages and renews its resource leases;
 /// quiet and exit 0 whatever happens. The same launcher is a `PreToolUse`
 /// hook on Bash, which refuses a command that would leave its tab's
-/// resource cap ([`crate::bash_guard`]).
-fn session_hooks() -> Value {
+/// resource cap ([`crate::bash_guard`]), and, with the manage skill in
+/// (`skill`), a `UserPromptSubmit` hook that sends a prompt asking to manage
+/// to that skill ([`crate::manage_trigger`]).
+fn session_hooks(skill: bool) -> Value {
+    let hook = || {
+        json!([{
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-hook\" 2>/dev/null || true"
+        }])
+    };
+    let mut hooks = json!({
+        "PreToolUse": [{ "matcher": "Bash", "hooks": hook() }],
+        "PostToolUse": [{ "matcher": "*", "hooks": hook() }]
+    });
+    if skill {
+        hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
+    }
     json!({
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
-                        and Bash commands kept inside their tab's resource cap",
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "Bash",
-                "hooks": [{
-                    "type": "command",
-                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-hook\" 2>/dev/null || true"
-                }]
-            }],
-            "PostToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/giverny-hook\" 2>/dev/null || true"
-                }]
-            }]
-        }
+                        Bash commands kept inside their tab's resource cap, \
+                        and \"manage this\" sent to the manage skill",
+        "hooks": hooks
     })
 }
 
@@ -193,7 +198,7 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
         ),
         (
             "plugins/giverny/hooks/hooks.json",
-            pretty(&session_hooks()),
+            pretty(&session_hooks(skill)),
             false,
         ),
     ];
@@ -585,6 +590,15 @@ mod tests {
         assert!(sync(&d, &exes, false).unwrap());
         assert!(!d.join(SKILL_PATH).exists());
         assert!(!d.join("plugins/giverny/skills").exists());
+        // …and so does the prompt hook that sends "manage this" to it.
+        let hooks = |d: &Path| -> Value {
+            serde_json::from_slice(
+                &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_none());
+        assert!(hooks(&d)["hooks"].get("PostToolUse").is_some());
         for kept in [
             "plugins/giverny/hooks/hooks.json",
             "plugins/giverny/bin/giverny-manage",
@@ -598,6 +612,7 @@ mod tests {
         // On again: back, byte for byte.
         assert!(sync(&d, &exes, true).unwrap());
         assert_eq!(std::fs::read_to_string(d.join(SKILL_PATH)).unwrap(), SKILL);
+        assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_some());
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -643,6 +658,10 @@ mod tests {
         let pre = &h["hooks"]["PreToolUse"][0];
         assert_eq!(pre["matcher"], "Bash");
         assert_eq!(pre["hooks"][0]["command"].as_str(), Some(cmd));
+        // So is the prompt hook, which takes no matcher.
+        let prompt = &h["hooks"]["UserPromptSubmit"][0];
+        assert!(prompt.get("matcher").is_none());
+        assert_eq!(prompt["hooks"][0]["command"].as_str(), Some(cmd));
         #[cfg(unix)]
         {
             let out = std::process::Command::new("sh")

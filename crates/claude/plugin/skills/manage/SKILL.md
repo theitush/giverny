@@ -1,6 +1,6 @@
 ---
 name: manage
-description: Run a piece of work as a manager session of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's management panel as Running, Next up with ETAs, and Done. Use when asked to manage, fan work out to subagents, or work through a list of tasks in parallel.
+description: Run a piece of work as a manager session of subagents, one per task (a worker reused for a next task where that saves tokens), several at once where their files do not overlap, and show it in Giverny's management panel as Running, Next up with ETAs, and Done. Invoke it whenever the user says "manage" — "manage this", "manage that task", "and manage it plz", "/manage" — before doing any of the work yourself; "manage" means this skill, not a project's own orchestrate or dispatch skill. Also use it when asked to fan work out to subagents or work through a list of tasks in parallel.
 ---
 
 # Manage a session
