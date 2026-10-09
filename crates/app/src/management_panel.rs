@@ -981,7 +981,8 @@ pub fn build_with(
     let written = feed.and_then(|f| f.written_ms);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for row in &rows {
-        lines.push(format_row(row, now_ms, written, clock));
+        let wait = planned_wait(row, &rows, now_ms);
+        lines.push(format_row(row, now_ms, written, clock, wait));
     }
     dittos(&rows, &mut lines);
     Table {
@@ -1058,6 +1059,7 @@ fn format_row(
     now_ms: u64,
     written: Option<u64>,
     clock: &Clock,
+    wait: Option<Wait>,
 ) -> Line {
     let f = row.feed;
     let l = row.live;
@@ -1159,7 +1161,6 @@ fn format_row(
     let held = f
         .and_then(|f| f.lease.as_ref())
         .filter(|_| row.stage != Stage::Done);
-    let queued = held.filter(|l| row.stage == Stage::Planned && l.state == LeaseState::Queued);
     // The cell is the row's use: a Running row's commands now,
     // a Done row's memory peak alone.
     let measured = f.and_then(|f| f.usage.as_ref());
@@ -1183,9 +1184,11 @@ fn format_row(
         Stage::Planned => String::new(),
     };
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
-    let flag = (row.stage == Stage::Running)
-        .then(|| unworked(row, now_ms))
-        .flatten();
+    let flag = match row.stage {
+        Stage::Running => unworked(row, now_ms),
+        Stage::Planned => wait.as_ref().filter(|w| w.flag).map(|w| w.note.clone()),
+        Stage::Done => None,
+    };
     let now = match row.stage {
         // What is not running comes first: a Running row whose worker has
         // finished, or that has none, says so before anything else.
@@ -1200,12 +1203,9 @@ fn format_row(
                 .and_then(|l| l.activity.clone())
                 .unwrap_or_default(),
         },
-        // Waiting in the machine ledger, else queued on a
-        // worker busy with another task.
-        Stage::Planned => queued
-            .map(queued_note)
-            .or_else(|| row.after_key.as_ref().map(|k| format!("after {k}")))
-            .unwrap_or_default(),
+        // What it waits for ([`planned_wait`]), or that it waits on
+        // nothing recorded.
+        Stage::Planned => wait.as_ref().map(|w| w.note.clone()).unwrap_or_default(),
         Stage::Done => f
             .and_then(|f| f.landing.clone())
             .or_else(|| row.next_key.as_ref().map(|k| format!("→ {k}")))
@@ -1219,6 +1219,9 @@ fn format_row(
             1.min(facts.len()),
             no_eta_hint(&key, l.map(|l| l.agent_id())),
         );
+    }
+    if let Some(why) = wait.as_ref().and_then(|w| w.held.as_deref()) {
+        facts.push(format!("held: {why}"));
     }
     if let Some(h) = held {
         facts.push(lease_fact(h));
@@ -1288,6 +1291,94 @@ fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<String> {
     let started = f.started_ms?;
     let fresh = now_ms < started.saturating_add(feed::HANDOFF_WINDOW_MS);
     (!fresh && f.live.is_none()).then(|| NO_WORKER.to_string())
+}
+
+/// How long a Next up row may sit with nothing recorded to wait on before
+/// it is flagged ([`NOT_STARTED`]; giverny#282).
+pub const IDLE_PLANNED_MS: u64 = 5 * 60 * 1000;
+/// The start of a flagged idle Next up row's NOW.
+pub const NOT_STARTED: &str = "not started";
+
+/// What a Next up row's NOW says ([`planned_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    pub note: String,
+    /// Waits on nothing recorded, past [`IDLE_PLANNED_MS`]: drawn in the
+    /// warning colour.
+    pub flag: bool,
+    /// The dispatcher's hold, in full, for the overlay header.
+    pub held: Option<String>,
+}
+
+/// What a Next up row waits for (giverny#282). A planned task may wait only
+/// on a hold the dispatcher recorded (`held: <why>`), a lease queued in the
+/// ledger (`queued for 3G behind demo#12`), or another task: the one it was
+/// planned `--after` until that lands, or the task its worker is busy with
+/// (`after <key>`). A row with none of these that has sat
+/// [`IDLE_PLANNED_MS`] since it last could have started (planned, its hold
+/// ended, the task before it landed, its lease granted) is flagged: `not
+/// started (idle 12m)`. `None` for any other row, and for a Next up row
+/// whose writer never said when it was planned.
+fn planned_wait(
+    row: &PaneRow<'_, SubagentRow>,
+    rows: &[PaneRow<'_, SubagentRow>],
+    now_ms: u64,
+) -> Option<Wait> {
+    if row.stage != Stage::Planned {
+        return None;
+    }
+    let f = row.feed;
+    let waits = |note: String| {
+        Some(Wait {
+            note,
+            flag: false,
+            held: None,
+        })
+    };
+    if let Some(why) = f.and_then(|f| f.held.clone()) {
+        return Some(Wait {
+            note: format!("held: {why}"),
+            flag: false,
+            held: Some(why),
+        });
+    }
+    let lease = f.and_then(|f| f.lease.as_ref());
+    if let Some(l) = lease.filter(|l| l.state == LeaseState::Queued) {
+        return waits(queued_note(l));
+    }
+    // The task it was planned after: waited for until it is drawn Done; one
+    // gone from the feed is no wait.
+    let before = f
+        .and_then(|f| f.after.as_deref())
+        .and_then(|a| rows.iter().find(|r| r.feed.is_some_and(|f| f.key == a)));
+    if let Some(r) = before.filter(|r| r.stage != Stage::Done) {
+        return waits(format!("after {}", r.feed.map_or("", |f| f.key.as_str())));
+    }
+    if let Some(k) = &row.after_key {
+        return waits(format!("after {k}"));
+    }
+    let f = f?;
+    let since = [
+        f.planned_ms,
+        f.unheld_ms,
+        before.and_then(|r| r.ended_ms()),
+        lease.and_then(|l| l.granted_ms),
+    ]
+    .into_iter()
+    .flatten()
+    .max()?;
+    let idle = now_ms.saturating_sub(since);
+    if idle < IDLE_PLANNED_MS {
+        return waits(String::new());
+    }
+    Some(Wait {
+        note: format!(
+            "{NOT_STARTED} (idle {})",
+            feed::fmt_span((idle / 1000) as i64)
+        ),
+        flag: true,
+        held: None,
+    })
 }
 
 /// The end of [`unworked`]'s line for a finished worker.
@@ -3600,6 +3691,73 @@ mod tests {
         assert!(drawn.contains("14% CPU  ·  4.2G"), "{drawn}");
         assert_eq!(cols.usew, busy.lines[0].usage.chars().count());
         assert!(cols.taskw < Cols::new(&queued, 100).taskw);
+    }
+
+    /// giverny#282: a Next up row says what it waits for, and one that
+    /// waits on nothing recorded is flagged once it has sat a while.
+    #[test]
+    fn a_next_up_row_says_what_it_waits_for_and_an_idle_one_is_flagged() {
+        let at = |m: u64| ts(T0 + m * 60_000);
+        let json = format!(
+            r#"{{"version":1,"rows":[
+              {{"key":"280-reuse","stage":"running","started":"{s}","eta_s":1800}},
+              {{"key":"265-x","stage":"planned","planned":"{p}","held":"a quiet machine"}},
+              {{"key":"282-hold","stage":"planned","planned":"{p}","after":"280-reuse"}},
+              {{"key":"283-y","stage":"planned","planned":"{p}",
+                "lease":{{"state":"queued","position":2,"behind":"280-reuse","cpu":3,"ram_mb":3072}}}},
+              {{"key":"284-idle","stage":"planned","planned":"{p}","eta_s":600}},
+              {{"key":"285-new","stage":"planned","planned":"{fresh}"}},
+              {{"key":"286-unheld","stage":"planned","planned":"{p}","unheld":"{fresh}"}},
+              {{"key":"287-after-done","stage":"planned","planned":"{p}","after":"279-done"}},
+              {{"key":"288-old-writer","stage":"planned"}},
+              {{"key":"279-done","stage":"done","started":"{p}","ended":"{fresh}"}}]}}"#,
+            s = at(0),
+            p = at(0),
+            fresh = at(28),
+        );
+        let t = build(Some(&feed(&json)), &[], T0 + 30 * 60_000);
+        let line = |k: &str| t.lines.iter().find(|l| l.id == k).unwrap();
+        let now = |k: &str| (line(k).now.as_str(), line(k).flag);
+        assert_eq!(now("265-x"), ("held: a quiet machine", false));
+        assert!(
+            line("265-x")
+                .click
+                .facts
+                .iter()
+                .any(|f| f == "held: a quiet machine"),
+            "the reason in full in the header"
+        );
+        assert_eq!(now("282-hold"), ("after 280-reuse", false));
+        assert_eq!(now("283-y"), ("queued for 3G behind 280-reuse", false));
+        assert_eq!(now("284-idle"), ("not started (idle 30m)", true));
+        assert_eq!(now("285-new"), ("", false), "planned two minutes ago");
+        assert_eq!(now("286-unheld"), ("", false), "free for two minutes");
+        assert_eq!(
+            now("287-after-done"),
+            ("", false),
+            "its task landed two minutes ago"
+        );
+        assert_eq!(
+            now("288-old-writer"),
+            ("", false),
+            "never said when it was planned"
+        );
+        let later = build(Some(&feed(&json)), &[], T0 + 40 * 60_000);
+        let flagged: Vec<_> = later
+            .lines
+            .iter()
+            .filter(|l| l.flag && l.stage == Stage::Planned)
+            .map(|l| (l.id.as_str(), l.now.as_str()))
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                ("284-idle", "not started (idle 40m)"),
+                ("285-new", "not started (idle 12m)"),
+                ("286-unheld", "not started (idle 12m)"),
+                ("287-after-done", "not started (idle 12m)"),
+            ]
+        );
     }
 
     /// A row's copy is only as fresh as its session's
