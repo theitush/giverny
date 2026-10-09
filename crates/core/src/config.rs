@@ -11,6 +11,7 @@ pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
     pub window: WindowConfig,
+    pub rail: RailConfig,
     pub titles: TitlesConfig,
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
@@ -217,6 +218,22 @@ impl WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         WindowConfig { opacity: 1.0 }
+    }
+}
+
+/// `[rail]`: how the tab list on the left draws itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RailConfig {
+    /// Move the rail's status marks: the spinner on a working tab, the
+    /// pulse on one that wants you. Off, no spinner is drawn, the flag does
+    /// not pulse, and the rail asks for no frames of its own.
+    pub animate: bool,
+}
+
+impl Default for RailConfig {
+    fn default() -> Self {
+        RailConfig { animate: true }
     }
 }
 

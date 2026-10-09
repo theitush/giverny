@@ -269,6 +269,19 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "rail.animate",
+        label: "animate the rail",
+        section: Section::Appearance,
+        doc: "Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse.",
+        note: &[
+            "Off, no spinner, ring or pulse is drawn: a working tab's mark is",
+            "left blank and a waiting one shows its amber flag, still. The",
+            "rail stops waking the window to animate them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "titles.strip_host_prefix",
         label: "strip user@host:",
         section: Section::Titles,
