@@ -169,6 +169,7 @@ mod tests {
                 stage: Stage::Running,
                 key: String::new(),
                 agent_id: None,
+                finished: false,
                 name: String::new(),
                 transcript: None,
                 open: None,

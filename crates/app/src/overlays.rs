@@ -1146,6 +1146,7 @@ mod tests {
                 stage: giverny_claude::feed::Stage::Running,
                 key: "demo#23".into(),
                 agent_id: Some("a1".into()),
+                finished: false,
                 name: "attach".into(),
                 transcript: None,
                 open: None,
