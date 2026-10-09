@@ -300,6 +300,19 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "rail.animate",
+        label: "animate the rail",
+        section: Section::Appearance,
+        doc: "Spin a working tab's mark and pulse a tab that wants you; off draws both still.",
+        note: &[
+            "Off, a working tab keeps its ring and a waiting one its amber",
+            "flag, just not moving, and the rail stops waking the window to",
+            "animate them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "titles.strip_host_prefix",
         label: "strip user@host:",
         section: Section::Titles,
@@ -624,7 +637,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "management_panel.lease.cpu_cores",
         label: "CPU cores",
         section: Section::ManagementPanel,
-        doc: "Cores a task's lease holds when nothing says otherwise.",
+        doc: "Cores a task's lease holds when nothing says otherwise. Also each Claude tab's CPU weight (100 a core) in `giverny-claude.slice`.",
         note: &[
             "What `giverny manage run` claims for a task that holds no lease, unless",
             "--cpu says. `giverny manage resources` prints it.",
@@ -639,7 +652,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "management_panel.lease.ram",
         label: "RAM",
         section: Section::ManagementPanel,
-        doc: "Memory a task's lease holds when nothing says otherwise.",
+        doc: "Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`.",
         note: &["A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it."],
         needs_restart: false,
         kind: Kind::Lease {
@@ -651,7 +664,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "manager.limits.cpu_cores",
         label: "CPU cores",
         section: Section::ManagementPanel,
-        doc: "Cores all manager sessions together may hand to workers. auto = all but 2.",
+        doc: "Cores all manager sessions together may hand to workers, and the hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = all but 2.",
         note: &[
             "The resource ledger (`giverny manage claim`) grants workers cores,",
             "RAM and GPUs out of these limits, across every manager on",
@@ -667,7 +680,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "manager.limits.ram",
         label: "RAM",
         section: Section::ManagementPanel,
-        doc: "Memory all manager sessions together may hand to workers. auto = 70 %.",
+        doc: "Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = 70 %.",
         note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
         needs_restart: false,
         kind: Kind::Limit {
