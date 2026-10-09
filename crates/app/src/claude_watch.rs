@@ -3085,6 +3085,16 @@ mod tests {
         );
         assert!(hooks::subagent_line_installed_in(&hooked_settings));
         assert!(giverny_claude::plugin::installed_in(&hooked_settings));
+        // Its launchers run without a permission prompt (giverny#263).
+        let allow = |settings: &Path| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(settings).unwrap()).unwrap()
+                ["permissions"]["allow"]
+                .clone()
+        };
+        assert_eq!(
+            allow(&hooked_settings),
+            serde_json::json!(giverny_claude::plugin::ALLOW_RULES)
+        );
         let skill =
             giverny_claude::plugin::marketplace_dir(&base).join(giverny_claude::plugin::SKILL_PATH);
         assert!(skill.exists());
@@ -3103,6 +3113,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(!hooks::subagent_line_installed_in(&hooked_settings));
         assert!(!giverny_claude::plugin::installed_in(&hooked_settings));
+        assert!(
+            allow(&hooked_settings).is_null(),
+            "the rules go with the pane"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
