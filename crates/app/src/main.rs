@@ -8,6 +8,7 @@ mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod prompt_bar;
 mod rail;
 mod settings_ui;
 mod splash;
@@ -3480,6 +3481,33 @@ impl eframe::App for App {
                     if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
+                    }
+                    // The prompt whose turn is in view, once its own row
+                    // has scrolled out of sight.
+                    let pinned = self.claude.prompts_of(active).and_then(|history| {
+                        let rows = session.viewport_rows();
+                        prompt_bar::owner(history, &rows, |matches| {
+                            session.find_above(prompt_bar::SEARCH_ABOVE, |row, shaded| {
+                                matches(row, shaded)
+                            })
+                        })
+                        .map(|i| history[i].as_str())
+                    });
+                    match pinned {
+                        Some(prompt) => {
+                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                            if prompt_bar::show(
+                                &ctx,
+                                &self.chrome,
+                                response.rect,
+                                row,
+                                active,
+                                prompt,
+                            ) {
+                                self.focus_terminal = true;
+                            }
+                        }
+                        None => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
