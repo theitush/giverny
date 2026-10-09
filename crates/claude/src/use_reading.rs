@@ -436,9 +436,22 @@ pub struct Sampler {
     pmon_at: Option<std::time::Instant>,
     workers: crate::worker_pids::Attributor,
     seq: u64,
+    /// Puts each tab's claude under its cap ([`crate::tab_cap`]); only the
+    /// app's own sampler ([`Sampler::capping_tabs`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    caps: Option<crate::tab_cap::Adopter>,
 }
 
 impl Sampler {
+    /// The app's sampler: each pass also puts every claude it finds under
+    /// a tab into its capped scope ([`crate::tab_cap`]).
+    pub fn capping_tabs() -> Sampler {
+        Sampler {
+            caps: Some(crate::tab_cap::Adopter::default()),
+            ..Sampler::default()
+        }
+    }
+
     #[cfg(target_os = "linux")]
     const GPU_EVERY: std::time::Duration = std::time::Duration::from_secs(6);
 
@@ -486,6 +499,9 @@ impl Sampler {
             .copied()
             .filter(|&p| crate::lineage::proc_is_claude(p))
             .collect();
+        if let Some(caps) = &mut self.caps {
+            caps.tick(&table.procs, &claudes);
+        }
         let agents = self
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);

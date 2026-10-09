@@ -36,9 +36,9 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `management_panel.columns.now` | `true` | What the row is doing now: its last tool call, a wait, a queue place. |
 | `management_panel.columns.tokens` | `true` | The tokens the row has used. |
 | `management_panel.columns.usage` | `true` | What the row's `giverny manage run` commands use: live CPU and memory, a Done row's peak. |
-| `management_panel.lease.cpu_cores` | `3` | Cores a task's lease holds when nothing says otherwise. |
-| `management_panel.lease.ram` | `"3G"` | Memory a task's lease holds when nothing says otherwise. |
-| `manager.limits.cpu_cores` | `"auto"` | Cores all manager sessions together may hand to workers. auto = all but 2. |
-| `manager.limits.ram` | `"auto"` | Memory all manager sessions together may hand to workers. auto = 70 %. |
+| `management_panel.lease.cpu_cores` | `3` | Cores a task's lease holds when nothing says otherwise. Also each Claude tab's CPU weight (100 a core) in `giverny-claude.slice`. |
+| `management_panel.lease.ram` | `"3G"` | Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`. |
+| `manager.limits.cpu_cores` | `"auto"` | Cores all manager sessions together may hand to workers, and the hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = all but 2. |
+| `manager.limits.ram` | `"auto"` | Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = 70 %. |
 | `manager.limits.gpus` | `"auto"` | GPUs and VRAM manager sessions may use. auto = 90 % of each GPU's VRAM. |
 | `update.check` | `true` | Ask GitHub whether a newer Giverny exists, hourly while it is open. |
