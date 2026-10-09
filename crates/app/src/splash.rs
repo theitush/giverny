@@ -455,6 +455,45 @@ mod tests {
         assert!(!bullets.is_empty(), "this release has notes");
     }
 
+    /// The installers draw this wordmark too, from their own copy of it: the
+    /// shell script in blocks, the PowerShell one in `#` (see its comment).
+    #[test]
+    fn the_installer_draws_the_same_wordmark() {
+        let sh = include_str!("../../../scripts/install.sh");
+        let ps1 = include_str!("../../../scripts/install.ps1");
+        for (y, wash) in WASH.iter().enumerate() {
+            let colored = word_row(y);
+            let mut row = String::new();
+            let mut chars = colored.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    chars.by_ref().find(|c| c.is_ascii_alphabetic());
+                } else {
+                    row.push(c);
+                }
+            }
+            let row = row.trim_end();
+            assert!(
+                sh.contains(&format!("|{row}'")),
+                "install.sh lacks row {y}: {row:?}"
+            );
+            let hashed = row.replace('█', "#");
+            assert!(
+                ps1.contains(&format!("'{hashed}'")),
+                "install.ps1 lacks row {y}: {hashed:?}"
+            );
+            // Same wash, row for row.
+            assert!(
+                sh.contains(&format!("'{wash}|")),
+                "install.sh row {y} colour"
+            );
+            assert!(
+                ps1.contains(&format!("@('{wash}'")),
+                "install.ps1 row {y} colour"
+            );
+        }
+    }
+
     /// A first run has never seen a version; an upgrade has seen an older one.
     #[test]
     fn the_marker_says_who_is_looking() {

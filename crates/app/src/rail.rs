@@ -82,6 +82,12 @@ fn keep_spinning(ui: &Ui, rect: Rect) {
 
 /// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
 /// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
+/// One breath every two seconds, from 0.3 to 1, sampled at the animation
+/// step: how something that is waiting on the user asks for them.
+fn breath(time: f64) -> f32 {
+    ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32
+}
+
 fn braille(turns: f64) -> String {
     let step = if giverny_term::pace::cheap_frames() {
         (turns * SPINNER.len() as f64) as usize
@@ -984,9 +990,7 @@ fn tab_row(
             spinner(&p, dot, spin(ui, rect), row.color);
         }
         ClaudeState::NeedsYou => {
-            // One breath every two seconds, sampled at the animation step.
-            let pulse = ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
-            flag(&p, dot, c.amber.gamma_multiply(pulse));
+            flag(&p, dot, c.amber.gamma_multiply(breath(time)));
             keep_animating(ui, rect);
         }
         // Green and still: finished, nothing owed. The amber flag above is
@@ -1154,30 +1158,55 @@ fn tab_row(
     rect
 }
 
-/// Offer the new release the hourly check found, and then the restart that
-/// finishes it.
+/// Offer the new release the hourly check found, follow the install it
+/// starts, and then offer the restart that finishes it.
 ///
 /// It was a line of 10px text with a small button beside it, in a rail full of
 /// small text, and it went unseen for versions at a time. A release nobody
 /// installs is a release nobody has.
 fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     let c = app.chrome;
+    let version = app.update.as_ref().map(|u| u.version.as_str());
     // The installer has already replaced the binary: the only thing left is
-    // handing over to it, and that offer outlives any dismissal.
+    // handing over to it, and that offer outlives any dismissal. It breathes
+    // toward the foreground, opaque throughout, so its ink stays readable.
     if app.update_installed {
-        let version = app.update.as_ref().map(|u| u.version.as_str());
-        banner_button(
+        let fill = c
+            .amber
+            .lerp_to_gamma(c.fg, (1.0 - breath(anim_time())) * 0.35);
+        let rect = banner_button(
             ui,
             &match version {
                 Some(v) => format!("⟳ restart to finish v{v}"),
                 None => "⟳ restart to finish the update".into(),
             },
-            c.amber,
+            fill,
             c.panel,
             "the new version is on disk.\nthis closes every tab and opens them again,\nresuming the claude sessions in them",
             actions,
             Action::RestartNow,
         );
+        keep_animating(ui, rect);
+        return;
+    }
+    // Between the click and the binary landing: the install is in a tab, and
+    // this row says so and leads there. The spinner is the tab rows' drawn
+    // one, not a braille character (see `spinner`).
+    if let Some(job) = &app.update_job {
+        let rect = banner_button(
+            ui,
+            &match version {
+                Some(v) => format!("installing v{v}…"),
+                None => "installing the update…".into(),
+            },
+            c.accent.lerp_to_gamma(c.panel, 0.6),
+            c.fg,
+            "installing in its tab, click to watch",
+            actions,
+            Action::Select(job.tab),
+        );
+        let at = Pos2::new(rect.min.x + 13.0, rect.center().y);
+        spinner(ui.painter(), at, spin(ui, rect), c.fg);
         return;
     }
     let Some(available) = &app.update else { return };
@@ -1195,27 +1224,30 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
         )
         .fill(c.accent)
         .corner_radius(4.0);
+        let what =
+            "opens a tab and runs the official install command,\nso you see exactly what runs";
         if ui
             .add_sized(Vec2::new(width, 22.0), button)
-            .on_hover_text(format!(
-                "{}\n\nopens a tab and runs the official install command,\nso you see exactly what runs",
-                available.url
-            ))
+            .on_hover_text(if app.update_stalled {
+                format!(
+                    "{}\n\nthe last attempt ended without installing it.\n{what}",
+                    available.url
+                )
+            } else {
+                format!("{}\n\n{what}", available.url)
+            })
             .clicked()
         {
             actions.push(Action::RunUpdate);
         }
-        if ui
-            .small_button("×")
-            .on_hover_text("not now")
-            .clicked()
-        {
+        if ui.small_button("×").on_hover_text("not now").clicked() {
             actions.push(Action::DismissUpdate);
         }
     });
 }
 
-/// One button across the width of the rail.
+/// One button across the width of the rail. Returns where it was drawn, for
+/// whoever animates it.
 fn banner_button(
     ui: &mut Ui,
     text: &str,
@@ -1224,7 +1256,7 @@ fn banner_button(
     hover: &str,
     actions: &mut Vec<Action>,
     action: Action,
-) {
+) -> Rect {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
@@ -1236,14 +1268,14 @@ fn banner_button(
         )
         .fill(fill)
         .corner_radius(4.0);
-        if ui
-            .add_sized(Vec2::new(width, 22.0), button)
-            .on_hover_text(hover)
-            .clicked()
-        {
+        let resp = ui.add_sized(Vec2::new(width, 22.0), button);
+        let rect = resp.rect;
+        if resp.on_hover_text(hover).clicked() {
             actions.push(action);
         }
-    });
+        rect
+    })
+    .inner
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {

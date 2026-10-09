@@ -792,6 +792,20 @@ struct Limited {
     session_gone: bool,
 }
 
+/// An install running in its tab, from the update button until the binary
+/// lands or the installer stops without replacing it.
+pub struct UpdateJob {
+    pub tab: TabId,
+    started: Instant,
+    /// Something has run in the tab's shell. Until then an empty foreground
+    /// is the command not having been typed yet, not the install having ended.
+    seen_running: bool,
+}
+
+/// How long an install that was never seen running gets before it counts as
+/// over: one that fails at once (no network) finishes between two looks.
+const UPDATE_UNSEEN_GRACE: Duration = Duration::from_secs(10);
+
 /// What one tab needs to open: the shell, the account it is on (named the
 /// way Giverny stores accounts), and the environment that reaches the shell.
 struct TabShape {
@@ -959,8 +973,10 @@ pub struct App {
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
-    update_ran: bool,
+    pub update_job: Option<UpdateJob>,
     pub update_installed: bool,
+    /// The last install ended without replacing the binary; its tab says why.
+    pub update_stalled: bool,
     /// Theme-derived colours for Giverny's own chrome.
     pub chrome: chrome::Chrome,
     pub settings: Option<settings_ui::SettingsState>,
@@ -1423,8 +1439,9 @@ impl App {
             welcome,
             update_dismissed: false,
             exe_mtime: update::binary_mtime(),
-            update_ran: false,
+            update_job: None,
             update_installed: false,
+            update_stalled: false,
             chrome,
             settings: None,
             keys_overlay: None,
@@ -1892,10 +1909,14 @@ impl App {
                             id,
                             Inject::Raw(cmd),
                         ));
+                        self.update_job = Some(UpdateJob {
+                            tab: id,
+                            started: Instant::now(),
+                            seen_running: false,
+                        });
+                        self.update_stalled = false;
                     }
                 }
-                self.update_ran = true;
-                self.update_dismissed = true;
             }
             Action::DismissUpdate => self.update_dismissed = true,
             Action::RestartNow => {
@@ -2779,12 +2800,13 @@ impl App {
         }
         // While an install is running in its tab, watch for the binary being
         // replaced: that is the moment a restart has something to pick up.
-        if self.update_ran && !self.update_installed {
+        if self.update_job.is_some() && !self.update_installed {
             self.update_installed =
                 update::binary_mtime().is_some_and(|at| Some(at) != self.exe_mtime);
         }
         self.persist_font_size();
         self.track_foreground();
+        self.follow_update_job();
         self.probe_wsl_cwds();
         self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -2792,6 +2814,29 @@ impl App {
             .refresh_stale_usage(self.cfg.usage.refresh_minutes, false);
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
+        }
+    }
+
+    /// Notice an install that ended without the binary changing: its tab was
+    /// closed, or its shell is back at the prompt after running something
+    /// (or never visibly ran it). Either way the update button comes back, so
+    /// it can be tried again.
+    fn follow_update_job(&mut self) {
+        if self.update_installed {
+            return;
+        }
+        let Some(job) = &mut self.update_job else {
+            return;
+        };
+        let Some(tab) = self.ws.tab(job.tab) else {
+            self.update_job = None;
+            return;
+        };
+        if tab.foreground.is_some() {
+            job.seen_running = true;
+        } else if job.seen_running || job.started.elapsed() > UPDATE_UNSEEN_GRACE {
+            self.update_job = None;
+            self.update_stalled = true;
         }
     }
 
