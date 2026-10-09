@@ -191,6 +191,34 @@ pub fn figures(t: &Use) -> String {
     s
 }
 
+/// What a tab's figures are coloured against: `[manager.limits]` on this
+/// machine, whose cores and RAM are read once.
+pub fn allowed(limits: &giverny_core::limits::Limits) -> giverny_core::limits::Resolved {
+    use giverny_core::limits::Machine;
+    static MACHINE: OnceLock<Machine> = OnceLock::new();
+    limits.resolve(MACHINE.get_or_init(Machine::detect_cpu_ram))
+}
+
+/// A tab's use as shares of what is allowed, percent: `(CPU, memory)`.
+/// Its CPU figure is a share of the whole machine (`cores` of them), so it
+/// is scaled to the allowed cores; a limit of nothing is never reached.
+pub fn shares(u: &Use, cores: u32, allowed: &giverny_core::limits::Resolved) -> (f64, f64) {
+    let of = |used: f64, limit: f64| {
+        if limit > 0.0 {
+            used * 100.0 / limit
+        } else {
+            0.0
+        }
+    };
+    (
+        of(
+            f64::from(u.cpu_pct) * f64::from(cores) / 100.0,
+            f64::from(allowed.cpu_cores),
+        ),
+        of(u.mem_mb as f64, allowed.ram.0 as f64),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +241,31 @@ mod tests {
         );
         u.gpu_pct = Some(40);
         assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
+    }
+
+    /// The number is the machine's share; the colour's is of the limits:
+    /// 25 % of 16 cores is 4 cores, all of a 4-core limit.
+    #[test]
+    fn a_tabs_share_is_of_what_is_allowed() {
+        use giverny_core::limits::{Mem, Resolved};
+        let allowed = Resolved {
+            cpu_cores: 4,
+            ram: Mem(8192),
+            gpus: Vec::new(),
+        };
+        let u = Use {
+            cpu_pct: 25,
+            mem_mb: 2048,
+            gpu_mb: None,
+            gpu_pct: None,
+        };
+        assert_eq!(shares(&u, 16, &allowed), (100.0, 25.0));
+        let none = Resolved {
+            cpu_cores: 0,
+            ram: Mem(0),
+            gpus: Vec::new(),
+        };
+        assert_eq!(shares(&u, 16, &none), (0.0, 0.0));
     }
 
     #[test]

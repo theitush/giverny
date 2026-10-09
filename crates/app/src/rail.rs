@@ -124,6 +124,9 @@ struct RowData {
     claude: ClaudeState,
     /// A background shell is alive while Claude itself waits at its prompt.
     background: bool,
+    /// Its Claude Code's CPU and memory now, from the reading the sidebar
+    /// shows (giverny#267); `None` for a tab with no claude in it.
+    used: Option<giverny_claude::use_reading::Use>,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -220,6 +223,11 @@ fn row_data(
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.background),
+        used: app
+            .rt
+            .get(&t.id)
+            .and_then(|rt| rt.session.as_ref()?.child_pid)
+            .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
     }
 }
 
@@ -1118,8 +1126,33 @@ fn tab_row(
         return rect;
     }
 
+    // Its Claude Code's CPU over its memory at the right edge, as the
+    // account bars' numbers are drawn: the CPU a share of the whole
+    // machine, each coloured by its share of `[manager.limits]`. The
+    // close button takes the corner while the pointer is on the row.
+    let readout = 34.0;
+    if let Some(u) = row.used.filter(|_| !hovered) {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+        let allowed = crate::sessions_load::allowed(&app.cfg.manager.limits);
+        let (cpu, mem) = crate::sessions_load::shares(&u, cores, &allowed);
+        let x = rect.max.x - 8.0;
+        for (y, text, share) in [
+            (13.0, format!("{}%", u.cpu_pct.min(100)), cpu),
+            (29.0, giverny_claude::session_use::gb(u.mem_mb), mem),
+        ] {
+            p.text(
+                Pos2::new(x, rect.min.y + y),
+                Align2::RIGHT_CENTER,
+                text,
+                FontId::monospace(9.0),
+                level_color(share, share >= 95.0, c),
+            );
+        }
+    }
+
     // Title (char-budget truncation; the rail is monospace).
-    let char_budget = ((width - 68.0) / 7.2).max(4.0) as usize;
+    let reserved = if row.used.is_some() { readout } else { 0.0 };
+    let char_budget = ((width - 68.0 - reserved) / 7.2).max(4.0) as usize;
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
@@ -1562,13 +1595,7 @@ fn usage_bar(
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 15.0), Sense::hover());
     let p = ui.painter_at(rect);
-    let color = if read.critical {
-        c.poppy
-    } else if pct >= 80.0 {
-        c.amber
-    } else {
-        c.dim
-    };
+    let color = level_color(pct, read.critical, c);
 
     // Label.
     p.text(
@@ -1608,6 +1635,19 @@ fn usage_bar(
         FontId::monospace(9.0),
         if read.critical { c.poppy } else { dim },
     );
+}
+
+/// How full a share is, as the account bars colour it: poppy when
+/// critical (95 % and up, [`ClaudeWatch::reading`]), amber from 80 %,
+/// dim below.
+fn level_color(pct: f64, critical: bool, c: crate::chrome::Chrome) -> Color32 {
+    if critical {
+        c.poppy
+    } else if pct >= 80.0 {
+        c.amber
+    } else {
+        c.dim
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {

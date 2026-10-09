@@ -377,6 +377,15 @@ impl Machine {
     /// elsewhere, which on macOS is `sysctl hw.memsize`), and NVIDIA GPUs
     /// from `nvidia-smi` when it is installed — else none.
     pub fn detect() -> Machine {
+        Machine {
+            gpus: detect_gpus(),
+            ..Machine::detect_cpu_ram()
+        }
+    }
+
+    /// [`Machine::detect`] without the GPUs: no `nvidia-smi`, so cheap
+    /// enough for a figure drawn on screen.
+    pub fn detect_cpu_ram() -> Machine {
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         let cores = (sys.cpus().len() as u32).max(
@@ -391,7 +400,7 @@ impl Machine {
         Machine {
             cores,
             ram,
-            gpus: detect_gpus(),
+            gpus: Vec::new(),
         }
     }
 }
