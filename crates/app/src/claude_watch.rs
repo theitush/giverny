@@ -629,7 +629,14 @@ impl ClaudeWatch {
             }
             Some("UserPromptSubmit") => {
                 entry.state = ClaudeState::Busy;
-                if let Some(prompt) = msg.prompt().map(str::trim).filter(|p| !p.is_empty()) {
+                // The hook fires for every turn, also the ones Claude Code or
+                // another agent sends (a finished background task, a
+                // subagent's hand-back): those are work, not prompts.
+                if let Some(prompt) = msg
+                    .prompt()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty() && !registry::is_injected_prompt(p))
+                {
                     entry.prompts.push(prompt.to_string());
                     cap_history(&mut entry.prompts);
                 }
@@ -1599,6 +1606,49 @@ mod tests {
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
         assert_eq!(w.prompt_of(TAB), None);
         assert_eq!(w.prompt_of(TabId(8)), Some("other account"));
+    }
+
+    #[test]
+    fn turns_nobody_typed_never_reach_the_prompt_bar() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let submit = |p: &str| {
+            hook(
+                "UserPromptSubmit",
+                &format!(r#","prompt":{}"#, serde_json::to_string(p).unwrap()),
+            )
+        };
+        feed(&mut w, &submit("start the two workers"), Some(TAB));
+        feed(&mut w, &hook("Stop", ""), Some(TAB));
+        // What the hook was sent, live (Claude Code 2.1.295), for a turn it
+        // took while the user typed nothing: a background command finishing,
+        // a subagent handing back.
+        for injected in [
+            "<task-notification>\n<task-id>bdjbssyyc</task-id>\n\
+             <tool-use-id>toolu_019raXNAx3pWWeWBpxr7QJNu</tool-use-id>\n\
+             <status>completed</status>\n\
+             <summary>Background command \"Sleep 8 seconds\" completed (exit code 0)</summary>\n\
+             </task-notification>",
+            "<agent-message from=\"ad09f1c404af364a1\">\n[Subagent hand-back] The text \
+             below is the final report of a subagent this session delegated to.\n  hi\n\
+             </agent-message>",
+            "3 background agents were stopped by the user: \"giverny#21 drop pane total row\"",
+            "Your claude.ai usage limit has reset. Continue the task you were working on.",
+            "The pass-spike plugin sent a message:\npass-spike: worker t3 asks for a decision.",
+        ] {
+            feed(&mut w, &submit(injected), Some(TAB));
+            assert_eq!(w.state_of(TAB), ClaudeState::Busy, "still work: {injected}");
+            assert_eq!(
+                w.prompt_of(TAB),
+                Some("start the two workers"),
+                "{injected}"
+            );
+            feed(&mut w, &hook("Stop", ""), Some(TAB));
+        }
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["start the two workers"]);
+        // A message typed while the turn ran fires the hook too, and is one.
+        feed(&mut w, &submit("queued typed message"), Some(TAB));
+        assert_eq!(w.prompt_of(TAB), Some("queued typed message"));
     }
 
     #[test]
