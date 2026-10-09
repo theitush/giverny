@@ -287,7 +287,9 @@ fn tail_title(path: &Path) -> Option<String> {
         };
         if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
             title = Some(t.to_string());
-        } else if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+        } else if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str())
+            && !is_injected_prompt(p)
+        {
             prompt = Some(p.to_string());
         }
     }
@@ -310,8 +312,11 @@ pub fn last_prompt(path: &Path) -> Option<String> {
 /// restart. Read from the tail, so a very long session gives its later turns.
 ///
 /// The prompts are the user messages that are not tool results, notes Claude
-/// Code adds (`isMeta`, compaction summaries) or things it wraps in a tag (a
-/// command, a notification, `!` shell input).
+/// Code adds (`isMeta`, compaction summaries), turns someone else sent (an
+/// `origin` other than `human`, or text [`is_injected_prompt`] knows) or
+/// things it wraps in a tag (a command, `!` shell input). A message typed
+/// while a turn ran, which Claude Code files as a `queued_command`
+/// attachment rather than a user message, is one of them.
 ///
 /// The last one is checked against Claude Code's own `lastPrompt` marker,
 /// which is cut at 200 characters with an ellipsis and has its line breaks
@@ -340,29 +345,57 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
         |v: &serde_json::Value, name: &str| v.get(name).and_then(|m| m.as_bool()) == Some(true);
     let mut marker: Option<String> = None;
     let mut typed: Vec<String> = Vec::new();
+    // Who sent a turn, when Claude Code says: `human` is the user, anything
+    // else (`task-notification`, `peer`, `plugin`, `auto-continuation`) is not.
+    let not_human = |v: &serde_json::Value| {
+        v.get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(|k| k.as_str())
+            .is_some_and(|k| k != "human")
+    };
     for line in buf.lines() {
         let has_marker = line.contains("\"lastPrompt\"");
-        if !has_marker && !line.contains("\"user\"") {
+        let queued = line.contains("\"queued_command\"");
+        if !has_marker && !queued && !line.contains("\"user\"") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if has_marker {
-            if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+            if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str())
+                && !is_injected_prompt(p)
+            {
                 marker = Some(p.to_string());
             }
             continue;
         }
-        if v.get("type").and_then(|t| t.as_str()) != Some("user")
-            || flag(&v, "isMeta")
-            || flag(&v, "isCompactSummary")
-        {
-            continue;
-        }
-        if let Some(text) = v.get("message").and_then(|m| user_text(m.get("content")?)) {
+        let text = match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") if !flag(&v, "isMeta") && !flag(&v, "isCompactSummary") => {
+                if not_human(&v) {
+                    continue;
+                }
+                v.get("message").and_then(|m| user_text(m.get("content")?))
+            }
+            // A message typed while a turn ran: only a typed one.
+            Some("attachment") => {
+                let Some(a) = v.get("attachment").filter(|a| {
+                    a.get("type").and_then(|t| t.as_str()) == Some("queued_command")
+                        && a.get("origin")
+                            .and_then(|o| o.get("kind"))
+                            .and_then(|k| k.as_str())
+                            == Some("human")
+                        && !flag(a, "isMeta")
+                }) else {
+                    continue;
+                };
+                a.get("prompt").and_then(user_text)
+            }
+            _ => continue,
+        };
+        if let Some(text) = text {
             let text = text.trim().to_string();
-            if !text.is_empty() {
+            if !text.is_empty() && !is_injected_prompt(&text) {
                 typed.push(text);
             }
         }
@@ -389,6 +422,39 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
         prompts.push(last);
     }
     prompts
+}
+
+/// Whether a user-role turn is one Claude Code or another agent sent, not
+/// something the user typed: a background task's `<task-notification>`, a
+/// subagent's or peer's `<agent-message>` hand-back, a plugin's message, the
+/// "usage limit has reset" nudge, background agents the user stopped, an
+/// interrupted request. Known by its text alone, because the
+/// `UserPromptSubmit` hook fires for these turns too and its payload says
+/// nothing else about who sent them; a transcript's `origin` says it first.
+pub fn is_injected_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    const PREFIXES: &[&str] = &[
+        "<task-notification>",
+        "<agent-message ",
+        "<agent-message>",
+        "Another Claude session sent a message:",
+        "Your claude.ai usage limit has reset.",
+        "[Request interrupted by user",
+    ];
+    if PREFIXES.iter().any(|p| text.starts_with(p)) {
+        return true;
+    }
+    let first = text.lines().next().unwrap_or("");
+    // "The pass-spike plugin sent a message:"
+    if first.starts_with("The ") && first.ends_with(" plugin sent a message:") {
+        return true;
+    }
+    // "3 background agents were stopped by the user: …"
+    let count = first.trim_start_matches(|c: char| c.is_ascii_digit());
+    count.len() < first.len()
+        && count.starts_with(" background ")
+        && (count.contains(" were stopped by the user")
+            || count.contains(" was stopped by the user"))
 }
 
 /// The text of a user message, or `None` when it is a tool result.
@@ -693,6 +759,167 @@ mod tests {
         let path = transcript("empty", &[serde_json::json!({"type": "mode"})]);
         assert_eq!(last_prompt(&path), None);
         assert_eq!(last_prompt(Path::new("/nonexistent/x.jsonl")), None);
+    }
+
+    /// A user-role turn as Claude Code writes one it took from someone else.
+    fn sent(kind: &str, meta: bool, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "isMeta": meta, "origin": {"kind": kind},
+            "promptSource": "system", "message": {"role": "user", "content": text}})
+    }
+
+    fn queued(kind: &str, prompt: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "attachment", "attachment": {"type": "queued_command",
+            "prompt": prompt, "commandMode": "prompt", "origin": {"kind": kind}}})
+    }
+
+    fn typed(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "origin": {"kind": "human"},
+            "promptSource": "typed", "message": {"role": "user", "content": text}})
+    }
+
+    const NOTIFICATION: &str = "<task-notification>\n<task-id>bvfpg99dj</task-id>\n\
+        <status>completed</status>\n<summary>Background command finished</summary>\n\
+        </task-notification>";
+    const HAND_BACK: &str = "Another Claude session sent a message:\n\
+        <agent-message from=\"a587ea9422f15b56a\">\n[Subagent hand-back] The report \
+        follows:\n  giverny#261 is finished.\n</agent-message>";
+    const STOPPED: &str = "2 background agents were stopped by the user: \"giverny#21 drop \
+        pane total row\", \"giverny#22 statusline token counts\"";
+
+    #[test]
+    fn turns_nobody_typed_are_not_prompts() {
+        // Each kind seen in real transcripts, after the prompt the user typed.
+        let kinds = [
+            (
+                "task-notification",
+                sent("task-notification", false, NOTIFICATION),
+            ),
+            ("hand-back", sent("peer", true, HAND_BACK)),
+            ("stopped agents", sent("task-notification", false, STOPPED)),
+            (
+                "plugin",
+                sent(
+                    "plugin",
+                    false,
+                    "The pass-spike plugin sent a message:\npass-spike: worker t3 asks.",
+                ),
+            ),
+            (
+                "usage reset",
+                sent(
+                    "auto-continuation",
+                    true,
+                    "Your claude.ai usage limit has reset. Continue the task you were working on.",
+                ),
+            ),
+            (
+                "interrupted",
+                user(serde_json::json!("[Request interrupted by user]")),
+            ),
+            (
+                "interrupted tool use",
+                user(serde_json::json!(
+                    "[Request interrupted by user for tool use]"
+                )),
+            ),
+            // Delivered mid-turn as attachments instead.
+            ("queued notification", {
+                let mut q = queued("task-notification", serde_json::json!(NOTIFICATION));
+                q["attachment"]["commandMode"] = serde_json::json!("task-notification");
+                q
+            }),
+            ("queued hand-back", {
+                let mut q = queued("peer", serde_json::json!(&HAND_BACK[39..]));
+                q["attachment"]["isMeta"] = serde_json::json!(true);
+                q
+            }),
+        ];
+        for (name, turn) in kinds {
+            let path = transcript(
+                &format!("sent-{}", name.replace(' ', "-")),
+                &[
+                    typed("start the two workers"),
+                    marker("start the two workers"),
+                    turn.clone(),
+                ],
+            );
+            assert_eq!(prompt_history(&path), ["start the two workers"], "{name}");
+
+            // Older Claude Code writes no `origin`: the text alone tells.
+            let mut bare = turn;
+            if let Some(o) = bare.as_object_mut() {
+                o.remove("origin");
+                o.remove("isMeta");
+            }
+            let path = transcript(
+                &format!("bare-{}", name.replace(' ', "-")),
+                &[user(serde_json::json!("start the two workers")), bare],
+            );
+            assert_eq!(
+                prompt_history(&path),
+                ["start the two workers"],
+                "bare {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_naming_an_injected_turn_is_not_the_last_prompt() {
+        // Seen live: Claude Code's `lastPrompt` named the untagged notice
+        // that background agents were stopped.
+        let path = transcript(
+            "marker-stopped",
+            &[
+                typed("start the two workers"),
+                marker("start the two workers"),
+                sent("task-notification", false, STOPPED),
+                marker(STOPPED),
+            ],
+        );
+        assert_eq!(last_prompt(&path).as_deref(), Some("start the two workers"));
+        assert_eq!(prompt_history(&path), ["start the two workers"]);
+        assert_eq!(tail_title(&path).as_deref(), Some("start the two workers"));
+    }
+
+    #[test]
+    fn a_message_typed_while_a_turn_ran_is_a_prompt() {
+        // Claude Code files it as an attachment, and its marker still names
+        // the turn's own prompt.
+        let path = transcript(
+            "queued",
+            &[
+                typed("run the slow command"),
+                queued("human", serde_json::json!("and then lint")),
+                queued(
+                    "human",
+                    serde_json::json!([{"type": "text", "text": "and test"}]),
+                ),
+                marker("run the slow command"),
+            ],
+        );
+        assert_eq!(
+            prompt_history(&path),
+            ["run the slow command", "and then lint", "and test"]
+        );
+    }
+
+    #[test]
+    fn typed_look_alikes_are_prompts() {
+        for typed in [
+            "<div> why does this not render",
+            "The plugin sent a message: what does that mean",
+            "3 background agents are slow, why?",
+            "were stopped by the user",
+            "Another Claude session, can it see mine?",
+        ] {
+            assert!(!is_injected_prompt(typed), "{typed}");
+        }
+        for injected in [NOTIFICATION, HAND_BACK, &HAND_BACK[39..], STOPPED] {
+            assert!(is_injected_prompt(injected), "{injected}");
+        }
+        assert!(is_injected_prompt(
+            "1 background agent was stopped by the user: \"x\""
+        ));
     }
 
     #[cfg(target_os = "linux")]
