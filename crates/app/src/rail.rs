@@ -32,11 +32,26 @@ fn anim_time() -> f64 {
     giverny_term::pace::anim_time()
 }
 
+/// Whether the rail's marks move (`rail.animate`, #266). Set once a frame
+/// by [`show`]; off, every spinner stands at [`STILL_TURNS`], the pulse at
+/// full strength, and nothing here asks for a frame.
+fn animating(ui: &Ui) -> bool {
+    ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new(ANIMATE_ID)))
+        .unwrap_or(true)
+}
+
+const ANIMATE_ID: &str = "rail-animate";
+
+/// Where a still spinner points: its gap up and to the right, which reads
+/// as a ring with a break, not the idle tab's closed one.
+const STILL_TURNS: f64 = 0.0;
+
 /// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
 /// but only while it is on screen. A row scrolled out of the rail, or a
 /// spinner nobody can see, costs nothing.
 fn keep_animating(ui: &Ui, rect: Rect) {
-    if !ui.is_rect_visible(rect) {
+    if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
     let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
@@ -60,7 +75,9 @@ fn spin(ui: &Ui, rect: Rect) -> f64 {
 
 /// [`spin`]'s angle alone, for a spinner whose rect is not known yet.
 fn spin_turns(ui: &Ui) -> f64 {
-    if giverny_term::pace::cheap_frames() {
+    if !animating(ui) {
+        STILL_TURNS
+    } else if giverny_term::pace::cheap_frames() {
         ui.input(|i| i.time)
     } else {
         anim_time() / 2.0
@@ -72,7 +89,7 @@ fn keep_spinning(ui: &Ui, rect: Rect) {
     if !giverny_term::pace::cheap_frames() {
         return keep_animating(ui, rect);
     }
-    if !ui.is_rect_visible(rect) {
+    if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
     let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
@@ -330,6 +347,9 @@ fn repo_name(path: &Path) -> Option<String> {
 pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     app.row_rects.clear();
+    let animate = app.cfg.rail.animate;
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
 
     // Precollect display data so rendering never borrows the workspace.
     let cats = groups(app);
@@ -1029,8 +1049,13 @@ fn tab_row(
             spinner(&p, dot, spin(ui, rect), row.color);
         }
         ClaudeState::NeedsYou => {
-            // One breath every two seconds, sampled at the animation step.
-            let pulse = ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32;
+            // One breath every two seconds, sampled at the animation step;
+            // full strength when the rail is still.
+            let pulse = if animating(ui) {
+                ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32
+            } else {
+                1.0
+            };
             flag(&p, dot, c.amber.gamma_multiply(pulse));
             keep_animating(ui, rect);
         }
@@ -1596,6 +1621,42 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delay the rail asks for in one frame that draws a spinner and a
+    /// pulse on screen, with `rail.animate` at `animate`.
+    fn rail_wake(ctx: &egui::Context, animate: bool) -> (std::time::Duration, f64) {
+        let mut turns = None;
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+            turns = Some(spin(ui, rect));
+            keep_spinning(ui, rect);
+            keep_animating(ui, rect);
+        });
+        let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        (delay, turns.unwrap())
+    }
+
+    /// Off, the marks stand still and the rail wakes nothing; on, it asks
+    /// for the clock's next tick (#266, #43).
+    #[test]
+    fn a_still_rail_schedules_no_frames() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            rail_wake(&ctx, false);
+        }
+        let (delay, turns) = rail_wake(&ctx, false);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "a still rail woke the window"
+        );
+        assert_eq!(turns, STILL_TURNS);
+        assert_eq!(braille(turns), braille(STILL_TURNS));
+        let (delay, _) = rail_wake(&ctx, true);
+        assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
+    }
 
     #[test]
     fn a_repository_is_named_by_its_directory() {
