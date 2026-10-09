@@ -1,7 +1,7 @@
-//! `giverny orchestrator-session`: the agents-pane feed's own writer.
+//! `giverny manage`: the management-panel feed's own writer.
 //!
-//! The pane draws what a feed file says (`docs/agents-pane.md`); this is the
-//! writer that ships with Giverny, so an orchestrating Claude session needs
+//! The pane draws what a feed file says (`docs/management-panel.md`); this is the
+//! writer that ships with Giverny, so a managing Claude session needs
 //! nothing else to show Running, Next up with ETAs, and Done. A task is any
 //! short name. Every stamp is the machine's clock at the moment the command
 //! runs, so ELAPSED and the Done row's `(+5m)` are measured, not reported.
@@ -9,7 +9,7 @@
 //! The feed file *is* the state: each command reads it, changes one row and
 //! writes it back atomically, under a lock, since workers re-estimate their
 //! own rows while the dispatcher stamps others. A feed some other writer owns
-//! (its `writer` field names someone else, e.g. another orchestrator's) is
+//! (its `writer` field names someone else, e.g. another manager's) is
 //! never touched.
 
 use std::io::Write as _;
@@ -19,15 +19,10 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use crate::worker_log::{self, WorkerLog};
-use crate::{continuation, feed, orchestrator_session_history, resources};
+use crate::{continuation, feed, manage_history, resources};
 
 /// Marks the files this writer owns, so it never rewrites another's.
-pub const WRITER: &str = "giverny/orchestrator_session";
-
-/// What this writer called itself while an orchestrator session was a
-/// "pass": a feed still marked so is its own, and is re-marked on its next
-/// write.
-pub const OLD_WRITER: &str = "giverny/pass";
+pub const WRITER: &str = "giverny/manage";
 
 /// Claude Code exports the session id into every Bash command it runs, and a
 /// subagent inherits its dispatcher's: a worker re-estimating its own row
@@ -35,7 +30,7 @@ pub const OLD_WRITER: &str = "giverny/pass";
 pub const SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
 pub const USAGE: &str = "\
-usage: giverny orchestrator-session <command> [args] [--session <id>]
+usage: giverny manage <command> [args] [--session <id>]
 
   plan  <task> --eta <dur> [--title T] [--note N] [--brief FILE] [--repo R]
                               queue a task (a Next up row) with its estimate
@@ -59,7 +54,7 @@ usage: giverny orchestrator-session <command> [args] [--session <id>]
                               time really worked, older tasks against recent
   path                        print the feed file's path
   clear-done                  clear the Done rows: from this session's feed,
-                              and from the agents pane of the Giverny tab it runs in
+                              and from the management panel of the Giverny tab it runs in
   clear                       delete this session's feed
 
   claim <task> [--cpu N] [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
@@ -93,7 +88,7 @@ The feed goes to $GIVERNY_FEED_DIR, else <config>/giverny/feeds.
 Estimates are told, never corrected: the pane counts down from the figure
 given. Every landed task appends its estimate, wall time
 and working time (wall minus pauses and waits) to history.jsonl beside the feeds
-($GIVERNY_ORCHESTRATOR_SESSION_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
+($GIVERNY_MANAGE_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
 print how such guesses have fared: the median working-time/estimate ratio of
 the last 20 tasks of the same kind (repo + the title's type word, as `BUG:`),
 else the repo, else all. A worker's first `eta` on a running task (its
@@ -104,17 +99,17 @@ A subagent that is no task here has an agent ETA instead (`giverny eta`).
 
 Resources: one ledger for every session on the machine, at
 <feed dir>/resources/ledger.json ($GIVERNY_LEDGER overrides). Leases expire
-20 minutes after their session's last `giverny orchestrator-session` command. Limits are
-[orchestrator.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
+20 minutes after their session's last `giverny manage` command. Limits are
+[manager.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
 90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
-`run` with no lease claims one first (the default lease, [agents_panel.lease]
+`run` with no lease claims one first (the default lease, [management_panel.lease]
 in config.toml: 3 cpu, 3G unless set; --cpu/--ram override), waits while it is
 queued, and releases it when the command ends.
 `claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
 Messages go to <feed dir>/inbox/<session>.jsonl; the plugin's hook delivers
 them, and renews the calling session's leases, on every tool call.";
 
-/// One `giverny orchestrator-session` command, parsed.
+/// One `giverny manage` command, parsed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Plan(String),
@@ -128,8 +123,6 @@ pub enum Cmd {
     Path,
     ClearDone,
     Clear,
-    /// The plugin's `PostToolUse` hook: a hook payload on stdin.
-    Nudge,
     /// Ask the machine ledger for a lease.
     Claim(String),
     Release(String),
@@ -237,8 +230,8 @@ pub fn parse_dur(s: &str) -> Option<u64> {
     (num.is_empty() && total.is_finite()).then(|| total.round() as u64)
 }
 
-/// Parse `giverny orchestrator-session …`'s arguments (after
-/// `orchestrator-session`).
+/// Parse `giverny manage …`'s arguments (after
+/// `manage`).
 pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
     let mut flags = Flags::default();
     let mut pos: Vec<String> = Vec::new();
@@ -304,7 +297,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             let left = pos
                 .next()
                 .or_else(|| flags.eta_s.map(|s| format!("{}s", s)))
-                .ok_or("`eta` needs the time left, e.g. `giverny orchestrator-session eta auth-fix 20`")?;
+                .ok_or("`eta` needs the time left, e.g. `giverny manage eta auth-fix 20`")?;
             Cmd::Eta(
                 t,
                 parse_dur(&left).ok_or_else(|| format!("bad duration: {left}"))?,
@@ -318,7 +311,6 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "path" => Cmd::Path,
         "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
         "clear" => Cmd::Clear,
-        "nudge" => Cmd::Nudge,
         "claim" => Cmd::Claim(task()?),
         "release" => Cmd::Release(task()?),
         "resources" => Cmd::Resources,
@@ -329,7 +321,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             let text = pos.by_ref().collect::<Vec<_>>().join(" ");
             if text.trim().is_empty() {
                 return Err(format!(
-                    "`{verb}` needs the message, e.g. `giverny orchestrator-session {verb} {what} \"…\"`"
+                    "`{verb}` needs the message, e.g. `giverny manage {verb} {what} \"…\"`"
                 ));
             }
             if verb == "ask" {
@@ -345,7 +337,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
     }
     if matches!(cmd, Cmd::Run(_)) && flags.command.is_empty() {
         return Err(format!(
-            "`run` needs a command after `--`, e.g. `giverny orchestrator-session run t -- cargo test`\n\n{USAGE}"
+            "`run` needs a command after `--`, e.g. `giverny manage run t -- cargo test`\n\n{USAGE}"
         ));
     }
     if flags.gpu.unwrap_or(0) > 0 && flags.vram_mb.is_none() {
@@ -395,12 +387,9 @@ pub fn new_doc(session: &str) -> Value {
     json!({ "version": feed::FEED_VERSION, "session": session, "writer": WRITER, "rows": [] })
 }
 
-/// Who wrote this document, when it says; [`OLD_WRITER`] reads as
-/// [`WRITER`].
+/// Who wrote this document, when it says.
 pub fn writer_of(doc: &Value) -> Option<&str> {
-    doc.get("writer")
-        .and_then(Value::as_str)
-        .map(|w| if w == OLD_WRITER { WRITER } else { w })
+    doc.get("writer").and_then(Value::as_str)
 }
 
 fn rows_mut(doc: &mut Value) -> Result<&mut Vec<Value>, String> {
@@ -868,7 +857,7 @@ fn idle_workers(doc: &Value, task: &str, now: u64) -> Vec<(String, String)> {
 const IDLE_HINT_MS: u64 = 30 * 60 * 1000;
 
 /// The line `start <task>` with no `--agent` adds when a worker of this
-/// orchestrator session is idle: hand it over with `--agent`, so its tokens are its own.
+/// manager session is idle: hand it over with `--agent`, so its tokens are its own.
 fn idle_hint(task: &str, idle: &[(String, String)]) -> Option<String> {
     let (agent, key) = idle.first()?;
     let more = match idle.len() {
@@ -907,7 +896,6 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Path
         | Cmd::Clear
         | Cmd::ClearDone
-        | Cmd::Nudge
         | Cmd::Claim(_)
         | Cmd::Release(_)
         | Cmd::Resources
@@ -920,17 +908,14 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
     };
     let at = find(rows, &key);
     let stage = at.and_then(|i| rows[i].as_object().and_then(stage_of));
-    let missing = || {
-        format!(
-            "no task `{key}` in this orchestrator session (`giverny orchestrator-session show` lists them)"
-        )
-    };
+    let missing =
+        || format!("no task `{key}` in this manager session (`giverny manage show` lists them)");
 
     match cmd {
         Cmd::Plan(_) => {
             if let Some(s) = stage.filter(|s| *s != feed::Stage::Planned) {
                 return Err(format!(
-                    "`{key}` is already {}; `giverny orchestrator-session eta` re-estimates it",
+                    "`{key}` is already {}; `giverny manage eta` re-estimates it",
                     stage_word(s)
                 ));
             }
@@ -1009,7 +994,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             })
         }
         Cmd::Eta(_, left) if at.is_none() => {
-            // A worker spawned outside an orchestrator session has no row
+            // A worker spawned outside a manager session has no row
             // for `eta` to re-estimate, and an error would teach nothing:
             // start one now, with what is left as its estimate. The time
             // the worker spent before this is not known, so the clock starts
@@ -1028,8 +1013,8 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                 }
             }
             Ok(format!(
-                "{key}: no row in this orchestrator session, so started it now with ~{} left \
-                 (as given; `giverny orchestrator-session start {key} --eta <min> --agent <id>` \
+                "{key}: no row in this manager session, so started it now with ~{} left \
+                 (as given; `giverny manage start {key} --eta <min> --agent <id>` \
                  before the spawn gives a row its whole time)",
                 feed::fmt_span(*left as i64)
             ))
@@ -1141,7 +1126,6 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
         | Cmd::Path
         | Cmd::Clear
         | Cmd::ClearDone
-        | Cmd::Nudge
         | Cmd::Claim(_)
         | Cmd::Release(_)
         | Cmd::Resources
@@ -1221,7 +1205,7 @@ pub fn show(doc: &Value, now: u64) -> String {
     out
 }
 
-/// A lock beside the feed, so concurrent `giverny orchestrator-session` runs (a dispatcher
+/// A lock beside the feed, so concurrent `giverny manage` runs (a dispatcher
 /// and its workers) never lose each other's rows. Taken with `create_new`;
 /// one left behind by a killed run is broken after ten seconds.
 pub(crate) struct Lock(PathBuf);
@@ -1277,7 +1261,7 @@ pub fn write(file: &Path, doc: &Value) -> std::io::Result<()> {
     std::fs::rename(&tmp, file)
 }
 
-/// The file this session's orchestrator session lives in: `<session>.json`, or an existing
+/// The file this session's manager session lives in: `<session>.json`, or an existing
 /// file that names the session as an alias.
 pub fn file_for(dir: &Path, session: &str) -> PathBuf {
     feed::find(dir, session)
@@ -1315,7 +1299,7 @@ fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
     continuation::adopt(&mut doc, session);
     continuation::stamp_root(&mut doc, Some(&root));
     if let Err(e) = write(&file, &doc) {
-        eprintln!("giverny orchestrator-session: {}: {e}", file.display());
+        eprintln!("giverny manage: {}: {e}", file.display());
     }
 }
 
@@ -1350,12 +1334,12 @@ pub fn run_in_code(
     if *cmd != Cmd::Path
         && let Err(e) = resources::heartbeat(&ledger, Some(dir), session, now)
     {
-        eprintln!("giverny orchestrator-session: {e}");
+        eprintln!("giverny manage: {e}");
     }
     match cmd {
         Cmd::Claim(task) => return claim(dir, &ledger, session, task, flags, now, cap),
         Cmd::Run(task) => {
-            return crate::orchestrator_session_run::run(dir, &ledger, session, task, flags, cap);
+            return crate::manage_run::run(dir, &ledger, session, task, flags, cap);
         }
         Cmd::Release(task) => {
             let gone = resources::release_at(&ledger, session, task, now)?;
@@ -1369,7 +1353,7 @@ pub fn run_in_code(
             ));
         }
         Cmd::Ask(target, text) => {
-            let msg = crate::orchestrator_session_inbox::ask(
+            let msg = crate::manage_inbox::ask(
                 dir,
                 &ledger,
                 session,
@@ -1382,8 +1366,7 @@ pub fn run_in_code(
             return Ok((msg, 0));
         }
         Cmd::Reply(id, text) => {
-            let msg =
-                crate::orchestrator_session_inbox::reply(dir, &ledger, session, id, text, now)?;
+            let msg = crate::manage_inbox::reply(dir, &ledger, session, id, text, now)?;
             return Ok((msg, 0));
         }
         Cmd::Accuracy => return Ok((accuracy(dir, flags.repo.as_deref()), 0)),
@@ -1402,7 +1385,7 @@ pub fn run_in_code(
     let (mut msg, landed) = match run_feed(dir, session, cmd, flags, now) {
         Ok(x) => x,
         // A task that is over gives its lease back even when its row could
-        // not be changed (none in this orchestrator session, another writer's feed).
+        // not be changed (none in this manager session, another writer's feed).
         Err(e) => {
             if let Cmd::Land(task) | Cmd::Drop(task) = cmd
                 && let Some(l) = resources::release_at(&ledger, session, task, now)?
@@ -1450,7 +1433,7 @@ fn claim(
     let req = flags.request();
     let repo = flags.repo.clone().or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
-        orchestrator_session_history::repo_of(task, &cwd)
+        manage_history::repo_of(task, &cwd)
     });
     // Figures given on a held lease, each no larger, shrink it in place: the
     // answer to an ask. Otherwise it is a claim as ever.
@@ -1501,25 +1484,19 @@ fn claim(
     Ok((line, out.exit_code()))
 }
 
-/// What past tasks like this one peaked at under `giverny orchestrator-session run`,
+/// What past tasks like this one peaked at under `giverny manage run`,
 /// for `claim` to say beside its answer: `the last 4 BUG
 /// tasks in demo peaked at 1.8G (median), 2.6G at most`.
 fn size_hint(dir: &Path, session: &str, task: &str, repo: Option<&str>) -> Option<String> {
-    let history = orchestrator_session_history::path(dir)?;
+    let history = manage_history::path(dir)?;
     let title = feed::find(dir, session).and_then(|(_, f)| {
         f.rows
             .into_iter()
             .find(|r| r.key == task)
             .and_then(|r| r.title)
     });
-    let kind = title
-        .as_deref()
-        .and_then(orchestrator_session_history::kind_of);
-    orchestrator_session_history::peak_hint(
-        &orchestrator_session_history::load(&history),
-        repo,
-        kind.as_deref(),
-    )
+    let kind = title.as_deref().and_then(manage_history::kind_of);
+    manage_history::peak_hint(&manage_history::load(&history), repo, kind.as_deref())
 }
 
 /// Change `session`'s feed row for `task` under the feed's lock, when the
@@ -1617,7 +1594,7 @@ fn run_feed(
         && w != WRITER
     {
         return Err(format!(
-            "{} is written by {w}; giverny orchestrator-session leaves it alone",
+            "{} is written by {w}; giverny manage leaves it alone",
             file.display()
         ));
     }
@@ -1642,7 +1619,7 @@ fn run_feed(
                 continuation::stamp_root(&mut doc, continuation::root_of(cfg, session).as_deref());
             }
             let sessions = continuation::ids(&doc);
-            let history = orchestrator_session_history::path(dir);
+            let history = manage_history::path(dir);
             let mut flags = flags.clone();
             let said = tell_record(&doc, cmd, &mut flags, history.as_deref());
             if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
@@ -1722,7 +1699,7 @@ fn no_brief(key: &str) -> String {
     format!(
         "  no brief: its Next up row opens to its title and note only; write the \
          worker's prompt (or the task's text) to a file and pass `--brief FILE` \
-         (`giverny orchestrator-session plan {key} --eta … --brief FILE`, or on `start`)"
+         (`giverny manage plan {key} --eta … --brief FILE`, or on `start`)"
     )
 }
 
@@ -1738,12 +1715,8 @@ fn tell_record(
     history: Option<&Path>,
 ) -> Option<String> {
     let (key, track, given) = match cmd {
-        Cmd::Plan(key) | Cmd::Start(key) => (
-            key,
-            orchestrator_session_history::Track::Guess,
-            flags.eta_s?,
-        ),
-        Cmd::Eta(key, left) => (key, orchestrator_session_history::Track::Reestimate, *left),
+        Cmd::Plan(key) | Cmd::Start(key) => (key, manage_history::Track::Guess, flags.eta_s?),
+        Cmd::Eta(key, left) => (key, manage_history::Track::Reestimate, *left),
         _ => return None,
     };
     let row = doc
@@ -1751,7 +1724,7 @@ fn tell_record(
         .and_then(Value::as_array)
         .and_then(|rows| find(rows, key).map(|i| &rows[i]))
         .and_then(Value::as_object);
-    if track == orchestrator_session_history::Track::Reestimate
+    if track == manage_history::Track::Reestimate
         && !row.is_some_and(|r| {
             stage_of(r) == Some(feed::Stage::Running) && !r.contains_key("reest_s")
         })
@@ -1763,17 +1736,15 @@ fn tell_record(
     if flags.repo.is_none() {
         flags.repo = row_str("repo").map(String::from).or_else(|| {
             let cwd = std::env::current_dir().unwrap_or_default();
-            orchestrator_session_history::repo_of(key, &cwd)
+            manage_history::repo_of(key, &cwd)
         });
     }
     let title = flags.title.as_deref().or(row_str("title")).unwrap_or("");
-    let kind = orchestrator_session_history::kind_of(title);
-    let past = history
-        .map(orchestrator_session_history::load)
-        .unwrap_or_default();
+    let kind = manage_history::kind_of(title);
+    let past = history.map(manage_history::load).unwrap_or_default();
     let (repo, kind) = (flags.repo.as_deref(), kind.as_deref());
-    let record = orchestrator_session_history::track_record(&past, track, repo, kind);
-    if track == orchestrator_session_history::Track::Reestimate {
+    let record = manage_history::track_record(&past, track, repo, kind);
+    if track == manage_history::Track::Reestimate {
         return record.map(|r| format!("\n  {r}"));
     }
     let told = record.unwrap_or_else(|| {
@@ -1785,14 +1756,9 @@ fn tell_record(
 
 /// `accuracy`: the history's report.
 fn accuracy(dir: &Path, repo: Option<&str>) -> String {
-    match orchestrator_session_history::path(dir) {
-        Some(h) => {
-            orchestrator_session_history::accuracy(&orchestrator_session_history::load(&h), repo)
-        }
-        None => format!(
-            "the history is off (${} is empty)",
-            orchestrator_session_history::ENV
-        ),
+    match manage_history::path(dir) {
+        Some(h) => manage_history::accuracy(&manage_history::load(&h), repo),
+        None => format!("the history is off (${} is empty)", manage_history::ENV),
     }
 }
 
@@ -1820,9 +1786,9 @@ fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
             continue;
         }
         if let Some(rec) = record_of(r, session)
-            && let Err(e) = orchestrator_session_history::append(history, &rec)
+            && let Err(e) = manage_history::append(history, &rec)
         {
-            eprintln!("giverny orchestrator-session: {}: {e}", history.display());
+            eprintln!("giverny manage: {}: {e}", history.display());
         }
     }
 }
@@ -1830,10 +1796,7 @@ fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
 /// A landed row as a history record: wall time from its true start
 /// (`spawned` when a pause moved `started` on), working time that less its
 /// paused and waiting spans.
-pub fn record_of(
-    r: &Map<String, Value>,
-    session: &str,
-) -> Option<orchestrator_session_history::Record> {
+pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<manage_history::Record> {
     let started = ms_of(r, "spawned").or_else(|| ms_of(r, "started"))?;
     let ended = ms_of(r, "ended")?;
     let wall_s = ended.saturating_sub(started) / 1000;
@@ -1846,11 +1809,9 @@ pub fn record_of(
             .and_then(Value::as_object)
             .and_then(|u| u64_of(u, k))
     };
-    Some(orchestrator_session_history::Record {
+    Some(manage_history::Record {
         key: s("key").unwrap_or_default(),
-        kind: title
-            .as_deref()
-            .and_then(orchestrator_session_history::kind_of),
+        kind: title.as_deref().and_then(manage_history::kind_of),
         title,
         repo: s("repo"),
         session: Some(session.to_string()),
@@ -1911,7 +1872,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The `giverny orchestrator-session` entrypoint. Returns the process exit code. `spool` is
+/// The `giverny manage` entrypoint. Returns the process exit code. `spool` is
 /// where a message to the app goes when its socket is not there
 /// (`clear-done`).
 pub fn main(args: &[String], spool: &Path) -> i32 {
@@ -1922,10 +1883,6 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
             return 2;
         }
     };
-    if cmd == Cmd::Nudge {
-        // The plugin's hook, under the name it had before `giverny hook`.
-        return crate::plugin_hook::main(false);
-    }
     if cmd == Cmd::Accuracy {
         // The history is the machine's, not a session's.
         println!("{}", accuracy(&feed::feed_dir(), flags.repo.as_deref()));
@@ -1939,7 +1896,7 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         .filter(|s| !s.is_empty());
     let Some(session) = session else {
         eprintln!(
-            "giverny orchestrator-session: no session — run it from inside Claude Code \
+            "giverny manage: no session — run it from inside Claude Code \
              (it sets ${SESSION_ENV}) or pass --session <id>"
         );
         return 2;
@@ -1948,7 +1905,7 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
     match run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None) {
         Ok((msg, _)) if cmd == Cmd::ClearDone => {
             let pane = if crate::hooks::send_clear_done(spool, Some(&session), now) {
-                "asked Giverny to clear the agents pane's Done rows in this tab"
+                "asked Giverny to clear the management panel's Done rows in this tab"
             } else {
                 "not in a Giverny tab, so no pane to clear"
             };
@@ -1962,7 +1919,7 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
             code
         }
         Err(e) => {
-            eprintln!("giverny orchestrator-session: {e}");
+            eprintln!("giverny manage: {e}");
             1
         }
     }
@@ -1980,10 +1937,7 @@ mod tests {
     const MIN: u64 = 60_000;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "giverny-orchestrator-session-{name}-{}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("giverny-manage-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -2023,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn an_orchestrator_session_from_plan_to_land_is_what_the_pane_reads() {
+    fn a_manager_session_from_plan_to_land_is_what_the_pane_reads() {
         let dir = scratch("life");
         run(&dir, "plan auth-fix --eta 30 --title Fix", T0).unwrap();
         run(&dir, "plan docs --eta 1h", T0).unwrap();
@@ -2094,10 +2048,10 @@ mod tests {
     #[test]
     fn a_workers_first_re_estimate_is_kept_told_and_learned() {
         let dir = scratch("reest");
-        let h = dir.join(orchestrator_session_history::FILE);
+        let h = dir.join(manage_history::FILE);
         // Past FEATURE re-estimates in demo ran ×1.5: 10m said, 15m taken.
-        for _ in 0..orchestrator_session_history::MIN_SAMPLES {
-            let rec = orchestrator_session_history::Record {
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
                 key: "demo#1".into(),
                 repo: Some("demo".into()),
                 kind: Some("FEATURE".into()),
@@ -2107,9 +2061,9 @@ mod tests {
                 wall_s: 1200,
                 work_s: 1200,
                 outcome: Some("Done".into()),
-                ..orchestrator_session_history::Record::default()
+                ..manage_history::Record::default()
             };
-            orchestrator_session_history::append(&h, &rec).unwrap();
+            manage_history::append(&h, &rec).unwrap();
         }
         let said = run(&dir, "plan demo#9 --eta 50 --title FEATURE:x", T0).unwrap();
         assert!(
@@ -2148,7 +2102,7 @@ mod tests {
         assert_eq!(row("reest_s"), 600);
         // Landed: the record carries the re-estimate.
         run(&dir, "land demo#9", T0 + 30 * MIN).unwrap();
-        let last = orchestrator_session_history::load(&h).pop().unwrap();
+        let last = manage_history::load(&h).pop().unwrap();
         assert_eq!(last.reest_s, Some(600));
         assert_eq!(last.reest_at_s, Some(240));
         assert_eq!(last.work_s, 28 * 60);
@@ -2189,7 +2143,7 @@ mod tests {
 
     #[test]
     fn eta_on_a_task_with_no_row_starts_it() {
-        // A worker spawned outside an orchestrator session; its dispatcher (or
+        // A worker spawned outside a manager session; its dispatcher (or
         // the worker) reaches for `eta`, and gets a Running row, not an error.
         let dir = scratch("eta-no-row");
         let said = run(
@@ -2200,7 +2154,7 @@ mod tests {
         .unwrap();
         assert!(said.contains("started it now with ~40m left"), "{said}");
         assert!(
-            said.contains("giverny orchestrator-session start acme#613 --eta"),
+            said.contains("giverny manage start acme#613 --eta"),
             "{said}"
         );
         let f = read_feed(&dir);
@@ -2371,20 +2325,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn history(dir: &Path) -> Vec<orchestrator_session_history::Record> {
-        orchestrator_session_history::load(&dir.join(orchestrator_session_history::FILE))
+    fn history(dir: &Path) -> Vec<manage_history::Record> {
+        manage_history::load(&dir.join(manage_history::FILE))
     }
 
     #[test]
     fn plan_and_start_keep_the_guess_and_tell_how_such_guesses_fared() {
         let dir = scratch("told");
         std::fs::create_dir_all(&dir).unwrap();
-        let h = dir.join(orchestrator_session_history::FILE);
+        let h = dir.join(manage_history::FILE);
         // Five landed demo BUGs that took half their guess, and five
         // FEATUREs that took a quarter.
         for (kind, work) in [("BUG", 15), ("FEATURE", 10)] {
-            for _ in 0..orchestrator_session_history::MIN_SAMPLES {
-                let rec = orchestrator_session_history::Record {
+            for _ in 0..manage_history::MIN_SAMPLES {
+                let rec = manage_history::Record {
                     key: "x".into(),
                     repo: Some("demo".into()),
                     kind: Some(kind.into()),
@@ -2394,7 +2348,7 @@ mod tests {
                     outcome: Some("Done".into()),
                     ..Default::default()
                 };
-                orchestrator_session_history::append(&h, &rec).unwrap();
+                manage_history::append(&h, &rec).unwrap();
             }
         }
         let (cmd, mut flags) = parse_args(&args("plan demo#1 --eta 40")).unwrap();
@@ -2512,10 +2466,10 @@ mod tests {
     #[test]
     fn an_empty_history_variable_turns_learning_off() {
         // Only the pure parts: the env var is process-wide, so the path is
-        // checked through `orchestrator_session_history::path` rather than by running.
+        // checked through `manage_history::path` rather than by running.
         assert_eq!(
-            orchestrator_session_history::path(Path::new("/f")),
-            std::env::var_os(orchestrator_session_history::ENV)
+            manage_history::path(Path::new("/f")),
+            std::env::var_os(manage_history::ENV)
                 .map(|v| (!v.is_empty()).then(|| PathBuf::from(v)))
                 .unwrap_or(Some(PathBuf::from("/f/history.jsonl")))
         );
@@ -2616,7 +2570,7 @@ mod tests {
         run_as(&dir, "b", "claim live --cpu 0 --ram 4G", T0);
         let (_, code) = run_as(&dir, "c", "claim x --cpu 4", T0);
         assert_eq!(code, resources::exit::QUEUED);
-        // b and c run orchestrator-session commands every few minutes; a is gone.
+        // b and c run manage commands every few minutes; a is gone.
         for k in 1..=5 {
             run_as(&dir, "b", "show", T0 + k * 5 * MIN);
             run_as(&dir, "c", "show", T0 + k * 5 * MIN);
@@ -2660,7 +2614,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_orchestrator_asks_the_holder_which_shrinks_and_releases() {
+    fn a_queued_manager_asks_the_holder_which_shrinks_and_releases() {
         let dir = scratch("ask");
         // a holds the cargo slot for a long task; b's short task needs it.
         run_as(&dir, "sess-a", "start demo#12 --eta 60", T0);
@@ -2681,7 +2635,7 @@ mod tests {
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
         assert!(
             msg.contains("that wait (~59m) is longer than acme#5 itself (~10m)")
-                && msg.contains("giverny orchestrator-session ask demo#12"),
+                && msg.contains("giverny manage ask demo#12"),
             "the queued answer suggests asking: {msg}"
         );
         // Nothing in anyone's inbox yet: the hook says nothing.
@@ -2708,9 +2662,9 @@ mod tests {
             "~10m left on it",
             "your lease demo#12 (3 cpu, 6G, slot cargo:/t)",
             "\"a 2-minute test needs the slot\"",
-            &format!("giverny-orchestrator-session reply {id} "),
-            "giverny-orchestrator-session release demo#12",
-            "giverny-orchestrator-session claim demo#12 --cpu <fewer> --ram <less>",
+            &format!("giverny-manage reply {id} "),
+            "giverny-manage release demo#12",
+            "giverny-manage claim demo#12 --cpu <fewer> --ram <less>",
         ] {
             assert!(ctx.contains(want), "{want:?} in {ctx}");
         }
@@ -2750,10 +2704,7 @@ mod tests {
         let ctx = hook(&dir, "sess-b", T0 + 6 * MIN).unwrap();
         assert!(ctx.contains(&format!("to your ask {id}")), "{ctx}");
         assert!(ctx.contains("demo#12 has released its lease"), "{ctx}");
-        assert!(
-            ctx.contains("giverny-orchestrator-session claim acme#5"),
-            "{ctx}"
-        );
+        assert!(ctx.contains("giverny-manage claim acme#5"), "{ctx}");
         let (msg, code) = run_as(
             &dir,
             "sess-b",
@@ -2777,11 +2728,11 @@ mod tests {
     }
 
     #[test]
-    fn the_hook_keeps_a_busy_orchestrators_leases_alive() {
+    fn the_hook_keeps_a_busy_managers_leases_alive() {
         let dir = scratch("hook-beat");
         run_as(&dir, "busy", "claim t --cpu 2", T0);
         run_as(&dir, "idle", "claim u --cpu 2", T0);
-        // `busy` runs no orchestrator-session command, but its (and its workers') tool calls
+        // `busy` runs no manage command, but its (and its workers') tool calls
         // fire the hook every minute; `idle` does nothing.
         for k in 1..=25 {
             let worker = json!({"session_id": "busy", "agent_id": "w1"});
@@ -3072,7 +3023,7 @@ mod tests {
             .clone()
     }
 
-    /// The inbar orchestrator session (giverny#217): one worker reused for three tasks with
+    /// The inbar manager session (giverny#217): one worker reused for three tasks with
     /// a plain `start` each time and the task handed over by a message in
     /// the dispatcher's own words, the third named only as "a review round
     /// on #828". Each task still gets the worker and its own count, frozen
@@ -3197,7 +3148,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// giverny#258, replayed from the inbar orchestrator session: `start
+    /// giverny#258, replayed from the inbar manager session: `start
     /// inbar#856` and `start inbar#865` with no `--agent`, the idle worker of
     /// #855 handed #865 by a message that says in passing that "another
     /// worker now holds inbar#856", #856's own worker spawned a moment
@@ -3310,7 +3261,7 @@ mod tests {
         run_cfg(&dir, "s1", "show", None, T0 + 2 * MIN);
         assert!(!held(&dir, "s1", "t", T0 + 2 * MIN));
         run_cfg(&dir, "s1", "claim t2 --cpu 1", None, T0 + 2 * MIN);
-        // A task landed with no row in the orchestrator session still gives its lease back.
+        // A task landed with no row in the manager session still gives its lease back.
         run_cfg(&dir, "s1", "claim u --cpu 1", None, T0 + 3 * MIN);
         let (cmd, flags) = parse_args(&args("land u")).unwrap();
         let err =

@@ -4,7 +4,7 @@
 //!
 //! The session is the `claude` process the status line command runs under
 //! and every process below it: its Bash commands, their builds, `giverny
-//! orchestrator-session run` commands (a `systemd-run --scope` execs the command in place,
+//! manage run` commands (a `systemd-run --scope` execs the command in place,
 //! so a capped command stays in the tree), background shells. Its
 //! subagents run inside the `claude` process itself.
 //!
@@ -94,7 +94,7 @@ pub fn cpu_pct(ticks_then: u64, ticks_now: u64, ticks_per_s: u64, over_ms: u64, 
         .clamp(0.0, 100.0) as u32
 }
 
-/// A size in G, the agents pane's way: `0.0G` for nothing, `0.1G` at the
+/// A size in G, the management panel's way: `0.0G` for nothing, `0.1G` at the
 /// least for anything, tenths below ten (`4.2G`), whole above (`12G`), T
 /// from a thousand G.
 pub fn gb(mb: u64) -> String {
@@ -127,7 +127,7 @@ pub fn cpu8(pct: u32) -> String {
 /// ` 45% CPU`, `4.2G` and, with a GPU, `gpu 1.2G`. Every figure has a
 /// fixed width ([`cpu8`], [`gb4`]), so the part, joined with [`SEP`] and
 /// right-aligned, keeps each figure in the same columns as it changes —
-/// and in the same columns as the agents pane's use cells drawn right
+/// and in the same columns as the management panel's use cells drawn right
 /// under it, which are built from the same pieces.
 pub fn segments(u: &SessionUse) -> Vec<String> {
     let mut out = vec![cpu8(u.cpu_pct), gb4(u.mem_mb)];
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn figures_read_like_the_agents_pane() {
+    fn figures_read_like_the_management_panel() {
         assert_eq!(gb(0), "0.0G");
         assert_eq!(gb(1), "0.1G");
         assert_eq!(gb(4300), "4.2G");

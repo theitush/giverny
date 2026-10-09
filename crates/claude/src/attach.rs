@@ -97,7 +97,7 @@ pub fn under(shell: u32) -> Option<String> {
     None
 }
 
-/// Elsewhere there is no `/proc` to read; the agents pane is WSL-only.
+/// Elsewhere there is no `/proc` to read; the management panel is WSL-only.
 #[cfg(not(target_os = "linux"))]
 pub fn under(_shell: u32) -> Option<String> {
     None

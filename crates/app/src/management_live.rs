@@ -1,4 +1,4 @@
-//! The agents pane's live rows, per tab: where relayed `subagentStatusLine`
+//! The management panel's live rows, per tab: where relayed `subagentStatusLine`
 //! ticks land.
 //!
 //! `giverny relay --subagent-line` forwards Claude Code's live worker list
@@ -6,14 +6,14 @@
 //! verified against 2.1.280). [`ClaudeWatch`] hands each one here,
 //! and this keeps one [`Tracker`] per tab — Running rows from the ticks, Done
 //! rows from the transcripts once a worker leaves the list. The pane reads
-//! them through [`AgentsLive::tracker`]; nothing here draws anything.
+//! them through [`ManagementLive::tracker`]; nothing here draws anything.
 //!
 //! Rows are kept until the tab's conversation is cleared (`/clear`, which
 //! Claude Code reports as `SessionStart` with `source: "clear"`), a fresh
 //! `claude` starts in it (`source: "startup"`), or the tab is closed, and they are saved to disk so a Giverny restart keeps the Done
 //! rows. They are part of the tab's session, though: after a restart they are
 //! not shown until that session is back up — its `SessionStart`, or a tick
-//! from it — and they go again when it ends ([`AgentsLive::shown`]).
+//! from it — and they go again when it ends ([`ManagementLive::shown`]).
 //!
 //! [`ClaudeWatch`]: crate::claude_watch::ClaudeWatch
 
@@ -32,7 +32,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// How soon a change is written to disk, at the latest.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
-pub struct AgentsLive {
+pub struct ManagementLive {
     trackers: HashMap<TabId, Tracker>,
     /// Tabs whose Claude session has been heard from in this run and not
     /// ended since: the ones whose rows are shown. Not saved — a restart
@@ -51,15 +51,15 @@ struct Saved {
     tabs: Vec<(u64, Tracker)>,
 }
 
-impl AgentsLive {
+impl ManagementLive {
     /// Trackers restored from `path` (or none), saved back there.
-    pub fn load(path: PathBuf) -> AgentsLive {
+    pub fn load(path: PathBuf) -> ManagementLive {
         let trackers = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
             .map(|s| s.tabs.into_iter().map(|(id, t)| (TabId(id), t)).collect())
             .unwrap_or_default();
-        AgentsLive {
+        ManagementLive {
             trackers,
             up: HashSet::new(),
             path: Some(path),
@@ -71,8 +71,8 @@ impl AgentsLive {
 
     /// Trackers that live in memory only (tests).
     #[cfg(test)]
-    pub fn in_memory() -> AgentsLive {
-        AgentsLive {
+    pub fn in_memory() -> ManagementLive {
+        ManagementLive {
             trackers: HashMap::new(),
             up: HashSet::new(),
             path: None,
@@ -83,7 +83,7 @@ impl AgentsLive {
     }
 
     /// The subagents of `tab`'s Claude session, Running and Done — what the
-    /// agents pane draws. `None` until the tab's Claude has spawned a worker.
+    /// management panel draws. `None` until the tab's Claude has spawned a worker.
     ///
     /// [`Tracker::rows`] is the table; [`Tracker::session_id`] and
     /// [`Tracker::aliases`] name the feed file to merge with it.
@@ -91,7 +91,7 @@ impl AgentsLive {
         self.trackers.get(&tab)
     }
 
-    /// [`AgentsLive::tracker`], but only while `tab`'s session is up: what
+    /// [`ManagementLive::tracker`], but only while `tab`'s session is up: what
     /// the pane draws. Rows restored from disk wait for the session they
     /// belong to, so the pane does not show before it.
     pub fn shown(&self, tab: TabId) -> Option<&Tracker> {
@@ -136,7 +136,7 @@ impl AgentsLive {
         }
         // A tick from another conversation is a start this tab never heard
         // of — a `/clear` whose hook went astray (giverny#242): the table is
-        // that conversation's, as [`AgentsLive::session_started`] would make it.
+        // that conversation's, as [`ManagementLive::session_started`] would make it.
         if let Some(sid) = snap.session_id.as_deref()
             && tracker.continues(sid) == Some(false)
         {
@@ -214,7 +214,7 @@ impl AgentsLive {
     ///
     /// The job runs, so its session is up: the pane shows from now, not
     /// from the first hook or status tick that reaches the tab — a job
-    /// shown by `claude attach` sends no `SessionStart`, and an orchestrator
+    /// shown by `claude attach` sends no `SessionStart`, and a manager
     /// that has only planned has no workers to tick (giverny#244).
     pub fn job_holds(
         &mut self,
@@ -280,7 +280,7 @@ impl AgentsLive {
         self.dirty = true;
     }
 
-    /// `giverny orchestrator-session clear-done` in `tab`: drop its Done rows (and hide the
+    /// `giverny manage clear-done` in `tab`: drop its Done rows (and hide the
     /// feed's that landed by then), keeping what runs. `at_ms` is when the
     /// command ran, else now.
     pub fn clear_done(&mut self, tab: TabId, at_ms: Option<u64>) {
@@ -289,7 +289,7 @@ impl AgentsLive {
             return;
         };
         let gone = tracker.clear_done(at_ms.unwrap_or(now).min(now));
-        tracing::info!("tab {tab:?}: {gone} Done row(s) cleared from the agents pane");
+        tracing::info!("tab {tab:?}: {gone} Done row(s) cleared from the management panel");
         self.dirty = true;
     }
 
@@ -328,7 +328,7 @@ impl AgentsLive {
                 .collect(),
         };
         if let Err(err) = write_atomic(path, &saved) {
-            tracing::warn!("agents pane rows not saved: {err:#}");
+            tracing::warn!("management panel rows not saved: {err:#}");
         }
     }
 }
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn a_tick_becomes_rows_on_its_tab() {
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         assert!(live.tracker(TAB).is_none(), "no tracker before any worker");
         live.apply_live(
             TAB,
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn clear_starts_over_and_other_starts_keep_rows() {
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
 
         live.session_started(TAB, Some("resume"), Some("s2"), None);
@@ -463,7 +463,7 @@ mod tests {
     /// to compare) keeps the rows.
     #[test]
     fn a_fresh_claude_starts_over_and_a_re_id_does_not() {
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
         live.apply_live(TAB, None, &tick_json("s1", &[]));
         assert_eq!(live.tracker(TAB).unwrap().rows().len(), 1, "a Done row");
@@ -504,7 +504,7 @@ mod tests {
         transcript("forked", "root-1");
         transcript("cleared", "root-2");
 
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some(config.clone()), &tick_json("old", &["a1"]));
         live.apply_live(TAB, None, &tick_json("forked", &[]));
         let t = live.tracker(TAB).unwrap();
@@ -537,7 +537,7 @@ mod tests {
             let line = serde_json::json!({"type": "user", "parentUuid": null, "uuid": root});
             std::fs::write(proj.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
         }
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some(config.clone()), &tick_json("old", &["a1"]));
 
         live.job_holds(TAB, "forked", None, None);
@@ -603,7 +603,7 @@ mod tests {
         };
         finished("A", "root-a", "wa");
         finished("B", "root-b", "wb");
-        let ids = |live: &AgentsLive| -> Vec<String> {
+        let ids = |live: &ManagementLive| -> Vec<String> {
             let mut v: Vec<String> = live
                 .tracker(TAB)
                 .unwrap()
@@ -614,7 +614,7 @@ mod tests {
             v.sort();
             v
         };
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some(config.clone()), &tick_json("A", &["ra"]));
         live.tick(|_| true);
         assert_eq!(ids(&live), ["ra", "wa"]);
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn clear_done_keeps_what_runs() {
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(
             TAB,
             Some("/nowhere".into()),
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn closed_tabs_are_dropped() {
-        let mut live = AgentsLive::in_memory();
+        let mut live = ManagementLive::in_memory();
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
         live.apply_live(TabId(8), Some("/nowhere".into()), &tick_json("s2", &["b1"]));
         live.tick(|id| id == TAB);
@@ -681,12 +681,12 @@ mod tests {
     #[test]
     fn rows_survive_a_restart() {
         let path = scratch_dir("restart").join("agents.json");
-        let mut live = AgentsLive::load(path.clone());
+        let mut live = ManagementLive::load(path.clone());
         live.apply_live(TAB, Some("/nowhere".into()), &tick_json("s1", &["a1"]));
         live.apply_live(TAB, None, &tick_json("s1", &[]));
         live.save();
 
-        let back = AgentsLive::load(path.clone());
+        let back = ManagementLive::load(path.clone());
         let t = back.tracker(TAB).expect("restored");
         assert_eq!(t.session_id.as_deref(), Some("s1"));
         assert_eq!(t.rows().len(), 1);
@@ -699,11 +699,11 @@ mod tests {
     /// reads. Claude Code counts ELAPSED from the tick's `startTime` and
     /// shows the tick's `tokenCount` — the last turn's context (123,200
     /// here) plus every output token so far (734). The feed's `started`
-    /// was stamped 75 s before the spawn, as an orchestrator's `start`
+    /// was stamped 75 s before the spawn, as a manager's `start`
     /// does, and is not the clock.
     #[test]
     fn a_worked_row_reads_as_claude_codes_agents_view() {
-        use crate::agents_pane::{build, fmt_tokens, stopwatch};
+        use crate::management_panel::{build, fmt_tokens, stopwatch};
         use giverny_claude::subagents::LiveSnapshot;
         const REAL: &str = include_str!("../../claude/testdata/agent-api-error-resume.jsonl");
         /// 2026-09-26T17:10:37.249Z, its first line.
@@ -753,7 +753,7 @@ mod tests {
     /// it stood once it is continued.
     #[test]
     fn a_worker_stopped_by_an_api_error_freezes_its_row() {
-        use crate::agents_pane::build;
+        use crate::management_panel::build;
         use giverny_claude::subagents::LiveSnapshot;
         const REAL: &str = include_str!("../../claude/testdata/agent-api-error-resume.jsonl");
         const ERROR_MS: u64 = 1_790_444_326_816;
@@ -788,7 +788,7 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        let worked = |ms: u64| crate::agents_pane::stopwatch(ms / 1000);
+        let worked = |ms: u64| crate::management_panel::stopwatch(ms / 1000);
 
         let mut t = Tracker::new(Some(config.clone()));
         // Still listed running for a moment, then failed; the pane is looked

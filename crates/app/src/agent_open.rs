@@ -1,4 +1,4 @@
-//! What a click on an agents-pane row opens.
+//! What a click on a management-panel row opens.
 //!
 //! The pane hands the app a [`RowClick`]; this module decides, without
 //! touching the app, what that click means — so the decision is tested here
@@ -8,7 +8,7 @@
 //!   Claude Code: Giverny types the keys that
 //!   put Claude Code in that subagent's interactive view, driven by
 //!   [`Walk`], which reads the parent's screen after every key rather than
-//!   typing blind. With the agents pane on, the relay is asked to show
+//!   typing blind. With the management panel on, the relay is asked to show
 //!   Claude Code's agent strip while the walk runs (`hooks::show_strip`),
 //!   since the strip is the only keyboard path to a worker's view; `/tasks`
 //!   is never used. The tab's picture is held from the click until the
@@ -22,7 +22,7 @@
 //!   Running one live, following it as it grows; a Done one opened at its
 //!   end, on the final report. Nothing is typed into Claude Code.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
-//!   orchestrator" button walk it back to the main view ([`Walk::home`]),
+//!   manager" button walk it back to the main view ([`Walk::home`]),
 //!   and the strip's own `main` row is not drawn
 //!   ([`row_marks`]).
 //! * A Done worker's overlay only reads: nothing is offered. Claude Code
@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use giverny_claude::feed::Stage;
 
-use crate::agents_pane::RowClick;
+use crate::management_panel::RowClick;
 
 /// The largest brief read; past it the overlay shows the head and says so.
 /// A safety net, not a fold: no brief comes near it.
@@ -181,7 +181,7 @@ fn planned_without_brief(click: &RowClick) -> String {
     }
     parts.push(
         "No brief was given for this row. The dispatcher adds one with \
-         `giverny-orchestrator-session plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
+         `giverny-manage plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
             .to_string(),
     );
     parts.join("\n\n")
@@ -475,7 +475,7 @@ pub fn prompt_box(screen: &str, undimmed: &str) -> Option<PromptBox> {
 }
 
 /// Whether Claude Code's agent strip is drawn under the prompt: its `main`
-/// row is on screen. With the agents pane on, Giverny's relay hides the
+/// row is on screen. With the management panel on, Giverny's relay hides the
 /// strip until asked to show it.
 pub fn strip_shown(screen: &str) -> bool {
     screen.lines().any(|row| main_row(row).is_some())
@@ -674,7 +674,7 @@ impl Stuck {
                 "Giverny opened the view of \u{201c}{other}\u{201d} instead of \
                  \u{201c}{description}\u{201d}: Claude Code's agent list names busy agents by \
                  what they are doing, and two looked alike. Press Esc to go back to the \
-                 orchestrator."
+                 manager."
             ),
         }
     }
@@ -888,7 +888,7 @@ impl Attach {
 
 /// The agent rows of Claude Code's strip on this screen, focused or not:
 /// the rows under its `main` row. Empty while the strip is hidden, and
-/// while it shows `main` alone (a worker's view with the agents pane on:
+/// while it shows `main` alone (a worker's view with the management panel on:
 /// the relay hides every agent row, but Claude Code keeps `main` so the
 /// way back is there).
 pub fn strip_agents(screen: &str) -> Vec<Item> {
@@ -939,11 +939,11 @@ pub enum Goal {
         /// the strip is asked for: found by that first.
         agent_id: Option<String>,
     },
-    /// The main session's view: the orchestrator.
+    /// The main session's view: the manager.
     Main,
 }
 
-/// How long the strip is waited for: with the agents pane on, the relay
+/// How long the strip is waited for: with the management panel on, the relay
 /// shows it only when asked (`hooks::show_strip`), and Claude Code runs the
 /// relay about every five seconds.
 pub const STRIP_WAIT: Duration = Duration::from_secs(8);
@@ -1250,7 +1250,7 @@ pub const SETTLE_MAX: Duration = Duration::from_millis(2500);
 
 /// After a [`Walk`] lands: waits for the screen to be the view's final
 /// one, so the terminal can go from the view before to it in one frame.
-/// Into a worker's view with the agents pane on, final is
+/// Into a worker's view with the management panel on, final is
 /// the strip's agent rows gone again (only its `main` row stays, and that
 /// is not drawn); back on main, it is main's prompt.
 #[derive(Debug, Clone)]
@@ -1398,12 +1398,12 @@ impl Nudge {
 
 // ------------------------------------------------------------ marks ----
 
-/// What Giverny paints over a Claude Code tab's grid while the agents pane
+/// What Giverny paints over a Claude Code tab's grid while the management panel
 /// stands in for Claude Code's own agent strip:
 ///
 /// * the strip's `main` row is not drawn — the pane shows which worker the
 ///   tab is on, and the way back is Giverny's button;
-/// * while a worker's view is on screen, a "back to orchestrator" button
+/// * while a worker's view is on screen, a "back to manager" button
 ///   sits where that `◯ main` was, left-aligned under the terminal's other
 ///   text; with no such row, on the status line under the prompt (the
 ///   row with the session's token counts), after its text and before the
@@ -2073,7 +2073,7 @@ mod tests {
     //
     // A fake Claude Code 2.1.281 that draws the screens seen in tmux during
     // the strip and back-to-main work (main view, a worker's view, the strip focused or
-    // not, the shells pill focused, the agents pane's relay hiding rows)
+    // not, the shells pill focused, the management panel's relay hiding rows)
     // and answers keys the way that one did.
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2088,7 +2088,7 @@ mod tests {
         /// 0 is main; 1.. the agents.
         view: usize,
         focus: Focus,
-        /// The agents pane is on: the relay hides every agent row.
+        /// The management panel is on: the relay hides every agent row.
         pane: bool,
         /// The relay has been asked to show the strip anyway.
         asked: bool,
@@ -2916,7 +2916,7 @@ mod tests {
     /// `GIVERNY_TMUX=<socket>:<target>`, a `claude` there
     /// with the running agent `GIVERNY_TMUX_AGENT` (its description; the
     /// strip's label for it, if different, in `GIVERNY_TMUX_ALIAS`). With
-    /// the agents pane on, `GIVERNY_TMUX_ASK` names the relay's ask file
+    /// the management panel on, `GIVERNY_TMUX_ASK` names the relay's ask file
     /// (`<state>/show-strip/<tab id>`): it is written for the way in and
     /// removed once the view is open, as the app does; `GIVERNY_TMUX_ID`
     /// is the worker's agent id. Run by hand:

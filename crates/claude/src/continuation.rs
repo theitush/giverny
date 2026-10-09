@@ -4,7 +4,7 @@
 //! the agents view's switch, the move into a background host — and copies
 //! its records forward, so the transcript's root record
 //! ([`crate::subagents::conversation_root`]) stays the same where the id
-//! does not. The files Giverny keys by session id (an orchestrator
+//! does not. The files Giverny keys by session id (a manager
 //! session's feed, the agent-ETA store) find their conversation again by
 //! that root: each records its `root`, and a session with no file of its
 //! own adopts the one whose root is its own, the id it had kept in

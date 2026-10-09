@@ -5,7 +5,7 @@
 //!
 //! Every figure shown comes from the same pass, measured the same way: the
 //! sidebar's line is its total (the app and everything under it), the
-//! agents pane's rows are its runs, and each tab's Claude Code status line
+//! management panel's rows are its runs, and each tab's Claude Code status line
 //! reads its session from the snapshot the pass leaves beside the socket
 //! ([`giverny_claude::use_reading::snapshot_path`]). So a row never shows
 //! more than its session, nor a session more than the total.
@@ -103,7 +103,7 @@ pub fn for_tab(
     pick(&LAST.get()?.lock().unwrap_or_else(|p| p.into_inner()), seq)
 }
 
-/// A reading's runs, as the agents pane keys them.
+/// A reading's runs, as the management panel keys them.
 pub fn task_lives(r: &Reading) -> Vec<TaskLive> {
     r.runs
         .iter()
@@ -120,7 +120,7 @@ pub fn task_lives(r: &Reading) -> Vec<TaskLive> {
         .collect()
 }
 
-/// A reading's workers' use, by agent id, as the agents pane shows it.
+/// A reading's workers' use, by agent id, as the management panel shows it.
 pub fn workers(r: &Reading) -> HashMap<String, RunLive> {
     r.agents
         .iter()

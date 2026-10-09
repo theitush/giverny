@@ -1,9 +1,9 @@
-//! The `giverny` Claude Code plugin: the orchestrator the agents pane needs,
+//! The `giverny` Claude Code plugin: the manager the management panel needs,
 //! carried inside the binary.
 //!
-//! The pane shows Running, Next up with ETAs and Done when an orchestrating
-//! session writes a feed; `giverny orchestrator-session` writes it, and this plugin's
-//! `orchestrate` skill (`/giverny:orchestrate`) tells Claude how to run an orchestrator session
+//! The pane shows Running, Next up with ETAs and Done when a managing
+//! session writes a feed; `giverny manage` writes it, and this plugin's
+//! `manage` skill (`/giverny:manage`) tells Claude how to run a manager session
 //! with it. Nothing outside Giverny is needed: no separate skill, no GitHub.
 //!
 //! How it reaches Claude Code, measured on 2.1.283:
@@ -17,11 +17,11 @@
 //!   next session runs. The plugin's version is the binary's.
 //! - Its `bin/` is on the Bash tool's `PATH`, so its launchers work in any
 //!   session and in its subagents without Giverny on `PATH`:
-//!   `giverny-orchestrator-session` (the orchestrate skill's), `giverny-eta`
+//!   `giverny-manage` (the manage skill's), `giverny-eta`
 //!   (any subagent's ETA) and `giverny-hook` (the hook's).
-//! - It coexists with a project's own `/orchestrate` skill: plugin skills are
+//! - It coexists with a project's own `/manage` skill: plugin skills are
 //!   namespaced. Its one command, `/giverny:clear-done`, runs
-//!   `giverny-orchestrator-session clear-done` to clear the agents pane's Done rows.
+//!   `giverny-manage clear-done` to clear the management panel's Done rows.
 //! - Removing the keys unloads it; a missing directory makes Claude Code skip
 //!   it silently.
 //!
@@ -31,14 +31,14 @@
 //!   is asked, once, to correct it, so every subagent gets an ETA. Any other
 //!   call costs a few `stat`s.
 //!
-//! The skill is its own switch (`agents_panel.orchestrate_skill`, on by
+//! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/`, so the hook, the
 //! launchers and `/giverny:clear-done` the pane needs stay, and only
 //! the skill goes — from every account at once, since they all load this
 //! one directory.
 //!
-//! The settings keys follow the house rules the other agents-pane key does:
-//! written only with `claude.agents_pane` on, never over a
+//! The settings keys follow the house rules the other management-panel key does:
+//! written only with `claude.management_panel` on, never over a
 //! marketplace called `giverny` that is not ours, removed when the setting
 //! goes off and on uninstall, and a no-op writes nothing.
 
@@ -54,8 +54,8 @@ pub const DIR_NAME: &str = "claude-plugin";
 /// The plugin's version: the binary's.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const SKILL: &str = include_str!("../plugin/skills/orchestrate/SKILL.md");
-/// `/giverny:clear-done`: the agents pane's Done rows, cleared.
+const SKILL: &str = include_str!("../plugin/skills/manage/SKILL.md");
+/// `/giverny:clear-done`: the management panel's Done rows, cleared.
 const CLEAR_DONE: &str = include_str!("../plugin/commands/clear-done.md");
 
 /// Where the marketplace lives: `<giverny config base>/claude-plugin`.
@@ -73,7 +73,7 @@ fn wrapper(exes: &[String], sub: &str) -> String {
     format!(
         "#!/bin/sh\n\
          # Written by Giverny {VERSION}; rewritten each time it starts with the\n\
-         # agents pane on. Runs `giverny {sub}`: see `giverny {sub} --help`.\n\
+         # management panel on. Runs `giverny {sub}`: see `giverny {sub} --help`.\n\
          for g in {list}; do\n  \
            if [ -x \"$g\" ]; then exec \"$g\" {sub} \"$@\"; fi\n\
          done\n\
@@ -86,14 +86,12 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 
 /// `hooks/hooks.json`: a `PostToolUse` hook, `giverny-hook`, which asks a
 /// dispatcher for the estimate of a worker it just started, and a worker
-/// five minutes in to correct it; on an orchestrator's own calls it delivers
+/// five minutes in to correct it; on a manager's own calls it delivers
 /// the session's `ask`/`reply` messages and renews its resource leases;
-/// quiet and exit 0
-/// whatever happens. (The `SessionStart` hook of orchestrate by default is
-/// gone; a sync prunes its old reply file.)
+/// quiet and exit 0 whatever happens.
 fn session_hooks() -> Value {
     json!({
-        "description": "Giverny: ETAs for subagents, and orchestrator sessions' upkeep",
+        "description": "Giverny: ETAs for subagents, and manager sessions' upkeep",
         "hooks": {
             "PostToolUse": [{
                 "matcher": "*",
@@ -107,7 +105,7 @@ fn session_hooks() -> Value {
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-/// `skill` false leaves the orchestrate skill out.
+/// `skill` false leaves the manage skill out.
 pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
@@ -116,14 +114,14 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
         "plugins": [{
             "name": PLUGIN,
             "source": "./plugins/giverny",
-            "description": "Orchestrate subagents and show them in Giverny's agents pane",
+            "description": "Manage subagents and show them in Giverny's management panel",
             "version": VERSION
         }]
     });
     let plugin = json!({
         "name": PLUGIN,
         "version": VERSION,
-        "description": "Orchestrate subagents and show them in Giverny's agents pane: \
+        "description": "Manage subagents and show them in Giverny's management panel: \
                         Running, Next up with ETAs, Done",
         "author": { "name": "Giverny" }
     });
@@ -145,8 +143,8 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
             false,
         ),
         (
-            "plugins/giverny/bin/giverny-orchestrator-session",
-            wrapper(exes, "orchestrator-session"),
+            "plugins/giverny/bin/giverny-manage",
+            wrapper(exes, "manage"),
             true,
         ),
         (
@@ -157,13 +155,6 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
         (
             "plugins/giverny/bin/giverny-hook",
             wrapper(exes, "hook"),
-            true,
-        ),
-        // Its name from when an orchestrator session was a "pass", for the
-        // sessions that loaded the skill under it.
-        (
-            "plugins/giverny/bin/giverny-pass",
-            wrapper(exes, "orchestrator-session"),
             true,
         ),
         (
@@ -178,8 +169,8 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
     out
 }
 
-/// Where the orchestrate skill sits in the marketplace.
-pub const SKILL_PATH: &str = "plugins/giverny/skills/orchestrate/SKILL.md";
+/// Where the manage skill sits in the marketplace.
+pub const SKILL_PATH: &str = "plugins/giverny/skills/manage/SKILL.md";
 
 /// The binary as the wrapper should name it: this one, and on Windows also
 /// its path from inside WSL (a WSL account's Claude runs it through interop).
@@ -208,7 +199,7 @@ pub fn exe_candidates() -> Vec<String> {
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
 /// whether anything changed. `skill` false writes the plugin without its
-/// orchestrate skill (and so prunes one written before).
+/// manage skill (and so prunes one written before).
 pub fn sync(dir: &Path, exes: &[String], skill: bool) -> std::io::Result<bool> {
     let want = files(exes, skill);
     let mut changed = false;
@@ -443,7 +434,7 @@ mod tests {
     #[test]
     fn the_skill_is_generic() {
         // What ships to every machine assumes no issue tracker, board or
-        // helper scripts: only Claude Code and `giverny-orchestrator-session`.
+        // helper scripts: only Claude Code and `giverny-manage`.
         let words: Vec<String> = SKILL
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '-')
@@ -455,15 +446,15 @@ mod tests {
             "github",
             "board",
             "machine-budget",
-            "orchestrate-status",
+            "estimate-audit",
         ] {
             assert!(
                 !words.iter().any(|w| w == word),
                 "the plugin's skill mentions {word:?}"
             );
         }
-        assert!(SKILL.starts_with("---\nname: orchestrate\n"));
-        assert!(SKILL.contains("giverny-orchestrator-session plan"));
+        assert!(SKILL.starts_with("---\nname: manage\n"));
+        assert!(SKILL.contains("giverny-manage plan"));
     }
 
     #[test]
@@ -478,17 +469,15 @@ mod tests {
         .unwrap();
         assert_eq!(manifest["version"], VERSION);
         let wrapper =
-            std::fs::read_to_string(d.join("plugins/giverny/bin/giverny-orchestrator-session"))
-                .unwrap();
+            std::fs::read_to_string(d.join("plugins/giverny/bin/giverny-manage")).unwrap();
         assert!(wrapper.contains("'/opt/giverny/giverny'"), "{wrapper}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode =
-                std::fs::metadata(d.join("plugins/giverny/bin/giverny-orchestrator-session"))
-                    .unwrap()
-                    .permissions()
-                    .mode();
+            let mode = std::fs::metadata(d.join("plugins/giverny/bin/giverny-manage"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o755);
         }
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
@@ -518,7 +507,7 @@ mod tests {
         assert!(!d.join("plugins/giverny/skills").exists());
         for kept in [
             "plugins/giverny/hooks/hooks.json",
-            "plugins/giverny/bin/giverny-orchestrator-session",
+            "plugins/giverny/bin/giverny-manage",
             "plugins/giverny/commands/clear-done.md",
             "plugins/giverny/.claude-plugin/plugin.json",
             ".claude-plugin/marketplace.json",
@@ -533,14 +522,14 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_prunes_the_dropped_orchestrate_hook() {
-        // A plugin written while orchestrate by default was on
-        // still holds its SessionStart reply; the next sync removes it, and
+    fn a_sync_prunes_a_dropped_hook() {
+        // A plugin an older Giverny wrote with a SessionStart hook still
+        // holds that hook's reply file; the next sync removes it, and
         // hooks.json carries no SessionStart hook.
-        let d = scratch("orchestrate").join(DIR_NAME);
+        let d = scratch("dropped-hook").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
-        let reply = d.join("plugins/giverny/hooks/orchestrate-by-default.json");
+        let reply = d.join("plugins/giverny/hooks/session-start.json");
         assert!(sync(&d, &exes, true).unwrap());
         std::fs::write(&reply, "{}").unwrap();
         std::fs::write(

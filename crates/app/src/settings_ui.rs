@@ -45,7 +45,7 @@ impl Default for SettingsState {
     }
 }
 
-/// This machine's cores, RAM and GPUs, for the orchestrator limits.
+/// This machine's cores, RAM and GPUs, for the manager limits.
 ///
 /// Detected once per process, off the UI thread: GPU detection runs
 /// `nvidia-smi`, which can take a second, and none of it changes while
@@ -270,8 +270,8 @@ fn body(
         ui.add_space(8.0);
     }
 
-    if state.search.is_empty() && state.section == Section::AgentsPanel {
-        return agents_panel_page(ui, state, cfg, machine, rows, suggestions, actions, c);
+    if state.search.is_empty() && state.section == Section::ManagementPanel {
+        return management_panel_page(ui, state, cfg, machine, rows, suggestions, actions, c);
     }
 
     for def in rows {
@@ -303,15 +303,15 @@ fn skip_gpus(
         && machine.is_none_or(|m| m.gpus.is_empty())
 }
 
-/// The table under the `columns` row: `agents_panel.columns.*`.
-const COLUMNS: &str = "agents_panel.columns.";
+/// The table under the `columns` row: `management_panel.columns.*`.
+const COLUMNS: &str = "management_panel.columns.";
 
-/// Settings → Agents panel, in the order a person reads it: the pane and
+/// Settings → Management panel, in the order a person reads it: the pane and
 /// the skill, the columns as one row of switches (in the pane's own order,
 /// which is `SETTINGS`'), then the default lease and the limits under their
 /// headings.
 #[allow(clippy::too_many_arguments)]
-fn agents_panel_page(
+fn management_panel_page(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
     cfg: &giverny_core::config::Config,
@@ -336,7 +336,7 @@ fn agents_panel_page(
     draw(ui, state, actions, &|d| {
         matches!(
             d.key,
-            "claude.agents_pane" | "agents_panel.orchestrate_skill"
+            "claude.management_panel" | "management_panel.manage_skill"
         )
     });
     let columns: Vec<&'static SettingDef> = rows
@@ -423,7 +423,7 @@ fn columns_row(
     });
 }
 
-/// A heading on the Agents panel page — the fields show their own figures.
+/// A heading on the Management panel page — the fields show their own figures.
 fn heading(ui: &mut egui::Ui, text: &str, c: Chrome) {
     ui.label(
         RichText::new(text)
@@ -472,9 +472,9 @@ fn row(
             }
             widget(ui, state, def, &value, suggestions, actions, c);
             ui.horizontal(|ui| {
-                // The Agents panel page is bare figures and switches; the
+                // The Management panel page is bare figures and switches; the
                 // doc stays on the def for search (and on hover).
-                if def.section != Section::AgentsPanel {
+                if def.section != Section::ManagementPanel {
                     ui.label(
                         RichText::new(def.doc)
                             .font(FontId::monospace(10.0))
@@ -684,7 +684,7 @@ fn refused(ui: &mut egui::Ui, state: &SettingsState, key: &str, c: Chrome) {
     }
 }
 
-/// One `[orchestrator.limits]` row: a bare field holding the figure in
+/// One `[manager.limits]` row: a bare field holding the figure in
 /// force — at `auto`, what that comes to on this machine. The row's ↺ puts
 /// `auto` back.
 #[allow(clippy::too_many_arguments)]
@@ -699,7 +699,7 @@ fn limit_widget(
     actions: &mut Vec<Action>,
     c: Chrome,
 ) {
-    let limits = &cfg.orchestrator.limits;
+    let limits = &cfg.manager.limits;
     if field == LimitField::Gpus {
         return gpu_rows(ui, state, limits, machine, def, actions, c);
     }
@@ -742,7 +742,7 @@ fn limit_widget(
     refused(ui, state, def.key, c);
 }
 
-/// One `[agents_panel.lease]` row: a bare field holding the figure, its
+/// One `[management_panel.lease]` row: a bare field holding the figure, its
 /// ● ↺, and the share of this machine it is, like a limit's.
 #[allow(clippy::too_many_arguments)]
 fn lease_widget(
@@ -1327,18 +1327,18 @@ mod tests {
         // Searching by TOML key works too — that is half the point of showing it.
         state.search = "titles.strip".into();
         assert_eq!(visible(&state).len(), 1);
-        // The orchestrator limits, by their table and by what they are.
+        // The manager limits, by their table and by what they are.
         state.search = "limits".into();
         let keys: Vec<&str> = visible(&state).iter().map(|d| d.key).collect();
         assert_eq!(
             keys,
             [
-                "orchestrator.limits.cpu_cores",
-                "orchestrator.limits.ram",
-                "orchestrator.limits.gpus"
+                "manager.limits.cpu_cores",
+                "manager.limits.ram",
+                "manager.limits.gpus"
             ]
         );
         state.search = "vram".into();
-        assert_eq!(visible(&state)[0].key, "orchestrator.limits.gpus");
+        assert_eq!(visible(&state)[0].key, "manager.limits.gpus");
     }
 }

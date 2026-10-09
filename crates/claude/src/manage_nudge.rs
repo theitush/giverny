@@ -1,4 +1,4 @@
-//! An orchestrator session's part of the plugin's hook
+//! A manager session's part of the plugin's hook
 //! ([`crate::plugin_hook`]): asking a worker that holds one of its tasks for
 //! a fresh estimate, and keeping the session's leases alive.
 //!
@@ -24,9 +24,9 @@
 //! kind's re-estimates fared; none changes its figure.
 //!
 //! **Heartbeats**. On every call the hook also renews the calling session's
-//! ledger leases — `session_id` is the orchestrator's for its own calls and
-//! its workers' alike, so a busy orchestrator session keeps its leases though
-//! it runs no `giverny orchestrator-session` command — at most every
+//! ledger leases — `session_id` is the manager's for its own calls and
+//! its workers' alike, so a busy manager session keeps its leases though
+//! it runs no `giverny manage` command — at most every
 //! [`resources::BEAT_EVERY_MS`], timed by a marker under `resources/beats/` so
 //! the calls in between cost a `stat`.
 
@@ -34,8 +34,8 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use crate::orchestrator_session;
-use crate::{feed, orchestrator_session_history, resources};
+use crate::manage;
+use crate::{feed, manage_history, resources};
 
 /// How long into its task a worker is asked to re-estimate.
 pub const AFTER_MS: u64 = 5 * 60 * 1000;
@@ -79,7 +79,7 @@ pub fn stamp_agent(doc: &mut Value, agent_id: &str, description: Option<&str>) -
     let mut changed = false;
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
         if !row.contains_key("agent_id")
-            && orchestrator_session::stage_of(row) == Some(feed::Stage::Running)
+            && manage::stage_of(row) == Some(feed::Stage::Running)
             && is_mine(row, agent_id, description)
         {
             row.insert("agent_id".into(), json!(agent_id));
@@ -103,24 +103,21 @@ pub fn check(
     let row = rows
         .iter_mut()
         .filter_map(Value::as_object_mut)
-        .filter(|r| orchestrator_session::stage_of(r) == Some(feed::Stage::Running))
+        .filter(|r| manage::stage_of(r) == Some(feed::Stage::Running))
         .find(|r| is_mine(r, agent_id, description))?;
     if row.contains_key("paused_since") {
         return None;
     }
-    let started = orchestrator_session::ms_of(row, "started")?;
+    let started = manage::ms_of(row, "started")?;
     let worked = now.saturating_sub(started);
     // Asked once; a worker that has re-estimated already needs no asking.
     if !row.contains_key("reestimate_asked") && !row.contains_key("eta_first_s") {
         if worked < AFTER_MS {
             return None;
         }
-        row.insert(
-            "reestimate_asked".into(),
-            json!(orchestrator_session::stamp(now)),
-        );
+        row.insert("reestimate_asked".into(), json!(manage::stamp(now)));
         let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
-        let estimate = match orchestrator_session::u64_of(row, "eta_s") {
+        let estimate = match manage::u64_of(row, "eta_s") {
             Some(eta) => format!(
                 "Its estimate was {}, so the pane shows about {} left.",
                 span(eta),
@@ -130,7 +127,7 @@ pub fn check(
         };
         return Some(format!(
             "Giverny: you have been on task `{key}` for {}. {estimate} Now that you have read \
-             the code, re-estimate it once: run `giverny-orchestrator-session eta {key} <minutes left> --note \
+             the code, re-estimate it once: run `giverny-manage eta {key} <minutes left> --note \
              \"<why>\"`, even if the figure stands.{} Then carry on.",
             span(worked / 1000),
             record(row, history)
@@ -148,13 +145,13 @@ fn span(s: u64) -> String {
 /// told, never applied. Empty with too little history.
 fn record(row: &Map<String, Value>, history: Option<&Path>) -> String {
     let s = |k: &str| row.get(k).and_then(Value::as_str);
-    let kind = s("title").and_then(orchestrator_session_history::kind_of);
+    let kind = s("title").and_then(manage_history::kind_of);
     history
-        .map(orchestrator_session_history::load)
+        .map(manage_history::load)
         .and_then(|h| {
-            orchestrator_session_history::track_record(
+            manage_history::track_record(
                 &h,
-                orchestrator_session_history::Track::Reestimate,
+                manage_history::Track::Reestimate,
                 s("repo"),
                 kind.as_deref(),
             )
@@ -171,21 +168,17 @@ fn deadline(
     now: u64,
     history: Option<&Path>,
 ) -> Option<String> {
-    let eta = orchestrator_session::u64_of(row, "eta_s").filter(|e| *e > 0)?;
-    let recent = |k: &str| {
-        orchestrator_session::ms_of(row, k).is_some_and(|t| now.saturating_sub(t) < QUIET_MS)
-    };
+    let eta = manage::u64_of(row, "eta_s").filter(|e| *e > 0)?;
+    let recent = |k: &str| manage::ms_of(row, k).is_some_and(|t| now.saturating_sub(t) < QUIET_MS);
     if recent("eta_at") || recent("reestimate_asked") {
         return None;
     }
     let worked = now.saturating_sub(started);
     let left = (eta * 1000) as i64 - worked as i64;
     // What was left when this figure was given: at `eta_at`, else the start.
-    let given_at = orchestrator_session::ms_of(row, "eta_at")
-        .unwrap_or(started)
-        .max(started);
+    let given_at = manage::ms_of(row, "eta_at").unwrap_or(started).max(started);
     let given_left = (eta * 1000).saturating_sub(given_at - started);
-    let asked = |k: &str| orchestrator_session::u64_of(row, k) == Some(eta);
+    let asked = |k: &str| manage::u64_of(row, k) == Some(eta);
     let (stamp, said) = if left < 0 {
         if asked("overdue_asked") {
             return None;
@@ -215,7 +208,7 @@ fn deadline(
     let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
     Some(format!(
         "Giverny: task `{key}` {said} ({} in all, {} so far). Re-estimate it once: run \
-         `giverny-orchestrator-session eta {key} <minutes left> --note \"<why>\"`, even if \
+         `giverny-manage eta {key} <minutes left> --note \"<why>\"`, even if \
          the figure stands.{} Then carry on.",
         span(eta),
         span(worked / 1000),
@@ -295,14 +288,14 @@ mod tests {
     const MIN: u64 = 60_000;
 
     fn doc(rows: Value) -> Value {
-        json!({"version": 1, "session": "s1", "writer": orchestrator_session::WRITER, "rows": rows})
+        json!({"version": 1, "session": "s1", "writer": manage::WRITER, "rows": rows})
     }
 
     #[test]
     fn a_worker_is_asked_once_five_minutes_in() {
         let mut d = doc(json!([
-            {"key": "auth-fix", "stage": "running", "started": orchestrator_session::stamp(T0), "eta_s": 1800},
-            {"key": "docs", "stage": "running", "started": orchestrator_session::stamp(T0)}
+            {"key": "auth-fix", "stage": "running", "started": manage::stamp(T0), "eta_s": 1800},
+            {"key": "docs", "stage": "running", "started": manage::stamp(T0)}
         ]));
         let desc = Some("auth-fix: fix the token race");
         assert_eq!(
@@ -311,10 +304,7 @@ mod tests {
             "too early"
         );
         let ask = check(&mut d, "w1", desc, T0 + 5 * MIN, None).unwrap();
-        assert!(
-            ask.contains("giverny-orchestrator-session eta auth-fix"),
-            "{ask}"
-        );
+        assert!(ask.contains("giverny-manage eta auth-fix"), "{ask}");
         assert!(ask.contains("30m") && ask.contains("25m left"), "{ask}");
         assert!(d["rows"][0].get("reestimate_asked").is_some());
         assert_eq!(
@@ -331,9 +321,9 @@ mod tests {
     fn the_ask_shows_how_past_re_estimates_fared() {
         let dir = std::env::temp_dir().join(format!("giverny-nudge-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let h = dir.join(orchestrator_session_history::FILE);
-        for _ in 0..orchestrator_session_history::MIN_SAMPLES {
-            let rec = orchestrator_session_history::Record {
+        let h = dir.join(manage_history::FILE);
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
                 key: "g#1".into(),
                 repo: Some("g".into()),
                 kind: Some("BUG".into()),
@@ -341,12 +331,12 @@ mod tests {
                 reest_at_s: Some(300),
                 wall_s: 1500,
                 work_s: 1500,
-                ..orchestrator_session_history::Record::default()
+                ..manage_history::Record::default()
             };
-            orchestrator_session_history::append(&h, &rec).unwrap();
+            manage_history::append(&h, &rec).unwrap();
         }
         let mut d = doc(json!([{"key": "g#2", "stage": "running", "repo": "g",
-            "title": "BUG: x", "started": orchestrator_session::stamp(T0), "eta_s": 1800}]));
+            "title": "BUG: x", "started": manage::stamp(T0), "eta_s": 1800}]));
         let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
         assert!(
             ask.contains(
@@ -361,8 +351,8 @@ mod tests {
     #[test]
     fn each_figure_is_asked_about_near_its_end_and_past_it() {
         let mut d = doc(json!([{"key": "g#7", "stage": "running",
-            "started": orchestrator_session::stamp(T0), "eta_s": 1800,
-            "reestimate_asked": orchestrator_session::stamp(T0 + 5 * MIN)}]));
+            "started": manage::stamp(T0), "eta_s": 1800,
+            "reestimate_asked": manage::stamp(T0 + 5 * MIN)}]));
         let mut ask = |at: u64| check(&mut d, "w", Some("g#7"), T0 + at, None);
         assert_eq!(ask(24 * MIN), None, "6m left");
         let a = ask(25 * MIN).unwrap();
@@ -370,7 +360,7 @@ mod tests {
             a.contains("task `g#7` has about 5m left of its estimate (30m in all, 25m so far)"),
             "{a}"
         );
-        assert!(a.contains("giverny-orchestrator-session eta g#7 <minutes left>"));
+        assert!(a.contains("giverny-manage eta g#7 <minutes left>"));
         assert_eq!(ask(26 * MIN), None, "asked once");
         let a = ask(31 * MIN).unwrap();
         assert!(a.contains("has run 1m past its estimate"), "{a}");
@@ -380,7 +370,7 @@ mod tests {
 
         // A fresh figure at 33m: 15m more. Quiet a while, then its own asks.
         d["rows"][0]["eta_s"] = json!(48 * 60);
-        d["rows"][0]["eta_at"] = json!(orchestrator_session::stamp(T0 + 33 * MIN));
+        d["rows"][0]["eta_at"] = json!(manage::stamp(T0 + 33 * MIN));
         let mut ask = |at: u64| check(&mut d, "w", Some("g#7"), T0 + at, None);
         assert_eq!(ask(34 * MIN), None);
         assert_eq!(ask(42 * MIN), None, "6m left");
@@ -392,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_short_or_fresh_figure_is_let_be_until_it_runs_out() {
-        let t = orchestrator_session::stamp;
+        let t = manage::stamp;
         // 4m left given ten minutes in: never "near", only past it.
         let mut d = doc(json!([{"key": "s", "stage": "running", "started": t(T0),
             "eta_s": 14 * 60, "eta_first_s": 14 * 60, "eta_at": t(T0 + 10 * MIN)}]));
@@ -415,11 +405,11 @@ mod tests {
 
     #[test]
     fn no_ask_for_a_re_estimated_paused_or_unknown_row() {
-        let started = orchestrator_session::stamp(T0);
+        let started = manage::stamp(T0);
         let mut d = doc(json!([
             {"key": "a", "stage": "running", "started": started, "eta_s": 3600, "eta_first_s": 300},
             {"key": "b", "stage": "running", "started": started,
-             "paused_since": orchestrator_session::stamp(T0 + 2 * MIN)},
+             "paused_since": manage::stamp(T0 + 2 * MIN)},
             {"key": "c", "stage": "planned", "eta_s": 600},
             {"key": "d", "stage": "running", "started": started, "agent_id": "other"}
         ]));

@@ -210,7 +210,7 @@ pub struct TabView {
     was_held: bool,
 }
 
-/// What the app paints over a tab's grid (the agents pane
+/// What the app paints over a tab's grid (the management panel
 /// standing in for Claude Code's agent strip). Rows are screen rows of the
 /// live screen, and nothing is painted while the view is scrolled back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

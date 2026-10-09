@@ -1,11 +1,11 @@
 //! Agent ETAs: how long any subagent is expected to take, whether or not an
-//! orchestrator session runs it.
+//! manager session runs it.
 //!
-//! An orchestrator session keeps its tasks — plans, landings, the history its
-//! estimates learn from — in its own file ([`crate::orchestrator_session`]).
-//! A worker that is no orchestrator's task (a plain session's batch of
-//! workers, an Explore search, a one-off helper) still sits on the agents
-//! pane, and its estimate lives here: one file per Claude session,
+//! A manager session keeps its tasks — plans, landings, the history its
+//! estimates learn from — in its own file ([`crate::manage`]).
+//! A worker that is no manager's task (a plain session's batch of
+//! workers, an Explore search, a one-off helper) still sits on the management
+//! panel, and its estimate lives here: one file per Claude session,
 //! `<feed dir>/agent-etas/<session>.json`, keyed by the agent id Claude Code
 //! gave the worker. No task key, no landing, no history: an estimate, when it
 //! was given, and the first one given.
@@ -16,7 +16,7 @@
 //! <minutes>`. Five minutes into its work the worker is asked, once, to
 //! re-estimate ([`worker_ask`]), with the same command, and again as each
 //! figure runs out: once with five minutes of it left, once past it
-//! ([`deadline_ask`]). No ask is made for a worker an orchestrator session's
+//! ([`deadline_ask`]). No ask is made for a worker a manager session's
 //! row holds: that row is its estimate.
 //!
 //! ```json
@@ -32,7 +32,7 @@ use std::time::SystemTime;
 use serde_json::{Map, Value, json};
 
 use crate::continuation;
-use crate::orchestrator_session::{self, Lock};
+use crate::manage::{self, Lock};
 
 /// Under the feed directory: a directory, so the pane's search for feeds
 /// (`*.json` directly in the feed directory) never takes one for a feed.
@@ -56,13 +56,13 @@ const ASKED_KEEP_MS: u64 = 24 * 60 * 60 * 1000;
 pub const USAGE: &str = "\
 usage: giverny eta <agent-id> <dur left> [--note N] [--session <id>]
 
-Give a subagent's estimate to the agents pane: this much is left from now.
+Give a subagent's estimate to the management panel: this much is left from now.
 The dispatcher runs it right after a spawn, with the agent id the Agent tool
 returned; the worker runs it again to correct the figure. <dur> is minutes
 (`25`) or `25m`, `1h30m`, `1.5h`. The session is --session, else
 $CLAUDE_CODE_SESSION_ID (set inside Claude Code, and a worker's is its
-dispatcher's). A worker that holds an orchestrator session's task is
-estimated there instead (`giverny orchestrator-session eta`).";
+dispatcher's). A worker that holds a manager session's task is
+estimated there instead (`giverny manage eta`).";
 
 /// One worker's estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,15 +105,15 @@ pub fn parse(bytes: &[u8]) -> Etas {
         .iter()
         .filter_map(|(id, e)| {
             let e = e.as_object()?;
-            let left_s = orchestrator_session::u64_of(e, "left_s")?;
-            let at_ms = orchestrator_session::ms_of(e, "at")?;
+            let left_s = manage::u64_of(e, "left_s")?;
+            let at_ms = manage::ms_of(e, "at")?;
             Some((
                 id.clone(),
                 Eta {
                     left_s,
                     at_ms,
-                    first_left_s: orchestrator_session::u64_of(e, "first_left_s").unwrap_or(left_s),
-                    first_at_ms: orchestrator_session::ms_of(e, "first_at").unwrap_or(at_ms),
+                    first_left_s: manage::u64_of(e, "first_left_s").unwrap_or(left_s),
+                    first_at_ms: manage::ms_of(e, "first_at").unwrap_or(at_ms),
                 },
             ))
         })
@@ -239,7 +239,7 @@ pub fn set_in(
         *entry = json!({});
     }
     let e: &mut Map<String, Value> = entry.as_object_mut().expect("made an object");
-    let at = orchestrator_session::stamp(now);
+    let at = manage::stamp(now);
     e.entry("first_left_s").or_insert(json!(left_s));
     e.entry("first_at").or_insert(json!(at));
     e.insert("left_s".into(), json!(left_s));
@@ -248,7 +248,7 @@ pub fn set_in(
         Some(n) => e.insert("note".into(), json!(n)),
         None => e.remove("note"),
     };
-    orchestrator_session::write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
+    manage::write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(parse(&serde_json::to_vec(&doc).unwrap_or_default())
         .remove(agent)
         .unwrap_or_default())
@@ -329,13 +329,13 @@ pub fn dispatcher_ask(
         .map(|d| format!("the worker you just started, \"{}\",", d.trim()))
         .unwrap_or_else(|| "the worker you just started".into());
     Some(format!(
-        "Giverny: the agents pane shows {what} with no ETA. Give it one now: run \
+        "Giverny: the management panel shows {what} with no ETA. Give it one now: run \
          `giverny-eta {agent} <minutes>` with your estimate of how long it will take. \
          The worker corrects it itself a few minutes in."
     ))
 }
 
-/// What the plugin's hook asks a worker that holds no orchestrator task,
+/// What the plugin's hook asks a worker that holds no manager task,
 /// [`AFTER_MS`] after its spawn (`spawned_ms`), once: correct the estimate
 /// it was given, or give the first one. `None` before then, once asked, and
 /// for a worker that corrected its figure itself already.
@@ -380,7 +380,7 @@ pub fn worker_ask(
     ))
 }
 
-/// What the plugin's hook asks a worker that holds no orchestrator task as
+/// What the plugin's hook asks a worker that holds no manager task as
 /// its current figure runs out: once when [`DEADLINE_LEFT_MS`] of it are
 /// left (a figure given with more than that), once when the work has run
 /// past it. Each figure — its `at` — is asked about once each way, by a
@@ -497,7 +497,7 @@ fn parse_args(args: &[String]) -> Result<(String, u64, Option<String>, Option<St
     let [agent, left] = pos.as_slice() else {
         return Err(USAGE.into());
     };
-    let left_s = orchestrator_session::parse_dur(left)
+    let left_s = manage::parse_dur(left)
         .ok_or_else(|| format!("not a duration: {left} (minutes, or 25m, 1h30m)"))?;
     Ok((agent.clone(), left_s, note, session))
 }
@@ -512,18 +512,18 @@ pub fn main(args: &[String]) -> i32 {
         }
     };
     let session = session
-        .or_else(|| std::env::var(orchestrator_session::SESSION_ENV).ok())
+        .or_else(|| std::env::var(manage::SESSION_ENV).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let Some(session) = session else {
         eprintln!(
             "giverny eta: no session — run it from inside Claude Code (it sets ${}) \
              or pass --session <id>",
-            orchestrator_session::SESSION_ENV
+            manage::SESSION_ENV
         );
         return 2;
     };
-    let now = orchestrator_session::now_ms();
+    let now = manage::now_ms();
     match set(
         &crate::feed::feed_dir(),
         &session,
@@ -534,7 +534,7 @@ pub fn main(args: &[String]) -> i32 {
     ) {
         Ok(_) => {
             println!(
-                "{agent}: ~{} left from now, on the agents pane",
+                "{agent}: ~{} left from now, on the management panel",
                 crate::feed::fmt_span(left_s as i64)
             );
             0

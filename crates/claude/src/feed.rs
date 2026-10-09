@@ -1,11 +1,11 @@
-//! The agents-pane feed: what an orchestrator knows that Claude Code does not.
+//! The management-panel feed: what a manager knows that Claude Code does not.
 //!
 //! Claude Code itself tells Giverny which subagents a session is running and
 //! which have finished (see `subagents`). What it cannot say is what those
 //! workers are *for* — the task each one holds, the work queued behind them,
-//! when each is expected to land and who reviews it. An orchestrator that
+//! when each is expected to land and who reviews it. A manager that
 //! knows that writes it to one JSON file per Claude session, and the pane
-//! merges it with the live rows. The contract is `docs/agents-pane.md`; this
+//! merges it with the live rows. The contract is `docs/management-panel.md`; this
 //! module is its reader, and the doc is what a writer codes against.
 //!
 //! The file is someone else's output and will drift, so it is read the way
@@ -85,7 +85,7 @@ impl Stage {
 }
 
 /// One row as the feed wrote it. Every field but `key` and `stage` is
-/// optional; see `docs/agents-pane.md` for what each one drives.
+/// optional; see `docs/management-panel.md` for what each one drives.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FeedRow {
     /// What the row is — a task id such as `acme#158`. Falls back to
@@ -129,17 +129,17 @@ pub struct FeedRow {
     /// so no dispatcher will land it: it is Done when its worker is.
     pub follows_worker: bool,
     /// What the machine ledger answered this row's task: a
-    /// copy written by `giverny orchestrator-session claim`, gone on `release`/`land`. The
+    /// copy written by `giverny manage claim`, gone on `release`/`land`. The
     /// ledger itself (`resources`) is the truth; this is for drawing.
     pub lease: Option<RowLease>,
-    /// What the task's `giverny orchestrator-session run` commands used.
+    /// What the task's `giverny manage run` commands used.
     pub usage: Option<RowUsage>,
-    /// What its running `giverny orchestrator-session run` commands use now, sampled by the
+    /// What its running `giverny manage run` commands use now, sampled by the
     /// pane from their cgroups. Never in the feed file.
     pub live: Option<crate::run_live::RunLive>,
 }
 
-/// A row's `usage` object: the task's `giverny orchestrator-session run` commands so far,
+/// A row's `usage` object: the task's `giverny manage run` commands so far,
 /// measured. Totals over every run, and the last run's command and cap.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowUsage {
@@ -647,7 +647,7 @@ pub fn spawned_at<L: LiveAgent>(l: &L, log: Option<&WorkerLog>) -> Option<u64> {
 }
 
 /// Do keys `a` and `b` name one task: either names the other, or they are
-/// one number with and without its `#` (`#204` and the orchestrator session row `204`).
+/// one number with and without its `#` (`#204` and the manager session row `204`).
 fn same_task(a: &str, b: &str) -> bool {
     names_key(a, b)
         || names_key(b, a)
@@ -985,7 +985,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
 ///   its start (the first from the worker's first turn) to the next batch's;
 ///   a Running later batch, what it added from its own start. The Done rows
 ///   of a worker add up to everything it added, and nothing is counted
-///   twice. A count `giverny orchestrator-session` froze on the row when it landed
+///   twice. A count `giverny manage` froze on the row when it landed
 ///   (`task_tokens`) is drawn in place of either. The worker's start is its
 ///   spawn ([`spawned_at`]), never the later `startTime` Claude Code lists a
 ///   worker woken by a message with.
@@ -1097,7 +1097,7 @@ fn queue<'w, L: LiveAgent>(
 pub const HANDOFF_WINDOW_MS: u64 = 3 * 60 * 1000;
 
 /// Does `text` name task `key`: as a whole word ([`names_key`]), or by
-/// its bare number — `#829` names the orchestrator session row `inbar#829` (and `829`).
+/// its bare number — `#829` names the manager session row `inbar#829` (and `829`).
 pub fn names_task(text: &str, key: &str) -> bool {
     !task_at(text, key).is_empty()
 }
@@ -1684,7 +1684,7 @@ mod tests {
         assert!(handed_by(&note, &one, true).is_empty(), "not an assignment");
     }
 
-    /// giverny#258, the inbar orchestrator session: the dispatcher ran
+    /// giverny#258, the inbar manager session: the dispatcher ran
     /// `start inbar#856` and `start inbar#865` and, before spawning
     /// #856's own worker, sent the idle worker of #855 its next task — and
     /// said in passing who holds #856. Only the task it assigns is handed.
@@ -2195,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn spans_and_deltas_read_like_the_orchestrator_writes_them() {
+    fn spans_and_deltas_read_like_the_manager_writes_them() {
         assert_eq!(fmt_span(0), "0m");
         assert_eq!(fmt_span(29), "0m");
         assert_eq!(fmt_span(300), "5m");

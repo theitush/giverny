@@ -2,7 +2,7 @@
 //! each of its turns added, and the messages its dispatcher sent it.
 //!
 //! A worker handed a second task by `SendMessage` holds one row per task in
-//! the agents pane. Each finished task's row shows what *that task* spent —
+//! the management panel. Each finished task's row shows what *that task* spent —
 //! the turns between its hand-off and the next one — never the worker's
 //! whole count, which would be counted once per row. That needs every turn
 //! with its time, which is what [`WorkerLog`] keeps, following the

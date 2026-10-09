@@ -1,6 +1,6 @@
 //! A Running row's open, started on the hover.
 //!
-//! Opening a Running agents-pane row waits first on Claude Code's agent
+//! Opening a Running management-panel row waits first on Claude Code's agent
 //! strip: the relay draws it only when asked, and Claude Code runs the
 //! relay 300 ms after a width change ([`agent_open::Nudge`]), so the click
 //! pays that trip before the first key can go. When the pointer rests on a
@@ -102,7 +102,7 @@ impl Still {
     }
 }
 
-/// The pointer over a tab's agents pane: whether a Running row has been
+/// The pointer over a tab's management panel: whether a Running row has been
 /// rested on long enough, on a screen still long enough, to pre-arm.
 /// Arms once per visit: moving between rows, or back onto one, while the
 /// pointer stays on the pane does not arm again.

@@ -1,6 +1,6 @@
 //! Subagents: the workers a tab's Claude session has spawned, as rows.
 //!
-//! The agents pane (off by default, `claude.agents_pane`) lists the subagents
+//! The management panel (off by default, `claude.management_panel`) lists the subagents
 //! of the Claude session in the tab you are looking at — the ones running and
 //! the ones that finished — so a finished worker stays on screen until
 //! `/clear` instead of vanishing thirty seconds after it lands. This module
@@ -245,7 +245,7 @@ const ROOT_SCAN: usize = 500;
 /// user or assistant turn. Claude Code copies a conversation's records
 /// forward when it re-ids a session, so this is the same before and after
 /// where the session id is not; `/clear` starts a new root, and a different
-/// conversation has its own (a key an orchestrator can file its sessions by).
+/// conversation has its own (a key a manager can file its sessions by).
 /// `None` for a transcript with no turn of its own yet — a session
 /// just switched to in the agents view holds only headers until its next
 /// turn.
@@ -931,7 +931,7 @@ impl SubagentRow {
 
     /// Why its clocks stand still, and since when: an API error it has not
     /// written past, else a failed, killed or stopped end. `None` while it
-    /// is working — or finished cleanly, where the orchestrator's landing is
+    /// is working — or finished cleanly, where the manager's landing is
     /// still time on the task.
     pub fn stopped(&self) -> Option<(u64, String)> {
         if let Some(s) = self.stops.last().filter(|s| s.to_ms.is_none()) {
@@ -1176,7 +1176,7 @@ impl Tracker {
         self.rows.clear();
     }
 
-    /// Clear the Done rows by hand (`giverny orchestrator-session clear-done`),
+    /// Clear the Done rows by hand (`giverny manage clear-done`),
     /// keeping the Running ones. A cleared worker stays gone — the next
     /// refresh finds its transcript and notification still on disk — unless
     /// it runs again. Returns how many rows went.
@@ -1284,7 +1284,7 @@ impl Tracker {
             }
             // The transcript's count is the one the pane keeps once there
             // is one (it moves every second, and agrees with the
-            // orchestrator's); the live list's stands in until then. It is
+            // manager's); the live list's stands in until then. It is
             // never taken back: after an API error the live count is the
             // output alone.
             if t.tokens.is_some() && !row.tokens_from_transcript {
@@ -1977,7 +1977,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             subs.join("agent-a2.meta.json"),
-            r#"{"agentType":"orchestrator","description":"Work acme#1 thing","model":"opus"}"#,
+            r#"{"agentType":"manager","description":"Work acme#1 thing","model":"opus"}"#,
         )
         .unwrap();
         // a3: a transcript but no notification and no live entry — ignored.
@@ -2001,7 +2001,7 @@ mod tests {
         assert_eq!(a2.stage, Stage::Done);
         assert_eq!(a2.outcome, Some(Outcome::Completed));
         assert_eq!(a2.description.as_deref(), Some("Work acme#1 thing"));
-        assert_eq!(a2.agent_type.as_deref(), Some("orchestrator"));
+        assert_eq!(a2.agent_type.as_deref(), Some("manager"));
         assert_eq!(a2.started_ms, Some(T0 - 50_000));
         assert_eq!(a2.ended_ms, Some(T0 + 30));
         assert!(t.get("a3").is_none());
@@ -2197,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn the_real_transcript_counts_as_orchestrate_status_does() {
+    fn the_real_transcript_counts_as_coos_status_script_does() {
         let dir = scratch("real92");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent-a.jsonl");

@@ -24,7 +24,7 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
-    AgentsPanel,
+    ManagementPanel,
     Keys,
     Updates,
     About,
@@ -38,7 +38,7 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
-        Section::AgentsPanel,
+        Section::ManagementPanel,
         Section::Keys,
         Section::Updates,
         Section::About,
@@ -51,7 +51,7 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
-            Section::AgentsPanel => "agents panel",
+            Section::ManagementPanel => "management panel",
             Section::Keys => "keys",
             Section::Updates => "updates",
             Section::About => "about",
@@ -92,7 +92,7 @@ pub enum Kind {
         /// `None` = empty by default; `Some` supplies a non-empty default.
         default: Option<fn() -> Vec<String>>,
     },
-    /// One of `[orchestrator.limits]`: `"auto"` by default, else a figure.
+    /// One of `[manager.limits]`: `"auto"` by default, else a figure.
     /// Carried as [`Value::Text`] in the form the file holds — `"auto"`,
     /// `"8"`, `"16G"`, or for GPUs a TOML array (`[]`,
     /// `[{ index = 0, vram = "20G" }]`) — and written back as the TOML type
@@ -101,7 +101,7 @@ pub enum Kind {
     Limit {
         field: LimitField,
     },
-    /// One of `[agents_panel.lease]`: a figure, never `auto`. Carried as
+    /// One of `[management_panel.lease]`: a figure, never `auto`. Carried as
     /// [`Value::Text`] (`"3"`, `"3G"`) and written back as the ledger reads
     /// it: an integer for cores, a size string for RAM. `field` is
     /// [`LimitField::Cores`] or [`LimitField::Ram`].
@@ -111,7 +111,7 @@ pub enum Kind {
     },
 }
 
-/// Which of `[orchestrator.limits]` a [`Kind::Limit`] row edits.
+/// Which of `[manager.limits]` a [`Kind::Limit`] row edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitField {
     Cores,
@@ -143,7 +143,7 @@ impl SettingDef {
         self.key.split('.')
     }
 
-    /// Everything above the leaf: `font`, or `orchestrator.limits`.
+    /// Everything above the leaf: `font`, or `manager.limits`.
     pub fn table(&self) -> &str {
         self.key.rsplit_once('.').map_or(self.key, |(t, _)| t)
     }
@@ -476,20 +476,20 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
-        key: "claude.agents_pane",
-        label: "agents pane",
-        // Shown at the top of Agents panel; the key stays under
+        key: "claude.management_panel",
+        label: "management panel",
+        // Shown at the top of Management panel; the key stays under
         // [claude], where it always was.
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "Show the tab's subagents — running, planned and done — in a table under the terminal.",
         note: &[
             "Running and Done come from Claude Code's own files and need no",
             "setup. On, in each account you installed Giverny's hooks in, it",
             "adds a subagentStatusLine (giverny relay --subagent-line) and the",
             "giverny Claude Code plugin to that account's settings.json, never",
-            "over a line of your own: /giverny:orchestrate runs a team of",
+            "over a line of your own: /giverny:manage runs a team of",
             "subagents and adds Planned rows, titles, ETAs and landings",
-            "(docs/agents-pane.md). Off removes both again.",
+            "(docs/management-panel.md). Off removes both again.",
             "Done rows stay until /clear or a fresh claude in the tab. The",
             "pane appears only in a tab whose session has spawned a",
             "subagent; off, nothing is read or drawn.",
@@ -531,103 +531,103 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
-        key: "agents_panel.orchestrate_skill",
-        label: "orchestrate skill",
-        section: Section::AgentsPanel,
-        doc: "Ship the /giverny:orchestrate skill with the plugin the agents pane installs.",
+        key: "management_panel.manage_skill",
+        label: "manage skill",
+        section: Section::ManagementPanel,
+        doc: "Ship the /giverny:manage skill with the plugin the management panel installs.",
         note: &[
-            "Written only where the agents pane's plugin is (accounts holding",
-            "Giverny's hooks, with claude.agents_pane on). Off removes only the",
-            "skill: the plugin keeps giverny-orchestrator-session, its hook and /giverny:clear-done.",
+            "Written only where the management panel's plugin is (accounts holding",
+            "Giverny's hooks, with claude.management_panel on). Off removes only the",
+            "skill: the plugin keeps giverny-manage, its hook and /giverny:clear-done.",
         ],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
-    // The columns, in the order the agents pane draws them: Settings shows
+    // The columns, in the order the management panel draws them: Settings shows
     // their switches in this order, and the pane's test
     // `the_settings_list_the_columns_in_the_panes_order` keeps the two in step.
-    // `agents_panel.done_rows` / `done_last` have no row here; the pane still
+    // `management_panel.done_rows` / `done_last` have no row here; the pane still
     // honours them when set by hand.
     SettingDef {
-        key: "agents_panel.columns.stage",
+        key: "management_panel.columns.stage",
         label: "stage",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "STAGE: Running, Next up or Done.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.id",
+        key: "management_panel.columns.id",
         label: "task id",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "The task's id (a feed row's key, a subagent's name).",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.title",
+        key: "management_panel.columns.title",
         label: "title",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "The task's title, or a subagent's description: the column that takes the room left.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.elapsed",
+        key: "management_panel.columns.elapsed",
         label: "elapsed",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "How long the row has worked: a stopwatch while it runs.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.eta",
+        key: "management_panel.columns.eta",
         label: "ETA",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "Time left on a Running row, the estimate of a Next up one, how late or early a Done one landed.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.now",
+        key: "management_panel.columns.now",
         label: "now",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "What the row is doing now: its last tool call, a wait, a queue place.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.tokens",
+        key: "management_panel.columns.tokens",
         label: "tokens",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "The tokens the row has used.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.columns.usage",
+        key: "management_panel.columns.usage",
         label: "CPU / RAM",
-        section: Section::AgentsPanel,
-        doc: "What the row's `giverny orchestrator-session run` commands use: live CPU and memory, a Done row's peak.",
+        section: Section::ManagementPanel,
+        doc: "What the row's `giverny manage run` commands use: live CPU and memory, a Done row's peak.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
     SettingDef {
-        key: "agents_panel.lease.cpu_cores",
+        key: "management_panel.lease.cpu_cores",
         label: "CPU cores",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "Cores a task's lease holds when nothing says otherwise.",
         note: &[
-            "What `giverny orchestrator-session run` claims for a task that holds no lease, unless",
-            "--cpu says. `giverny orchestrator-session resources` prints it.",
+            "What `giverny manage run` claims for a task that holds no lease, unless",
+            "--cpu says. `giverny manage resources` prints it.",
         ],
         needs_restart: false,
         kind: Kind::Lease {
@@ -636,9 +636,9 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
-        key: "agents_panel.lease.ram",
+        key: "management_panel.lease.ram",
         label: "RAM",
-        section: Section::AgentsPanel,
+        section: Section::ManagementPanel,
         doc: "Memory a task's lease holds when nothing says otherwise.",
         note: &["A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it."],
         needs_restart: false,
@@ -648,13 +648,13 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
-        key: "orchestrator.limits.cpu_cores",
+        key: "manager.limits.cpu_cores",
         label: "CPU cores",
-        section: Section::AgentsPanel,
-        doc: "Cores all orchestrator sessions together may hand to workers. auto = all but 2.",
+        section: Section::ManagementPanel,
+        doc: "Cores all manager sessions together may hand to workers. auto = all but 2.",
         note: &[
-            "The resource ledger (`giverny orchestrator-session claim`) grants workers cores,",
-            "RAM and GPUs out of these limits, across every orchestrator on",
+            "The resource ledger (`giverny manage claim`) grants workers cores,",
+            "RAM and GPUs out of these limits, across every manager on",
             "this machine, and reads them on each claim: an edit applies to the",
             "next one. A number, or \"auto\" (cores - 2, at least 1).",
         ],
@@ -664,10 +664,10 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
-        key: "orchestrator.limits.ram",
+        key: "manager.limits.ram",
         label: "RAM",
-        section: Section::AgentsPanel,
-        doc: "Memory all orchestrator sessions together may hand to workers. auto = 70 %.",
+        section: Section::ManagementPanel,
+        doc: "Memory all manager sessions together may hand to workers. auto = 70 %.",
         note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
         needs_restart: false,
         kind: Kind::Limit {
@@ -675,14 +675,14 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
-        key: "orchestrator.limits.gpus",
+        key: "manager.limits.gpus",
         label: "GPUs",
-        section: Section::AgentsPanel,
-        doc: "GPUs and VRAM orchestrator sessions may use. auto = 90 % of each GPU's VRAM.",
+        section: Section::ManagementPanel,
+        doc: "GPUs and VRAM manager sessions may use. auto = 90 % of each GPU's VRAM.",
         note: &[
             "GPUs are found with nvidia-smi; without it there are none. A list",
             "like [{ index = 0, vram = \"20G\" }] names the GPUs and how much of",
-            "each; [] gives orchestrators none.",
+            "each; [] gives managers none.",
         ],
         needs_restart: false,
         kind: Kind::Limit {
@@ -746,7 +746,7 @@ pub fn current(cfg: &Config, def: &SettingDef) -> Option<Value> {
     })
 }
 
-/// A `[orchestrator.limits]` value in the form [`Kind::Limit`] carries it:
+/// A `[manager.limits]` value in the form [`Kind::Limit`] carries it:
 /// read with the ledger's own types, so the screen shows what the ledger
 /// would grant from.
 fn limit_text(field: LimitField, node: &toml::Value) -> Option<String> {
@@ -767,7 +767,7 @@ fn limit_text(field: LimitField, node: &toml::Value) -> Option<String> {
     })
 }
 
-/// A `[agents_panel.lease]` value in the form [`Kind::Lease`] carries it.
+/// A `[management_panel.lease]` value in the form [`Kind::Lease`] carries it.
 fn lease_text(field: LimitField, node: &toml::Value) -> Option<String> {
     let node = node.clone();
     Some(match field {
@@ -865,7 +865,7 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     for (i, part) in parts[..parents].iter().enumerate() {
         if !node.contains_key(part) {
             let mut table = toml_edit::Table::new();
-            // `[orchestrator.limits]` alone, not an empty `[orchestrator]`
+            // `[manager.limits]` alone, not an empty `[manager]`
             // above it.
             table.set_implicit(i + 1 < parents);
             node.insert(part, toml_edit::Item::Table(table));
@@ -1028,14 +1028,14 @@ mod tests {
         );
         assert_eq!(parsed.usage.refresh_minutes, defaults.usage.refresh_minutes);
         assert_eq!(parsed.update.check, defaults.update.check);
-        assert_eq!(parsed.orchestrator, defaults.orchestrator);
-        assert_eq!(parsed.agents_panel, defaults.agents_panel);
+        assert_eq!(parsed.manager, defaults.manager);
+        assert_eq!(parsed.management_panel, defaults.management_panel);
         assert!(
-            text.contains("\n[agents_panel.lease]\n") && text.contains("\ncpu_cores = 3\n"),
+            text.contains("\n[management_panel.lease]\n") && text.contains("\ncpu_cores = 3\n"),
             "the lease's cores are an integer:\n{text}"
         );
         assert!(
-            text.contains("\n[orchestrator.limits]\n"),
+            text.contains("\n[manager.limits]\n"),
             "limits get their own table:\n{text}"
         );
     }
@@ -1206,17 +1206,14 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             (config::parse(&text).unwrap().0, text)
         };
-        let (cfg, text) = set("orchestrator.limits.cpu_cores", "8");
-        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(8));
+        let (cfg, text) = set("manager.limits.cpu_cores", "8");
+        assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(8));
         assert!(text.contains("cpu_cores = 8"), "an integer: {text}");
-        let (cfg, _) = set("orchestrator.limits.ram", "1.5G");
-        assert_eq!(cfg.orchestrator.limits.ram, Auto::Set(Mem(1536)));
-        let (cfg, text) = set(
-            "orchestrator.limits.gpus",
-            r#"[{ index = 0, vram = "20G" }]"#,
-        );
+        let (cfg, _) = set("manager.limits.ram", "1.5G");
+        assert_eq!(cfg.manager.limits.ram, Auto::Set(Mem(1536)));
+        let (cfg, text) = set("manager.limits.gpus", r#"[{ index = 0, vram = "20G" }]"#);
         assert_eq!(
-            cfg.orchestrator.limits.gpus,
+            cfg.manager.limits.gpus,
             Auto::Set(vec![GpuLimit {
                 index: 0,
                 vram: Mem::gb(20)
@@ -1224,28 +1221,25 @@ mod tests {
         );
         assert_eq!(
             limits::Limits::from_config_str(&text).unwrap(),
-            cfg.orchestrator.limits,
+            cfg.manager.limits,
             "the ledger reads the same"
         );
         for def in
-            in_section(Section::AgentsPanel).filter(|d| d.key.starts_with("orchestrator.limits."))
+            in_section(Section::ManagementPanel).filter(|d| d.key.starts_with("manager.limits."))
         {
             assert_ne!(current(&cfg, def), Some(def.default_value()));
         }
         // Back to auto, and the screen sees it as the default again.
-        let (cfg, _) = set("orchestrator.limits.gpus", "auto");
-        assert!(is_default(
-            &cfg,
-            by_key("orchestrator.limits.gpus").unwrap()
-        ));
+        let (cfg, _) = set("manager.limits.gpus", "auto");
+        assert!(is_default(&cfg, by_key("manager.limits.gpus").unwrap()));
         assert_eq!(
-            current(&cfg, by_key("orchestrator.limits.ram").unwrap()),
+            current(&cfg, by_key("manager.limits.ram").unwrap()),
             Some(Value::Text("1536M".into()))
         );
         // Not a limit: refused, file untouched.
         let before = std::fs::read_to_string(&path).unwrap();
         let bad = Value::Text("lots".into());
-        assert!(write(&dir, by_key("orchestrator.limits.ram").unwrap(), &bad).is_err());
+        assert!(write(&dir, by_key("manager.limits.ram").unwrap(), &bad).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1256,40 +1250,40 @@ mod tests {
         std::fs::write(config::config_path(&dir), "[font]\nsize = 13.0\n").unwrap();
         write(
             &dir,
-            by_key("orchestrator.limits.cpu_cores").unwrap(),
+            by_key("manager.limits.cpu_cores").unwrap(),
             &Value::Text("4".into()),
         )
         .unwrap();
         let text = std::fs::read_to_string(config::config_path(&dir)).unwrap();
-        assert!(!text.contains("[orchestrator]\n"), "{text}");
-        assert!(
-            text.contains("[orchestrator.limits]\ncpu_cores = 4"),
-            "{text}"
-        );
+        assert!(!text.contains("[manager]\n"), "{text}");
+        assert!(text.contains("[manager.limits]\ncpu_cores = 4"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn every_agents_panel_key_round_trips_through_the_file() {
+    fn every_management_panel_key_round_trips_through_the_file() {
         use crate::config::{DoneRows, PaneColumns};
-        let dir = scratch("agents-panel");
+        let dir = scratch("management-panel");
         let path = config::config_path(&dir);
         // A file from before these keys: the old ones load, the new ones
         // come out at today's behaviour.
         std::fs::write(
             &path,
-            "[claude]\nagents_pane = false\n[orchestrator.limits]\ncpu_cores = 4\n",
+            "[claude]\nmanagement_panel = false\n[manager.limits]\ncpu_cores = 4\n",
         )
         .unwrap();
         let read = || config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let (cfg, unknown) = read();
         assert!(unknown.is_empty(), "{unknown:?}");
-        assert!(!cfg.claude.agents_pane);
-        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(4));
-        assert_eq!(cfg.agents_panel, config::AgentsPanelConfig::default());
-        assert_eq!(cfg.agents_panel.done(), DoneRows::All);
-        assert!(cfg.agents_panel.orchestrate_skill);
-        assert_eq!(cfg.agents_panel.columns, PaneColumns::default());
+        assert!(!cfg.claude.management_panel);
+        assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(4));
+        assert_eq!(
+            cfg.management_panel,
+            config::ManagementPanelConfig::default()
+        );
+        assert_eq!(cfg.management_panel.done(), DoneRows::All);
+        assert!(cfg.management_panel.manage_skill);
+        assert_eq!(cfg.management_panel.columns, PaneColumns::default());
 
         let set = |key: &str, v: Value| {
             write(&dir, by_key(key).unwrap(), &v).unwrap();
@@ -1300,23 +1294,24 @@ mod tests {
             assert!(!is_default(&cfg, def), "{key}");
             cfg
         };
-        let cfg = set("agents_panel.orchestrate_skill", Value::Bool(false));
-        assert!(!cfg.agents_panel.orchestrate_skill);
+        let cfg = set("management_panel.manage_skill", Value::Bool(false));
+        assert!(!cfg.management_panel.manage_skill);
         // The Done rows have no row in Settings, but a hand-written pair
         // still loads, unflagged.
-        assert!(by_key("agents_panel.done_rows").is_none());
-        let done = config::parse("[agents_panel]\ndone_rows = \"last\"\ndone_last = 3\n").unwrap();
+        assert!(by_key("management_panel.done_rows").is_none());
+        let done =
+            config::parse("[management_panel]\ndone_rows = \"last\"\ndone_last = 3\n").unwrap();
         assert!(done.1.is_empty(), "{:?}", done.1);
-        assert_eq!(done.0.agents_panel.done(), DoneRows::Last(3));
+        assert_eq!(done.0.management_panel.done(), DoneRows::Last(3));
         for def in SETTINGS
             .iter()
-            .filter(|d| d.key.starts_with("agents_panel.columns."))
+            .filter(|d| d.key.starts_with("management_panel.columns."))
         {
             set(def.key, Value::Bool(false));
         }
         let (cfg, _) = read();
         assert_eq!(
-            cfg.agents_panel.columns,
+            cfg.management_panel.columns,
             PaneColumns {
                 stage: false,
                 id: false,
@@ -1328,23 +1323,30 @@ mod tests {
                 tokens: false,
             }
         );
-        let cfg = set("agents_panel.lease.cpu_cores", Value::Text("2".into()));
-        assert_eq!(cfg.agents_panel.lease.cpu_cores, 2);
-        let cfg = set("agents_panel.lease.ram", Value::Text("1536M".into()));
-        assert_eq!(cfg.agents_panel.lease.ram, Mem(1536));
+        let cfg = set("management_panel.lease.cpu_cores", Value::Text("2".into()));
+        assert_eq!(cfg.management_panel.lease.cpu_cores, 2);
+        let cfg = set("management_panel.lease.ram", Value::Text("1536M".into()));
+        assert_eq!(cfg.management_panel.lease.ram, Mem(1536));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("cpu_cores = 2\n"), "an integer: {text}");
         assert_eq!(
             config::DefaultLease::from_config_str(&text),
-            cfg.agents_panel.lease,
-            "orchestrator-session run reads the same"
+            cfg.management_panel.lease,
+            "manage run reads the same"
         );
         // The old keys are where they were.
-        assert!(!cfg.claude.agents_pane);
-        assert_eq!(cfg.orchestrator.limits.cpu_cores, Auto::Set(4));
+        assert!(!cfg.claude.management_panel);
+        assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(4));
         // Not a lease: refused, file untouched.
         let bad = Value::Text("0".into());
-        assert!(write(&dir, by_key("agents_panel.lease.cpu_cores").unwrap(), &bad).is_err());
+        assert!(
+            write(
+                &dir,
+                by_key("management_panel.lease.cpu_cores").unwrap(),
+                &bad
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         let _ = std::fs::remove_dir_all(&dir);
     }

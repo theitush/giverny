@@ -4,23 +4,23 @@
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
-//!   estimate for it exists (no orchestrator session task holds it, no agent
+//!   estimate for it exists (no manager session task holds it, no agent
 //!   ETA names it), the dispatcher is asked, once, to give one
 //!   ([`agent_eta::dispatcher_ask`]). Five minutes into its work a worker is
 //!   asked, once, to re-estimate, and again as each figure runs out (five
-//!   minutes left, then past it): on its orchestrator task's row when it
-//!   holds one ([`orchestrator_session_nudge::check`]), else on its agent ETA
+//!   minutes left, then past it): on its manager task's row when it
+//!   holds one ([`manage_nudge::check`]), else on its agent ETA
 //!   ([`agent_eta::worker_ask`], [`agent_eta::deadline_ask`]). A worker
 //!   spawned in the foreground blocks its dispatcher until it is done, so
 //!   only the worker's asks reach it.
-//! - **An orchestrator session's upkeep.** Its leases are renewed
-//!   ([`orchestrator_session_nudge::beat`]) and, on the dispatcher's own
+//! - **A manager session's upkeep.** Its leases are renewed
+//!   ([`manage_nudge::beat`]) and, on the dispatcher's own
 //!   calls, its unread `ask`/`reply` messages delivered
-//!   ([`orchestrator_session_inbox`]).
+//!   ([`manage_inbox`]).
 //!
 //! **Only where something tracks the worker.** Every ask is for the pane:
 //! it goes out only when the session runs in a Giverny tab
-//! (`$GIVERNY_TAB_ID`, whose pane shows the worker) or has an orchestrator
+//! (`$GIVERNY_TAB_ID`, whose pane shows the worker) or has a manager
 //! session (its file is this writer's). Anywhere else — a plain `claude` in
 //! another terminal — the hook says nothing, where a `giverny-eta` nobody
 //! reads would raise a permission prompt for it.
@@ -36,9 +36,9 @@ use std::time::SystemTime;
 
 use serde_json::{Map, Value, json};
 
-use crate::orchestrator_session::{self, Lock};
-use crate::orchestrator_session_nudge::{beat, check, holds_row, stamp_agent};
-use crate::{agent_eta, orchestrator_session_history, orchestrator_session_inbox, resources};
+use crate::manage::{self, Lock};
+use crate::manage_nudge::{beat, check, holds_row, stamp_agent};
+use crate::{agent_eta, manage_history, manage_inbox, resources};
 
 /// What the hook payload says about who is calling.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -159,17 +159,17 @@ pub fn in_giverny_tab() -> bool {
         && crate::lineage::of_this_process().is_tabs()
 }
 
-/// The session's orchestrator session, when it has one of this writer's:
+/// The session's manager session, when it has one of this writer's:
 /// its file and document. `Err` for a file another writer owns.
-fn orchestrator_doc(dir: &Path, session: &str) -> Result<Option<(PathBuf, Value)>, ()> {
-    let file = orchestrator_session::file_for(dir, session);
+fn manager_doc(dir: &Path, session: &str) -> Result<Option<(PathBuf, Value)>, ()> {
+    let file = manage::file_for(dir, session);
     let Some(bytes) = std::fs::read(&file).ok() else {
         return Ok(None);
     };
     let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
         return Err(());
     };
-    if orchestrator_session::writer_of(&doc) != Some(orchestrator_session::WRITER) {
+    if manage::writer_of(&doc) != Some(manage::WRITER) {
         return Err(());
     }
     Ok(Some((file, doc)))
@@ -179,18 +179,6 @@ fn orchestrator_doc(dir: &Path, session: &str) -> Result<Option<(PathBuf, Value)
 /// feed directory, `in_tab` whether the session runs in a Giverny tab
 /// ([`in_giverny_tab`]). Returns what to print (the hook reply), or nothing.
 pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
-    run_with(payload, dir, now, in_tab, true)
-}
-
-/// [`run`], with the agent-ETA asks on or off: off under the hook's old
-/// name ([`main`]), whose plugin has no `giverny-eta` to answer them with.
-fn run_with(
-    payload: &Value,
-    dir: &Path,
-    now: u64,
-    in_tab: bool,
-    agent_etas: bool,
-) -> Option<String> {
     let session = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -199,12 +187,12 @@ fn run_with(
     let ledger = resources::ledger_path(dir);
     beat(&ledger, Some(dir), session, now);
     if let Some(caller) = Caller::of(payload) {
-        return worker(&caller, dir, now, in_tab, agent_etas).map(|t| reply(&t));
+        return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
     }
     // The dispatcher's own call: its messages, and the worker it just started.
     let asks: Vec<String> = [
-        orchestrator_session_inbox::deliver(dir, &ledger, session, now),
-        spawned(payload, dir, session, in_tab).filter(|_| agent_etas),
+        manage_inbox::deliver(dir, &ledger, session, now),
+        spawned(payload, dir, session, in_tab),
     ]
     .into_iter()
     .flatten()
@@ -220,11 +208,11 @@ fn spawned(payload: &Value, dir: &Path, session: &str, in_tab: bool) -> Option<S
         return None; // it has run to its end already
     }
     let description = text(payload, "spawned_description");
-    match orchestrator_doc(dir, session) {
+    match manager_doc(dir, session) {
         Err(()) => return None, // another writer's feed: its rows, its estimates
         Ok(Some((_, doc))) => {
             if holds_row(&doc, &agent, description.as_deref()) {
-                return None; // an orchestrator session's task: its row is its estimate
+                return None; // a manager session's task: its row is its estimate
             }
         }
         Ok(None) if !in_tab => return None, // nothing would show this worker
@@ -234,11 +222,11 @@ fn spawned(payload: &Value, dir: &Path, session: &str, in_tab: bool) -> Option<S
 }
 
 /// A worker's call: its re-estimate ask, when something tracks it — a
-/// Giverny tab, or an orchestrator session.
-fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool, agent_etas: bool) -> Option<String> {
+/// Giverny tab, or a manager session.
+fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
     let description = caller.description();
     let desc = description.as_deref();
-    match orchestrator_doc(dir, &caller.session) {
+    match manager_doc(dir, &caller.session) {
         Err(()) => return None,
         Ok(Some((file, d))) if holds_row(&d, &caller.agent_id, desc) => {
             // Under the lock, re-read: the dispatcher may be writing it.
@@ -250,19 +238,16 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool, agent_etas: bool)
                 &caller.agent_id,
                 desc,
                 now,
-                orchestrator_session_history::path(dir).as_deref(),
+                manage_history::path(dir).as_deref(),
             );
             if stamped || ask.is_some() {
-                orchestrator_session::write(&file, &d).ok()?;
+                manage::write(&file, &d).ok()?;
             }
             return ask;
         }
         Ok(Some(_)) => {}
         Ok(None) if !in_tab => return None, // nothing would show this worker
         Ok(None) => {}
-    }
-    if !agent_etas {
-        return None;
     }
     let spawned = caller.spawned_ms()?;
     agent_eta::worker_ask(dir, &caller.session, &caller.agent_id, spawned, now)
@@ -281,20 +266,16 @@ pub fn reply(text: &str) -> String {
 }
 
 /// `giverny hook`: the payload on stdin, the reply (if any) on stdout, exit 0
-/// whatever happens. `agent_etas` is false under the hook's old name,
-/// `giverny orchestrator-session nudge`: the plugin a Giverny of before
-/// wrote, which has no `giverny-eta`, so only an orchestrator session's
-/// part runs until that Giverny restarts and writes the new one.
-pub fn main(agent_etas: bool) -> i32 {
+/// whatever happens.
+pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     if let Some(payload) = payload_of(&input)
-        && let Some(out) = run_with(
+        && let Some(out) = run(
             &payload,
             &crate::feed::feed_dir(),
-            orchestrator_session::now_ms(),
+            manage::now_ms(),
             in_giverny_tab(),
-            agent_etas,
         )
     {
         println!("{out}");
@@ -317,7 +298,7 @@ mod tests {
     }
 
     fn doc(rows: Value) -> Value {
-        json!({"version": 1, "session": "s1", "writer": orchestrator_session::WRITER, "rows": rows})
+        json!({"version": 1, "session": "s1", "writer": manage::WRITER, "rows": rows})
     }
 
     fn context(out: &str) -> String {
@@ -399,7 +380,7 @@ mod tests {
         assert_eq!(run_in(&spawn_input("s1", "a3", "x", true), true), None);
         // A foreground worker has finished by the time the call returns.
         assert_eq!(run_in(&spawn_input("s1", "a4", "x", false), true), None);
-        // Nothing would show it outside a tab, with no orchestrator session.
+        // Nothing would show it outside a tab, with no manager session.
         assert_eq!(run_in(&spawn_input("s1", "a5", "x", true), false), None);
         // The dispatcher's other calls read nothing and say nothing.
         assert_eq!(run(&json!({"session_id": "s1"}), &dir, T0, true), None);
@@ -408,11 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn an_orchestrator_sessions_task_is_never_asked_about() {
-        let dir = temp("orchestrated");
-        orchestrator_session::write(
+    fn a_manager_sessions_task_is_never_asked_about() {
+        let dir = temp("managed");
+        manage::write(
             &feed::feed_path(&dir, "s1"),
-            &doc(json!([{"key": "acme#7", "stage": "running", "started": orchestrator_session::stamp(T0)}])),
+            &doc(json!([{"key": "acme#7", "stage": "running", "started": manage::stamp(T0)}])),
         )
         .unwrap();
         let run_in = |input: &str| run(&payload_of(input).unwrap(), &dir, T0, false);
@@ -460,23 +441,12 @@ mod tests {
             "{ctx}"
         );
         assert_eq!(run(&p, &feeds, T0 + 10 * MIN, true), None, "once");
-        // Outside a tab, with no orchestrator session: silent, nothing made.
+        // Outside a tab, with no manager session: silent, nothing made.
         let q = worker_payload(&dir, "s2", "w2", "x", T0);
         for k in 0..10 {
             assert_eq!(run(&q, &feeds, T0 + k * MIN, false), None);
         }
         assert!(!feed::feed_path(&feeds, "s2").exists(), "no feed made");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn under_its_old_name_the_hook_asks_for_no_agent_eta() {
-        let dir = temp("old-name");
-        let p = payload_of(&spawn_input("s1", "a1", "x", true)).unwrap();
-        assert_eq!(run_with(&p, &dir, T0, true, false), None);
-        let w = worker_payload(&dir, "s1", "w1", "x", T0);
-        assert_eq!(run_with(&w, &dir, T0 + 6 * MIN, true, false), None);
-        assert!(run_with(&w, &dir, T0 + 6 * MIN, true, true).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -487,15 +457,12 @@ mod tests {
         std::fs::create_dir_all(&feeds).unwrap();
         let f = feed::feed_path(&feeds, "s1");
         let d = doc(json!([{"key": "demo#143", "stage": "running",
-                            "started": orchestrator_session::stamp(T0), "eta_s": 4500}]));
-        orchestrator_session::write(&f, &d).unwrap();
+                            "started": manage::stamp(T0), "eta_s": 4500}]));
+        manage::write(&f, &d).unwrap();
         let p = worker_payload(&dir, "s1", "abc", "demo#143: better estimates", T0);
         assert_eq!(run(&p, &feeds, T0 + MIN, false), None);
         let ctx = context(&run(&p, &feeds, T0 + 6 * MIN, false).unwrap());
-        assert!(
-            ctx.contains("giverny-orchestrator-session eta demo#143"),
-            "{ctx}"
-        );
+        assert!(ctx.contains("giverny-manage eta demo#143"), "{ctx}");
         assert_eq!(run(&p, &feeds, T0 + 7 * MIN, false), None, "asked once");
         let back = feed::read(&f).unwrap();
         assert_eq!(back.rows.len(), 1);
