@@ -4225,6 +4225,8 @@ impl App {
     ///   tab's management panel, cell to cell; the same cell twice
     ///   is a click;
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
+    /// * `wheel <lines> [<x> <y>]` — the wheel turned over a point (up when
+    ///   positive), by default the terminal's top row;
     /// * `settings <section>` — the settings screen, on that section (its
     ///   rail title, `management panel`); `settings` alone closes it;
     /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
@@ -4416,6 +4418,31 @@ impl App {
                         )]);
                     }
                     feed(vec![button(to, false)]);
+                }
+                // `wheel <lines> [<x> <y>]`: the pointer there (by default
+                // just inside the terminal's top-left corner, over its top
+                // row) and the wheel turned that many lines, up when
+                // positive.
+                "wheel" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let pos = match n.as_slice() {
+                        [_, x, y] => Some(egui::pos2(*x, *y)),
+                        _ => self.session_rect.map(|r| r.min + egui::vec2(60.0, 4.0)),
+                    };
+                    let (Some(&lines), Some(pos)) = (n.first(), pos) else {
+                        tracing::warn!("debug cmd: no such wheel {arg}");
+                        continue;
+                    };
+                    feed(vec![egui::Event::PointerMoved(pos)]);
+                    feed(vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, lines),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
                 }
                 // `shots <dir> <frames> <stride>`: photograph the window's
                 // next frames, leaving it open.
