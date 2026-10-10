@@ -63,9 +63,39 @@ const MATCH_MIN: usize = 8;
 /// A turn's answer is rarely longer; past it, the latest prompt is shown.
 pub const SEARCH_ABOVE: usize = 5000;
 
-/// How much of this prompt a `❯` row, with the `❯` taken off, agrees with:
-/// the length of their common start, or `None` when the row is not this
-/// prompt.
+/// The characters a sent prompt's row starts with: Claude Code's `❯`, and
+/// the `>` of older versions.
+pub const PROMPT_MARKS: [char; 2] = ['❯', '>'];
+
+/// The start of a prompt's first line that is not blank, whitespace
+/// collapsed as [`one_line`] does, at most `max` characters of it. Read only
+/// as far as that: a pasted log one line long is not copied whole to
+/// compare a row's worth of it.
+fn first_line_start(prompt: &str, max: usize) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut space = false;
+    for ch in prompt.trim_start().chars() {
+        if ch == '\n' || out.len() == max {
+            break;
+        }
+        if ch.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if std::mem::take(&mut space) {
+            out.push(' ');
+            if out.len() == max {
+                break;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// How much of this prompt a `❯` row, with the `❯` taken off and its
+/// whitespace collapsed (`got`), agrees with: the length of their common
+/// start, or `None` when the row is not this prompt.
 ///
 /// The row holds the start of the prompt's first line, its whitespace as the
 /// terminal laid it out, maybe cut short: by a wrap at a word, or with an
@@ -73,13 +103,14 @@ pub const SEARCH_ABOVE: usize = 5000;
 /// be the prompt's start, and at least [`MATCH_MIN`] of it (or all of a
 /// shorter prompt). Past [`MATCH_CHARS`] the two may part: what a terminal
 /// does to wide characters or tabs is not this check's business.
-fn agreement(prompt: &str, rest: &str) -> Option<usize> {
-    let first = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let want: Vec<char> = one_line(first, usize::MAX).chars().collect();
-    let got: Vec<char> = one_line(rest.trim().trim_end_matches('…'), usize::MAX)
-        .chars()
-        .collect();
-    let common = want.iter().zip(&got).take_while(|(a, b)| a == b).count();
+fn agreement(prompt: &str, got: &[char]) -> Option<usize> {
+    // One more than the row, to tell a prompt that ends with the row from
+    // one that goes on past it: no more of it can ever match.
+    let want = first_line_start(prompt, got.len() + 1);
+    if want.is_empty() {
+        return None;
+    }
+    let common = want.iter().zip(got).take_while(|(a, b)| a == b).count();
     let whole_row = common == got.len();
     (common >= MATCH_MIN.min(want.len()) && common > 0 && (whole_row || common >= MATCH_CHARS))
         .then_some(common)
@@ -90,10 +121,13 @@ fn agreement(prompt: &str, rest: &str) -> Option<usize> {
 /// more recent.
 pub fn prompt_of_row(history: &[String], row: &str) -> Option<usize> {
     let row = row.trim();
-    let rest = row.strip_prefix('❯').or_else(|| row.strip_prefix('>'))?;
+    let rest = PROMPT_MARKS.iter().find_map(|&m| row.strip_prefix(m))?;
+    let got: Vec<char> = one_line(rest.trim().trim_end_matches('…'), usize::MAX)
+        .chars()
+        .collect();
     let mut best: Option<(usize, usize)> = None;
     for (i, prompt) in history.iter().enumerate() {
-        if let Some(n) = agreement(prompt, rest)
+        if let Some(n) = agreement(prompt, &got)
             && best.is_none_or(|(_, m)| n >= m)
         {
             best = Some((i, n));
@@ -163,6 +197,42 @@ pub fn owner(
         return None;
     }
     Some(above(&|row, _| prompt_of_row(history, row)).unwrap_or(history.len() - 1))
+}
+
+/// [`owner`] for one tab, worked out again only when what it reads has
+/// changed: the terminal's rows (`seq`, [`TermSession::content_seq`]) or the
+/// prompts. Every frame of an idle Claude tab asked it, and each time read
+/// the screen into strings, and with no prompt row on screen walked up to
+/// [`SEARCH_ABOVE`] rows of scrollback, holding the lock the terminal's
+/// output parser needs.
+///
+/// [`TermSession::content_seq`]: giverny_term::session::TermSession::content_seq
+#[derive(Default)]
+pub struct Owner {
+    seen: Option<(u64, Vec<String>)>,
+    owner: Option<usize>,
+}
+
+impl Owner {
+    pub fn get(
+        &mut self,
+        seq: u64,
+        history: &[String],
+        work: impl FnOnce() -> Option<usize>,
+    ) -> Option<usize> {
+        // Compared, not copied: a copy is only taken when they differ.
+        match &mut self.seen {
+            Some((s, h)) if h.as_slice() == history => {
+                if *s == seq {
+                    return self.owner;
+                }
+                *s = seq;
+            }
+            seen => *seen = Some((seq, history.to_vec())),
+        }
+        self.owner = work();
+        self.owner
+    }
 }
 
 fn open_id(tab: TabId) -> egui::Id {
@@ -604,6 +674,88 @@ mod tests {
         );
         assert_eq!(one_line_cut("abcdefg", 6), ("abcdef…".to_string(), true));
         assert_eq!(one_line_cut("abc", 6), ("abc".to_string(), false));
+    }
+
+    #[test]
+    fn cjk_and_emoji_prompts_are_found_by_their_rows() {
+        // The rows as the terminal reads them now: one character per
+        // double-width cell, its spacer left out.
+        let h = history(&[
+            "日本語で長い答えを書いてください。各段落に見出しを付けて。",
+            "👋 hi, write me a long story 🎉",
+            "And the cubes of 1 to 70",
+        ]);
+        assert_eq!(
+            prompt_of_row(
+                &h,
+                "❯ 日本語で長い答えを書いてください。各段落に見出しを付けて。"
+            ),
+            Some(0)
+        );
+        // Wrapped, and pinned by Claude with an ellipsis.
+        assert_eq!(prompt_of_row(&h, "❯ 日本語で長い答えを書いて"), Some(0));
+        assert_eq!(prompt_of_row(&h, "❯ 日本語で長い答え…"), Some(0));
+        assert_eq!(
+            prompt_of_row(&h, "❯ 👋 hi, write me a long story 🎉"),
+            Some(1)
+        );
+        // Read with the spacers, as it was: no longer the prompt.
+        assert_eq!(prompt_of_row(&h, "❯ 日 本 語 で 長 い 答 え"), None);
+        let rows = screen(&[("第三段落の続き", false), ("もう少し", false)]);
+        let above = screen(&[
+            ("段落", false),
+            ("❯ 日本語で長い答えを書いてください。", true),
+        ]);
+        let search = |m: &dyn Fn(&str, bool) -> Option<usize>| {
+            above.iter().find_map(|(text, shaded)| m(text, *shaded))
+        };
+        assert_eq!(owner(&h, &rows, search), Some(0));
+    }
+
+    #[test]
+    fn only_a_rows_worth_of_a_prompt_is_read() {
+        assert_eq!(
+            first_line_start("\n\n  fix   the\tbuild  \nthen test", 100),
+            "fix the build".chars().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first_line_start("fix   the build", 5),
+            "fix t".chars().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first_line_start("fix   the build", 4),
+            "fix ".chars().collect::<Vec<_>>()
+        );
+        assert!(first_line_start("  \n ", 10).is_empty());
+        // A pasted log on one line, a megabyte long: matched by its start.
+        let log = format!("cargo build failed: {}", "x".repeat(1 << 20));
+        let h = history(&[&log]);
+        assert_eq!(prompt_of_row(&h, "❯ cargo build failed: xxxxxxxx"), Some(0));
+        assert_eq!(prompt_of_row(&h, "❯ cargo build passed"), None);
+    }
+
+    #[test]
+    fn the_owner_is_worked_out_again_only_when_something_changed() {
+        let mut cache = Owner::default();
+        let h = history(&TURNS);
+        let runs = std::cell::Cell::new(0);
+        let work = |answer| {
+            runs.set(runs.get() + 1);
+            answer
+        };
+        assert_eq!(cache.get(1, &h, || work(Some(1))), Some(1));
+        assert_eq!(cache.get(1, &h, || work(Some(0))), Some(1), "kept");
+        assert_eq!(runs.get(), 1);
+        // The terminal changed.
+        assert_eq!(cache.get(2, &h, || work(Some(0))), Some(0));
+        // A prompt came.
+        let more = history(&[TURNS[0], TURNS[1], TURNS[2], "and squares"]);
+        assert_eq!(cache.get(2, &more, || work(Some(3))), Some(3));
+        // The same number of prompts, another session's.
+        let other = history(&["a", "b", "c", "d"]);
+        assert_eq!(cache.get(2, &other, || work(None)), None);
+        assert_eq!(cache.get(2, &other, || work(Some(2))), None, "kept");
+        assert_eq!(runs.get(), 4);
     }
 
     #[test]
