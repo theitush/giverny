@@ -270,6 +270,12 @@ fn gpu_opengl() -> bool {
             tracing::info!("renderer: OpenGL on the GPU through WSLg's d3d12 driver ({renderer})");
             return true;
         }
+        wslg::Gpu::Inherited => {
+            tracing::info!(
+                "renderer: OpenGL on the GPU through WSLg's d3d12 driver (GALLIUM_DRIVER=d3d12 inherited)"
+            );
+            return true;
+        }
         wslg::Gpu::Unavailable(why) => {
             tracing::warn!(
                 "WSLg's d3d12 GL driver is unavailable, drawing may fall back to the CPU: {why}"

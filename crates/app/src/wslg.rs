@@ -43,6 +43,9 @@ pub enum Gpu {
     D3d12(String),
     /// Tried and did not work; why.
     Unavailable(String),
+    /// Already on: `GALLIUM_DRIVER=d3d12` was in the environment, as it is
+    /// for a Giverny started from another one's tab or restarted by it.
+    Inherited,
 }
 
 /// On WSLg, switch Mesa to its d3d12 driver if a probe shows it works.
@@ -62,6 +65,14 @@ pub fn enable_d3d12() -> Gpu {
     }
     if !std::path::Path::new("/dev/dxg").exists() {
         return Gpu::NotApplicable;
+    }
+    // A Giverny's own choice, handed down to everything it starts: its probe
+    // already passed on this machine. Without this, a Giverny opened from a
+    // tab, or restarted into a new version, saw a choice made, left OpenGL to
+    // wgpu, and wgpu took its GL backend on this same driver, a path nobody
+    // vetted and one that panics on a lost device.
+    if inherits_d3d12(std::env::var_os("GALLIUM_DRIVER").as_deref()) {
+        return Gpu::Inherited;
     }
     // Someone has already chosen: respect it, including a choice of llvmpipe.
     for key in [
@@ -153,6 +164,11 @@ const PROBE_RGBA: [u8; 4] = [0x33, 0x66, 0x99, 0xcc];
 /// What the probe prints when the context works but the readback does not;
 /// the parent recognises it to tell the user what to do about it.
 const READBACK_FAILED: &str = "readback failed";
+
+/// Whether `GALLIUM_DRIVER` already names the d3d12 driver.
+fn inherits_d3d12(driver: Option<&std::ffi::OsStr>) -> bool {
+    driver.is_some_and(|d| d.eq_ignore_ascii_case("d3d12"))
+}
 
 /// Mesa's d3d12 renderer string is `D3D12 (<adapter name>)`.
 fn is_d3d12(renderer: &str) -> bool {
@@ -435,6 +451,16 @@ mod tests {
         assert!(is_d3d12("D3D12 (NVIDIA GeForce RTX 3060)"));
         assert!(!is_d3d12("llvmpipe (LLVM 20.1.2, 256 bits)"));
         assert!(!is_d3d12(""));
+    }
+
+    #[test]
+    fn only_a_d3d12_gallium_driver_counts_as_inherited() {
+        use std::ffi::OsStr;
+        assert!(inherits_d3d12(Some(OsStr::new("d3d12"))));
+        assert!(inherits_d3d12(Some(OsStr::new("D3D12"))));
+        assert!(!inherits_d3d12(Some(OsStr::new("llvmpipe"))));
+        assert!(!inherits_d3d12(Some(OsStr::new(""))));
+        assert!(!inherits_d3d12(None));
     }
 
     #[test]
