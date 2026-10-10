@@ -91,10 +91,9 @@ pub struct Reading {
     pub total: Use,
     /// Every claude under the app, by pid.
     pub sessions: BTreeMap<u32, Use>,
-    /// Each tab's Claude Code, by the pid of the app's child it runs under
-    /// (the tab's shell): every claude there with all it started, its
-    /// `manage run` scopes too, counted once (a claude a claude started is
-    /// in the outer one's). Only tabs with a claude in them (giverny#267).
+    /// Each tab, by its shell's pid (a child of the app): the shell and
+    /// everything under it, Claude Code or not, its `manage run` scopes
+    /// too (giverny#267, giverny#289).
     #[serde(default)]
     pub tabs: BTreeMap<u32, Use>,
     pub runs: Vec<RunUse>,
@@ -174,7 +173,7 @@ impl Table {
             .iter()
             .map(|(&p, pids)| (p, self.use_of(pids)))
             .collect();
-        let tabs = self.tabs(app, &claudes);
+        let tabs = self.tabs(app, &tree);
         let mut by_task: BTreeMap<(String, String), HashSet<u32>> = BTreeMap::new();
         for (session, task, pids) in runs {
             by_task
@@ -211,27 +210,37 @@ impl Table {
 }
 
 impl Table {
-    /// [`Reading::tabs`]: each outermost claude's processes, gathered under
-    /// the child of `app` above it.
-    fn tabs(&self, app: u32, claudes: &BTreeMap<u32, HashSet<u32>>) -> BTreeMap<u32, Use> {
+    /// [`Reading::tabs`]: each child of `app` (a tab's shell) with every
+    /// process under it, from `tree` (`app`'s subtree), in one sweep.
+    fn tabs(&self, app: u32, tree: &HashSet<u32>) -> BTreeMap<u32, Use> {
         let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        // Each process's tab, as found: a walk up stops at the first
+        // process whose tab is known.
+        let mut tab_of: HashMap<u32, u32> = HashMap::new();
         let mut by_tab: BTreeMap<u32, HashSet<u32>> = BTreeMap::new();
-        'claude: for (&claude, pids) in claudes {
-            let mut at = claude;
-            for _ in 0..256 {
-                let Some(&up) = parent.get(&at) else {
-                    continue 'claude;
-                };
-                if up == app {
-                    by_tab.entry(at).or_default().extend(pids);
-                    continue 'claude;
-                }
-                if claudes.contains_key(&up) || up == at {
-                    // Inside another claude: counted in that one's.
-                    continue 'claude;
-                }
-                at = up;
+        let mut path = Vec::new();
+        for &pid in tree {
+            if pid == app {
+                continue;
             }
+            path.clear();
+            let mut at = pid;
+            let tab = loop {
+                if let Some(&t) = tab_of.get(&at) {
+                    break Some(t);
+                }
+                path.push(at);
+                match parent.get(&at) {
+                    Some(&up) if up == app => break Some(at),
+                    Some(&up) if up != at && path.len() < 256 => at = up,
+                    _ => break None,
+                }
+            };
+            let Some(tab) = tab else { continue };
+            for &p in &path {
+                tab_of.insert(p, tab);
+            }
+            by_tab.entry(tab).or_default().insert(pid);
         }
         by_tab
             .into_iter()
@@ -695,36 +704,44 @@ mod tests {
             assert!(part.mem_mb <= whole.mem_mb, "{part:?} {whole:?}");
         }
         assert!(!r.sessions.contains_key(&900));
-        // Each tab's figure is its claude's: shells 110 and 210 are the
-        // app's children, and a tab is the sum of the claudes under it.
+        // Each tab is its shell (a child of the app) with all under it:
+        // A's tab is A and its shell 110, B's is B and 210.
         assert_eq!(r.tabs.keys().copied().collect::<Vec<_>>(), vec![110, 210]);
-        assert_eq!((r.tabs[&110], r.tabs[&210]), (a, b));
+        let shell_a = HashSet::from([110, 120, 130, 140, 141]);
+        assert_eq!(r.tabs[&110], t.use_of(&shell_a));
+        assert_eq!(r.tabs[&210], t.use_of(&HashSet::from([210, 220])));
+        for (part, whole) in [(a, r.tabs[&110]), (b, r.tabs[&210])] {
+            assert!(part.cpu_pct <= whole.cpu_pct, "{part:?} {whole:?}");
+            assert!(part.mem_mb <= whole.mem_mb, "{part:?} {whole:?}");
+        }
     }
 
-    /// A claude started by a claude is in its tab once, inside the outer
-    /// one's figure; two claudes side by side in one tab are summed.
+    /// Every tab reads, Claude Code in it or not: its shell and every
+    /// process under it, each counted once, whichever claudes are where.
     #[test]
-    fn a_tab_counts_each_of_its_claudes_once() {
+    fn every_tab_is_its_whole_shell_claude_or_not() {
         let before = machine();
         let mut after = machine();
         for q in &mut after {
             q.ticks += 10;
         }
         let t = table(after, Some(&seen(&before)), None);
-        // 141 is a claude inside claude 120: still one tab, the same figure.
-        let r = t.reading(42, 100, |p| [120, 141].contains(&p), &[], &HashMap::new());
-        assert_eq!(r.tabs.len(), 1);
-        assert_eq!(r.tabs[&110], r.sessions[&120]);
-        // 130 and 220 side by side under one shell (220 moved there).
-        let mut procs = machine();
-        procs.retain(|q| q.pid != 210);
-        procs.iter_mut().find(|q| q.pid == 220).unwrap().ppid = 110;
-        let t = table(procs, None, None);
-        let r = t.reading(42, 100, |p| [130, 220].contains(&p), &[], &HashMap::new());
-        // 130 → 140 → 141 and 220, in KiB.
-        let both = (3_000u64 + 50_000 + 900_000 + 250_000).div_ceil(1024);
-        assert_eq!(r.tabs[&110].mem_mb, both);
-        assert_eq!(r.tabs.len(), 1);
+        let none = t.reading(42, 100, |_| false, &[], &HashMap::new());
+        assert!(none.sessions.is_empty());
+        assert_eq!(
+            none.tabs.keys().copied().collect::<Vec<_>>(),
+            vec![110, 210]
+        );
+        for shell in [110, 210] {
+            assert_eq!(none.tabs[&shell], t.use_of(&subtree(&t.procs, shell)));
+        }
+        // A claude inside a claude, or two side by side: the same tabs.
+        for claudes in [&[120, 141][..], &[130, 220], &[220]] {
+            let r = t.reading(42, 100, |p| claudes.contains(&p), &[], &HashMap::new());
+            assert_eq!(r.tabs, none.tabs, "{claudes:?}");
+        }
+        // The app itself and processes outside it are in no tab.
+        assert!(!none.tabs.contains_key(&100) && !none.tabs.contains_key(&900));
     }
 
     /// A worker's commands: within its session, and a `manage run` it
@@ -934,10 +951,35 @@ mod dump {
             let t = std::time::Instant::now();
             let r = s.sample(app, &runs).expect("a /proc");
             let took = t.elapsed();
-            let procs = crate::session_use::subtree(&crate::session_use::proc_table(4), app).len();
+            let all = crate::session_use::proc_table(4);
+            let procs = crate::session_use::subtree(&all, app).len();
+            // The grouping alone (no /proc reads): what a pass adds on top
+            // of reading the table.
+            let table = super::Table {
+                spent: all.iter().map(|p| (p.pid, p.ticks)).collect(),
+                procs: all,
+                over_ms: 1_000,
+                ticks_per_s: 100,
+                cores: 1,
+                ..super::Table::default()
+            };
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = table.reading(
+                    0,
+                    app,
+                    |p| r.sessions.contains_key(&p),
+                    &[],
+                    &Default::default(),
+                );
+            }
+            let grouping = t.elapsed();
             println!(
-                "pass {pass}: {:.1} ms over {procs} processes\n{}",
+                "pass {pass}: {:.1} ms over {procs} processes ({} on the machine), \
+                 grouping {:.1} µs\n{}",
                 took.as_secs_f64() * 1000.0,
+                table.procs.len(),
+                grouping.as_secs_f64() * 1e6 / 100.0,
                 serde_json::to_string_pretty(&r).unwrap()
             );
             std::thread::sleep(std::time::Duration::from_secs(1));
