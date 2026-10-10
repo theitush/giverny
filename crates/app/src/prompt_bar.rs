@@ -169,6 +169,13 @@ fn open_id(tab: TabId) -> egui::Id {
     egui::Id::new(("giverny-prompt-bar", tab.0))
 }
 
+/// The layer the closed bar is drawn in, over the grid. The wheel goes
+/// through it to the terminal; the open prompt, in a layer of its own,
+/// scrolls itself.
+pub fn layer(tab: TabId) -> egui::LayerId {
+    egui::LayerId::new(egui::Order::Middle, open_id(tab).with("bar"))
+}
+
 /// The bar is not shown: the full prompt it opens goes with it, and the bar
 /// comes back closed.
 pub fn hide(ctx: &egui::Context, tab: TabId) {
