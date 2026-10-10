@@ -235,6 +235,14 @@ impl Owner {
     }
 }
 
+/// The bar's text size, in points: the terminal's, unless that would not
+/// fit in a row `row` points high: egui lays a line of its monospace font
+/// out about 1.17 times its size, and the terminal's cell is sized by its own
+/// font's metrics.
+pub fn text_size(terminal: f32, row: f32) -> f32 {
+    terminal.min(row / 1.2).max(1.0)
+}
+
 fn open_id(tab: TabId) -> egui::Id {
     egui::Id::new(("giverny-prompt-bar", tab.0))
 }
@@ -267,8 +275,12 @@ pub fn fill(chrome: &Chrome) -> Color32 {
 }
 
 /// Draw the bar for `tab` over the top row of the terminal at `over`, `row`
-/// points high. Returns true when it was clicked, so the caller can hand the
-/// keyboard back to the terminal.
+/// points high, its text the size of the terminal's (`text`, in points).
+/// Returns true when it was clicked, so the caller can hand the keyboard back
+/// to the terminal.
+///
+/// Exactly the top row: at any font size or zoom, it covers that row and
+/// none of the one below.
 ///
 /// Over the grid rather than above it: the bar comes and goes as the prompt
 /// scrolls in and out of view, and a bar that took a row of the layout would
@@ -282,15 +294,16 @@ pub fn show(
     chrome: &Chrome,
     over: Rect,
     row: f32,
+    text: f32,
     tab: TabId,
     prompt: &str,
 ) -> bool {
     let open_id = open_id(tab);
     let mut open = ctx.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
-    let height = row.max(16.0);
+    let height = row;
     let fill = fill(chrome);
     let rule = mix(chrome.panel, chrome.fg, 0.25);
-    let font = FontId::monospace(12.0);
+    let font = FontId::monospace(text_size(text, row));
     // Where the one line's text starts, and the room the marker keeps. The
     // room is kept whether or not there is a marker, so a prompt that fits
     // is decided at the same width either way.
@@ -311,6 +324,7 @@ pub fn show(
         overflow_character: Some('…'),
     };
     let galley = ctx.fonts_mut(|f| f.layout_job(job));
+    let line_height = galley.size().y;
     let more = expandable(prompt, capped || galley.elided);
     if !more {
         open = false;
@@ -332,7 +346,7 @@ pub fn show(
             let rect = if open {
                 // The prompt in full, its first line where the bar's was.
                 let max_height = (over.height() * 0.6).max(60.0);
-                let pad = ((height - 14.0) / 2.0).round().clamp(1.0, 8.0) as i8;
+                let pad = ((height - line_height) / 2.0).round().clamp(0.0, 8.0) as i8;
                 egui::Frame::new()
                     .fill(fill)
                     .inner_margin(egui::Margin {
@@ -756,6 +770,15 @@ mod tests {
         assert_eq!(cache.get(2, &other, || work(None)), None);
         assert_eq!(cache.get(2, &other, || work(Some(2))), None, "kept");
         assert_eq!(runs.get(), 4);
+    }
+
+    #[test]
+    fn the_bar_text_fits_the_row() {
+        // The terminal's size, where its row has the room.
+        assert_eq!(text_size(13.0, 17.0), 13.0);
+        assert_eq!(text_size(24.0, 31.0), 24.0);
+        // Smaller where a line of it would be taller than the row.
+        assert!(text_size(8.0, 8.0) * 1.17 <= 8.0);
     }
 
     #[test]
