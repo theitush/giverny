@@ -385,11 +385,22 @@ pub struct RailConfig {
     /// pulse on one that wants you. Off, no spinner is drawn, the flag does
     /// not pulse, and the rail asks for no frames of its own.
     pub animate: bool,
+    /// Show each tab's CPU and memory at its row's right edge, and a
+    /// collapsed group's summed. Off, none is drawn and the title, sub-line
+    /// and group name take the room. The sampler runs either way.
+    pub tab_figures: bool,
+    /// Show the total line under the account bars: what Giverny runs now,
+    /// summed (`23% CPU  2.0G RAM`). The sampler runs either way.
+    pub total_line: bool,
 }
 
 impl Default for RailConfig {
     fn default() -> Self {
-        RailConfig { animate: true }
+        RailConfig {
+            animate: true,
+            tab_figures: true,
+            total_line: true,
+        }
     }
 }
 

@@ -228,9 +228,12 @@ fn row_data(
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.background),
+        // Off (`rail.tab_figures`, giverny#304), a row has no figures, so
+        // nothing reserves room for them and no group sums them.
         used: app
             .rt
             .get(&t.id)
+            .filter(|_| app.cfg.rail.tab_figures)
             .and_then(|rt| rt.session.as_ref()?.child_pid)
             .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
     }
@@ -1608,6 +1611,10 @@ fn usage_panel(
     }
     ui.add_space(6.0);
     // The reading the active tab's status line shows (`App::use_now`).
+    // Off (`rail.total_line`, giverny#304), no line and no rule over it.
+    if !app.cfg.rail.total_line {
+        return None;
+    }
     let r = app.use_now.clone()?;
     Some(sessions_load_row(ui, &r, app.chrome))
 }

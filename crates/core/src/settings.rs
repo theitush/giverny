@@ -313,6 +313,32 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: true },
     },
     SettingDef {
+        key: "rail.tab_figures",
+        label: "tab CPU/mem figures",
+        section: Section::Appearance,
+        doc: "Each tab's CPU and memory in the rail, and a collapsed group's sum.",
+        note: &[
+            "Off, no row or group header draws figures, and the title,",
+            "sub-line and group name take the room they held. The status",
+            "line and the management panel still read them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.total_line",
+        label: "total CPU/mem line",
+        section: Section::Appearance,
+        doc: "The summed CPU and memory line under the account bars.",
+        note: &[
+            "What Giverny runs now, summed: `23% CPU  2.0G RAM`. Off, the",
+            "bars end the rail's bottom panel. The status line and the",
+            "management panel still read the figures.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "titles.strip_host_prefix",
         label: "strip user@host:",
         section: Section::Titles,
