@@ -176,19 +176,29 @@ fn read_loop(last: &Mutex<Recent>, ctx: &egui::Context) {
 
 /// The line's figures: `23% CPU  2.0G RAM`, then `  40% GPU` with a GPU
 /// that reports per-process utilisation, `  1.2G GPU` (its memory) with
-/// one that does not, nothing with none.
+/// one that does not, nothing with none. In the pieces the rail colours one
+/// by one (giverny#295), each with its share of the whole machine as
+/// [`machine_shares`] takes it of `ram_mb` (GPU compute as it is); the gaps,
+/// and GPU memory, whose total is not known here, at none.
 ///
 /// Unpadded: the status line pads its figures to fixed widths to hold
 /// them in their columns, which a line read from the left has no use for.
-pub fn figures(t: &Use) -> String {
+pub fn figure_parts(t: &Use, ram_mb: u64) -> Vec<(String, f64)> {
     use giverny_claude::session_use::gb;
-    let mut s = format!("{}% CPU  {} RAM", t.cpu_pct.min(100), gb(t.mem_mb));
+    let (cpu, mem) = machine_shares(t, ram_mb);
+    let mut parts = vec![
+        (format!("{}% CPU", t.cpu_pct.min(100)), cpu),
+        ("  ".to_string(), 0.0),
+        (format!("{} RAM", gb(t.mem_mb)), mem),
+    ];
     match (t.gpu_pct, t.gpu_mb) {
-        (Some(p), _) => s.push_str(&format!("  {p}% GPU")),
-        (None, Some(g)) => s.push_str(&format!("  {} GPU", gb(g))),
+        (Some(p), _) => {
+            parts.extend([("  ".to_string(), 0.0), (format!("{p}% GPU"), f64::from(p))])
+        }
+        (None, Some(g)) => parts.extend([("  ".to_string(), 0.0), (format!("{} GPU", gb(g)), 0.0)]),
         (None, None) => {}
     }
-    s
+    parts
 }
 
 /// The use of the whole machine a tab's (or a group's) figures are
@@ -216,6 +226,11 @@ mod tests {
     use super::*;
     use giverny_claude::use_reading::RunUse;
 
+    /// The line as read.
+    fn figures(t: &Use) -> String {
+        figure_parts(t, 0).into_iter().map(|(s, _)| s).collect()
+    }
+
     #[test]
     fn the_line_is_cpu_ram_and_gpu_when_there_is_one() {
         let mut u = Use {
@@ -233,6 +248,28 @@ mod tests {
         );
         u.gpu_pct = Some(40);
         assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
+    }
+
+    /// The pieces the rail colours carry their own shares: CPU as it is,
+    /// RAM of all of it, GPU compute as it is; the gaps none.
+    #[test]
+    fn each_piece_of_the_line_carries_its_share() {
+        let u = Use {
+            cpu_pct: 23,
+            mem_mb: 12_000,
+            gpu_mb: Some(512),
+            gpu_pct: Some(60),
+        };
+        assert_eq!(
+            figure_parts(&u, 24_000),
+            vec![
+                ("23% CPU".to_string(), 23.0),
+                ("  ".to_string(), 0.0),
+                ("12G RAM".to_string(), 50.0),
+                ("  ".to_string(), 0.0),
+                ("60% GPU".to_string(), 60.0),
+            ]
+        );
     }
 
     /// Both shares are of the whole machine: the CPU figure as it is (a

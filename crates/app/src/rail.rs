@@ -874,17 +874,22 @@ fn category_header(
         cat.color,
     );
     // A collapsed group's tabs' use, summed, at the right edge as on a tab
-    // row (giverny#289); the "+" takes the corner while the pointer is on
-    // the header, as a tab's close button does. Its counts sit left of it.
+    // row (giverny#289). While the pointer is on the header the "+" takes
+    // the corner, as a tab's close button does, and the sum steps left of
+    // it rather than hiding (giverny#295). Its counts sit left of where it
+    // goes then, so nothing else moves on hover.
     let hovered = ui.rect_contains_pointer(rect);
     let used = cat.used.filter(|_| cat.collapsed);
     let mut badge_x = match &used {
         Some(u) => {
-            if !hovered {
-                let y = rect.center().y;
-                readout(&p, rect.max.x - 8.0, [y - 6.0, y + 6.0], u, c);
-            }
-            rect.max.x - 8.0 - readout_width(u) - 4.0
+            let y = rect.center().y;
+            let right = if hovered {
+                rect.max.x - 26.0
+            } else {
+                rect.max.x - 8.0
+            };
+            readout(&p, right, [y - 6.0, y + 6.0], u, c);
+            rect.max.x - 26.0 - readout_width(u) - 4.0
         }
         None => rect.max.x - 26.0,
     };
@@ -1189,16 +1194,17 @@ fn tab_row(
 
     // Its shell's CPU over its memory at the right edge, as the account
     // bars' numbers are drawn, each coloured by its share of the whole
-    // machine. The close button takes the corner while the pointer is on
-    // the row.
-    if let Some(u) = row.used.filter(|_| !hovered) {
-        readout(
-            &p,
-            rect.max.x - 8.0,
-            [rect.min.y + 13.0, rect.min.y + 29.0],
-            &u,
-            c,
-        );
+    // machine. While the pointer is on the row the close button takes the
+    // corner and the figures fold onto the second line, CPU left of memory
+    // (giverny#295): they stay in sight, and the sub line gives way.
+    let sub_y = rect.min.y + 29.0;
+    let mut sub_end = rect.max.x - 8.0;
+    if let Some(u) = &row.used {
+        if hovered {
+            sub_end = readout_inline(&p, rect.max.x - 8.0, sub_y, u, c) - 6.0;
+        } else {
+            readout(&p, rect.max.x - 8.0, [rect.min.y + 13.0, sub_y], u, c);
+        }
     }
 
     // Title (char-budget truncation; the rail is monospace).
@@ -1216,11 +1222,21 @@ fn tab_row(
         },
     );
     if !row.sub.is_empty() {
+        let sub_font = FontId::monospace(10.0);
+        let sub_budget = if hovered && row.used.is_some() {
+            let char_w = ui
+                .ctx()
+                .fonts_mut(|f| f.glyph_width(&sub_font, 'M'))
+                .max(1.0);
+            ((sub_end - (rect.min.x + 44.0)) / char_w).max(1.0) as usize
+        } else {
+            char_budget + 2
+        };
         p.text(
-            Pos2::new(rect.min.x + 44.0, rect.min.y + 29.0),
+            Pos2::new(rect.min.x + 44.0, sub_y),
             Align2::LEFT_CENTER,
-            truncate_chars(&row.sub, char_budget + 2),
-            FontId::monospace(10.0),
+            truncate_chars(&row.sub, sub_budget),
+            sub_font,
             dim,
         );
     }
@@ -1593,13 +1609,18 @@ fn usage_panel(
     ui.add_space(6.0);
     // The reading the active tab's status line shows (`App::use_now`).
     let r = app.use_now.clone()?;
-    Some(sessions_load_row(ui, &r, dim))
+    Some(sessions_load_row(ui, &r, app.chrome))
 }
 
 /// Under the account bars: what Giverny runs now, summed —
 /// `23% CPU  2.0G RAM  40% GPU`, centred, in the bars' lettering. Hovering says
 /// what is counted. Returns where the line above it goes.
-fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim: Color32) -> f32 {
+fn sessions_load_row(
+    ui: &mut Ui,
+    r: &giverny_claude::use_reading::Reading,
+    c: crate::chrome::Chrome,
+) -> f32 {
+    let dim = c.dim;
     let y = ui.cursor().min.y + 0.5;
     ui.add_space(5.0);
     let width = ui.available_width();
@@ -1607,13 +1628,20 @@ fn sessions_load_row(ui: &mut Ui, r: &giverny_claude::use_reading::Reading, dim:
     // A wide row (a banner, a button) can stretch the panel's layout past
     // what is shown: the figures end at the visible edge.
     rect.max.x = rect.max.x.min(ui.clip_rect().max.x);
-    ui.painter_at(rect).text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        crate::sessions_load::figures(&r.total),
-        FontId::monospace(9.5),
-        dim,
-    );
+    // Each figure coloured by its share of the whole machine, as a tab's
+    // are (giverny#295).
+    let mut job = egui::text::LayoutJob::default();
+    let ram = crate::sessions_load::machine_ram_mb();
+    for (text, share) in crate::sessions_load::figure_parts(&r.total, ram) {
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat::simple(FontId::monospace(9.5), machine_color(share, c)),
+        );
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter_at(rect).galley(at, galley, dim);
     ui.add_space(5.0);
     let gpu = match (r.total.gpu_pct, r.total.gpu_mb) {
         (Some(_), _) => ", the GPUs' compute it uses",
@@ -1729,12 +1757,44 @@ fn readout(p: &egui::Painter, right: f32, ys: [f32; 2], u: &Use, c: crate::chrom
     }
 }
 
+/// [`readout`] folded onto one line for a hovered tab row (giverny#295):
+/// `g40% g1.2G  23%  1.2G`, right-aligned to `right` at `y`, coloured as
+/// there. Returns where it starts.
+fn readout_inline(p: &egui::Painter, right: f32, y: f32, u: &Use, c: crate::chrome::Chrome) -> f32 {
+    use giverny_claude::session_use::gb;
+    let (cpu, mem) =
+        crate::sessions_load::machine_shares(u, crate::sessions_load::machine_ram_mb());
+    // Right to left, each with the gap to draw before the next one.
+    let figures = [
+        Some((gb(u.mem_mb), mem, 10.0)),
+        Some((format!("{}%", u.cpu_pct.min(100)), cpu, 10.0)),
+        u.gpu_mb.map(|m| (format!("g{}", gb(m)), 0.0, 4.0)),
+        u.gpu_pct
+            .map(|g| (format!("g{}%", g.min(100)), f64::from(g), 4.0)),
+    ];
+    let mut x = right;
+    let mut gap = 0.0;
+    for (text, share, after) in figures.into_iter().flatten() {
+        let at = p.text(
+            Pos2::new(x - gap, y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::monospace(9.0),
+            machine_color(share, c),
+        );
+        x = at.min.x;
+        gap = after;
+    }
+    x
+}
+
 /// How much of the whole machine a figure is, as the rail colours it
-/// (giverny#289): dim under 30 %, amber to 50 %, poppy over it.
+/// (giverny#289, #295): dim under 20 %, amber from 20 % to 50 %, poppy
+/// over it.
 fn machine_color(share: f64, c: crate::chrome::Chrome) -> Color32 {
     if share > 50.0 {
         c.poppy
-    } else if share >= 30.0 {
+    } else if share >= 20.0 {
         c.amber
     } else {
         c.dim
@@ -1804,8 +1864,8 @@ mod tests {
     }
 
     /// A figure is coloured by its share of the whole machine: dim under
-    /// 30 %, amber from 30 % to 50 %, poppy over 50 % (giverny#289). Memory
-    /// is taken of all the RAM: 51 % of it is poppy, as 51 % CPU is.
+    /// 20 %, amber from 20 % to 50 %, poppy over 50 % (giverny#289, #295).
+    /// Memory is taken of all the RAM: 51 % of it is poppy, as 51 % CPU is.
     #[test]
     fn a_figure_is_coloured_by_its_share_of_the_machine() {
         let c =
@@ -1813,9 +1873,10 @@ mod tests {
         assert!(c.dim != c.amber && c.amber != c.poppy && c.dim != c.poppy);
         for (share, want) in [
             (0.0, c.dim),
-            (29.0, c.dim),
-            (29.9, c.dim),
-            (30.0, c.amber),
+            (19.0, c.dim),
+            (19.9, c.dim),
+            (20.0, c.amber),
+            (29.0, c.amber),
             (50.0, c.amber),
             (50.5, c.poppy),
             (51.0, c.poppy),
@@ -1834,8 +1895,9 @@ mod tests {
             let (cpu, mem) = crate::sessions_load::machine_shares(&u, ram);
             (machine_color(cpu, c), machine_color(mem, c))
         };
-        assert_eq!(at(29, 6_960), (c.dim, c.dim), "29 %");
-        assert_eq!(at(30, 7_200), (c.amber, c.amber), "30 %");
+        assert_eq!(at(19, 4_560), (c.dim, c.dim), "19 %");
+        assert_eq!(at(20, 4_800), (c.amber, c.amber), "20 %");
+        assert_eq!(at(25, 6_000), (c.amber, c.amber), "25 %");
         assert_eq!(at(50, 12_000), (c.amber, c.amber), "50 %");
         assert_eq!(at(51, 12_240), (c.poppy, c.poppy), "51 %");
         // Each by its own share.
