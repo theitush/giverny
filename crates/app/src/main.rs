@@ -3463,6 +3463,9 @@ impl eframe::App for App {
 
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
+                    // The wheel over the closed prompt bar scrolls the
+                    // terminal under it.
+                    rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     // Typing goes to the terminal. egui drops a widget's
