@@ -297,7 +297,8 @@ pub fn last_prompt(path: &Path) -> Option<String> {
 /// `origin` other than `human`, or text [`is_injected_prompt`] knows) or
 /// things it wraps in a tag (a command, `!` shell input). A message typed
 /// while a turn ran, which Claude Code files as a `queued_command`
-/// attachment rather than a user message, is one of them.
+/// attachment rather than a user message, is one of them, and so is one that
+/// starts with a paste, listed without the paste's tags.
 ///
 /// The last one is checked against Claude Code's own `lastPrompt` marker,
 /// which is cut at 200 characters with an ellipsis and has its line breaks
@@ -321,11 +322,14 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
         return Vec::new();
     };
 
-    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    // The marker flattens line breaks and drops a paste's tags; whitespace
+    // runs are where the two spellings differ.
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let flag =
         |v: &serde_json::Value, name: &str| v.get(name).and_then(|m| m.as_bool()) == Some(true);
     let mut marker: Option<String> = None;
-    let mut typed: Vec<String> = Vec::new();
+    // Each message, and whether Claude Code says the user sent it.
+    let mut typed: Vec<(String, bool)> = Vec::new();
     // Who sent a turn, when Claude Code says: `human` is the user, anything
     // else (`task-notification`, `peer`, `plugin`, `auto-continuation`) is not.
     let not_human = |v: &serde_json::Value| {
@@ -333,6 +337,12 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
             .and_then(|o| o.get("kind"))
             .and_then(|k| k.as_str())
             .is_some_and(|k| k != "human")
+    };
+    let human = |v: &serde_json::Value| {
+        v.get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("human")
     };
     for line in buf.lines() {
         let has_marker = line.contains("\"lastPrompt\"");
@@ -351,12 +361,15 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
             }
             continue;
         }
-        let text = match v.get("type").and_then(|t| t.as_str()) {
+        let (text, by_human) = match v.get("type").and_then(|t| t.as_str()) {
             Some("user") if !flag(&v, "isMeta") && !flag(&v, "isCompactSummary") => {
                 if not_human(&v) {
                     continue;
                 }
-                v.get("message").and_then(|m| user_text(m.get("content")?))
+                (
+                    v.get("message").and_then(|m| user_text(m.get("content")?)),
+                    human(&v),
+                )
             }
             // A message typed while a turn ran: only a typed one.
             Some("attachment") => {
@@ -370,31 +383,40 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
                 }) else {
                     continue;
                 };
-                a.get("prompt").and_then(user_text)
+                (a.get("prompt").and_then(user_text), true)
             }
             _ => continue,
         };
         if let Some(text) = text {
-            let text = text.trim().to_string();
+            let text = unwrap_pastes(&text).trim().to_string();
             if !text.is_empty() && !is_injected_prompt(&text) {
-                typed.push(text);
+                typed.push((text, by_human));
             }
         }
     }
     // The last prompt: the message the marker names, in full.
     let last = marker.map(|m| {
         let stem = m.strip_suffix('…').filter(|_| m.chars().count() > 200);
+        let (m_key, stem_key) = (squash(&m), stem.map(squash));
         typed
             .iter()
             .rev()
+            .map(|(t, _)| t)
             .find(|t| {
-                let t = flat(t);
-                t == m || stem.is_some_and(|stem| t.starts_with(stem))
+                let t = squash(t);
+                t == m_key || stem_key.as_ref().is_some_and(|stem| t.starts_with(stem))
             })
             .cloned()
             .unwrap_or_else(|| m.trim().to_string())
     });
-    let mut prompts: Vec<String> = typed.into_iter().filter(|t| !t.starts_with('<')).collect();
+    // What Claude Code wraps in a tag is its own (a command, `!` input, its
+    // output). A turn the user sent can still start with `<` (pasted HTML);
+    // one that does not say who sent it is taken for a wrapper.
+    let mut prompts: Vec<String> = typed
+        .into_iter()
+        .filter(|(t, by_human)| !is_wrapper(t) && (*by_human || !t.starts_with('<')))
+        .map(|(t, _)| t)
+        .collect();
     // A marker no listed message agrees with names one Claude Code wrapped
     // (`!` shell input): it is the latest prompt.
     if let Some(last) = last.filter(|l| !l.is_empty())
@@ -438,7 +460,65 @@ pub fn is_injected_prompt(text: &str) -> bool {
             || count.contains(" was stopped by the user"))
 }
 
-/// The text of a user message, or `None` when it is a tool result.
+/// Whether a user message is one Claude Code wrote around something that was
+/// not a prompt: a slash command, `!` shell input and its output, a local
+/// command's output, editor context. Each tag seen in real transcripts.
+fn is_wrapper(text: &str) -> bool {
+    const TAGS: &[&str] = &[
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+        "<local-command-",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<ide_",
+        "<system-reminder>",
+        "<user-prompt-submit-hook>",
+    ];
+    let text = text.trim_start();
+    TAGS.iter().any(|t| text.starts_with(t))
+}
+
+/// A prompt with Claude Code's paste tags taken off, so it reads as typed:
+/// a paste is filed as `<pasted_content id="d87c">\n…\n</pasted_content
+/// id="d87c">` inside the message, and its `lastPrompt` marker has the text
+/// without them.
+pub fn unwrap_pastes(text: &str) -> String {
+    const OPEN: &str = "<pasted_content";
+    const CLOSE: &str = "</pasted_content";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let open = rest.find(OPEN);
+        let close = rest.find(CLOSE);
+        let (at, is_open) = match (open, close) {
+            (Some(o), Some(c)) if c < o => (c, false),
+            (Some(o), _) => (o, true),
+            (None, Some(c)) => (c, false),
+            (None, None) => break,
+        };
+        let Some(end) = rest[at..].find('>').map(|e| at + e + 1) else {
+            break;
+        };
+        let mut before = &rest[..at];
+        let mut after = &rest[end..];
+        // The tag sits on a line of its own.
+        if is_open {
+            after = after.strip_prefix('\n').unwrap_or(after);
+        } else {
+            before = before.strip_suffix('\n').unwrap_or(before);
+        }
+        out.push_str(before);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text of a user message, or `None` when it is a tool result. An
+/// editor's context (the file open, the lines selected) arrives as items of
+/// its own before what was typed, and is left out.
 fn user_text(content: &serde_json::Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return Some(text.to_string());
@@ -447,7 +527,12 @@ fn user_text(content: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
     for item in items {
         match item.get("type").and_then(|t| t.as_str()) {
-            Some("text") => parts.push(item.get("text")?.as_str()?.to_string()),
+            Some("text") => {
+                let text = item.get("text")?.as_str()?;
+                if !text.trim_start().starts_with("<ide_") {
+                    parts.push(text.to_string());
+                }
+            }
             Some("tool_result") => return None,
             _ => {}
         }
@@ -891,6 +976,108 @@ mod tests {
         assert!(is_injected_prompt(
             "1 background agent was stopped by the user: \"x\""
         ));
+    }
+
+    #[test]
+    fn an_interrupted_request_is_not_a_prompt() {
+        // As Esc mid-turn writes it: a text item, no `origin`, no `isMeta`,
+        // and the marker still naming the prompt it interrupted.
+        for note in [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+        ] {
+            let path = transcript(
+                "interrupted",
+                &[
+                    typed("run the slow command"),
+                    marker("run the slow command"),
+                    serde_json::json!({"type": "user", "message": {"role": "user",
+                        "content": [{"type": "text", "text": note}]}}),
+                    marker("run the slow command"),
+                ],
+            );
+            assert_eq!(prompt_history(&path), ["run the slow command"], "{note}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_starts_with_a_paste_is_a_prompt() {
+        // Its real shape, cut down: the paste tagged on lines of its own,
+        // the marker without the tags and with its spacing flattened.
+        let pasted = "\n\n<pasted_content id=\"5f7c\">\n\u{a0}1. A\n  2. <b>bold</b>\n\
+            </pasted_content id=\"5f7c\">\n\n\nfile these plz";
+        let path = transcript(
+            "pasted",
+            &[
+                typed("first"),
+                typed(pasted),
+                marker("1. A   2. <b>bold</b>    file these plz"),
+            ],
+        );
+        let want = "\u{a0}1. A\n  2. <b>bold</b>\n\n\nfile these plz".trim();
+        assert_eq!(prompt_history(&path), ["first", want]);
+
+        // Nothing but a paste, which itself starts with a tag; and the same
+        // typed while a turn ran.
+        let html = "<pasted_content id=\"cd88\">\n<div>why</div>\n</pasted_content id=\"cd88\">";
+        let path = transcript(
+            "pasted-html",
+            &[
+                typed(html),
+                queued(
+                    "human",
+                    serde_json::json!(
+                        "<pasted_content id=\"a1\">\n<p>and this</p>\n</pasted_content id=\"a1\">"
+                    ),
+                ),
+                marker("<div>why</div>"),
+            ],
+        );
+        assert_eq!(prompt_history(&path), ["<div>why</div>", "<p>and this</p>"]);
+    }
+
+    #[test]
+    fn claude_codes_own_tags_are_not_prompts_even_from_the_user() {
+        let path = transcript(
+            "wrappers",
+            &[
+                typed("first"),
+                typed(
+                    "<command-message>orchestrate</command-message>\n<command-name>/orchestrate</command-name>",
+                ),
+                typed("<local-command-stdout>ok</local-command-stdout>"),
+                // An editor's context comes before what was typed.
+                serde_json::json!({"type": "user", "origin": {"kind": "human"},
+                    "promptSource": "sdk", "message": {"role": "user", "content": [
+                        {"type": "text", "text": "<ide_selection>The user selected lines 1 to 1</ide_selection>"},
+                        {"type": "text", "text": "why so much stuff?"}]}}),
+                serde_json::json!({"type": "user", "origin": {"kind": "human"},
+                    "message": {"role": "user", "content": [
+                        {"type": "text", "text": "<ide_opened_file>The user opened a.rs</ide_opened_file>"}]}}),
+                user(serde_json::json!("<b>no origin</b>")),
+            ],
+        );
+        assert_eq!(prompt_history(&path), ["first", "why so much stuff?"]);
+    }
+
+    #[test]
+    fn paste_tags_come_off() {
+        assert_eq!(unwrap_pastes("no paste"), "no paste");
+        assert_eq!(
+            unwrap_pastes("a\n<pasted_content id=\"1\">\nb\n</pasted_content id=\"1\">\nc"),
+            "a\nb\nc"
+        );
+        assert_eq!(
+            unwrap_pastes(
+                "<pasted_content id=\"1\">\nx\n</pasted_content id=\"1\"> and <pasted_content id=\"2\">\ny\n</pasted_content>"
+            ),
+            "x and y"
+        );
+        // A tag never closed is left as it is.
+        assert_eq!(
+            unwrap_pastes("x <pasted_content id"),
+            "x <pasted_content id"
+        );
     }
 
     #[cfg(target_os = "linux")]
