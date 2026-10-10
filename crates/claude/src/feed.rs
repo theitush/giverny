@@ -147,6 +147,12 @@ pub struct FeedRow {
     /// What its running `giverny manage run` commands use now, sampled by the
     /// pane from their cgroups. Never in the feed file.
     pub live: Option<crate::run_live::RunLive>,
+    /// When the worker's end its manager was told to land was
+    /// ([`crate::manage_chores`], `land_nudged`).
+    pub land_nudged_ms: Option<u64>,
+    /// Since when the idle Next up row its manager was told to start or
+    /// hold had waited (`start_nudged`).
+    pub start_nudged_ms: Option<u64>,
 }
 
 /// A row's `usage` object: the task's `giverny manage run` commands so far,
@@ -420,6 +426,8 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         lease: parse_lease(v),
         usage: parse_usage(v),
         live: None,
+        land_nudged_ms: millis_field(v, "land_nudged"),
+        start_nudged_ms: millis_field(v, "start_nudged"),
     })
 }
 

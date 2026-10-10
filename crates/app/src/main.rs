@@ -5045,6 +5045,11 @@ impl eframe::App for App {
         let effects = self
             .claude
             .tick(&shell_pids, self.ws.active, &titles, &opened);
+        // What each manager tab's rows ask of its manager, for the plugin's
+        // hook to tell it (giverny#310).
+        if self.cfg.claude.management_panel {
+            self.agent_views.keep_chores(self.claude.agents.all_shown());
+        }
         self.show_attention(&ctx, frame);
         self.come_forward(&ctx);
         self.watch_for_limits();

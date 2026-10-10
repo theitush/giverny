@@ -57,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::agent_eta::{self, Etas};
 use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
+use giverny_claude::manage_chores::{self, Chore};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::session_use;
@@ -140,6 +141,9 @@ struct View {
     /// its dispatcher's messages, to split a worker that took tasks one
     /// after another into a row per task.
     logs: Logs,
+    /// The chores last kept for this tab's manager, and for which session
+    /// ([`Views::keep_chores`]): written again only when they change.
+    chores: Option<(String, Vec<Chore>)>,
 }
 
 impl View {
@@ -194,9 +198,67 @@ pub struct Views {
     /// The machine ledger, read off the UI thread: one for every tab, as
     /// there is one ledger for the whole machine.
     ledger: LedgerWatch,
+    /// When every manager tab's chores were last worked out.
+    chores_at: Option<Instant>,
 }
 
+/// How often every manager tab's chores are worked out ([`Views::keep_chores`]).
+const CHORES_EVERY: Duration = Duration::from_secs(10);
+
 impl Views {
+    /// Keep what each tab's manager has to be told ([`chores`]) where the
+    /// plugin's hook finds it ([`manage_chores::publish`]): the due chores
+    /// its rows were not told of yet, worked out from the very rows the
+    /// pane draws, for every tab whose session is up (`tabs`) — the one in
+    /// view or not. Call every frame; it works once a [`CHORES_EVERY`].
+    pub fn keep_chores<'t>(&mut self, tabs: impl IntoIterator<Item = (TabId, &'t Tracker)>) {
+        if self.chores_at.is_some_and(|t| t.elapsed() < CHORES_EVERY) {
+            return;
+        }
+        self.chores_at = Some(Instant::now());
+        let now = now_ms();
+        let dir = feed::feed_dir();
+        let ledger = giverny_claude::manage_inbox::read_ledger(&ledger_file(), now);
+        for (tab, tracker) in tabs {
+            let Some(session) = tracker.session_id.clone() else {
+                continue;
+            };
+            let view = self.tabs.entry(tab).or_default();
+            view.poll_feed(Some(&session), &tracker.aliases);
+            if std::mem::take(&mut view.logs_due) {
+                poll_logs(&mut view.logs, tracker.rows());
+            }
+            let due = match view.feed_now.as_ref() {
+                Some(f) => {
+                    let cleared = tracker.done_cleared_ms.map(|c| f.without_done_by(c));
+                    let f = cleared.as_ref().unwrap_or(f);
+                    let leased = ledger.as_ref().map(|l| {
+                        let mut sessions: Vec<&str> =
+                            f.session.iter().map(String::as_str).collect();
+                        sessions.extend(f.aliases.iter().map(String::as_str));
+                        sessions.push(&session);
+                        sessions.extend(tracker.aliases.iter().map(String::as_str));
+                        with_ledger(f, &sessions, l)
+                    });
+                    let f = leased.as_ref().unwrap_or(f);
+                    due_chores(f, tracker.rows(), &view.logs, now)
+                }
+                None => Vec::new(),
+            };
+            let same = view
+                .chores
+                .as_ref()
+                .is_some_and(|(s, c)| *s == session && *c == due);
+            if same {
+                continue;
+            }
+            match manage_chores::publish(&dir, &session, &due) {
+                Ok(()) => view.chores = Some((session, due)),
+                Err(e) => tracing::warn!("management panel: chores not kept: {e}"),
+            }
+        }
+    }
+
     /// Forget a closed tab.
     pub fn forget(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
@@ -973,8 +1035,10 @@ pub struct Line {
     /// A `giverny manage run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
-    /// A Running row with nothing running it ([`unworked`]): its worker has
-    /// finished, or it has none. NOW says which, in the warning colour.
+    /// A Running row the person has to know about ([`unworked`]): its
+    /// worker stopped on an API error, or it has none. NOW says which, in
+    /// the warning colour. A worker that finished is its manager's to land,
+    /// not the person's ([`chores`]): its row is drawn as any Running row.
     pub flag: bool,
     pub click: RowClick,
 }
@@ -1027,22 +1091,87 @@ pub fn build_with(
     logs: &Logs,
     done: DoneRows,
 ) -> Table {
+    with_rows(feed, live, logs, |feed, mut rows| {
+        keep_done(&mut rows, done, |r| r.stage);
+        let written = feed.and_then(|f| f.written_ms);
+        let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let wait = planned_wait(row, &rows);
+            lines.push(format_row(row, now_ms, written, clock, wait));
+        }
+        dittos(&rows, &mut lines);
+        Table {
+            lines,
+            footer: feed.and_then(|f| f.footer.clone()),
+        }
+    })
+}
+
+/// The pane's rows, as it draws them: the feed with the hand-offs its
+/// workers' transcripts tell of, merged with the live rows. `f` gets the
+/// feed it was merged from.
+fn with_rows<T>(
+    feed: Option<&Feed>,
+    live: &[SubagentRow],
+    logs: &Logs,
+    f: impl FnOnce(Option<&Feed>, Vec<PaneRow<'_, SubagentRow>>) -> T,
+) -> T {
     let log = |id: &str| logs.get(id);
     let handed = feed::with_handoffs(feed, live, log);
     let feed = handed.as_ref().or(feed);
-    let mut rows = feed::merge_with(feed, live, log);
-    keep_done(&mut rows, done, |r| r.stage);
-    let written = feed.and_then(|f| f.written_ms);
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let wait = planned_wait(row, &rows, now_ms);
-        lines.push(format_row(row, now_ms, written, clock, wait));
-    }
-    dittos(&rows, &mut lines);
-    Table {
-        lines,
-        footer: feed.and_then(|f| f.footer.clone()),
-    }
+    f(feed, feed::merge_with(feed, live, log))
+}
+
+/// The chores of [`chores`] that are due at `now_ms` and that the feed's
+/// rows were not told of yet: what the manager is to hear.
+pub fn due_chores(feed: &Feed, live: &[SubagentRow], logs: &Logs, now_ms: u64) -> Vec<Chore> {
+    chores(Some(feed), live, logs, now_ms)
+        .into_iter()
+        .filter(|c| c.is_due(now_ms))
+        .filter(|c| !feed.rows.iter().any(|r| r.key == c.key && c.told(r)))
+        .collect()
+}
+
+/// What the rows ask of their manager rather than of the person
+/// (giverny#310): a Running row whose worker has finished, unlanded
+/// ([`Unworked::Finished`]), and a Next up row waiting on nothing recorded
+/// ([`Wait::idle_since`]) — the very rows the pane once drew in amber, from
+/// the same logic. Every one, due or not, told or not:
+/// [`manage_chores::Chore::is_due`] and [`manage_chores::Chore::told`] say
+/// which to keep.
+pub fn chores(feed: Option<&Feed>, live: &[SubagentRow], logs: &Logs, now_ms: u64) -> Vec<Chore> {
+    with_rows(feed, live, logs, |_, rows| {
+        let mut out = Vec::new();
+        for row in &rows {
+            let Some(key) = row.feed.map(|f| f.key.clone()) else {
+                continue;
+            };
+            let chore = match row.stage {
+                Stage::Running => match unworked(row, now_ms) {
+                    Some(Unworked::Finished { how, ended_ms }) => ended_ms.map(|since| Chore {
+                        key,
+                        kind: manage_chores::Kind::Land,
+                        since,
+                        how: Some(how.to_string()),
+                    }),
+                    _ => None,
+                },
+                Stage::Planned => {
+                    planned_wait(row, &rows)
+                        .and_then(|w| w.idle_since)
+                        .map(|since| Chore {
+                            key,
+                            kind: manage_chores::Kind::Start,
+                            since,
+                            how: None,
+                        })
+                }
+                Stage::Done => None,
+            };
+            out.extend(chore);
+        }
+        out
+    })
 }
 
 /// Drop the Done rows `done` does not keep. Done rows sit newest first, so
@@ -1235,14 +1364,17 @@ fn format_row(
     };
     let usage_load = live.map(|l| run_load(l, sessions_load::machine_ram_mb()));
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
+    // Only what the person has to know is flagged: a worker stopped on an
+    // API error, a row nothing runs. A finished worker's row and an idle
+    // Next up row are their manager's ([`chores`]), drawn plain.
     let flag = match row.stage {
-        Stage::Running => unworked(row, now_ms),
-        Stage::Planned => wait.as_ref().filter(|w| w.flag).map(|w| w.note.clone()),
-        Stage::Done => None,
+        Stage::Running => unworked(row, now_ms).and_then(Unworked::flag),
+        Stage::Planned | Stage::Done => None,
     };
     let now = match row.stage {
-        // What is not running comes first: a Running row whose worker has
-        // finished, or that has none, says so before anything else.
+        // What is not running comes first: a Running row whose worker
+        // stopped on an error, or that has none, says so before anything
+        // else.
         Stage::Running if flag.is_some() => flag.clone().unwrap_or_default(),
         // The limit next: a row the writer paused for it says why.
         Stage::Running => match (limit, paused) {
@@ -1254,7 +1386,7 @@ fn format_row(
                 .and_then(|l| l.activity.clone())
                 .unwrap_or_default(),
         },
-        // What it waits for ([`planned_wait`]), or that it waits on
+        // What it waits for ([`planned_wait`]); nothing when it waits on
         // nothing recorded.
         Stage::Planned => wait.as_ref().map(|w| w.note.clone()).unwrap_or_default(),
         Stage::Done => f
@@ -1315,21 +1447,47 @@ fn format_row(
     }
 }
 
-/// What a Running row's NOW says when nothing is running it (giverny#258):
-/// the feed says the task runs, but its worker has finished — handed back,
-/// failed, killed or stopped (on an API error, that error) — and nobody
-/// has landed it; or it has no
-/// worker at all, [`feed::HANDOFF_WINDOW_MS`] after it started (a
-/// dispatcher runs `start` a moment before the spawn), and no command of
-/// its own runs either. `None` while a worker works on it.
-fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<String> {
+/// A Running row nothing is running (giverny#258).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unworked {
+    /// Its worker ended on an API error it never wrote past: that error.
+    Stopped(String),
+    /// Its worker finished — handed back, failed, killed or stopped
+    /// (`how`) — at `ended_ms`, and nobody has landed the row.
+    Finished {
+        how: &'static str,
+        ended_ms: Option<u64>,
+    },
+    /// No worker at all, and no command of its own runs.
+    NoWorker,
+}
+
+impl Unworked {
+    /// What the pane flags of it, in NOW: the person's to know. A finished
+    /// worker is its manager's to land ([`chores`]), never flagged.
+    fn flag(self) -> Option<String> {
+        match self {
+            Unworked::Stopped(reason) => Some(format!("stopped: {reason}")),
+            Unworked::NoWorker => Some(NO_WORKER.to_string()),
+            Unworked::Finished { .. } => None,
+        }
+    }
+}
+
+/// Why nothing is running a Running row: the feed says the task runs, but
+/// its worker has finished — handed back, failed, killed or stopped (on an
+/// API error, that error) — and nobody has landed it; or it has no worker
+/// at all, [`feed::HANDOFF_WINDOW_MS`] after it started (a dispatcher runs
+/// `start` a moment before the spawn), and no command of its own runs
+/// either. `None` while a worker works on it.
+fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<Unworked> {
     if let Some(l) = row.live {
         if l.running() {
             return None;
         }
         // Ended on an API error it never wrote past: that error is why.
         if let Some(s) = l.stops.last().filter(|s| s.to_ms.is_none()) {
-            return Some(format!("stopped: {}", s.reason));
+            return Some(Unworked::Stopped(s.reason.clone()));
         }
         let how = match l.outcome {
             Some(Outcome::Failed) => "failed",
@@ -1337,27 +1495,26 @@ fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<String> {
             Some(Outcome::Stopped) => "stopped",
             _ => "finished",
         };
-        return Some(format!("worker {how} — {NOT_LANDED}"));
+        return Some(Unworked::Finished {
+            how,
+            ended_ms: l.ended_ms.or(l.last_turn_ms),
+        });
     }
     let f = row.feed?;
     let started = f.started_ms?;
     let fresh = now_ms < started.saturating_add(feed::HANDOFF_WINDOW_MS);
-    (!fresh && f.live.is_none()).then(|| NO_WORKER.to_string())
+    (!fresh && f.live.is_none()).then_some(Unworked::NoWorker)
 }
-
-/// How long a Next up row may sit with nothing recorded to wait on before
-/// it is flagged ([`NOT_STARTED`]; giverny#282).
-pub const IDLE_PLANNED_MS: u64 = 5 * 60 * 1000;
-/// The start of a flagged idle Next up row's NOW.
-pub const NOT_STARTED: &str = "not started";
 
 /// What a Next up row's NOW says ([`planned_wait`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wait {
     pub note: String,
-    /// Waits on nothing recorded, past [`IDLE_PLANNED_MS`]: drawn in the
-    /// warning colour.
-    pub flag: bool,
+    /// It waits on nothing recorded, since this instant (epoch ms): its
+    /// manager's to start or hold once that is
+    /// [`manage_chores::IDLE_PLANNED_MS`] past ([`chores`]). Drawn as any
+    /// Next up row.
+    pub idle_since: Option<u64>,
     /// The dispatcher's hold, in full, for the overlay header.
     pub held: Option<String>,
 }
@@ -1366,16 +1523,12 @@ pub struct Wait {
 /// on a hold the dispatcher recorded (`held: <why>`), a lease queued in the
 /// ledger (`queued for 3G behind demo#12`), or another task: the one it was
 /// planned `--after` until that lands, or the task its worker is busy with
-/// (`after <key>`). A row with none of these that has sat
-/// [`IDLE_PLANNED_MS`] since it last could have started (planned, its hold
-/// ended, the task before it landed, its lease granted) is flagged: `not
-/// started (idle 12m)`. `None` for any other row, and for a Next up row
-/// whose writer never said when it was planned.
-fn planned_wait(
-    row: &PaneRow<'_, SubagentRow>,
-    rows: &[PaneRow<'_, SubagentRow>],
-    now_ms: u64,
-) -> Option<Wait> {
+/// (`after <key>`). A row with none of these waits on nothing, since it last
+/// could have started (planned, its hold ended, the task before it landed,
+/// its lease granted): [`Wait::idle_since`], and an empty NOW. `None` for
+/// any other row; a Next up row whose writer never said when it was planned
+/// has no `idle_since`.
+fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>]) -> Option<Wait> {
     if row.stage != Stage::Planned {
         return None;
     }
@@ -1383,14 +1536,14 @@ fn planned_wait(
     let waits = |note: String| {
         Some(Wait {
             note,
-            flag: false,
+            idle_since: None,
             held: None,
         })
     };
     if let Some(why) = f.and_then(|f| f.held.clone()) {
         return Some(Wait {
             note: format!("held: {why}"),
-            flag: false,
+            idle_since: None,
             held: Some(why),
         });
     }
@@ -1418,23 +1571,14 @@ fn planned_wait(
     ]
     .into_iter()
     .flatten()
-    .max()?;
-    let idle = now_ms.saturating_sub(since);
-    if idle < IDLE_PLANNED_MS {
-        return waits(String::new());
-    }
+    .max();
     Some(Wait {
-        note: format!(
-            "{NOT_STARTED} (idle {})",
-            feed::fmt_span((idle / 1000) as i64)
-        ),
-        flag: true,
+        note: String::new(),
+        idle_since: since,
         held: None,
     })
 }
 
-/// The end of [`unworked`]'s line for a finished worker.
-const NOT_LANDED: &str = "not landed";
 /// [`unworked`]'s line for a Running row nothing works on.
 pub const NO_WORKER: &str = "no worker running";
 
@@ -3241,12 +3385,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// giverny#258: what the pane draws for a Running row that nothing
-    /// runs. A row linked to a worker that has finished — here acme#615,
-    /// which a hand-off message to `w` only mentioned — stays Running, as
-    /// its writer says, and says its worker finished and it has not landed;
-    /// a Running row with no worker at all says so once a spawn would have
-    /// come; one just started, or whose worker works, says nothing of it.
+    /// giverny#258, giverny#310: what the pane draws for a Running row that
+    /// nothing runs. A row linked to a worker that has finished — here
+    /// acme#615, which a hand-off message to `w` only mentioned — stays
+    /// Running, as its writer says, drawn as any Running row: landing it is
+    /// its manager's chore, told to the manager, not drawn for the person.
+    /// A Running row with no worker at all is flagged once a spawn would
+    /// have come; one just started, or whose worker works, says nothing.
     #[test]
     fn a_running_row_that_nothing_runs_says_so() {
         let lines = [
@@ -3275,16 +3420,32 @@ mod tests {
         let line = |id: &str| t.lines.iter().find(|l| l.id == id).unwrap();
         let got = line("acme#615");
         assert_eq!(got.stage, Stage::Running, "the feed's stage, never Done");
-        assert_eq!(got.now, "worker finished — not landed");
-        assert!(got.flag);
+        assert_eq!(got.now, "", "no chore text");
+        assert!(!got.flag, "drawn in its own colour");
         assert!(
-            got.click
-                .facts
-                .iter()
-                .any(|f| f == "worker finished — not landed")
+            !got.click.facts.iter().any(|f| f.contains("landed")),
+            "{:?}",
+            got.click.facts
         );
-        assert_eq!(got.now.chars().count(), NOW_W, "fits NOW");
         assert!(got.click.finished, "a click opens it as Done (giverny#274)");
+        // The manager hears of it instead, from the same rows: once its
+        // grace is past (the worker ended five minutes ago).
+        let all = chores(Some(&f), &rows, &logs, T0);
+        assert_eq!(
+            all,
+            [Chore {
+                key: "acme#615".into(),
+                kind: manage_chores::Kind::Land,
+                since: T0 - 5 * MIN,
+                how: Some("finished".into()),
+            }]
+        );
+        assert_eq!(due_chores(&f, &rows, &logs, T0), all);
+        assert_eq!(
+            due_chores(&f, &rows, &logs, T0 - 3 * MIN),
+            [],
+            "in its grace"
+        );
         let none = line("acme#617");
         assert_eq!((none.stage, none.now.as_str()), (Stage::Running, NO_WORKER));
         assert!(none.flag);
@@ -3293,17 +3454,25 @@ mod tests {
         assert_eq!((fresh.now.as_str(), fresh.flag), ("", false));
         assert!(!line("acme#614").flag, "a Done row is not flagged");
 
-        // A worker that failed says how; one that works says nothing of it.
+        // A worker that failed is drawn plain too, its end in NOW, and its
+        // manager is told how it ended; one that works is nobody's chore.
         let (dir2, mut rows, logs) = reused_worker("failed", &lines, false);
         rows[0].outcome = Some(Outcome::Failed);
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
-        assert_eq!(got.now, "worker failed — not landed");
+        assert_eq!((got.now.as_str(), got.flag), ("stopped: failed", false));
+        let told = chores(Some(&f), &rows, &logs, T0);
+        assert_eq!(told[0].how.as_deref(), Some("failed"));
+        // Told once: a row stamped for that end is no chore any more.
+        let mut stamped = f.clone();
+        stamped.rows[0].land_nudged_ms = Some(T0 - 5 * MIN);
+        assert_eq!(due_chores(&stamped, &rows, &logs, T0), []);
         let (dir3, rows, logs) = reused_worker("working", &lines, true);
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
         assert!(!got.flag, "{got:?}");
         assert!(!got.click.finished, "a working worker is walked into");
+        assert_eq!(chores(Some(&f), &rows, &logs, T0), []);
         for d in [dir, dir2, dir3] {
             let _ = std::fs::remove_dir_all(&d);
         }
@@ -3844,10 +4013,11 @@ mod tests {
         assert!(cols.taskw < Cols::new(&queued, 100).taskw);
     }
 
-    /// giverny#282: a Next up row says what it waits for, and one that
-    /// waits on nothing recorded is flagged once it has sat a while.
+    /// giverny#282, giverny#310: a Next up row says what it waits for; one
+    /// that waits on nothing recorded is drawn as any Next up row, and is
+    /// its manager's chore once it has sat a while.
     #[test]
-    fn a_next_up_row_says_what_it_waits_for_and_an_idle_one_is_flagged() {
+    fn a_next_up_row_says_what_it_waits_for_and_an_idle_one_is_its_managers() {
         let at = |m: u64| ts(T0 + m * 60_000);
         let json = format!(
             r#"{{"version":1,"rows":[
@@ -3880,7 +4050,7 @@ mod tests {
         );
         assert_eq!(now("282-hold"), ("after 280-reuse", false));
         assert_eq!(now("283-y"), ("queued for 3G behind 280-reuse", false));
-        assert_eq!(now("284-idle"), ("not started (idle 30m)", true));
+        assert_eq!(now("284-idle"), ("", false), "idle 30m: the manager's");
         assert_eq!(now("285-new"), ("", false), "planned two minutes ago");
         assert_eq!(now("286-unheld"), ("", false), "free for two minutes");
         assert_eq!(
@@ -3894,20 +4064,44 @@ mod tests {
             "never said when it was planned"
         );
         let later = build(Some(&feed(&json)), &[], T0 + 40 * 60_000);
-        let flagged: Vec<_> = later
-            .lines
-            .iter()
-            .filter(|l| l.flag && l.stage == Stage::Planned)
-            .map(|l| (l.id.as_str(), l.now.as_str()))
-            .collect();
+        assert!(
+            later
+                .lines
+                .iter()
+                .all(|l| !l.flag || l.stage == Stage::Running),
+            "no Next up row flagged for the person"
+        );
+        // The manager's, from the same logic: every idle row with its
+        // instant, due only past five minutes of it.
+        let f = feed(&json);
+        let idle = |now: u64| -> Vec<(String, u64)> {
+            due_chores(&f, &[], &Logs::new(), now)
+                .into_iter()
+                .map(|c| {
+                    assert_eq!(c.kind, manage_chores::Kind::Start);
+                    (c.key, c.since)
+                })
+                .collect()
+        };
+        let k = |s: &str, m: u64| (s.to_string(), T0 + m * 60_000);
+        assert_eq!(idle(T0 + 30 * 60_000), [k("284-idle", 0)]);
         assert_eq!(
-            flagged,
+            idle(T0 + 40 * 60_000),
             [
-                ("284-idle", "not started (idle 40m)"),
-                ("285-new", "not started (idle 12m)"),
-                ("286-unheld", "not started (idle 12m)"),
-                ("287-after-done", "not started (idle 12m)"),
+                k("284-idle", 0),
+                k("285-new", 28),
+                k("286-unheld", 28),
+                k("287-after-done", 28),
             ]
+        );
+        let line = chores(Some(&f), &[], &Logs::new(), 0)
+            .into_iter()
+            .find(|c| c.key == "284-idle")
+            .unwrap()
+            .line(T0 + 30 * 60_000);
+        assert!(
+            line.contains("`284-idle` has waited 30m with a free lane"),
+            "{line}"
         );
     }
 

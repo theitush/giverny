@@ -103,8 +103,10 @@ away. A planned task may wait on only three things, and each shows on its
   machine" is not one: the ledger already decides that, so claim and let it
   queue.
 
-A Next up row with none of these that sits five minutes is flagged in amber
-(`not started (idle 12m)`): start it, or record what it waits for.
+A Next up row with none of these that sits five minutes is yours to act on:
+Giverny tells you once, on your next tool call (`<task> has waited 12m with a
+free lane: start it, or giverny-manage hold <task> --why …`). Start it, or
+record what it waits for.
 
 ## 2. Start a task
 
@@ -247,9 +249,11 @@ message; `start`/`eta --agent` is how to move one. Beginning the message with
 `New task for you: <next task>` is what tells a hand-off to a worker still busy
 on its last task apart from a mid-task note.
 
-A Running row whose worker has finished says so on its row (`worker finished —
-not landed`), and so does one with no worker at all (`no worker running`):
-land it, or hand it to the worker that holds it. A task you resume with a fresh
+A Running row whose worker has finished and that you have not landed three
+minutes later is told to you once, on your next tool call (`<task>'s worker
+finished 4m ago: check its report and giverny-manage land <task>`). A Running
+row with no worker at all says so on its row, for the user (`no worker
+running`). Land it, or hand it to the worker that holds it. A task you resume with a fresh
 worker (its description naming the task, as always) moves to that worker by
 itself once the old one has finished; `start <task> --agent <new id>` moves it
 at once.

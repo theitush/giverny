@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod jobs;
 pub mod lineage;
 pub mod manage;
+pub mod manage_chores;
 pub mod manage_history;
 pub mod manage_inbox;
 pub mod manage_nudge;

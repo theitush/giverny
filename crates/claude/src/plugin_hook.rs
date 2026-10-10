@@ -21,7 +21,9 @@
 //! - **A manager session's upkeep.** Its leases are renewed
 //!   ([`manage_nudge::beat`]) and, on the dispatcher's own
 //!   calls, its unread `ask`/`reply` messages delivered
-//!   ([`manage_inbox`]).
+//!   ([`manage_inbox`]), and its rows' chores — a finished worker's task to
+//!   land, a Next up task idle with nothing to wait on — told once each
+//!   ([`manage_chores`]).
 //!
 //! **Only where something tracks the worker.** Every ask is for the pane:
 //! it goes out only when the session runs in a Giverny tab
@@ -43,7 +45,7 @@ use serde_json::{Map, Value, json};
 
 use crate::manage::{self, Lock};
 use crate::manage_nudge::{beat, check, holds_row, stamp_agent};
-use crate::{agent_eta, manage_history, manage_inbox, resources};
+use crate::{agent_eta, manage_chores, manage_history, manage_inbox, resources};
 
 /// What the hook payload says about who is calling.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -194,9 +196,11 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
     if let Some(caller) = Caller::of(payload) {
         return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
     }
-    // The dispatcher's own call: its messages, and the worker it just started.
+    // The dispatcher's own call: its messages, its rows' chores, and the
+    // worker it just started.
     let asks: Vec<String> = [
         manage_inbox::deliver(dir, &ledger, session, now),
+        manage_chores::deliver(dir, session, now),
         spawned(payload, dir, session, in_tab),
     ]
     .into_iter()
@@ -548,6 +552,44 @@ mod tests {
             assert_eq!(run(&q, &feeds, T0 + k * MIN, false), None);
         }
         assert!(!feed::feed_path(&feeds, "s2").exists(), "no feed made");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rows_chore_reaches_the_dispatcher_once_and_never_a_worker() {
+        let dir = temp("chores");
+        let f = feed::feed_path(&dir, "s1");
+        manage::write(
+            &f,
+            &doc(
+                json!([{"key": "demo#9", "stage": "running", "started": manage::stamp(T0),
+                         "agent_id": "w1"}]),
+            ),
+        )
+        .unwrap();
+        let chore = manage_chores::Chore {
+            key: "demo#9".into(),
+            kind: manage_chores::Kind::Land,
+            since: T0 + 10 * MIN,
+            how: Some("finished".into()),
+        };
+        manage_chores::publish(&dir, "s1", std::slice::from_ref(&chore)).unwrap();
+        // A worker's call under the same session hears nothing of it.
+        let w = worker_payload(&dir, "s1", "w2", "other work", T0);
+        let said = run(&w, &dir, T0 + 14 * MIN, false).map(|o| context(&o));
+        assert!(!said.unwrap_or_default().contains("demo#9"));
+        assert!(
+            manage_chores::path(&dir, "s1").exists(),
+            "kept for the dispatcher"
+        );
+        let me = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Bash"});
+        let ctx = context(&run(&me, &dir, T0 + 14 * MIN, false).unwrap());
+        assert_eq!(
+            ctx,
+            "Giverny: `demo#9`'s worker finished 4m ago: check its report and \
+             `giverny-manage land demo#9`."
+        );
+        assert_eq!(run(&me, &dir, T0 + 15 * MIN, false), None, "told once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

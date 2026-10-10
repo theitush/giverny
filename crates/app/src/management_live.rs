@@ -98,6 +98,15 @@ impl ManagementLive {
         self.tracker(tab).filter(|_| self.up.contains(&tab))
     }
 
+    /// Every tab whose session is up, with its tracker: what
+    /// [`ManagementLive::shown`] would give for each.
+    pub fn all_shown(&self) -> impl Iterator<Item = (TabId, &Tracker)> {
+        self.trackers
+            .iter()
+            .filter(|(id, _)| self.up.contains(id))
+            .map(|(id, t)| (*id, t))
+    }
+
     /// `tab`'s session ended (`SessionEnd`): its pane goes with it; the rows
     /// are kept for the next start.
     pub fn session_ended(&mut self, tab: TabId) {
