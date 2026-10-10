@@ -249,7 +249,10 @@ on its last task apart from a mid-task note.
 
 A Running row whose worker has finished says so on its row (`worker finished —
 not landed`), and so does one with no worker at all (`no worker running`):
-land it, or hand it to the worker that holds it.
+land it, or hand it to the worker that holds it. A task you resume with a fresh
+worker (its description naming the task, as always) moves to that worker by
+itself once the old one has finished; `start <task> --agent <new id>` moves it
+at once.
 
 ## 4. Land a task
 

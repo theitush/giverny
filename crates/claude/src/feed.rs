@@ -868,7 +868,9 @@ impl<L: LiveAgent> PaneRow<'_, L> {
 ///   It carries the live row its `agent_id` names; failing that (no
 ///   `agent_id`, or one Claude Code no longer lists), the live row whose
 ///   description names the row's key — `Work demo#82 …` holds
-///   `demo#82`, and one naming several keys holds each of them
+///   `demo#82`, and one naming several keys holds each of them.
+///   A Running row whose named worker has finished carries a running one
+///   spawned after it whose description names the key, if there is one.
 ///   The feed's stage wins: one worker may hold a Done row and
 ///   a Running one at once.
 /// - A live row that no feed row carries, and whose description names no
@@ -901,14 +903,34 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
         let first = named.clone().next()?;
         Some(named.find(|l| l.running() == want_running).unwrap_or(first))
     };
+    // A Running row whose worker has finished, and a worker spawned after
+    // it for the same task is running: the dispatcher resumed the task with
+    // a fresh worker and never moved the row (giverny#287). One another row
+    // names by id is that row's.
+    let successor = |f: &FeedRow, held: &L| -> Option<&'a L> {
+        live.iter().find(|l| {
+            l.running()
+                && l.agent_id() != held.agent_id()
+                && names(l, &f.key)
+                && !feed_rows
+                    .iter()
+                    .any(|o| o.agent_id.as_deref() == Some(l.agent_id()))
+                && match (l.started_ms(), held.started_ms()) {
+                    (Some(new), Some(old)) => new > old,
+                    _ => true,
+                }
+        })
+    };
     let mut out: Vec<PaneRow<'a, L>> = feed_rows
         .iter()
         .map(|f| {
-            let live = f
-                .agent_id
-                .as_deref()
-                .and_then(find_live)
-                .or_else(|| by_description(f));
+            let live = match f.agent_id.as_deref().and_then(find_live) {
+                Some(held) if f.stage() == Stage::Running && !held.running() => {
+                    successor(f, held).or(Some(held))
+                }
+                Some(held) => Some(held),
+                None => by_description(f),
+            };
             let finished = f.follows_worker && live.is_some_and(|l| !l.running());
             PaneRow {
                 stage: if finished { Stage::Done } else { f.stage() },
@@ -1925,9 +1947,60 @@ mod tests {
             shape(&rows),
             [(Stage::Done, Some("g#5"), Some("old"), false)]
         );
-        // An agent_id that is listed still wins over any description.
+        // An agent_id that is listed wins over any description while its
+        // worker runs, and on a row that has landed.
+        let busy = [
+            described("old", true, "Work g#5 first try"),
+            described("new", true, "Work g#5 again"),
+        ];
         let f = Feed {
             rows: vec![row("g#5", Stage::Running, Some("old"))],
+            ..Default::default()
+        };
+        assert_eq!(merge(Some(&f), &busy)[0].live.map(|l| l.id), Some("old"));
+        let f = Feed {
+            rows: vec![row("g#5", Stage::Done, Some("old"))],
+            ..Default::default()
+        };
+        assert_eq!(merge(Some(&f), &lives)[0].live.map(|l| l.id), Some("old"));
+    }
+
+    /// The dispatcher resumed a task with a fresh worker and never moved
+    /// its row (giverny#287): the Running row carries the worker running
+    /// it, not the one that finished, and the old one is not drawn alone.
+    #[test]
+    fn a_running_row_whose_worker_finished_takes_the_one_resuming_it() {
+        let lives = [
+            described("old", false, "histfan: population history in the fan"),
+            Live {
+                started: Some(9_000),
+                ..described("new", true, "histfan: resume population history")
+            },
+        ];
+        let f = Feed {
+            rows: vec![row("histfan", Stage::Running, Some("old"))],
+            ..Default::default()
+        };
+        let rows = merge(Some(&f), &lives);
+        assert_eq!(
+            shape(&rows),
+            [(Stage::Running, Some("histfan"), Some("new"), false)]
+        );
+        // One spawned before the finished worker is not resuming it, and
+        // one another row names by id is that row's.
+        let older = [
+            Live {
+                started: Some(9_000),
+                ..described("old", false, "histfan: first try")
+            },
+            described("early", true, "histfan: tests"),
+        ];
+        assert_eq!(merge(Some(&f), &older)[0].live.map(|l| l.id), Some("old"));
+        let f = Feed {
+            rows: vec![
+                row("histfan", Stage::Running, Some("old")),
+                row("histfan-r1", Stage::Running, Some("new")),
+            ],
             ..Default::default()
         };
         assert_eq!(merge(Some(&f), &lives)[0].live.map(|l| l.id), Some("old"));
