@@ -516,7 +516,12 @@ impl ClaudeWatch {
                     Err(e) => tracing::warn!("hook refresh failed for {}: {e}", p.name),
                 }
             }
-            if !hooks::statusline_installed_in(&settings) || hooks::needs_path_refresh(&settings) {
+            // An entry of ours from before `refreshInterval` was written gains
+            // it here, so existing installs see the cold-cache warning too.
+            if !hooks::statusline_installed_in(&settings)
+                || hooks::needs_path_refresh(&settings)
+                || hooks::statusline_lacks_refresh(&settings)
+            {
                 match hooks::set_statusline(&settings, true) {
                     Ok(()) => tracing::info!("live-usage statusline enabled for {}", p.name),
                     Err(e) => tracing::info!("statusline skipped for {}: {e}", p.name),

@@ -568,8 +568,39 @@ pub fn statusline_installed_in(settings_path: &Path) -> bool {
         .is_some_and(|c| c.contains("giverny") && c.trim_end().ends_with("statusline"))
 }
 
+/// How often, in seconds, Claude Code reruns the statusline while a session
+/// sits idle (the entry's `refreshInterval`). Without one it runs only when
+/// the conversation changes, so the cold-cache warning would never appear on
+/// an idle session, which is the only kind it is for. The cache it warns
+/// about expires after 5 minutes at the shortest, so being up to 30 s late
+/// costs nothing, while a short tick would launch `giverny statusline` in
+/// every open session that often for no gain.
+pub const STATUSLINE_REFRESH_S: u64 = 30;
+
+/// Does our statusline entry lack a `refreshInterval`? True only for an
+/// entry of ours (installs from before it was written), never for a foreign
+/// statusline or none at all; `set_statusline(.., true)` then adds it.
+pub fn statusline_lacks_refresh(settings_path: &Path) -> bool {
+    if !statusline_installed_in(settings_path) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("statusLine")
+        .and_then(|s| s.get("refreshInterval"))
+        .is_none_or(serde_json::Value::is_null)
+}
+
 /// Install/remove the Giverny statusline. Refuses to replace a statusline
 /// the user configured themselves.
+///
+/// Enabling over an entry of ours (a path refresh) rewrites only its `type`
+/// and `command`: a `padding`, `refreshInterval` or any other key the user
+/// set on it is kept, and the defaults fill in only what is missing.
 pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
     let mut root: serde_json::Value = match std::fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -587,14 +618,23 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
         anyhow::bail!("a custom statusLine is already configured — leaving it alone");
     }
     if enable {
-        obj.insert(
-            "statusLine".into(),
-            serde_json::json!({
-                "type": "command",
-                "command": statusline_command_for(settings_path),
-                "padding": 0,
-            }),
+        let mut entry = match obj.remove("statusLine") {
+            Some(serde_json::Value::Object(ours)) => ours,
+            _ => serde_json::Map::new(),
+        };
+        entry.insert("type".into(), "command".into());
+        entry.insert(
+            "command".into(),
+            statusline_command_for(settings_path).into(),
         );
+        entry.entry("padding").or_insert(0.into());
+        if entry
+            .get("refreshInterval")
+            .is_none_or(serde_json::Value::is_null)
+        {
+            entry.insert("refreshInterval".into(), STATUSLINE_REFRESH_S.into());
+        }
+        obj.insert("statusLine".into(), entry.into());
     } else {
         obj.remove("statusLine");
     }
@@ -1193,6 +1233,84 @@ mod tests {
             set_statusline(&path, true).is_err(),
             "must not clobber a user statusline"
         );
+    }
+
+    fn statusline_entry(path: &Path) -> serde_json::Value {
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        root["statusLine"].clone()
+    }
+
+    #[test]
+    fn a_fresh_statusline_refreshes_every_30_seconds() {
+        let path = scratch("statusline-refresh-fresh");
+        set_statusline(&path, true).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["refreshInterval"], STATUSLINE_REFRESH_S);
+        assert_eq!(entry["refreshInterval"], 30);
+        assert_eq!(entry["padding"], 0);
+        assert!(!statusline_lacks_refresh(&path));
+    }
+
+    #[test]
+    fn a_refresh_interval_the_user_set_survives_a_path_refresh() {
+        let path = scratch("statusline-refresh-user");
+        std::fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"/old/path/giverny statusline",
+                "padding":2,"refreshInterval":5,"note":"mine"}}"#,
+        )
+        .unwrap();
+        assert!(needs_path_refresh(&path));
+        assert!(!statusline_lacks_refresh(&path), "it has one");
+
+        set_statusline(&path, true).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["command"], statusline_command_for(&path));
+        assert_eq!(entry["refreshInterval"], 5, "the user's value is kept");
+        assert_eq!(entry["padding"], 2);
+        assert_eq!(entry["note"], "mine", "other keys of the user's are kept");
+        assert!(!needs_path_refresh(&path));
+
+        set_statusline(&path, true).unwrap();
+        assert_eq!(statusline_entry(&path)["refreshInterval"], 5);
+    }
+
+    #[test]
+    fn an_older_entry_of_ours_gains_the_refresh_interval() {
+        let path = scratch("statusline-refresh-old");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": statusline_command_for(&path),
+                    "padding": 0,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(statusline_installed_in(&path));
+        assert!(!needs_path_refresh(&path), "the path is current");
+        assert!(statusline_lacks_refresh(&path));
+
+        set_statusline(&path, true).unwrap();
+        assert_eq!(statusline_entry(&path)["refreshInterval"], 30);
+        assert!(!statusline_lacks_refresh(&path));
+    }
+
+    #[test]
+    fn a_foreign_statusline_never_lacks_a_refresh_interval() {
+        let path = scratch("statusline-refresh-foreign");
+        let mine = r#"{"statusLine":{"type":"command","command":"my-own-script.sh"}}"#;
+        std::fs::write(&path, mine).unwrap();
+        assert!(!statusline_lacks_refresh(&path), "not ours to change");
+        assert!(set_statusline(&path, true).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+
+        let none = scratch("statusline-refresh-none");
+        assert!(!statusline_lacks_refresh(&none), "no file, nothing to add");
     }
 
     #[test]
