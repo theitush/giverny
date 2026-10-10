@@ -900,6 +900,8 @@ pub struct TabRuntime {
     /// The worker view whose header was closed with its `×`; it stays
     /// closed until the tab leaves that view.
     header_closed: Option<String>,
+    /// Which prompt the bar over the terminal pins, kept between frames.
+    pub prompt_bar: prompt_bar::Owner,
 }
 
 /// How often the active tab's screen is read for a worker's view: fast
@@ -2408,8 +2410,11 @@ impl App {
                     viewed: None,
                     shown_viewed: None,
                     header_closed: None,
+                    prompt_bar: prompt_bar::Owner::default(),
                 });
                 entry.session = Some(session);
+                // A new session counts its changes from nothing again.
+                entry.prompt_bar = prompt_bar::Owner::default();
                 // Startup rc files may `cd` away from the spawn dir; verify
                 // and correct once the shell has settled. Not across the WSL
                 // boundary: what Windows can see of `wsl.exe` is its own
@@ -4220,6 +4225,8 @@ impl App {
     ///   tab's management panel, cell to cell; the same cell twice
     ///   is a click;
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
+    /// * `wheel <lines> [<x> <y>]` — the wheel turned over a point (up when
+    ///   positive), by default the terminal's top row;
     /// * `settings <section>` — the settings screen, on that section (its
     ///   rail title, `management panel`); `settings` alone closes it;
     /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
@@ -4411,6 +4418,31 @@ impl App {
                         )]);
                     }
                     feed(vec![button(to, false)]);
+                }
+                // `wheel <lines> [<x> <y>]`: the pointer there (by default
+                // just inside the terminal's top-left corner, over its top
+                // row) and the wheel turned that many lines, up when
+                // positive.
+                "wheel" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let pos = match n.as_slice() {
+                        [_, x, y] => Some(egui::pos2(*x, *y)),
+                        _ => self.session_rect.map(|r| r.min + egui::vec2(60.0, 4.0)),
+                    };
+                    let (Some(&lines), Some(pos)) = (n.first(), pos) else {
+                        tracing::warn!("debug cmd: no such wheel {arg}");
+                        continue;
+                    };
+                    feed(vec![egui::Event::PointerMoved(pos)]);
+                    feed(vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, lines),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
                 }
                 // `shots <dir> <frames> <stride>`: photograph the window's
                 // next frames, leaving it open.
@@ -5072,6 +5104,9 @@ impl eframe::App for App {
                 if let Some(session) = &mut rt.session {
                     // The worker overlay is laid out on this rect.
                     self.session_rect = Some(ui.available_rect_before_wrap());
+                    // The wheel over the closed prompt bar scrolls the
+                    // terminal under it.
+                    rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     if rt.view.button_pressed {
@@ -5115,13 +5150,18 @@ impl eframe::App for App {
                         .prompts_of(active)
                         .filter(|_| header.is_none())
                         .and_then(|history| {
-                            let rows = session.viewport_rows();
-                            prompt_bar::owner(history, &rows, |matches| {
-                                session.find_above(prompt_bar::SEARCH_ABOVE, |row, shaded| {
-                                    matches(row, shaded)
+                            rt.prompt_bar
+                                .get(session.content_seq(), history, || {
+                                    let rows = session.viewport_rows();
+                                    prompt_bar::owner(history, &rows, |matches| {
+                                        session.find_above(
+                                            prompt_bar::SEARCH_ABOVE,
+                                            &prompt_bar::PROMPT_MARKS,
+                                            |row, shaded| matches(row, shaded),
+                                        )
+                                    })
                                 })
-                            })
-                            .map(|i| history[i].as_str())
+                                .map(|i| history[i].as_str())
                         });
                     match pinned {
                         Some(prompt) => {
@@ -5131,6 +5171,7 @@ impl eframe::App for App {
                                 &self.chrome,
                                 response.rect,
                                 row,
+                                self.shared.font_size,
                                 active,
                                 prompt,
                             ) {
