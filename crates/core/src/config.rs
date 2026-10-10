@@ -382,8 +382,8 @@ impl Default for WindowConfig {
 #[serde(default)]
 pub struct RailConfig {
     /// Move the rail's status marks: the spinner on a working tab, the
-    /// pulse on one that wants you. Off, each is drawn still and the rail
-    /// asks for no frames of its own.
+    /// pulse on one that wants you. Off, no spinner is drawn, the flag does
+    /// not pulse, and the rail asks for no frames of its own.
     pub animate: bool,
 }
 
