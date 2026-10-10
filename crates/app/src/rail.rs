@@ -32,9 +32,10 @@ fn anim_time() -> f64 {
     giverny_term::pace::anim_time()
 }
 
-/// Whether the rail's marks move (`rail.animate`, #266). Set once a frame
-/// by [`show`]; off, every spinner stands at [`STILL_TURNS`], the pulse at
-/// full strength, and nothing here asks for a frame.
+/// Whether the rail draws its moving marks (`rail.animate`, #266). Set once
+/// a frame by [`show`]. Off, no spinner, ring or pulse is drawn at all (their
+/// place stays blank, so nothing beside them moves), and nothing here asks
+/// for a frame.
 fn animating(ui: &Ui) -> bool {
     ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(ANIMATE_ID)))
@@ -42,10 +43,6 @@ fn animating(ui: &Ui) -> bool {
 }
 
 const ANIMATE_ID: &str = "rail-animate";
-
-/// Where a still spinner points: its gap up and to the right, which reads
-/// as a ring with a break, not the idle tab's closed one.
-const STILL_TURNS: f64 = 0.0;
 
 /// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
 /// but only while it is on screen. A row scrolled out of the rail, or a
@@ -68,16 +65,19 @@ fn keep_animating(ui: &Ui, rect: Rect) {
 /// (#70). On a software renderer every frame is CPU, so they keep to the
 /// shared four-a-second clock at half a turn a second, eight positions to a
 /// turn (#43).
-fn spin(ui: &Ui, rect: Rect) -> f64 {
+///
+/// `None` with `rail.animate` off: then there is no spinner to draw.
+fn spin(ui: &Ui, rect: Rect) -> Option<f64> {
+    if !animating(ui) {
+        return None;
+    }
     keep_spinning(ui, rect);
-    spin_turns(ui)
+    Some(spin_turns(ui))
 }
 
 /// [`spin`]'s angle alone, for a spinner whose rect is not known yet.
 fn spin_turns(ui: &Ui) -> f64 {
-    if !animating(ui) {
-        STILL_TURNS
-    } else if giverny_term::pace::cheap_frames() {
+    if giverny_term::pace::cheap_frames() {
         ui.input(|i| i.time)
     } else {
         anim_time() / 2.0
@@ -635,11 +635,15 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
         tab_row(app, ui, row, fg, dim, actions);
     }
     let turns = spin_turns(ui);
+    let animate = animating(ui);
     for job in &jobs {
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
+            // Off, its place stays blank: the glyph is drawn see-through,
+            // so the name beside it does not move when the switch flips.
+            JobState::Working if job.live && !animate => (braille(turns), Color32::TRANSPARENT),
             JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
             JobState::Blocked => ("⚑".into(), c.amber),
@@ -861,12 +865,10 @@ fn category_header(
     );
     badge_x -= 20.0;
     if cat.busy > 0 {
-        spinner(
-            &p,
-            Pos2::new(badge_x, rect.center().y),
-            spin(ui, rect),
-            cat.color,
-        );
+        // Off, the ring's place stays blank and the count keeps its spot.
+        if let Some(turns) = spin(ui, rect) {
+            spinner(&p, Pos2::new(badge_x, rect.center().y), turns, cat.color);
+        }
         p.text(
             Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -1053,19 +1055,23 @@ fn tab_row(
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     let time = anim_time();
     match row.claude {
+        // Off, a working tab has no mark: the only state drawn blank. The
+        // title stays where it is.
         ClaudeState::Busy => {
-            spinner(&p, dot, spin(ui, rect), row.color);
+            if let Some(turns) = spin(ui, rect) {
+                spinner(&p, dot, turns, row.color);
+            }
         }
         ClaudeState::NeedsYou => {
-            // One breath every two seconds, sampled at the animation step;
-            // full strength when the rail is still.
+            // One breath every two seconds, sampled at the animation step.
+            // Off, no pulse: the flag in plain amber.
             let pulse = if animating(ui) {
+                keep_animating(ui, rect);
                 ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32
             } else {
                 1.0
             };
             flag(&p, dot, c.amber.gamma_multiply(pulse));
-            keep_animating(ui, rect);
         }
         // Green and still: finished, nothing owed. The amber flag above is
         // the one that wants something, and the two differ in colour, shape
@@ -1403,7 +1409,8 @@ fn usage_panel(
                 .color(dim),
         );
         let spinning = app.claude.refresh_in_flight();
-        let label = if spinning {
+        // Off, no spinner: the refresh mark stays, lit while it runs.
+        let label = if spinning && animating(ui) {
             braille(spin_turns(ui))
         } else {
             "⟳".to_string()
@@ -1663,25 +1670,26 @@ mod tests {
     use super::*;
 
     /// The delay the rail asks for in one frame that draws a spinner and a
-    /// pulse on screen, with `rail.animate` at `animate`.
-    fn rail_wake(ctx: &egui::Context, animate: bool) -> (std::time::Duration, f64) {
+    /// pulse on screen, with `rail.animate` at `animate`, and the spinner's
+    /// angle (`None`: no spinner drawn).
+    fn rail_wake(ctx: &egui::Context, animate: bool) -> (std::time::Duration, Option<f64>) {
         let mut turns = None;
         let out = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.ctx()
                 .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
-            turns = Some(spin(ui, rect));
+            turns = spin(ui, rect);
             keep_spinning(ui, rect);
             keep_animating(ui, rect);
         });
         let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
-        (delay, turns.unwrap())
+        (delay, turns)
     }
 
-    /// Off, the marks stand still and the rail wakes nothing; on, it asks
-    /// for the clock's next tick (#266, #43).
+    /// Off, there is no spinner and the rail wakes nothing; on, it spins
+    /// and asks for the clock's next tick (#266, #43).
     #[test]
-    fn a_still_rail_schedules_no_frames() {
+    fn a_rail_without_animation_draws_no_spinner_and_schedules_no_frames() {
         let ctx = egui::Context::default();
         for _ in 0..3 {
             rail_wake(&ctx, false);
@@ -1692,10 +1700,10 @@ mod tests {
             std::time::Duration::MAX,
             "a still rail woke the window"
         );
-        assert_eq!(turns, STILL_TURNS);
-        assert_eq!(braille(turns), braille(STILL_TURNS));
-        let (delay, _) = rail_wake(&ctx, true);
+        assert_eq!(turns, None, "a spinner drawn with the switch off");
+        let (delay, turns) = rail_wake(&ctx, true);
         assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
+        assert!(turns.is_some(), "no spinner with the switch on");
     }
 
     #[test]
