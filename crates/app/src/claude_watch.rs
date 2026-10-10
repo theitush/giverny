@@ -267,6 +267,13 @@ pub struct ClaudeWatch {
     pub accounts: Vec<AccountPanel>,
     pub hooks_installed: bool,
     hook_rx: Option<Receiver<RelayMsg>>,
+    /// The live Giverny that has the relay socket, when this one could not
+    /// take it: every hook goes to that one's window, not this one's.
+    relay_holder: Option<hooks::Holder>,
+    /// Second launches asking this window to come forward, each the
+    /// connection to answer ([`hooks::spawn_listener`]).
+    #[cfg(unix)]
+    raise_rx: Receiver<std::os::unix::net::UnixStream>,
     last_scan: Instant,
     /// The last registry scan, and whether every live session predates the
     /// settings file. Both are filesystem work — for an account inside WSL,
@@ -547,12 +554,16 @@ impl ClaudeWatch {
         // Unix: a socket for instant delivery. Elsewhere (or if binding
         // fails): poll the spool file the relay always falls back to.
         #[cfg(unix)]
-        let listener = hooks::spawn_listener(spool, wake);
+        let (raise_tx, raise_rx) = crossbeam_channel::unbounded();
+        #[cfg(unix)]
+        let listener = hooks::spawn_listener(spool, raise_tx, wake);
         #[cfg(not(unix))]
         let listener = hooks::spawn_spool_watcher(spool, wake);
+        let mut relay_holder = None;
         let (hook_rx, spooled) = match listener {
             Ok((rx, spooled)) => (Some(rx), spooled),
             Err(err) => {
+                relay_holder = err.downcast_ref::<hooks::Held>().map(|held| held.holder);
                 tracing::warn!("hook listener unavailable: {err:#}");
                 (None, Vec::new())
             }
@@ -585,6 +596,9 @@ impl ClaudeWatch {
             viewing: HashMap::new(),
             accounts: Vec::new(),
             hook_rx,
+            relay_holder,
+            #[cfg(unix)]
+            raise_rx,
             last_scan: Instant::now() - Duration::from_secs(10),
             scan_rx: None,
             scanned: ScanResult::default(),
@@ -1819,6 +1833,9 @@ impl ClaudeWatch {
             accounts: Vec::new(),
             hooks_installed: true,
             hook_rx: None,
+            relay_holder: None,
+            #[cfg(unix)]
+            raise_rx: crossbeam_channel::never(),
             last_scan: Instant::now(),
             scan_rx: None,
             scanned: ScanResult::default(),
@@ -1846,6 +1863,17 @@ impl ClaudeWatch {
     /// Is the hook relay socket actually listening?
     pub fn relay_listening(&self) -> bool {
         self.hook_rx.is_some()
+    }
+
+    /// The Giverny that has the relay instead of this one, if a live one does.
+    pub fn relay_holder(&self) -> Option<hooks::Holder> {
+        self.relay_holder
+    }
+
+    /// Second launches waiting for this window to come forward and say so.
+    #[cfg(unix)]
+    pub fn raise_requests(&self) -> Vec<std::os::unix::net::UnixStream> {
+        self.raise_rx.try_iter().collect()
     }
 }
 
