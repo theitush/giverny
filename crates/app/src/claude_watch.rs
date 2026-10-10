@@ -2606,7 +2606,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_adopted_session_reads_its_prompt_from_the_transcript() {
-        let dir = std::env::temp_dir().join(format!("giverny-adopt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("giverny-adopted-transcript-{}", std::process::id()));
         let proj = dir.join("projects").join("-home-u-proj");
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(
