@@ -3514,6 +3514,7 @@ impl eframe::App for App {
                                 &self.chrome,
                                 response.rect,
                                 row,
+                                self.shared.font_size,
                                 active,
                                 prompt,
                             ) {
