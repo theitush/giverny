@@ -1796,16 +1796,10 @@ fn readout_inline(p: &egui::Painter, right: f32, y: f32, u: &Use, c: crate::chro
 }
 
 /// How much of the whole machine a figure is, as the rail colours it
-/// (giverny#289, #295): dim under 20 %, amber from 20 % to 50 %, poppy
-/// over it.
+/// (giverny#289, #295): dim while [`Load::Light`](crate::sessions_load::Load),
+/// amber or poppy above.
 fn machine_color(share: f64, c: crate::chrome::Chrome) -> Color32 {
-    if share > 50.0 {
-        c.poppy
-    } else if share >= 20.0 {
-        c.amber
-    } else {
-        c.dim
-    }
+    crate::sessions_load::Load::of(share).color(c.dim, c)
 }
 
 /// How full a share is, as the account bars colour it: poppy when

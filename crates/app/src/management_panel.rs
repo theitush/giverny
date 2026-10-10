@@ -69,6 +69,7 @@ use giverny_term::widget::RenderShared;
 
 use crate::chrome::Chrome;
 use crate::claude_watch::ClaudeWatch;
+use crate::sessions_load::{self, Load};
 
 /// The three stage tints, the 256-colour codes 38;5;32, 38;5;67 and
 /// 38;5;28, picked to read on dark and light
@@ -747,6 +748,55 @@ pub fn usage_cell(live: Option<RunLive>, peak_mb: Option<u64>, oom: bool, gpu: b
     format!("{oom}{cpu}{memory}{gpu}")
 }
 
+/// How heavy a run's live CPU and memory are on the whole machine of
+/// `ram_mb`, as the rail weighs a tab's ([`sessions_load::machine_shares`]).
+fn run_load(l: RunLive, ram_mb: u64) -> (Load, Load) {
+    let u = giverny_claude::use_reading::Use {
+        cpu_pct: l.cpu_pct,
+        mem_mb: l.mem_mb,
+        gpu_mb: None,
+        gpu_pct: None,
+    };
+    let (cpu, mem) = sessions_load::machine_shares(&u, ram_mb);
+    (Load::of(cpu), Load::of(mem))
+}
+
+/// A use cell as drawn, in runs of one colour: `(column in the cell, text,
+/// colour)`. Everything is `ink`, the cell's own colour, but a Running
+/// row's CPU and memory figures (`load`), each coloured by its weight on
+/// the machine ([`Load::color`]): the same columns as [`usage_cell`]'s
+/// slots, so nothing moves. The OOM tag, the separator and the GPU slot
+/// keep `ink`.
+fn usage_inks(
+    cell: &str,
+    load: Option<(Load, Load)>,
+    ink: Color32,
+    c: &Chrome,
+) -> Vec<(usize, String, Color32)> {
+    let chars: Vec<char> = cell.chars().collect();
+    let piece = |a: usize, b: usize| -> String {
+        chars[a.min(chars.len())..b.min(chars.len())]
+            .iter()
+            .collect()
+    };
+    let Some((cpu, mem)) = load else {
+        return vec![(0, cell.to_string(), ink)];
+    };
+    let cpu_at = OOM_SLOT.len();
+    let mem_at = cpu_at + 8 + session_use::SEP.chars().count();
+    let runs = [
+        (0, cpu_at, ink),
+        (cpu_at, cpu_at + 8, cpu.color(ink, *c)),
+        (cpu_at + 8, mem_at, ink),
+        (mem_at, mem_at + 4, mem.color(ink, *c)),
+        (mem_at + 4, chars.len(), ink),
+    ];
+    runs.into_iter()
+        .map(|(a, b, color)| (a, piece(a, b), color))
+        .filter(|(_, t, _)| !t.trim().is_empty())
+        .collect()
+}
+
 /// The usage in full for the row's overlay header: `peak 2.1G of 3G, 45s
 /// CPU, killed by the memory cap (OOM) x2`.
 fn usage_fact(u: &RowUsage) -> String {
@@ -916,6 +966,10 @@ pub struct Line {
     /// (zero between its commands), the memory peak on a Done one (zero when
     /// nothing was measured); empty on a Next up row.
     pub usage: String,
+    /// How heavy a Running row's live CPU and memory are on the whole
+    /// machine ([`Load`]), each drawn in its own colour over the cell's
+    /// ([`usage_inks`]); `None` on any other row, whose cell is one colour.
+    pub usage_load: Option<(Load, Load)>,
     /// A `giverny manage run` of the row was killed by its memory cap: the
     /// lease cell is drawn in the warning colour.
     pub oom: bool,
@@ -1169,20 +1223,17 @@ fn format_row(
     // or was measured; Next up rows say what they wait for in NOW instead.
     let peak = measured.and_then(|u| u.peak_mb);
     let gpu = session_use::gpu::present();
+    let live = (row.stage == Stage::Running).then(|| {
+        f.and_then(|f| f.live)
+            .or_else(|| row.agent_id().and_then(|id| clock.workers.get(id)).copied())
+            .unwrap_or_default()
+    });
     let usage = match row.stage {
-        Stage::Running => usage_cell(
-            Some(
-                f.and_then(|f| f.live)
-                    .or_else(|| row.agent_id().and_then(|id| clock.workers.get(id)).copied())
-                    .unwrap_or_default(),
-            ),
-            None,
-            oom,
-            gpu,
-        ),
+        Stage::Running => usage_cell(live, None, oom, gpu),
         Stage::Done => usage_cell(None, peak, oom, gpu),
         Stage::Planned => String::new(),
     };
+    let usage_load = live.map(|l| run_load(l, sessions_load::machine_ram_mb()));
     let limit = clock.limit.filter(|l| l.out_at(now_ms));
     let flag = match row.stage {
         Stage::Running => unworked(row, now_ms),
@@ -1242,6 +1293,7 @@ fn format_row(
         now,
         tokens,
         usage,
+        usage_load,
         oom,
         flag: flag.is_some(),
         click: RowClick {
@@ -2210,6 +2262,16 @@ fn draw_table(
             } else {
                 color
             };
+            if k == LEASE_SEG
+                && let Some(line) = line
+            {
+                // A Running row's figures each by their weight on the
+                // machine (giverny#305).
+                for (col, run, ink) in usage_inks(s, line.usage_load, ink, chrome) {
+                    shared.paint_text(&p, at + egui::vec2(col as f32 * cw, 0.0), &run, ink);
+                }
+                continue;
+            }
             shared.paint_text(&p, at, s, ink);
         }
     }
@@ -3645,6 +3707,95 @@ mod tests {
             "{:?}",
             t.lines[0].usage
         );
+    }
+
+    /// A Running row's live CPU and memory are each coloured by their
+    /// weight on the whole machine, as the rail's figures are
+    /// (giverny#305): the row's own colour under 20 %, amber to 50 %, poppy
+    /// over it. Memory is a share of all the RAM. The OOM tag, the
+    /// separator, the GPU slot and a Done row's peak keep the cell's
+    /// colour, and the runs sit in the cell's own columns.
+    #[test]
+    fn a_running_rows_figures_are_coloured_by_their_weight_on_the_machine() {
+        let c = Chrome::from_theme(&giverny_term::render::theme::Theme::monet_dark());
+        let rl = |cpu_pct, mem_mb| RunLive {
+            cpu_pct,
+            mem_mb,
+            gpu_mb: None,
+        };
+        // Of 24G: 4.56G is 19 %, 6G 25 %, 12.24G 51 %.
+        let ram = 24_000;
+        assert_eq!(run_load(rl(5, 4_560), ram), (Load::Light, Load::Light));
+        assert_eq!(run_load(rl(25, 100), ram), (Load::Busy, Load::Light));
+        assert_eq!(run_load(rl(50, 6_000), ram), (Load::Busy, Load::Busy));
+        assert_eq!(run_load(rl(51, 12_240), ram), (Load::Heavy, Load::Heavy));
+        assert_eq!(run_load(rl(5, 0), 0), (Load::Light, Load::Light));
+
+        // Drawn: each figure in its own colour, in its own columns.
+        for gpu in [false, true] {
+            let on_gpu = RunLive {
+                gpu_mb: Some(1_200),
+                ..rl(25, 100)
+            };
+            let cell = usage_cell(Some(on_gpu), None, true, gpu);
+            let runs = usage_inks(&cell, Some((Load::Busy, Load::Light)), RUNNING, &c);
+            let mut back = vec![' '; cell.chars().count()];
+            for (at, text, _) in &runs {
+                for (i, ch) in text.chars().enumerate() {
+                    back[at + i] = ch;
+                }
+            }
+            assert_eq!(back.into_iter().collect::<String>(), cell, "same columns");
+            let ink = |piece: &str| {
+                runs.iter()
+                    .find(|(_, t, _)| t.contains(piece))
+                    .map(|r| r.2)
+                    .unwrap_or_else(|| panic!("{piece:?} in {runs:?}"))
+            };
+            assert_eq!(ink("25% CPU"), c.amber);
+            assert_eq!(ink("0.1G"), RUNNING);
+            assert_eq!(ink("OOM"), RUNNING, "the tag keeps the cell's colour");
+            assert_eq!(ink("·"), RUNNING);
+            if gpu {
+                assert_eq!(ink("gpu"), RUNNING);
+            }
+        }
+        let cell = usage_cell(Some(rl(60, 13_000)), None, false, false);
+        let runs = usage_inks(&cell, Some((Load::Heavy, Load::Heavy)), RUNNING, &c);
+        let inks: Vec<_> = runs.iter().map(|r| (r.1.trim(), r.2)).collect();
+        assert_eq!(
+            inks,
+            [("60% CPU", c.poppy), ("·", RUNNING), ("13G", c.poppy)]
+        );
+        // A Done row's peak is the cell's colour, whatever it weighs.
+        let done = usage_cell(None, Some(20_000), false, false);
+        assert_eq!(usage_inks(&done, None, DONE, &c), [(0, done.clone(), DONE)]);
+
+        // From the feed: a Running row carries its load, a Done row none.
+        let json = r#"{"session":"s","rows":[
+            {"key":"sim#1","stage":"running","agent_id":"a1","started":1790000000000,"eta_s":1800},
+            {"key":"sim#2","stage":"running","agent_id":"a2","started":1790000000000,"eta_s":1800},
+            {"key":"sim#3","stage":"running","agent_id":"a3","started":1790000000000,"eta_s":1800},
+            {"key":"sim#4","stage":"done","agent_id":"a1","started":1790000000000,"ended":1790000600000,
+             "usage":{"runs":1,"peak_mb":512}}]}"#;
+        let workers = HashMap::from([
+            ("a1".to_string(), rl(60, 1)),
+            ("a2".to_string(), rl(25, 1)),
+            ("a3".to_string(), rl(5, 1)),
+        ]);
+        let f = with_workers(feed(json), &["s"], &[], &workers);
+        let t = build(Some(&f), &[], T0 + 60_000);
+        let load = |k: &str| {
+            t.lines
+                .iter()
+                .find(|l| l.id.ends_with(k) || l.click.key == k)
+                .unwrap()
+                .usage_load
+        };
+        assert_eq!(load("sim#1"), Some((Load::Heavy, Load::Light)));
+        assert_eq!(load("sim#2"), Some((Load::Busy, Load::Light)));
+        assert_eq!(load("sim#3"), Some((Load::Light, Load::Light)));
+        assert_eq!(load("sim#4"), None);
     }
 
     #[test]

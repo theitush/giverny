@@ -22,6 +22,8 @@ use std::time::Duration;
 use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::use_reading::{self, Reading, Sampler, Use};
 
+use crate::chrome::Chrome;
+
 /// How often the pass is taken.
 const EVERY: Duration = Duration::from_secs(1);
 
@@ -212,6 +214,40 @@ pub fn machine_shares(u: &Use, ram_mb: u64) -> (f64, f64) {
         0.0
     };
     (f64::from(u.cpu_pct), mem)
+}
+
+/// How heavy a figure is on the whole machine, as every use figure is
+/// coloured — a tab's and the total in the rail (giverny#289, #295), a
+/// Running row's in the management panel (giverny#305): light under 20 %,
+/// busy from 20 % to 50 %, heavy over it. The share is a
+/// [`machine_shares`] figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    Light,
+    Busy,
+    Heavy,
+}
+
+impl Load {
+    pub fn of(share: f64) -> Self {
+        if share > 50.0 {
+            Load::Heavy
+        } else if share >= 20.0 {
+            Load::Busy
+        } else {
+            Load::Light
+        }
+    }
+
+    /// The figure's colour: its own (`light`, dim in the rail, the row's
+    /// in the panel) while light, amber when busy, poppy when heavy.
+    pub fn color(self, light: egui::Color32, c: Chrome) -> egui::Color32 {
+        match self {
+            Load::Light => light,
+            Load::Busy => c.amber,
+            Load::Heavy => c.poppy,
+        }
+    }
 }
 
 /// This machine's total RAM, MiB, read once.
