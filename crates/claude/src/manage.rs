@@ -55,7 +55,8 @@ usage: giverny manage <command> [args] [--session <id>]
                               until its next eta, and that span is not work;
                               a worker's first eta on a Running row is its
                               re-estimate: taken as given, scored, and told
-                              how past re-estimates fared
+                              how past re-estimates fared; --agent moves the
+                              row to that worker, as on `start`
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
@@ -744,6 +745,82 @@ fn stamp_spawns(doc: &mut Value, spawns: &[Spawn]) -> Vec<String> {
     stamped
 }
 
+/// Whether any Running row has a worker: only then can one have been
+/// resumed by a fresh worker ([`relink_resumed`]).
+fn has_worked(doc: &Value) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|r| r.contains_key("agent_id") && stage_of(r) == Some(feed::Stage::Running))
+}
+
+/// Move each Running row whose worker has finished to the worker spawned
+/// after it for the same task: the dispatcher resumed the task with a fresh
+/// worker and never ran `start <task> --agent <id>` (giverny#287). The new
+/// worker is the newest spawn whose description names the key, first
+/// written after the old worker last wrote, that no row names by id; the
+/// old one must have `finished` (its completion notice is its last word).
+/// `last_write` is when a worker's transcript was last written. Returns the
+/// keys moved.
+fn relink_resumed(
+    doc: &mut Value,
+    spawns: &[Spawn],
+    last_write: impl Fn(&str) -> Option<u64>,
+    finished: impl Fn(&str, Option<u64>) -> bool,
+) -> Vec<String> {
+    let Some(rows) = doc.get_mut("rows").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let held: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("agent_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut moved = Vec::new();
+    for r in rows.iter_mut().filter_map(Value::as_object_mut) {
+        if stage_of(r) != Some(feed::Stage::Running) {
+            continue;
+        }
+        let (Some(key), Some(old)) = (
+            r.get("key")
+                .and_then(Value::as_str)
+                .filter(|k| !k.is_empty()),
+            r.get("agent_id").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(quiet) = last_write(old) else {
+            continue;
+        };
+        let new = spawns
+            .iter()
+            .filter(|s| !held.contains(&s.agent) && feed::names_key(&s.description, key))
+            .filter(|s| s.at_ms.is_some_and(|at| at > quiet))
+            .max_by_key(|s| s.at_ms);
+        let Some(new) = new else { continue };
+        if !finished(old, Some(quiet)) {
+            continue;
+        }
+        moved.push(key.to_string());
+        r.insert("agent_id".into(), json!(new.agent));
+    }
+    moved
+}
+
+/// When subagent `agent`'s transcript was last written, under the first of
+/// `sessions` that has it.
+fn last_written(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<u64> {
+    sessions.iter().find_map(|session| {
+        let dir = session_subagents(cfg, session)?;
+        let t = std::fs::metadata(crate::subagents::agent_transcript(&dir, agent))
+            .and_then(|m| m.modified())
+            .ok()?;
+        Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
+    })
+}
+
 /// The hand-offs a dispatcher made by message alone (giverny#217): a plain
 /// `start <task>`, then a `SendMessage` to a worker of this session that
 /// assigns the task ([`feed::assigns`]: `New task for you: <task>`, `Next
@@ -960,8 +1037,9 @@ fn idle_hint(task: &str, idle: &[Idle]) -> Option<String> {
 
 /// `start <task> --agent <worker>`'s guard: refuse a worker over
 /// [`REUSE_MAX_TOKENS`] unless `--heavy-ok`, saying how heavy it is; with
-/// `--heavy-ok`, the note to add. A worker already holding `task` is not
-/// being reused, and one whose context cannot be read is let through.
+/// `--heavy-ok`, the note to add. A worker already holding `task`, or
+/// spawned for it, is not being reused (the caller checks), and one whose
+/// context cannot be read is let through.
 fn heavy_guard(
     task: &str,
     agent: &str,
@@ -1207,7 +1285,23 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                     close_wait(row, now);
                 }
             }
-            Ok(format!("{key}: ~{} left", feed::fmt_span(*left as i64)))
+            let msg = format!("{key}: ~{} left", feed::fmt_span(*left as i64));
+            // `--agent` moves the row to that worker, as `start --agent` does.
+            let Some(agent) = f.agent.as_deref() else {
+                return Ok(msg);
+            };
+            if row.get("agent_id").and_then(Value::as_str) == Some(agent) {
+                return Ok(msg);
+            }
+            row.insert("agent_id".into(), json!(agent));
+            let handed = hand_off(rows, i, agent, f.agent_desc.as_deref(), now);
+            Ok(match handed.as_slice() {
+                [] => format!("{msg}; now held by {agent}"),
+                done => format!(
+                    "{msg}; now held by {agent}, handed on from {}",
+                    done.join(", ")
+                ),
+            })
         }
         Cmd::Land(_) => {
             let i = at.ok_or_else(missing)?;
@@ -1875,9 +1969,15 @@ fn run_feed(
             let sessions = continuation::ids(&doc);
             let history = manage_history::path(dir);
             let mut flags = flags.clone();
+            // A worker spawned for the task (its description names it) is
+            // not being reused, however much it has read (giverny#287).
+            let spawned_for = |task: &str, agent: &str| {
+                agent_description(cfg, &sessions, agent).is_some_and(|d| feed::names_key(&d, task))
+            };
             let heavy_note = match (cmd, &flags.agent) {
-                (Cmd::Start(task), Some(agent))
-                    if row_agent(&doc, task) != Some(agent.as_str()) =>
+                (Cmd::Start(task) | Cmd::Eta(task, _), Some(agent))
+                    if row_agent(&doc, task) != Some(agent.as_str())
+                        && !spawned_for(task, agent) =>
                 {
                     heavy_guard(
                         task,
@@ -1889,23 +1989,50 @@ fn run_feed(
                 _ => None,
             };
             let said = tell_record(&doc, cmd, &mut flags, history.as_deref());
-            if let (Cmd::Start(_), Some(agent), None) = (cmd, &flags.agent, &flags.agent_desc)
+            if let (Cmd::Start(_) | Cmd::Eta(..), Some(agent), None) =
+                (cmd, &flags.agent, &flags.agent_desc)
                 && needs_description(&doc, now)
             {
                 flags.agent_desc = agent_description(cfg, &sessions, agent);
             }
             let before = done_keys(&doc);
             let read_log = |agent: &str| worker_log(cfg, &sessions, agent);
-            if has_unworkered(&doc) {
-                stamp_spawns(&mut doc, &spawns(cfg, &sessions));
-            }
+            let resumed = if has_unworkered(&doc) || has_worked(&doc) {
+                let spawned = spawns(cfg, &sessions);
+                stamp_spawns(&mut doc, &spawned);
+                let notices = std::cell::OnceCell::new();
+                let finished = |agent: &str, last: Option<u64>| {
+                    let notices = notices.get_or_init(|| {
+                        let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
+                        sessions
+                            .iter()
+                            .filter_map(|s| {
+                                crate::subagents::session_transcript(cfg.as_deref()?, s)
+                            })
+                            .map(|t| crate::subagents::read_completions(&t))
+                            .collect::<Vec<_>>()
+                    });
+                    notices
+                        .iter()
+                        .find_map(|n| n.get(agent))
+                        .is_some_and(|c| crate::subagents::is_finished(c, last))
+                };
+                relink_resumed(
+                    &mut doc,
+                    &spawned,
+                    |a| last_written(cfg, &sessions, a),
+                    finished,
+                )
+            } else {
+                Vec::new()
+            };
             let linked = link_handoffs(&mut doc, read_log);
             for (agent, _) in &linked {
                 freeze_tokens(&mut doc, &before, Some(agent), read_log);
             }
             let msg = apply(&mut doc, cmd, &flags, now)?;
             let handed = match cmd {
-                Cmd::Start(_) => flags.agent.as_deref(),
+                Cmd::Start(_) | Cmd::Eta(..) => flags.agent.as_deref(),
                 _ => None,
             };
             freeze_tokens(&mut doc, &before, handed, read_log);
@@ -1937,10 +2064,16 @@ fn run_feed(
             if let Some(h) = &history {
                 learn(&doc, &before, session, h);
             }
-            let msg = match said {
+            let mut msg = match said {
                 Some(said) => format!("{msg}{said}"),
                 None => msg,
             };
+            if !resumed.is_empty() {
+                msg.push_str(&format!(
+                    "\n  {} moved to the worker resuming it: its first worker had finished",
+                    resumed.join(", ")
+                ));
+            }
             let landed = done_keys(&doc)
                 .into_iter()
                 .filter(|k| !before.contains(k))
@@ -3624,6 +3757,133 @@ mod tests {
         let said = try_cfg(&dir, "start type-fix --agent w1", &cfg, T0 + 12 * MIN).unwrap();
         assert!(said.starts_with("started type-fix"), "{said}");
         assert!(!said.contains("reuse limit"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worker's transcript: one turn at `at`, last written then.
+    fn wrote(cfg: &Path, agent: &str, at: u64) {
+        let path = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join(format!("agent-{agent}.jsonl"));
+        std::fs::write(&path, real_turn(at, 20_000) + "\n").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(at))
+            .unwrap();
+    }
+
+    /// Claude Code's notice, in the manager's own transcript, that `agent`
+    /// has finished.
+    fn notified(cfg: &Path, agent: &str, at: u64) {
+        let text = format!(
+            "<task-notification>\n<task-id>{agent}</task-id>\n<status>completed</status>\n\
+             <summary>Agent \"x\" finished</summary>\n</task-notification>"
+        );
+        let line = json!({"type": "user", "timestamp": stamp(at),
+            "message": {"role": "user", "content": text}});
+        let parent = cfg.join("projects").join("-w").join("s1.jsonl");
+        let mut old = std::fs::read_to_string(&parent).unwrap_or_default();
+        old.push_str(&(line.to_string() + "\n"));
+        std::fs::write(parent, old).unwrap();
+    }
+
+    /// The dispatcher resumed `histfan` with a fresh worker after its first
+    /// had finished, and never moved the row: the next command that writes
+    /// the feed moves it, and says so (giverny#287). Until the first
+    /// worker's notice is in, a fresh spawn naming the task leaves the row
+    /// alone.
+    #[test]
+    fn a_row_moves_to_the_worker_resuming_it_once_its_first_finished() {
+        let dir = scratch("resume");
+        let cfg = spawned(&dir, "s1", "old", "histfan: population history in the fan");
+        run_cfg(
+            &dir,
+            "s1",
+            "start histfan --eta 60m --agent old",
+            Some(&cfg),
+            T0,
+        );
+        wrote(&cfg, "old", T0 + 30 * MIN);
+        spawned(
+            &dir,
+            "s1",
+            "new",
+            "histfan: resume population history in the fan",
+        );
+        wrote(&cfg, "new", T0 + 600 * MIN);
+        spawned(&dir, "s1", "rev", "histfan-r1: review the fan");
+        wrote(&cfg, "rev", T0 + 601 * MIN);
+
+        let (said, _) = run_cfg(&dir, "s1", "plan tree --eta 1h", Some(&cfg), T0 + 602 * MIN);
+        assert!(!said.contains("moved"), "{said}");
+        assert_eq!(
+            agent_of(&read_feed_of(&dir, "s1"), "histfan").as_deref(),
+            Some("old")
+        );
+
+        notified(&cfg, "old", T0 + 30 * MIN);
+        let (said, _) = run_cfg(
+            &dir,
+            "s1",
+            "plan scale --eta 1h",
+            Some(&cfg),
+            T0 + 603 * MIN,
+        );
+        assert!(
+            said.contains("histfan moved to the worker resuming it"),
+            "{said}"
+        );
+        let f = read_feed_of(&dir, "s1");
+        assert_eq!(agent_of(&f, "histfan").as_deref(), Some("new"));
+        let row = f.rows.iter().find(|r| r.key == "histfan").unwrap();
+        assert_eq!(
+            row.stage(),
+            feed::Stage::Running,
+            "still running, its clock kept"
+        );
+        assert_eq!(row.started_ms, Some(T0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `eta --agent` moves a row to that worker, as `start --agent` does,
+    /// under the same reuse limit; a worker spawned for the task passes the
+    /// limit however much it has read (giverny#287).
+    #[test]
+    fn eta_agent_moves_the_row_and_a_worker_spawned_for_the_task_is_no_reuse() {
+        let dir = scratch("eta-agent");
+        let cfg = light_and_heavy(&dir);
+        run_cfg(
+            &dir,
+            "s1",
+            "start emit-fix --eta 30m",
+            Some(&cfg),
+            T0 + 11 * MIN,
+        );
+        let err = try_cfg(&dir, "eta emit-fix 20m --agent w2", &cfg, T0 + 12 * MIN).unwrap_err();
+        assert!(err.contains("w2 carries 312k context"), "{err}");
+        let said = try_cfg(&dir, "eta emit-fix 20m --agent w1", &cfg, T0 + 12 * MIN).unwrap();
+        assert!(said.contains("now held by w1"), "{said}");
+        assert_eq!(
+            agent_of(&read_feed_of(&dir, "s1"), "emit-fix").as_deref(),
+            Some("w1")
+        );
+
+        // A fresh worker spawned for emit-fix that has read 312k already.
+        spawned(&dir, "s1", "w3", "emit-fix: resume the emitter");
+        let sub = cfg.join("projects").join("-w").join("s1").join("subagents");
+        std::fs::write(
+            sub.join("agent-w3.jsonl"),
+            real_turn(T0 + 13 * MIN, 312_000) + "\n",
+        )
+        .unwrap();
+        let said = try_cfg(&dir, "start emit-fix --agent w3", &cfg, T0 + 14 * MIN).unwrap();
+        assert!(!said.contains("reuse limit"), "{said}");
+        assert_eq!(
+            agent_of(&read_feed_of(&dir, "s1"), "emit-fix").as_deref(),
+            Some("w3")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
