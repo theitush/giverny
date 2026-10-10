@@ -172,6 +172,9 @@ pub struct TabView {
     /// A press that landed on something drawn over the grid (an overlay in a
     /// layer above it) and so was not reported; its release is not either.
     swallowed_press: bool,
+    /// Layers drawn over the grid that the wheel goes through, to scroll the
+    /// terminal under them: [`Self::wheel_through`].
+    wheel_through: Vec<egui::LayerId>,
     last_blink: bool,
     /// When the cursor blink (re)started: on focus, and on every keystroke,
     /// so the cursor is solid while typing. `None` while unfocused.
@@ -300,6 +303,7 @@ impl Default for TabView {
             had_focus: false,
             last_motion_cell: None,
             swallowed_press: false,
+            wheel_through: Vec::new(),
             last_blink: true,
             blink_from: None,
             search: None,
@@ -319,6 +323,16 @@ impl Default for TabView {
     }
 }
 
+/// Is a swallowed press still owed its release, after a frame? Only while
+/// mouse reporting is on and its release has not come: a release on a frame
+/// that did not report (Shift held, the pointer over a link) is the one it
+/// was owed, and with mouse mode off there is nothing left to hold back.
+/// Kept past that, the flag swallowed the release of the next click on the
+/// grid instead, and the program saw a button held down.
+fn still_swallowed(swallowed: bool, reported: bool, mouse_mode: bool, released: bool) -> bool {
+    swallowed && mouse_mode && (reported || !released)
+}
+
 struct CachedFrame {
     origin_px: Vec2,
     generation: u32,
@@ -332,6 +346,14 @@ impl TabView {
     /// for is not started while it does.
     pub fn cursor_blinking(&self, now: f64) -> bool {
         self.blink_from.is_some_and(|from| now - from < BLINK_FOR)
+    }
+
+    /// Let the mouse wheel through these layers, drawn over the grid, to the
+    /// terminal: over them it scrolls exactly as over the grid. A bar pinned
+    /// to the top row covers the grid, but nothing of its own scrolls.
+    pub fn wheel_through(&mut self, layers: impl IntoIterator<Item = egui::LayerId>) {
+        self.wheel_through.clear();
+        self.wheel_through.extend(layers);
     }
 
     pub fn show(
@@ -408,6 +430,17 @@ impl TabView {
         } else {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);
         }
+        let released = ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, EguiEvent::PointerButton { pressed: false, .. }))
+        });
+        self.swallowed_press = still_swallowed(
+            self.swallowed_press,
+            mouse_reporting && !pointer_is_ours,
+            mode.intersects(TermMode::MOUSE_MODE),
+            released,
+        );
         self.handle_wheel(
             ui,
             session,
@@ -977,7 +1010,16 @@ impl TabView {
         mouse_reporting: bool,
         ch_pt: f32,
     ) {
-        if !response.hovered() {
+        // Over a layer the wheel goes through, the grid is not hovered but
+        // is under the pointer. The layer is asked outside `input`: the
+        // context is locked while it reads.
+        let through = !self.wheel_through.is_empty()
+            && ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|pos| rect.contains(*pos))
+                .and_then(|pos| ui.ctx().layer_id_at(pos))
+                .is_some_and(|layer| self.wheel_through.contains(&layer));
+        if !response.hovered() && !through {
             return;
         }
         let dy = ui.input(|i| i.smooth_scroll_delta.y);
@@ -1451,5 +1493,27 @@ mod blink_tests {
         // The last wake-up before the stop lands on the stop.
         let (_, wait) = cursor_blink(14.9);
         assert!(wait.unwrap() <= 0.11);
+    }
+}
+
+#[cfg(test)]
+mod swallow_tests {
+    use super::still_swallowed;
+
+    #[test]
+    fn a_swallowed_press_is_owed_one_release_and_no_more() {
+        // Held, reported frames: still owed until its release comes, which
+        // the reporting itself takes.
+        assert!(still_swallowed(true, true, true, false));
+        assert!(still_swallowed(true, true, true, true));
+        // Released on a frame that did not report (Shift held): that was it.
+        assert!(!still_swallowed(true, false, true, true));
+        // Not reported and not released yet: still owed.
+        assert!(still_swallowed(true, false, true, false));
+        // Mouse mode off: nothing to hold back any more.
+        assert!(!still_swallowed(true, true, false, false));
+        assert!(!still_swallowed(true, false, false, false));
+        // Nothing swallowed stays nothing.
+        assert!(!still_swallowed(false, false, true, false));
     }
 }

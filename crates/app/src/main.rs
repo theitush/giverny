@@ -5072,6 +5072,9 @@ impl eframe::App for App {
                 if let Some(session) = &mut rt.session {
                     // The worker overlay is laid out on this rect.
                     self.session_rect = Some(ui.available_rect_before_wrap());
+                    // The wheel over the closed prompt bar scrolls the
+                    // terminal under it.
+                    rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
                     if rt.view.button_pressed {
