@@ -824,6 +824,8 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// Which prompt the bar over the terminal pins, kept between frames.
+    pub prompt_bar: prompt_bar::Owner,
 }
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
@@ -2058,8 +2060,11 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    prompt_bar: prompt_bar::Owner::default(),
                 });
                 entry.session = Some(session);
+                // A new session counts its changes from nothing again.
+                entry.prompt_bar = prompt_bar::Owner::default();
                 // Startup rc files may `cd` away from the spawn dir; verify
                 // and correct once the shell has settled. Not across the WSL
                 // boundary: what Windows can see of `wsl.exe` is its own
@@ -3488,13 +3493,18 @@ impl eframe::App for App {
                     // The prompt whose turn is in view, once its own row
                     // has scrolled out of sight.
                     let pinned = self.claude.prompts_of(active).and_then(|history| {
-                        let rows = session.viewport_rows();
-                        prompt_bar::owner(history, &rows, |matches| {
-                            session.find_above(prompt_bar::SEARCH_ABOVE, |row, shaded| {
-                                matches(row, shaded)
+                        rt.prompt_bar
+                            .get(session.content_seq(), history, || {
+                                let rows = session.viewport_rows();
+                                prompt_bar::owner(history, &rows, |matches| {
+                                    session.find_above(
+                                        prompt_bar::SEARCH_ABOVE,
+                                        &prompt_bar::PROMPT_MARKS,
+                                        |row, shaded| matches(row, shaded),
+                                    )
+                                })
                             })
-                        })
-                        .map(|i| history[i].as_str())
+                            .map(|i| history[i].as_str())
                     });
                     match pinned {
                         Some(prompt) => {
