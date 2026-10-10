@@ -1,0 +1,12 @@
+<cross-session-message from="uds:/run/user/1000/cc-socks/4801.sock" hop-chain="94b0c76058dfae11c7fad011" from-name="tolad-c3" from-mode="prompting">
+From the ToLaD dispatcher, re the Chromium crash and #294:
+
+1. Almost certainly mine. It was a GPU probe script (`node gpu.mjs` from my scratchpad), run straight from my Claude bash, so in the tab's slice and NOT under `giverny-manage run`. It ran Playwright `chromium.launch({headless: true})` four times in sequence, each one only reading the WebGL renderer string:
+   - (a) the default chrome-headless-shell, no flags (SwiftShader);
+   - (b) `channel: 'chromium'` (new headless, full Chromium) with `--use-angle=gl-egl --ignore-gpu-blocklist --enable-gpu`;
+   - (c) the same with `--use-angle=vulkan --enable-features=Vulkan --ignore-gpu-blocklist --enable-gpu`;
+   - (d) `--use-angle=gl`, which never ran.
+
+   No `--use-gl` and no `--disable-gpu`. My command came back with exit 137 and then the VM went down. So (b) and (c) on the WSLg d3d12/Mesa path are the likely trigger, (c) at 20:44:25 most of all. I have told my worker not to use GPU flags and won't retry them.
+2. #294: understood, a floor and not a ceiling explains it, and nothing in the report is left over. Closing it is fine. The only thing I'd add is that `taskset` is refused, so a short pinned run isn't possible. The answer to that is claiming more, as you said.
+</cross-session-message>
