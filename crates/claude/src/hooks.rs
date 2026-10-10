@@ -202,13 +202,19 @@ pub fn spawn_spool_watcher(
 /// Bind the app-side listener. `wake` is called after each delivered message
 /// (the app passes a repaint trigger). Returns the receiver plus any messages
 /// spooled while the app was closed.
+///
+/// The socket is also how one Giverny finds another: a second launch sends
+/// [`RAISE_REQUEST`] instead of opening a window ([`ask_running_to_raise`]).
+/// Each such request reaches `raise` as the connection to answer, and the app
+/// answers it from its UI thread, so an answer means a window that is alive.
 #[cfg(unix)]
 pub fn spawn_listener(
     spool: &Path,
+    raise: crossbeam_channel::Sender<std::os::unix::net::UnixStream>,
     wake: impl Fn() + Send + 'static,
 ) -> anyhow::Result<(crossbeam_channel::Receiver<RelayMsg>, Vec<RelayMsg>)> {
     use std::io::BufRead;
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::net::UnixListener;
 
     let spooled = drain_spool(spool);
 
@@ -216,11 +222,8 @@ pub fn spawn_listener(
     // A socket that still accepts connections belongs to a live instance —
     // unlinking and rebinding would silently steal its hook stream. Only a
     // stale socket (owner gone) may be replaced.
-    if UnixStream::connect(&path).is_ok() {
-        anyhow::bail!(
-            "another Giverny is listening on {} — this window will not receive hook events",
-            path.display()
-        );
+    if let Some(holder) = socket_holder(&path) {
+        return Err(Held { path, holder }.into());
     }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -231,10 +234,16 @@ pub fn spawn_listener(
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let tx = tx.clone();
-                let reader = std::io::BufReader::new(stream);
+                let reader = std::io::BufReader::new(&stream);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
+                    if is_raise_request(&line) {
+                        if let Ok(reply) = stream.try_clone() {
+                            let _ = raise.send(reply);
+                            wake();
+                        }
+                        continue;
+                    }
                     if let Ok(msg) = serde_json::from_str::<RelayMsg>(&line) {
                         let _ = tx.send(msg);
                         wake();
@@ -244,6 +253,151 @@ pub fn spawn_listener(
         })?;
 
     Ok((rx, spooled))
+}
+
+/// What a second launch sends down the relay socket in place of a hook: come
+/// to the front, because the user just started Giverny again.
+pub const RAISE_REQUEST: &str = r#"{"giverny":"raise"}"#;
+
+fn is_raise_request(line: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Control {
+        giverny: String,
+    }
+    serde_json::from_str::<Control>(line).is_ok_and(|c| c.giverny == "raise")
+}
+
+/// The answer to a [`RAISE_REQUEST`], written by the running app once its
+/// window has been told to come forward.
+pub fn raise_reply() -> String {
+    format!("{{\"raised\":true,\"pid\":{}}}\n", std::process::id())
+}
+
+/// Whoever already listens on the relay socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holder {
+    /// Its process id, where the platform tells (Linux).
+    pub pid: Option<u32>,
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.pid {
+            Some(pid) => write!(f, "another Giverny (pid {pid})"),
+            None => write!(f, "another Giverny"),
+        }
+    }
+}
+
+/// The relay socket is taken by a live Giverny, which gets the hooks.
+#[derive(Debug)]
+pub struct Held {
+    pub path: PathBuf,
+    pub holder: Holder,
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} holds the relay at {} — this window will not receive hook events",
+            self.holder,
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for Held {}
+
+/// Who listens on the socket at `path`, if anyone does. A socket file whose
+/// owner is gone refuses the connection, and counts as nobody.
+#[cfg(unix)]
+pub fn socket_holder(path: &Path) -> Option<Holder> {
+    let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+    Some(Holder {
+        pid: peer_pid(&stream),
+    })
+}
+
+/// The pid of the process at the other end of a unix socket: for a client's
+/// end, the one that is listening.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a live fd, and a buffer of the size we pass.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
+}
+
+/// What a second launch found on the relay socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Running {
+    /// Nobody listens: this launch is the one Giverny.
+    Nobody,
+    /// A Giverny answered and is coming to the front.
+    Raised { pid: Option<u32> },
+    /// Something holds the socket but gave no answer in time: a window that
+    /// is hung, or a Giverny too old to know the request.
+    Silent(Holder),
+}
+
+/// Ask the Giverny that holds the relay socket, if one does, to come to the
+/// front. The answer comes from that app's UI thread, so `timeout` is how
+/// long a live window may take to get to it.
+#[cfg(unix)]
+pub fn ask_running_to_raise(timeout: Duration) -> Running {
+    ask_to_raise(&socket_path(), timeout)
+}
+
+#[cfg(unix)]
+fn ask_to_raise(path: &Path, timeout: Duration) -> Running {
+    use std::io::BufRead;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return Running::Nobody;
+    };
+    let holder = Holder {
+        pid: peer_pid(&stream),
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    if writeln!(stream, "{RAISE_REQUEST}").is_err() {
+        return Running::Silent(holder);
+    }
+    // Done writing: the listener reads to the end of a connection before it
+    // takes the next one.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut answer = String::new();
+    let _ = std::io::BufReader::new(&stream).read_line(&mut answer);
+    #[derive(Deserialize)]
+    struct Reply {
+        raised: bool,
+        pid: Option<u32>,
+    }
+    match serde_json::from_str::<Reply>(answer.trim()) {
+        Ok(Reply { raised: true, pid }) => Running::Raised {
+            pid: pid.or(holder.pid),
+        },
+        _ => Running::Silent(holder),
+    }
 }
 
 // ---- settings.json installer ----------------------------------------------
@@ -861,6 +1015,94 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short socket path of its own: a long one does not fit `sun_path`.
+    #[cfg(unix)]
+    fn scratch_socket(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("gv-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn only_the_raise_request_reads_as_one() {
+        assert!(is_raise_request(RAISE_REQUEST));
+        assert!(!is_raise_request(r#"{"giverny":"other"}"#));
+        assert!(!is_raise_request(
+            r#"{"tab_id":"1","config_dir":null,"event":{"hook_event_name":"Stop"}}"#
+        ));
+        assert!(!is_raise_request("not json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nobody_on_the_socket_means_this_launch_opens_the_window() {
+        let path = scratch_socket("none");
+        assert_eq!(
+            ask_to_raise(&path, Duration::from_millis(200)),
+            Running::Nobody
+        );
+        assert_eq!(socket_holder(&path), None);
+        // A socket file left by a Giverny that is gone refuses connections.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert_eq!(
+            ask_to_raise(&path, Duration::from_millis(200)),
+            Running::Nobody
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_giverny_answers_and_a_hung_one_is_named() {
+        use std::io::BufRead;
+        let path = scratch_socket("raise");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let ours = cfg!(target_os = "linux").then_some(std::process::id());
+        assert_eq!(socket_holder(&path), Some(Holder { pid: ours }));
+        // `socket_holder`'s own connection is still queued: take it.
+        drop(listener.accept().unwrap());
+
+        // Alive: reads the request, answers it.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            assert!(is_raise_request(line.trim()));
+            (&stream).write_all(raise_reply().as_bytes()).unwrap();
+            listener
+        });
+        assert_eq!(
+            ask_to_raise(&path, Duration::from_secs(5)),
+            Running::Raised {
+                pid: Some(std::process::id())
+            }
+        );
+        let listener = server.join().unwrap();
+
+        // Hung: the connection is accepted (by the kernel) and never answered.
+        assert_eq!(
+            ask_to_raise(&path, Duration::from_millis(200)),
+            Running::Silent(Holder { pid: ours })
+        );
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_held_relay_names_the_pid_that_holds_it() {
+        let held = Held {
+            path: PathBuf::from("/run/user/1000/giverny.sock"),
+            holder: Holder { pid: Some(408784) },
+        };
+        assert_eq!(
+            held.to_string(),
+            "another Giverny (pid 408784) holds the relay at /run/user/1000/giverny.sock \
+             — this window will not receive hook events"
+        );
+    }
 
     #[test]
     fn a_cold_prompt_cache_shows_red_with_what_the_next_message_recaches() {

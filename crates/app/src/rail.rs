@@ -1281,14 +1281,33 @@ fn banner_button(
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     let c = app.chrome;
     if app.claude.hooks_installed && !app.claude.relay_listening() {
+        // Another live Giverny is the usual reason, and the one worth naming:
+        // every hook goes to its window, and this one shows nothing.
+        let (text, hover) = match app.claude.relay_holder() {
+            Some(holder) => (
+                match holder.pid {
+                    Some(pid) => format!("⚠ relay held by Giverny pid {pid}"),
+                    None => "⚠ relay held by another Giverny".to_string(),
+                },
+                "This window opened while another Giverny was running, and every \
+                 Claude session's hooks go to that one: no live states here. Close \
+                 this window and use that one; a deliberate second window wants its \
+                 own XDG_RUNTIME_DIR.",
+            ),
+            None => (
+                "⚠ hook relay socket failed — states degraded".to_string(),
+                "The hook relay socket could not be bound; `giverny doctor` says more.",
+            ),
+        };
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("⚠ hook relay socket failed — states degraded")
+                egui::RichText::new(text)
                     .font(FontId::monospace(10.0))
                     .color(c.poppy),
-            );
+            )
+            .on_hover_text(hover);
         });
     }
     // Hooks were just installed for the first time, and Claude Code reads
