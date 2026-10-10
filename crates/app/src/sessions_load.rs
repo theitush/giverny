@@ -191,32 +191,24 @@ pub fn figures(t: &Use) -> String {
     s
 }
 
-/// What a tab's figures are coloured against: `[manager.limits]` on this
-/// machine, whose cores and RAM are read once.
-pub fn allowed(limits: &giverny_core::limits::Limits) -> giverny_core::limits::Resolved {
-    use giverny_core::limits::Machine;
-    static MACHINE: OnceLock<Machine> = OnceLock::new();
-    limits.resolve(MACHINE.get_or_init(Machine::detect_cpu_ram))
+/// The use of the whole machine a tab's (or a group's) figures are
+/// coloured by (giverny#289): `(CPU, memory)`, percent. Its CPU figure is
+/// already a share of every core; its memory is taken of all the RAM
+/// (`ram_mb`), and with no RAM known it is never high.
+pub fn machine_shares(u: &Use, ram_mb: u64) -> (f64, f64) {
+    let mem = if ram_mb > 0 {
+        u.mem_mb as f64 * 100.0 / ram_mb as f64
+    } else {
+        0.0
+    };
+    (f64::from(u.cpu_pct), mem)
 }
 
-/// A tab's use as shares of what is allowed, percent: `(CPU, memory)`.
-/// Its CPU figure is a share of the whole machine (`cores` of them), so it
-/// is scaled to the allowed cores; a limit of nothing is never reached.
-pub fn shares(u: &Use, cores: u32, allowed: &giverny_core::limits::Resolved) -> (f64, f64) {
-    let of = |used: f64, limit: f64| {
-        if limit > 0.0 {
-            used * 100.0 / limit
-        } else {
-            0.0
-        }
-    };
-    (
-        of(
-            f64::from(u.cpu_pct) * f64::from(cores) / 100.0,
-            f64::from(allowed.cpu_cores),
-        ),
-        of(u.mem_mb as f64, allowed.ram.0 as f64),
-    )
+/// This machine's total RAM, MiB, read once.
+pub fn machine_ram_mb() -> u64 {
+    use giverny_core::limits::Machine;
+    static RAM: OnceLock<u64> = OnceLock::new();
+    *RAM.get_or_init(|| Machine::detect_cpu_ram().ram.0)
 }
 
 #[cfg(test)]
@@ -243,29 +235,19 @@ mod tests {
         assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
     }
 
-    /// The number is the machine's share; the colour's is of the limits:
-    /// 25 % of 16 cores is 4 cores, all of a 4-core limit.
+    /// Both shares are of the whole machine: the CPU figure as it is (a
+    /// share of every core), the memory of all the RAM.
     #[test]
-    fn a_tabs_share_is_of_what_is_allowed() {
-        use giverny_core::limits::{Mem, Resolved};
-        let allowed = Resolved {
-            cpu_cores: 4,
-            ram: Mem(8192),
-            gpus: Vec::new(),
-        };
+    fn a_tabs_share_is_of_the_whole_machine() {
         let u = Use {
             cpu_pct: 25,
             mem_mb: 2048,
             gpu_mb: None,
             gpu_pct: None,
         };
-        assert_eq!(shares(&u, 16, &allowed), (100.0, 25.0));
-        let none = Resolved {
-            cpu_cores: 0,
-            ram: Mem(0),
-            gpus: Vec::new(),
-        };
-        assert_eq!(shares(&u, 16, &none), (0.0, 0.0));
+        assert_eq!(machine_shares(&u, 8192), (25.0, 25.0));
+        assert_eq!(machine_shares(&u, 0), (25.0, 0.0), "no RAM known");
+        assert!(machine_ram_mb() > 0, "this machine's RAM");
     }
 
     #[test]
