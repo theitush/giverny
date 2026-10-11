@@ -857,9 +857,10 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     }
 
     /// A Done row's ETA cell, in seconds: `eta_delta_s` when the feed sent
-    /// it, else `(ended − started) − eta_s`. `None` on any other stage, or
-    /// when there is no estimate to compare with.
-    pub fn eta_delta_s(&self) -> Option<i64> {
+    /// it, else `(ended − started) − eta_s`, less the ms `off_ms` says of
+    /// that span nothing ran (the machine slept, [`crate::sleeps`]). `None`
+    /// on any other stage, or when there is no estimate to compare with.
+    pub fn eta_delta_s(&self, off_ms: &dyn Fn(u64, u64) -> u64) -> Option<i64> {
         if self.stage != Stage::Done {
             return None;
         }
@@ -868,7 +869,8 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             return Some(d);
         }
         let eta = f.eta_s? as i64;
-        let took_ms = self.ended_ms()? as i64 - self.row_started_ms()? as i64;
+        let (start, end) = (self.row_started_ms()?, self.ended_ms()?);
+        let took_ms = end as i64 - start as i64 - off_ms(start, end) as i64;
         Some(took_ms.div_euclid(1000) - eta)
     }
 }
@@ -2225,13 +2227,15 @@ mod tests {
         let rows = merge::<Live>(Some(&f), &[]);
         // 45 min taken against a 40 min estimate: 5 min late.
         let done = rows.iter().find(|r| r.stage == Stage::Done).unwrap();
-        assert_eq!(done.eta_delta_s(), Some(300));
-        assert_eq!(fmt_delta(done.eta_delta_s().unwrap()), "(+5m)");
+        assert_eq!(done.eta_delta_s(&|_, _| 0), Some(300));
+        assert_eq!(fmt_delta(done.eta_delta_s(&|_, _| 0).unwrap()), "(+5m)");
+        // Ten minutes of it the machine slept: five under, not five over.
+        assert_eq!(done.eta_delta_s(&|_, _| 600_000), Some(-300));
         // Only Done rows carry one.
         assert!(
             rows.iter()
                 .filter(|r| r.stage != Stage::Done)
-                .all(|r| r.eta_delta_s().is_none())
+                .all(|r| r.eta_delta_s(&|_, _| 0).is_none())
         );
 
         let mut r = row("k", Stage::Done, None);
@@ -2242,14 +2246,20 @@ mod tests {
             rows: vec![r.clone()],
             ..Default::default()
         };
-        assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(), Some(-4800));
+        assert_eq!(
+            merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0),
+            Some(-4800)
+        );
         // The writer's own delta wins.
         r.eta_delta_s = Some(60);
         let f = Feed {
             rows: vec![r.clone()],
             ..Default::default()
         };
-        assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(), Some(60));
+        assert_eq!(
+            merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0),
+            Some(60)
+        );
         // No estimate, no cell.
         r.eta_delta_s = None;
         r.eta_s = None;
@@ -2257,7 +2267,7 @@ mod tests {
             rows: vec![r],
             ..Default::default()
         };
-        assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(), None);
+        assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0), None);
     }
 
     #[test]
