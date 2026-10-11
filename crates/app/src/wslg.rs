@@ -142,6 +142,47 @@ fn parse_desktop_scale(log: &str) -> Option<f32> {
         .map(|pct| pct as f32 / 100.0)
 }
 
+/// The fix for [`slow_mode`], to paste into a PowerShell run as administrator.
+/// Restarting the WSL VM alone keeps the shared memory broken: it is Windows'
+/// side of WSLg that has lost it, and the service restart brings it back
+/// (#312).
+pub const SLOW_MODE_FIX: &str = "wsl --shutdown; Restart-Service wslservice";
+
+/// Whether WSLg started without its shared memory with Windows (#312).
+///
+/// After a resume from hibernate, WSLg's compositor can fail to open its
+/// `/mnt/shared_memory` and carry on without it, sending every frame to
+/// Windows as an RDP bitmap instead of handing it over in place: the whole
+/// window lags, typing most of all, and nothing inside Linux changes that.
+/// Weston logs it once, at the start it rewrites its log on. An unreadable
+/// or missing log says nothing.
+pub fn slow_mode() -> bool {
+    // A fixture log, for seeing the notice without breaking WSLg.
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GIVERNY_DEBUG_WESTON_LOG") {
+        return std::fs::read_to_string(path).is_ok_and(|log| parse_slow_mode(&log));
+    }
+    is_wslg()
+        && std::fs::read_to_string("/mnt/wslg/weston.log").is_ok_and(|log| parse_slow_mode(&log))
+}
+
+/// What a Weston log says about the RDP backend's shared memory: the last
+/// `use_gfxredir = <n>` decides (0 is the slow mode), and a log without one
+/// is slow only if it says the shared memory failed to open.
+fn parse_slow_mode(log: &str) -> bool {
+    let gfxredir = log.lines().rev().find_map(|line| {
+        let rest = line.split("use_gfxredir").nth(1)?;
+        let value = rest.trim_start().strip_prefix('=')?.trim();
+        value.parse::<u32>().ok()
+    });
+    match gfxredir {
+        Some(n) => n == 0,
+        None => log
+            .lines()
+            .any(|line| line.contains("rdp_allocate_shared_memory: Failed")),
+    }
+}
+
 /// The size of the framebuffer the probe reads back: 256 KiB, well over the
 /// 64 KiB at which a broken driver starts returning zeros.
 const PROBE_SIDE: i32 = 256;
@@ -427,6 +468,45 @@ mod tests {
             None
         );
         assert_eq!(parse_desktop_scale("desktopScaleFactor:9000\n"), None);
+    }
+
+    /// The start of a WSLg session that lost its shared memory (#312).
+    const BROKEN: &str = "\
+[10:57:37.200] \trdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:0
+[10:57:37.385] rdp_allocate_shared_memory: Failed to open \"/mnt/shared_memory/{edeb5aa5-c449-4c5c-a573-695a2a326e69}\" with error: Input/output error
+[10:57:37.385] RDP backend: use_gfxredir = 0
+[10:57:38.001] \trdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+";
+
+    /// The same lines from a healthy start.
+    const HEALTHY: &str = "\
+[11:14:02.100] \trdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:0
+[11:14:02.310] RDP backend: use_gfxredir = 1
+[11:14:02.900] Client: gfxredir_caps[1]: version:0x2000
+[11:14:03.020] \trdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+";
+
+    #[test]
+    fn the_slow_mode_is_what_weston_logged_at_its_start() {
+        assert!(parse_slow_mode(BROKEN));
+        assert!(!parse_slow_mode(HEALTHY));
+        // Either line alone is enough to tell.
+        assert!(parse_slow_mode("[x] RDP backend: use_gfxredir = 0\n"));
+        assert!(parse_slow_mode(
+            "[x] rdp_allocate_shared_memory: Failed to open \"/mnt/shared_memory/{x}\"\n"
+        ));
+        // A later allocation failure under a working hand-off is not the mode.
+        let transient =
+            format!("{HEALTHY}[12:00:00.000] rdp_allocate_shared_memory: Failed to open \"x\"\n");
+        assert!(!parse_slow_mode(&transient));
+        // Nothing to go on is not a failure.
+        assert!(!parse_slow_mode(""));
+        assert!(!parse_slow_mode(
+            "garbage\n\0\u{fffd} use_gfxredir\nuse_gfxredir = x\n"
+        ));
+        // The scale still reads from the same logs.
+        assert_eq!(parse_desktop_scale(BROKEN), Some(1.75));
+        assert_eq!(parse_desktop_scale(HEALTHY), Some(1.75));
     }
 
     #[test]
