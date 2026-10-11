@@ -2,8 +2,8 @@
 //!
 //! Before a worker starts, its manager *claims* what the worker needs
 //! (`giverny manage claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
-//! is answered *granted*, *granted smaller* (less RAM, down to `--min-ram`)
-//! or *queued* behind whoever holds what it needs. The answer is a
+//! is answered *granted*, *granted smaller* (fewer cores, down to
+//! `--min-cpu`, or less RAM, down to `--min-ram`) or *queued* behind whoever holds what it needs. The answer is a
 //! [`Lease`] in one JSON file shared by every session on the machine; it is
 //! the "hello" managers say to each other, and the source of truth when
 //! they talk or when a worker's commands are capped to its
@@ -145,6 +145,9 @@ pub struct Request {
     /// Grant less RAM than `ram_mb`, down to this, rather than queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_ram_mb: Option<u64>,
+    /// Grant fewer cores than `cpu`, down to this, rather than queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_cpu: Option<u32>,
     /// The task's Priority (`asap`, `high`, `medium`, `low`): queued ahead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -358,9 +361,10 @@ pub struct Free {
     pub counted_mb: u64,
 }
 
-/// A fitting grant: the RAM and GPUs it gets.
+/// A fitting grant: the cores, RAM and GPUs it gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fit {
+    pub cpu: u32,
     pub ram_mb: u64,
     pub gpus: Vec<u32>,
     /// What admission counted it at, MiB.
@@ -371,9 +375,11 @@ pub struct Fit {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Granted(Lease),
-    /// Less RAM than asked (`wanted_mb`), at least `--min-ram`.
+    /// Fewer cores than asked (`wanted_cpu`), at least `--min-cpu`, or
+    /// less RAM (`wanted_mb`), at least `--min-ram`, or both.
     GrantedSmaller {
         lease: Lease,
+        wanted_cpu: u32,
         wanted_mb: u64,
     },
     /// The task already holds this lease (a re-claim heartbeats it).
@@ -568,9 +574,16 @@ impl Ledger {
     pub fn try_fit(&self, cap: &Capacity, req: &Request) -> Result<Fit, Vec<String>> {
         let free = self.free(cap);
         let mut short = Vec::new();
-        if req.cpu > free.cpu {
+        // Fewer cores than asked, down to `--min-cpu` (at least one), when
+        // that is all that is free.
+        let cpu = if req.cpu <= free.cpu {
+            req.cpu
+        } else if req.min_cpu.is_some_and(|m| m.max(1) <= free.cpu) {
+            free.cpu
+        } else {
             short.push("cpu".to_string());
-        }
+            0
+        };
         // The lease's RAM is the commands' protection; what must fit is
         // the task's expected peak. A smaller grant helps only a task with
         // no history, which counts at its RAM.
@@ -608,6 +621,7 @@ impl Ledger {
         }
         if short.is_empty() {
             Ok(Fit {
+                cpu,
                 ram_mb,
                 counted_mb: Ledger::counted_for(cap, req, ram_mb),
                 gpus: gpus
@@ -662,11 +676,9 @@ impl Ledger {
     /// Why `req` can never fit under the limits, if it cannot.
     pub fn never_fits(cap: &Capacity, req: &Request) -> Option<String> {
         let l = &cap.limits;
-        if req.cpu > l.cpu_cores {
-            return Some(format!(
-                "{} cores asked; the limit is {}",
-                req.cpu, l.cpu_cores
-            ));
+        let cpu = req.min_cpu.unwrap_or(req.cpu).min(req.cpu);
+        if cpu > l.cpu_cores {
+            return Some(format!("{cpu} cores asked; the limit is {}", l.cpu_cores));
         }
         let ram = req.min_ram_mb.unwrap_or(req.ram_mb).min(req.ram_mb);
         if ram > l.ram.0 {
@@ -741,7 +753,7 @@ impl Ledger {
                     session: session.into(),
                     task: task.into(),
                     repo: repo.map(String::from),
-                    cpu: req.cpu,
+                    cpu: fit.cpu,
                     ram_mb: fit.ram_mb,
                     gpus: fit.gpus,
                     vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
@@ -751,9 +763,10 @@ impl Ledger {
                     heartbeat_at: now,
                 };
                 self.leases.push(lease.clone());
-                if lease.ram_mb < req.ram_mb {
+                if lease.cpu < req.cpu || lease.ram_mb < req.ram_mb {
                     Outcome::GrantedSmaller {
                         lease,
+                        wanted_cpu: req.cpu,
                         wanted_mb: req.ram_mb,
                     }
                 } else {
@@ -977,12 +990,25 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
     match o {
         Outcome::Granted(l) => format!("granted {task}: {}{}", l.describe(), counted(l)),
         Outcome::Held(l) => format!("{task} holds its lease already: {}", l.describe()),
-        Outcome::GrantedSmaller { lease, wanted_mb } => format!(
-            "granted smaller {task}: {}{} (asked {}, more is not free)",
-            lease.describe(),
-            counted(lease),
-            Mem(*wanted_mb)
-        ),
+        Outcome::GrantedSmaller {
+            lease,
+            wanted_cpu,
+            wanted_mb,
+        } => {
+            let mut asked = Vec::new();
+            if lease.cpu < *wanted_cpu {
+                asked.push(format!("{wanted_cpu} cpu"));
+            }
+            if lease.ram_mb < *wanted_mb {
+                asked.push(Mem(*wanted_mb).to_string());
+            }
+            format!(
+                "granted smaller {task}: {}{} (asked {}, more is not free)",
+                lease.describe(),
+                counted(lease),
+                asked.join(", ")
+            )
+        }
         Outcome::Queued {
             position,
             blockers,
@@ -1028,7 +1054,10 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
             "slots": l.slots,
             "granted_at": manage::stamp(l.granted_at),
         });
-        if state == "smaller" {
+        if state == "smaller" && l.cpu < req.cpu {
+            v["wanted_cpu"] = json!(req.cpu);
+        }
+        if state == "smaller" && l.ram_mb < req.ram_mb {
             v["wanted_ram_mb"] = json!(req.ram_mb);
         }
         v
@@ -1514,6 +1543,98 @@ mod tests {
     }
 
     #[test]
+    fn min_cpu_takes_the_free_cores_instead_of_queueing() {
+        let c = cap();
+        let mut l = Ledger::default();
+        // Another session holds 10 of the 12 leasable cores: 2 are free.
+        assert!(matches!(
+            l.claim(&c, "other", "big", None, &req(10, 2), T0),
+            Outcome::Granted(_)
+        ));
+        // Without --min-cpu, 3 cores wait.
+        let q = l.claim(&c, "a", "merge", None, &req(3, 3), T0);
+        let Outcome::Queued { short, .. } = &q else {
+            panic!("{q:?}")
+        };
+        assert_eq!(short, &vec!["cpu".to_string()]);
+        // With --min-cpu 1 it takes the 2 that are free, and leaves the queue.
+        let r = Request {
+            min_cpu: Some(1),
+            ..req(3, 3)
+        };
+        let g = l.claim(&c, "a", "merge", None, &r, T0);
+        let Outcome::GrantedSmaller {
+            lease,
+            wanted_cpu,
+            wanted_mb,
+        } = &g
+        else {
+            panic!("{g:?}")
+        };
+        assert_eq!((lease.cpu, lease.ram_mb), (2, 3 * 1024));
+        assert_eq!((*wanted_cpu, *wanted_mb), (3, 3 * 1024));
+        assert_eq!(g.exit_code(), exit::GRANTED_SMALLER);
+        assert!(l.queue.is_empty(), "{:?}", l.queue);
+        assert_eq!(
+            outcome_line("merge", &g, &|_, _| None),
+            "granted smaller merge: 2 cpu, 3G (asked 3 cpu, more is not free)"
+        );
+        let row = row_lease(&g, &r).unwrap();
+        assert_eq!(row["state"], "smaller");
+        assert_eq!(row["cpu"], 2);
+        assert_eq!(row["wanted_cpu"], 3);
+        assert!(row.get("wanted_ram_mb").is_none(), "{row}");
+        // Fewer free than --min-cpu: it queues as ever.
+        let r = Request {
+            min_cpu: Some(2),
+            ..req(3, 1)
+        };
+        let q = l.claim(&c, "b", "fix", None, &r, T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        // --min-cpu as large as --cpu, or a request that fits, is a plain grant.
+        l.release("other", "big", T0 + MIN);
+        let g = l.claim(&c, "b", "fix", None, &r, T0 + MIN);
+        assert!(matches!(g, Outcome::Granted(ref x) if x.cpu == 3), "{g:?}");
+        // --min-cpu under the limit is not refused for a --cpu above it.
+        let r = Request {
+            min_cpu: Some(4),
+            ..req(20, 1)
+        };
+        assert_eq!(Ledger::never_fits(&c, &r), None);
+        assert!(Ledger::never_fits(&c, &req(20, 1)).is_some());
+    }
+
+    #[test]
+    fn min_cpu_and_min_ram_shrink_together() {
+        let mut c = cap();
+        c.load.mem_available = Some(Mem::gb(5));
+        c.load.load1 = Some(12.0);
+        let mut l = Ledger::default();
+        // 14 cores − 12 busy = 2 free; 5G − 1.15G headroom = 3.85G free.
+        let r = Request {
+            min_cpu: Some(1),
+            min_ram_mb: Some(2048),
+            ..req(3, 6)
+        };
+        let g = l.claim(&c, "a", "t", None, &r, T0);
+        let Outcome::GrantedSmaller { lease, .. } = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!((lease.cpu, lease.ram_mb), (2, 3840));
+        assert_eq!(
+            outcome_line("t", &g, &|_, _| None),
+            "granted smaller t: 2 cpu, 3.8G (asked 3 cpu, 6G, more is not free)"
+        );
+        // RAM short past --min-ram still queues, whatever the cores.
+        let r = Request {
+            min_cpu: Some(1),
+            ..req(1, 6)
+        };
+        let q = Ledger::default().claim(&c, "a", "u", None, &r, T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+    }
+
+    #[test]
     fn other_programs_shrink_what_is_grantable() {
         let mut c = cap();
         // A browser eats RAM: 5 G available, less 1.15 G headroom.
@@ -1528,7 +1649,10 @@ mod tests {
             ..req(1, 6)
         };
         let g = l.claim(&c, "a", "t", None, &r, T0);
-        let Outcome::GrantedSmaller { lease, wanted_mb } = &g else {
+        let Outcome::GrantedSmaller {
+            lease, wanted_mb, ..
+        } = &g
+        else {
             panic!("{g:?}")
         };
         assert_eq!(*wanted_mb, 6 * 1024);

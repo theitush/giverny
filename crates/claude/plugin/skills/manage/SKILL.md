@@ -123,10 +123,14 @@ Size it from the hint `claim` prints once there is history (`the last 4 BUG
 tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the default
 lease (Settings → Management panel; `giverny-manage resources` prints it). Add
 `--slot <name>` for something only one task at a time may use (a shared build
-folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU. The answer is one line and an exit code:
+folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU.
+A light task (a merge, a review, docs, a small fix) adds `--min-cpu 1`
+(`--cpu 3 --min-cpu 1`), so it takes the cores that are free rather than
+queue for all three. The answer is one line and an exit code:
 
 - `granted` (0): go on.
-- `granted smaller` (3, only with `--min-ram`): go on, with what it says.
+- `granted smaller` (3, only with `--min-cpu` or `--min-ram`): go on, with what
+  it says; `run` caps the worker at it.
 - `queued` (4): something it needs is held; its row says so. Start another
   planned task from a free lane instead, and re-run the same `claim` now and then until it is
   granted (nothing calls back). When it says the wait is longer than the task

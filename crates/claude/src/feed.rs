@@ -203,7 +203,8 @@ fn parse_usage(v: &Value) -> Option<RowUsage> {
 pub enum LeaseState {
     /// Holds what it asked for.
     Granted,
-    /// Holds less RAM than it asked for (`wanted_ram_mb`).
+    /// Holds fewer cores (`wanted_cpu`) or less RAM (`wanted_ram_mb`) than
+    /// it asked for.
     Smaller,
     /// Waiting, at `position`, `behind` a holder.
     Queued,
@@ -222,6 +223,7 @@ pub struct RowLease {
     pub slots: Vec<String>,
     pub granted_ms: Option<u64>,
     pub wanted_ram_mb: Option<u64>,
+    pub wanted_cpu: Option<u32>,
     /// 1-based place in the ledger's queue when it was last asked.
     pub position: Option<u64>,
     /// The task whose lease it waits on, or the queued task before it.
@@ -275,6 +277,7 @@ fn parse_lease(v: &Value) -> Option<RowLease> {
         slots: strings("slots"),
         granted_ms: millis_field(l, "granted_at"),
         wanted_ram_mb: u64_field(l, "wanted_ram_mb"),
+        wanted_cpu: u64_field(l, "wanted_cpu").map(|c| c as u32),
         position: u64_field(l, "position"),
         behind: str_field(l, "behind"),
     })
