@@ -863,17 +863,38 @@ impl ClaudeWatch {
             .iter()
             .filter_map(|(id, tab)| Some((tab.session_id.clone()?, *id)))
             .collect();
+        // One session per tab. Two can sit under one tab's shell (a `claude`
+        // started from a `!` command in another), and taking each in turn
+        // switched the tab's session twice a scan: its prompts cleared and
+        // both transcripts read again every second. The tab holds the newer
+        // one, the one in front, as its SessionStart hook says; the older
+        // one comes back when it ends.
+        let mut shown: Vec<(TabId, registry::LiveSession)> = Vec::new();
+        for live in self.scanned.live.clone() {
+            let Some(tab_id) = shell_pids
+                .iter()
+                .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
+                .map(|(id, _)| *id)
+                .or_else(|| by_session.get(&live.entry.session_id).copied())
+            else {
+                continue;
+            };
+            let held = self.tabs.get(&tab_id).and_then(|t| t.session_id.as_deref());
+            let rank = |s: &registry::LiveSession| {
+                (
+                    s.entry.started_at_ms,
+                    held == Some(s.entry.session_id.as_str()),
+                )
+            };
+            match shown.iter_mut().find(|(id, _)| *id == tab_id) {
+                Some((_, kept)) if rank(&live) > rank(kept) => *kept = live,
+                Some(_) => {}
+                None => shown.push((tab_id, live)),
+            }
+        }
         let mut ask_prompts: Vec<(String, PathBuf, u64)> = Vec::new();
         {
-            for live in self.scanned.live.clone() {
-                let Some(tab_id) = shell_pids
-                    .iter()
-                    .find(|(_, shell)| registry::has_ancestor(live.entry.pid, **shell))
-                    .map(|(id, _)| *id)
-                    .or_else(|| by_session.get(&live.entry.session_id).copied())
-                else {
-                    continue;
-                };
+            for (tab_id, live) in shown {
                 let account = self.account_of(Some(&live.config_dir));
                 let entry = self.tabs.entry(tab_id).or_default();
                 entry.seen_in_scan = true;
@@ -1957,6 +1978,52 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two sessions under one tab's shell, a `claude` started from a `!`
+    /// command in another: the tab holds the newer one, and reads its
+    /// transcript once, not on every scan.
+    #[test]
+    fn two_sessions_under_one_shell_do_not_take_turns() {
+        let me = std::process::id();
+        let live = |id: &str, started_at_ms: u64| {
+            let mut entry = session("busy");
+            entry.pid = me;
+            entry.session_id = id.into();
+            entry.started_at_ms = started_at_ms;
+            registry::LiveSession {
+                entry,
+                config_dir: PathBuf::from("/nonexistent/giverny-two-sessions"),
+            }
+        };
+        let mut w = ClaudeWatch::for_tests();
+        w.scanned = ScanResult {
+            live: vec![live("s-1", 1), live("s-2", 2)],
+        };
+        let shells = HashMap::from([(TAB, me)]);
+        w.merge_scan(&shells, &mut WatchEffects::default());
+        let read = w.prompts_asked.get("s-2").copied();
+        assert!(read.is_some());
+        for _ in 0..3 {
+            let mut fx = WatchEffects::default();
+            w.merge_scan(&shells, &mut fx);
+            assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-2"));
+            assert_eq!(w.prompts_asked.get("s-2").copied(), read, "not read again");
+            assert!(!w.prompts_asked.contains_key("s-1"));
+            assert!(fx.captured.is_empty(), "the resume target holds still");
+        }
+
+        // The newer one ends: the tab goes back to the older.
+        w.scanned.live.retain(|s| s.entry.session_id == "s-1");
+        w.merge_scan(&shells, &mut WatchEffects::default());
+        assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-1"));
+
+        // With no start times to go by, the tab keeps the one it holds.
+        w.scanned.live = vec![live("s-2", 0), live("s-1", 0)];
+        for _ in 0..3 {
+            w.merge_scan(&shells, &mut WatchEffects::default());
+            assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-1"));
+        }
     }
 
     #[test]
