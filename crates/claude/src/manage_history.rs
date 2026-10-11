@@ -3,7 +3,8 @@
 //! Every task that lands appends one line to `history.jsonl` beside the
 //! feeds: its estimate (the guess as given), its
 //! wall-clock time, and its *working* time — wall time minus the spans it was
-//! paused and the spans its worker said it was waiting. Append-only, one JSON
+//! paused, the spans its worker said it was waiting and the spans the
+//! machine slept through ([`crate::sleeps`]). Append-only, one JSON
 //! object per line, so concurrent manager sessions never lose each other's lines and a
 //! line this version cannot read is skipped, not fatal.
 //!
@@ -70,6 +71,9 @@ pub struct Record {
     pub paused_s: u64,
     #[serde(default)]
     pub wait_s: u64,
+    /// What the machine slept through between start and end.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slept_s: u64,
     pub work_s: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<String>,
@@ -147,6 +151,10 @@ impl Track {
             Track::Reestimate => "worker's re-estimate of the time left, as given",
         }
     }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Where the history lives: `$GIVERNY_MANAGE_HISTORY`, else

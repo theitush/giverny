@@ -61,6 +61,7 @@ use giverny_claude::manage_chores::{self, Chore};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{RunLive, TaskLive};
 use giverny_claude::session_use;
+use giverny_claude::sleeps;
 use giverny_claude::subagents::{Outcome, SubagentRow, Tracker};
 use giverny_claude::worker_log::WorkerLog;
 use giverny_core::config::{DoneRows, ManagementPanelConfig, PaneColumns};
@@ -200,6 +201,8 @@ pub struct Views {
     ledger: LedgerWatch,
     /// When every manager tab's chores were last worked out.
     chores_at: Option<Instant>,
+    /// What the machine slept through: one log for the whole machine.
+    sleeps: sleeps::Cache,
 }
 
 /// How often every manager tab's chores are worked out ([`Views::keep_chores`]).
@@ -348,17 +351,14 @@ pub fn track(holds: &mut Vec<Hold>, limit: Option<&Limit>, now_ms: u64) {
     }
 }
 
-/// Milliseconds of `[start, upto]` that fall inside a hold — what comes off
-/// a row's clock.
-pub fn held_ms(holds: &[Hold], start: u64, upto: u64) -> u64 {
-    holds
+/// Milliseconds of `[start, upto]` that fall inside a hold or a sleep —
+/// what comes off a row's clock. A sleep inside a hold comes off once.
+pub fn off_ms(holds: &[Hold], slept: &[sleeps::Span], start: u64, upto: u64) -> u64 {
+    let held = holds
         .iter()
-        .map(|h| {
-            let a = h.since_ms.max(start);
-            let b = h.until_ms.unwrap_or(upto).min(upto);
-            b.saturating_sub(a)
-        })
-        .sum()
+        .map(|h| (h.since_ms, h.until_ms.unwrap_or(upto)));
+    let slept = slept.iter().map(|z| (z.since, z.until));
+    sleeps::off_ms(held.chain(slept), start, upto)
 }
 
 /// The usage limit `tab` is stopped by, if any: the app's own record of a
@@ -471,6 +471,8 @@ fn clock_at(at_ms: u64, now_ms: u64, tz: &jiff::tz::TimeZone) -> String {
 /// (for NOW), and the zone NOW writes times in.
 pub struct Clock<'a> {
     pub holds: &'a [Hold],
+    /// What the machine slept through ([`sleeps`]): off every clock.
+    pub sleeps: &'a [sleeps::Span],
     pub limit: Option<&'a Limit>,
     pub tz: jiff::tz::TimeZone,
     /// Each worker's processes' use now, by agent id: what a Running row
@@ -495,6 +497,7 @@ impl Clock<'_> {
     pub(crate) fn plain() -> Clock<'static> {
         Clock {
             holds: &[],
+            sleeps: &[],
             limit: None,
             tz: jiff::tz::TimeZone::system(),
             workers: &NO_WORKERS,
@@ -1288,8 +1291,10 @@ fn format_row(
     // pane's own holds would take them off twice.
     let writer_pauses = f.is_some_and(|f| f.paused_s.is_some() || f.paused_since_ms.is_some());
     let holds = if writer_pauses { &[][..] } else { clock.holds };
+    let slept_ms = |s: u64, e: u64| sleeps::slept_ms(clock.sleeps, s, e);
     // A Running row's work so far, in seconds: wall time up to where its
-    // clock stands, less every span the account was out of its limit.
+    // clock stands, less every span the account was out of its limit or
+    // the machine slept.
     // A worker stopped on an API error, or ended badly under a Running
     // row, stands still from then, and its error spans are off its clock.
     let stopped = l
@@ -1304,7 +1309,7 @@ fn format_row(
             }
             Some(
                 stop.saturating_sub(s)
-                    .saturating_sub(held_ms(holds, s, stop))
+                    .saturating_sub(off_ms(holds, clock.sleeps, s, stop))
                     .saturating_sub(error_ms(s, stop))
                     / 1000,
             )
@@ -1317,9 +1322,12 @@ fn format_row(
         Stage::Done => {
             let end = row.ended_ms();
             match (row_start, end) {
-                (Some(s), Some(e)) => {
-                    stopwatch(e.saturating_sub(s).saturating_sub(error_ms(s, e)) / 1000)
-                }
+                (Some(s), Some(e)) => stopwatch(
+                    e.saturating_sub(s)
+                        .saturating_sub(error_ms(s, e))
+                        .saturating_sub(slept_ms(s, e))
+                        / 1000,
+                ),
                 _ => String::new(),
             }
         }
@@ -1340,9 +1348,10 @@ fn format_row(
             .map(|e| format!("~{}", feed::fmt_span(e as i64)))
             .unwrap_or_default(),
         Stage::Done => row
-            .eta_delta_s()
+            .eta_delta_s(&slept_ms)
             .or_else(|| {
-                let took_ms = row.ended_ms()?.checked_sub(row_start?)?;
+                let (s, e) = (row_start?, row.ended_ms()?);
+                let took_ms = e.checked_sub(s)?.saturating_sub(slept_ms(s, e));
                 Some((took_ms / 1000) as i64 - agent_eta? as i64)
             })
             .map(feed::fmt_delta)
@@ -1777,6 +1786,7 @@ pub fn show(
         .unwrap_or_default();
     let clock = Clock {
         holds: &view.holds,
+        sleeps: views.sleeps.poll(&feed::feed_dir()),
         limit: limit.as_ref(),
         tz: jiff::tz::TimeZone::system(),
         workers: &workers,
@@ -4530,6 +4540,7 @@ mod tests {
     fn utc<'a>(holds: &'a [Hold], limit: Option<&'a Limit>) -> Clock<'a> {
         Clock {
             holds,
+            sleeps: &[],
             limit,
             tz: jiff::tz::TimeZone::UTC,
             workers: &NO_WORKERS,
@@ -4609,6 +4620,41 @@ mod tests {
         let mut again = holds.clone();
         track(&mut again, Some(&limit), now);
         assert_eq!(again, holds, "a reset that came round opens nothing");
+    }
+
+    #[test]
+    fn a_night_asleep_is_off_every_clock() {
+        let (rows, f) = ten_minutes_in();
+        // Asleep from T0 for eight hours; drawn five minutes after waking.
+        let night = [sleeps::Span {
+            since: T0,
+            until: T0 + 480 * MIN,
+        }];
+        let now = T0 + 485 * MIN;
+        let clock = Clock {
+            sleeps: &night,
+            ..utc(&[], None)
+        };
+        let t = build_at(Some(&f), &rows, now, &clock, &Logs::new());
+        assert_eq!(t.lines[0].elapsed, "15:00");
+        assert_eq!(t.lines[0].eta, "~15m");
+        // A writer that pauses rows has its pauses in `started`, not the
+        // machine's sleeps: those still come off.
+        let paused = feed(
+            r#"{"rows":[{"key":"g#1","stage":"running","agent_id":"a1","eta_s":1800,
+                "paused_s":0}]}"#,
+        );
+        let t = build_at(Some(&paused), &rows, now, &clock, &Logs::new());
+        assert_eq!(t.lines[0].elapsed, "15:00");
+        // Landed 20 minutes after waking, 30 minutes of work in all: on
+        // time, not eight hours over.
+        let done = feed(
+            r#"{"rows":[{"key":"g#1","stage":"done","eta_s":1800,
+                "started":1789999400000,"ended":1790030000000}]}"#,
+        );
+        let t = build_at(Some(&done), &[], now, &clock, &Logs::new());
+        assert_eq!(t.lines[0].elapsed, "30:00");
+        assert_eq!(t.lines[0].eta, "(±0m)");
     }
 
     #[test]
@@ -4753,8 +4799,20 @@ mod tests {
                 reopens_ms: None,
             },
         ];
-        assert_eq!(held_ms(&holds, 5, 30), 5 + 10);
-        assert_eq!(held_ms(&holds, 12, 18), 0);
+        assert_eq!(off_ms(&holds, &[], 5, 30), 5 + 10);
+        assert_eq!(off_ms(&holds, &[], 12, 18), 0);
+        // A sleep comes off too, and inside a hold only once.
+        let slept = [
+            sleeps::Span {
+                since: 12,
+                until: 16,
+            },
+            sleeps::Span {
+                since: 25,
+                until: 40,
+            },
+        ];
+        assert_eq!(off_ms(&holds, &slept, 5, 30), 5 + 4 + 10);
     }
 
     // --------------------------------------------------- selectable text ----

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use crate::worker_log::{self, WorkerLog};
-use crate::{continuation, feed, manage_history, resources};
+use crate::{continuation, feed, manage_history, resources, sleeps};
 
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/manage";
@@ -492,15 +492,16 @@ fn close_wait(row: &mut Map<String, Value>, now: u64) {
 
 /// Working time so far on a Running row, in seconds: since `started`
 /// (already moved on by closed pauses) up to an open pause, less its closed
-/// and open waiting spans.
-fn worked_s(row: &Map<String, Value>, now: u64) -> u64 {
+/// and open waiting spans and what the machine slept through.
+fn worked_s(row: &Map<String, Value>, now: u64, sleeps: &[sleeps::Span]) -> u64 {
     let Some(started) = ms_of(row, "started") else {
         return 0;
     };
     let upto = ms_of(row, "paused_since").unwrap_or(now);
     let open_wait = ms_of(row, "waiting_since").map_or(0, |w| upto.saturating_sub(w) / 1000);
+    let slept = sleeps::slept_ms(sleeps, started, upto) / 1000;
     (upto.saturating_sub(started) / 1000)
-        .saturating_sub(u64_of(row, "wait_s").unwrap_or(0) + open_wait)
+        .saturating_sub(u64_of(row, "wait_s").unwrap_or(0) + open_wait + slept)
 }
 
 /// A new estimate on a row drops what a row from before giverny#229 kept
@@ -1087,7 +1088,13 @@ fn agent_description(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Op
 
 /// Apply one command to a feed document at `now` (epoch ms). Returns the
 /// line to print. `Show`, `Path`, `Clear` and `ClearDone` are the caller's.
-pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, String> {
+pub fn apply(
+    doc: &mut Value,
+    cmd: &Cmd,
+    f: &Flags,
+    now: u64,
+    sleeps: &[sleeps::Span],
+) -> Result<String, String> {
     let rows = rows_mut(doc)?;
     let key = match cmd {
         Cmd::Plan(k)
@@ -1237,7 +1244,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
             // here; and the figure is taken as given, as every figure is.
             let mut sf = f.clone();
             sf.eta_s = Some(*left);
-            apply(doc, &Cmd::Start(key.clone()), &sf, now)?;
+            apply(doc, &Cmd::Start(key.clone()), &sf, now, sleeps)?;
             let rows = rows_mut(doc)?;
             if let Some(row) = find(rows, &key).and_then(|i| rows[i].as_object_mut()) {
                 // Started from `eta`, by a dispatcher that forgot `start`
@@ -1262,7 +1269,7 @@ pub fn apply(doc: &mut Value, cmd: &Cmd, f: &Flags, now: u64) -> Result<String, 
                 // The worker's first re-estimate: kept, with
                 // when it was made in working time, to be scored at landing.
                 row.insert("reest_s".into(), json!(left));
-                row.insert("reest_at_s".into(), json!(worked_s(row, now)));
+                row.insert("reest_at_s".into(), json!(worked_s(row, now, sleeps)));
             }
             let eta = match stage {
                 Some(feed::Stage::Running) => {
@@ -1442,7 +1449,7 @@ fn planned_wait(r: &Map<String, Value>, rows: &[Value]) -> Option<String> {
 }
 
 /// The rows as text, in the pane's section order.
-pub fn show(doc: &Value, now: u64) -> String {
+pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
     let rows = doc
         .get("rows")
         .and_then(Value::as_array)
@@ -1465,7 +1472,11 @@ pub fn show(doc: &Value, now: u64) -> String {
             let cell = match want {
                 feed::Stage::Running => {
                     let upto = ms_of(r, "paused_since").unwrap_or(now);
-                    let el = started.map(|s| upto.saturating_sub(s) / 1000);
+                    let el = started.map(|s| {
+                        upto.saturating_sub(s)
+                            .saturating_sub(sleeps::slept_ms(sleeps, s, upto))
+                            / 1000
+                    });
                     let left = eta.zip(el).map(|(e, el)| e as i64 - el as i64);
                     format!(
                         "{} elapsed, {}{}",
@@ -1489,9 +1500,11 @@ pub fn show(doc: &Value, now: u64) -> String {
                     }
                 }
                 feed::Stage::Done => {
-                    let took = started
-                        .zip(ms_of(r, "ended"))
-                        .map(|(s, e)| e.saturating_sub(s) / 1000);
+                    let took = started.zip(ms_of(r, "ended")).map(|(s, e)| {
+                        e.saturating_sub(s)
+                            .saturating_sub(sleeps::slept_ms(sleeps, s, e))
+                            / 1000
+                    });
                     let landing = r.get("landing").and_then(Value::as_str).unwrap_or("Done");
                     match took {
                         Some(t) => format!(
@@ -1960,6 +1973,8 @@ fn run_feed(
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let _lock = Lock::take(&file)?;
+    // What the machine slept through comes off every clock here.
+    let sleeps = sleeps::load(dir);
     let existing = std::fs::read(&file)
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -1978,7 +1993,7 @@ fn run_feed(
     }
     match cmd {
         Cmd::Show => Ok((
-            show(existing.as_ref().unwrap_or(&new_doc(session)), now),
+            show(existing.as_ref().unwrap_or(&new_doc(session)), now, &sleeps),
             Vec::new(),
         )),
         Cmd::Clear => {
@@ -2060,7 +2075,7 @@ fn run_feed(
             for (agent, _) in &linked {
                 freeze_tokens(&mut doc, &before, Some(agent), read_log);
             }
-            let msg = apply(&mut doc, cmd, &flags, now)?;
+            let msg = apply(&mut doc, cmd, &flags, now, &sleeps)?;
             let handed = match cmd {
                 Cmd::Start(_) | Cmd::Eta(..) => flags.agent.as_deref(),
                 _ => None,
@@ -2092,7 +2107,7 @@ fn run_feed(
             }
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
             if let Some(h) = &history {
-                learn(&doc, &before, session, h);
+                learn(&doc, &before, session, h, &sleeps);
             }
             let mut msg = match said {
                 Some(said) => format!("{msg}{said}"),
@@ -2218,7 +2233,7 @@ fn done_keys(doc: &Value) -> Vec<String> {
 
 /// Append every row that landed in this command (Done now, not before) to
 /// the history. A row that never started has no span and teaches nothing.
-fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
+fn learn(doc: &Value, before: &[String], session: &str, history: &Path, sleeps: &[sleeps::Span]) {
     let rows = doc.get("rows").and_then(Value::as_array);
     for r in rows.into_iter().flatten().filter_map(Value::as_object) {
         let Some(key) = r.get("key").and_then(Value::as_str) else {
@@ -2227,7 +2242,7 @@ fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
         if stage_of(r) != Some(feed::Stage::Done) || before.iter().any(|k| k == key) {
             continue;
         }
-        if let Some(rec) = record_of(r, session)
+        if let Some(rec) = record_of(r, session, sleeps)
             && let Err(e) = manage_history::append(history, &rec)
         {
             eprintln!("giverny manage: {}: {e}", history.display());
@@ -2237,11 +2252,16 @@ fn learn(doc: &Value, before: &[String], session: &str, history: &Path) {
 
 /// A landed row as a history record: wall time from its true start
 /// (`spawned` when a pause moved `started` on), working time that less its
-/// paused and waiting spans.
-pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<manage_history::Record> {
+/// paused and waiting spans and what the machine slept through.
+pub fn record_of(
+    r: &Map<String, Value>,
+    session: &str,
+    sleeps: &[sleeps::Span],
+) -> Option<manage_history::Record> {
     let started = ms_of(r, "spawned").or_else(|| ms_of(r, "started"))?;
     let ended = ms_of(r, "ended")?;
     let wall_s = ended.saturating_sub(started) / 1000;
+    let slept_s = sleeps::slept_ms(sleeps, started, ended) / 1000;
     let paused_s = u64_of(r, "paused_s").unwrap_or(0);
     let wait_s = u64_of(r, "wait_s").unwrap_or(0);
     let s = |k: &str| r.get(k).and_then(Value::as_str).map(String::from);
@@ -2269,7 +2289,8 @@ pub fn record_of(r: &Map<String, Value>, session: &str) -> Option<manage_history
         wall_s,
         paused_s,
         wait_s,
-        work_s: wall_s.saturating_sub(paused_s + wait_s),
+        slept_s,
+        work_s: wall_s.saturating_sub(paused_s + wait_s + slept_s),
         started: Some(stamp(started)),
         ended: Some(stamp(ended)),
         outcome: s("landing"),
@@ -2848,6 +2869,32 @@ mod tests {
 
     fn history(dir: &Path) -> Vec<manage_history::Record> {
         manage_history::load(&dir.join(manage_history::FILE))
+    }
+
+    #[test]
+    fn a_night_asleep_is_no_working_time() {
+        let dir = scratch("slept");
+        run(&dir, "start demo#3 --eta 30", T0).unwrap();
+        // Ten minutes in, the laptop slept eight hours.
+        sleeps::append(
+            &dir,
+            sleeps::Span {
+                since: T0 + 10 * MIN,
+                until: T0 + 490 * MIN,
+            },
+        )
+        .unwrap();
+        let shown = run(&dir, "show", T0 + 495 * MIN).unwrap();
+        assert!(shown.contains("15m elapsed, ~15m left"), "{shown}");
+        run(&dir, "eta demo#3 10", T0 + 495 * MIN).unwrap();
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
+        assert_eq!(doc["rows"][0]["reest_at_s"], 15 * 60);
+        run(&dir, "land demo#3", T0 + 500 * MIN).unwrap();
+        let last = history(&dir).pop().unwrap();
+        assert_eq!((last.wall_s, last.slept_s), (500 * 60, 480 * 60));
+        assert_eq!(last.work_s, 20 * 60);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

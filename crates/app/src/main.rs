@@ -1414,6 +1414,14 @@ fn management_panel_on(cfg: &config::Config) -> bool {
     bool_setting(cfg, "claude.management_panel")
 }
 
+/// With the management panel on, log what the machine sleeps through, so
+/// its clocks stop for it ([`giverny_claude::sleeps`]). Once per process.
+fn watch_sleeps(cfg: &config::Config) {
+    if management_panel_on(cfg) {
+        giverny_claude::sleeps::watch(giverny_claude::feed::feed_dir());
+    }
+}
+
 /// Does the management panel's plugin carry the manage skill?
 fn manage_skill_on(cfg: &config::Config) -> bool {
     cfg.management_panel.manage_skill
@@ -1944,6 +1952,7 @@ impl App {
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         set_up_accounts(&mut app.claude, &app.cfg, config_read, app.paths.base());
+        watch_sleeps(&app.cfg);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -3199,6 +3208,7 @@ impl App {
                 manage_skill_on(&cfg),
                 self.paths.base(),
             );
+            watch_sleeps(&cfg);
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
