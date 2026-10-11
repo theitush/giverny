@@ -19,6 +19,19 @@ this skill only says how to run it and keep the pane true.
 
 ## 1. Plan
 
+First, name yourself. Pick a one-word first name when the pass starts and
+record it; the pane shows it over your rows, so the user tells managers
+apart:
+
+```bash
+giverny-manage name Juniper
+```
+
+If the project signs its tasks, sign your umbrella task with that name, and
+record the full name the signing gives you (`giverny-manage name Juniper
+Belfry`). Keep the name for the whole manager session, and when you are
+resumed. Introduce yourself with it once, in your first message to the user.
+
 Break the work into tasks a single subagent can finish on its own. For each,
 choose:
 
