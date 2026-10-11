@@ -260,6 +260,22 @@ fn pick_renderer(gpu_gl: bool) -> (eframe::Renderer, Option<eframe::wgpu::Backen
     }
 }
 
+/// The fix to offer if WSLg is in its slow, no-shared-memory mode.
+/// Logged here; the rail says it to the user.
+fn wslg_slow_mode() -> Option<&'static str> {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg::slow_mode() {
+        tracing::warn!(
+            "WSLg started without its shared memory with Windows (weston.log: use_gfxredir = 0): \
+             every frame goes over RDP as a bitmap and typing will lag. \
+             Fix: `{}` in PowerShell as administrator, then reopen Giverny",
+            wslg::SLOW_MODE_FIX
+        );
+        return Some(wslg::SLOW_MODE_FIX);
+    }
+    None
+}
+
 /// Whether OpenGL has been pointed at a GPU that wgpu cannot reach: WSLg's
 /// d3d12 driver. Logs the outcome either way, since it decides the CPU cost.
 fn gpu_opengl() -> bool {
@@ -751,6 +767,7 @@ pub enum Action {
     MoveTab(TabId, CategoryId),
     InstallHooks,
     DismissHooksBanner,
+    DismissWslgSlow,
     SetCategoryProfile(CategoryId, Option<PathBuf>),
     /// Jump to the next tab where Claude needs attention (then done-unseen).
     JumpAttention,
@@ -929,6 +946,9 @@ pub struct App {
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
     pub hooks_banner_dismissed: bool,
+    /// WSLg lost its shared memory with Windows and the window lags:
+    /// the command that fixes it, said in the rail until dismissed.
+    pub wslg_slow: Option<&'static str>,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
     pub palette: Option<overlays::PaletteState>,
@@ -1425,6 +1445,7 @@ impl App {
             last_save: Instant::now(),
             claude,
             hooks_banner_dismissed: false,
+            wslg_slow: wslg_slow_mode(),
             pending_inject: Vec::new(),
             palette: None,
             session_picker: None,
@@ -1717,6 +1738,7 @@ impl App {
                 Err(e) => tracing::error!("hook install: {e}"),
             },
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
+            Action::DismissWslgSlow => self.wslg_slow = None,
             Action::SetCategoryProfile(id, dir) => {
                 if let Some(cat) = self.ws.category_mut(id) {
                     cat.profile_dir = dir;
