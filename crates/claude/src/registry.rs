@@ -313,8 +313,10 @@ pub fn last_prompt(path: &Path) -> Option<String> {
 ///
 /// The prompts are the user messages that are not tool results, notes Claude
 /// Code adds (`isMeta`, compaction summaries), turns someone else sent (an
-/// `origin` other than `human`, or text [`is_injected_prompt`] knows) or
-/// things it wraps in a tag (a command, `!` shell input). A message typed
+/// `origin` other than `human`, or, with no `origin`, text
+/// [`is_injected_prompt`] knows) or things it wraps in a tag (a command, `!`
+/// shell input). A turn whose `origin` is `human` is not checked against
+/// that text: the user can paste or type anything. A message typed
 /// while a turn ran, which Claude Code files as a `queued_command`
 /// attachment rather than a user message, is one of them, and so is one that
 /// starts with a paste, listed without the paste's tags.
@@ -408,7 +410,7 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
         };
         if let Some(text) = text {
             let text = unwrap_pastes(&text).trim().to_string();
-            if !text.is_empty() && !is_injected_prompt(&text) {
+            if !text.is_empty() && (by_human || !is_injected_prompt(&text)) {
                 typed.push((text, by_human));
             }
         }
@@ -454,8 +456,8 @@ pub fn prompt_history(path: &Path) -> Vec<String> {
 /// to its subagent, a plugin's message, the "usage limit has reset" nudge,
 /// background agents the user stopped, an interrupted request. Known by its
 /// text alone, because the `UserPromptSubmit` hook fires for these turns too
-/// and its payload (Claude Code 2.1.296) carries no `origin`; a transcript's
-/// `origin` says it first.
+/// and its payload (Claude Code 2.1.296) carries no `origin`. A transcript
+/// turn's `origin` says it instead, when it has one.
 pub fn is_injected_prompt(text: &str) -> bool {
     let text = text.trim_start();
     // Claude Code's envelopes, as `<tag>` or `<tag attr="…">`.
@@ -464,7 +466,6 @@ pub fn is_injected_prompt(text: &str) -> bool {
         "agent-message",
         "cross-session-message",
         "teammate-message",
-        "channel-message",
         "channel",
         "system-reminder",
     ];
@@ -1034,9 +1035,8 @@ mod tests {
         ));
     }
 
-    /// Another session's message, as it reached the session at
-    /// 2026-10-10T17:57:59Z (Claude Code 2.1.296): enqueued, queued as the
-    /// turn's prompt, and rendered into the turn (giverny#297).
+    /// Another session's message, in the shapes Claude Code 2.1.296 gives it:
+    /// enqueued, queued as the turn's prompt, and rendered into the turn.
     const PEER: [&str; 3] = [
         include_str!("../testdata/peer-message-enqueued.txt"),
         include_str!("../testdata/peer-message-prompt.txt"),
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn another_sessions_message_is_not_a_prompt() {
         for text in PEER {
-            assert!(text.contains("from-name=\"tolad-c3\""));
+            assert!(text.contains("from-name=\"docs\""));
             assert!(is_injected_prompt(text), "{text}");
         }
         // Its other framings, and the other envelopes Claude Code sends in.
@@ -1058,7 +1058,6 @@ mod tests {
             "<cross-session-message>hi</cross-session-message>",
             "<teammate-message teammate_id=\"tester\">\nall green\n</teammate-message>",
             "<channel source=\"telegram\" chat_id=\"1\">hi</channel>",
-            "<channel-message from=\"ops\">hi</channel-message>",
             "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder>",
             "The coordinator sent a message while you were working:\nrun the tests too",
             "[SYSTEM NOTIFICATION - NOT USER INPUT] Background agent completed",
@@ -1081,20 +1080,67 @@ mod tests {
         let path = transcript(
             "peer",
             &[
-                user(serde_json::json!("tell me when tolad answers")),
+                user(serde_json::json!("tell me when the docs session answers")),
                 serde_json::json!({
                     "type": "attachment",
                     "attachment": {
                         "type": "queued_command",
                         "prompt": PEER[1],
                         "commandMode": "prompt",
-                        "origin": {"kind": "peer", "name": "tolad-c3"},
+                        "origin": {"kind": "peer", "name": "docs"},
                     },
                     "isMeta": true,
                 }),
             ],
         );
-        assert_eq!(prompt_history(&path), ["tell me when tolad answers"]);
+        assert_eq!(
+            prompt_history(&path),
+            ["tell me when the docs session answers"]
+        );
+    }
+
+    /// Typed or pasted text that opens the way an injected turn does.
+    const LOOK_ALIKES: [&str; 3] = [
+        "<channel>\n<title>Giverny releases</title>\n<item>v1.4.0</item>\n</channel>\n\nwhy is this feed empty?",
+        "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder id=\"7abcbf89088787d4\">\n\nwhere did this come from?",
+        "The coordinator sent a message: how does the prompt bar know that's not me?",
+    ];
+
+    #[test]
+    fn a_human_turn_is_a_prompt_whatever_it_opens_with() {
+        for text in LOOK_ALIKES {
+            // The hook's payload says nothing of who sent it: the text decides.
+            assert!(is_injected_prompt(text), "{text}");
+            // The transcript says the user did, typed or while a turn ran.
+            let path = transcript(
+                "look-alike",
+                &[
+                    typed("first"),
+                    marker("first"),
+                    typed(text),
+                    marker(&text.replace('\n', " ")),
+                ],
+            );
+            assert_eq!(prompt_history(&path), ["first", text], "{text}");
+            let path = transcript(
+                "look-alike-queued",
+                &[
+                    typed("first"),
+                    queued("human", serde_json::json!(text)),
+                    marker("first"),
+                ],
+            );
+            assert_eq!(prompt_history(&path), ["first", text], "queued {text}");
+            // Sent by someone else, or with no `origin` to say, it is not.
+            for turn in [
+                sent("peer", false, text),
+                queued("peer", serde_json::json!(text)),
+                user(serde_json::json!(text)),
+            ] {
+                let path = transcript("look-alike-sent", &[typed("first"), turn.clone()]);
+                assert_eq!(prompt_history(&path), ["first"], "{turn}");
+            }
+        }
     }
 
     #[test]
