@@ -62,7 +62,7 @@ pub struct Layout {
     #[serde(default)]
     pub work_area: Option<[f32; 4]>,
     /// The settings screen's section when it was last shown, by title, so
-    /// `Ctrl+,` comes back to it (#211). A title rather than the enum: a
+    /// `Ctrl+,` comes back to it. A title rather than the enum: a
     /// section a later build renames or drops must cost only this, not the
     /// whole state file.
     #[serde(default)]
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(back.layout.collapsed_repos.len(), 1);
         // So is the interface zoom (#62: it came back at 1.0 every restart).
         assert_eq!(back.layout.zoom(), Some(1.7));
-        // And the settings section last looked at (#211).
+        // And the settings section last looked at.
         assert_eq!(back.layout.settings_section.as_deref(), Some("keys"));
         // The pre-window read sees the same thing without a full load.
         assert_eq!(load_layout(&paths), back.layout);

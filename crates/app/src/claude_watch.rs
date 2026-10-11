@@ -302,6 +302,14 @@ pub struct ClaudeWatch {
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
+    /// When the link was last checked for a target that is gone.
+    #[cfg(unix)]
+    last_link_check: Instant,
+    /// The Claude processes, by account and pid, that were running when
+    /// their account's hooks were first installed. Claude Code reads hooks
+    /// when a session starts, so these report nothing until restarted. Each
+    /// drops out when its process ends. See [`ClaudeWatch::sessions_without_hooks`].
+    predate_hooks: HashSet<(PathBuf, u32)>,
     /// Sessions whose transcript has been asked for its prompts, so each is
     /// read once, with the number of the latest read asked for, and what the
     /// readers found. Only the latest read of a session is taken: reads run
@@ -386,6 +394,10 @@ const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
 const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
 /// How often accounts are looked for again while none inside WSL is known.
 const LOOK_AGAIN_INTERVAL: Duration = Duration::from_secs(45);
+/// How often the link is checked for a target that is gone: a build that
+/// pointed it at itself, then was deleted (`cargo clean`).
+#[cfg(unix)]
+const LINK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A bool two threads share. `AtomicBool` in a name that says what it is for.
 #[derive(Default)]
@@ -540,14 +552,9 @@ fn bare_title(title: &str) -> &str {
 }
 
 impl ClaudeWatch {
-    /// `config_read` is false when Giverny's config file could not be parsed:
-    /// then the startup pass that brings accounts' hook paths and statusline
-    /// up to date is skipped, since the settings it would follow are
-    /// defaults standing in for the unreadable file.
     pub fn new(
         spool: &Path,
         extra_dirs: &[PathBuf],
-        config_read: bool,
         wake: impl Fn() + Send + 'static,
     ) -> (Self, Vec<RelayMsg>) {
         let profiles = profiles::discover(extra_dirs);
@@ -580,7 +587,9 @@ impl ClaudeWatch {
                 tracing::warn!("giverny link not pointed here: {err}");
             }
         }
-        Self::adopt_statusline_where_hooked(&profiles, leave_accounts || !config_read);
+        // Reads nothing from Giverny's config, so a config that does not
+        // parse is no reason to skip it; a side instance skips it all.
+        Self::adopt_statusline_where_hooked(&profiles, leave_accounts);
         let mut watch = ClaudeWatch {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
@@ -619,6 +628,9 @@ impl ClaudeWatch {
                     .join("agents.json"),
             ),
             leave_accounts,
+            #[cfg(unix)]
+            last_link_check: Instant::now(),
+            predate_hooks: HashSet::new(),
             prompts_asked: HashMap::new(),
             reads_asked: 0,
             hooks_drained: Instant::now(),
@@ -647,8 +659,20 @@ impl ClaudeWatch {
         let mut errs = Vec::new();
         for p in &self.profiles {
             let settings = p.config_dir.join("settings.json");
+            let first = !hooks::installed_in(&settings);
             match hooks::install_into(&settings) {
-                Ok(_) => ok += 1,
+                Ok(_) => {
+                    ok += 1;
+                    if first {
+                        self.predate_hooks.extend(
+                            self.scanned
+                                .live
+                                .iter()
+                                .filter(|s| s.config_dir == p.config_dir)
+                                .map(|s| (s.config_dir.clone(), s.entry.pid)),
+                        );
+                    }
+                }
                 Err(e) => errs.push(format!("{}: {e}", p.name)),
             }
             // Live usage comes with it — the on-disk cache goes stale for
@@ -940,6 +964,11 @@ impl ClaudeWatch {
                 Ok(result) => {
                     self.scan_rx = None;
                     self.scanned = result;
+                    let live = &self.scanned.live;
+                    self.predate_hooks.retain(|(dir, pid)| {
+                        live.iter()
+                            .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
+                    });
                     self.merge_scan(shell_pids, &mut effects);
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => self.scan_rx = None,
@@ -964,6 +993,21 @@ impl ClaudeWatch {
                 .is_ok()
             {
                 self.scan_rx = Some(rx);
+            }
+        }
+
+        // A build that pointed the link at itself and was then deleted left
+        // every session's hooks naming nothing: take the link back.
+        #[cfg(unix)]
+        if !self.leave_accounts && self.last_link_check.elapsed() >= LINK_CHECK_INTERVAL {
+            self.last_link_check = Instant::now();
+            if hooks::link_is_dangling() {
+                match hooks::point_link() {
+                    Ok(()) => {
+                        tracing::info!("giverny link named a binary that is gone: pointed here")
+                    }
+                    Err(err) => tracing::warn!("giverny link not pointed here: {err}"),
+                }
             }
         }
 
@@ -1453,6 +1497,7 @@ impl ClaudeWatch {
     /// changes the next `claude`, not the ones already running.
     pub fn set_auto_mode(&mut self, enable: bool) {
         if self.leave_accounts {
+            tracing::info!("auto mode: {LEFT_ALONE}");
             return;
         }
         for p in &self.profiles {
@@ -1848,6 +1893,9 @@ impl ClaudeWatch {
             last_look: Instant::now(),
             late_in_flight: Arc::new(AtomicFlag::default()),
             extra_dirs: Vec::new(),
+            #[cfg(unix)]
+            last_link_check: Instant::now(),
+            predate_hooks: HashSet::new(),
             prompts_asked: HashMap::new(),
             reads_asked: 0,
             hooks_drained: Instant::now(),
@@ -1858,6 +1906,12 @@ impl ClaudeWatch {
             agents: ManagementLive::in_memory(),
             leave_accounts: false,
         }
+    }
+
+    /// How many Claude sessions started before their account's hooks were
+    /// first installed, and are still running without them.
+    pub fn sessions_without_hooks(&self) -> usize {
+        self.predate_hooks.len()
     }
 
     /// Is the hook relay socket actually listening?
@@ -3437,5 +3491,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch_account(name: &str) -> (PathBuf, Profile) {
+        let dir = std::env::temp_dir().join(format!(
+            "giverny-watch-{name}-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = Profile {
+            name: name.into(),
+            config_dir: dir.clone(),
+            email: None,
+            account_uuid: None,
+        };
+        (dir, profile)
+    }
+
+    /// Sessions running when hooks are first installed never loaded them:
+    /// those, and only those, are counted until they end. A later install
+    /// over hooks already there counts nothing.
+    #[test]
+    fn sessions_older_than_the_first_install_are_counted_until_they_end() {
+        let (dir, profile) = scratch_account("first");
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![profile];
+        let live = |pid: u32| registry::LiveSession {
+            entry: serde_json::from_str(&format!(r#"{{"pid":{pid},"sessionId":"s-{pid}"}}"#))
+                .unwrap(),
+            config_dir: dir.clone(),
+        };
+        w.scanned.live = vec![live(11), live(12)];
+
+        w.install_hooks().unwrap();
+        assert_eq!(w.sessions_without_hooks(), 2);
+
+        // Installed again: nothing new predates it.
+        w.scanned.live.push(live(13));
+        w.install_hooks().unwrap();
+        assert_eq!(w.sessions_without_hooks(), 2);
+
+        // One of them restarted (gone from the registry): one left.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(ScanResult {
+            live: vec![live(12), live(13)],
+            ..ScanResult::default()
+        })
+        .unwrap();
+        w.scan_rx = Some(rx);
+        w.tick(&HashMap::new(), None, &HashMap::new(), &HashMap::new());
+        assert_eq!(w.sessions_without_hooks(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

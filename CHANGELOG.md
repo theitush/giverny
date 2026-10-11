@@ -1,5 +1,79 @@
 # Changelog
 
+## v1.4.0 — 2026-10-10
+
+The prompt bar is [@theitush](https://github.com/theitush)'s, merged from #5.
+
+- A Claude tab keeps the prompt of the turn you are reading in view. Once a
+  long answer scrolls it off the top, a one-line bar over the top row shows
+  it, and goes when the prompt is back on screen. Click the bar to read the
+  whole prompt. It follows Claude Code's fullscreen view and the terminal's
+  own scrollback, and a session resumed or adopted after a restart has its
+  prompts read back from the transcript. Only what you typed shows:
+  interrupted turns, background-task notifications and subagent hand-backs
+  do not.
+
+- A click on something drawn over the terminal no longer reaches the program
+  under it. With mouse reporting on, as in Claude Code's fullscreen view, a
+  click on an overlay also moved Claude's view.
+
+- Updating from the rail shows the install while it runs, and leads to its
+  tab. If the install ends without replacing the binary, the update button
+  comes back, and the restart button pulses once there is a new version to
+  restart into. Before, the rail went blank between the click and the new
+  binary landing. Run in a terminal, the installers draw Giverny's wordmark
+  and one line per step. Piped, logged or under `NO_COLOR`, they print the
+  same plain lines as before.
+
+## v1.3.0 — 2026-10-09
+
+All of this is [@theitush](https://github.com/theitush)'s, merged from #3.
+
+- Claude's hooks and status line no longer go stale when Giverny moves. Each
+  account's `settings.json` used to name the running Giverny's own path, so a
+  rebuild, a second build or a reinstall rewrote it, and sessions already
+  running kept calling the old binary. They now name one link,
+  `<giverny config dir>/bin/giverny`, that each Giverny points at itself when
+  it starts. Existing installs move to the link once, on first launch. The
+  "restart claude for live states" line now appears only after hooks are
+  installed for the first time, and goes once the sessions that predate them
+  have ended. A test build started with `GIVERNY_NO_ACCOUNT_SETUP=1` leaves the
+  link and every account alone, and a link left pointing at a deleted build is
+  taken back within seconds.
+
+- On Windows, hook and status-line commands are written with forward slashes.
+  Claude Code runs them through Git Bash, which read `C:\Users\…` as
+  `C:Users…`, so they never ran.
+
+- Each tab can keep its own shell history, restored with the tab:
+  `behavior.history_per_tab`, off by default, under Settings → Terminal. Works
+  with bash, zsh and fish, without touching your rc files, and nothing leaks
+  into shells started from the tab. `behavior.history_also_shared` also
+  appends each command to `~/.bash_history` (bash only).
+
+- One bad line in `config.toml` costs that line, not the file. An unknown key
+  (a typo, or a setting from a newer version) is logged and skipped, and a
+  wrong-typed value keeps its previous value. Before, either one put every
+  setting back to its default. A hot reload of a file that doesn't parse keeps
+  the running settings, and a file that exists but can't be read is no longer
+  overwritten with the template.
+
+- `giverny <word>` with a word it doesn't know prints usage and exits, instead
+  of opening a window. Flags and paths still open one.
+
+- The status line's `session:` count keeps what was spent before each
+  `/compact`, as `session: 41.2k (+310.5k)`, and `total:` includes it.
+
+- The status line can also warn in red when the prompt cache has gone cold,
+  with how many tokens the next message will cache again. It only shows if
+  Claude Code redraws the status line while the session is idle, which
+  Giverny does not set up yet.
+
+- Smaller fixes. Ctrl+click opens links and files under WSL. The terminal
+  takes the keyboard back after a click on the rail, the taskbar or a header
+  button. Settings reopens on the section you last viewed. A restored tab's
+  dot stays dim until its shell has started.
+
 ## v1.2.1 — 2026-10-07
 
 Both fixes are [@theitush](https://github.com/theitush)'s, from running the

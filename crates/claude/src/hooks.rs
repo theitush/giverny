@@ -522,11 +522,31 @@ fn exe_path() -> String {
     if let Some(link) = link_path()
         && is_link_to_a_binary(&link)
     {
-        return link.display().to_string();
+        return command_word(&link);
     }
     running_exe()
-        .map(|p| p.display().to_string())
+        .map(|p| command_word(&p))
         .unwrap_or_else(|| "giverny".into())
+}
+
+/// A path as the first word of a hook command. On macOS the link lives
+/// under `~/Library/Application Support`, and an unquoted space there split
+/// every hook and the status line into a command that does not exist.
+fn command_word(path: &Path) -> String {
+    word_for_shell(&path.display().to_string(), cfg!(windows))
+}
+
+/// Claude Code on Windows runs hook commands with Git Bash, or PowerShell
+/// where Git Bash is not installed. Bash takes `\` as an escape, so
+/// `C:\Users\…` arrives as `C:Users…`; forward slashes run in both shells,
+/// and need no quoting unless the path has a space. A quoted path only
+/// suits Git Bash (PowerShell wants `& '…'`), but it is the default.
+fn word_for_shell(path: &str, windows: bool) -> String {
+    if windows {
+        shell_quote(&path.replace('\\', "/"))
+    } else {
+        shell_quote(path)
+    }
 }
 
 /// This binary's path. Linux names a binary that was rebuilt in place while
@@ -566,6 +586,20 @@ fn is_link_to_a_binary(link: &Path) -> bool {
         && std::fs::metadata(link).is_ok_and(|m| m.is_file())
 }
 
+/// Does [`link_path`] name a binary that is gone? A build that pointed it at
+/// itself and was then deleted (`cargo clean`) leaves every session's hooks
+/// running nothing, until a Giverny points it somewhere real again.
+#[cfg(unix)]
+pub fn link_is_dangling() -> bool {
+    link_path().is_some_and(|link| is_dangling(&link))
+}
+
+#[cfg(unix)]
+fn is_dangling(link: &Path) -> bool {
+    std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && !std::fs::metadata(link).is_ok_and(|m| m.is_file())
+}
+
 /// Point [`link_path`] at this binary, so the commands written into each
 /// account name it. Done at startup by the Giverny that looks after the
 /// accounts; a side instance (`GIVERNY_NO_ACCOUNT_SETUP`) leaves it alone.
@@ -579,7 +613,12 @@ pub fn point_link() -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
-    if std::fs::read_link(link).is_ok_and(|t| t == exe) {
+    // The binary itself, not a path to it: Giverny started through the link
+    // (macOS reports the path it was started by) would otherwise point the
+    // link at itself, and every hook would run nothing.
+    // A binary copied to the link's own path is left alone the same way.
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if exe == link || std::fs::read_link(link).is_ok_and(|t| t == exe) {
         return Ok(());
     }
     if let Some(dir) = link.parent() {
@@ -589,7 +628,7 @@ fn point_link_at(link: &Path, exe: &Path) -> std::io::Result<()> {
     // binary or the new one, never no file at all.
     let tmp = link.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::os::unix::fs::symlink(&exe, &tmp)?;
     std::fs::rename(&tmp, link)
 }
 
@@ -607,9 +646,8 @@ fn exe_for(settings_path: &Path) -> String {
 }
 
 /// A path as one word for the shell Claude Code runs hook commands with.
-/// Windows paths under `/mnt/c` land in `Program Files` often enough that
-/// this is not hypothetical.
-#[cfg(windows)]
+/// Windows paths under `/mnt/c` land in `Program Files`, and macOS's config
+/// dir in `Application Support`, so this is not hypothetical.
 fn shell_quote(path: &str) -> String {
     if path
         .chars()
@@ -711,7 +749,7 @@ pub fn run_statusline(spool: &Path) {
 }
 
 /// Red `cache cold · next msg <n>` once the main conversation's prompt cache
-/// has expired (giverny#223): `<n>` is what the next message re-caches.
+/// has expired: `<n>` is what the next message re-caches.
 /// Nothing while it is warm, or when the provider reports no cache tokens.
 ///
 /// Claude Code's `prompt_cache` says so once this process has sent a
@@ -1554,8 +1592,10 @@ mod tests {
     fn the_link_follows_the_binary() {
         let d = std::env::temp_dir().join(format!("giverny-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let (a, b) = (d.join("a"), d.join("b"));
         std::fs::create_dir_all(&d).unwrap();
+        // The binary is named by its real path (macOS's /tmp is a link).
+        let d = d.canonicalize().unwrap();
+        let (a, b) = (d.join("a"), d.join("b"));
         std::fs::write(&a, "").unwrap();
         std::fs::write(&b, "").unwrap();
         let link = d.join("bin/giverny");
@@ -1570,6 +1610,62 @@ mod tests {
         assert!(
             !is_link_to_a_binary(&link),
             "a link to nothing is no binary"
+        );
+        assert!(is_dangling(&link), "and is taken back");
+        point_link_at(&link, &a).unwrap();
+        assert!(!is_dangling(&link));
+        assert!(
+            !is_dangling(&d.join("nothing")),
+            "no link is not a dangling one"
+        );
+
+        // Started through the link, the binary is still the one it names,
+        // never the link itself.
+        point_link_at(&link, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        assert!(is_link_to_a_binary(&link));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// macOS's config dir is `~/Library/Application Support`: the hook
+    /// command must still run the binary there, through the shell Claude
+    /// Code runs it with.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_a_space_runs_as_one_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("giverny-quote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("Application Support/giverny's bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("giverny");
+        std::fs::write(&exe, "#!/bin/sh\necho \"ran $1\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = format!("{} relay", command_word(&exe));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ran relay\n",
+            "{command}"
+        );
+        assert_eq!(
+            command_word(Path::new("/home/x/.config/giverny/bin/giverny")),
+            "/home/x/.config/giverny/bin/giverny",
+            "a plain path is written as before"
+        );
+        // Windows: forward slashes, which Git Bash and PowerShell both run.
+        assert_eq!(
+            word_for_shell(r"C:\Users\ita\AppData\Local\Giverny\bin\giverny.exe", true),
+            "C:/Users/ita/AppData/Local/Giverny/bin/giverny.exe"
+        );
+        assert_eq!(
+            word_for_shell(r"C:\Users\Jane Doe\giverny.exe", true),
+            "'C:/Users/Jane Doe/giverny.exe'"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

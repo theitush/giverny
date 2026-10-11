@@ -1,4 +1,4 @@
-//! Shell history per tab (#213).
+//! Shell history per tab.
 //!
 //! Each tab's shell keeps its own history file, named by the tab's stable
 //! [`TabId`] and kept beside its restore snapshot, so a restored tab's ↑
@@ -8,8 +8,8 @@
 //! No rc file of the user's is written, and a shell started anywhere else is
 //! untouched. The tab's shell is started through a small init file of
 //! Giverny's own ([`write_init`], under `state/shell/`) that runs the user's
-//! usual startup files and sets the history *inside* the shell, unexported
-//! (#216): a shell started from the tab — a nested bash, a zsh in a bash tab
+//! usual startup files and sets the history *inside* the shell, unexported:
+//! a shell started from the tab — a nested bash, a zsh in a bash tab
 //! — gets none of it and keeps its own defaults. The startup files run after
 //! the tab's file is named, so an rc that sets `HISTFILE` itself wins, and
 //! the tab simply has the user's usual history, as before.
@@ -102,9 +102,9 @@ pub fn init_dir(paths: &Paths) -> PathBuf {
 /// of this reaches a shell started from the tab. The prompt-command entry
 /// expands to nothing where `__giverny_hf` is unset, so even an inherited,
 /// exported `PROMPT_COMMAND` carries nothing a nested shell trips over.
-pub const BASHRC: &str = r#"# Written by Giverny for its terminal tabs (per-tab history, giverny#213,
-# #216) and rewritten when a tab starts: edits here do not last. It runs your
-# ~/.bashrc; nothing of yours is changed.
+pub const BASHRC: &str = r#"# Written by Giverny for its terminal tabs (per-tab history) and rewritten
+# when a tab starts: edits here do not last. It runs your ~/.bashrc;
+# nothing of yours is changed.
 __giverny_hf=${GIVERNY_HISTFILE-}
 __giverny_hf_shared=${GIVERNY_HISTFILE_SHARED-}
 unset GIVERNY_HISTFILE GIVERNY_HISTFILE_SHARED
@@ -139,9 +139,9 @@ fi
 /// user's `ZDOTDIR` back at once — so `.zprofile`, `.zshrc`, `.zlogin` and
 /// every shell started from the tab are the user's own — name the tab's
 /// file, and run the user's `.zshenv`.
-pub const ZSHENV: &str = r#"# Written by Giverny for its terminal tabs (per-tab history, giverny#213,
-# #216) and rewritten when a tab starts: edits here do not last. It runs your
-# own .zshenv; nothing of yours is changed.
+pub const ZSHENV: &str = r#"# Written by Giverny for its terminal tabs (per-tab history) and rewritten
+# when a tab starts: edits here do not last. It runs your own .zshenv;
+# nothing of yours is changed.
 if [[ -n ${GIVERNY_ZDOTDIR+x} ]]; then
     ZDOTDIR=$GIVERNY_ZDOTDIR
 else
@@ -291,7 +291,7 @@ mod tests {
     }
 
     /// The tab's history variables, which no shell started from the tab
-    /// may inherit (#216).
+    /// may inherit.
     const HISTORY_VARS: [&str; 5] = [
         "HISTFILE",
         "PROMPT_COMMAND",
@@ -359,6 +359,7 @@ mod tests {
     }
 
     /// The history variables in an `env` dump.
+    #[cfg(unix)]
     fn leaked(dump: &Path) -> Vec<String> {
         std::fs::read_to_string(dump)
             .unwrap()

@@ -986,6 +986,20 @@ struct Limited {
     session_gone: bool,
 }
 
+/// An install running in its tab, from the update button until the binary
+/// lands or the installer stops without replacing it.
+pub struct UpdateJob {
+    pub tab: TabId,
+    started: Instant,
+    /// Something has run in the tab's shell. Until then an empty foreground
+    /// is the command not having been typed yet, not the install having ended.
+    seen_running: bool,
+}
+
+/// How long an install that was never seen running gets before it counts as
+/// over: one that fails at once (no network) finishes between two looks.
+const UPDATE_UNSEEN_GRACE: Duration = Duration::from_secs(10);
+
 /// What one tab needs to open: the shell, the account it is on (named the
 /// way Giverny stores accounts), and the environment that reaches the shell.
 struct TabShape {
@@ -1218,8 +1232,10 @@ pub struct App {
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
-    update_ran: bool,
+    pub update_job: Option<UpdateJob>,
     pub update_installed: bool,
+    /// The last install ended without replacing the binary; its tab says why.
+    pub update_stalled: bool,
     /// Theme-derived colours for Giverny's own chrome.
     pub chrome: chrome::Chrome,
     pub settings: Option<settings_ui::SettingsState>,
@@ -1391,8 +1407,6 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
     ))
 }
 
-/// Environment every tab's shell inherits, so `claude` behaves the way the
-/// settings screen says however it is started — typed, resumed, or attached.
 /// Is the management panel on? Read by its settings key rather than a struct
 /// field, so the relay and the installer follow whatever the settings table
 /// declares — and read as off in a build that does not declare it.
@@ -1415,11 +1429,13 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
 /// the management panel's subagent line and plugin.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
-/// not (`config_read` false). The app then runs on defaults there, and following those would rewrite accounts against
-/// what the user configured: turn the management panel's subagent line and plugin
-/// on where they were turned off, or (in a build whose default is off) strip
-/// them from every account. Once the file parses again, the hot reload
-/// applies what it says.
+/// not (`config_read` false). The app then runs on defaults there, and
+/// following those would rewrite accounts against what the user configured:
+/// turn the management panel's subagent line and plugin on where they were
+/// turned off, or (in a build whose default is off) strip them from every
+/// account. Once the file parses again, the hot reload applies what it says.
+/// Hook paths and the status line read nothing from the config, so
+/// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
 fn set_up_accounts(
     claude: &mut claude_watch::ClaudeWatch,
     cfg: &config::Config,
@@ -1450,6 +1466,8 @@ fn bool_setting(cfg: &config::Config, key: &str) -> bool {
 /// feed writer inside WSL writes where the app reads.
 const FEED_DIR_WSLENV: &str = "GIVERNY_FEED_DIR/p";
 
+/// Environment every tab's shell inherits, so `claude` behaves the way the
+/// settings screen says however it is started — typed, resumed, or attached.
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if claude.skip_resume_summary {
@@ -1816,7 +1834,6 @@ impl App {
         let (claude, spooled) = claude_watch::ClaudeWatch::new(
             &paths.hook_spool(),
             &cfg.behavior.extra_profile_dirs,
-            config_read,
             move || wake_ctx.request_repaint(),
         );
         // Events spooled while the app was closed: keep session captures.
@@ -1889,8 +1906,9 @@ impl App {
             welcome,
             update_dismissed: false,
             exe_mtime: update::binary_mtime(),
-            update_ran: false,
+            update_job: None,
             update_installed: false,
+            update_stalled: false,
             chrome,
             settings: None,
             keys_overlay: None,
@@ -1941,6 +1959,15 @@ impl App {
         // otherwise.
         app.save_state();
         app
+    }
+
+    /// A brand-new tab. Tab ids start over when the state file is lost, so
+    /// a history file can outlive its tab (one whose shell outlasted the
+    /// close, say): a new tab with that id starts without it.
+    fn new_tab(&mut self, category: CategoryId) -> TabId {
+        let id = self.ws.add_tab(category);
+        history::remove(&self.paths, id);
+        id
     }
 
     /// Write one tab's scrollback, skipping the write when the screen has not
@@ -2028,7 +2055,7 @@ impl App {
                     .or_else(|| self.ws.active_tab().and_then(|t| t.cwd.clone()))
                     .or_else(dirs::home_dir)
                     .unwrap_or_else(|| PathBuf::from("/"));
-                let id = self.ws.add_tab(category);
+                let id = self.new_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
                 self.reveal_terminal();
@@ -2043,12 +2070,23 @@ impl App {
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
-                    // Join off the UI thread; the loop exits quickly.
-                    std::thread::spawn(move || session.shutdown());
+                    // Join off the UI thread; the loop exits quickly. The
+                    // history goes once the shell has: zsh writes its file
+                    // on the SIGHUP that shutdown sends, so removing it
+                    // first would only see it written again.
+                    let paths = self.paths.clone();
+                    std::thread::spawn(move || {
+                        // Longer than the 500 ms an app exit allows: this
+                        // thread holds nothing up, and a shell that is slow
+                        // to go would write its file after the removal.
+                        session.shutdown_within(Duration::from_secs(10));
+                        history::remove(&paths, id);
+                    });
+                } else {
+                    history::remove(&self.paths, id);
                 }
                 self.ws.close_tab(id);
                 state::remove_snapshot(&self.paths, id);
-                history::remove(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.agent_views.forget(id);
                 self.focus_terminal = true;
@@ -2188,7 +2226,7 @@ impl App {
             Action::ToggleSettings => {
                 self.settings = match self.settings.take() {
                     Some(_) => None,
-                    // Back on the section last looked at, not the first (#211).
+                    // Back on the section last looked at, not the first.
                     None => Some(settings_ui::SettingsState {
                         section: giverny_core::settings::Section::ALL
                             .iter()
@@ -2246,7 +2284,7 @@ impl App {
                 // its category only has to exist, and is not opened for it.
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
                 let collapsed = self.ws.category_mut(cat).map(|c| c.collapsed);
-                let id = self.ws.add_tab(cat);
+                let id = self.new_tab(cat);
                 if let (Some(was), Some(c)) = (collapsed, self.ws.category_mut(cat)) {
                     c.collapsed = was;
                 }
@@ -2280,7 +2318,7 @@ impl App {
                     .map(|t| t.category)
                     .or_else(|| self.ws.categories.first().map(|c| c.id));
                 if let Some(cat) = cat {
-                    let id = self.ws.add_tab(cat);
+                    let id = self.new_tab(cat);
                     self.ws.tab_mut(id).unwrap().cwd = dirs::home_dir();
                     self.spawn_session(ctx, id, None);
                     // Same deferred injection the resume path uses: give the
@@ -2387,10 +2425,14 @@ impl App {
                             id,
                             Inject::Raw(cmd),
                         ));
+                        self.update_job = Some(UpdateJob {
+                            tab: id,
+                            started: Instant::now(),
+                            seen_running: false,
+                        });
+                        self.update_stalled = false;
                     }
                 }
-                self.update_ran = true;
-                self.update_dismissed = true;
             }
             Action::DismissUpdate => self.update_dismissed = true,
             Action::RestartNow => {
@@ -2424,7 +2466,7 @@ impl App {
             .or_else(|| self.ws.categories.first().map(|c| c.id));
         let Some(category) = category else { return };
         splash::mark_seen(self.paths.base());
-        let id = self.ws.add_tab(category);
+        let id = self.new_tab(category);
         if let Some(tab) = self.ws.tab_mut(id) {
             tab.cwd = dirs::home_dir();
         }
@@ -2432,9 +2474,9 @@ impl App {
         self.reveal_terminal();
     }
 
-    /// How this tab's shell is started so it keeps its own history (#213):
-    /// arguments for it and environment for Giverny's init file there
-    /// (#216). `None` when the setting is off, or the shell is not one that
+    /// How this tab's shell is started so it keeps its own history:
+    /// arguments for it and environment for Giverny's init file there.
+    /// `None` when the setting is off, or the shell is not one that
     /// can be steered this way or already has arguments of its own. `env` is
     /// what the tab already adds on top of ours.
     fn history_steer(
@@ -3396,12 +3438,13 @@ impl App {
         }
         // While an install is running in its tab, watch for the binary being
         // replaced: that is the moment a restart has something to pick up.
-        if self.update_ran && !self.update_installed {
+        if self.update_job.is_some() && !self.update_installed {
             self.update_installed =
                 update::binary_mtime().is_some_and(|at| Some(at) != self.exe_mtime);
         }
         self.persist_font_size();
         self.track_foreground();
+        self.follow_update_job();
         self.probe_wsl_cwds();
         self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -3409,6 +3452,29 @@ impl App {
             .refresh_stale_usage(self.cfg.usage.refresh_minutes, false);
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
+        }
+    }
+
+    /// Notice an install that ended without the binary changing: its tab was
+    /// closed, or its shell is back at the prompt after running something
+    /// (or never visibly ran it). Either way the update button comes back, so
+    /// it can be tried again.
+    fn follow_update_job(&mut self) {
+        if self.update_installed {
+            return;
+        }
+        let Some(job) = &mut self.update_job else {
+            return;
+        };
+        let Some(tab) = self.ws.tab(job.tab) else {
+            self.update_job = None;
+            return;
+        };
+        if tab.foreground.is_some() {
+            job.seen_running = true;
+        } else if job.seen_running || job.started.elapsed() > UPDATE_UNSEEN_GRACE {
+            self.update_job = None;
+            self.update_stalled = true;
         }
     }
 
@@ -4815,7 +4881,7 @@ impl App {
             Some(t) => t.category,
             None => category_for_agent(&mut self.ws, cwd.as_deref()),
         };
-        let id = self.ws.add_tab(cat);
+        let id = self.new_tab(cat);
         if let Some(tab) = self.ws.tab_mut(id) {
             tab.cwd = cwd.or_else(dirs::home_dir);
             tab.custom_title = Some(title.to_string());
@@ -4918,6 +4984,13 @@ impl App {
     }
 }
 
+/// The terminal `id` has lost the keyboard to something that is not meant
+/// to hold it, and should take it back: anything but a text field, while no
+/// `overlay` reading keys of its own is open.
+fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
+    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
+}
+
 /// Frames drawn per second, logged every ten seconds at debug level
 /// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
 /// asked for the last one. On a software renderer every frame is CPU, so
@@ -4947,13 +5020,6 @@ fn count_frame(ctx: &egui::Context) {
 }
 
 /// Input queued by `debug_cmd`, one frame's worth per entry.
-/// The terminal `id` has lost the keyboard to something that is not meant
-/// to hold it, and should take it back: anything but a text
-/// field, while no `overlay` reading keys of its own is open.
-fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
-    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
-}
-
 #[cfg(debug_assertions)]
 static DEBUG_INPUT: std::sync::Mutex<Vec<Vec<egui::Event>>> = std::sync::Mutex::new(Vec::new());
 
