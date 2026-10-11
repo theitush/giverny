@@ -61,7 +61,9 @@ usage: giverny manage <command> [args] [--session <id>]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
   drop  <task>                remove the task's row
-  show                        print the rows
+  name  <Name…>                this manager's name, shown over its rows in the
+                              pane (a second `name` replaces it)
+  show                        print the name and the rows
   accuracy [--repo R]         how every estimator's figures fared against the
                               time really worked, older tasks against recent
   path                        print the feed file's path
@@ -136,6 +138,8 @@ pub enum Cmd {
     Hold(String),
     /// End a hold.
     Unhold(String),
+    /// The manager's own name, shown over its rows.
+    Name(String),
     Show,
     Path,
     ClearDone,
@@ -341,6 +345,14 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "drop" => Cmd::Drop(task()?),
         "hold" => Cmd::Hold(task()?),
         "unhold" | "release-hold" => Cmd::Unhold(task()?),
+        "name" => {
+            let name = pos.by_ref().collect::<Vec<_>>().join(" ");
+            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            if name.is_empty() {
+                return Err("`name` needs the name, e.g. `giverny manage name Juniper`".into());
+            }
+            Cmd::Name(name)
+        }
         "show" => Cmd::Show,
         "path" => Cmd::Path,
         "clear-done" | "clear_done" | "cleardone" => Cmd::ClearDone,
@@ -1095,6 +1107,14 @@ pub fn apply(
     now: u64,
     sleeps: &[sleeps::Span],
 ) -> Result<String, String> {
+    if let Cmd::Name(name) = cmd {
+        let obj = doc.as_object_mut().ok_or("the feed is not a JSON object")?;
+        let was = obj.insert("name".into(), json!(name));
+        return Ok(match was.as_ref().and_then(Value::as_str) {
+            Some(w) if w != name => format!("named {name} (was {w})"),
+            _ => format!("named {name}"),
+        });
+    }
     let rows = rows_mut(doc)?;
     let key = match cmd {
         Cmd::Plan(k)
@@ -1106,7 +1126,8 @@ pub fn apply(
         | Cmd::Drop(k)
         | Cmd::Hold(k)
         | Cmd::Unhold(k) => k.clone(),
-        Cmd::Show
+        Cmd::Name(_)
+        | Cmd::Show
         | Cmd::Path
         | Cmd::Clear
         | Cmd::ClearDone
@@ -1409,7 +1430,8 @@ pub fn apply(
                 "released the hold on {key}: start it once its lane and lease are free"
             ))
         }
-        Cmd::Show
+        Cmd::Name(_)
+        | Cmd::Show
         | Cmd::Path
         | Cmd::Clear
         | Cmd::ClearDone
@@ -1456,6 +1478,10 @@ pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
         .cloned()
         .unwrap_or_default();
     let mut out = String::new();
+    if let Some(name) = doc.get("name").and_then(Value::as_str) {
+        out.push_str(&format!("{name}\n"));
+    }
+    let named = out.len();
     for want in [
         feed::Stage::Running,
         feed::Stage::Planned,
@@ -1523,7 +1549,7 @@ pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
             ));
         }
     }
-    if out.is_empty() {
+    if out.len() == named {
         out.push_str("(no rows)\n");
     }
     out
@@ -2864,6 +2890,32 @@ mod tests {
             theirs.to_vec()
         );
         assert_eq!(parse_args(&args("clear-done")).unwrap().0, Cmd::ClearDone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_is_kept_on_the_feed_and_a_second_replaces_it() {
+        assert_eq!(
+            parse_args(&args("name  Juniper   Belfry ")).unwrap().0,
+            Cmd::Name("Juniper Belfry".into())
+        );
+        assert!(parse_args(&args("name")).is_err());
+        assert!(USAGE.contains("name  <Name…>"));
+
+        let dir = scratch("name");
+        assert_eq!(run(&dir, "name Juniper", T0).unwrap(), "named Juniper");
+        assert_eq!(read_feed(&dir).name.as_deref(), Some("Juniper"));
+        assert_eq!(run(&dir, "show", T0).unwrap(), "Juniper\n(no rows)\n");
+        run(&dir, "plan a --eta 5", T0).unwrap();
+        assert_eq!(
+            run(&dir, "name Juniper Belfry", T0).unwrap(),
+            "named Juniper Belfry (was Juniper)"
+        );
+        let f = read_feed(&dir);
+        assert_eq!(f.name.as_deref(), Some("Juniper Belfry"));
+        assert_eq!(f.rows.len(), 1, "naming leaves the rows alone");
+        let shown = run(&dir, "show", T0).unwrap();
+        assert!(shown.starts_with("Juniper Belfry\nplanned  a "), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

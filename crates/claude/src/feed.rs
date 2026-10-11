@@ -297,6 +297,8 @@ pub struct Feed {
     pub version: u64,
     /// The Claude session id the feed is for.
     pub session: Option<String>,
+    /// The manager's own name (`giverny manage name`), drawn over its rows.
+    pub name: Option<String>,
     /// Earlier ids of the same conversation (a resume or a re-id), so a tab
     /// still holding an old id finds the feed.
     pub aliases: Vec<String>,
@@ -474,6 +476,7 @@ pub fn parse(bytes: &[u8]) -> Result<Feed, FeedError> {
     Ok(Feed {
         version,
         session: str_field(&v, "session"),
+        name: str_field(&v, "name"),
         aliases,
         rows,
         footer,
@@ -1570,7 +1573,7 @@ mod tests {
         assert_eq!(keys, ["b", "d", "e"]);
     }
 
-    const FULL: &str = r#"{"version":1,"session":"s-new","aliases":["s-old"],
+    const FULL: &str = r#"{"version":1,"session":"s-new","aliases":["s-old"],"name":"Juniper Belfry",
       "rows":[
         {"key":"acme#158","stage":"running","title":"FEATURE: pane","agent_id":"a1",
          "started":"2026-09-23T10:00:00Z","eta_s":2400,"landing":"Review — ita",
@@ -2069,6 +2072,7 @@ mod tests {
         assert_eq!(f.version, 1);
         assert_eq!(f.session.as_deref(), Some("s-new"));
         assert_eq!(f.aliases, vec!["s-old".to_string()]);
+        assert_eq!(f.name.as_deref(), Some("Juniper Belfry"));
         assert_eq!(
             f.footer.as_deref(),
             Some("session: 3 · subagents: 1.2M · total: 1.2M")
@@ -2106,6 +2110,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.version, 1, "an absent version is 1");
+        assert_eq!(f.name, None, "no name, no header");
         let keys: Vec<_> = f.rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(
             keys,
