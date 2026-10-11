@@ -3123,15 +3123,12 @@ mod tests {
         let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
         assert_eq!(ids, ["acme#614", "acme#616", "acme#613"]);
         let (run, next, done) = (&t.lines[0], &t.lines[1], &t.lines[2]);
-        // Running: timed from the message, counted from it too.
+        // Running: timed from the message, but its count is the worker's
+        // whole live context, what it works with now (giverny#319).
         assert_eq!(run.stage, Stage::Running);
         assert_eq!(run.elapsed, "30:00");
         assert_eq!(run.eta, "~30m");
-        assert_eq!(
-            run.tokens,
-            fmt_tokens(8_000 + 3_000),
-            "not the worker's 156.3k"
-        );
+        assert_eq!(run.tokens, "156.3k", "the worker's context, not 11k");
         // Queued behind it on the same worker.
         assert_eq!(next.stage, Stage::Planned);
         assert_eq!(next.now, "after acme#614");
@@ -3178,7 +3175,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#616", "10:00", "0"),
+                (Stage::Running, "acme#616", "10:00", "156.3k"),
                 (Stage::Done, "acme#614", "20:00", "11k"),
                 (Stage::Done, "acme#613", "30:00", "28k"),
             ]
@@ -3242,8 +3239,8 @@ mod tests {
     /// giverny#217, the inbar manager session: a plain `start` and the task handed
     /// over in the dispatcher's own words, with no `New task for you`. The
     /// row with no worker is the worker's from the message, and each task
-    /// counts its own tokens — the next one named only as "a review round
-    /// on #613".
+    /// counts its own tokens once done — the next one named only as "a
+    /// review round on #613".
     #[test]
     fn a_task_handed_by_message_in_any_words_counts_its_own_tokens() {
         let lines = [
@@ -3280,7 +3277,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#614", k7.as_str(), Some("w")),
+                (Stage::Running, "acme#614", "156.3k", Some("w")),
                 (Stage::Done, "acme#613", k21.as_str(), Some("w")),
             ]
         );
@@ -3320,11 +3317,10 @@ mod tests {
                 )
             })
             .collect();
-        let k35 = fmt_tokens(3_500);
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#613-r1", k35.as_str(), Some("w")),
+                (Stage::Running, "acme#613-r1", "156.3k", Some("w")),
                 (Stage::Done, "acme#614", k7.as_str(), Some("w")),
                 (Stage::Done, "acme#613", k21.as_str(), Some("w")),
             ]
@@ -3370,7 +3366,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#616", "20:00", "", "3.7k"),
+                (Stage::Running, "acme#616", "20:00", "", "156.3k"),
                 (Stage::Done, "acme#614", "20:00", "→ acme#616", "4.9k"),
                 (Stage::Done, "acme#613", "20:00", "→ acme#614", "13.5k"),
             ]
@@ -3491,8 +3487,9 @@ mod tests {
     /// Claude Code lists a worker woken by a message afresh, its
     /// `startTime` moved to that message. A worker on its third task, so
     /// listed, still has a row per task: each Done row counts its own span
-    /// and stays put while the worker goes on, the Running row counts from
-    /// its own start, and a count the feed froze at landing is the one shown.
+    /// and stays put while the worker goes on, the Running row shows the
+    /// worker's live context (giverny#319), and a count the feed froze at
+    /// landing is the one shown.
     #[test]
     fn a_relisted_workers_done_rows_keep_their_own_counts() {
         let mut lines = vec![
@@ -3518,12 +3515,12 @@ mod tests {
             s614 = T0 - 40 * MIN,
             s616 = T0 - 20 * MIN,
         ));
-        let table = |lines: &[String], f: &Feed| {
+        let table = |lines: &[String], f: &Feed, context: u64| {
             std::fs::write(&path, lines.join("\n") + "\n").unwrap();
             let mut rows = live(&format!(
                 r#"{{"session_id":"s","tasks":[{{"id":"w","status":"running",
                     "description":"acme#613 market SD graph","startTime":{},
-                    "tokenCount":156313}}]}}"#,
+                    "tokenCount":{context}}}]}}"#,
                 T0 - 20 * MIN
             ));
             rows[0].transcript = Some(path.clone());
@@ -3537,20 +3534,82 @@ mod tests {
         };
         let row = |id: &str, el: &str, tok: u64| (id.to_string(), el.to_string(), fmt_tokens(tok));
         let want = [
-            row("acme#616", "20:00", 3_700),
+            row("acme#616", "20:00", 17_000),
             row("acme#614", "20:00", 4_600),
             row("acme#613", "20:00", 11_000),
         ];
-        assert_eq!(table(&lines, &f), want);
+        assert_eq!(table(&lines, &f, 17_000), want);
         // The worker goes on: only its Running row moves.
         lines.push(reply("m4", T0 - 5 * MIN, 50_000, 17_000, 900));
         let mut later = want.clone();
-        later[0].2 = fmt_tokens(3_700 + 50_900);
-        assert_eq!(table(&lines, &f), later);
+        later[0].2 = fmt_tokens(67_000);
+        assert_eq!(table(&lines, &f, 67_000), later);
         // A count frozen when the row landed is the one drawn.
         let mut f = f;
         f.rows[1].task_tokens = Some(4_321);
-        assert_eq!(table(&lines, &f)[1].2, fmt_tokens(4_321));
+        assert_eq!(table(&lines, &f, 67_000)[1].2, fmt_tokens(4_321));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#319: a reused worker's Running row shows the whole context
+    /// it works with now — the figure `giverny manage start` says an idle
+    /// worker carries — not the 4k spent since the hand-off. Its first
+    /// task's Done row still shows only what that task took, and a fresh
+    /// worker's Running row is its live count, as ever.
+    #[test]
+    fn a_reused_workers_running_row_shows_its_whole_context() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 60_000, 0, 2_000),
+            reply("m2", T0 - 35 * MIN, 28_000, 62_000, 2_000),
+            sent(T0 - 30 * MIN, "New task for you: acme#614, the follow-up."),
+            reply("m3", T0 - 10 * MIN, 3_100, 90_000, 900),
+        ];
+        let dir = std::env::temp_dir().join(format!("giverny-pane-319-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-w.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        // What `start` prints for this worker were it idle.
+        let context = giverny_claude::tokens::tokens_of(&path).unwrap();
+        assert_eq!(context, 93_100);
+        let mut rows = live(&format!(
+            r#"{{"session_id":"s","tasks":[
+              {{"id":"w","status":"running","description":"acme#613 market SD graph",
+                "startTime":{w},"tokenCount":{context}}},
+              {{"id":"f","status":"running","description":"acme#700 fresh one",
+                "startTime":{f},"tokenCount":41200}}]}}"#,
+            w = T0 - 60 * MIN,
+            f = T0 - 15 * MIN,
+        ));
+        rows[0].transcript = Some(path.clone());
+        let mut logs = Logs::new();
+        poll_logs(&mut logs, &rows);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#614","stage":"running","agent_id":"w","started":{s614}}},
+              {{"key":"acme#700","stage":"running","agent_id":"f","started":{s700}}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{s614}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            s614 = T0 - 30 * MIN,
+            s700 = T0 - 15 * MIN,
+        ));
+        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
+        let got: Vec<(Stage, &str, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.stage, l.id.as_str(), l.tokens.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Stage::Running, "acme#614", "93.1k"),
+                (Stage::Running, "acme#700", "41.2k"),
+                (Stage::Done, "acme#613", "92k"),
+            ]
+        );
+        assert_eq!(t.lines[0].tokens, fmt_tokens(context), "agrees with start");
+        assert_eq!(logs["w"].added(T0 - 30 * MIN, None), 4_000, "not this");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

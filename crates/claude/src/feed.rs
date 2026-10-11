@@ -704,8 +704,8 @@ pub struct PaneRow<'a, L> {
     /// task ended there at the latest.
     pub next_ms: Option<u64>,
     pub next_key: Option<String>,
-    /// One of a worker's tasks taken one after another: what this task
-    /// spent, the turns from its hand-off to the next one's. `Some(None)`
+    /// One of a worker's finished tasks taken one after another: what this
+    /// task spent, the turns from its hand-off to the next one's. `Some(None)`
     /// when the transcript could not be read: never the worker's whole
     /// count, which every such row would repeat.
     pub task_tokens: Option<Option<u64>>,
@@ -831,8 +831,9 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         }
     }
 
-    /// Tokens: for one of a worker's tasks taken one after another, what
-    /// that task spent ([`PaneRow::task_tokens`]); else the worker's count
+    /// Tokens: for one of a worker's finished tasks taken one after
+    /// another, what that task spent ([`PaneRow::task_tokens`]); else (a
+    /// Running row, a reused worker's too) the worker's count
     /// (Claude Code's own, as its agents view shows it), else what the feed
     /// wrote.
     pub fn tokens(&self) -> Option<u64> {
@@ -1029,8 +1030,9 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
 ///   when the next batch began, at the latest; still Running in the feed, it
 ///   is Done there — `start <next> --agent <worker>` is the whole hand-off.
 /// - **Tokens per task.** Each Done batch shows what its turns added, from
-///   its start (the first from the worker's first turn) to the next batch's;
-///   a Running later batch, what it added from its own start. The Done rows
+///   its start (the first from the worker's first turn) to the next batch's.
+///   A Running batch shows the worker's whole live context, as a fresh
+///   worker's does: what it works with now (giverny#319). The Done rows
 ///   of a worker add up to everything it added, and nothing is counted
 ///   twice. A count `giverny manage` froze on the row when it landed
 ///   (`task_tokens`) is drawn in place of either. The worker's start is its
@@ -1110,10 +1112,12 @@ fn queue<'w, L: LiveAgent>(
                         r.next_key = next_key.clone();
                         r.stage = Stage::Done;
                     }
-                    // A later task, still running, counts from its own
-                    // start too, never the turns of the tasks before it;
-                    // with no transcript to count, the worker's live count.
-                    if r.stage == Stage::Done || (k > 0 && w.is_some()) {
+                    // A task still running shows the context its worker
+                    // works with now, the tasks before it and all
+                    // (giverny#319): the live count, as a fresh worker's
+                    // row does and `giverny manage start` says an idle
+                    // worker carries. Only a finished task is its own span.
+                    if r.stage == Stage::Done {
                         r.task_tokens = Some(w.map(|w| w.added(from, to)));
                     }
                 }
