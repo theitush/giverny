@@ -70,9 +70,10 @@ usage: giverny manage <command> [args] [--session <id>]
   clear                       delete this session's feed
 
   claim <task> [--cpu N] [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
-               [--min-ram 2G] [--priority asap|high|medium|low]
+               [--min-cpu N] [--min-ram 2G] [--priority asap|high|medium|low]
                               ask the machine ledger for what the task's worker
-                              needs: granted (exit 0), granted smaller (3),
+                              needs: granted (exit 0), granted smaller (3:
+                              fewer cores or less RAM, down to --min-cpu/--min-ram),
                               queued behind its holders (4; re-run to poll),
                               refused as larger than the limits (5)
   release <task>              give the task's lease back (land and drop do it)
@@ -180,6 +181,7 @@ pub struct Flags {
     pub vram_mb: Option<u64>,
     pub slots: Vec<String>,
     pub min_ram_mb: Option<u64>,
+    pub min_cpu: Option<u32>,
     pub priority: Option<String>,
     /// `run`: the command, everything after `--`.
     pub command: Vec<String>,
@@ -204,6 +206,7 @@ impl Flags {
             vram_mb: self.vram_mb.unwrap_or(0),
             slots: self.slots.clone(),
             min_ram_mb: self.min_ram_mb,
+            min_cpu: self.min_cpu,
             priority: self.priority.clone(),
             peak_mb: None,
         }
@@ -297,6 +300,10 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--ram" => flags.ram_mb = Some(parse_mem("--ram", &val("--ram")?)?),
             "--vram" => flags.vram_mb = Some(parse_mem("--vram", &val("--vram")?)?),
             "--min-ram" => flags.min_ram_mb = Some(parse_mem("--min-ram", &val("--min-ram")?)?),
+            "--min-cpu" => match parse_count("--min-cpu", &val("--min-cpu")?)? {
+                0 => return Err("--min-cpu: at least 1".into()),
+                n => flags.min_cpu = Some(n),
+            },
             "--slot" => flags.slots.push(val("--slot")?),
             "--priority" => flags.priority = Some(val("--priority")?),
             "--task" => flags.task = Some(val("--task")?),
@@ -3274,7 +3281,7 @@ mod tests {
     #[test]
     fn claim_flags_parse() {
         let (cmd, f) = parse_args(&args(
-            "claim t --cpu 3 --ram 1.5G --gpu 1 --vram 8G --slot a --slot b --min-ram 512M --priority high",
+            "claim t --cpu 3 --ram 1.5G --gpu 1 --vram 8G --slot a --slot b --min-ram 512M --min-cpu 2 --priority high",
         ))
         .unwrap();
         assert_eq!(cmd, Cmd::Claim("t".into()));
@@ -3282,6 +3289,8 @@ mod tests {
         assert_eq!((r.cpu, r.ram_mb, r.gpu, r.vram_mb), (3, 1536, 1, 8192));
         assert_eq!(r.slots, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(r.min_ram_mb, Some(512));
+        assert_eq!(r.min_cpu, Some(2));
+        assert!(parse_args(&args("claim t --min-cpu 0")).is_err());
         assert_eq!(r.priority.as_deref(), Some("high"));
         assert!(parse_args(&args("claim t --ram lots")).is_err());
         assert!(

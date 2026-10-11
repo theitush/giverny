@@ -693,6 +693,7 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                 slots: l.slots.clone(),
                 granted_ms: Some(l.granted_at),
                 wanted_ram_mb: smaller.and_then(|c| c.wanted_ram_mb),
+                wanted_cpu: smaller.and_then(|c| c.wanted_cpu),
                 position: None,
                 behind: None,
             });
@@ -727,6 +728,7 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                 slots: w.request.slots.clone(),
                 granted_ms: None,
                 wanted_ram_mb: None,
+                wanted_cpu: None,
                 position: Some(i as u64 + 1),
                 behind,
             });
@@ -928,8 +930,16 @@ fn lease_fact(l: &RowLease) -> String {
                 "holds {}",
                 resources::describe_held(l.cpu, l.ram_mb, &l.gpus, l.vram_mb, &l.slots)
             );
-            if let Some(w) = l.wanted_ram_mb.filter(|_| l.state == LeaseState::Smaller) {
-                s.push_str(&format!(" (asked {})", mem(w)));
+            if l.state == LeaseState::Smaller {
+                let asked: Vec<String> = l
+                    .wanted_cpu
+                    .map(|c| format!("{c} cpu"))
+                    .into_iter()
+                    .chain(l.wanted_ram_mb.map(mem))
+                    .collect();
+                if !asked.is_empty() {
+                    s.push_str(&format!(" (asked {})", asked.join(", ")));
+                }
             }
             s
         }
@@ -3669,6 +3679,23 @@ mod tests {
         l.state = LeaseState::Queued;
         l.position = Some(2);
         assert_eq!(lease_fact(&l), "queued #2 for 3G");
+        // Granted smaller: what it asked for, beside what it holds.
+        let mut s = l.clone();
+        s.state = LeaseState::Smaller;
+        s.cpu = 2;
+        s.wanted_cpu = Some(3);
+        s.wanted_ram_mb = None;
+        assert!(
+            lease_fact(&s).ends_with(" (asked 3 cpu)"),
+            "{}",
+            lease_fact(&s)
+        );
+        s.wanted_ram_mb = Some(4096);
+        assert!(
+            lease_fact(&s).ends_with(" (asked 3 cpu, 4G)"),
+            "{}",
+            lease_fact(&s)
+        );
     }
 
     /// Every cell is as wide as every other, whatever
