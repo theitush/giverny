@@ -1709,6 +1709,11 @@ mod tests {
             // queued it and as it rendered it into the turn.
             include_str!("../../claude/testdata/peer-message-prompt.txt"),
             include_str!("../../claude/testdata/peer-message-rendered.txt"),
+            // The hook can't tell these from typed ones; the transcript can,
+            // and a later read brings them back.
+            "<channel>\n<title>Giverny releases</title>\n</channel>\n\nwhy is this feed empty?",
+            "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder id=\"7abcbf89088787d4\">",
+            "The coordinator sent a message: how does the prompt bar know that's not me?",
         ] {
             feed(&mut w, &submit(injected), Some(TAB));
             assert_eq!(w.state_of(TAB), ClaudeState::Busy, "still work: {injected}");
