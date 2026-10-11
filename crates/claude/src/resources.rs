@@ -21,8 +21,21 @@
 //! what it held without anyone cleaning up.
 //!
 //! **The grant rule** ([`Ledger::try_fit`]): a request fits when
-//! - its CPU ≤ the limit − Σ live leases, and ≤ the machine's cores − Σ
-//!   leases − the 1-minute load average that the leases do not explain;
+//! - its CPU fits by **measured use**, not by the sum of leases
+//!   (giverny#318): every lease counts at the high end of the cores its
+//!   kind uses over a task's life (p90 of the history's CPU time over wall
+//!   time, [`crate::manage_history::expected_cpu_m`]), or at what its
+//!   running commands use now when that is more, never above its lease;
+//!   with too little history, at its lease ([`Capacity::counted_cpu_m`]).
+//!   Their sum is raised by a headroom, the largest gap between one lease
+//!   and what it counts at (at least a core), and never past the leases'
+//!   sum ([`Ledger::counted_cpu_m`]): one lease may start a build at any
+//!   moment. The new lease must then fit **whole** (it is the one about to
+//!   build) under the limit less that sum, and under the machine's cores
+//!   less that sum or the 1-minute load average, whichever is more: what
+//!   really runs now still blocks, idle reservations do not. An
+//!   over-admitted moment slows tasks by their `CPUWeight` shares rather
+//!   than starving any;
 //! - its memory fits by **expected peaks**, not by the sum of leases
 //!   (giverny#281): every task, running or about to, counts at its expected
 //!   peak — the high end of its kind's measured history (p90, as `claim`
@@ -156,6 +169,11 @@ pub struct Request {
     /// counts at its RAM (or the default lease when it asks none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_mb: Option<u64>,
+    /// The cores tasks like this one use over their life (the high end of
+    /// their history), thousandths: what its lease counts at once granted.
+    /// `None`: too little history, so it counts at its whole lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_use_m: Option<u64>,
 }
 
 /// What one session's task holds.
@@ -183,6 +201,10 @@ pub struct Lease {
     /// gave one; else it counts at `ram_mb` (or the default lease).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_mb: Option<u64>,
+    /// The cores its kind's history says it uses, thousandths
+    /// (giverny#318); else it counts at its whole `cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_use_m: Option<u64>,
     #[serde(with = "ts")]
     pub granted_at: u64,
     #[serde(with = "ts")]
@@ -237,6 +259,8 @@ pub struct Capacity {
     pub default_lease: giverny_core::config::DefaultLease,
     /// What the slice really holds now.
     pub mem_use: MemUse,
+    /// What the leases' running commands use now.
+    pub cpu_use: CpuUse,
 }
 
 impl Capacity {
@@ -253,6 +277,7 @@ impl Capacity {
             machine,
             default_lease: giverny_core::config::DefaultLease::load(),
             mem_use: MemUse::sample(&crate::run_live::runs_dir(ledger)),
+            cpu_use: CpuUse::sample(&crate::run_live::runs_dir(ledger), manage::now_ms()),
         })
     }
 
@@ -266,6 +291,62 @@ impl Capacity {
         });
         expected.max(self.mem_use.of(&l.id))
     }
+
+    /// What CPU admission counts `l` at, thousandths of a core: its kind's
+    /// expected use, or what its commands use now when that is more, never
+    /// above its lease; its whole lease when there is no history.
+    pub fn counted_cpu_m(&self, l: &Lease) -> u64 {
+        let lease = u64::from(l.cpu) * 1000;
+        match l.cpu_use_m {
+            Some(e) => e.max(self.cpu_use.of(&l.id)).min(lease),
+            None => lease,
+        }
+    }
+}
+
+/// The cores the leases' running `giverny manage run` commands use now,
+/// thousandths, by lease id: each scope's `cpu.stat` `usage_usec` over the
+/// time it has run. An average since the command started, not an instant:
+/// the load average speaks for the instant.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CpuUse {
+    pub by_lease: HashMap<String, u64>,
+}
+
+impl CpuUse {
+    pub fn of(&self, lease_id: &str) -> u64 {
+        self.by_lease.get(lease_id).copied().unwrap_or(0)
+    }
+
+    /// The running commands under `runs_dir` at `now`. Nothing where they
+    /// have no cgroup of their own, or say no start.
+    pub fn sample(runs_dir: &Path, now: u64) -> CpuUse {
+        let mut by_lease: HashMap<String, u64> = HashMap::new();
+        for (session, task, cg, started) in crate::run_live::running_since(runs_dir) {
+            let Some(started) = started else { continue };
+            if let Some(m) = cpu_m(&cg, now.saturating_sub(started)) {
+                *by_lease.entry(lease_id(&session, &task)).or_default() += m;
+            }
+        }
+        CpuUse { by_lease }
+    }
+}
+
+/// The cores the cgroup at `dir` used on average over `ran_ms`, thousandths.
+fn cpu_m(dir: &Path, ran_ms: u64) -> Option<u64> {
+    if ran_ms == 0 {
+        return None;
+    }
+    let usec = std::fs::read_to_string(dir.join("cpu.stat"))
+        .ok()
+        .and_then(|t| stat_field(&t, "usage_usec"))?;
+    // µs of CPU per ms of wall time is thousandths of a core.
+    Some(usec / ran_ms)
+}
+
+/// `1.5` for 1500 thousandths of a core.
+pub fn fmt_cores(m: u64) -> String {
+    format!("{:.1}", m as f64 / 1000.0)
 }
 
 /// Memory the slice's processes cannot give back (no swap): a cgroup's
@@ -359,6 +440,13 @@ pub struct Free {
     pub mem_room_mb: Option<u64>,
     /// What every lease counts at, summed ([`Capacity::counted_mb`]).
     pub counted_mb: u64,
+    /// What the leases count at for CPU with the headroom, thousandths
+    /// ([`Ledger::counted_cpu_m`]).
+    pub counted_cpu_m: u64,
+    /// The leases' cores, summed.
+    pub leased_cpu: u32,
+    /// The headroom in `counted_cpu_m`, thousandths.
+    pub cpu_headroom_m: u64,
 }
 
 /// A fitting grant: the cores, RAM and GPUs it gets.
@@ -495,9 +583,30 @@ impl Ledger {
             .find(|l| l.session == session && l.task == task)
     }
 
+    /// What the leases count at for CPU, thousandths, and the headroom in
+    /// it: each at [`Capacity::counted_cpu_m`], the sum raised by the
+    /// largest gap between one lease and what it counts at (at least a
+    /// core), never past the sum of the leases. With no history every lease
+    /// counts whole and this is that sum.
+    pub fn counted_cpu_m(&self, cap: &Capacity) -> (u64, u64) {
+        let leased: u64 = self.leases.iter().map(|l| u64::from(l.cpu) * 1000).sum();
+        let counted: u64 = self.leases.iter().map(|l| cap.counted_cpu_m(l)).sum();
+        let gap = self
+            .leases
+            .iter()
+            .map(|l| (u64::from(l.cpu) * 1000).saturating_sub(cap.counted_cpu_m(l)))
+            .max()
+            .unwrap_or(0)
+            .max(1000);
+        let total = (counted + gap).min(leased);
+        (total, total - counted)
+    }
+
     /// What is free now under `cap`.
     pub fn free(&self, cap: &Capacity) -> Free {
         let leased_cpu: u32 = self.leases.iter().map(|l| l.cpu).sum();
+        let (counted_cpu_m, cpu_headroom_m) = self.counted_cpu_m(cap);
+        let counted_cpu = counted_cpu_m as f64 / 1000.0;
         let counted_mb: u64 = self.leases.iter().map(|l| cap.counted_mb(l)).sum();
         // What the leases may still grow by before their peaks: not yet
         // taken out of `MemAvailable`.
@@ -510,10 +619,12 @@ impl Ledger {
         let foreign_cpu = cap
             .load
             .load1
-            .map(|l| (l - leased_cpu as f64).max(0.0))
+            .map(|l| (l - counted_cpu).max(0.0))
             .unwrap_or(0.0);
-        let by_limit = cap.limits.cpu_cores.saturating_sub(leased_cpu) as f64;
-        let by_machine = cap.machine.cores as f64 - leased_cpu as f64 - foreign_cpu;
+        let by_limit = cap.limits.cpu_cores as f64 - counted_cpu;
+        // The cores less what really runs (the load average) or what the
+        // leases count at, whichever is more.
+        let by_machine = cap.machine.cores as f64 - cap.load.load1.unwrap_or(0.0).max(counted_cpu);
         let cpu = by_limit.min(by_machine).floor().max(0.0) as u32;
         let mem_room_mb = cap
             .load
@@ -548,6 +659,9 @@ impl Ledger {
             foreign_cpu,
             mem_room_mb,
             counted_mb,
+            counted_cpu_m,
+            leased_cpu,
+            cpu_headroom_m,
         }
     }
 
@@ -666,6 +780,8 @@ impl Ledger {
                 vram_mb: r.vram_mb,
                 slots: r.slots.clone(),
                 peak_mb: Some(Ledger::counted_for(cap, r, r.ram_mb)),
+                // Set aside whole: it is about to start.
+                cpu_use_m: None,
                 granted_at: w.queued_at,
                 heartbeat_at: w.heartbeat_at,
             });
@@ -759,6 +875,7 @@ impl Ledger {
                     vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
                     slots: req.slots.clone(),
                     peak_mb: req.peak_mb.map(|_| fit.counted_mb),
+                    cpu_use_m: req.cpu_use_m,
                     granted_at: now,
                     heartbeat_at: now,
                 };
@@ -836,6 +953,20 @@ impl Ledger {
         for l in self.leases.iter_mut().filter(|l| l.peak_mb.is_none()) {
             if let Some(p) = peak(l) {
                 l.peak_mb = Some(p);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Give each lease admitted before its kind had a CPU history (or before
+    /// giverny#318) the expected use `cpu` finds for it now, thousandths, so
+    /// it stops counting at its whole lease. True when any changed.
+    pub fn fill_cpu(&mut self, cpu: &dyn Fn(&Lease) -> Option<u64>) -> bool {
+        let mut changed = false;
+        for l in self.leases.iter_mut().filter(|l| l.cpu_use_m.is_none()) {
+            if let Some(c) = cpu(l) {
+                l.cpu_use_m = Some(c);
                 changed = true;
             }
         }
@@ -970,12 +1101,22 @@ pub fn ask_hint(
     ))
 }
 
-/// `, counted at its kind's peak 1.2G` when admission counted a lease at
-/// an expected peak other than its RAM.
+/// `, counted at its kind's 0.6 cpu, peak 1.2G` when admission counts a
+/// lease below its cores, or at an expected peak other than its RAM.
 fn counted(l: &Lease) -> String {
+    let mut parts = Vec::new();
+    match l.cpu_use_m {
+        Some(c) if c < u64::from(l.cpu) * 1000 => parts.push(format!("{} cpu", fmt_cores(c))),
+        _ => {}
+    }
     match l.peak_mb {
-        Some(p) if p != l.ram_mb => format!(", counted at its kind's peak {}", Mem(p)),
-        _ => String::new(),
+        Some(p) if p != l.ram_mb => parts.push(format!("peak {}", Mem(p))),
+        _ => {}
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", counted at its kind's {}", parts.join(", "))
     }
 }
 
@@ -1307,7 +1448,15 @@ pub fn report(
         cap.default_lease.cpu_cores, cap.default_lease.ram
     ));
     out.push_str(&format!(
-        "others    load {:.1} beyond the leases; {} available{} (headroom {})\n",
+        "cores     {} counted of {}: the {} leased at their kinds' use (or use now, \
+         or lease), {} headroom\n",
+        fmt_cores(free.counted_cpu_m),
+        lim.cpu_cores,
+        free.leased_cpu,
+        fmt_cores(free.cpu_headroom_m),
+    ));
+    out.push_str(&format!(
+        "others    load {:.1} beyond what the leases count; {} available{} (headroom {})\n",
         free.foreign_cpu,
         cap.load
             .mem_available
@@ -1348,10 +1497,22 @@ pub fn report(
                 .unwrap_or_default();
             let using = cap.mem_use.of(&x.id);
             let counts = cap.counted_mb(x);
-            let mem = if using > 0 {
-                format!("  counts {}, using {}", Mem(counts), Mem(using))
-            } else {
-                format!("  counts {}", Mem(counts))
+            let cpu_using = cap.cpu_use.of(&x.id);
+            let cpu_counts = format!("{} cpu", fmt_cores(cap.counted_cpu_m(x)));
+            let mem = match (cpu_using > 0, using > 0) {
+                (false, false) => format!("  counts {cpu_counts}, {}", Mem(counts)),
+                (c, m) => format!(
+                    "  counts {cpu_counts}, {}, using {}",
+                    Mem(counts),
+                    [
+                        c.then(|| format!("{} cpu", fmt_cores(cpu_using))),
+                        m.then(|| Mem(using).to_string()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                ),
             };
             out.push_str(&format!(
                 "  {:<16} {}{mem}  session {}  beat {} ago{left}\n",
@@ -1417,6 +1578,7 @@ mod tests {
             machine,
             default_lease: Default::default(),
             mem_use: Default::default(),
+            cpu_use: Default::default(),
         }
     }
 
@@ -1814,6 +1976,146 @@ mod tests {
         assert_eq!(u.of("s1:demo#7"), 2048);
         assert_eq!(u.of("s1:other"), 0);
         assert_eq!(held_mb(&dir.join("none")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2-core lease whose kind uses `use_m` thousandths of a core.
+    fn busy(l: &mut Ledger, c: &Capacity, task: &str, use_m: Option<u64>) {
+        let r = Request {
+            cpu_use_m: use_m,
+            ..req(2, 1)
+        };
+        let g = l.claim(c, "tolad", task, Some("ToLaD"), &r, T0);
+        assert!(matches!(g, Outcome::Granted(_)), "{task}: {g:?}");
+    }
+
+    /// giverny#318: five 2-core leases of a kind that uses 0.58 cores over
+    /// a task's life count at 2.9 cores and one burst of headroom (1.42),
+    /// not at the 10 leased: a 3-core task starts beside them.
+    #[test]
+    fn idle_cores_are_counted_at_their_kinds_use_not_their_lease() {
+        let c = cap();
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            busy(&mut l, &c, t, Some(580));
+        }
+        let free = l.free(&c);
+        assert_eq!(free.leased_cpu, 10);
+        assert_eq!((free.counted_cpu_m, free.cpu_headroom_m), (4320, 1420));
+        // 12 − 4.32 by the limit; 14 − max(load 0, 4.32) by the machine.
+        assert_eq!(free.cpu, 7);
+        let new = Request {
+            cpu_use_m: Some(580),
+            ..req(3, 1)
+        };
+        let g = l.claim(&c, "s", "new", Some("ToLaD"), &new, T0);
+        let Outcome::Granted(lease) = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!((lease.cpu, lease.cpu_use_m), (3, Some(580)));
+        assert_eq!(
+            outcome_line("new", &g, &|_, _| None),
+            "granted new: 3 cpu, 1G, counted at its kind's 0.6 cpu"
+        );
+        // The new lease must fit whole: 12 − (3.48 + 2.42) leaves 6.
+        assert_eq!(l.free(&c).cpu, 6);
+        let big = l.claim(&c, "s", "big", None, &req(7, 1), T0);
+        assert!(matches!(big, Outcome::Queued { .. }), "{big:?}");
+        l.release("s", "big", T0);
+        let smaller = Request {
+            min_cpu: Some(4),
+            ..req(7, 1)
+        };
+        let g = l.claim(&c, "s", "big", None, &smaller, T0);
+        assert!(
+            matches!(&g, Outcome::GrantedSmaller { lease, .. } if lease.cpu == 6),
+            "{g:?}"
+        );
+
+        // Without history the same leases count whole, as before.
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            busy(&mut l, &c, t, None);
+        }
+        let free = l.free(&c);
+        assert_eq!((free.counted_cpu_m, free.cpu_headroom_m), (10_000, 0));
+        assert_eq!(free.cpu, 2);
+        assert!(matches!(
+            l.claim(&c, "s", "new", None, &req(3, 1), T0),
+            Outcome::Queued { .. }
+        ));
+        // Their kind's history arrives: they are counted by it from then.
+        l.release("s", "new", T0);
+        assert!(l.fill_cpu(&|x| (x.repo.as_deref() == Some("ToLaD")).then_some(580)));
+        assert!(!l.fill_cpu(&|_| Some(1)), "a figure once given stays");
+        assert_eq!(l.free(&c).cpu, 7);
+    }
+
+    /// giverny#318: what really runs still blocks — a lease building now
+    /// counts at its use (never past its lease), and the load average
+    /// counts what the history cannot see.
+    #[test]
+    fn busy_cores_still_queue() {
+        let mut c = cap();
+        let mut l = Ledger::default();
+        for t in ["a", "b", "c", "d", "e"] {
+            busy(&mut l, &c, t, Some(580));
+        }
+        // `a` builds on 1.8 cores now: 1.8 + 4 × 0.58, plus 1.42 headroom.
+        c.cpu_use.by_lease.insert(lease_id("tolad", "a"), 1800);
+        assert_eq!(c.counted_cpu_m(&l.leases[0]), 1800);
+        assert_eq!(l.free(&c).counted_cpu_m, 1800 + 4 * 580 + 1420);
+        // Past its lease it counts at the lease.
+        c.cpu_use.by_lease.insert(lease_id("tolad", "a"), 4000);
+        assert_eq!(c.counted_cpu_m(&l.leases[0]), 2000);
+        // The machine is busy on 12 of 14 cores: 2 are free, whatever the
+        // leases count at.
+        let mut c = cap();
+        c.load.load1 = Some(12.0);
+        let free = l.free(&c);
+        assert_eq!(free.cpu, 2);
+        assert!((free.foreign_cpu - (12.0 - 4.32)).abs() < 1e-9);
+        assert_eq!(l.try_fit(&c, &req(3, 1)), Err(vec!["cpu".to_string()]));
+        // One idle lease left: it counts at its use and a whole core of
+        // headroom, never past its lease.
+        let c = cap();
+        let mut l = Ledger::default();
+        busy(&mut l, &c, "a", Some(200));
+        assert_eq!(l.counted_cpu_m(&c), (2000, 1800));
+        let mut l = Ledger::default();
+        let r = Request {
+            cpu_use_m: Some(500),
+            ..req(4, 1)
+        };
+        l.claim(&c, "s", "x", None, &r, T0);
+        assert_eq!(l.counted_cpu_m(&c), (4000, 3500));
+        l.claim(&c, "s", "y", None, &r, T0);
+        assert_eq!(l.counted_cpu_m(&c), (4500, 3500));
+    }
+
+    /// A run's cores are its scope's CPU time over the time it has run.
+    #[test]
+    fn a_runs_cores_are_read_from_its_scope() {
+        let dir = std::env::temp_dir().join(format!("giverny-cpuuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runs = dir.join("runs");
+        let cg = dir.join("scope");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::create_dir_all(&cg).unwrap();
+        // 90 s of CPU in the minute since it started: 1.5 cores.
+        std::fs::write(
+            cg.join("cpu.stat"),
+            "usage_usec 90000000\nuser_usec 80000000\nsystem_usec 10000000\n",
+        )
+        .unwrap();
+        let stats = runs.join("1-0.stats");
+        std::fs::write(&stats, format!("started\ncgroup {}\n", cg.display())).unwrap();
+        let _live = crate::run_live::register(&stats, "demo#7", "s1", T0).unwrap();
+        let u = CpuUse::sample(&runs, T0 + MIN);
+        assert_eq!(u.of("s1:demo#7"), 1500);
+        assert_eq!(u.of("s1:other"), 0);
+        assert_eq!(cpu_m(&cg, 0), None);
+        assert_eq!(cpu_m(&dir.join("none"), MIN), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

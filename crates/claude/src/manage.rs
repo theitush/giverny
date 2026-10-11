@@ -209,6 +209,7 @@ impl Flags {
             min_cpu: self.min_cpu,
             priority: self.priority.clone(),
             peak_mb: None,
+            cpu_use_m: None,
         }
     }
 }
@@ -1688,7 +1689,7 @@ pub fn run_in_code(
             let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
             let peaks = Peaks::load(dir);
             let out = resources::with_ledger(&ledger, now, |l| {
-                l.fill_peaks(&|x| peaks.of_lease(x));
+                peaks.fill(l);
                 resources::report(l, &cap, now, &eta)
             })?;
             return Ok((out, 0));
@@ -1750,12 +1751,13 @@ fn claim(
     let peaks = Peaks::load(dir);
     let req = resources::Request {
         peak_mb: peaks.expected(session, task, repo.as_deref()),
+        cpu_use_m: peaks.expected_cpu(session, task, repo.as_deref()),
         ..flags.request()
     };
     // Figures given on a held lease, each no larger, shrink it in place: the
     // answer to an ask. Otherwise it is a claim as ever.
     let (out, shrunk) = resources::with_ledger(ledger, now, |l| {
-        l.fill_peaks(&|x| peaks.of_lease(x));
+        peaks.fill(l);
         if let Some(s) = l.shrink(session, task, flags.cpu, flags.ram_mb, flags.vram_mb, now) {
             l.heartbeat(session, now);
             return (resources::Outcome::Held(s.1.clone()), Some(s.0));
@@ -1851,6 +1853,27 @@ impl<'a> Peaks<'a> {
     /// [`Peaks::expected`] for a lease already in the ledger.
     pub(crate) fn of_lease(&self, l: &resources::Lease) -> Option<u64> {
         self.expected(&l.session, &l.task, l.repo.as_deref())
+    }
+
+    /// What CPU admission counts the task at (giverny#318), thousandths of
+    /// a core: the high end of the cores tasks like it used over their life.
+    pub(crate) fn expected_cpu(
+        &self,
+        session: &str,
+        task: &str,
+        repo: Option<&str>,
+    ) -> Option<u64> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let kind = self.kind(session, task);
+        manage_history::expected_cpu_m(&self.history, repo, kind.as_deref())
+    }
+
+    /// Give the ledger's leases that have none their expected peak and CPU.
+    pub(crate) fn fill(&self, l: &mut resources::Ledger) {
+        l.fill_peaks(&|x| self.of_lease(x));
+        l.fill_cpu(&|x| self.expected_cpu(&x.session, &x.task, x.repo.as_deref()));
     }
 }
 
@@ -2994,6 +3017,7 @@ mod tests {
             },
             default_lease: Default::default(),
             mem_use: Default::default(),
+            cpu_use: Default::default(),
         }
     }
 
@@ -3091,7 +3115,47 @@ mod tests {
         }
         let shown = run_as(&dir, "a", "resources", T0).0;
         assert!(shown.contains("memory    7.6G counted of 16G"), "{shown}");
-        assert!(shown.contains("counts 1.3G"), "{shown}");
+        assert!(shown.contains("counts 1.0 cpu, 1.3G"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#318: a claim's cores count at its kind's measured use, so
+    /// 3-core leases of tasks that use 0.6 cores leave room past the
+    /// limit ÷ 3; `resources` says what each counts at.
+    #[test]
+    fn claim_counts_a_lease_at_its_kinds_cpu() {
+        let dir = scratch("claim-cpu");
+        let h = dir.join(manage_history::FILE);
+        for cpu_s in [300, 360, 240] {
+            let rec = manage_history::Record {
+                key: "demo#1".into(),
+                repo: Some("demo".into()),
+                kind: Some("BUG".into()),
+                cpu_s: Some(cpu_s),
+                wall_s: 600,
+                ..manage_history::Record::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        // Five 3-core leases are 15 cores, past the 12-core limit; at 0.6
+        // each and one burst (2.4) of headroom, 5.4.
+        for n in 2..=6 {
+            let key = format!("demo#{n}");
+            run_as(&dir, "a", &format!("plan {key} --eta 10 --title BUG:x"), T0);
+            let (msg, code) = run_as(&dir, "a", &format!("claim {key} --cpu 3 --ram 1G"), T0);
+            assert_eq!(code, resources::exit::GRANTED, "{msg}");
+            assert!(
+                msg.contains("3 cpu, 1G, counted at its kind's 0.6 cpu"),
+                "{msg}"
+            );
+        }
+        let shown = run_as(&dir, "a", "resources", T0).0;
+        assert!(
+            shown.contains("cores     5.4 counted of 12: the 15 leased"),
+            "{shown}"
+        );
+        assert!(shown.contains("counts 0.6 cpu, 1G"), "{shown}");
+        assert!(shown.contains("free now  6 cores"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -425,6 +425,7 @@ fn lease_for(
         cpu: flags.cpu.unwrap_or(default.cpu_cores),
         ram_mb: flags.ram_mb.unwrap_or(default.ram.0),
         peak_mb: peaks.expected(session, task, repo.as_deref()),
+        cpu_use_m: peaks.expected_cpu(session, task, repo.as_deref()),
         ..flags.request()
     };
     let mut waiting = false;
@@ -436,7 +437,7 @@ fn lease_for(
         };
         let now = manage::now_ms();
         let out = resources::with_ledger(ledger, now, |l| {
-            l.fill_peaks(&|x| peaks.of_lease(x));
+            peaks.fill(l);
             l.claim(&capacity, session, task, repo.as_deref(), &req, now)
         })?;
         resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
@@ -935,6 +936,7 @@ mod tests {
             },
             default_lease: Default::default(),
             mem_use: Default::default(),
+            cpu_use: Default::default(),
         }
     }
 

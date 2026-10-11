@@ -619,6 +619,7 @@ mod tests {
             },
             default_lease: Default::default(),
             mem_use: Default::default(),
+            cpu_use: Default::default(),
         }
     }
 
