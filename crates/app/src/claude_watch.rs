@@ -46,13 +46,28 @@ pub struct ClaudeTab {
     /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
     /// from the transcript for a session adopted mid-way or resumed.
     pub prompts: Vec<String>,
-    /// For each prompt at the end of `prompts` a hook reported, the earliest
-    /// it can have reached Giverny: when the hook stream was last drained
-    /// before it. See [`merge_history`].
-    heard: Vec<Instant>,
+    /// For each prompt at the end of `prompts` a hook reported, when it
+    /// reached Giverny. Kept until a transcript read is sure to have it or
+    /// sure not to. See [`ClaudeWatch::apply_found_prompts`].
+    heard: Vec<Heard>,
     last_hook: Option<Instant>,
     seen_in_scan: bool,
 }
+
+/// When a hook's prompt reached Giverny: after the hook stream was last
+/// drained before it, and by the drain that took it.
+#[derive(Debug, Clone, Copy)]
+struct Heard {
+    after: Instant,
+    by: Instant,
+}
+
+/// How far apart a prompt's hook and its line in the transcript can be, as
+/// Giverny sees them. Claude Code writes the prompt once its hooks have run,
+/// and the hook can reach Giverny up to a spool poll (400 ms) after it ran.
+/// A prompt heard this long before a read began is in it; one heard this long
+/// after a read finished is not. Between the two, a read can't say.
+const SEAM: Duration = Duration::from_secs(1);
 
 /// How many of a session's prompts a tab keeps.
 pub const PROMPT_HISTORY: usize = 200;
@@ -291,6 +306,9 @@ struct FoundPrompt {
     session: String,
     /// Which read of the session this is, of [`ClaudeWatch::prompts_asked`].
     read: u64,
+    /// When the transcript was opened: a prompt Claude Code wrote before
+    /// this is in it.
+    started: Instant,
     /// When the transcript had been read: a prompt Claude Code wrote after
     /// this is not in it.
     done: Instant,
@@ -685,7 +703,10 @@ impl ClaudeWatch {
                     .filter(|p| !p.is_empty() && !registry::is_injected_prompt(p))
                 {
                     entry.prompts.push(prompt);
-                    entry.heard.push(self.hooks_drained);
+                    entry.heard.push(Heard {
+                        after: self.hooks_drained,
+                        by: Instant::now(),
+                    });
                     entry.cap_prompts();
                 }
             }
@@ -1475,6 +1496,7 @@ impl ClaudeWatch {
             .name("giverny last prompt".into())
             .spawn(move || {
                 for (session, dir, read) in sessions {
+                    let started = Instant::now();
                     let prompts = registry::find_transcript(&dir, &session)
                         .map(|path| registry::prompt_history(&path))
                         .unwrap_or_default();
@@ -1482,6 +1504,7 @@ impl ClaudeWatch {
                         let _ = tx.send(FoundPrompt {
                             session,
                             read,
+                            started,
                             done: Instant::now(),
                             prompts,
                         });
@@ -1494,12 +1517,21 @@ impl ClaudeWatch {
     /// takes the read as it is; one a hook has told of prompts since keeps
     /// those, after the ones read. A read that is not its session's latest
     /// is stale and dropped.
+    ///
+    /// Whether a heard prompt is in the read goes by when it was heard (see
+    /// [`SEAM`]): one heard well after the read is a new turn however it
+    /// reads, and one heard well before it is met by its text. One heard
+    /// around the read is met by its text for now, and the transcript is
+    /// read again, by when the read is sure: a repeated "yes" written just
+    /// after the read is not the earlier "yes", and a prompt whose hook
+    /// reached Giverny late is not added twice.
     fn apply_found_prompts(&mut self) {
         let found: Vec<FoundPrompt> = self.prompts_found.1.try_iter().collect();
         for found in found {
             if self.prompts_asked.get(&found.session) != Some(&found.read) {
                 continue;
             }
+            let mut unsure = false;
             for tab in self.tabs.values_mut() {
                 if tab.session_id.as_deref() != Some(found.session.as_str()) {
                     continue;
@@ -1509,12 +1541,24 @@ impl ClaudeWatch {
                     tab.heard.clear();
                 } else {
                     let heard = &tab.prompts[tab.prompts.len() - tab.heard.len()..];
-                    let fresh = tab.heard.iter().filter(|&&t| t >= found.done).count();
+                    let read = tab
+                        .heard
+                        .iter()
+                        .take_while(|h| h.by + SEAM <= found.started)
+                        .count();
+                    let fresh = tab
+                        .heard
+                        .iter()
+                        .filter(|h| h.after >= found.done + SEAM)
+                        .count();
                     tab.prompts = merge_history(&found.prompts, heard, fresh);
-                    let over = tab.heard.len() - fresh;
-                    tab.heard.drain(..over);
+                    unsure |= read + fresh < tab.heard.len();
+                    tab.heard.drain(..read);
                 }
                 tab.cap_prompts();
+            }
+            if unsure {
+                self.prompts_asked.remove(&found.session);
             }
         }
     }
@@ -1801,15 +1845,18 @@ mod tests {
             s(&["a", "yes", "yes"])
         );
 
-        // Through the watcher: a hook's "yes" from after the transcript was
-        // read is a second "yes"; one from before it is the read's own.
+        // Through the watcher: a hook's "yes" from well after the transcript
+        // was read is a second "yes"; one from well before it is the read's
+        // own. Neither asks for another read.
         for (after, want) in [(true, &["a", "yes", "yes"][..]), (false, &["a", "yes"][..])] {
             let mut w = ClaudeWatch::for_tests();
             feed(&mut w, &hook("SessionStart", ""), Some(TAB));
             w.prompts_asked.insert("s-1".into(), 1);
-            let before = Instant::now();
-            let done = before + Duration::from_millis(5);
-            w.hooks_drained = if after { done } else { before };
+            let started = Instant::now() + 2 * SEAM;
+            let done = started + Duration::from_millis(5);
+            if after {
+                w.hooks_drained = done + SEAM;
+            }
             feed(
                 &mut w,
                 &hook("UserPromptSubmit", r#","prompt":"yes""#),
@@ -1820,13 +1867,71 @@ mod tests {
                 .send(FoundPrompt {
                     session: "s-1".into(),
                     read: 1,
+                    started,
                     done,
                     prompts: s(&["a", "yes"]),
                 })
                 .unwrap();
             w.apply_found_prompts();
             assert_eq!(w.prompts_of(TAB), Some(&s(want)[..]), "after: {after}");
+            assert!(w.prompts_asked.contains_key("s-1"), "after: {after}");
         }
+    }
+
+    /// A prompt heard around a read, while it ran or soon after it, may or
+    /// may not be in it: the transcript is read again, by when it is sure.
+    #[test]
+    fn a_prompt_heard_around_the_read_is_read_again() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let read = |w: &mut ClaudeWatch, read: u64, started: Instant, prompts: &[&str]| {
+            w.prompts_asked.insert("s-1".into(), read);
+            w.prompts_found
+                .0
+                .send(FoundPrompt {
+                    session: "s-1".into(),
+                    read,
+                    started,
+                    done: started + Duration::from_millis(5),
+                    prompts: s(prompts),
+                })
+                .unwrap();
+            w.apply_found_prompts();
+        };
+        // The "yes" heard while the read ran: the same as the turn before
+        // it, but written after the read's snapshot. The first read can't
+        // tell it from the earlier one; the one after it can.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let started = Instant::now();
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"yes""#),
+            Some(TAB),
+        );
+        read(&mut w, 1, started, &["a", "yes"]);
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["a", "yes"]);
+        assert!(!w.prompts_asked.contains_key("s-1"), "read again");
+        read(&mut w, 2, Instant::now() + 2 * SEAM, &["a", "yes", "yes"]);
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["a", "yes", "yes"]);
+        assert!(w.prompts_asked.contains_key("s-1"), "and that is the last");
+
+        // A prompt the read already has, heard just after it finished: a
+        // hook that waited out the Windows spool poll. Added once.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let started = Instant::now();
+        w.hooks_drained = started + Duration::from_millis(400);
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"go""#),
+            Some(TAB),
+        );
+        read(&mut w, 1, started, &["a", "go"]);
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["a", "go"]);
+        assert!(!w.prompts_asked.contains_key("s-1"), "read again");
+        read(&mut w, 2, Instant::now() + 2 * SEAM, &["a", "go"]);
+        assert_eq!(w.prompts_of(TAB).unwrap(), ["a", "go"]);
+        assert!(w.prompts_asked.contains_key("s-1"), "and that is the last");
     }
 
     #[test]
@@ -1860,6 +1965,7 @@ mod tests {
                 .send(FoundPrompt {
                     session: "s-1".into(),
                     read,
+                    started: Instant::now(),
                     done: Instant::now(),
                     prompts,
                 })
@@ -2095,6 +2201,7 @@ mod tests {
             .send(FoundPrompt {
                 session: "s-1".into(),
                 read: w.prompts_asked["s-1"],
+                started: Instant::now(),
                 done: Instant::now(),
                 prompts: vec!["stale".into()],
             })
