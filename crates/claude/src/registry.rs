@@ -445,7 +445,6 @@ pub fn is_injected_prompt(text: &str) -> bool {
         "agent-message",
         "cross-session-message",
         "teammate-message",
-        "channel-message",
         "channel",
         "system-reminder",
     ];
@@ -1028,7 +1027,6 @@ mod tests {
             "<cross-session-message>hi</cross-session-message>",
             "<teammate-message teammate_id=\"tester\">\nall green\n</teammate-message>",
             "<channel source=\"telegram\" chat_id=\"1\">hi</channel>",
-            "<channel-message from=\"ops\">hi</channel-message>",
             "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder>",
             "The coordinator sent a message while you were working:\nrun the tests too",
             "[SYSTEM NOTIFICATION - NOT USER INPUT] Background agent completed",
