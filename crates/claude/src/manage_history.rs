@@ -411,6 +411,17 @@ fn peak_sample(
     repo: Option<&str>,
     kind: Option<&str>,
 ) -> Option<(String, Vec<u64>)> {
+    sample(history, repo, kind, &|h| h.peak_mb.filter(|p| *p > 0))
+}
+
+/// One figure (`of`) of the most recent tasks like this one that have it,
+/// by the levels [`peak_sample`] uses.
+fn sample(
+    history: &[Record],
+    repo: Option<&str>,
+    kind: Option<&str>,
+    of: &dyn Fn(&Record) -> Option<u64>,
+) -> Option<(String, Vec<u64>)> {
     let levels: [(Option<&str>, Option<&str>); 3] = [(repo, kind), (repo, None), (None, None)];
     for (i, (r, k)) in levels.into_iter().enumerate() {
         if (i == 0 && (r.is_none() || k.is_none())) || (i == 1 && r.is_none()) {
@@ -421,7 +432,7 @@ fn peak_sample(
             .rev()
             .filter(|h| r.is_none_or(|r| h.repo.as_deref() == Some(r)))
             .filter(|h| k.is_none_or(|k| h.kind.as_deref() == Some(k)))
-            .filter_map(|h| h.peak_mb.filter(|p| *p > 0))
+            .filter_map(of)
             .take(RECENT)
             .collect();
         if peaks.len() < MIN_PEAK_SAMPLES {
@@ -463,6 +474,26 @@ pub fn expected_peak_mb(history: &[Record], repo: Option<&str>, kind: Option<&st
     peaks.sort_unstable();
     let rank = (peaks.len() * 9).div_ceil(10).max(1);
     peaks.get(rank - 1).copied()
+}
+
+/// The cores a task used over the time it held its lease, in thousandths:
+/// its `run` commands' CPU time over its wall time (start to landing).
+/// `None` for a task with no CPU time recorded.
+pub fn cpu_use_m(r: &Record) -> Option<u64> {
+    let cpu = r.cpu_s?;
+    (r.wall_s > 0).then(|| (cpu * 1000).div_ceil(r.wall_s))
+}
+
+/// The high end of the cores tasks like this one use over their life, in
+/// thousandths: the 90th percentile (nearest rank) of [`cpu_use_m`] over
+/// the same levels and as many tasks as [`expected_peak_mb`]. What the
+/// ledger counts a lease at when it admits CPU (giverny#318). `None` with
+/// too little history.
+pub fn expected_cpu_m(history: &[Record], repo: Option<&str>, kind: Option<&str>) -> Option<u64> {
+    let (_, mut uses) = sample(history, repo, kind, &cpu_use_m)?;
+    uses.sort_unstable();
+    let rank = (uses.len() * 9).div_ceil(10).max(1);
+    uses.get(rank - 1).copied()
 }
 
 #[cfg(test)]
@@ -515,6 +546,35 @@ mod tests {
                 .as_deref()
                 .map(|s| &s[..12]),
             Some("the last 4 t")
+        );
+    }
+
+    /// giverny#318: a task's cores over its life are its runs' CPU time
+    /// over its wall time; the ledger counts the p90 of its kind's.
+    #[test]
+    fn cpu_use_is_cpu_time_over_wall_time_and_counted_at_p90() {
+        let used = |kind: &str, cpu_s: Option<u64>, wall_m: u64| Record {
+            cpu_s,
+            ..rec("demo", Some(kind), 10, wall_m)
+        };
+        // 30 min of CPU in a 60 min task: half a core.
+        assert_eq!(cpu_use_m(&used("BUG", Some(1800), 60)), Some(500));
+        assert_eq!(cpu_use_m(&used("BUG", None, 60)), None);
+        assert_eq!(cpu_use_m(&used("BUG", Some(5), 0)), None);
+        let ten: Vec<Record> = (1..=10).map(|i| used("BUG", Some(i * 60), 10)).collect();
+        // 0.1 … 1.0 cores: p90 by nearest rank is 0.9.
+        assert_eq!(expected_cpu_m(&ten, Some("demo"), Some("BUG")), Some(900));
+        // Two is too few at a level, none says nothing; a task with no CPU
+        // recorded is not a sample.
+        assert_eq!(expected_cpu_m(&ten[..2], Some("demo"), Some("BUG")), None);
+        let mut h = ten[..2].to_vec();
+        h.push(used("BUG", None, 10));
+        assert_eq!(expected_cpu_m(&h, Some("demo"), Some("BUG")), None);
+        h.push(used("FEATURE", Some(1200), 10));
+        assert_eq!(
+            expected_cpu_m(&h, Some("demo"), Some("BUG")),
+            Some(2000),
+            "the repo speaks over all three"
         );
     }
 

@@ -126,7 +126,10 @@ lease (Settings → Management panel; `giverny-manage resources` prints it). Add
 folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU.
 A light task (a merge, a review, docs, a small fix) adds `--min-cpu 1`
 (`--cpu 3 --min-cpu 1`), so it takes the cores that are free rather than
-queue for all three. The answer is one line and an exit code:
+queue for all three. Once tasks like it have landed, a lease's cores and RAM
+count at what such tasks really used (`counted at its kind's 0.6 cpu, peak
+1.3G`), not at their size, so ask for what a build needs: idle cores do not
+keep others waiting. The answer is one line and an exit code:
 
 - `granted` (0): go on.
 - `granted smaller` (3, only with `--min-cpu` or `--min-ram`): go on, with what

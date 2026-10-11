@@ -113,6 +113,7 @@ struct LiveFile {
     session: String,
     pid: u32,
     stats: PathBuf,
+    started_ms: Option<u64>,
 }
 
 fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
@@ -123,6 +124,7 @@ fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
         session: s("session")?,
         pid: v.get("pid").and_then(Value::as_u64)? as u32,
         stats: PathBuf::from(s("stats")?),
+        started_ms: v.get("started_ms").and_then(Value::as_u64),
     })
 }
 
@@ -170,6 +172,15 @@ pub fn cgroup_pids(dir: &Path) -> HashSet<u32> {
 /// `(session, task, its cgroup)`. A `.live` file whose `run` is gone, or
 /// whose command runs plain (no cgroup), is left out.
 pub fn running(runs_dir: &Path) -> Vec<(String, String, PathBuf)> {
+    running_since(runs_dir)
+        .into_iter()
+        .map(|(s, t, cg, _)| (s, t, cg))
+        .collect()
+}
+
+/// [`running`], with when each command started (epoch ms, `None` from a
+/// `.live` file that does not say).
+pub fn running_since(runs_dir: &Path) -> Vec<(String, String, PathBuf, Option<u64>)> {
     read_dir(runs_dir)
         .into_iter()
         .filter(|(_, l)| alive(l.pid))
@@ -177,7 +188,7 @@ pub fn running(runs_dir: &Path) -> Vec<(String, String, PathBuf)> {
             let cg = std::fs::read_to_string(&l.stats)
                 .ok()
                 .and_then(|t| cgroup_of(&t))?;
-            Some((l.session, l.task, cg))
+            Some((l.session, l.task, cg, l.started_ms))
         })
         .collect()
 }
