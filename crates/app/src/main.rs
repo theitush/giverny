@@ -2076,6 +2076,10 @@ impl App {
                 self.rename_needs_focus = true;
             }
             Action::CloseTab(id) => {
+                // Mid Ctrl+Tab walk, the tab it started from is not on the
+                // recent stack yet. Commit the walk first, so closing the
+                // previewed tab goes back to it.
+                self.end_switch();
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
@@ -2095,6 +2099,12 @@ impl App {
                     history::remove(&self.paths, id);
                 }
                 self.ws.close_tab(id);
+                // The tab it lands on is now in view, as if it was clicked:
+                // a "done" mark on it has been seen.
+                if let Some(active) = self.ws.active {
+                    self.refresh_tab_info(active);
+                    self.claude.mark_viewed(active);
+                }
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.agent_views.forget(id);

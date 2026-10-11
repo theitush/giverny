@@ -453,7 +453,7 @@ pub fn show(ui: &mut egui::Ui, title: &str, chrome: &Chrome, max: &mut Maximize)
     painter.text(
         egui::pos2(rect.left() + 34.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        title,
+        giverny_term::render::bidi::egui_line(title, None),
         egui::FontId::proportional(12.5),
         fg,
     );

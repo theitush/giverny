@@ -21,6 +21,7 @@ use alacritty_terminal::term::TermMode;
 use crate::input::{self, MouseCode};
 use crate::pty::GridSize;
 use crate::render::atlas::Atlas;
+use crate::render::bidi::RowOrder;
 use crate::render::mesh::{self, BuildParams, Snapshot};
 use crate::render::metrics::{CellMetrics, FontSet};
 use crate::render::opacity::see_through;
@@ -169,9 +170,10 @@ pub struct TabView {
     cached: Option<CachedFrame>,
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
-    /// A press that landed on something drawn over the grid (an overlay in a
-    /// layer above it) and so was not reported; its release is not either.
-    swallowed_press: bool,
+    /// Buttons whose press landed on something drawn over the grid (an
+    /// overlay in a layer above it) and so was not reported; their releases
+    /// are not either.
+    swallowed_press: Buttons,
     /// Layers drawn over the grid that the wheel goes through, to scroll the
     /// terminal under them: [`Self::wheel_through`].
     wheel_through: Vec<egui::LayerId>,
@@ -302,7 +304,7 @@ impl Default for TabView {
             cached: None,
             had_focus: false,
             last_motion_cell: None,
-            swallowed_press: false,
+            swallowed_press: Buttons::default(),
             wheel_through: Vec::new(),
             last_blink: true,
             blink_from: None,
@@ -323,14 +325,61 @@ impl Default for TabView {
     }
 }
 
-/// Is a swallowed press still owed its release, after a frame? Only while
-/// mouse reporting is on and its release has not come: a release on a frame
-/// that did not report (Shift held, the pointer over a link) is the one it
-/// was owed, and with mouse mode off there is nothing left to hold back.
-/// Kept past that, the flag swallowed the release of the next click on the
-/// grid instead, and the program saw a button held down.
-fn still_swallowed(swallowed: bool, reported: bool, mouse_mode: bool, released: bool) -> bool {
-    swallowed && mouse_mode && (reported || !released)
+/// A set of mouse buttons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Buttons(u8);
+
+impl Buttons {
+    fn bit(button: PointerButton) -> u8 {
+        1 << button as u8
+    }
+
+    fn insert(&mut self, button: PointerButton) {
+        self.0 |= Self::bit(button);
+    }
+
+    /// Take `button` out of the set; whether it was in.
+    fn take(&mut self, button: PointerButton) -> bool {
+        let had = self.0 & Self::bit(button) != 0;
+        self.0 &= !Self::bit(button);
+        had
+    }
+
+    /// Is this press or release one the program must not see? A press on
+    /// something drawn over the grid is not, and nor is that button's
+    /// release. Another button's release is: a right click on the grid while
+    /// left is held on the bar still lets go of right.
+    fn swallows(&mut self, button: PointerButton, pressed: bool, covered: bool) -> bool {
+        if pressed {
+            if covered {
+                self.insert(button);
+            }
+            covered
+        } else {
+            self.take(button)
+        }
+    }
+}
+
+/// Which swallowed presses are still owed their release, after a frame?
+/// Only while mouse reporting is on and the release has not come: a release
+/// on a frame that did not report (Shift held, the pointer over a link) is
+/// the one it was owed, and with mouse mode off there is nothing left to
+/// hold back. Kept past that, the flag swallowed the release of the next
+/// click on the grid instead, and the program saw a button held down.
+fn still_swallowed(
+    swallowed: Buttons,
+    reported: bool,
+    mouse_mode: bool,
+    released: Buttons,
+) -> Buttons {
+    if !mouse_mode {
+        Buttons::default()
+    } else if reported {
+        swallowed
+    } else {
+        Buttons(swallowed.0 & !released.0)
+    }
 }
 
 struct CachedFrame {
@@ -338,6 +387,8 @@ struct CachedFrame {
     generation: u32,
     bg: Color32,
     meshes: Vec<Arc<Mesh>>,
+    /// Rows drawn right to left, as last painted: what the pointer is over.
+    orders: Vec<(u16, RowOrder)>,
 }
 
 impl TabView {
@@ -431,9 +482,18 @@ impl TabView {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);
         }
         let released = ui.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, EguiEvent::PointerButton { pressed: false, .. }))
+            let mut released = Buttons::default();
+            for e in &i.events {
+                if let EguiEvent::PointerButton {
+                    button,
+                    pressed: false,
+                    ..
+                } = e
+                {
+                    released.insert(*button);
+                }
+            }
+            released
         });
         self.swallowed_press = still_swallowed(
             self.swallowed_press,
@@ -553,6 +613,7 @@ impl TabView {
                 generation: shared.generation,
                 bg,
                 meshes,
+                orders: snapshot.orders,
             });
         }
 
@@ -631,11 +692,13 @@ impl TabView {
 
         // Painted here, after the grid mesh: anything drawn before it is
         // covered by the terminal's own background.
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
         if let Some(hints) = &self.hints {
             for (label, row, item) in &hints.items {
-                let x = rect.min.x + (item.col as f32 * metrics.cell_w as f32) / ppp;
+                let (col, len) = drawn_span(orders, *row, item.col, item.len);
+                let x = rect.min.x + (col as f32 * metrics.cell_w as f32) / ppp;
                 let y = rect.min.y + (*row as f32 * metrics.cell_h as f32) / ppp;
-                let w = (item.len as f32 * metrics.cell_w as f32) / ppp;
+                let w = (len as f32 * metrics.cell_w as f32) / ppp;
                 let h = metrics.cell_h as f32 / ppp;
                 painter.rect_filled(
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)),
@@ -655,11 +718,12 @@ impl TabView {
             }
         }
         if let Some((_, line, col, len)) = &self.hover_target {
-            let x = rect.min.x + (*col as f32 * metrics.cell_w as f32) / ppp;
+            let (col, len) = drawn_span(orders, *line, *col, *len);
+            let x = rect.min.x + (col as f32 * metrics.cell_w as f32) / ppp;
             let y = rect.min.y + ((*line + 1) as f32 * metrics.cell_h as f32 - 2.0) / ppp;
             let underline = Rect::from_min_size(
                 Pos2::new(x, y),
-                Vec2::new((*len as f32 * metrics.cell_w as f32) / ppp, 1.0),
+                Vec2::new((len as f32 * metrics.cell_w as f32) / ppp, 1.0),
             );
             painter.rect_filled(underline, 0.0, shared.theme.ansi[12]);
         }
@@ -850,6 +914,7 @@ impl TabView {
         mode: TermMode,
     ) {
         let mut out: Vec<u8> = Vec::new();
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
         // Something the app draws over the grid in a layer of its own (a bar
         // pinned to its top row) takes the pointer there: a click on it is
         // not a click in the program.
@@ -872,17 +937,13 @@ impl TabView {
                         if !rect.contains(*pos) && *pressed {
                             continue;
                         }
-                        if *pressed && covered {
-                            self.swallowed_press = true;
-                            continue;
-                        }
-                        if !*pressed && std::mem::take(&mut self.swallowed_press) {
+                        if self.swallowed_press.swallows(*button, *pressed, covered) {
                             continue;
                         }
                         let Some(code) = button_code(*button) else {
                             continue;
                         };
-                        let (col, line, _) = cell_at(rect, ppp, m, *pos);
+                        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, *pos));
                         if let Some(seq) =
                             input::encode_mouse(code, col, line, *pressed, false, *modifiers, mode)
                         {
@@ -899,7 +960,7 @@ impl TabView {
                         if !motion_wanted {
                             continue;
                         }
-                        let (col, line, _) = cell_at(rect, ppp, m, *pos);
+                        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, *pos));
                         if self.last_motion_cell == Some((col, line)) {
                             continue;
                         }
@@ -940,11 +1001,12 @@ impl TabView {
     ) {
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let Some(pos) = pointer else { return };
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
 
         let select_at = |ty: SelectionType, copy: bool| {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
-            let (col, vp_line, side) = cell_at(rect, ppp, m, pos);
+            let (col, vp_line, side) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let point = Point::new(Line(vp_line as i32 - offset as i32), Column(col as usize));
             let mut sel = Selection::new(ty, point, side);
             if ty != SelectionType::Simple {
@@ -974,7 +1036,7 @@ impl TabView {
         } else if response.dragged_by(PointerButton::Primary) {
             let mut term = session.term.lock();
             let offset = term.grid().display_offset();
-            let (col, vp_line, side) = cell_at(rect, ppp, m, pos);
+            let (col, vp_line, side) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let point = Point::new(Line(vp_line as i32 - offset as i32), Column(col as usize));
             if let Some(sel) = &mut term.selection {
                 sel.update(point, side);
@@ -1035,7 +1097,8 @@ impl TabView {
 
         if mouse_reporting {
             let pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.min);
-            let (col, line, _) = cell_at(rect, ppp, m, pos);
+            let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
+            let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, pos));
             let code = if lines > 0 {
                 MouseCode::WheelUp
             } else {
@@ -1403,7 +1466,8 @@ impl TabView {
         let Some(pos) = pos.filter(|p| ctrl && rect.contains(*p)) else {
             return;
         };
-        let (col, line, _) = cell_at(rect, ppp, m, pos);
+        let orders = self.cached.as_ref().map_or(&[][..], |c| &c.orders[..]);
+        let (col, line, _) = grid_cell(orders, cell_at(rect, ppp, m, pos));
 
         // An OSC 8 hyperlink wins: its URL is in the escape sequence, so the
         // visible text says nothing about it. This is how Claude, `gh`, `ls
@@ -1458,6 +1522,38 @@ fn button_code(button: PointerButton) -> Option<MouseCode> {
     }
 }
 
+/// A drawn cell → the grid cell it shows. On a row drawn right to left the
+/// column under the pointer is not the cell's column, and the left half of
+/// a right-to-left letter is the end of it, not the start.
+fn grid_cell(orders: &[(u16, RowOrder)], (col, line, side): (u16, u16, Side)) -> (u16, u16, Side) {
+    let Some((_, order)) = orders.iter().find(|(l, _)| *l == line) else {
+        return (col, line, side);
+    };
+    let Some(&logical) = order.to_logical.get(col as usize) else {
+        return (col, line, side);
+    };
+    let side = match (order.rtl.get(logical as usize), side) {
+        (Some(true), Side::Left) => Side::Right,
+        (Some(true), Side::Right) => Side::Left,
+        _ => side,
+    };
+    (logical, line, side)
+}
+
+/// The drawn columns a run of grid cells covers, as its left edge and width.
+/// A path in a Hebrew line is one left-to-right run, so it stays in one
+/// piece on screen; it is just somewhere else.
+fn drawn_span(orders: &[(u16, RowOrder)], line: u16, start: u16, len: u16) -> (u16, u16) {
+    let Some((_, order)) = orders.iter().find(|(l, _)| *l == line) else {
+        return (start, len);
+    };
+    let drawn = (start..start + len).filter_map(|c| order.to_visual.get(c as usize).copied());
+    match (drawn.clone().min(), drawn.max()) {
+        (Some(lo), Some(hi)) => (lo, hi - lo + 1),
+        _ => (start, len),
+    }
+}
+
 /// Pointer position → 0-based viewport cell + cell side.
 fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
     let x_px = ((pos.x - rect.min.x) * ppp).max(0.0);
@@ -1498,22 +1594,82 @@ mod blink_tests {
 
 #[cfg(test)]
 mod swallow_tests {
-    use super::still_swallowed;
+    use super::{Buttons, still_swallowed};
+    use egui::PointerButton::{Primary as Left, Secondary as Right};
+
+    fn of(buttons: &[egui::PointerButton]) -> Buttons {
+        let mut set = Buttons::default();
+        for &b in buttons {
+            set.insert(b);
+        }
+        set
+    }
 
     #[test]
     fn a_swallowed_press_is_owed_one_release_and_no_more() {
+        let none = Buttons::default();
+        let left = of(&[Left]);
         // Held, reported frames: still owed until its release comes, which
         // the reporting itself takes.
-        assert!(still_swallowed(true, true, true, false));
-        assert!(still_swallowed(true, true, true, true));
+        assert_eq!(still_swallowed(left, true, true, none), left);
+        assert_eq!(still_swallowed(left, true, true, left), left);
         // Released on a frame that did not report (Shift held): that was it.
-        assert!(!still_swallowed(true, false, true, true));
+        assert_eq!(still_swallowed(left, false, true, left), none);
         // Not reported and not released yet: still owed.
-        assert!(still_swallowed(true, false, true, false));
+        assert_eq!(still_swallowed(left, false, true, none), left);
+        // Another button let go of on such a frame: left is still owed.
+        assert_eq!(still_swallowed(left, false, true, of(&[Right])), left);
         // Mouse mode off: nothing to hold back any more.
-        assert!(!still_swallowed(true, true, false, false));
-        assert!(!still_swallowed(true, false, false, false));
+        assert_eq!(still_swallowed(left, true, false, none), none);
+        assert_eq!(still_swallowed(left, false, false, none), none);
         // Nothing swallowed stays nothing.
-        assert!(!still_swallowed(false, false, true, false));
+        assert_eq!(still_swallowed(none, false, true, left), none);
+    }
+
+    /// Left held on the bar, then a right click on the grid: the right
+    /// release is reported, and the left one still is not.
+    #[test]
+    fn a_swallowed_press_owes_only_its_own_button() {
+        let mut swallowed = Buttons::default();
+        assert!(swallowed.swallows(Left, true, true));
+        assert!(!swallowed.swallows(Right, true, false));
+        assert!(
+            !swallowed.swallows(Right, false, false),
+            "right is reported"
+        );
+        assert!(swallowed.swallows(Left, false, false), "left is not");
+        assert_eq!(swallowed, Buttons::default());
+        // A release with nothing swallowed is reported.
+        assert!(!swallowed.swallows(Left, false, true));
+    }
+}
+
+#[cfg(test)]
+mod rtl_pointer_tests {
+    use super::{Side, drawn_span, grid_cell};
+
+    #[test]
+    fn a_click_on_a_hebrew_row_lands_on_the_letter_drawn_there() {
+        use crate::render::bidi::{Dir, order_row};
+        // "ab שלום" padded to 10, drawn right to left: the word at the right
+        // edge, read leftwards, and "ab" to its left.
+        let row: Vec<char> = "ab שלום   ".chars().collect();
+        let orders = vec![(3u16, order_row(&row, Dir::Ltr))];
+        let drawn_at = |logical: usize| orders[0].1.to_visual[logical];
+        // Left to right: "ab " then the word turned round.
+        assert_eq!(drawn_at(0), 0);
+        assert_eq!(drawn_at(3), 6, "ש is drawn last of the word");
+        let (col, line, side) = grid_cell(&orders, (6, 3, Side::Left));
+        assert_eq!((col, line), (3, 3));
+        assert_eq!(
+            side,
+            Side::Right,
+            "the left half of an RTL letter is its end"
+        );
+        // Rows with no order are left alone.
+        assert_eq!(grid_cell(&orders, (6, 4, Side::Left)), (6, 4, Side::Left));
+        // A run of cells reads back as the columns it is drawn over.
+        assert_eq!(drawn_span(&orders, 3, 3, 4), (3, 4));
+        assert_eq!(drawn_span(&orders, 3, 0, 2), (0, 2));
     }
 }

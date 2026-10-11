@@ -114,8 +114,6 @@ would corrupt state. Visibility only.
 
 ## Known gaps, already documented
 
-- Selecting or clicking inside an RTL run maps to the wrong cell (the forward
-  mapping exists; it needs inverting).
 - The palette matches tabs only, and shows no chords despite the keymap table
   existing to feed it.
 - Themes apply on click rather than previewing on hover; no theme files.

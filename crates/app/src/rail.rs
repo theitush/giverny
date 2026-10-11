@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use giverny_core::state::RailView;
 use giverny_core::tabs::{CategoryId, TabId};
+use giverny_term::render::bidi::egui_line;
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
 use crate::{Action, App, RenameTarget};
@@ -703,7 +704,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
             ui.vertical(|ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(truncate_chars(&job.name, 22))
+                        egui::RichText::new(egui_line(&truncate_chars(&job.name, 22), None))
                             .font(FontId::monospace(11.5))
                             .color(if job.live { fg } else { dim }),
                     )
@@ -732,7 +733,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
                 if !sub.is_empty() {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(truncate_chars(&sub, 30))
+                            egui::RichText::new(egui_line(&truncate_chars(&sub, 30), None))
                                 .font(FontId::monospace(9.5))
                                 .color(dim),
                         )
@@ -1223,7 +1224,7 @@ fn tab_row(
     p.text(
         Pos2::new(rect.min.x + 44.0, rect.min.y + 13.0),
         Align2::LEFT_CENTER,
-        truncate_chars(&row.title, char_budget),
+        egui_line(&truncate_chars(&row.title, char_budget), None),
         FontId::monospace(12.5),
         if row.active {
             fg

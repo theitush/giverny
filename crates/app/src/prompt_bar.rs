@@ -10,6 +10,7 @@
 
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Stroke, Vec2};
 use giverny_core::tabs::TabId;
+use giverny_term::render::bidi::{self, Dir};
 
 use crate::chrome::{Chrome, mix};
 
@@ -50,6 +51,93 @@ fn cut(mut text: String) -> String {
     text.truncate(text.trim_end().len());
     text.push('…');
     text
+}
+
+/// The most of `line` that fits `width`, with an ellipsis if it had to be
+/// cut, and whether it was. Cut from the end of the text, not the end of
+/// the row.
+fn fit(
+    fonts: &mut egui::epaint::FontsView<'_>,
+    font: &FontId,
+    line: &str,
+    width: f32,
+) -> (String, bool) {
+    let total: f32 = line.chars().map(|c| fonts.glyph_width(font, c)).sum();
+    if total <= width {
+        return (line.to_string(), false);
+    }
+    let mut used = fonts.glyph_width(font, '…');
+    let mut out = String::new();
+    for c in line.chars() {
+        used += fonts.glyph_width(font, c);
+        if used > width {
+            break;
+        }
+        out.push(c);
+    }
+    (cut(out), true)
+}
+
+/// `text` broken into rows no wider than `width`, at spaces where it can
+/// be, in reading order — the order a row has to be cut in before it is
+/// turned round to be drawn.
+fn wrap_rows(
+    fonts: &mut egui::epaint::FontsView<'_>,
+    font: &FontId,
+    text: &str,
+    width: f32,
+) -> Vec<String> {
+    let space = fonts.glyph_width(font, ' ');
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0.0;
+    for word in text.split(' ') {
+        let w: f32 = word.chars().map(|c| fonts.glyph_width(font, c)).sum();
+        if !row.is_empty() && used + space + w > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0.0;
+        } else if !row.is_empty() {
+            row.push(' ');
+            used += space;
+        }
+        // A word wider than a row of its own is broken anywhere.
+        for c in word.chars() {
+            let w = fonts.glyph_width(font, c);
+            if !row.is_empty() && used + w > width {
+                rows.push(std::mem::take(&mut row));
+                used = 0.0;
+            }
+            row.push(c);
+            used += w;
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// The open prompt, when it has right-to-left text in it: each paragraph
+/// wrapped in reading order, each row turned round for egui, and the
+/// paragraphs that run right to left set against the right edge.
+fn show_rtl(ui: &mut egui::Ui, prompt: &str, font: &FontId, color: Color32) {
+    let width = ui.available_width();
+    for paragraph in prompt.split('\n') {
+        let dir = bidi::first_strong(paragraph.chars());
+        let layout = if dir == Some(Dir::Rtl) {
+            egui::Layout::right_to_left(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Min)
+        };
+        for row in ui.ctx().fonts_mut(|f| wrap_rows(f, font, paragraph, width)) {
+            let text = bidi::egui_line(&row, dir).into_owned();
+            ui.with_layout(layout, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(text).font(font.clone()).color(color))
+                        .extend()
+                        .selectable(false),
+                );
+            });
+        }
+    }
 }
 
 /// How much of the prompt's first line has to be found on a row to call the
@@ -313,19 +401,32 @@ pub fn show(
     // The one line, laid out at this width: whether it was cut is what
     // says there is more to see, and a resize can change the answer.
     let (line, capped) = one_line_cut(prompt, LINE_CHARS);
-    let mut job = egui::text::LayoutJob::single_section(
-        line,
-        egui::TextFormat::simple(font.clone(), chrome.fg),
-    );
-    job.wrap = egui::text::TextWrapping {
-        max_width: (over.width() - LEFT - RIGHT).max(0.0),
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
+    let width = (over.width() - LEFT - RIGHT).max(0.0);
+    let rtl = bidi::first_strong(line.chars()) == Some(Dir::Rtl);
+    let (galley, elided) = if rtl || line.chars().any(bidi::is_rtl) {
+        // Cut in reading order: egui cuts the right-hand end, which in a
+        // Hebrew line is where it starts.
+        let (shown, elided) = ctx.fonts_mut(|f| fit(f, &font, &line, width));
+        let shown = bidi::egui_line(&shown, None).into_owned();
+        let galley = ctx.fonts_mut(|f| f.layout_no_wrap(shown, font.clone(), chrome.fg));
+        (galley, elided)
+    } else {
+        let mut job = egui::text::LayoutJob::single_section(
+            line,
+            egui::TextFormat::simple(font.clone(), chrome.fg),
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: width,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+        let elided = galley.elided;
+        (galley, elided)
     };
-    let galley = ctx.fonts_mut(|f| f.layout_job(job));
     let line_height = galley.size().y;
-    let more = expandable(prompt, capped || galley.elided);
+    let more = expandable(prompt, capped || elided);
     if !more {
         open = false;
     }
@@ -360,6 +461,10 @@ pub fn show(
                         egui::ScrollArea::vertical()
                             .max_height(max_height)
                             .show(ui, |ui| {
+                                if prompt.chars().any(bidi::is_rtl) {
+                                    show_rtl(ui, prompt, &font, chrome.fg);
+                                    return;
+                                }
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(prompt)
@@ -379,7 +484,13 @@ pub fn show(
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, fill);
                 let y = rect.center().y - galley.size().y / 2.0;
-                p.galley(egui::pos2(rect.min.x + LEFT, y), galley, chrome.fg);
+                // A Hebrew prompt starts at the right, where it is read from.
+                let x = if rtl {
+                    rect.max.x - RIGHT - galley.size().x
+                } else {
+                    rect.min.x + LEFT
+                };
+                p.galley(egui::pos2(x, y), galley, chrome.fg);
                 rect
             };
             let p = ui.painter();
@@ -779,6 +890,48 @@ mod tests {
         assert_eq!(text_size(24.0, 31.0), 24.0);
         // Smaller where a line of it would be taller than the row.
         assert!(text_size(8.0, 8.0) * 1.17 <= 8.0);
+    }
+
+    /// A context with the fonts the app gives egui, Hebrew among them.
+    fn fonts() -> egui::Context {
+        let ctx = egui::Context::default();
+        giverny_term::widget::RenderShared::new(
+            giverny_term::render::theme::Theme::monet_dark(),
+            13.0,
+        )
+        .expect("a monospace font")
+        .install_ui_fonts(&ctx);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        ctx
+    }
+
+    #[test]
+    fn a_hebrew_line_is_cut_at_its_end_not_its_start() {
+        let ctx = fonts();
+        let font = FontId::monospace(12.0);
+        let one = ctx.fonts_mut(|f| f.glyph_width(&font, 'ש'));
+        assert!(one > 0.0, "a Hebrew face is installed");
+        let (shown, cut) = ctx.fonts_mut(|f| fit(f, &font, "שלום עולם יפה", one * 8.0));
+        assert!(cut);
+        assert!(shown.starts_with("שלום"), "{shown}");
+        assert!(shown.ends_with('…'));
+        let (shown, cut) = ctx.fonts_mut(|f| fit(f, &font, "שלום", one * 8.0));
+        assert_eq!((shown.as_str(), cut), ("שלום", false));
+    }
+
+    #[test]
+    fn a_long_paragraph_wraps_at_spaces_in_reading_order() {
+        let ctx = fonts();
+        let font = FontId::monospace(12.0);
+        let one = ctx.fonts_mut(|f| f.glyph_width(&font, 'ש'));
+        let rows = ctx.fonts_mut(|f| wrap_rows(f, &font, "אחת שתיים שלוש ארבע", one * 10.0));
+        assert_eq!(rows, ["אחת שתיים", "שלוש ארבע"]);
+        // A word longer than a row is broken rather than spilling out.
+        let one = ctx.fonts_mut(|f| f.glyph_width(&font, 'a'));
+        let rows = ctx.fonts_mut(|f| wrap_rows(f, &font, "abcdefghijkl", one * 5.0));
+        assert_eq!(rows, ["abcde", "fghij", "kl"]);
+        let rows = ctx.fonts_mut(|f| wrap_rows(f, &font, "", one * 5.0));
+        assert_eq!(rows, [""]);
     }
 
     #[test]

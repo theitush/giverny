@@ -44,9 +44,15 @@ sanitized bracketed paste as `Ctrl+V` — a filename is untrusted input.
 
 ### Bidirectional text
 
-The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` reorders each row that contains RTL script, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.
+The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` orders the rows of a screen that has RTL script on it, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.
 
-Rows with no RTL character skip the algorithm entirely, so the cost for ordinary output is one range test per cell. Mouse hit-testing and selection still work in logical columns, so a click inside an RTL run currently lands on the wrong cell — the mapping exists (`logical_to_visual`) and inverting it is the next step.
+A row runs in the direction of its first letter (Unicode's rule P2, a browser's `dir="auto"`), and a right-to-left row is mirrored across the whole width, so a Hebrew answer sits against the right edge with Claude's `⏺` and indent on the right, and its words, English terms and full stops in reading order. Left to right for every row would put the runs of a mixed sentence in the wrong order. The exception is a row that carries on the paragraph above it, which takes that paragraph's direction: Claude Code wraps its own text, so the terminal sees no soft wrap, and the second row of a Hebrew sentence can start with an English word. A row carries on the one above when it starts at that row's text column, opens no bullet or message of its own, and its first word would not have fitted at the end of the row above. Lines that merely follow each other, like code, fail the last test. Box drawing is a wall: the text between each pair is ordered on its own and the walls stay put, so a table whose rows run in different directions keeps its columns.
+
+Screens with no RTL character skip all of it, so the cost for ordinary output is one range test per cell. Each snapshot carries the orders of the rows it moved, and the widget inverts them for the pointer: clicks, selection, mouse reporting and link hover all work in logical cells.
+
+egui, which draws the rail and the prompt bar, has no bidi pass, but it shapes each run of one font with HarfBuzz's guess at its direction, so it turns a Hebrew word round by itself and leaves a sentence's words in the wrong order. `bidi::egui_line` orders the line and then puts each RTL run back in writing order for egui to finish; a test pins egui's half of that.
+
+Hebrew glyphs come from Cascadia Mono, bundled in `crates/term/fonts`: monospace Hebrew designed for a coding font, where most systems have only proportional faces or Miriam Mono. They serve the Hebrew block and nothing else, so no other character changes face.
 
 ## Persistence (`crates/core`)
 

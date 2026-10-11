@@ -227,7 +227,8 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "font.family",
         label: "font family",
         section: Section::Appearance,
-        doc: "Preferred monospace family; empty auto-detects.",
+        doc: "Preferred monospace family; empty auto-detects. Hebrew comes from the bundled \
+              Cascadia Mono unless this family has Hebrew of its own.",
         note: &["Applied at startup: the glyph atlas is built once."],
         needs_restart: true,
         kind: Kind::Text {

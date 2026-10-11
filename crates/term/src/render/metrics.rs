@@ -25,26 +25,43 @@ const PRIMARY_CANDIDATES: &[&str] = &[
     "DejaVu Sans Mono",
 ];
 
-/// Fallback faces appended after the primary family styles.
-const FALLBACK_CANDIDATES: &[&str] = &[
+/// Fallback faces appended after the primary family styles: symbols first,
+/// then — after the bundled Hebrew faces — scripts and the generic faces.
+const SYMBOL_FALLBACKS: &[&str] = &[
     "Symbols Nerd Font Mono",
     "Symbols Nerd Font",
     "PowerlineSymbols",
     "Noto Color Emoji",
     "Noto Emoji",
-    // Right-to-left scripts, before the generic faces below. DejaVu Sans
-    // *Mono* has no Hebrew or Arabic at all, so those fell through to the
-    // proportional DejaVu Sans and were drawn into monospace cells — legible
-    // in the sense that a shape appeared, and hard to read as words. These
-    // are script-specific, so they can only ever serve the scripts they
-    // cover; everything else resolves exactly as before.
-    "Miriam Mono CLM",
-    "Noto Sans Hebrew",
+];
+const FALLBACK_CANDIDATES: &[&str] = &[
+    // Arabic before the generic faces below: DejaVu Sans *Mono* has none, so
+    // it fell through to the proportional DejaVu Sans, drawn into monospace
+    // cells — legible in the sense that a shape appeared. These are
+    // script-specific, so they can only ever serve the script they cover.
     "Noto Naskh Arabic",
     "Noto Sans Arabic",
     "DejaVu Sans Mono",
     "DejaVu Sans",
 ];
+
+/// Hebrew comes with Giverny: Cascadia Mono's, drawn by Liron Lavi Turkenich
+/// for a coding font. It is monospace — every letter one cell wide, where a
+/// proportional face like Noto Sans Hebrew leaves `ו` in a gap and squeezes
+/// `ש` — and weighted to sit beside a coding font's Latin, where the Miriam
+/// Mono that Linux usually has is a thin typewriter face. Bundled rather
+/// than looked up because few systems have a good monospace Hebrew at all.
+/// SIL Open Font License; see `fonts/CascadiaMono-OFL.txt`.
+pub(crate) const HEBREW_REGULAR: &[u8] = include_bytes!("../../fonts/CascadiaMono-Regular.ttf");
+const HEBREW_BOLD: &[u8] = include_bytes!("../../fonts/CascadiaMono-Bold.ttf");
+
+/// Hebrew letters, points and punctuation, and the Hebrew presentation
+/// forms: what the bundled faces are used for, and all they are used for —
+/// they cover Latin, Arabic and symbols too, and taking those over would
+/// change how text that looked fine yesterday looks today.
+pub fn is_hebrew(c: char) -> bool {
+    matches!(c, '\u{0590}'..='\u{05FF}' | '\u{FB1D}'..='\u{FB4F}')
+}
 
 /// One loaded font face (owned bytes + collection index).
 pub struct LoadedFont {
@@ -75,6 +92,11 @@ pub struct FontSet {
     bold: Option<u16>,
     italic: Option<u16>,
     bold_italic: Option<u16>,
+    /// The bundled Hebrew faces: regular and bold.
+    hebrew: Option<(u16, Option<u16>)>,
+    /// Their letters' width, in ems: one for every letter, since they are
+    /// monospace.
+    hebrew_advance: f32,
     /// Lazy charmap memo: (slot, char) → glyph id (0 = absent).
     charmap_cache: RefCell<HashMap<(u16, char), u16>>,
 }
@@ -125,18 +147,36 @@ impl FontSet {
         let bold_italic = query(Weight::BOLD, Style::Italic, &prim)
             .and_then(|id| push_face(db, id, &mut seen, &mut fonts));
 
-        for name in FALLBACK_CANDIDATES {
-            let fams = [Family::Name(name)];
-            if let Some(id) = query(Weight::NORMAL, Style::Normal, &fams) {
-                push_face(db, id, &mut seen, &mut fonts);
+        let mut fallbacks = |names: &[&str], fonts: &mut Vec<LoadedFont>| {
+            for name in names {
+                let fams = [Family::Name(name)];
+                if let Some(id) = query(Weight::NORMAL, Style::Normal, &fams) {
+                    push_face(db, id, &mut seen, fonts);
+                }
             }
-        }
+        };
+        fallbacks(SYMBOL_FALLBACKS, &mut fonts);
+        // Ahead of every system face with Hebrew in it, so that the rail and
+        // prompt bar — which take faces in this order — draw Hebrew with it
+        // too.
+        let hebrew = push_bundled(HEBREW_REGULAR, &mut fonts)
+            .map(|regular| (regular, push_bundled(HEBREW_BOLD, &mut fonts)));
+        let hebrew_advance = hebrew
+            .and_then(|(regular, _)| fonts[regular as usize].as_font())
+            .map_or(0.0, |font| {
+                let alef = font.charmap().map('\u{05D0}');
+                let units = font.metrics(&[]).units_per_em as f32;
+                font.glyph_metrics(&[]).advance_width(alef) / units
+            });
+        fallbacks(FALLBACK_CANDIDATES, &mut fonts);
 
         Ok(FontSet {
             fonts,
             bold,
             italic,
             bold_italic,
+            hebrew,
+            hebrew_advance,
             charmap_cache: RefCell::new(HashMap::new()),
         })
     }
@@ -178,9 +218,25 @@ impl FontSet {
         g
     }
 
+    /// How far right to draw a glyph from `slot` so it sits in the middle of
+    /// its cell. Only the bundled Hebrew faces are moved: their letters are
+    /// a shade narrower than most coding fonts' cells, and left where they
+    /// fall they lean against the next letter. Every other face draws where
+    /// it always has.
+    pub fn centring(&self, slot: u16, ppem: f32, cell_w: u32) -> f32 {
+        let Some((regular, bold)) = self.hebrew else {
+            return 0.0;
+        };
+        if slot != regular && Some(slot) != bold {
+            return 0.0;
+        }
+        ((cell_w as f32 - self.hebrew_advance * ppem) / 2.0).round()
+    }
+
     /// Resolve a character + style to a face slot, glyph id and synthesis
     /// flags. Walks: styled primary face → primary regular (with synthesis)
-    /// → fallbacks (with synthesis).
+    /// → the bundled Hebrew faces, for Hebrew only → fallbacks (with
+    /// synthesis).
     pub fn resolve(&self, ch: char, bold: bool, italic: bool) -> Option<Resolved> {
         let styled_slot = match (bold, italic) {
             (true, true) => self.bold_italic.or(self.bold).or(self.italic),
@@ -211,7 +267,34 @@ impl FontSet {
         if italic {
             synth |= SYNTH_ITALIC;
         }
-        for slot in std::iter::once(0u16).chain((0..self.fonts.len() as u16).filter(|s| *s != 0)) {
+        // The primary first: a family with Hebrew of its own keeps it, since
+        // that is the family that was chosen.
+        let glyph = self.glyph_in(0, ch);
+        if glyph != 0 {
+            return Some(Resolved {
+                slot: 0,
+                glyph,
+                synth,
+            });
+        }
+
+        let hebrew = [self.hebrew.map(|h| h.0), self.hebrew.and_then(|h| h.1)];
+        if let Some((regular, bold_face)) = self.hebrew
+            && is_hebrew(ch)
+        {
+            let slot = bold_face.filter(|_| bold).unwrap_or(regular);
+            let glyph = self.glyph_in(slot, ch);
+            if glyph != 0 {
+                let synth = if Some(slot) == bold_face {
+                    synth & !SYNTH_BOLD
+                } else {
+                    synth
+                };
+                return Some(Resolved { slot, glyph, synth });
+            }
+        }
+
+        for slot in (1..self.fonts.len() as u16).filter(|s| !hebrew.contains(&Some(*s))) {
             let glyph = self.glyph_in(slot, ch);
             if glyph != 0 {
                 return Some(Resolved { slot, glyph, synth });
@@ -238,6 +321,22 @@ fn push_face(
         .unwrap_or_default();
     let font = load_face(db, id, family)?;
     fonts.push(font);
+    Some((fonts.len() - 1) as u16)
+}
+
+/// A face compiled into the binary; `None` only if it fails to parse.
+fn push_bundled(data: &'static [u8], fonts: &mut Vec<LoadedFont>) -> Option<u16> {
+    let font = FontRef::from_index(data, 0)?;
+    let family = font
+        .localized_strings()
+        .find_by_id(swash::StringId::Family, None)
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    fonts.push(LoadedFont {
+        family,
+        data: Arc::new(data.to_vec()),
+        index: 0,
+    });
     Some((fonts.len() - 1) as u16)
 }
 
@@ -295,14 +394,13 @@ mod tests {
     use super::FALLBACK_CANDIDATES;
 
     #[test]
-    fn rtl_faces_are_tried_before_the_generic_ones() {
-        // DejaVu Sans Mono covers neither Hebrew nor Arabic, so both used to
-        // land on the proportional DejaVu Sans — a shape in every cell, and
-        // hard to read as words. Order is the whole fix: a script-specific
-        // face has to be reached first.
+    fn arabic_faces_are_tried_before_the_generic_ones() {
+        // DejaVu Sans Mono covers no Arabic, so it used to land on the
+        // proportional DejaVu Sans. Order is the whole fix: a
+        // script-specific face has to be reached first.
         let at = |name: &str| FALLBACK_CANDIDATES.iter().position(|f| *f == name);
         let generic = at("DejaVu Sans Mono").expect("generic fallback present");
-        for face in ["Miriam Mono CLM", "Noto Sans Hebrew", "Noto Sans Arabic"] {
+        for face in ["Noto Naskh Arabic", "Noto Sans Arabic"] {
             let pos = at(face).unwrap_or_else(|| panic!("{face} missing from fallbacks"));
             assert!(pos < generic, "{face} must be tried before DejaVu");
         }
@@ -347,6 +445,48 @@ mod tests {
                 "regular face ⇒ synthetic bold"
             );
         }
+    }
+
+    #[test]
+    fn hebrew_is_drawn_with_the_bundled_face_and_only_hebrew_is() {
+        let s = set();
+        let (regular, bold) = s.hebrew.expect("the bundled faces parse");
+        assert_eq!(s.font(regular).family, "Cascadia Mono");
+        if s.glyph_in(0, 'ש') != 0 {
+            return; // a primary with Hebrew of its own keeps it
+        }
+        let r = s.resolve('ש', false, false).expect("Hebrew resolves");
+        assert_eq!((r.slot, r.synth), (regular, 0));
+        // Bold Hebrew is the real bold face, not the regular one smeared.
+        let b = s.resolve('ש', true, false).unwrap();
+        assert_eq!((Some(b.slot), b.synth), (bold, 0));
+        let bi = s.resolve('ש', true, true).unwrap();
+        assert_eq!(bi.synth, SYNTH_ITALIC, "italic is still synthesised");
+        // Everything else resolves as it did before the faces were bundled,
+        // even what Cascadia Mono happens to cover.
+        for ch in ['A', '─', '⠋', 'ب', 'Ж'] {
+            if let Some(r) = s.resolve(ch, false, false) {
+                assert!(
+                    r.slot != regular && Some(r.slot) != bold,
+                    "{ch:?} went to Cascadia"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hebrew_sits_in_the_middle_of_its_cell() {
+        let s = set();
+        let (regular, _) = s.hebrew.unwrap();
+        // A cell two pixels wider than the letter: one pixel either side.
+        let font = s.font(regular).as_font().unwrap();
+        let advance = font
+            .glyph_metrics(&[])
+            .scale(20.0)
+            .advance_width(font.charmap().map('א'));
+        let cell = advance.round() as u32 + 2;
+        assert_eq!(s.centring(regular, 20.0, cell), 1.0);
+        assert_eq!(s.centring(0, 20.0, cell), 0.0, "other faces stay put");
     }
 
     #[test]

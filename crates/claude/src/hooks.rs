@@ -1092,6 +1092,13 @@ pub fn set_subagent_line(settings_path: &Path, enable: bool) -> anyhow::Result<b
     Ok(true)
 }
 
+/// Is this statusLine command ours? Giverny only ever writes its binary
+/// followed by ` statusline`. A command that just mentions giverny, like a
+/// script of the user's under `~/giverny-tools/`, is theirs.
+fn is_our_statusline(command: &str) -> bool {
+    command.contains("giverny") && command.trim_end().ends_with(" statusline")
+}
+
 /// Is the Giverny statusline configured in this settings file?
 pub fn statusline_installed_in(settings_path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(settings_path) else {
@@ -1103,7 +1110,7 @@ pub fn statusline_installed_in(settings_path: &Path) -> bool {
     root.get("statusLine")
         .and_then(|s| s.get("command"))
         .and_then(|c| c.as_str())
-        .is_some_and(|c| c.contains("giverny") && c.trim_end().ends_with("statusline"))
+        .is_some_and(is_our_statusline)
 }
 
 /// Install/remove the Giverny statusline. Refuses to replace a statusline
@@ -1120,7 +1127,7 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
         .get("statusLine")
         .and_then(|s| s.get("command"))
         .and_then(|c| c.as_str())
-        .is_some_and(|c| !c.contains("giverny"));
+        .is_some_and(|c| !is_our_statusline(c));
     if existing_is_foreign {
         anyhow::bail!("a custom statusLine is already configured — leaving it alone");
     }
@@ -1311,7 +1318,7 @@ pub fn needs_path_refresh(settings_path: &Path) -> bool {
     let ours = root.get("statusLine").filter(|s| {
         s.get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|c| c.contains("giverny"))
+            .is_some_and(is_our_statusline)
     });
     // Ours, but another binary's, or written before it reran every second.
     let statusline_stale = ours.is_some_and(|s| {
@@ -1850,6 +1857,21 @@ mod tests {
             .expect("watcher delivers appended lines");
         assert_eq!(msg.hook_event(), Some("Stop"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A statusline of the user's whose path only mentions giverny is still
+    /// theirs: not counted as ours, not stale, and never replaced.
+    #[test]
+    fn a_user_statusline_under_a_giverny_path_is_theirs() {
+        let path = scratch("statusline-theirs");
+        for command in ["~/giverny-tools/line.sh", "~/bin/giverny-statusline"] {
+            let theirs = format!(r#"{{"statusLine":{{"type":"command","command":"{command}"}}}}"#);
+            std::fs::write(&path, &theirs).unwrap();
+            assert!(!statusline_installed_in(&path), "{command}");
+            assert!(!needs_path_refresh(&path), "{command}");
+            assert!(set_statusline(&path, true).is_err(), "{command}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        }
     }
 
     #[test]

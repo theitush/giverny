@@ -443,8 +443,6 @@ mod tests {
         assert_eq!(ws.active, None);
     }
 
-    /// Closing the current tab goes back to where you were before it, not
-    /// to its neighbour in the rail (giverny#247).
     #[test]
     fn tabs_opened_from_background_do_not_come_back() {
         let mut ws = Workspace::default();
@@ -460,6 +458,8 @@ mod tests {
         assert_eq!(ws.active, Some(a));
     }
 
+    /// Closing the current tab goes back to where you were before it, not
+    /// to its neighbour in the rail (giverny#247).
     #[test]
     fn closing_the_active_tab_goes_back_to_the_last_one_used() {
         let mut ws = Workspace::default();
@@ -516,8 +516,11 @@ mod tests {
         let c = ws.add_tab(cat);
         ws.close_tab(b);
         assert_eq!(ws.active, Some(c));
+        assert!(!ws.recent.contains(&b), "b left the stack");
+        assert_eq!(ws.recent_order(), vec![c, a]);
         ws.close_tab(c);
-        assert_eq!(ws.active, Some(a), "b is gone, so not b");
+        assert_eq!(ws.active, Some(a));
+        assert_eq!(ws.recent_order(), vec![a]);
     }
 
     /// The Ctrl+Tab order: where you were, not where the tab sits in the rail.

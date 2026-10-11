@@ -7,7 +7,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 
 | Key | Default | What it does |
 |---|---|---|
-| `font.family` | `""` | Preferred monospace family; empty auto-detects. Takes effect on restart. |
+| `font.family` | `""` | Preferred monospace family; empty auto-detects. Hebrew comes from the bundled Cascadia Mono unless this family has Hebrew of its own. Takes effect on restart. |
 | `font.size` | `13.0` | Point size of the terminal grid. |
 | `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin, catppuccin-mauve, rouen, phosphor, abyss, synthwave, workbench, riso. |
 | `window.opacity` | `1.0` | How solid the window's background is; below 1.0 the desktop shows through. Takes effect on restart. |
