@@ -906,16 +906,20 @@ impl ClaudeWatch {
                 let hooks_own = entry.last_hook.is_some();
                 let was = entry.state;
                 entry.state = merge_registry(entry.state, hooks_own, &live.entry);
-                // Adopted mid-way or resumed after a restart, no hook has said
-                // what was asked, but the transcript has. A session with no
-                // hooks at all never will: each turn it starts is read again.
+                // A session new to the tab has its earlier turns read back
+                // from the transcript, once: adopted mid-way, resumed after a
+                // restart, or resumed with a prompt on the command line
+                // (`claude -c "go on"`), whose hook is heard before this scan
+                // and is no reason to skip the read. A session with no hooks
+                // at all never says what was asked: each turn it starts is
+                // read again.
                 let sid = &live.entry.session_id;
                 let new_turn =
                     !hooks_own && was != ClaudeState::Busy && entry.state == ClaudeState::Busy;
                 if new_turn {
                     self.prompts_asked.remove(sid);
                 }
-                if (entry.prompts.is_empty() || new_turn) && !self.prompts_asked.contains_key(sid) {
+                if !self.prompts_asked.contains_key(sid) {
                     self.reads_asked += 1;
                     self.prompts_asked.insert(sid.clone(), self.reads_asked);
                     ask_prompts.push((sid.clone(), live.config_dir.clone(), self.reads_asked));
@@ -1902,6 +1906,56 @@ mod tests {
         feed(&mut w, &start("s-1"), Some(TAB));
         assert_eq!(w.prompt_of(TAB), None);
         assert_eq!(read_back(&mut w).as_deref(), Some("what changed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `claude -c "go on"`: the session's start and its first prompt are
+    /// both heard before the next scan, and its earlier turns are still read
+    /// back, ahead of the prompt, whether or not the transcript has it yet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resume_with_a_prompt_reads_the_earlier_turns_back() {
+        let dir =
+            std::env::temp_dir().join(format!("giverny-resume-prompt-{}", std::process::id()));
+        let proj = dir.join("projects").join("-home-u-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let turn = |p: &str| format!(r#"{{"type":"user","message":{{"content":"{p}"}}}}"#);
+        for written in [false, true] {
+            let mut lines = vec![turn("first"), turn("second")];
+            if written {
+                lines.push(turn("go on"));
+            }
+            std::fs::write(proj.join("s-1.jsonl"), lines.join("\n") + "\n").unwrap();
+
+            let mut w = ClaudeWatch::for_tests();
+            let me = std::process::id();
+            let mut live = session("busy");
+            live.pid = me;
+            w.scanned = ScanResult {
+                live: vec![registry::LiveSession {
+                    entry: live,
+                    config_dir: dir.clone(),
+                }],
+            };
+            feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+            feed(
+                &mut w,
+                &hook("UserPromptSubmit", r#","prompt":"go on""#),
+                Some(TAB),
+            );
+            w.merge_scan(&HashMap::from([(TAB, me)]), &mut WatchEffects::default());
+            assert!(w.prompts_asked.contains_key("s-1"), "a read is asked");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while w.prompts_of(TAB).is_some_and(|p| p.len() < 3) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                w.apply_found_prompts();
+            }
+            assert_eq!(
+                w.prompts_of(TAB).unwrap(),
+                ["first", "second", "go on"],
+                "written: {written}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
