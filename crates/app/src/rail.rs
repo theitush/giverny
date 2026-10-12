@@ -107,6 +107,65 @@ fn breath(time: f64) -> f32 {
     ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32
 }
 
+/// How a working tab is marked: the spinner, or with `rail.calm_busy` a dot
+/// that breathes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyMark {
+    Spinner,
+    Breath,
+}
+
+impl BusyMark {
+    fn of(cfg: &giverny_core::config::RailConfig) -> Self {
+        if cfg.calm_busy {
+            BusyMark::Breath
+        } else {
+            BusyMark::Spinner
+        }
+    }
+}
+
+/// How far in the calm mark's breath is, 0 out to 1 in: one slow breath
+/// every three seconds, against the amber flag's two (see [`breath`]), so
+/// "working" and "wants you" never fall into step. `None` is a rail that
+/// does not move: the dot holds still, full.
+fn calm_breath(time: Option<f64>) -> f32 {
+    const PERIOD: f64 = 3.0;
+    match time {
+        Some(t) => (0.5 - 0.5 * (t * std::f64::consts::TAU / PERIOD).cos()) as f32,
+        None => 1.0,
+    }
+}
+
+/// A working tab's mark at `at`, kept moving while `rect` is on screen. With
+/// `rail.animate` off the spinner is left out and the calm dot holds still.
+fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: BusyMark) {
+    match mark {
+        BusyMark::Spinner => {
+            if let Some(turns) = spin(ui, rect) {
+                spinner(p, at, turns, color);
+            }
+        }
+        BusyMark::Breath => {
+            let time = animating(ui).then(anim_time);
+            if time.is_some() {
+                keep_animating(ui, rect);
+            }
+            calm_dot(p, at, calm_breath(time), color);
+        }
+    }
+}
+
+/// A dot that swells and brightens as it breathes in. Filled, and in the
+/// tab's colour: the idle ring is hollow and the shell's dot green and still.
+fn calm_dot(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
+    p.circle_filled(
+        at,
+        3.0 + 1.5 * breath,
+        color.gamma_multiply(0.4 + 0.6 * breath),
+    );
+}
+
 /// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
 /// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
 fn braille(turns: f64) -> String {
@@ -701,16 +760,21 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
     }
     let turns = spin_turns(ui);
     let animate = animating(ui);
+    let mark = BusyMark::of(&app.cfg.rail);
     for job in &jobs {
         let ending = app.job_ends.get(&job.id).cloned();
         let stopping = matches!(ending, Some(Ending::Running(_)));
+        let working = job.live && job.state == JobState::Working;
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
-            // Off, its place stays blank: the glyph is drawn see-through,
-            // so the name beside it does not move when the switch flips.
-            JobState::Working if job.live && !animate => (braille(turns), Color32::TRANSPARENT),
+            // Off, or calm, its place stays blank: the glyph is drawn
+            // see-through, so the name beside it does not move when either
+            // switch flips. A calm one is drawn over that place.
+            JobState::Working if job.live && (!animate || mark == BusyMark::Breath) => {
+                (braille(turns), Color32::TRANSPARENT)
+            }
             JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
             JobState::Blocked => ("⚑".into(), c.amber),
@@ -723,7 +787,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
         let resp = ui.horizontal(|ui| {
             ui.set_min_width(ui.available_width());
             ui.add_space(8.0);
-            ui.add(
+            let glyph = ui.add(
                 egui::Label::new(
                     egui::RichText::new(glyph)
                         .font(FontId::monospace(11.0))
@@ -731,6 +795,14 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
                 )
                 .selectable(false),
             );
+            if working && mark == BusyMark::Breath {
+                calm_dot(
+                    ui.painter(),
+                    glyph.rect.center(),
+                    calm_breath(animate.then(anim_time)),
+                    c.accent,
+                );
+            }
             ui.vertical(|ui| {
                 ui.add(
                     egui::Label::new(
@@ -787,8 +859,11 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
                 }
             });
         });
-        if job.live && job.state == JobState::Working {
-            keep_spinning(ui, resp.response.rect);
+        if working {
+            match mark {
+                BusyMark::Spinner => keep_spinning(ui, resp.response.rect),
+                BusyMark::Breath => keep_animating(ui, resp.response.rect),
+            }
         }
         let rect = resp.response.rect;
         let resp = resp.response.interact(Sense::click());
@@ -1004,10 +1079,16 @@ fn category_header(
     let mut name_end = badge_x - 6.0 * digits(cat.count);
     badge_x -= 20.0;
     if cat.busy > 0 {
-        // Off, the ring's place stays blank and the count keeps its spot.
-        if let Some(turns) = spin(ui, rect) {
-            spinner(&p, Pos2::new(badge_x, rect.center().y), turns, cat.color);
-        }
+        // Off, the spinner's place stays blank and the count keeps its spot;
+        // a calm dot holds still.
+        busy(
+            ui,
+            &p,
+            rect,
+            Pos2::new(badge_x, rect.center().y),
+            cat.color,
+            BusyMark::of(&app.cfg.rail),
+        );
         p.text(
             Pos2::new(badge_x - 8.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -1213,12 +1294,10 @@ fn tab_row(
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     let time = anim_time();
     match row.claude {
-        // Off, a working tab has no mark: the only state drawn blank. The
-        // title stays where it is.
+        // Off, a working tab's spinner is not drawn, the only state left
+        // blank (a calm dot holds still). The title stays where it is.
         ClaudeState::Busy => {
-            if let Some(turns) = spin(ui, rect) {
-                spinner(&p, dot, turns, row.color);
-            }
+            busy(ui, &p, rect, dot, row.color, BusyMark::of(&app.cfg.rail));
         }
         ClaudeState::NeedsYou => {
             // One breath every two seconds, sampled at the animation step.
@@ -2190,5 +2269,97 @@ mod tests {
         assert_ne!(repo_color(&chrome, Some(a)), repo_color(&chrome, Some(b)));
         // Tabs in no repository are grouped, not coloured.
         assert_eq!(repo_color(&chrome, None), Color32::GRAY);
+    }
+
+    #[test]
+    fn the_busy_mark_spins_unless_asked_to_breathe() {
+        let mut cfg = giverny_core::config::RailConfig::default();
+        assert_eq!(
+            BusyMark::of(&cfg),
+            BusyMark::Spinner,
+            "y0av's spinner by default"
+        );
+        cfg.calm_busy = true;
+        assert_eq!(BusyMark::of(&cfg), BusyMark::Breath);
+    }
+
+    /// One breath every three seconds, out of step with the amber flag's two,
+    /// and still when the rail does not move.
+    #[test]
+    fn the_calm_mark_breathes_slower_than_the_flag() {
+        let at = |t: f64| calm_breath(Some(t));
+        assert!(at(0.0) < 0.01, "starts breathed out");
+        assert!((at(1.5) - 1.0).abs() < 0.01, "in at half a breath");
+        for t in [0.25, 0.7, 1.1, 2.4] {
+            assert!((at(t) - at(t + 3.0)).abs() < 1e-5, "a breath is 3s");
+            assert!((0.0..=1.0).contains(&at(t)));
+        }
+        // The flag's pulse is back where it was after 2s; the calm mark is not.
+        assert!((breath(0.25) - breath(2.25)).abs() < 1e-5);
+        assert!((at(0.25) - at(2.25)).abs() > 0.2);
+        assert_eq!(calm_breath(None), 1.0, "a still rail holds the dot full");
+    }
+
+    /// The calm mark wakes the window on the shared animation clock, as the
+    /// pulse does, and draws in a frame without a spinner (#43).
+    #[test]
+    fn the_calm_mark_keeps_to_the_animation_clock() {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run_ui(egui::RawInput::default(), |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                busy(
+                    ui,
+                    ui.painter(),
+                    rect,
+                    rect.center(),
+                    Color32::WHITE,
+                    BusyMark::Breath,
+                );
+            }));
+        }
+        let delay = out.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay <= giverny_term::pace::STEP_BACKGROUND, "{delay:?}");
+    }
+
+    /// With `rail.animate` off a calm rail still marks a working tab: the
+    /// dot, full and still, and no frame asked for. The spinner it replaces
+    /// draws nothing at all (#266).
+    #[test]
+    fn a_still_rail_holds_the_calm_dot_full() {
+        let ctx = egui::Context::default();
+        let frame = |mark: BusyMark| {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), false));
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                busy(ui, ui.painter(), rect, rect.center(), Color32::WHITE, mark);
+            });
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            let shapes: Vec<egui::Shape> = out.shapes.into_iter().map(|c| c.shape).collect();
+            (delay, shapes)
+        };
+        for _ in 0..3 {
+            frame(BusyMark::Breath);
+        }
+        let (delay, shapes) = frame(BusyMark::Breath);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "a still dot woke the window"
+        );
+        let dots: Vec<_> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Circle(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dots.len(), 1, "{shapes:?}");
+        assert_eq!(dots[0].radius, 4.5, "breathed in, all the way");
+        assert_eq!(dots[0].fill, Color32::WHITE, "at full strength");
+        let (_, shapes) = frame(BusyMark::Spinner);
+        assert!(shapes.is_empty(), "a spinner drawn with the switch off");
     }
 }
