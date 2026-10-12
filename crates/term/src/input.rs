@@ -326,7 +326,7 @@ pub fn quote_path(path: &str) -> String {
     // accept that a literal `"` in a filename is not worth chasing.
     #[cfg(windows)]
     {
-        return format!("\"{}\"", path.replace('"', ""));
+        format!("\"{}\"", path.replace('"', ""))
     }
     #[cfg(not(windows))]
     {

@@ -569,9 +569,12 @@ fn main() -> eframe::Result {
         && std::env::var_os("GIVERNY_NO_X11").is_none()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let mut wayland_stashed = None;
+    // Put back for the restart on Wayland below, which only Unix has.
+    #[cfg(unix)]
+    let wayland_stashed = try_x11
+        .then(|| std::env::var_os("WAYLAND_DISPLAY"))
+        .flatten();
     if try_x11 {
-        wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
         // SAFETY: no threads yet — this runs before the event loop.
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
         if wslg_x11 {
@@ -599,13 +602,14 @@ fn main() -> eframe::Result {
         .flatten();
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     let display_zoom: Option<f32> = None;
-    if let Some(z) = display_zoom {
-        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
-    }
-    let zoom = layout.zoom().or(display_zoom);
     // A first window scaled with its contents, so they have the room the
     // default size was chosen for.
-    let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
+    let mut first_size = [1280.0, 820.0];
+    if let Some(z) = display_zoom {
+        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
+        first_size = first_size.map(|v| v * z);
+    }
+    let zoom = layout.zoom().or(display_zoom);
     // WSLg frames an X11 window with Weston's own caption — a 1x-scale strip
     // with Windows-95 buttons inside a thick black band — and there is no way
     // to have Windows draw one instead, so there Giverny draws its own (#69).
