@@ -11,6 +11,7 @@ pub struct Config {
     pub font: FontConfig,
     pub theme: ThemeConfig,
     pub window: WindowConfig,
+    pub rail: RailConfig,
     pub titles: TitlesConfig,
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
@@ -39,6 +40,9 @@ pub struct TitlesConfig {
     pub strip_host_prefix: bool,
     /// Abbreviate every directory but the last: `~/Dev/bobo` → `~/D/bobo`.
     pub shorten_paths: bool,
+    /// Drop the status glyph Claude Code puts in front of its title (`✳`,
+    /// `◐`, a braille spinner). The rail's own mark already says the same.
+    pub strip_claude_glyph: bool,
 }
 
 impl Default for TitlesConfig {
@@ -46,8 +50,17 @@ impl Default for TitlesConfig {
         TitlesConfig {
             strip_host_prefix: true,
             shorten_paths: false,
+            strip_claude_glyph: false,
         }
     }
+}
+
+/// `[rail]`: how the tab list on the left draws itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RailConfig {
+    /// A working tab breathes a slow dot in its colour instead of spinning.
+    pub calm_busy: bool,
 }
 
 /// Tidy a title the shell set, for a rail that is 240px wide.
@@ -57,6 +70,9 @@ impl Default for TitlesConfig {
 /// titles set afterwards.
 pub fn display_title(raw: &str, cfg: &TitlesConfig) -> String {
     let mut out = raw;
+    if cfg.strip_claude_glyph {
+        out = strip_claude_glyph(out);
+    }
     if cfg.strip_host_prefix {
         out = strip_host_prefix(out);
     }
@@ -84,6 +100,28 @@ fn program_title(raw: &str) -> Option<String> {
         .or_else(|| name.strip_suffix(".EXE"))?;
     // Only a bare path: anything with arguments is a title someone chose.
     (!stem.is_empty() && !trimmed.contains(char::is_whitespace)).then(|| stem.to_string())
+}
+
+/// `✳ Fix the parser` → `Fix the parser`.
+///
+/// Claude Code marks its title with how the turn is going: a braille spinner
+/// while it works, `✳` and friends between. Only those glyphs, and only in
+/// front of a name: a title that is nothing but the glyph is left as it is,
+/// and so is one that merely starts with some other symbol.
+fn strip_claude_glyph(title: &str) -> &str {
+    let glyph = |c: char| {
+        matches!(
+            c,
+            '\u{2800}'..='\u{28ff}' | '✳' | '✢' | '✶' | '✻' | '✽' | '◐' | '◓' | '◑' | '◒'
+        )
+    };
+    if !title.starts_with(glyph) {
+        return title;
+    }
+    match title.trim_start_matches(|c: char| glyph(c) || c.is_whitespace()) {
+        "" => title,
+        rest => rest,
+    }
 }
 
 /// `yoz@yoz-framework:~/Dev/bobo` → `~/Dev/bobo`.
@@ -788,10 +826,31 @@ mod tests {
     }
 
     #[test]
+    fn claude_glyph_is_stripped_only_when_asked() {
+        let off = TitlesConfig::default();
+        assert!(!off.strip_claude_glyph, "off unless asked for");
+        assert_eq!(display_title("✳ Fix the parser", &off), "✳ Fix the parser");
+        let on = TitlesConfig {
+            strip_claude_glyph: true,
+            ..TitlesConfig::default()
+        };
+        assert_eq!(display_title("✳ Fix the parser", &on), "Fix the parser");
+        assert_eq!(display_title("⠐ Fix the parser", &on), "Fix the parser");
+        assert_eq!(display_title("◐ Fix the parser", &on), "Fix the parser");
+        assert_eq!(display_title("⠐ ✳ Name (2) ", &on), "Name (2) ");
+        // Nothing to name the tab once it is gone, a symbol that is not
+        // Claude Code's, and one that is not in front: all left alone.
+        for keep in ["✳", "⠐ ", "★ starred", "btop", "build ✳ done", "~/Dev/bobo"] {
+            assert_eq!(display_title(keep, &on), keep, "{keep} should be untouched");
+        }
+    }
+
+    #[test]
     fn shortening_keeps_the_directory_you_are_in() {
         let cfg = TitlesConfig {
             strip_host_prefix: true,
             shorten_paths: true,
+            ..TitlesConfig::default()
         };
         assert_eq!(
             display_title("yoz@host:~/Dev/claude_test/giverny", &cfg),
