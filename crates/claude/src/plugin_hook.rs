@@ -5,9 +5,10 @@
 //! command that would leave its tab's resource cap ([`guard`],
 //! [`crate::bash_guard`]) and does nothing else, and the plugin's
 //! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
-//! `giverny:manage` skill ([`crate::manage_trigger`]), and, with names on, the
-//! `SessionStart` hook that asks a tab's session to name itself
-//! ([`crate::names`]).
+//! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
+//! hook that, with names on, asks a tab's session to name itself
+//! ([`crate::names`]) — or, for a session whose start ran no such hook, its
+//! next prompt does (giverny#356).
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -332,13 +333,37 @@ pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
     )
 }
 
+/// The `UserPromptSubmit` reply carrying every context given, one paragraph
+/// each: a prompt can both ask to manage ([`crate::manage_trigger`]) and be
+/// the first its session's name ask rides on ([`crate::names::first_prompt`]).
+fn prompt_reply(contexts: &[Option<&str>]) -> Option<String> {
+    let all: Vec<&str> = contexts.iter().flatten().copied().collect();
+    (!all.is_empty()).then(|| {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": all.join("\n\n")
+            }
+        })
+        .to_string()
+    })
+}
+
 /// `giverny hook`: the payload on stdin, the reply (if any) on stdout, exit 0
 /// whatever happens.
 pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
-        if let Some(out) = crate::manage_trigger::reply(&prompt) {
+        let feeds = crate::feed::feed_dir();
+        let on = crate::names::is_on(&feeds);
+        let name = on
+            .then(|| serde_json::from_str::<Value>(&input).ok())
+            .flatten()
+            .and_then(|p| crate::names::first_prompt(&p, &feeds, on, tabs_own));
+        let manage = crate::manage_trigger::asks_to_manage(&prompt)
+            .then_some(crate::manage_trigger::CONTEXT);
+        if let Some(out) = prompt_reply(&[manage, name.as_deref()]) {
             println!("{out}");
         }
         return 0;
@@ -374,6 +399,20 @@ pub fn main() -> i32 {
 mod tests {
     use super::*;
     use crate::feed;
+
+    #[test]
+    fn a_prompt_reply_carries_every_context_given() {
+        assert_eq!(prompt_reply(&[None, None]), None);
+        let one: Value = serde_json::from_str(&prompt_reply(&[None, Some("b")]).unwrap()).unwrap();
+        assert_eq!(
+            one["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(one["hookSpecificOutput"]["additionalContext"], "b");
+        let both: Value =
+            serde_json::from_str(&prompt_reply(&[Some("a"), Some("b")]).unwrap()).unwrap();
+        assert_eq!(both["hookSpecificOutput"]["additionalContext"], "a\n\nb");
+    }
 
     const T0: u64 = 1_790_000_000_000;
     const MIN: u64 = 60_000;

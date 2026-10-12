@@ -38,10 +38,15 @@
 //!   `giverny:manage` first, since a skill picked only by its description
 //!   loses to "manage" read as a plain verb ([`crate::manage_trigger`]).
 //!
-//! - With `management_panel.ask_names` on (off by default, giverny#343) it
-//!   runs as a `SessionStart` hook as well: a session in a Giverny tab is
-//!   asked to pick a first name and record it with `giverny-manage name`
-//!   ([`crate::names`]).
+//! - It runs as a `SessionStart` hook as well: with
+//!   `management_panel.ask_names` on (off by default, giverny#343), a
+//!   session in a Giverny tab is asked to pick a first name and record it
+//!   with `giverny-manage name` ([`crate::names`]). The hook is there with
+//!   the switch off too, and reads `<feeds>/names/on` itself: Claude Code
+//!   reads `hooks.json` only when a claude starts (or on `/reload-plugins`),
+//!   so a hook added when the switch goes on would never reach the sessions
+//!   already running, not even at their `/clear` (giverny#356, measured on
+//!   2.1.296).
 //!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/` and without its
@@ -127,10 +132,14 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// (`skill`), a `UserPromptSubmit` hook that sends a prompt asking to manage
 /// to that skill ([`crate::manage_trigger`]).
 ///
-/// With `names` (`management_panel.ask_names`, giverny#343) the same launcher
-/// is a `SessionStart` hook too: a Giverny tab's session is asked to name
-/// itself, or told the name it has ([`crate::names`]).
-fn session_hooks(skill: bool, names: bool) -> Value {
+/// The same launcher is a `SessionStart` hook too, on every source (startup,
+/// resume, clear, compact): with `management_panel.ask_names` on
+/// (giverny#343), a Giverny tab's session is asked to name itself, or told
+/// the name it has ([`crate::names`]). It is registered whatever the switch
+/// says, which the hook reads as it runs: Claude Code loads `hooks.json` once
+/// per process, so a hook written only with the switch on misses every
+/// session started before it went on (giverny#356). Off, it costs a `stat`.
+fn session_hooks(skill: bool) -> Value {
     let hook = || {
         json!([{
             "type": "command",
@@ -139,13 +148,11 @@ fn session_hooks(skill: bool, names: bool) -> Value {
     };
     let mut hooks = json!({
         "PreToolUse": [{ "matcher": "Bash", "hooks": hook() }],
-        "PostToolUse": [{ "matcher": "*", "hooks": hook() }]
+        "PostToolUse": [{ "matcher": "*", "hooks": hook() }],
+        "SessionStart": [{ "hooks": hook() }]
     });
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
-    }
-    if names {
-        hooks["SessionStart"] = json!([{ "hooks": hook() }]);
     }
     json!({
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
@@ -156,9 +163,8 @@ fn session_hooks(skill: bool, names: bool) -> Value {
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-/// `skill` false leaves the manage skill out; `names` adds the
-/// `SessionStart` hook that asks a session to name itself.
-pub fn files(exes: &[String], skill: bool, names: bool) -> Vec<(&'static str, String, bool)> {
+/// `skill` false leaves the manage skill out.
+pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
         "owner": { "name": "Giverny" },
@@ -211,7 +217,7 @@ pub fn files(exes: &[String], skill: bool, names: bool) -> Vec<(&'static str, St
         ),
         (
             "plugins/giverny/hooks/hooks.json",
-            pretty(&session_hooks(skill, names)),
+            pretty(&session_hooks(skill)),
             false,
         ),
     ];
@@ -251,10 +257,9 @@ pub fn exe_candidates() -> Vec<String> {
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
 /// whether anything changed. `skill` false writes the plugin without its
-/// manage skill (and so prunes one written before); `names` adds the
-/// `SessionStart` hook ([`files`]).
-pub fn sync(dir: &Path, exes: &[String], skill: bool, names: bool) -> std::io::Result<bool> {
-    let want = files(exes, skill, names);
+/// manage skill (and so prunes one written before).
+pub fn sync(dir: &Path, exes: &[String], skill: bool) -> std::io::Result<bool> {
+    let want = files(exes, skill);
     let mut changed = false;
     for (rel, body, exec) in &want {
         let path = dir.join(rel);
@@ -560,11 +565,8 @@ mod tests {
     fn sync_writes_once_and_prunes_what_is_not_ours() {
         let d = scratch("sync").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes, true, false).unwrap());
-        assert!(
-            !sync(&d, &exes, true, false).unwrap(),
-            "a second sync is a no-op"
-        );
+        assert!(sync(&d, &exes, true).unwrap());
+        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/.claude-plugin/plugin.json")).unwrap(),
         )
@@ -585,7 +587,7 @@ mod tests {
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
         std::fs::create_dir_all(d.join("plugins/giverny/skills/old")).unwrap();
         std::fs::write(d.join("plugins/giverny/skills/old/SKILL.md"), "x").unwrap();
-        assert!(sync(&d, &["/elsewhere/giverny".into()], true, false).unwrap());
+        assert!(sync(&d, &["/elsewhere/giverny".into()], true).unwrap());
         assert!(!d.join("plugins/giverny/skills/old").exists());
         assert!(remove_dir(&d).unwrap());
         assert!(!d.exists());
@@ -600,11 +602,11 @@ mod tests {
     fn the_skill_switch_takes_only_the_skill() {
         let d = scratch("skill").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         assert!(d.join(SKILL_PATH).exists());
         // Off: the skill goes, and its emptied directories with it; the
         // hook, the wrapper and the command stay.
-        assert!(sync(&d, &exes, false, false).unwrap());
+        assert!(sync(&d, &exes, false).unwrap());
         assert!(!d.join(SKILL_PATH).exists());
         assert!(!d.join("plugins/giverny/skills").exists());
         // …and so does the prompt hook that sends "manage this" to it.
@@ -625,19 +627,20 @@ mod tests {
         ] {
             assert!(d.join(kept).exists(), "{kept} stays");
         }
-        assert!(
-            !sync(&d, &exes, false, false).unwrap(),
-            "a second sync is a no-op"
-        );
+        assert!(!sync(&d, &exes, false).unwrap(), "a second sync is a no-op");
         // On again: back, byte for byte.
-        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         assert_eq!(std::fs::read_to_string(d.join(SKILL_PATH)).unwrap(), SKILL);
         assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_some());
         assert!(remove_dir(&d).unwrap());
     }
 
     #[test]
-    fn the_names_switch_adds_the_session_start_hook_and_off_takes_it() {
+    fn the_session_start_hook_is_there_whatever_the_names_switch_says() {
+        // Claude Code reads hooks.json only when a claude starts, so a hook
+        // written when the switch goes on would miss every session already
+        // running (giverny#356): the hook is always there and reads the
+        // switch itself.
         let d = scratch("names").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = |d: &Path| -> Value {
@@ -646,56 +649,51 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(sync(&d, &exes, true, false).unwrap());
-        assert!(
-            hooks(&d)["hooks"].get("SessionStart").is_none(),
-            "off by default"
-        );
-        assert!(sync(&d, &exes, true, true).unwrap());
-        let h = hooks(&d);
-        let start = &h["hooks"]["SessionStart"][0];
-        assert!(
-            start.get("matcher").is_none(),
-            "every source: startup, resume, clear, compact"
-        );
-        assert_eq!(
-            start["hooks"][0]["command"],
-            h["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-        );
-        assert!(
-            !sync(&d, &exes, true, true).unwrap(),
-            "a second sync is a no-op"
-        );
-        assert!(sync(&d, &exes, true, false).unwrap());
-        assert!(hooks(&d)["hooks"].get("SessionStart").is_none());
+        for skill in [true, false] {
+            assert!(sync(&d, &exes, skill).unwrap());
+            let h = hooks(&d);
+            let start = &h["hooks"]["SessionStart"][0];
+            assert!(
+                start.get("matcher").is_none(),
+                "every source: startup, resume, clear, compact"
+            );
+            assert_eq!(
+                start["hooks"][0]["command"],
+                h["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+            );
+        }
         assert!(remove_dir(&d).unwrap());
     }
 
     #[test]
-    fn a_sync_prunes_a_dropped_hook() {
-        // A plugin an older Giverny wrote with a SessionStart hook still
-        // holds that hook's reply file; the next sync removes it, and
-        // hooks.json carries no SessionStart hook.
+    fn a_sync_rewrites_a_hook_an_older_giverny_left() {
+        // A plugin an older Giverny wrote with its own SessionStart hook
+        // still holds that hook's reply file; the next sync removes it, and
+        // hooks.json carries this Giverny's SessionStart hook instead.
         let d = scratch("dropped-hook").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
         let reply = d.join("plugins/giverny/hooks/session-start.json");
-        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         std::fs::write(&reply, "{}").unwrap();
         std::fs::write(
             &hooks,
             r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[]}]}}"#,
         )
         .unwrap();
-        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(sync(&d, &exes, true).unwrap());
         assert!(!reply.exists(), "the old reply is pruned");
         let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
-        assert!(h["hooks"].get("SessionStart").is_none(), "{h}");
-        assert!(h["hooks"].get("PostToolUse").is_some(), "{h}");
+        let start = &h["hooks"]["SessionStart"][0];
+        assert!(start.get("matcher").is_none(), "{h}");
         assert!(
-            !sync(&d, &exes, true, false).unwrap(),
-            "a second sync is a no-op"
+            start["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("giverny-hook")),
+            "{h}"
         );
+        assert!(h["hooks"].get("PostToolUse").is_some(), "{h}");
+        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -703,7 +701,7 @@ mod tests {
     fn the_re_estimate_hook_is_always_there_and_quiet() {
         let d = scratch("nudge").join(DIR_NAME);
         // A wrapper naming no binary at all: the hook still exits 0, silent.
-        assert!(sync(&d, &["/nonexistent/giverny".into()], true, false).unwrap());
+        assert!(sync(&d, &["/nonexistent/giverny".into()], true).unwrap());
         let h: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
         )
