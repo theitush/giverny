@@ -166,6 +166,50 @@ fn calm_dot(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     );
 }
 
+/// How lit each of a background shell's three dots is, 0 (dim) to 1 (the
+/// tab's colour), as a colour travels through them left to right: one lap
+/// every 3.75 s, slower than the calm mark's 3 s breath and the amber flag's
+/// 2 s, so "something hums along" never falls into step with "working" or
+/// "wants you". Fifteen animation steps a lap, five from one dot's peak to
+/// the next, so each peak lands on the clock's grid. Each dot's glow spans
+/// two thirds of a lap: it fades up as the one before it fades down, and at
+/// any moment at most two are lit. `None` is a rail that does not move: all
+/// three dim and still, as they were before they moved.
+fn shell_wave(time: Option<f64>) -> [f32; 3] {
+    const LAP: f64 = 3.75;
+    const HALF_WIDTH: f64 = 1.0 / 3.0;
+    let Some(t) = time else {
+        return [0.0; 3];
+    };
+    std::array::from_fn(|i| {
+        let phase = (t / LAP - i as f64 / 3.0).rem_euclid(1.0);
+        let off = phase.min(1.0 - phase);
+        if off >= HALF_WIDTH {
+            0.0
+        } else {
+            (0.5 + 0.5 * (std::f64::consts::PI * off / HALF_WIDTH).cos()) as f32
+        }
+    })
+}
+
+/// A Claude tab's background shell at `at`: three small dots, a colour
+/// moving through them from `dim` toward the tab's `color`, kept moving
+/// while `rect` is on screen. With `rail.animate` off they hold still and
+/// dim, and nothing asks for a frame.
+fn shell_dots(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, dim: Color32, color: Color32) {
+    let time = animating(ui).then(anim_time);
+    if time.is_some() {
+        keep_animating(ui, rect);
+    }
+    for (i, lit) in shell_wave(time).into_iter().enumerate() {
+        p.circle_filled(
+            at + Vec2::new((i as f32 - 1.0) * 4.0, 0.0),
+            1.4,
+            dim.lerp_to_gamma(color, lit),
+        );
+    }
+}
+
 /// The braille spinner's glyph at `turns` (see [`spin_turns`]): one lap of
 /// its ten a turn — ten a second on a GPU, one a step on the CPU clock.
 fn braille(turns: f64) -> String {
@@ -1317,12 +1361,11 @@ fn tab_row(
         ClaudeState::Idle => {
             // A background shell keeps running while Claude waits at its
             // prompt. Worth showing — it is why a directory is still churning
-            // — but it is not the agent working, and animating it would say
-            // "come back later" about a tab that is waiting on you.
+            // — but it is not the agent working. So no spinner and no amber:
+            // a slow colour drifting through three small dots, the hum of
+            // something left running (#352). Off, they hold still and dim.
             if row.background {
-                for i in -1..=1 {
-                    p.circle_filled(dot + Vec2::new(i as f32 * 4.0, 0.0), 1.4, dim);
-                }
+                shell_dots(ui, &p, rect, dot, dim, row.color);
             } else {
                 p.circle_stroke(dot, 4.0, Stroke::new(1.4, dim));
             }
@@ -2361,5 +2404,91 @@ mod tests {
         assert_eq!(dots[0].fill, Color32::WHITE, "at full strength");
         let (_, shapes) = frame(BusyMark::Spinner);
         assert!(shapes.is_empty(), "a spinner drawn with the switch off");
+    }
+
+    /// A colour travels through the shell's dots: each in [0,1], the peak
+    /// moving 0 → 1 → 2 and back to 0 after a lap, and all dim and still
+    /// when the rail does not move (#352).
+    #[test]
+    fn the_shell_dots_carry_a_colour_left_to_right() {
+        const LAP: f64 = 3.75;
+        let at = |t: f64| shell_wave(Some(t));
+        let peak = |w: [f32; 3]| (0..3).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap();
+        for k in 0..60 {
+            let t = k as f64 * 0.25;
+            let w = at(t);
+            assert!(w.iter().all(|v| (0.0..=1.0).contains(v)), "{t}: {w:?}");
+            assert!(w.iter().filter(|&&v| v > 1e-4).count() <= 2, "{t}: {w:?}");
+            let later = at(t + LAP);
+            for i in 0..3 {
+                assert!((w[i] - later[i]).abs() < 1e-5, "a lap is {LAP}s at {t}");
+            }
+        }
+        for (i, t) in [0.0, LAP / 3.0, 2.0 * LAP / 3.0, LAP]
+            .into_iter()
+            .enumerate()
+        {
+            let w = at(t);
+            assert_eq!(peak(w), i % 3, "{t}: {w:?}");
+            assert!((w[i % 3] - 1.0).abs() < 1e-5, "full at its peak: {w:?}");
+        }
+        // Halfway from one dot to the next, the two share the light.
+        let w = at(LAP / 6.0);
+        assert!(
+            (w[0] - w[1]).abs() < 1e-5 && w[0] > 0.3 && w[2] == 0.0,
+            "{w:?}"
+        );
+        // Not in step with the calm mark (3s) or the amber flag (2s).
+        assert!((at(0.25)[0] - at(3.25)[0]).abs() > 0.2);
+        assert!((at(0.25)[0] - at(2.25)[0]).abs() > 0.2);
+        assert_eq!(shell_wave(None), [0.0; 3], "a still rail holds them dim");
+    }
+
+    /// The shell's dots: moving, they wake the window on the shared clock;
+    /// with `rail.animate` off they are drawn still and dim, as before #352,
+    /// and ask for no frame.
+    #[test]
+    fn the_shell_dots_hold_still_and_dim_when_the_rail_does_not_move() {
+        let ctx = egui::Context::default();
+        let dim = Color32::from_gray(90);
+        let frame = |animate: bool| {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                shell_dots(ui, ui.painter(), rect, rect.center(), dim, Color32::RED);
+            });
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            let dots: Vec<egui::epaint::CircleShape> = out
+                .shapes
+                .into_iter()
+                .filter_map(|c| match c.shape {
+                    egui::Shape::Circle(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            (delay, dots)
+        };
+        for _ in 0..3 {
+            frame(true);
+        }
+        let (delay, dots) = frame(true);
+        assert_eq!(dots.len(), 3);
+        assert!(delay <= giverny_term::pace::STEP_BACKGROUND, "{delay:?}");
+        for _ in 0..3 {
+            frame(false);
+        }
+        let (delay, dots) = frame(false);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "still dots woke the window"
+        );
+        assert_eq!(dots.len(), 3);
+        for (i, d) in dots.iter().enumerate() {
+            assert_eq!(d.fill, dim, "dot {i}");
+            assert_eq!(d.radius, 1.4);
+            assert_eq!(d.center.x, 5.0 + (i as f32 - 1.0) * 4.0);
+        }
     }
 }
