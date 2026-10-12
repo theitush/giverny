@@ -1004,9 +1004,10 @@ fn category_header(
         && as_category == Some(*id)
     {
         let id = *id;
+        // Its text (4px in from the field's edge) where the name was.
         let edit_rect = Rect::from_min_size(
-            Pos2::new(rect.min.x + 22.0, rect.min.y + 2.0),
-            Vec2::new(width - 30.0, HEADER_H - 4.0),
+            Pos2::new(rect.min.x + 16.0, rect.min.y + 2.0),
+            Vec2::new(width - 24.0, HEADER_H - 4.0),
         );
         let te = ui.put(
             edit_rect,
@@ -1085,11 +1086,6 @@ fn category_header(
         FontId::monospace(10.0),
         dim,
     );
-    p.circle_filled(
-        Pos2::new(rect.min.x + 24.0, rect.center().y),
-        4.0,
-        cat.color,
-    );
     // A collapsed group's tabs' use, summed, at the right edge as on a tab
     // row (giverny#289). While the pointer is on the header the "+" takes
     // the corner, as a tab's close button does, and the sum steps left of
@@ -1160,7 +1156,9 @@ fn category_header(
         .ctx()
         .fonts_mut(|f| f.glyph_width(&name_font, 'M'))
         .max(1.0);
-    let name_x = rect.min.x + 34.0;
+    // Right after the fold triangle: no dot between them (giverny#353), the
+    // name's own colour is the category's.
+    let name_x = rect.min.x + 20.0;
     let char_budget = ((name_end - 6.0 - name_x) / char_w).max(4.0) as usize;
     p.text(
         Pos2::new(name_x, rect.center().y),
@@ -1332,7 +1330,7 @@ fn tab_row(
     // ⠿ for a background shell — and a font without the braille block turns
     // them into empty boxes, which is what every Windows machine did. A shape
     // is a shape everywhere.
-    // Indented past the header above it: a category's name starts at 34, so
+    // Indented past the header above it: a category's name starts at 20, so
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
