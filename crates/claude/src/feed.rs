@@ -811,6 +811,24 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         }
     }
 
+    /// When this row's task was handed to a worker that was already there
+    /// (giverny#332): the dispatcher's message naming it, else the feed's
+    /// `started` (less its pauses) — `start <key> --agent <worker>` is the
+    /// hand-off. `None` for the task the spawn named, which the worker had
+    /// from its first turn. A worker that ended before this instant ended
+    /// its previous task, not this one.
+    pub fn handed_at_ms(&self) -> Option<u64> {
+        if self.spawn_task() {
+            return None;
+        }
+        let f = self.feed?;
+        let began = f.started_ms.map(|s| s.saturating_sub(moved_ms(f)));
+        match (self.handed_ms, began) {
+            (Some(h), Some(b)) => Some(h.min(b)),
+            (h, b) => h.or(b),
+        }
+    }
+
     /// Was this row's task given at the spawn: the worker's description
     /// names its key.
     fn spawn_task(&self) -> bool {
