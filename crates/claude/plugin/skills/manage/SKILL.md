@@ -20,8 +20,8 @@ this skill only says how to run it and keep the pane true.
 ## 1. Plan
 
 First, name yourself. Pick a one-word first name when the pass starts and
-record it; the pane shows it over your rows, so the user tells managers
-apart:
+record it; your status line shows it beside the model name
+(`Opus 5.5 (Juniper)`), so the user tells managers apart:
 
 ```bash
 giverny-manage name Juniper

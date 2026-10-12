@@ -14,9 +14,8 @@
 //! `(+5m)`/`(-1h20m)`, `"` for a cell that repeats the same worker's row
 //! above it — a compact status table pinned under
 //! Claude Code. The session's token total is not here: it is on the status
-//! line's model row. A manager that named itself (`giverny manage name`)
-//! has its name on a line of its own over the rows, so managers in
-//! different tabs are told apart.
+//! line's model row, and so is the manager's name (`giverny manage name`):
+//! `Opus 5.5 (Juniper)`.
 //!
 //! **The rows are not kept here.** [`show`] is handed the tab's tracker —
 //! `ClaudeWatch::agents` (`management_live.rs`), fed by the relay, persisted,
@@ -1058,12 +1057,9 @@ pub struct Line {
     pub click: RowClick,
 }
 
-/// The whole table: the manager's name over it, rows and the feed's
-/// footer line.
+/// The whole table: rows and the feed's footer line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Table {
-    /// The manager's name (`giverny manage name`): a line over the rows.
-    pub name: Option<String>,
     pub lines: Vec<Line>,
     pub footer: Option<String>,
 }
@@ -1119,7 +1115,6 @@ pub fn build_with(
         }
         dittos(&rows, &mut lines);
         Table {
-            name: feed.and_then(|f| f.name.clone()),
             lines,
             footer: feed.and_then(|f| f.footer.clone()),
         }
@@ -1948,8 +1943,7 @@ pub fn show(
     let cell = shared.cell_size(ui.ctx().pixels_per_point());
     // A little air around each row; a table, not a wall of grid.
     let row_h = (cell.y * 1.2).round().max(cell.y);
-    let rows =
-        table.lines.len() + usize::from(table.name.is_some()) + usize::from(table.footer.is_some());
+    let rows = table.lines.len() + usize::from(table.footer.is_some());
     let frame = pane_frame(shared.theme.bg);
     let want = pane_height(
         rows,
@@ -2291,7 +2285,7 @@ fn compose(segments: &[(usize, String)]) -> String {
 // ---------------------------------------------------------- selection ----
 
 /// A drag over the pane's text, in `(row, column)` cells —
-/// rows count the manager's name, the table's lines, then its footer. The terminal's own model:
+/// rows count the table's lines, then its footer. The terminal's own model:
 /// a stream from where the drag began to where the pointer is, copied when
 /// the drag ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2463,11 +2457,8 @@ fn draw_table(
 ) -> (Option<RowClick>, Vec<egui::Rect>, Option<Option<RowClick>>) {
     let cw = cell.x.max(1.0);
     let layout = Cols::shown(table, cols, shown);
-    // The manager's name heads the rows; `head` is how many lines it takes.
     let mut segs: Vec<Vec<(usize, String)>> =
-        table.name.iter().map(|n| vec![(0, cut(n, cols))]).collect();
-    let head = segs.len();
-    segs.extend(table.lines.iter().map(|l| layout.segments(l)));
+        table.lines.iter().map(|l| layout.segments(l)).collect();
     if let Some(footer) = &table.footer {
         segs.push(vec![(0, cut(footer, cols))]);
     }
@@ -2479,13 +2470,11 @@ fn draw_table(
                 .0
         })
         .collect();
-    // The rows' own rects, as the debug harness finds them by row.
-    let line_rects = rects[head..].to_vec();
     let Some((input, _)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
-        return (None, line_rects, None);
+        return (None, rects, None);
     };
-    let line_at = |r: usize| r.checked_sub(head).and_then(|i| table.lines.get(i));
-    let hovered_line = input.hovered.filter(|&r| line_at(r).is_some());
+    let n = table.lines.len();
+    let hovered_line = input.hovered.filter(|&r| r < n);
     if hovered_line.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -2493,12 +2482,8 @@ fn draw_table(
     let p = ui.painter().clone();
 
     for (i, rect) in rects.iter().copied().enumerate() {
-        let line = line_at(i);
-        let color = match line {
-            Some(l) => stage_color(l.stage),
-            None if i < head => chrome.accent,
-            None => chrome.dim,
-        };
+        let line = table.lines.get(i);
+        let color = line.map_or(chrome.dim, |l| stage_color(l.stage));
         if let Some(line) = line {
             // The worker whose view the terminal above shows:
             // held lit, with a bar at its left edge, as a selection.
@@ -2556,9 +2541,14 @@ fn draw_table(
             shared.paint_text(&p, at, s, ink);
         }
     }
-    let clicked = input.clicked.and_then(line_at).map(|l| l.click.clone());
-    let hover = input.hovered.map(|i| line_at(i).map(|l| l.click.clone()));
-    (clicked, line_rects, hover)
+    let clicked = input
+        .clicked
+        .and_then(|i| table.lines.get(i))
+        .map(|l| l.click.clone());
+    let hover = input
+        .hovered
+        .map(|i| table.lines.get(i).map(|l| l.click.clone()));
+    (clicked, rects, hover)
 }
 
 #[cfg(test)]
@@ -4646,14 +4636,12 @@ mod tests {
         assert_eq!(t.footer.as_deref(), Some("session 3"));
     }
 
+    /// The manager's name is the status line's (giverny#330), not the pane's.
     #[test]
-    fn the_managers_name_heads_its_rows_and_none_leaves_the_pane_as_it_was() {
-        let f = feed(r#"{"name":"Juniper Belfry","rows":[{"key":"k","stage":"planned"}]}"#);
-        let t = build(Some(&f), &[], T0);
-        assert_eq!(t.name.as_deref(), Some("Juniper Belfry"));
-        assert_eq!(t.lines.len(), 1, "the name is no row");
-        let f = feed(r#"{"rows":[{"key":"k","stage":"planned"}]}"#);
-        assert_eq!(build(Some(&f), &[], T0).name, None);
+    fn the_managers_name_leaves_the_pane_as_it_was() {
+        let named = feed(r#"{"name":"Juniper Belfry","rows":[{"key":"k","stage":"planned"}]}"#);
+        let plain = feed(r#"{"rows":[{"key":"k","stage":"planned"}]}"#);
+        assert_eq!(build(Some(&named), &[], T0), build(Some(&plain), &[], T0));
     }
 
     #[test]

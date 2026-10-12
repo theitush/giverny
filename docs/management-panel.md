@@ -21,10 +21,10 @@ giverny manage land  <task> [--outcome Done|Blocked|…] [--review TEXT] [--note
 giverny manage pause <task> [--note N]  /  giverny manage resume <task>          # stop / restart its clock
 giverny manage drop  <task>  ·  giverny manage show  ·  giverny manage path  ·  giverny manage clear
 giverny manage clear-done                                                        # clear the Done rows
-giverny manage name  <Name…>                                                     # the manager's name, over its rows
+giverny manage name  <Name…>                                                     # the manager's name, on its status line
 ```
 
-- **A manager has a name.** `name Juniper Belfry` writes the feed's `name`; the pane draws it on a line over the rows, and `show` prints it first. A second `name` replaces it. With none, the pane is as before.
+- **A manager has a name.** `name Juniper Belfry` writes the feed's `name`; the session's status line (`giverny statusline`) draws its first word beside the model name, `Opus 5.5 (Juniper)`, in the chrome's accent colour, and `show` prints it first. A second `name` replaces it. With none, the status line is as before. The line reads only the session's own `<session>.json`, so a feed kept under an earlier id after a re-id names no one there.
 - **A task is any short name** (`auth-fix`, `12`). It is the row's `key`. The worker's spawn `description` should name it as a whole word (`auth-fix: fix the refresh race`), which is how the row finds its worker (see **Merge**, rule 3).
 - **Every time is measured.** `start` stamps `started`, `land` stamps `ended`, both from the machine's clock when the command runs. `<dur>` is minutes (`25`) or `25m`, `1h30m`, `1.5h`.
 - **`start --agent` on a busy worker is a hand-off**. Its Running rows that started five minutes or more before land now (`Done`), so each task keeps its own measured span; rows started less than that before are a batch it was given at once and keep running. The worker's rows are those carrying its `agent_id`, and those with none whose key its spawn description names (a row `start`ed before the spawn gave the id; the plugin's hook also writes the id on such a row at the worker's first tool call). Each row landed so gives its lease back. A `start` with no `--agent` names a worker of the manager session that is idle (all its rows landed, the last within 30 minutes), with the context it carries, as the `--agent` to pass if it takes the task; a `SendMessage` to it naming the task links it as well (rule 7).
@@ -188,7 +188,7 @@ Rewrite the file whenever anything in it changes. Do **not** rewrite it just to 
 | `version` | integer | no (absent = `1`) | The format version; see **Versioning**. |
 | `session` | string | recommended | The Claude session id this feed is for — normally the file's own name without `.json`. |
 | `aliases` | array of strings | no | Earlier session ids of the same conversation. Claude Code gives a conversation a new id on some resumes and restarts; a tab still holding an old id finds the feed through this list. List every id the conversation has had. |
-| `name` | string | no | The manager's name, drawn on a line of its own over the rows. |
+| `name` | string | no | The manager's name; its first word is drawn beside the model on the session's status line. |
 | `rows` | array of row objects | no (absent = no rows) | The table, in the order the writer wants it drawn within each stage. |
 | `footer` | object `{"text": string}`, or a bare string | no | One line drawn under the table, verbatim (a session count, a total). |
 

@@ -300,7 +300,8 @@ pub struct Feed {
     pub version: u64,
     /// The Claude session id the feed is for.
     pub session: Option<String>,
-    /// The manager's own name (`giverny manage name`), drawn over its rows.
+    /// The manager's own name (`giverny manage name`): its first name is drawn
+    /// beside the model on the session's status line.
     pub name: Option<String>,
     /// Earlier ids of the same conversation (a resume or a re-id), so a tab
     /// still holding an old id finds the feed.

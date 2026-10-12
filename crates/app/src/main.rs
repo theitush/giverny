@@ -83,6 +83,16 @@ fn category_for_agent(ws: &mut Workspace, cwd: Option<&Path>) -> CategoryId {
     ws.add_category(&name)
 }
 
+/// Leave the chrome's accent beside the socket, where each tab's status line
+/// takes the colour its manager's name is drawn in (giverny#330).
+fn record_accent(chrome: &chrome::Chrome) {
+    let c = chrome.accent;
+    let path = giverny_claude::hooks::statusline_accent_path();
+    if let Err(err) = giverny_claude::hooks::write_statusline_accent(&path, [c.r(), c.g(), c.b()]) {
+        tracing::debug!("accent: {}: {err}", path.display());
+    }
+}
+
 /// The theme a name means right now. Only Rouen cares when now is: its light
 /// follows the local clock.
 fn theme_for(name: &str) -> Theme {
@@ -1778,6 +1788,7 @@ impl App {
         shared.opacity = opacity_for(see_through, &cfg);
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name), shared.opacity);
+        record_accent(&chrome);
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -3228,6 +3239,7 @@ impl App {
         // around a Gruvbox grid.
         self.chrome = chrome::Chrome::from_theme(&theme);
         self.chrome.apply(ctx, &theme, self.shared.opacity);
+        record_accent(&self.chrome);
     }
 
     /// Adopt a freshly loaded config, applying what can be applied live.
