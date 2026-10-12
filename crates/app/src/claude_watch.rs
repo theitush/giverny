@@ -317,6 +317,9 @@ pub struct ClaudeWatch {
     /// A side instance (`GIVERNY_NO_ACCOUNT_SETUP`): read the accounts, never
     /// write them. See [`leaves_accounts_alone`].
     leave_accounts: bool,
+    /// The feed directory, where `names/on` is the session-names switch
+    /// ([`giverny_claude::names`]).
+    feeds: PathBuf,
     /// When the link was last checked for a target that is gone.
     #[cfg(unix)]
     last_link_check: Instant,
@@ -646,6 +649,7 @@ impl ClaudeWatch {
                     .join("agents.json"),
             ),
             leave_accounts,
+            feeds: giverny_claude::feed::feed_dir(),
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
@@ -1627,16 +1631,27 @@ impl ClaudeWatch {
     /// account's `settings.json` gains the two keys that load it; off, the
     /// keys go and so does the directory. `skill` is
     /// `management_panel.manage_skill`: off, the plugin is written without
-    /// its manage skill.
+    /// its manage skill. `names` is `management_panel.ask_names`
+    /// (giverny#343): on (with the pane), the plugin asks each tab's session
+    /// to name itself at its start, and `<feeds>/names/on` tells the status
+    /// line to show the name; off, neither.
     ///
     /// The setting is on by default, so it is not consent by itself: the
     /// keys are written only into an account that already holds our hooks
     /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
     /// it is for the live-usage statusline. Every other account is left
     /// byte-identical. Off removes only what is ours, wherever it is.
-    pub fn set_management_panel(&mut self, enable: bool, skill: bool, base: &Path) {
+    pub fn set_management_panel(&mut self, enable: bool, skill: bool, names: bool, base: &Path) {
         if self.leave_accounts {
             return;
+        }
+        match giverny_claude::names::set_on(&self.feeds, enable && names) {
+            Ok(true) => tracing::info!(
+                "session names {}",
+                if enable && names { "on" } else { "off" }
+            ),
+            Ok(false) => {}
+            Err(err) => tracing::warn!("session names switch not written: {err}"),
         }
         let dir = giverny_claude::plugin::marketplace_dir(base);
         if enable {
@@ -1644,6 +1659,7 @@ impl ClaudeWatch {
                 &dir,
                 &giverny_claude::plugin::exe_candidates(),
                 skill,
+                names,
             ) {
                 Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
                 Ok(false) => {}
@@ -1978,6 +1994,12 @@ impl ClaudeWatch {
             cache_dirty: Arc::new(AtomicBool::new(false)),
             agents: ManagementLive::in_memory(),
             leave_accounts: false,
+            // Never the real feeds: a test's switch is its own.
+            feeds: std::env::temp_dir().join(format!(
+                "giverny-watch-feeds-{}-{}",
+                std::process::id(),
+                jiff::Timestamp::now().as_nanosecond()
+            )),
         }
     }
 
@@ -3626,8 +3648,8 @@ mod tests {
         assert!(w.set_statusline(false).is_err());
         w.set_auto_mode(true);
         w.ensure_auto_mode();
-        w.set_management_panel(true, true, &base);
-        w.set_management_panel(false, true, &base);
+        w.set_management_panel(true, true, false, &base);
+        w.set_management_panel(false, true, false, &base);
         let after = (
             std::fs::read(&settings).unwrap(),
             std::fs::read(&known).unwrap(),
@@ -3637,7 +3659,7 @@ mod tests {
 
         // The installed instance, same calls: the account does change.
         w.leave_accounts = false;
-        w.set_management_panel(false, true, &base);
+        w.set_management_panel(false, true, false, &base);
         w.set_auto_mode(true);
         assert_ne!(std::fs::read(&settings).unwrap(), before.0);
 
@@ -3676,7 +3698,7 @@ mod tests {
         let mut w = ClaudeWatch::for_tests();
         w.profiles = vec![plain.clone(), hooked.clone()];
         w.leave_accounts = false;
-        w.set_management_panel(true, true, &base);
+        w.set_management_panel(true, true, false, &base);
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(
             !plain.config_dir.join("settings.json.giverny-bak").exists(),
@@ -3700,15 +3722,27 @@ mod tests {
 
         // The skill off: only the skill goes; the plugin and the pane's
         // keys stay, and the plain account is still untouched.
-        w.set_management_panel(true, false, &base);
+        w.set_management_panel(true, false, false, &base);
         assert!(!skill.exists());
         assert!(giverny_claude::plugin::installed_in(&hooked_settings));
         assert!(hooks::subagent_line_installed_in(&hooked_settings));
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
-        w.set_management_panel(true, true, &base);
+        w.set_management_panel(true, true, false, &base);
         assert!(skill.exists());
+        // Names (giverny#343): off by default; on with the pane, the switch
+        // file the status line reads is there, and it goes with the pane.
+        w.feeds = root.join("feeds");
+        let feeds = w.feeds.clone();
+        let on = || giverny_claude::names::is_on(&feeds);
+        assert!(!on());
+        w.set_management_panel(true, true, true, &base);
+        assert!(on());
+        w.set_management_panel(true, true, false, &base);
+        assert!(!on());
+        w.set_management_panel(true, true, true, &base);
 
-        w.set_management_panel(false, true, &base);
+        w.set_management_panel(false, true, true, &base);
+        assert!(!on(), "no pane, no names");
         assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
         assert!(!hooks::subagent_line_installed_in(&hooked_settings));
         assert!(!giverny_claude::plugin::installed_in(&hooked_settings));

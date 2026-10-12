@@ -19,18 +19,12 @@ this skill only says how to run it and keep the pane true.
 
 ## 1. Plan
 
-First, name yourself. Pick a one-word first name when the pass starts and
-record it; your status line shows it beside the model name
-(`Opus 5.5 (Juniper)`), so the user tells managers apart:
-
-```bash
-giverny-manage name Juniper
-```
-
-If the project signs its tasks, sign your umbrella task with that name, and
-record the full name the signing gives you (`giverny-manage name Juniper
-Belfry`). Keep the name for the whole manager session, and when you are
-resumed. Introduce yourself with it once, in your first message to the user.
+Your name: when Giverny asks its sessions to name themselves (a setting,
+off by default), you already have one from the session's start; keep it, and
+`giverny-manage name` prints it. If the project signs its tasks, sign your
+umbrella task with that full name, and introduce yourself with it once, in
+your first message to the user. When Giverny does not ask, do not name
+yourself.
 
 Break the work into tasks a single subagent can finish on its own. For each,
 choose:

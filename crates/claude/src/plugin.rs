@@ -38,6 +38,11 @@
 //!   `giverny:manage` first, since a skill picked only by its description
 //!   loses to "manage" read as a plain verb ([`crate::manage_trigger`]).
 //!
+//! - With `management_panel.ask_names` on (off by default, giverny#343) it
+//!   runs as a `SessionStart` hook as well: a session in a Giverny tab is
+//!   asked to pick a first name and record it with `giverny-manage name`
+//!   ([`crate::names`]).
+//!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/` and without its
 //! prompt hook, so the tool hooks, the launchers and `/giverny:clear-done`
@@ -121,7 +126,11 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// resource cap ([`crate::bash_guard`]), and, with the manage skill in
 /// (`skill`), a `UserPromptSubmit` hook that sends a prompt asking to manage
 /// to that skill ([`crate::manage_trigger`]).
-fn session_hooks(skill: bool) -> Value {
+///
+/// With `names` (`management_panel.ask_names`, giverny#343) the same launcher
+/// is a `SessionStart` hook too: a Giverny tab's session is asked to name
+/// itself, or told the name it has ([`crate::names`]).
+fn session_hooks(skill: bool, names: bool) -> Value {
     let hook = || {
         json!([{
             "type": "command",
@@ -135,6 +144,9 @@ fn session_hooks(skill: bool) -> Value {
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
     }
+    if names {
+        hooks["SessionStart"] = json!([{ "hooks": hook() }]);
+    }
     json!({
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
                         Bash commands kept inside their tab's resource cap, \
@@ -144,8 +156,9 @@ fn session_hooks(skill: bool) -> Value {
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-/// `skill` false leaves the manage skill out.
-pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> {
+/// `skill` false leaves the manage skill out; `names` adds the
+/// `SessionStart` hook that asks a session to name itself.
+pub fn files(exes: &[String], skill: bool, names: bool) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
         "owner": { "name": "Giverny" },
@@ -198,7 +211,7 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
         ),
         (
             "plugins/giverny/hooks/hooks.json",
-            pretty(&session_hooks(skill)),
+            pretty(&session_hooks(skill, names)),
             false,
         ),
     ];
@@ -238,9 +251,10 @@ pub fn exe_candidates() -> Vec<String> {
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
 /// whether anything changed. `skill` false writes the plugin without its
-/// manage skill (and so prunes one written before).
-pub fn sync(dir: &Path, exes: &[String], skill: bool) -> std::io::Result<bool> {
-    let want = files(exes, skill);
+/// manage skill (and so prunes one written before); `names` adds the
+/// `SessionStart` hook ([`files`]).
+pub fn sync(dir: &Path, exes: &[String], skill: bool, names: bool) -> std::io::Result<bool> {
+    let want = files(exes, skill, names);
     let mut changed = false;
     for (rel, body, exec) in &want {
         let path = dir.join(rel);
@@ -546,8 +560,11 @@ mod tests {
     fn sync_writes_once_and_prunes_what_is_not_ours() {
         let d = scratch("sync").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes, true).unwrap());
-        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
+        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(
+            !sync(&d, &exes, true, false).unwrap(),
+            "a second sync is a no-op"
+        );
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/.claude-plugin/plugin.json")).unwrap(),
         )
@@ -568,7 +585,7 @@ mod tests {
         // An old version's leftover skill goes; a moved binary rewrites the wrapper.
         std::fs::create_dir_all(d.join("plugins/giverny/skills/old")).unwrap();
         std::fs::write(d.join("plugins/giverny/skills/old/SKILL.md"), "x").unwrap();
-        assert!(sync(&d, &["/elsewhere/giverny".into()], true).unwrap());
+        assert!(sync(&d, &["/elsewhere/giverny".into()], true, false).unwrap());
         assert!(!d.join("plugins/giverny/skills/old").exists());
         assert!(remove_dir(&d).unwrap());
         assert!(!d.exists());
@@ -583,11 +600,11 @@ mod tests {
     fn the_skill_switch_takes_only_the_skill() {
         let d = scratch("skill").join(DIR_NAME);
         let exes = vec!["/opt/giverny/giverny".to_string()];
-        assert!(sync(&d, &exes, true).unwrap());
+        assert!(sync(&d, &exes, true, false).unwrap());
         assert!(d.join(SKILL_PATH).exists());
         // Off: the skill goes, and its emptied directories with it; the
         // hook, the wrapper and the command stay.
-        assert!(sync(&d, &exes, false).unwrap());
+        assert!(sync(&d, &exes, false, false).unwrap());
         assert!(!d.join(SKILL_PATH).exists());
         assert!(!d.join("plugins/giverny/skills").exists());
         // …and so does the prompt hook that sends "manage this" to it.
@@ -608,11 +625,49 @@ mod tests {
         ] {
             assert!(d.join(kept).exists(), "{kept} stays");
         }
-        assert!(!sync(&d, &exes, false).unwrap(), "a second sync is a no-op");
+        assert!(
+            !sync(&d, &exes, false, false).unwrap(),
+            "a second sync is a no-op"
+        );
         // On again: back, byte for byte.
-        assert!(sync(&d, &exes, true).unwrap());
+        assert!(sync(&d, &exes, true, false).unwrap());
         assert_eq!(std::fs::read_to_string(d.join(SKILL_PATH)).unwrap(), SKILL);
         assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_some());
+        assert!(remove_dir(&d).unwrap());
+    }
+
+    #[test]
+    fn the_names_switch_adds_the_session_start_hook_and_off_takes_it() {
+        let d = scratch("names").join(DIR_NAME);
+        let exes = vec!["/opt/giverny/giverny".to_string()];
+        let hooks = |d: &Path| -> Value {
+            serde_json::from_slice(
+                &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(
+            hooks(&d)["hooks"].get("SessionStart").is_none(),
+            "off by default"
+        );
+        assert!(sync(&d, &exes, true, true).unwrap());
+        let h = hooks(&d);
+        let start = &h["hooks"]["SessionStart"][0];
+        assert!(
+            start.get("matcher").is_none(),
+            "every source: startup, resume, clear, compact"
+        );
+        assert_eq!(
+            start["hooks"][0]["command"],
+            h["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        );
+        assert!(
+            !sync(&d, &exes, true, true).unwrap(),
+            "a second sync is a no-op"
+        );
+        assert!(sync(&d, &exes, true, false).unwrap());
+        assert!(hooks(&d)["hooks"].get("SessionStart").is_none());
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -625,19 +680,22 @@ mod tests {
         let exes = vec!["/opt/giverny/giverny".to_string()];
         let hooks = d.join("plugins/giverny/hooks/hooks.json");
         let reply = d.join("plugins/giverny/hooks/session-start.json");
-        assert!(sync(&d, &exes, true).unwrap());
+        assert!(sync(&d, &exes, true, false).unwrap());
         std::fs::write(&reply, "{}").unwrap();
         std::fs::write(
             &hooks,
             r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[]}]}}"#,
         )
         .unwrap();
-        assert!(sync(&d, &exes, true).unwrap());
+        assert!(sync(&d, &exes, true, false).unwrap());
         assert!(!reply.exists(), "the old reply is pruned");
         let h: Value = serde_json::from_slice(&std::fs::read(&hooks).unwrap()).unwrap();
         assert!(h["hooks"].get("SessionStart").is_none(), "{h}");
         assert!(h["hooks"].get("PostToolUse").is_some(), "{h}");
-        assert!(!sync(&d, &exes, true).unwrap(), "a second sync is a no-op");
+        assert!(
+            !sync(&d, &exes, true, false).unwrap(),
+            "a second sync is a no-op"
+        );
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -645,7 +703,7 @@ mod tests {
     fn the_re_estimate_hook_is_always_there_and_quiet() {
         let d = scratch("nudge").join(DIR_NAME);
         // A wrapper naming no binary at all: the hook still exits 0, silent.
-        assert!(sync(&d, &["/nonexistent/giverny".into()], true).unwrap());
+        assert!(sync(&d, &["/nonexistent/giverny".into()], true, false).unwrap());
         let h: Value = serde_json::from_slice(
             &std::fs::read(d.join("plugins/giverny/hooks/hooks.json")).unwrap(),
         )

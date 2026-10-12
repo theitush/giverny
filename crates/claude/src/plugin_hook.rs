@@ -5,7 +5,9 @@
 //! command that would leave its tab's resource cap ([`guard`],
 //! [`crate::bash_guard`]) and does nothing else, and the plugin's
 //! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
-//! `giverny:manage` skill ([`crate::manage_trigger`]).
+//! `giverny:manage` skill ([`crate::manage_trigger`]), and, with names on, the
+//! `SessionStart` hook that asks a tab's session to name itself
+//! ([`crate::names`]).
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -163,6 +165,14 @@ pub fn in_giverny_tab() -> bool {
         return crate::lineage::bg_job().is_some();
     }
     crate::lineage::giverny_var("GIVERNY_TAB_ID").is_some()
+        && crate::lineage::of_this_process().is_tabs()
+}
+
+/// Whether this process runs for a Giverny tab's own session: not a
+/// background job's, not a claude nested in the tab ([`in_giverny_tab`]).
+pub fn tabs_own() -> bool {
+    !crate::lineage::in_bg_job()
+        && crate::lineage::giverny_var("GIVERNY_TAB_ID").is_some()
         && crate::lineage::of_this_process().is_tabs()
 }
 
@@ -329,6 +339,14 @@ pub fn main() -> i32 {
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
         if let Some(out) = crate::manage_trigger::reply(&prompt) {
+            println!("{out}");
+        }
+        return 0;
+    }
+    if let Some(start) = crate::names::start_payload(&input) {
+        let feeds = crate::feed::feed_dir();
+        let on = crate::names::is_on(&feeds);
+        if let Some(out) = crate::names::session_start(&start, &feeds, on, on && tabs_own()) {
             println!("{out}");
         }
         return 0;
