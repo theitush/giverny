@@ -1,12 +1,14 @@
 //! A manager's chores, told to the manager rather than drawn for the person
 //! (giverny#310, giverny#284).
 //!
-//! Two of the management panel's states are the dispatcher's to act on, not
-//! the person's: a Running row whose worker has **finished** and that nobody
-//! has landed, and a Next up row that has sat with **nothing recorded to wait
-//! on** (no hold, no queued lease, no task before it). The panel draws both
-//! as ordinary rows; the manager session that owns them hears of each once,
-//! as one line on its next tool call.
+//! Three of the management panel's states are the dispatcher's to act on,
+//! not the person's: a Running row whose worker has **finished** and that
+//! nobody has landed; a Next up row that has sat with **nothing recorded to
+//! wait on** (no hold, no queued lease, no task before it); and a Running row
+//! with **no worker** at all, that its manager has not paused (giverny#334).
+//! The panel draws each as an ordinary row (the last under Next up, `no
+//! worker yet`); the manager session that owns them hears of each once, as
+//! one line on its next tool call.
 //!
 //! **Who knows what.** Only the app sees Claude Code's live worker list (the
 //! relayed `subagentStatusLine`), so only the app can tell a finished worker
@@ -25,7 +27,8 @@
 //!
 //! **Thresholds.** A Next up row is the manager's after [`IDLE_PLANNED_MS`]
 //! (the panel's idle mark since giverny#282). A finished worker's row after
-//! [`LAND_GRACE_MS`].
+//! [`LAND_GRACE_MS`]. A row with no worker [`feed::HANDOFF_WINDOW_MS`] after
+//! it was handed out, when a spawn or a pick-up would have come.
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +62,9 @@ pub enum Kind {
     Land,
     /// It waits on nothing recorded: start it, or hold it with a reason.
     Start,
+    /// It is Running with no worker: spawn or hand it one, or pause or drop
+    /// it.
+    Worker,
 }
 
 impl Kind {
@@ -67,17 +73,20 @@ impl Kind {
         match self {
             Kind::Land => "land_nudged",
             Kind::Start => "start_nudged",
+            Kind::Worker => "worker_nudged",
         }
     }
 
     /// Whether a row of the manager session's file in `stage` is still
     /// this chore's: a Next up row still planned; a finished worker's row
     /// not landed — Running, or still planned in the file for a task the
-    /// dispatcher handed over by message and never `start`ed.
+    /// dispatcher handed over by message and never `start`ed; a row with
+    /// no worker still Running.
     fn stands_in(self, stage: Option<Stage>) -> bool {
         match self {
             Kind::Land => matches!(stage, Some(Stage::Running | Stage::Planned)),
             Kind::Start => stage == Some(Stage::Planned),
+            Kind::Worker => stage == Some(Stage::Running),
         }
     }
 
@@ -85,6 +94,7 @@ impl Kind {
         match self {
             Kind::Land => LAND_GRACE_MS,
             Kind::Start => IDLE_PLANNED_MS,
+            Kind::Worker => feed::HANDOFF_WINDOW_MS,
         }
     }
 }
@@ -95,9 +105,11 @@ pub struct Chore {
     /// The row's key in the manager session's file.
     pub key: String,
     pub kind: Kind,
-    /// Since when, epoch ms: the worker's end ([`Kind::Land`]), or the last
+    /// Since when, epoch ms: the worker's end ([`Kind::Land`]), the last
     /// instant the row could have started ([`Kind::Start`]: planned, unheld,
-    /// the task before it landed, its lease granted).
+    /// the task before it landed, its lease granted), or when it was handed
+    /// out ([`Kind::Worker`]: started, or handed to a worker that never
+    /// picked it up).
     pub since: u64,
     /// How the worker ended (`finished`, `failed`, `killed`, `stopped`):
     /// [`Kind::Land`] only.
@@ -116,6 +128,7 @@ impl Chore {
         let stamp = match self.kind {
             Kind::Land => row.land_nudged_ms,
             Kind::Start => row.start_nudged_ms,
+            Kind::Worker => row.worker_nudged_ms,
         };
         stamp == Some(self.since)
     }
@@ -139,6 +152,12 @@ impl Chore {
             Kind::Start => format!(
                 "Giverny: `{key}` has waited {ago} with a free lane: start it, or \
                  `giverny-manage hold {key} --why \"<reason>\"`."
+            ),
+            Kind::Worker => format!(
+                "Giverny: `{key}` is Running with no worker ({ago} since it was handed \
+                 out): spawn one for it, hand it to an idle one (`giverny-manage start \
+                 {key} --agent <id>`), or `giverny-manage pause {key}` / \
+                 `giverny-manage drop {key}`."
             ),
         }
     }
@@ -201,7 +220,8 @@ pub fn publish(feed_dir: &Path, session: &str, chores: &[Chore]) -> Result<(), S
 ///
 /// A chore stands while its row is still in its stage under its key in the
 /// session's file (this writer's), unstamped for that instant, and — for a
-/// Next up row — still not held. Every chore read leaves the file but the
+/// Next up row, or a Running one with no worker — still not held (nor, for
+/// the latter, paused). Every chore read leaves the file but the
 /// ones not yet due.
 pub fn deliver(feed_dir: &Path, session: &str, now: u64) -> Option<String> {
     if !safe(session) {
@@ -250,6 +270,10 @@ fn stamp(feed_dir: &Path, session: &str, due: &[Chore], now: u64) -> Vec<String>
         }
         if c.kind == Kind::Start && row.contains_key("held") {
             continue; // it waits on a reason now
+        }
+        if c.kind == Kind::Worker && (row.contains_key("held") || row.contains_key("paused_since"))
+        {
+            continue; // set aside now
         }
         row.insert(c.kind.field().into(), json!(c.since));
         lines.push(c.line(now));
@@ -374,6 +398,57 @@ mod tests {
                 .unwrap()
                 .contains("`a`'s worker")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn worker(key: &str, since: u64) -> Chore {
+        Chore {
+            key: key.into(),
+            kind: Kind::Worker,
+            since,
+            how: None,
+        }
+    }
+
+    /// giverny#334: a Running row with no worker is its manager's, told once
+    /// past the hand-off window; set aside (paused, held) or landed before
+    /// the hook runs, it is dropped unsaid.
+    #[test]
+    fn a_row_with_no_worker_reaches_its_manager_unless_set_aside() {
+        assert!(!worker("a", T0).is_due(T0 + 2 * MIN));
+        assert!(worker("a", T0).is_due(T0 + 3 * MIN));
+        assert_eq!(
+            worker("demo#9", T0).line(T0 + 7 * MIN),
+            "Giverny: `demo#9` is Running with no worker (7m since it was handed out): \
+             spawn one for it, hand it to an idle one (`giverny-manage start demo#9 \
+             --agent <id>`), or `giverny-manage pause demo#9` / `giverny-manage drop demo#9`."
+        );
+        let dir = temp("worker");
+        let f = feed::feed_path(&dir, "s1");
+        manage::write(
+            &f,
+            &doc(json!([
+                {"key": "a", "stage": "running", "started": manage::stamp(T0)},
+                {"key": "b", "stage": "running", "started": manage::stamp(T0),
+                 "paused_since": manage::stamp(T0 + MIN)},
+                {"key": "c", "stage": "done"}
+            ])),
+        )
+        .unwrap();
+        publish(
+            &dir,
+            "s1",
+            &[worker("a", T0), worker("b", T0), worker("c", T0)],
+        )
+        .unwrap();
+        let said = deliver(&dir, "s1", T0 + 5 * MIN).unwrap();
+        assert!(said.contains("`a` is Running with no worker"), "{said}");
+        assert!(!said.contains("`b`") && !said.contains("`c`"), "{said}");
+        let back = feed::read(&f).unwrap();
+        assert_eq!(back.rows[0].worker_nudged_ms, Some(T0));
+        assert_eq!(back.rows[1].worker_nudged_ms, None);
+        publish(&dir, "s1", &[worker("a", T0)]).unwrap();
+        assert_eq!(deliver(&dir, "s1", T0 + 6 * MIN), None, "told once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

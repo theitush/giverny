@@ -153,6 +153,9 @@ pub struct FeedRow {
     /// Since when the idle Next up row its manager was told to start or
     /// hold had waited (`start_nudged`).
     pub start_nudged_ms: Option<u64>,
+    /// Since when the Running row its manager was told has no worker had
+    /// been handed out (`worker_nudged`, giverny#334).
+    pub worker_nudged_ms: Option<u64>,
 }
 
 /// A row's `usage` object: the task's `giverny manage run` commands so far,
@@ -433,6 +436,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         live: None,
         land_nudged_ms: millis_field(v, "land_nudged"),
         start_nudged_ms: millis_field(v, "start_nudged"),
+        worker_nudged_ms: millis_field(v, "worker_nudged"),
     })
 }
 

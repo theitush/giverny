@@ -272,8 +272,11 @@ on its last task apart from a mid-task note.
 A Running row whose worker has finished and that you have not landed three
 minutes later is told to you once, on your next tool call (`<task>'s worker
 finished 4m ago: check its report and giverny-manage land <task>`). A Running
-row with no worker at all says so on its row, for the user (`no worker
-running`). Land it, or hand it to the worker that holds it. A task you resume with a fresh
+row with no worker three minutes after you started or handed it is told to you
+once too (`<task> is Running with no worker`): spawn a worker for it, hand it to
+an idle one (`start <task> --agent <id>`), or `pause` or `drop` it. The pane
+draws a task nobody works on under Next up, not Running, with why: `no worker
+yet`, `paused since 10:42`, `held: <why>`. A task you resume with a fresh
 worker (its description naming the task, as always) moves to that worker by
 itself once the old one has finished; `start <task> --agent <new id>` moves it
 at once.
