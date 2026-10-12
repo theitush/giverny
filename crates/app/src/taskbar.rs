@@ -35,7 +35,7 @@ mod mac {
         };
         let tile = NSApplication::sharedApplication(marker).dockTile();
         let label = (waiting > 0).then(|| NSString::from_str(&waiting.to_string()));
-        unsafe { tile.setBadgeLabel(label.as_deref()) };
+        tile.setBadgeLabel(label.as_deref());
     }
 }
 

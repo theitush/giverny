@@ -599,13 +599,14 @@ fn main() -> eframe::Result {
         .flatten();
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     let display_zoom: Option<f32> = None;
-    if let Some(z) = display_zoom {
-        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
-    }
-    let zoom = layout.zoom().or(display_zoom);
     // A first window scaled with its contents, so they have the room the
     // default size was chosen for.
-    let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
+    let mut first_size = [1280.0, 820.0];
+    if let Some(z) = display_zoom {
+        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
+        first_size = first_size.map(|v| v * z);
+    }
+    let zoom = layout.zoom().or(display_zoom);
     // WSLg frames an X11 window with Weston's own caption — a 1x-scale strip
     // with Windows-95 buttons inside a thick black band — and there is no way
     // to have Windows draw one instead, so there Giverny draws its own (#69).
