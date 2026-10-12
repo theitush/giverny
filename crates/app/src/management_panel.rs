@@ -2210,6 +2210,26 @@ impl Cols {
         }
     }
 
+    /// The cells TASK leaves the title, past the id; `None` with the
+    /// title off.
+    fn title_w(&self) -> Option<usize> {
+        if !self.on.title {
+            None
+        } else if self.idw > 0 {
+            Some(self.taskw.saturating_sub(self.idw + 1))
+        } else {
+            Some(self.taskw)
+        }
+    }
+
+    /// `line`'s whole title when TASK cuts it, for the row's tooltip
+    /// (giverny#350); `None` when it fits or is not shown.
+    fn cut_title<'l>(&self, line: &'l Line) -> Option<&'l str> {
+        self.title_w()
+            .filter(|&w| line.title.chars().count() > w)
+            .map(|_| line.title.as_str())
+    }
+
     /// A row's cells as drawn: each one's text and the column it starts at.
     /// Always the same seven, in this order ([`ETA_SEG`], [`LEASE_SEG`]); a
     /// column switched off is an empty cell.
@@ -2217,13 +2237,10 @@ impl Cols {
         let on = &self.on;
         let idw = self.idw;
         // The id is never cut; the title takes what is left.
-        let task = if !on.title {
-            line.id.clone()
-        } else if idw > 0 {
-            let title_w = self.taskw.saturating_sub(idw + 1);
-            format!("{:<idw$} {}", line.id, cut(&line.title, title_w))
-        } else {
-            cut(&line.title, self.taskw)
+        let task = match self.title_w() {
+            None => line.id.clone(),
+            Some(w) if idw > 0 => format!("{:<idw$} {}", line.id, cut(&line.title, w)),
+            Some(w) => cut(&line.title, w),
         };
         let cell = |shown: bool, at: usize, text: String| {
             if shown {
@@ -2475,13 +2492,27 @@ fn draw_table(
                 .0
         })
         .collect();
-    let Some((input, _)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
+    let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
         return (None, rects, None);
     };
     let n = table.lines.len();
     let hovered_line = input.hovered.filter(|&r| r < n);
     if hovered_line.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    // A title TASK cut is read whole on hover; one that fits has no
+    // tooltip (giverny#110). Every row shares the one response, so the
+    // tooltip is anchored to the hovered row's rect: it sits under that
+    // row, and moving to another cut row keeps it open (same id, the
+    // pointer still inside) with the new title. egui keeps it closed
+    // while a drag selects or just after a click.
+    if let Some(i) = hovered_line
+        && let Some(title) = layout.cut_title(&table.lines[i])
+    {
+        let mut row = resp.clone();
+        row.rect = rects[i];
+        row.interact_rect = rects[i];
+        row.on_hover_text(title);
     }
     let sel_fill = ui.visuals().selection.bg_fill;
     let p = ui.painter().clone();
@@ -2866,6 +2897,52 @@ mod tests {
                 .iter()
                 .all(|l| compose(&cols.segments(l)).is_empty())
         );
+    }
+
+    #[test]
+    fn a_cut_title_is_offered_whole_and_one_that_fits_is_not() {
+        // giverny#350: the row's tooltip carries the whole title only when
+        // TASK cut it; a title that fits gets none (giverny#110).
+        let mut t = build(Some(&feed(DONE_FOUR)), &[], T0);
+        let long = "a title far too long to fit in the narrow pane's TASK column";
+        t.lines[0].title = long.into();
+        let narrow = Cols::new(&t, 60);
+        let w = narrow.title_w().expect("the title is on");
+        assert!(long.chars().count() > w, "the test needs the title cut");
+        let drawn = compose(&narrow.segments(&t.lines[0]));
+        assert!(drawn.contains('…') && !drawn.contains(long), "{drawn}");
+        assert_eq!(narrow.cut_title(&t.lines[0]), Some(long));
+        // A short title fits: no tooltip.
+        assert_eq!(t.lines[1].title, "two");
+        assert_eq!(narrow.cut_title(&t.lines[1]), None);
+        // Exactly the width fits too, one more is cut.
+        t.lines[1].title = "x".repeat(w);
+        assert_eq!(narrow.cut_title(&t.lines[1]), None);
+        t.lines[1].title.push('x');
+        assert_eq!(
+            narrow.cut_title(&t.lines[1]),
+            Some(t.lines[1].title.as_str())
+        );
+        // Wide enough, the long one fits whole.
+        let wide = Cols::new(&t, 200);
+        assert!(compose(&wide.segments(&t.lines[0])).contains(long));
+        assert_eq!(wide.cut_title(&t.lines[0]), None);
+        // The id off: the title has TASK to itself, and the same rule holds.
+        let no_id = PaneColumns {
+            id: false,
+            ..PaneColumns::default()
+        };
+        let cols = Cols::shown(&t, 60, &no_id);
+        assert_eq!(cols.title_w(), Some(cols.taskw));
+        assert_eq!(cols.cut_title(&t.lines[0]), Some(long));
+        // The title off: nothing to read whole.
+        let off = PaneColumns {
+            title: false,
+            ..PaneColumns::default()
+        };
+        let cols = Cols::shown(&t, 60, &off);
+        assert_eq!(cols.title_w(), None);
+        assert!(t.lines.iter().all(|l| cols.cut_title(l).is_none()));
     }
 
     #[test]
