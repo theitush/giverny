@@ -640,7 +640,10 @@ impl TabView {
                             input::ClipboardChord::Signal(b) => bytes.push(b),
                         }
                     }
-                    EguiEvent::Paste(s) => bytes.extend(input::encode_paste(s, mode)),
+                    EguiEvent::Paste(s) => {
+                        let text = input::copied_files_text();
+                        bytes.extend(input::encode_paste(text.as_deref().unwrap_or(s), mode));
+                    }
                     // Composed input — Hebrew, Arabic, CJK, anything going
                     // through the platform input method — arrives as an IME
                     // commit and never as `Text`, so it used to vanish

@@ -349,6 +349,23 @@ pub fn dropped_paths_text(paths: &[String]) -> String {
     out
 }
 
+/// Files copied in Finder, as the text a paste should type: their paths,
+/// exactly as dropping them would. Finder also puts each file's display name
+/// on the clipboard as plain text, and that is all egui hands over, so
+/// pasting a copied screenshot typed `Screenshot … at 9.53.01` (no folder, no
+/// extension) where Claude needed a path to attach the image.
+#[cfg(target_os = "macos")]
+pub fn copied_files_text() -> Option<String> {
+    let paths = arboard::Clipboard::new().ok()?.get().file_list().ok()?;
+    let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    Some(dropped_paths_text(&paths)).filter(|t| !t.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copied_files_text() -> Option<String> {
+    None
+}
+
 /// Wrap pasted text for the terminal: bracketed when the mode is on
 /// (sanitized so the payload cannot fake the closing bracket), plain
 /// sanitized bytes otherwise.
