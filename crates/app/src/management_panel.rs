@@ -1504,11 +1504,27 @@ impl Unworked {
 /// API error, that error) — and nobody has landed it; or it has no worker
 /// at all, [`feed::HANDOFF_WINDOW_MS`] after it started (a dispatcher runs
 /// `start` a moment before the spawn), and no command of its own runs
-/// either. `None` while a worker works on it.
+/// either. A worker counts as finished only if it ended after the row was
+/// handed to it ([`PaneRow::handed_at_ms`]); one that ended before is
+/// still to pick the row up, and is [`Unworked::NoWorker`] only once
+/// [`feed::HANDOFF_WINDOW_MS`] has passed without it doing so. `None` while
+/// a worker works on it.
 fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<Unworked> {
     if let Some(l) = row.live {
         if l.running() {
             return None;
+        }
+        let ended_ms = l.ended_ms.or(l.last_turn_ms);
+        // An idle worker handed this task (`start --agent`, a message) and
+        // not woken yet ended its previous task, not this one (giverny#332):
+        // it is about to pick this up. Nothing to land, nothing to flag,
+        // until it has had [`feed::HANDOFF_WINDOW_MS`] to; then nothing
+        // works on the row.
+        if let (Some(end), Some(handed)) = (ended_ms, row.handed_at_ms())
+            && end < handed
+        {
+            let fresh = now_ms < handed.saturating_add(feed::HANDOFF_WINDOW_MS);
+            return (!fresh).then_some(Unworked::NoWorker);
         }
         // Ended on an API error it never wrote past: that error is why.
         if let Some(s) = l.stops.last().filter(|s| s.to_ms.is_none()) {
@@ -1520,10 +1536,7 @@ fn unworked(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> Option<Unworked> {
             Some(Outcome::Stopped) => "stopped",
             _ => "finished",
         };
-        return Some(Unworked::Finished {
-            how,
-            ended_ms: l.ended_ms.or(l.last_turn_ms),
-        });
+        return Some(Unworked::Finished { how, ended_ms });
     }
     let f = row.feed?;
     let started = f.started_ms?;
@@ -3503,6 +3516,115 @@ mod tests {
         for d in [dir, dir2, dir3] {
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// giverny#332: a task handed to a worker that finished its last one
+    /// five minutes ago (`start acme#614 --agent w`) is not finished the
+    /// moment it is handed on: no land chore, drawn plain, while the worker
+    /// is still to pick it up. Never picked up, it has no worker running
+    /// once the hand-off window is past. Picked up and finished again, its
+    /// manager hears of it three minutes after that second end.
+    #[test]
+    fn a_task_handed_to_an_idle_worker_is_not_finished() {
+        let lines = [
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            reply("m2", T0 - 5 * MIN, 5_000, 20_000, 2_000),
+        ];
+        // The worker ended acme#613 at T0 - 5m; acme#614 is handed it at T0.
+        let (dir, rows, logs) = reused_worker("332-idle", &lines, false);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#614","stage":"running","agent_id":"w","started":{s614},"eta_s":900}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{e613}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            e613 = T0 - 5 * MIN,
+            s614 = T0,
+        ));
+        let row = |t: &Table| {
+            t.lines
+                .iter()
+                .find(|l| l.id == "acme#614")
+                .cloned()
+                .unwrap()
+        };
+        for at in [T0, T0 + MIN, T0 + 2 * MIN] {
+            assert_eq!(
+                chores(Some(&f), &rows, &logs, at),
+                [],
+                "at T0+{}m",
+                (at - T0) / MIN
+            );
+            assert_eq!(due_chores(&f, &rows, &logs, at), []);
+            let got = row(&build_at(Some(&f), &rows, at, &Clock::plain(), &logs));
+            assert_eq!(got.stage, Stage::Running);
+            assert!(!got.flag, "plain while it is picked up: {got:?}");
+            assert_ne!(got.now, NO_WORKER);
+        }
+        // Never picked up: nothing works on it.
+        let late = T0 + 3 * MIN;
+        assert_eq!(chores(Some(&f), &rows, &logs, late), []);
+        let got = row(&build_at(Some(&f), &rows, late, &Clock::plain(), &logs));
+        assert_eq!((got.now.as_str(), got.flag), (NO_WORKER, true));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Picked up at T0 + 1m (the message) and finished at T0 + 10m.
+        let mut lines = lines.to_vec();
+        lines.push(sent(T0 + MIN, "New task for you: acme#614."));
+        lines.push(reply("m3", T0 + 10 * MIN, 3_000, 25_000, 900));
+        let (dir, mut rows, logs) = reused_worker("332-again", &lines, false);
+        rows[0].ended_ms = Some(T0 + 10 * MIN);
+        let all = chores(Some(&f), &rows, &logs, T0 + 10 * MIN);
+        assert_eq!(
+            all,
+            [Chore {
+                key: "acme#614".into(),
+                kind: manage_chores::Kind::Land,
+                since: T0 + 10 * MIN,
+                how: Some("finished".into()),
+            }]
+        );
+        assert_eq!(
+            due_chores(&f, &rows, &logs, T0 + 12 * MIN),
+            [],
+            "in its grace"
+        );
+        assert_eq!(due_chores(&f, &rows, &logs, T0 + 13 * MIN), all);
+        let got = row(&build_at(
+            Some(&f),
+            &rows,
+            T0 + 13 * MIN,
+            &Clock::plain(),
+            &logs,
+        ));
+        assert!(
+            !got.flag,
+            "a finished worker's row is its manager's, drawn plain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Handed by message before `start` was run: the message is the
+        // hand-off, and a worker that ended after it finished this task.
+        let mut lines = vec![
+            reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
+            reply("m2", T0 - 30 * MIN, 5_000, 20_000, 2_000),
+            sent(T0 - 20 * MIN, "New task for you: acme#614."),
+        ];
+        lines.push(reply("m3", T0 - 5 * MIN, 3_000, 25_000, 900));
+        let (dir, rows, logs) = reused_worker("332-msg", &lines, false);
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#614","stage":"running","agent_id":"w","started":{s614}}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{e613}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            e613 = T0 - 30 * MIN,
+            s614 = T0 - 2 * MIN,
+        ));
+        let got = chores(Some(&f), &rows, &logs, T0);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].since, T0 - 5 * MIN);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Claude Code lists a worker woken by a message afresh, its
