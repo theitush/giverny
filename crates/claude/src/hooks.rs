@@ -844,8 +844,11 @@ fn statusline_tokens(payload: &serde_json::Value, transcript: Option<&Path>) -> 
     let compacted = transcript.map_or(0, |t| {
         tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
     });
-    let (session, subagents, total) =
-        tokens::session_subagents_total(session, compacted, &tokens::subagent_transcripts(&dirs));
+    let (_, subagents, total) = tokens::session_subagents_total(
+        session.map(|s| s.tokens),
+        compacted,
+        &tokens::subagent_transcripts(&dirs),
+    );
     tokens::segments(session, compacted, subagents, total)
 }
 
