@@ -29,6 +29,8 @@ mod wayland_dnd;
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg_cursor;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg_watchdog;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -839,6 +841,9 @@ struct ComingForward {
     unmapped: Option<Option<egui::Pos2>>,
     /// Mapped again, and still to be put back here.
     move_to: Option<egui::Pos2>,
+    /// Asked by the WSLg watchdog, not by a launch: mapped again once, so
+    /// that Windows shows the window it lost, without taking the focus.
+    quiet: bool,
 }
 
 impl ComingForward {
@@ -850,6 +855,16 @@ impl ComingForward {
             asked: 0,
             unmapped: None,
             move_to: None,
+            quiet: false,
+        }
+    }
+
+    /// One remap for the WSLg watchdog (#337).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    fn quiet() -> Self {
+        ComingForward {
+            quiet: true,
+            ..Self::new()
         }
     }
 }
@@ -1233,6 +1248,9 @@ pub struct App {
     /// That window's cursors, sized to the display (#100).
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     cursors: Option<wslg_cursor::Cursors>,
+    /// Brings the window back when WSLg loses it after a sleep (#337).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    wslg_watchdog: Option<wslg_watchdog::Handle>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -1886,6 +1904,13 @@ impl App {
         // Asked before the workspace moves into the app: a restored tab is how
         // an upgrade is told apart from a first run.
         let welcome = splash::due(paths.base(), !ws.tabs.is_empty());
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        let wslg_watchdog = {
+            let ctx = cc.egui_ctx.clone();
+            wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
+                ctx.request_repaint()
+            })
+        };
         let mut app = App {
             shared,
             ws,
@@ -1921,6 +1946,8 @@ impl App {
             cursors: frameless
                 .then(|| wslg_cursor::Cursors::new(cc, wslg::desktop_scale()))
                 .flatten(),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -2904,7 +2931,9 @@ impl App {
         // it was, once it is shown.
         if let Some(corner) = forward.unmapped.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !forward.quiet {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             forward.move_to = corner;
             forward.asked += 1;
             soon(forward, Duration::from_millis(200));
@@ -2914,8 +2943,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(corner));
         }
         let focused = ctx.input(|i| i.focused);
-        if forward.asked > 0 && (focused || forward.asked >= COME_FORWARD_AT.len()) {
-            if !focused {
+        if forward.asked > 0 && (forward.quiet || focused || forward.asked >= COME_FORWARD_AT.len())
+        {
+            if !focused && !forward.quiet {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                     egui::UserAttentionType::Critical,
                 ));
@@ -2923,7 +2953,7 @@ impl App {
             self.coming_forward = None;
             return;
         }
-        if self.raise_by_remap {
+        if self.raise_by_remap || forward.quiet {
             // WSLg's Weston ignores `_NET_ACTIVE_WINDOW`, so on WSLg asking is
             // not enough: the window is unmapped and mapped again, which is a
             // new window to Windows, and comes to the front as a new window
@@ -5234,6 +5264,15 @@ impl eframe::App for App {
             self.agent_views.keep_chores(self.claude.agents.all_shown());
         }
         self.show_attention(&ctx, frame);
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        if self
+            .wslg_watchdog
+            .as_ref()
+            .is_some_and(wslg_watchdog::Handle::take_remap)
+            && self.coming_forward.is_none()
+        {
+            self.coming_forward = Some(ComingForward::quiet());
+        }
         self.come_forward(&ctx);
         self.watch_for_limits();
         for (id, session, config_dir) in effects.captured {
@@ -5841,6 +5880,23 @@ fn doctor() {
                 (false, false) => "not installed (X11 uses the built-in window icon)".to_string(),
             }
         );
+        println!();
+    }
+
+    // What the WSLg watchdog did, if anything (#337).
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg_watchdog::applies() {
+        let recent = wslg_watchdog::recent(Paths::default_dirs().base(), 5);
+        println!(
+            "wslg watch   brings the window back when WSLg loses it after a sleep \
+             (GIVERNY_WSLG_WATCHDOG=0 turns it off)"
+        );
+        if recent.is_empty() {
+            println!("             nothing to do so far");
+        }
+        for line in recent {
+            println!("             {line}");
+        }
         println!();
     }
 
