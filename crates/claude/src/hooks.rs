@@ -773,7 +773,7 @@ fn cache_cold_segment(
             if now_ms < last.at_ms + last.ttl_ms? {
                 return None;
             }
-            Some(last.recache)
+            last.recache
         }
     };
     let text = match recache {
