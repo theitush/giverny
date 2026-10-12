@@ -301,9 +301,40 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "titles.strip_host_prefix",
+        label: "strip user@host:",
+        section: Section::Titles,
+        doc: "Drop the `user@host:` your shell puts in front of every title.",
+        note: &["The rail is narrow and that prefix is the same on every tab."],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "titles.shorten_paths",
+        label: "shorten paths",
+        section: Section::Titles,
+        doc: "Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
+        key: "titles.strip_claude_glyph",
+        label: "drop Claude's title glyph",
+        section: Section::Titles,
+        doc: "Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner).",
+        note: &[
+            "The rail's own mark beside the title already shows whether",
+            "Claude is working, and keeps showing it while background",
+            "agents run. A title you typed yourself is never touched.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "rail.animate",
         label: "animate the rail",
-        section: Section::Appearance,
+        section: Section::Titles,
         doc: "Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse.",
         note: &[
             "Off, no spinner, ring or pulse is drawn: a working tab's mark is",
@@ -316,7 +347,7 @@ pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "rail.calm_busy",
         label: "calm busy mark",
-        section: Section::Appearance,
+        section: Section::Titles,
         doc: "A working tab breathes a slow dot in its colour instead of spinning.",
         note: &[
             "One breath every three seconds, everywhere the spinner would be:",
@@ -353,37 +384,6 @@ pub const SETTINGS: &[SettingDef] = &[
         ],
         needs_restart: false,
         kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "titles.strip_host_prefix",
-        label: "strip user@host:",
-        section: Section::Titles,
-        doc: "Drop the `user@host:` your shell puts in front of every title.",
-        note: &["The rail is narrow and that prefix is the same on every tab."],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "titles.shorten_paths",
-        label: "shorten paths",
-        section: Section::Titles,
-        doc: "Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: false },
-    },
-    SettingDef {
-        key: "titles.strip_claude_glyph",
-        label: "drop Claude's title glyph",
-        section: Section::Titles,
-        doc: "Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner).",
-        note: &[
-            "The rail's own mark beside the title already shows whether",
-            "Claude is working, and keeps showing it while background",
-            "agents run. A title you typed yourself is never touched.",
-        ],
-        needs_restart: false,
-        kind: Kind::Bool { default: false },
     },
     SettingDef {
         key: "behavior.scrollback_lines",
@@ -1185,10 +1185,24 @@ mod tests {
             assert!(matches!(def.kind, Kind::Bool { default: false }), "{key}");
             assert_eq!(current(&absent, def), Some(Value::Bool(false)), "{key}");
         }
+    }
+
+    /// The rail's two motion options sit with the title glyph toggle in tabs
+    /// & titles, right after it, though their keys stay in `[rail]`.
+    #[test]
+    fn rail_motion_options_follow_the_title_glyph() {
+        let titles: Vec<&str> = in_section(Section::Titles).map(|d| d.key).collect();
+        let glyph = titles
+            .iter()
+            .position(|k| *k == "titles.strip_claude_glyph")
+            .expect("glyph toggle is in tabs & titles");
         assert_eq!(
-            by_key("rail.calm_busy").unwrap().section,
-            Section::Appearance
+            titles[glyph + 1..glyph + 3],
+            ["rail.animate", "rail.calm_busy"]
         );
+        for key in ["rail.tab_figures", "rail.total_line"] {
+            assert_eq!(by_key(key).unwrap().section, Section::Appearance, "{key}");
+        }
     }
 
     #[test]
