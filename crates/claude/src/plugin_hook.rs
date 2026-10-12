@@ -3,7 +3,10 @@
 //! workers' alike — and hands each part of its work to the side that owns it.
 //! The same command is the plugin's `PreToolUse` Bash hook, which refuses a
 //! command that would leave its tab's resource cap ([`guard`],
-//! [`crate::bash_guard`]) and does nothing else, and the plugin's
+//! [`crate::bash_guard`]), and, with the manage skill in, its `PreToolUse`
+//! Agent hook, which nudges a session that is no manager toward the skill
+//! when a subagent it starts looks like task work ([`crate::manage_hint`],
+//! giverny#358), and the plugin's
 //! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
 //! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
 //! hook that, with names on, asks a tab's session to name itself
@@ -401,6 +404,15 @@ pub fn main() -> i32 {
         let feeds = crate::feed::feed_dir();
         let on = crate::names::is_on(&feeds);
         if let Some(out) = crate::names::session_start(&start, &feeds, on, on && tabs_own()) {
+            println!("{out}");
+        }
+        return 0;
+    }
+    // A session's own `Agent` call: maybe the nudge toward the manage
+    // skill (giverny#358). A subagent's spawn goes on to the Bash check,
+    // which has nothing to say about it.
+    if let Some(spawn) = crate::manage_hint::spawn_of(&input) {
+        if let Some(out) = crate::manage_hint::nudge(&spawn, &crate::feed::feed_dir()) {
             println!("{out}");
         }
         return 0;

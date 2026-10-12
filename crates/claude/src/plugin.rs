@@ -37,6 +37,10 @@
 //!   manage ("manage that task") gets context telling Claude to invoke
 //!   `giverny:manage` first, since a skill picked only by its description
 //!   loses to "manage" read as a plain verb ([`crate::manage_trigger`]).
+//!   With the skill in it is a `PreToolUse` hook on the `Agent` tool too: a
+//!   session that is no manager, starting a subagent that looks like task
+//!   work, is told once that the skill is there ([`crate::manage_hint`],
+//!   giverny#358).
 //!
 //! - It runs as a `SessionStart` hook as well: with
 //!   `management_panel.ask_names` on (off by default, giverny#343), a
@@ -130,7 +134,11 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// hook on Bash, which refuses a command that would leave its tab's
 /// resource cap ([`crate::bash_guard`]), and, with the manage skill in
 /// (`skill`), a `UserPromptSubmit` hook that sends a prompt asking to manage
-/// to that skill ([`crate::manage_trigger`]).
+/// to that skill ([`crate::manage_trigger`]) and a `PreToolUse` hook on the
+/// `Agent` tool (`Task` in older Claude Code) that nudges a session toward
+/// the skill when a subagent it starts looks like task work
+/// ([`crate::manage_hint`], giverny#358). With the skill off both go: they
+/// would point at a skill that is not there.
 ///
 /// The same launcher is a `SessionStart` hook too, on every source (startup,
 /// resume, clear, compact): with `management_panel.ask_names` on
@@ -153,11 +161,16 @@ fn session_hooks(skill: bool) -> Value {
     });
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
+        hooks["PreToolUse"] = json!([
+            { "matcher": "Bash", "hooks": hook() },
+            { "matcher": "Agent|Task", "hooks": hook() }
+        ]);
     }
     json!({
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
                         Bash commands kept inside their tab's resource cap, \
-                        and \"manage this\" sent to the manage skill",
+                        \"manage this\" sent to the manage skill, \
+                        and task work pointed at it",
         "hooks": hooks
     })
 }
@@ -618,6 +631,11 @@ mod tests {
         };
         assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_none());
         assert!(hooks(&d)["hooks"].get("PostToolUse").is_some());
+        // …and the Agent hook that points task work at it; the Bash guard
+        // stays (giverny#358).
+        let pre = &hooks(&d)["hooks"]["PreToolUse"];
+        assert_eq!(pre.as_array().map(Vec::len), Some(1), "{pre}");
+        assert_eq!(pre[0]["matcher"], "Bash");
         for kept in [
             "plugins/giverny/hooks/hooks.json",
             "plugins/giverny/bin/giverny-manage",
@@ -632,6 +650,7 @@ mod tests {
         assert!(sync(&d, &exes, true).unwrap());
         assert_eq!(std::fs::read_to_string(d.join(SKILL_PATH)).unwrap(), SKILL);
         assert!(hooks(&d)["hooks"].get("UserPromptSubmit").is_some());
+        assert_eq!(hooks(&d)["hooks"]["PreToolUse"][1]["matcher"], "Agent|Task");
         assert!(remove_dir(&d).unwrap());
     }
 
@@ -714,6 +733,11 @@ mod tests {
         let pre = &h["hooks"]["PreToolUse"][0];
         assert_eq!(pre["matcher"], "Bash");
         assert_eq!(pre["hooks"][0]["command"].as_str(), Some(cmd));
+        // And the nudge toward the manage skill, before Agent calls
+        // (giverny#358).
+        let agent = &h["hooks"]["PreToolUse"][1];
+        assert_eq!(agent["matcher"], "Agent|Task");
+        assert_eq!(agent["hooks"][0]["command"].as_str(), Some(cmd));
         // So is the prompt hook, which takes no matcher.
         let prompt = &h["hooks"]["UserPromptSubmit"][0];
         assert!(prompt.get("matcher").is_none());
