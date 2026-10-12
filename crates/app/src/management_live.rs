@@ -38,6 +38,12 @@ pub struct ManagementLive {
     /// ended since: the ones whose rows are shown. Not saved — a restart
     /// starts every tab's session over.
     up: HashSet<TabId>,
+    /// Tabs whose session started with no table and no worker yet: the
+    /// session and its account. Such a start makes no table (a fresh
+    /// `claude` in every tab would rescan for workers each second), until
+    /// the session is marked a manager (giverny#357): then it gets one, so
+    /// its pane shows its Next up before its first spawn.
+    waiting: HashMap<TabId, (String, Option<PathBuf>)>,
     /// Where the trackers are saved; `None` keeps them in memory only.
     path: Option<PathBuf>,
     dirty: bool,
@@ -62,6 +68,7 @@ impl ManagementLive {
         ManagementLive {
             trackers,
             up: HashSet::new(),
+            waiting: HashMap::new(),
             path: Some(path),
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -75,6 +82,7 @@ impl ManagementLive {
         ManagementLive {
             trackers: HashMap::new(),
             up: HashSet::new(),
+            waiting: HashMap::new(),
             path: None,
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -83,7 +91,8 @@ impl ManagementLive {
     }
 
     /// The subagents of `tab`'s Claude session, Running and Done — what the
-    /// management panel draws. `None` until the tab's Claude has spawned a worker.
+    /// management panel draws. `None` until the tab's Claude has spawned a
+    /// worker, resumed a conversation, or been marked a manager.
     ///
     /// [`Tracker::rows`] is the table; [`Tracker::session_id`] and
     /// [`Tracker::aliases`] name the feed file to merge with it.
@@ -111,6 +120,7 @@ impl ManagementLive {
     /// are kept for the next start.
     pub fn session_ended(&mut self, tab: TabId) {
         self.up.remove(&tab);
+        self.waiting.remove(&tab);
     }
 
     /// The same, for the pane's own edits (a manual clear). Marks the store
@@ -132,6 +142,7 @@ impl ManagementLive {
     ) {
         let snap = LiveSnapshot::from_value(event);
         self.up.insert(tab);
+        self.waiting.remove(&tab);
         let tracker = self
             .trackers
             .entry(tab)
@@ -189,14 +200,17 @@ impl ManagementLive {
         config_dir: Option<PathBuf>,
     ) {
         self.up.insert(tab);
+        self.waiting.remove(&tab);
         let Some(tracker) = self.trackers.get_mut(&tab) else {
-            if let Some(sid) = session_id
-                && !matches!(source, Some("clear" | "startup"))
-            {
-                let mut fresh = Tracker::new(config_dir.or_else(default_config_dir));
-                fresh.set_session(sid);
-                self.trackers.insert(tab, fresh);
-                self.dirty = true;
+            if let Some(sid) = session_id {
+                if matches!(source, Some("clear" | "startup")) {
+                    self.waiting.insert(tab, (sid.to_string(), config_dir));
+                } else {
+                    let mut fresh = Tracker::new(config_dir.or_else(default_config_dir));
+                    fresh.set_session(sid);
+                    self.trackers.insert(tab, fresh);
+                    self.dirty = true;
+                }
             }
             return;
         };
@@ -308,10 +322,12 @@ impl ManagementLive {
         let before = self.trackers.len();
         self.trackers.retain(|id, _| tab_exists(*id));
         self.up.retain(|id| tab_exists(*id));
+        self.waiting.retain(|id, _| tab_exists(*id));
         self.dirty |= self.trackers.len() != before;
 
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.last_refresh = Instant::now();
+            self.adopt_managers(&giverny_claude::feed::feed_dir());
             for tracker in self.trackers.values_mut() {
                 let before = signature(tracker);
                 tracker.refresh();
@@ -320,6 +336,27 @@ impl ManagementLive {
         }
         if self.dirty && self.last_save.elapsed() >= SAVE_INTERVAL {
             self.save();
+        }
+    }
+
+    /// Give each [`ManagementLive::waiting`] tab whose session is marked a
+    /// manager in `feeds` ([`giverny_claude::managers`]) its table, bound to
+    /// that session: a `stat` per waiting tab.
+    fn adopt_managers(&mut self, feeds: &Path) {
+        let marked: Vec<TabId> = self
+            .waiting
+            .iter()
+            .filter(|(_, (sid, _))| giverny_claude::managers::is_marked(feeds, sid, &[], || None))
+            .map(|(tab, _)| *tab)
+            .collect();
+        for tab in marked {
+            let Some((sid, config)) = self.waiting.remove(&tab) else {
+                continue;
+            };
+            let mut fresh = Tracker::new(config.or_else(default_config_dir));
+            fresh.set_session(&sid);
+            self.trackers.insert(tab, fresh);
+            self.dirty = true;
         }
     }
 
@@ -455,9 +492,21 @@ mod tests {
         assert!(t.aliases.is_empty(), "and forgets the old ids");
         assert_eq!(t.config_dir.as_deref(), Some(Path::new("/nowhere")));
 
-        // A session start in a tab with no workers creates nothing.
+        // A session start in a tab with no workers creates nothing…
         live.session_started(TabId(9), Some("clear"), Some("x"), None);
         assert!(live.tracker(TabId(9)).is_none());
+        // …until its session is marked a manager (giverny#357): then its
+        // table is made, bound to it, for its Next up to show.
+        let feeds = std::env::temp_dir().join(format!("giverny-live-mgr-{}", std::process::id()));
+        live.adopt_managers(&feeds);
+        assert!(live.tracker(TabId(9)).is_none());
+        giverny_claude::managers::mark(&feeds, "x", None).unwrap();
+        live.adopt_managers(&feeds);
+        let t = live.shown(TabId(9)).expect("a manager gets its table");
+        assert_eq!(t.session_id.as_deref(), Some("x"));
+        assert!(t.is_empty());
+        let _ = std::fs::remove_dir_all(&feeds);
+        live.trackers.remove(&TabId(9));
         // A resume brings a conversation in: its table is made, so its
         // finished workers show from disk (giverny#242).
         live.session_started(TabId(9), Some("resume"), Some("y"), Some("/c".into()));
