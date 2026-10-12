@@ -569,9 +569,12 @@ fn main() -> eframe::Result {
         && std::env::var_os("GIVERNY_NO_X11").is_none()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let mut wayland_stashed = None;
+    // Put back for the restart on Wayland below, which only Unix has.
+    #[cfg(unix)]
+    let wayland_stashed = try_x11
+        .then(|| std::env::var_os("WAYLAND_DISPLAY"))
+        .flatten();
     if try_x11 {
-        wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
         // SAFETY: no threads yet — this runs before the event loop.
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
         if wslg_x11 {

@@ -90,7 +90,7 @@ mod imp {
                     let handle = LoadImageW(
                         Some(HINSTANCE(module.0)),
                         // MAKEINTRESOURCE(2): the id `build.rs` gave it.
-                        PCWSTR(2 as *const u16),
+                        PCWSTR(std::ptr::without_provenance(2)),
                         IMAGE_ICON,
                         0,
                         0,
