@@ -473,12 +473,16 @@ pub enum Outcome {
     /// The task already holds this lease (a re-claim heartbeats it).
     Held(Lease),
     /// In line at `position` (1-based); `blockers` are the leases holding
-    /// what it needs, `ahead` the queued tasks before it.
+    /// what it needs, `ahead` the queued tasks before it, `short` what it
+    /// is short of, `behind` who is really in the way ([`in_the_way`]),
+    /// and `request` what it asked.
     Queued {
         position: usize,
         blockers: Vec<Lease>,
         ahead: Vec<Waiter>,
         short: Vec<String>,
+        behind: Option<String>,
+        request: Request,
     },
     /// Larger than the limits allow: never queued.
     Refused(String),
@@ -892,17 +896,20 @@ impl Ledger {
             }
             fit => {
                 let short = fit.err().unwrap_or_default();
-                let blockers = self
+                let blockers: Vec<Lease> = self
                     .leases
                     .iter()
                     .filter(|l| blocks(l, req, &short))
                     .cloned()
                     .collect();
+                let behind = in_the_way(&blockers, &ahead, req, &short);
                 Outcome::Queued {
                     position: position + 1,
                     blockers,
                     ahead,
                     short,
+                    behind,
+                    request: req.clone(),
                 }
             }
         }
@@ -985,6 +992,66 @@ impl Ledger {
             .position(|l| l.session == session && l.task == task)?;
         Some(self.leases.remove(at))
     }
+}
+
+/// Who a queued `req` really waits on, given what it is `short` of: the
+/// first request queued `ahead` of it that wants any of that, since it goes
+/// first whatever frees (the queue is FIFO, no backfill); else the first
+/// of `leases` holding any of it; else nobody (other programs hold it).
+pub fn in_the_way<'a>(
+    leases: impl IntoIterator<Item = &'a Lease>,
+    ahead: impl IntoIterator<Item = &'a Waiter>,
+    req: &Request,
+    short: &[String],
+) -> Option<String> {
+    let wants = |w: &Waiter| {
+        let r = &w.request;
+        short.iter().any(|s| match s.as_str() {
+            "cpu" => r.cpu > 0,
+            // Every request is set aside at some memory.
+            "ram" => true,
+            "gpu" => r.gpu > 0,
+            s => s
+                .strip_prefix("slot ")
+                .is_some_and(|slot| r.slots.iter().any(|x| x == slot)),
+        })
+    };
+    ahead
+        .into_iter()
+        .find(|w| wants(w))
+        .map(|w| w.task.clone())
+        .or_else(|| {
+            leases
+                .into_iter()
+                .find(|l| blocks(l, req, short))
+                .map(|l| l.task.clone())
+        })
+}
+
+/// What a queued request is short of, in its own sizes: `3 cores`, `3G`,
+/// `3 cores, 3G`, `gpu 8G`, `a slot`. Empty when nothing is known to be
+/// short. The panel's queued row and `claim`'s line both say it.
+pub fn short_need(short: &[String], cpu: u32, ram_mb: u64, vram_mb: u64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |p: String| {
+        if !parts.contains(&p) {
+            parts.push(p);
+        }
+    };
+    for s in short {
+        match s.as_str() {
+            "cpu" => push(match cpu {
+                1 => "1 core".into(),
+                n => format!("{n} cores"),
+            }),
+            "ram" if ram_mb > 0 => push(Mem(ram_mb).to_string()),
+            "ram" => push("RAM".into()),
+            "gpu" if vram_mb > 0 => push(format!("gpu {}", Mem(vram_mb))),
+            "gpu" => push("a GPU".into()),
+            _ => push("a slot".into()),
+        }
+    }
+    parts.join(", ")
 }
 
 /// Does lease `l` hold something `req` is short of?
@@ -1155,25 +1222,54 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
             blockers,
             ahead,
             short,
+            behind,
+            request,
         } => {
             let mut s = format!("queued #{position}");
+            // What is short, in the request's own sizes (the panel's words).
+            let need = short_need(short, request.cpu, request.ram_mb, request.vram_mb);
+            if !need.is_empty() {
+                s.push_str(&format!(" for {need}"));
+            }
+            let waiter = behind
+                .as_deref()
+                .and_then(|b| ahead.iter().position(|w| w.task == b));
             let mut held: Vec<&Lease> = blockers.iter().collect();
-            held.sort_by_key(|l| eta(&l.session, &l.task).unwrap_or(i64::MAX));
-            if !held.is_empty() {
-                let names: Vec<String> = held.iter().take(3).map(|l| holder(l)).collect();
-                s.push_str(&format!(" behind {}", names.join(", ")));
+            held.sort_by_key(|l| {
+                (
+                    behind.as_deref() != Some(l.task.as_str()),
+                    eta(&l.session, &l.task).unwrap_or(i64::MAX),
+                )
+            });
+            let list = |held: &[&Lease]| {
+                let mut names: Vec<String> = held.iter().take(3).map(|l| holder(l)).collect();
                 if held.len() > 3 {
-                    s.push_str(&format!(" and {} more", held.len() - 3));
+                    names.push(format!("{} more", held.len() - 3));
+                }
+                names.join(", ")
+            };
+            if let Some(k) = waiter {
+                let w = &ahead[k];
+                s.push_str(&format!(
+                    " behind {} (queued #{}: {})",
+                    w.task,
+                    k + 1,
+                    w.request.describe()
+                ));
+                if !held.is_empty() {
+                    s.push_str(&format!("; held by {}", list(&held)));
+                }
+            } else if !held.is_empty() {
+                s.push_str(&format!(" behind {}", list(&held)));
+                if let Some(first) = ahead.first() {
+                    s.push_str(&format!(
+                        "; after {} in the queue ({})",
+                        first.task,
+                        first.request.describe()
+                    ));
                 }
             } else if !short.is_empty() {
                 s.push_str(&format!(" ({} taken by other programs)", short.join(", ")));
-            }
-            if let Some(first) = ahead.first() {
-                s.push_str(&format!(
-                    "; after {} in the queue ({})",
-                    first.task,
-                    first.request.describe()
-                ));
             }
             s.push_str("; re-run the same claim to keep the place and take it when free");
             s
@@ -1208,14 +1304,14 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
         Outcome::GrantedSmaller { lease, .. } => Some(granted(lease, "smaller")),
         Outcome::Queued {
             position,
-            blockers,
-            ahead,
+            short,
+            behind,
             ..
         } => Some(json!({
             "state": "queued",
             "position": position,
-            "behind": blockers.first().map(|l| l.task.clone())
-                .or_else(|| ahead.first().map(|w| w.task.clone())),
+            "behind": behind,
+            "short": short,
             "cpu": req.cpu,
             "ram_mb": req.ram_mb,
             "gpus": [],
@@ -1689,7 +1785,7 @@ mod tests {
         assert_eq!(blockers[0].task, "w1");
         let line = outcome_line("w2", &q, &|_, t| (t == "w1").then_some(14 * 60));
         assert!(
-            line.starts_with("queued #1 behind w1 (1 cpu, slot cargo:/t; ~14m)"),
+            line.starts_with("queued #1 for a slot behind w1 (1 cpu, slot cargo:/t; ~14m)"),
             "{line}"
         );
         // Another slot is free.
@@ -1702,6 +1798,73 @@ mod tests {
             l.claim(&c, "b", "w2", None, &slot("cargo:/t"), T0 + MIN),
             Outcome::Granted(_)
         ));
+    }
+
+    /// giverny#333: a queued request names what it is really short of, in
+    /// its own sizes, and who is really in the way — the request queued
+    /// ahead that wants it, else a lease holding it. `claim`'s line and the
+    /// row's lease agree. The grant rule is not this test's.
+    #[test]
+    fn a_queued_request_names_what_is_short_and_who_is_in_the_way() {
+        let c = cap();
+        let queued = |o: &Outcome| match o {
+            Outcome::Queued { short, behind, .. } => (short.clone(), behind.clone()),
+            o => panic!("{o:?}"),
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // CPU short: 10 of the 12 cores are held; RAM is plenty.
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "fold146", None, &req(10, 2), T0);
+        let q = l.claim(&c, "a", "899x", None, &req(3, 3), T0);
+        assert_eq!(queued(&q), (s(&["cpu"]), Some("fold146".into())));
+        let line = outcome_line("899x", &q, &|_, _| None);
+        assert!(
+            line.starts_with("queued #1 for 3 cores behind fold146 (10 cpu, 2G)"),
+            "{line}"
+        );
+        let row = row_lease(&q, &req(3, 3)).unwrap();
+        assert_eq!(row["short"], json!(["cpu"]));
+        assert_eq!(row["behind"], "fold146");
+
+        // Held back by the request ahead: 899x goes first whatever frees,
+        // so a later one waits on it, not on the lease holder — even one
+        // that asks for no more than is free now.
+        for (cpu, ram) in [(3, 3), (2, 1)] {
+            let q = l.claim(&c, "b", "283", None, &req(cpu, ram), T0 + MIN);
+            assert_eq!(queued(&q), (s(&["cpu"]), Some("899x".into())));
+            let line = outcome_line("283", &q, &|_, _| None);
+            assert!(
+                line.starts_with(&format!(
+                    "queued #2 for {cpu} cores behind 899x (queued #1: 3 cpu, 3G); \
+                     held by fold146 (10 cpu, 2G)"
+                )),
+                "{line}"
+            );
+            assert_eq!(row_lease(&q, &req(cpu, ram)).unwrap()["behind"], "899x");
+        }
+
+        // RAM short: 12G of the ~14.8G held; cores are plenty.
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "big", None, &req(2, 12), T0);
+        let q = l.claim(&c, "a", "t", None, &req(1, 4), T0);
+        assert_eq!(queued(&q), (s(&["ram"]), Some("big".into())));
+        assert!(
+            outcome_line("t", &q, &|_, _| None).starts_with("queued #1 for 4G behind big"),
+            "{}",
+            outcome_line("t", &q, &|_, _| None)
+        );
+
+        // Both short.
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "big", None, &req(10, 12), T0);
+        let q = l.claim(&c, "a", "t", None, &req(3, 4), T0);
+        assert_eq!(queued(&q), (s(&["cpu", "ram"]), Some("big".into())));
+        assert!(
+            outcome_line("t", &q, &|_, _| None).starts_with("queued #1 for 3 cores, 4G behind big"),
+            "{}",
+            outcome_line("t", &q, &|_, _| None)
+        );
     }
 
     #[test]

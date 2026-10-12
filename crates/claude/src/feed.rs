@@ -229,8 +229,12 @@ pub struct RowLease {
     pub wanted_cpu: Option<u32>,
     /// 1-based place in the ledger's queue when it was last asked.
     pub position: Option<u64>,
-    /// The task whose lease it waits on, or the queued task before it.
+    /// Who it really waits on: the queued request ahead that wants what it
+    /// is short of, else a lease holding that ([`crate::resources::in_the_way`]).
     pub behind: Option<String>,
+    /// What it is short of, as of its last claim (`cpu`, `ram`, `gpu`,
+    /// `slot <name>`); empty when not known.
+    pub short: Vec<String>,
 }
 
 fn parse_lease(v: &Value) -> Option<RowLease> {
@@ -283,6 +287,7 @@ fn parse_lease(v: &Value) -> Option<RowLease> {
         wanted_cpu: u64_field(l, "wanted_cpu").map(|c| c as u32),
         position: u64_field(l, "position"),
         behind: str_field(l, "behind"),
+        short: strings("short"),
     })
 }
 

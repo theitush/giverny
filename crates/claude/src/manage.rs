@@ -3145,13 +3145,18 @@ mod tests {
         let (msg, code) = run_as(&dir, "b", "claim t2 --cpu 6 --ram 2G", T0 + 16 * MIN);
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
         assert!(
-            msg.starts_with("queued #1 behind t1 (8 cpu, 10G, slot cargo:/t; ~14m)"),
+            msg.starts_with("queued #1 for 6 cores behind t1 (8 cpu, 10G, slot cargo:/t; ~14m)"),
             "{msg}"
         );
         let f = feed::read(&feed::feed_path(&dir, "b")).unwrap();
         let l = f.rows[0].lease.as_ref().unwrap();
         assert_eq!(l.state, feed::LeaseState::Queued);
         assert_eq!((l.position, l.behind.as_deref()), (Some(1), Some("t1")));
+        assert_eq!(
+            l.short,
+            vec!["cpu".to_string()],
+            "the pane says what the line says"
+        );
         // The slot is exclusive whatever the size.
         let (_, code) = run_as(&dir, "b", "claim t3 --cpu 1 --slot cargo:/t", T0 + 16 * MIN);
         assert_eq!(code, resources::exit::QUEUED);
