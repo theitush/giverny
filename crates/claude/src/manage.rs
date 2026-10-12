@@ -21,6 +21,10 @@ use serde_json::{Map, Value, json};
 use crate::worker_log::{self, WorkerLog};
 use crate::{continuation, feed, manage_history, names, resources, sleeps};
 
+/// Is a session a manager: the manage skill ran in it (giverny#357). Rows
+/// it writes never make it one ([`crate::managers`]).
+pub use crate::managers::is_manager;
+
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/manage";
 

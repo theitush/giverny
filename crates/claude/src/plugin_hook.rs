@@ -26,6 +26,10 @@
 //!   ([`manage_inbox`]), and its rows' chores — a finished worker's task to
 //!   land, a Next up task idle with nothing to wait on — told once each
 //!   ([`manage_chores`]).
+//! - **The manager mark.** The session's own `Skill` call running the
+//!   manage skill marks it a manager ([`crate::managers`], giverny#357), as
+//!   does the person typing `/giverny:manage` (the prompt hook): what lets
+//!   its pane open before any worker, and draw its Next up.
 //!
 //! **Only where something tracks the worker.** Every ask is for the pane:
 //! it goes out only when the session runs in a Giverny tab
@@ -125,6 +129,7 @@ pub fn payload_of(input: &str) -> Option<Value> {
     let h: Hook = serde_json::from_str(input).ok()?;
     let mut m = Map::new();
     let spawn = matches!(h.tool_name.as_deref(), Some("Agent" | "Task")) && h.agent_id.is_none();
+    let skill = h.tool_name.as_deref() == Some("Skill") && h.agent_id.is_none();
     for (k, v) in [
         ("session_id", h.session_id),
         ("agent_id", h.agent_id),
@@ -150,6 +155,18 @@ pub fn payload_of(input: &str) -> Option<Value> {
         let background = r.get("status").and_then(Value::as_str) == Some("async_launched")
             || r.get("isAsync").and_then(Value::as_bool) == Some(true);
         m.insert("spawned_background".into(), json!(background));
+    }
+    // The session's own `Skill` call: which skill, for the manager mark
+    // ([`crate::managers`]). Its response is the skill's text, never read.
+    if skill && let Ok(s) = serde_json::from_str::<Spawn>(input) {
+        let name = s
+            .tool_input
+            .as_ref()
+            .and_then(crate::managers::skill_of)
+            .map(String::from);
+        if let Some(name) = name {
+            m.insert("skill".into(), json!(name));
+        }
     }
     Some(Value::Object(m))
 }
@@ -203,6 +220,11 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
         .filter(|s| !s.is_empty() && !s.contains(['/', '\\']) && !s.starts_with('.'))?;
     let ledger = resources::ledger_path(dir);
     beat(&ledger, Some(dir), session, now);
+    // The manage skill ran: the session is a manager from now on
+    // (giverny#357), whatever it has written yet.
+    if crate::managers::skill_call(payload) {
+        crate::managers::mark_from(dir, payload);
+    }
     if let Some(caller) = Caller::of(payload) {
         return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
     }
@@ -338,6 +360,13 @@ pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
+        // The person typed the skill's command: Claude Code expands it with
+        // no `Skill` call, so the mark is made here (giverny#357).
+        if crate::managers::typed_skill(&prompt)
+            && let Ok(v) = serde_json::from_str::<Value>(&input)
+        {
+            crate::managers::mark_from(&crate::feed::feed_dir(), &v);
+        }
         if let Some(out) = crate::manage_trigger::reply(&prompt) {
             println!("{out}");
         }
@@ -487,6 +516,34 @@ mod tests {
             .unwrap();
         assert_eq!(p["session_id"], "s1");
         assert!(p.get("spawned_agent").is_none());
+    }
+
+    /// giverny#357: the session's own `Skill` call running the manage
+    /// skill marks it a manager; any other skill, or a worker's call, marks
+    /// nobody.
+    #[test]
+    fn the_manage_skill_call_marks_its_session_a_manager() {
+        let dir = temp("mark");
+        let skill = |session: &str, agent: Option<&str>, name: &str| {
+            let agent = agent
+                .map(|a| format!(r#""agent_id":"{a}","#))
+                .unwrap_or_default();
+            format!(
+                r#"{{"session_id":"{session}",{agent}"hook_event_name":"PostToolUse","tool_name":"Skill","tool_input":{{"skill":"{name}","args":"task 12"}},"tool_response":{{"success":true}}}}"#
+            )
+        };
+        let p = payload_of(&skill("s1", None, "giverny:manage")).unwrap();
+        assert_eq!(p["skill"], "giverny:manage");
+        run(&p, &dir, T0, true);
+        assert!(crate::managers::is_manager(&dir, "s1", None));
+        for (s, input) in [
+            ("s2", skill("s2", None, "simplify")),
+            ("s3", skill("s3", Some("w1"), "giverny:manage")),
+        ] {
+            run(&payload_of(&input).unwrap(), &dir, T0, true);
+            assert!(!crate::managers::is_manager(&dir, s, None), "{input}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

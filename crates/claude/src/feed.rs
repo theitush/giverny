@@ -297,6 +297,13 @@ impl FeedRow {
     pub fn stage(&self) -> Stage {
         self.stage.unwrap_or(Stage::Planned)
     }
+
+    /// A row that runs `giverny manage run` commands of its own: it holds a
+    /// lease, has measured runs, or has one running. A manager's build row
+    /// (`integ-build`) is one, with no worker behind it.
+    pub fn is_run(&self) -> bool {
+        self.lease.is_some() || self.usage.is_some() || self.live.is_some()
+    }
 }
 
 /// A parsed feed file.
@@ -905,6 +912,56 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         let took_ms = end as i64 - start as i64 - off_ms(start, end) as i64;
         Some(took_ms.div_euclid(1000) - eta)
     }
+}
+
+/// Which of a session's merged rows its pane draws (giverny#357): every
+/// drawn row is a real agent. A feed row annotates a worker — its title,
+/// ETA, lease, brief — and with no subagent behind it is not drawn: any
+/// agent can leave itself a note to run `giverny manage start`, and such a
+/// row once opened the pane alone, blank where its worker's cells go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drawn {
+    /// A session that is no manager: only rows a subagent Claude Code
+    /// lists stands behind.
+    Agents,
+    /// A manager session ([`crate::managers`]): those, and its own rows no
+    /// worker stands behind — Next up (a Running row with no worker is drawn
+    /// there too) and its build rows ([`FeedRow::is_run`]), in any stage.
+    Manager,
+    /// Every merged row: for the tests and debug lookups of the merge
+    /// itself.
+    Every,
+}
+
+impl Drawn {
+    /// What a session's pane draws: [`Drawn::Manager`] for a manager, else
+    /// [`Drawn::Agents`].
+    pub fn of(manager: bool) -> Drawn {
+        if manager {
+            Drawn::Manager
+        } else {
+            Drawn::Agents
+        }
+    }
+
+    /// Is `row` drawn? Asked of the rows as the pane places them: after a
+    /// Running row with no worker is moved under Next up.
+    pub fn keeps<L>(self, row: &PaneRow<'_, L>) -> bool {
+        match self {
+            Drawn::Every => true,
+            _ if row.live.is_some() => true,
+            Drawn::Agents => false,
+            Drawn::Manager => row.stage == Stage::Planned || row.feed.is_some_and(FeedRow::is_run),
+        }
+    }
+}
+
+/// Does a session get a pane at all (giverny#357): only when subagents are
+/// involved — its tracker holds a real one, running or done this session
+/// (`has_agents`) — or it is a manager, whose Next up shows before its
+/// first spawn. Its feed never opens one by itself.
+pub fn opens(has_agents: bool, manager: bool) -> bool {
+    has_agents || manager
 }
 
 /// Merge the feed with the live rows.
@@ -2469,5 +2526,58 @@ mod tests {
             feed_path(Path::new("/d"), "abc"),
             PathBuf::from("/d/abc.json")
         );
+    }
+
+    /// giverny#357: only rows a real subagent stands behind are drawn,
+    /// but a manager's Next up and build rows show with no worker; and the
+    /// pane opens only with a subagent, or for a manager.
+    #[test]
+    fn only_rows_a_real_agent_stands_behind_are_drawn() {
+        let build = FeedRow {
+            usage: Some(RowUsage {
+                runs: 1,
+                ..Default::default()
+            }),
+            ..row("integ-build", Stage::Running, None)
+        };
+        let f = Feed {
+            rows: vec![
+                // A stray `start` with nobody behind it.
+                row("stray", Stage::Running, None),
+                row("worked", Stage::Running, Some("a1")),
+                row("next", Stage::Planned, None),
+                build,
+                row("landed", Stage::Done, None),
+            ],
+            ..Default::default()
+        };
+        let lives = [live("a1", true), live("x1", false)];
+        let rows = merge(Some(&f), &lives);
+        let drawn = |d: Drawn| -> Vec<String> {
+            rows.iter()
+                .filter(|r| d.keeps(r))
+                .map(|r| {
+                    r.feed
+                        .map(|f| f.key.clone())
+                        .or_else(|| r.live.map(|l| l.id.to_string()))
+                        .unwrap()
+                })
+                .collect()
+        };
+        // A plain session: its workers, a feed row naming one included.
+        assert_eq!(drawn(Drawn::Agents), ["worked", "x1"]);
+        // A manager: Next up and its build row too; a worker-less Running
+        // row only once the pane benches it under Next up.
+        assert_eq!(
+            drawn(Drawn::Manager),
+            ["worked", "integ-build", "next", "x1"]
+        );
+        assert_eq!(drawn(Drawn::Every).len(), rows.len());
+        assert_eq!(Drawn::of(true), Drawn::Manager);
+        assert_eq!(Drawn::of(false), Drawn::Agents);
+        // The pane opens only with a subagent, or for a manager.
+        assert!(!opens(false, false), "a feed alone opens nothing");
+        assert!(opens(true, false));
+        assert!(opens(false, true));
     }
 }

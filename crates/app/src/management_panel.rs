@@ -2,12 +2,20 @@
 //! Code subagents — Running, Planned and Done — one row each.
 //!
 //! Off by default (`claude.management_panel`); off, nothing here runs. On, it is
-//! drawn only in a tab whose session has rows, as a resizable bottom panel
-//! inside the terminal's area.
+//! drawn as a resizable bottom panel inside the terminal's area, only when
+//! subagents are involved (giverny#357): in a tab whose tracker holds a
+//! real subagent, running or done this session, or whose session is a
+//! manager — the manage skill ran in it ([`giverny_claude::managers`]) — so
+//! its Next up shows before its first spawn. A feed never opens it alone
+//! ([`feed::opens`]).
 //!
 //! The rows are a [`Tracker`] (Claude Code's own data: live list,
 //! transcripts, notifications) merged with the optional feed file
-//! ([`feed::merge`], `docs/management-panel.md`). This module owns only the look:
+//! ([`feed::merge`], `docs/management-panel.md`), and **every row drawn is a
+//! real agent** ([`Drawn`]): a feed row with no subagent behind it is not
+//! drawn, save a manager's own Next up and build rows. The manager's chores
+//! are worked out from the same drawn rows, so a session that is no manager
+//! is never told of a row it cannot see. This module owns only the look:
 //! the columns STAGE, TASK, ELAPSED, ETA, NOW and TOKENS, every one but TASK a
 //! fixed width, no column headings, the whole row tinted by its stage, a
 //! stopwatch ELAPSED ticking every second, `~1h3m` ETAs, a Done row's
@@ -50,14 +58,16 @@
 //! `Ctrl+Shift+C` copies it again. The next press anywhere lets it go.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::agent_eta::{self, Etas};
-use giverny_claude::feed::{self, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage};
+use giverny_claude::feed::{
+    self, Drawn, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage,
+};
 use giverny_claude::manage_chores::{self, Chore};
 use giverny_claude::resources::{self, Ledger};
 use giverny_claude::run_live::{RunLive, TaskLive};
@@ -118,6 +128,12 @@ struct View {
     etas: agent_eta::Cache,
     etas_now: Etas,
     feed_session: Option<String>,
+    /// The session is a manager: the manage skill ran in it
+    /// ([`giverny_claude::managers`], giverny#357). Looked up with the feed.
+    manager: bool,
+    /// The session's conversation root, once read: what a resumed
+    /// manager's mark is found by, read from its transcript once per id.
+    root: Option<String>,
     last_poll: Option<Instant>,
     /// The height the pane last sized itself to, while the user has not
     /// dragged it; `None` once they have.
@@ -153,18 +169,35 @@ impl View {
     /// when the session changed). A session Claude Code re-id'd is looked
     /// up by its earlier ids too, newest first, until its files name the
     /// new one (giverny#105).
-    fn poll_feed(&mut self, session: Option<&str>, aliases: &[String]) {
+    ///
+    /// The manager mark is looked up with it ([`View::manager`]): a `stat`
+    /// of the session's mark and its earlier ids', and of its
+    /// conversation's, whose root is read from the transcript (under
+    /// `config`) once.
+    fn poll_feed(&mut self, session: Option<&str>, aliases: &[String], config: Option<&Path>) {
         let changed = self.feed_session.as_deref() != session;
         if !changed && self.last_poll.is_some_and(|t| t.elapsed() < POLL) {
             return;
         }
         self.last_poll = Some(Instant::now());
+        if changed {
+            self.root = None;
+        }
         self.feed_session = session.map(str::to_string);
         let ids: Vec<&str> = session
             .into_iter()
             .chain(aliases.iter().rev().map(String::as_str))
             .collect();
         let dir = feed::feed_dir();
+        self.manager = session.is_some_and(|s| {
+            let root = &mut self.root;
+            giverny_claude::managers::is_marked(&dir, s, &ids[1..], || {
+                if root.is_none() {
+                    *root = giverny_claude::continuation::root_of(config, s);
+                }
+                root.clone()
+            })
+        });
         self.feed_now = session.and_then(|_| self.feed.poll_any(&dir, &ids).cloned());
         self.etas_now = session
             .map(|_| self.etas.poll_any(&dir, &ids).clone())
@@ -228,11 +261,19 @@ impl Views {
                 continue;
             };
             let view = self.tabs.entry(tab).or_default();
-            view.poll_feed(Some(&session), &tracker.aliases);
+            view.poll_feed(
+                Some(&session),
+                &tracker.aliases,
+                tracker.config_dir.as_deref(),
+            );
             if std::mem::take(&mut view.logs_due) {
                 poll_logs(&mut view.logs, tracker.rows());
             }
-            let due = match view.feed_now.as_ref() {
+            // Worked out from the rows the pane draws: a session with
+            // nothing drawn has nothing to be told (giverny#357).
+            let opens = feed::opens(!tracker.is_empty(), view.manager);
+            let drawn = Drawn::of(view.manager);
+            let due = match view.feed_now.as_ref().filter(|_| opens) {
                 Some(f) => {
                     let cleared = tracker.done_cleared_ms.map(|c| f.without_done_by(c));
                     let f = cleared.as_ref().unwrap_or(f);
@@ -245,7 +286,7 @@ impl Views {
                         with_ledger(f, &sessions, l)
                     });
                     let f = leased.as_ref().unwrap_or(f);
-                    due_chores(f, tracker.rows(), &view.logs, now)
+                    due_chores(drawn, f, tracker.rows(), &view.logs, now)
                 }
                 None => Vec::new(),
             };
@@ -1096,12 +1137,13 @@ pub fn build_at(
     clock: &Clock,
     logs: &Logs,
 ) -> Table {
-    build_with(feed, live, now_ms, clock, logs, DoneRows::All)
+    build_with(feed, live, now_ms, clock, logs, DoneRows::All, Drawn::Every)
 }
 
 /// [`build_at`], showing only the Done rows `done` keeps
-/// (`management_panel.done_rows`). Rows are dropped before they are formatted,
-/// so a `"` never stands for a row that is not drawn.
+/// (`management_panel.done_rows`) and the rows `drawn` keeps (giverny#357).
+/// Rows are dropped before they are formatted, so a `"` never stands for a
+/// row that is not drawn.
 pub fn build_with(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -1109,13 +1151,23 @@ pub fn build_with(
     clock: &Clock,
     logs: &Logs,
     done: DoneRows,
+    drawn: Drawn,
 ) -> Table {
-    with_rows(feed, live, logs, now_ms, |feed, mut rows| {
-        keep_done(&mut rows, done, |r| r.stage);
+    with_rows(feed, live, logs, now_ms, |feed, rows| {
+        // What a Next up row waits for is read off every row, drawn or not:
+        // the task it was planned after may have no worker yet.
+        let waits: Vec<Option<Wait>> = rows.iter().map(|r| planned_wait(r, &rows)).collect();
+        let mut kept: Vec<_> = rows
+            .into_iter()
+            .zip(waits)
+            .filter(|(r, _)| drawn.keeps(r))
+            .collect();
+        keep_done(&mut kept, done, |(r, _)| r.stage);
+        let (mut rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().unzip();
+        reditto(&mut rows);
         let written = feed.and_then(|f| f.written_ms);
         let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let wait = planned_wait(row, &rows);
+        for (row, wait) in rows.iter().zip(waits) {
             lines.push(format_row(row, now_ms, written, clock, wait));
         }
         dittos(&rows, &mut lines);
@@ -1126,10 +1178,11 @@ pub fn build_with(
     })
 }
 
-/// The pane's rows, as it draws them at `now_ms`: the feed with the
+/// The pane's rows, as it places them at `now_ms`: the feed with the
 /// hand-offs its workers' transcripts tell of, merged with the live rows,
-/// and the Running rows nobody works on moved to Next up ([`benched`]). `f`
-/// gets the feed it was merged from.
+/// and the Running rows nobody works on moved to Next up ([`benched`]):
+/// every row, drawn or not ([`Drawn`] says which are). `f` gets the feed
+/// it was merged from.
 fn with_rows<T>(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -1185,6 +1238,12 @@ fn bench(rows: &mut [PaneRow<'_, SubagentRow>], now_ms: u64) {
     }
     // Stable: a benched row was above every Next up row, and stays so.
     rows.sort_by_key(|r| r.stage);
+    reditto(rows);
+}
+
+/// Ditto again ([`PaneRow::ditto`]) where rows moved or went: a row is a
+/// ditto of the one now directly above it, the same worker's same batch.
+fn reditto(rows: &mut [PaneRow<'_, SubagentRow>]) {
     for i in 0..rows.len() {
         let same = i > 0
             && match (rows[i - 1].agent_id(), rows[i].agent_id()) {
@@ -1197,8 +1256,14 @@ fn bench(rows: &mut [PaneRow<'_, SubagentRow>], now_ms: u64) {
 
 /// The chores of [`chores`] that are due at `now_ms` and that the feed's
 /// rows were not told of yet: what the manager is to hear.
-pub fn due_chores(feed: &Feed, live: &[SubagentRow], logs: &Logs, now_ms: u64) -> Vec<Chore> {
-    chores(Some(feed), live, logs, now_ms)
+pub fn due_chores(
+    drawn: Drawn,
+    feed: &Feed,
+    live: &[SubagentRow],
+    logs: &Logs,
+    now_ms: u64,
+) -> Vec<Chore> {
+    chores(drawn, Some(feed), live, logs, now_ms)
         .into_iter()
         .filter(|c| c.is_due(now_ms))
         .filter(|c| !feed.rows.iter().any(|r| r.key == c.key && c.told(r)))
@@ -1214,10 +1279,22 @@ pub fn due_chores(feed: &Feed, live: &[SubagentRow], logs: &Logs, now_ms: u64) -
 /// same logic. Every one, due or not, told or not:
 /// [`manage_chores::Chore::is_due`] and [`manage_chores::Chore::told`] say
 /// which to keep.
-pub fn chores(feed: Option<&Feed>, live: &[SubagentRow], logs: &Logs, now_ms: u64) -> Vec<Chore> {
+///
+/// Only of the rows the pane draws (`drawn`, giverny#357): nothing drawn,
+/// nothing to nag about. A session that is no manager ([`Drawn::Agents`])
+/// never draws a row with no worker, so it never hears "no worker"; a
+/// manager still does, as its Next up draws such a row: one that ran
+/// `start` and forgot to spawn is the one it catches.
+pub fn chores(
+    drawn: Drawn,
+    feed: Option<&Feed>,
+    live: &[SubagentRow],
+    logs: &Logs,
+    now_ms: u64,
+) -> Vec<Chore> {
     with_rows(feed, live, logs, now_ms, |_, rows| {
         let mut out = Vec::new();
-        for row in &rows {
+        for row in rows.iter().filter(|r| drawn.keeps(r)) {
             let Some(key) = row.feed.map(|f| f.key.clone()) else {
                 continue;
             };
@@ -1880,7 +1957,17 @@ pub fn show(
         return (None, None);
     };
     let view = views.tabs.entry(tab).or_default();
-    view.poll_feed(tracker.session_id.as_deref(), &tracker.aliases);
+    view.poll_feed(
+        tracker.session_id.as_deref(),
+        &tracker.aliases,
+        tracker.config_dir.as_deref(),
+    );
+    // Only when subagents are involved, or for a manager (giverny#357): a
+    // feed row alone opens nothing.
+    if !feed::opens(!tracker.is_empty(), view.manager) {
+        return (None, None);
+    }
+    let drawn = Drawn::of(view.manager);
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
     // What the rows' processes use: the reading the tab's status line
@@ -1926,7 +2013,15 @@ pub fn show(
     if std::mem::take(&mut view.logs_due) {
         poll_logs(&mut view.logs, tracker.rows());
     }
-    let table = build_with(feed, tracker.rows(), now, &clock, &view.logs, panel.done());
+    let table = build_with(
+        feed,
+        tracker.rows(),
+        now,
+        &clock,
+        &view.logs,
+        panel.done(),
+        drawn,
+    );
     if table.is_empty() {
         return (None, None);
     }
@@ -2777,11 +2872,19 @@ mod tests {
     fn done_rows_are_all_none_or_the_newest_few() {
         let f = feed(DONE_FOUR);
         let keys = |done: DoneRows| -> Vec<String> {
-            build_with(Some(&f), &[], T0, &Clock::plain(), &Logs::new(), done)
-                .lines
-                .into_iter()
-                .map(|l| l.id)
-                .collect()
+            build_with(
+                Some(&f),
+                &[],
+                T0,
+                &Clock::plain(),
+                &Logs::new(),
+                done,
+                Drawn::Every,
+            )
+            .lines
+            .into_iter()
+            .map(|l| l.id)
+            .collect()
         };
         assert_eq!(
             keys(DoneRows::All),
@@ -3646,11 +3749,11 @@ mod tests {
             since: T0 - 10 * MIN,
             how: None,
         };
-        let all = chores(Some(&f), &rows, &logs, T0);
+        let all = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
         assert_eq!(all, [land, staff.clone()]);
-        assert_eq!(due_chores(&f, &rows, &logs, T0), all);
+        assert_eq!(due_chores(Drawn::Manager, &f, &rows, &logs, T0), all);
         assert_eq!(
-            due_chores(&f, &rows, &logs, T0 - 3 * MIN),
+            due_chores(Drawn::Manager, &f, &rows, &logs, T0 - 3 * MIN),
             [staff],
             "the land chore in its grace"
         );
@@ -3672,13 +3775,13 @@ mod tests {
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
         assert_eq!((got.now.as_str(), got.flag), ("stopped: failed", false));
-        let told = chores(Some(&f), &rows, &logs, T0);
+        let told = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
         assert_eq!(told[0].how.as_deref(), Some("failed"));
         // Told once: a row stamped for that end is no chore any more.
         let mut stamped = f.clone();
         stamped.rows[0].land_nudged_ms = Some(T0 - 5 * MIN);
         assert!(
-            due_chores(&stamped, &rows, &logs, T0)
+            due_chores(Drawn::Manager, &stamped, &rows, &logs, T0)
                 .iter()
                 .all(|c| c.key != "acme#615")
         );
@@ -3688,7 +3791,7 @@ mod tests {
         assert!(!got.flag, "{got:?}");
         assert!(!got.click.finished, "a working worker is walked into");
         assert!(
-            chores(Some(&f), &rows, &logs, T0)
+            chores(Drawn::Manager, Some(&f), &rows, &logs, T0)
                 .iter()
                 .all(|c| c.key != "acme#615")
         );
@@ -3729,12 +3832,12 @@ mod tests {
         };
         for at in [T0, T0 + MIN, T0 + 2 * MIN] {
             assert_eq!(
-                chores(Some(&f), &rows, &logs, at),
+                chores(Drawn::Manager, Some(&f), &rows, &logs, at),
                 [],
                 "at T0+{}m",
                 (at - T0) / MIN
             );
-            assert_eq!(due_chores(&f, &rows, &logs, at), []);
+            assert_eq!(due_chores(Drawn::Manager, &f, &rows, &logs, at), []);
             let got = row(&build_at(Some(&f), &rows, at, &Clock::plain(), &logs));
             assert_eq!(got.stage, Stage::Running);
             assert!(!got.flag, "plain while it is picked up: {got:?}");
@@ -3744,7 +3847,7 @@ mod tests {
         // its manager is told to staff it (giverny#334).
         let late = T0 + 3 * MIN;
         assert_eq!(
-            chores(Some(&f), &rows, &logs, late),
+            chores(Drawn::Manager, Some(&f), &rows, &logs, late),
             [Chore {
                 key: "acme#614".into(),
                 kind: manage_chores::Kind::Worker,
@@ -3765,7 +3868,7 @@ mod tests {
         lines.push(reply("m3", T0 + 10 * MIN, 3_000, 25_000, 900));
         let (dir, mut rows, logs) = reused_worker("332-again", &lines, false);
         rows[0].ended_ms = Some(T0 + 10 * MIN);
-        let all = chores(Some(&f), &rows, &logs, T0 + 10 * MIN);
+        let all = chores(Drawn::Manager, Some(&f), &rows, &logs, T0 + 10 * MIN);
         assert_eq!(
             all,
             [Chore {
@@ -3776,11 +3879,14 @@ mod tests {
             }]
         );
         assert_eq!(
-            due_chores(&f, &rows, &logs, T0 + 12 * MIN),
+            due_chores(Drawn::Manager, &f, &rows, &logs, T0 + 12 * MIN),
             [],
             "in its grace"
         );
-        assert_eq!(due_chores(&f, &rows, &logs, T0 + 13 * MIN), all);
+        assert_eq!(
+            due_chores(Drawn::Manager, &f, &rows, &logs, T0 + 13 * MIN),
+            all
+        );
         let got = row(&build_at(
             Some(&f),
             &rows,
@@ -3812,7 +3918,7 @@ mod tests {
             e613 = T0 - 30 * MIN,
             s614 = T0 - 2 * MIN,
         ));
-        let got = chores(Some(&f), &rows, &logs, T0);
+        let got = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].since, T0 - 5 * MIN);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3870,7 +3976,7 @@ mod tests {
         // Only the row nobody set aside is its manager's to staff, and the
         // idle Next up row is no chore for being below it.
         assert_eq!(
-            chores(Some(&f), &[], &Logs::new(), T0),
+            chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0),
             [
                 Chore {
                     key: "acme#702".into(),
@@ -3890,7 +3996,7 @@ mod tests {
         let mut stamped = f.clone();
         stamped.rows[2].worker_nudged_ms = Some(T0 - 30 * MIN);
         assert!(
-            due_chores(&stamped, &[], &Logs::new(), T0)
+            due_chores(Drawn::Manager, &stamped, &[], &Logs::new(), T0)
                 .iter()
                 .all(|c| c.key != "acme#702")
         );
@@ -3902,7 +4008,7 @@ mod tests {
         assert_eq!(at("acme#700"), Stage::Planned);
         assert_eq!(at("acme#701"), Stage::Planned);
         assert!(
-            chores(Some(&f), &[], &Logs::new(), T0 - 29 * MIN)
+            chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0 - 29 * MIN)
                 .iter()
                 .all(|c| c.kind != manage_chores::Kind::Worker)
         );
@@ -3926,7 +4032,7 @@ mod tests {
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         assert_eq!(t.lines[0].stage, Stage::Planned, "{:?}", t.lines[0]);
         assert!(t.lines[0].now.starts_with("paused since "));
-        assert_eq!(chores(Some(&f), &rows, &logs, T0), []);
+        assert_eq!(chores(Drawn::Manager, Some(&f), &rows, &logs, T0), []);
         let (dir2, mut rows, logs) = reused_worker("334-failed", &lines, false);
         rows[0].outcome = Some(Outcome::Failed);
         let mut f = f.clone();
@@ -4104,6 +4210,92 @@ mod tests {
     #[test]
     fn nothing_to_show_is_no_pane() {
         assert!(build(None, &[], T0).is_empty());
+    }
+
+    /// [`build_with`] as the pane calls it, for a session that is a
+    /// manager or not.
+    fn drawn_table(f: &Feed, live: &[SubagentRow], manager: bool) -> Table {
+        let (clock, logs) = (Clock::plain(), Logs::new());
+        let d = Drawn::of(manager);
+        build_with(Some(f), live, T0, &clock, &logs, DoneRows::All, d)
+    }
+
+    /// giverny#357, the case that prompted it: a session that is no
+    /// manager runs `giverny manage start` for its own build. Its row has
+    /// no worker behind it: nothing is drawn, and its session hears no
+    /// "no worker" chore.
+    #[test]
+    fn a_stray_start_in_a_plain_session_draws_and_nags_nothing() {
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"build","stage":"running","started":{s},"eta_s":600}},
+              {{"key":"later","stage":"planned","planned":{s},"eta_s":600}}]}}"#,
+            s = T0 - 30 * MIN,
+        ));
+        assert!(drawn_table(&f, &[], false).is_empty());
+        assert_eq!(chores(Drawn::Agents, Some(&f), &[], &Logs::new(), T0), []);
+        // A manager's own: both under Next up, and its chores.
+        let t = drawn_table(&f, &[], true);
+        let ids: Vec<_> = t.lines.iter().map(|l| (l.id.as_str(), l.stage)).collect();
+        assert_eq!(ids, [("build", Stage::Planned), ("later", Stage::Planned)]);
+        let kinds: Vec<_> = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0)
+            .into_iter()
+            .map(|c| (c.key, c.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("build".to_string(), manage_chores::Kind::Worker),
+                ("later".to_string(), manage_chores::Kind::Start),
+            ]
+        );
+    }
+
+    /// giverny#357: a real subagent is a full row in any session — its
+    /// feed row's title and ETA, the worker's clock, activity and tokens —
+    /// and a feed row with nobody behind it beside it is not drawn.
+    #[test]
+    fn a_real_worker_is_a_full_row_in_a_plain_session() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
+                "description":"Work demo#12","startTime":1789999958000,
+                "tokenCount":64100,"label":"Editing src/lib.rs"}]}"#,
+        );
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"demo#12","stage":"running","title":"FEATURE: pane","started":{s},
+                "eta_s":1800}},
+              {{"key":"stray","stage":"running","started":{s},"eta_s":600}}]}}"#,
+            s = T0 - 60_000,
+        ));
+        let t = drawn_table(&f, &rows, false);
+        assert_eq!(t.lines.len(), 1, "{:?}", t.lines);
+        let l = &t.lines[0];
+        assert_eq!((l.id.as_str(), l.stage), ("demo#12", Stage::Running));
+        assert_eq!(l.title, "FEATURE: pane");
+        assert_eq!(l.elapsed, "0:42");
+        assert_eq!(l.tokens, "64.1k");
+        assert_eq!(l.now, "Editing src/lib.rs");
+        assert!(!l.eta.is_empty() && l.eta != NO_ETA, "{:?}", l.eta);
+    }
+
+    /// giverny#357: a manager's build row — `giverny manage run` on a row
+    /// of its own, no worker behind it — shows, Running or Done.
+    #[test]
+    fn a_managers_build_row_shows_with_no_worker() {
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"integ-build","stage":"running","started":{s},"eta_s":600,
+                "usage":{{"runs":1,"peak_mb":1500,"cpu_s":60,"wall_s":60}}}},
+              {{"key":"old-build","stage":"done","started":{s},"ended":{s},
+                "usage":{{"runs":1}}}},
+              {{"key":"stray-done","stage":"done","started":{s},"ended":{s}}}]}}"#,
+            s = T0 - MIN,
+        ));
+        let t = drawn_table(&f, &[], true);
+        let ids: Vec<_> = t.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["integ-build", "old-build"]);
+        assert!(drawn_table(&f, &[], false).is_empty());
     }
 
     // ------------------------------------------------- resources ----
@@ -4621,7 +4813,7 @@ mod tests {
         // instant, due only past five minutes of it.
         let f = feed(&json);
         let idle = |now: u64| -> Vec<(String, u64)> {
-            due_chores(&f, &[], &Logs::new(), now)
+            due_chores(Drawn::Manager, &f, &[], &Logs::new(), now)
                 .into_iter()
                 // 280-reuse has no worker: its manager's to staff
                 // (giverny#334), not an idle Next up row.
@@ -4647,7 +4839,7 @@ mod tests {
                 k("287-after-done", 28),
             ]
         );
-        let line = chores(Some(&f), &[], &Logs::new(), 0)
+        let line = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), 0)
             .into_iter()
             .find(|c| c.key == "284-idle")
             .unwrap()
