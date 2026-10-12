@@ -135,9 +135,10 @@ pub struct TabView {
     cached: Option<CachedFrame>,
     had_focus: bool,
     last_motion_cell: Option<(u16, u16)>,
-    /// A press that landed on something drawn over the grid (an overlay in a
-    /// layer above it) and so was not reported; its release is not either.
-    swallowed_press: bool,
+    /// Buttons whose press landed on something drawn over the grid (an
+    /// overlay in a layer above it) and so was not reported; their releases
+    /// are not either.
+    swallowed_press: Buttons,
     /// Layers drawn over the grid that the wheel goes through, to scroll the
     /// terminal under them: [`Self::wheel_through`].
     wheel_through: Vec<egui::LayerId>,
@@ -223,7 +224,7 @@ impl Default for TabView {
             cached: None,
             had_focus: false,
             last_motion_cell: None,
-            swallowed_press: false,
+            swallowed_press: Buttons::default(),
             wheel_through: Vec::new(),
             last_blink: true,
             blink_from: None,
@@ -235,14 +236,61 @@ impl Default for TabView {
     }
 }
 
-/// Is a swallowed press still owed its release, after a frame? Only while
-/// mouse reporting is on and its release has not come: a release on a frame
-/// that did not report (Shift held, the pointer over a link) is the one it
-/// was owed, and with mouse mode off there is nothing left to hold back.
-/// Kept past that, the flag swallowed the release of the next click on the
-/// grid instead, and the program saw a button held down.
-fn still_swallowed(swallowed: bool, reported: bool, mouse_mode: bool, released: bool) -> bool {
-    swallowed && mouse_mode && (reported || !released)
+/// A set of mouse buttons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Buttons(u8);
+
+impl Buttons {
+    fn bit(button: PointerButton) -> u8 {
+        1 << button as u8
+    }
+
+    fn insert(&mut self, button: PointerButton) {
+        self.0 |= Self::bit(button);
+    }
+
+    /// Take `button` out of the set; whether it was in.
+    fn take(&mut self, button: PointerButton) -> bool {
+        let had = self.0 & Self::bit(button) != 0;
+        self.0 &= !Self::bit(button);
+        had
+    }
+
+    /// Is this press or release one the program must not see? A press on
+    /// something drawn over the grid is not, and nor is that button's
+    /// release. Another button's release is: a right click on the grid while
+    /// left is held on the bar still lets go of right.
+    fn swallows(&mut self, button: PointerButton, pressed: bool, covered: bool) -> bool {
+        if pressed {
+            if covered {
+                self.insert(button);
+            }
+            covered
+        } else {
+            self.take(button)
+        }
+    }
+}
+
+/// Which swallowed presses are still owed their release, after a frame?
+/// Only while mouse reporting is on and the release has not come: a release
+/// on a frame that did not report (Shift held, the pointer over a link) is
+/// the one it was owed, and with mouse mode off there is nothing left to
+/// hold back. Kept past that, the flag swallowed the release of the next
+/// click on the grid instead, and the program saw a button held down.
+fn still_swallowed(
+    swallowed: Buttons,
+    reported: bool,
+    mouse_mode: bool,
+    released: Buttons,
+) -> Buttons {
+    if !mouse_mode {
+        Buttons::default()
+    } else if reported {
+        swallowed
+    } else {
+        Buttons(swallowed.0 & !released.0)
+    }
 }
 
 struct CachedFrame {
@@ -311,9 +359,18 @@ impl TabView {
             self.handle_selection(ui, session, &response, rect, ppp, metrics);
         }
         let released = ui.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, EguiEvent::PointerButton { pressed: false, .. }))
+            let mut released = Buttons::default();
+            for e in &i.events {
+                if let EguiEvent::PointerButton {
+                    button,
+                    pressed: false,
+                    ..
+                } = e
+                {
+                    released.insert(*button);
+                }
+            }
+            released
         });
         self.swallowed_press = still_swallowed(
             self.swallowed_press,
@@ -654,11 +711,7 @@ impl TabView {
                         if !rect.contains(*pos) && *pressed {
                             continue;
                         }
-                        if *pressed && covered {
-                            self.swallowed_press = true;
-                            continue;
-                        }
-                        if !*pressed && std::mem::take(&mut self.swallowed_press) {
+                        if self.swallowed_press.swallows(*button, *pressed, covered) {
                             continue;
                         }
                         let Some(code) = button_code(*button) else {
@@ -1315,23 +1368,53 @@ mod blink_tests {
 
 #[cfg(test)]
 mod swallow_tests {
-    use super::still_swallowed;
+    use super::{Buttons, still_swallowed};
+    use egui::PointerButton::{Primary as Left, Secondary as Right};
+
+    fn of(buttons: &[egui::PointerButton]) -> Buttons {
+        let mut set = Buttons::default();
+        for &b in buttons {
+            set.insert(b);
+        }
+        set
+    }
 
     #[test]
     fn a_swallowed_press_is_owed_one_release_and_no_more() {
+        let none = Buttons::default();
+        let left = of(&[Left]);
         // Held, reported frames: still owed until its release comes, which
         // the reporting itself takes.
-        assert!(still_swallowed(true, true, true, false));
-        assert!(still_swallowed(true, true, true, true));
+        assert_eq!(still_swallowed(left, true, true, none), left);
+        assert_eq!(still_swallowed(left, true, true, left), left);
         // Released on a frame that did not report (Shift held): that was it.
-        assert!(!still_swallowed(true, false, true, true));
+        assert_eq!(still_swallowed(left, false, true, left), none);
         // Not reported and not released yet: still owed.
-        assert!(still_swallowed(true, false, true, false));
+        assert_eq!(still_swallowed(left, false, true, none), left);
+        // Another button let go of on such a frame: left is still owed.
+        assert_eq!(still_swallowed(left, false, true, of(&[Right])), left);
         // Mouse mode off: nothing to hold back any more.
-        assert!(!still_swallowed(true, true, false, false));
-        assert!(!still_swallowed(true, false, false, false));
+        assert_eq!(still_swallowed(left, true, false, none), none);
+        assert_eq!(still_swallowed(left, false, false, none), none);
         // Nothing swallowed stays nothing.
-        assert!(!still_swallowed(false, false, true, false));
+        assert_eq!(still_swallowed(none, false, true, left), none);
+    }
+
+    /// Left held on the bar, then a right click on the grid: the right
+    /// release is reported, and the left one still is not.
+    #[test]
+    fn a_swallowed_press_owes_only_its_own_button() {
+        let mut swallowed = Buttons::default();
+        assert!(swallowed.swallows(Left, true, true));
+        assert!(!swallowed.swallows(Right, true, false));
+        assert!(
+            !swallowed.swallows(Right, false, false),
+            "right is reported"
+        );
+        assert!(swallowed.swallows(Left, false, false), "left is not");
+        assert_eq!(swallowed, Buttons::default());
+        // A release with nothing swallowed is reported.
+        assert!(!swallowed.swallows(Left, false, true));
     }
 }
 

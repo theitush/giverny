@@ -479,8 +479,11 @@ mod tests {
         let c = ws.add_tab(cat);
         ws.close_tab(b);
         assert_eq!(ws.active, Some(c));
+        assert!(!ws.recent.contains(&b), "b left the stack");
+        assert_eq!(ws.recent_order(), vec![c, a]);
         ws.close_tab(c);
-        assert_eq!(ws.active, Some(a), "b is gone, so not b");
+        assert_eq!(ws.active, Some(a));
+        assert_eq!(ws.recent_order(), vec![a]);
     }
 
     /// The Ctrl+Tab order: where you were, not where the tab sits in the rail.
