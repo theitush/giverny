@@ -306,8 +306,8 @@ fn skip_gpus(
 /// The table under the `columns` row: `management_panel.columns.*`.
 const COLUMNS: &str = "management_panel.columns.";
 
-/// Settings → Management panel, in the order a person reads it: the pane and
-/// the skill, the columns as one row of switches (in the pane's own order,
+/// Settings → Management panel, in the order a person reads it: the pane,
+/// the skill and the names switch, the columns as one row of switches (in the pane's own order,
 /// which is `SETTINGS`'), then the default lease and the limits under their
 /// headings.
 #[allow(clippy::too_many_arguments)]
@@ -336,7 +336,9 @@ fn management_panel_page(
     draw(ui, state, actions, &|d| {
         matches!(
             d.key,
-            "claude.management_panel" | "management_panel.manage_skill"
+            "claude.management_panel"
+                | "management_panel.manage_skill"
+                | "management_panel.ask_names"
         )
     });
     let columns: Vec<&'static SettingDef> = rows

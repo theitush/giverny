@@ -583,6 +583,19 @@ pub const SETTINGS: &[SettingDef] = &[
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
+    SettingDef {
+        key: "management_panel.ask_names",
+        label: "ask sessions to name themselves",
+        section: Section::ManagementPanel,
+        doc: "Ask every Claude session in a Giverny tab to pick a first name at its start; the full name shows on its status line.",
+        note: &[
+            "Giverny draws the surname: `Opus 5.5 (Tamsin Camden)`. A session",
+            "reads its name back with `giverny-manage name`. Off, no session is",
+            "asked, managers included, and no name shows on any status line.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
     // The columns, in the order the management panel draws them: Settings shows
     // their switches in this order, and the pane's test
     // `the_settings_list_the_columns_in_the_panes_order` keeps the two in step.
@@ -1336,6 +1349,12 @@ mod tests {
         };
         let cfg = set("management_panel.manage_skill", Value::Bool(false));
         assert!(!cfg.management_panel.manage_skill);
+        assert!(
+            !config::ManagementPanelConfig::default().ask_names,
+            "absent is off"
+        );
+        let cfg = set("management_panel.ask_names", Value::Bool(true));
+        assert!(cfg.management_panel.ask_names);
         // The Done rows have no row in Settings, but a hand-written pair
         // still loads, unflagged.
         assert!(by_key("management_panel.done_rows").is_none());

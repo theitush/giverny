@@ -305,8 +305,9 @@ pub struct Feed {
     pub version: u64,
     /// The Claude session id the feed is for.
     pub session: Option<String>,
-    /// The manager's own name (`giverny manage name`): its first name is drawn
-    /// beside the model on the session's status line.
+    /// The manager's name, as `giverny manage name` wrote it before names
+    /// had their own home ([`crate::names`]); the status line still shows it
+    /// for its session while names are on.
     pub name: Option<String>,
     /// Earlier ids of the same conversation (a resume or a re-id), so a tab
     /// still holding an old id finds the feed.

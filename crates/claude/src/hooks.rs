@@ -703,18 +703,19 @@ pub fn run_statusline(spool: &Path) {
     // What Claude displays. Keep it short and useful.
     let mut parts: Vec<String> = Vec::new();
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let transcript = transcript_of(&payload);
     if let Some(model) = payload
         .get("model")
         .and_then(|m| m.get("display_name"))
         .and_then(|d| d.as_str())
     {
-        let name = session_id.and_then(|s| manager_first_name(&crate::feed::feed_dir(), s));
+        let name = session_id
+            .and_then(|s| crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref()));
         parts.push(model_segment(model, name.as_deref(), || {
             accent_sgr(&statusline_accent_path())
         }));
     }
     // No 5h or week usage here: Giverny's sidebar shows both.
-    let transcript = transcript_of(&payload);
     parts.extend(statusline_tokens(&payload, transcript.as_deref()));
     let now_ms = jiff::Timestamp::now().as_millisecond();
     parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
@@ -786,22 +787,14 @@ fn cache_cold_segment(
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
-/// The model's name, and beside it the first name of the manager this
-/// session is (`giverny manage name`, giverny#330) in the chrome's accent:
-/// `Opus 5.5 (Juniper)`. `accent` is asked only when there is a name.
+/// The model's name, and beside it the session's full name (`giverny manage
+/// name`, giverny#330, giverny#343) in the chrome's accent:
+/// `Opus 5.5 (Tamsin Camden)`. `accent` is asked only when there is a name.
 fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> String) -> String {
     match name {
         Some(name) => format!("{model} {}({name}){RESET}", accent()),
         None => model.to_string(),
     }
-}
-
-/// The first name of the manager whose feed is `session`'s own
-/// `<dir>/<session>.json`, if it named itself: one small file read, no
-/// search of the folder (the line runs every second in every tab).
-fn manager_first_name(dir: &Path, session: &str) -> Option<String> {
-    let name = crate::feed::read(&crate::feed::feed_path(dir, session))?.name?;
-    name.split_whitespace().next().map(str::to_string)
 }
 
 /// Where the app leaves its chrome's accent colour for the status line: beside
@@ -812,7 +805,7 @@ pub fn statusline_accent_path() -> PathBuf {
 }
 
 /// Record the app's accent colour (`#rrggbb`) for the status line to draw a
-/// manager's name in; the app writes it at start and on every theme change.
+/// session's name in; the app writes it at start and on every theme change.
 pub fn write_statusline_accent(path: &Path, rgb: [u8; 3]) -> std::io::Result<()> {
     let [r, g, b] = rgb;
     let tmp = path.with_extension(format!("accent.{}.tmp", std::process::id()));
@@ -2208,12 +2201,15 @@ mod tests {
         assert_eq!(msg.message(), Some("needs ok"));
     }
 
-    /// The model, then the manager's first name in the accent and a reset
-    /// (giverny#330); no name, the model alone and no accent asked for.
+    /// The model, then the session's full name in the accent and a reset
+    /// (giverny#330, giverny#343); no name, the model alone and no accent
+    /// asked for. The switch off, no name at all.
     #[test]
-    fn the_status_line_names_its_manager_beside_the_model() {
-        let dir = scratch("manager-name");
-        let dir = dir.parent().unwrap();
+    fn the_status_line_names_its_session_beside_the_model() {
+        let feeds = scratch("session-name");
+        let dir = feeds.parent().unwrap();
+        let _ = std::fs::remove_dir_all(crate::names::dir(dir));
+        // A manager named before names had their own home: its feed's name.
         std::fs::write(
             dir.join("s1.json"),
             r#"{"version":1,"session":"s1","name":"Juniper Belfry","rows":[]}"#,
@@ -2224,15 +2220,22 @@ mod tests {
             r#"{"version":1,"session":"s2","rows":[]}"#,
         )
         .unwrap();
-        assert_eq!(manager_first_name(dir, "s1").as_deref(), Some("Juniper"));
-        assert_eq!(manager_first_name(dir, "s2"), None);
-        assert_eq!(manager_first_name(dir, "s3"), None);
+        crate::names::record(dir, "s4", "Tamsin", None, || "Camden".into()).unwrap();
+        let shown = |s: &str| crate::names::shown(dir, s, None);
+        // Off (no switch file): nobody's name shows.
+        assert_eq!(shown("s1"), None);
+        assert_eq!(shown("s4"), None);
+        crate::names::set_on(dir, true).unwrap();
+        assert_eq!(shown("s1").as_deref(), Some("Juniper Belfry"));
+        assert_eq!(shown("s4").as_deref(), Some("Tamsin Camden"));
+        assert_eq!(shown("s2"), None);
+        assert_eq!(shown("s3"), None);
 
         let accent = dir.join("giverny.accent");
         write_statusline_accent(&accent, [0x84, 0xc5, 0x0a]).unwrap();
         assert_eq!(accent_sgr(&accent), "\x1b[38;2;132;197;10m");
-        let line = model_segment("Opus 5.5", Some("Juniper"), || accent_sgr(&accent));
-        assert_eq!(line, "Opus 5.5 \x1b[38;2;132;197;10m(Juniper)\x1b[0m");
+        let line = model_segment("Opus 5.5", shown("s4").as_deref(), || accent_sgr(&accent));
+        assert_eq!(line, "Opus 5.5 \x1b[38;2;132;197;10m(Tamsin Camden)\x1b[0m");
         assert_eq!(
             model_segment("Opus 5.5", None, || panic!("no name, no accent")),
             "Opus 5.5"

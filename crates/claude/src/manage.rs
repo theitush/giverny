@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use crate::worker_log::{self, WorkerLog};
-use crate::{continuation, feed, manage_history, resources, sleeps};
+use crate::{continuation, feed, manage_history, names, resources, sleeps};
 
 /// Marks the files this writer owns, so it never rewrites another's.
 pub const WRITER: &str = "giverny/manage";
@@ -61,8 +61,12 @@ usage: giverny manage <command> [args] [--session <id>]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
   drop  <task>                remove the task's row
-  name  <Name…>                this manager's name, shown over its rows in the
-                              pane (a second `name` replaces it)
+  name  [<First> | <First Last>]
+                              record this session's name: Giverny draws a
+                              surname for a first name alone (the same first
+                              name again keeps it), a full name is kept as
+                              given; prints the full name. With no name, print
+                              the one recorded (exit 1 when there is none)
   show                        print the name and the rows
   accuracy [--repo R]         how every estimator's figures fared against the
                               time really worked, older tasks against recent
@@ -138,8 +142,8 @@ pub enum Cmd {
     Hold(String),
     /// End a hold.
     Unhold(String),
-    /// The manager's own name, shown over its rows.
-    Name(String),
+    /// The session's own name (giverny#343): record it, or (`None`) print it.
+    Name(Option<String>),
     Show,
     Path,
     ClearDone,
@@ -348,10 +352,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "name" => {
             let name = pos.by_ref().collect::<Vec<_>>().join(" ");
             let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-            if name.is_empty() {
-                return Err("`name` needs the name, e.g. `giverny manage name Juniper`".into());
-            }
-            Cmd::Name(name)
+            Cmd::Name((!name.is_empty()).then_some(name))
         }
         "show" => Cmd::Show,
         "path" => Cmd::Path,
@@ -1107,14 +1108,6 @@ pub fn apply(
     now: u64,
     sleeps: &[sleeps::Span],
 ) -> Result<String, String> {
-    if let Cmd::Name(name) = cmd {
-        let obj = doc.as_object_mut().ok_or("the feed is not a JSON object")?;
-        let was = obj.insert("name".into(), json!(name));
-        return Ok(match was.as_ref().and_then(Value::as_str) {
-            Some(w) if w != name => format!("named {name} (was {w})"),
-            _ => format!("named {name}"),
-        });
-    }
     let rows = rows_mut(doc)?;
     let key = match cmd {
         Cmd::Plan(k)
@@ -1653,6 +1646,34 @@ fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
     }
 }
 
+/// `name`: record `session`'s name from `given` and print the full name, or
+/// with none print the name it has ([`names`]; a manager named before names
+/// had their own home has it on its feed).
+fn name(
+    dir: &Path,
+    session: &str,
+    given: Option<&str>,
+    cfg: Option<&Path>,
+) -> Result<String, String> {
+    match given {
+        Some(given) => {
+            let root = continuation::root_of(cfg, session);
+            names::record(dir, session, given, root.as_deref(), names::draw_surname)
+                .map(|(name, _)| name)
+        }
+        None => {
+            let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
+            let transcript = cfg.and_then(|c| crate::subagents::session_transcript(&c, session));
+            names::find(dir, session, transcript.as_deref())
+                .or_else(|| feed::find(dir, session)?.1.name)
+                .ok_or_else(|| {
+                    "no name recorded for this session: `giverny-manage name <First>` records one"
+                        .to_string()
+                })
+        }
+    }
+}
+
 /// Run one command against `dir` for `session` at `now`. The output line,
 /// or why not.
 pub fn run_in(
@@ -1677,6 +1698,10 @@ pub fn run_in_code(
 ) -> Result<(String, i32), String> {
     if session.is_empty() || session.contains(['/', '\\']) || session.starts_with('.') {
         return Err(format!("not a session id: {session:?}"));
+    }
+    // A name is the session's, not a manager's: no feed, no lease.
+    if let Cmd::Name(given) = cmd {
+        return name(dir, session, given.as_deref(), flags.claude_dir.as_deref()).map(|m| (m, 0));
     }
     adopt_continued(dir, session, flags.claude_dir.as_deref());
     let ledger = resources::ledger_path(dir);
@@ -2018,10 +2043,14 @@ fn run_feed(
         ));
     }
     match cmd {
-        Cmd::Show => Ok((
-            show(existing.as_ref().unwrap_or(&new_doc(session)), now, &sleeps),
-            Vec::new(),
-        )),
+        Cmd::Show => {
+            let mut doc = existing.unwrap_or_else(|| new_doc(session));
+            // The session's name lives beside the feed (giverny#343).
+            if let (Some(n), Some(obj)) = (names::read(dir, session), doc.as_object_mut()) {
+                obj.insert("name".into(), json!(n));
+            }
+            Ok((show(&doc, now, &sleeps), Vec::new()))
+        }
         Cmd::Clear => {
             if existing.is_some() {
                 std::fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -2894,25 +2923,37 @@ mod tests {
     }
 
     #[test]
-    fn name_is_kept_on_the_feed_and_a_second_replaces_it() {
+    fn a_name_is_the_sessions_and_makes_no_manager() {
         assert_eq!(
             parse_args(&args("name  Juniper   Belfry ")).unwrap().0,
-            Cmd::Name("Juniper Belfry".into())
+            Cmd::Name(Some("Juniper Belfry".into()))
         );
-        assert!(parse_args(&args("name")).is_err());
-        assert!(USAGE.contains("name  <Name…>"));
+        assert_eq!(parse_args(&args("name")).unwrap().0, Cmd::Name(None));
+        assert!(USAGE.contains("name  [<First> | <First Last>]"));
 
         let dir = scratch("name");
-        assert_eq!(run(&dir, "name Juniper", T0).unwrap(), "named Juniper");
-        assert_eq!(read_feed(&dir).name.as_deref(), Some("Juniper"));
-        assert_eq!(run(&dir, "show", T0).unwrap(), "Juniper\n(no rows)\n");
+        let name = |line: &str| {
+            let (cmd, mut flags) = parse_args(&args(line))?;
+            flags.claude_dir = Some(dir.join("claude"));
+            run_in(&dir, "s1", &cmd, &flags, T0)
+        };
+        assert!(name("name").is_err(), "nothing recorded yet");
+        let full = name("name Juniper").unwrap();
+        let (first, last) = full.split_once(' ').unwrap();
+        assert_eq!(first, "Juniper");
+        assert!(names::SURNAMES.contains(&last), "{full}");
+        assert_eq!(name("name").unwrap(), full, "read back");
+        assert_eq!(name("name Juniper").unwrap(), full, "the surname stands");
+        // A session that only names itself is no manager: no feed, so no
+        // rows and no name line in the pane.
+        assert!(feed::find(&dir, "s1").is_none());
+        assert!(!feed::feed_path(&dir, "s1").exists());
+        // A manager's `show` heads its rows with the name; the feed is
+        // left without one.
         run(&dir, "plan a --eta 5", T0).unwrap();
-        assert_eq!(
-            run(&dir, "name Juniper Belfry", T0).unwrap(),
-            "named Juniper Belfry (was Juniper)"
-        );
+        assert_eq!(name("name Juniper Belfry").unwrap(), "Juniper Belfry");
         let f = read_feed(&dir);
-        assert_eq!(f.name.as_deref(), Some("Juniper Belfry"));
+        assert_eq!(f.name, None);
         assert_eq!(f.rows.len(), 1, "naming leaves the rows alone");
         let shown = run(&dir, "show", T0).unwrap();
         assert!(shown.starts_with("Juniper Belfry\nplanned  a "), "{shown}");

@@ -32,6 +32,10 @@ pub struct ManagementPanelConfig {
     /// installs. Off, the plugin keeps its hook and `giverny-manage`; only
     /// the skill goes.
     pub manage_skill: bool,
+    /// Ask every session in a Giverny tab to name itself at its start, and
+    /// show the full name on its status line (giverny#343). Off by default:
+    /// no session is asked, managers included, and no name shows.
+    pub ask_names: bool,
     /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
     /// newest [`Self::done_last`]).
     pub done_rows: String,
@@ -47,6 +51,7 @@ impl Default for ManagementPanelConfig {
     fn default() -> Self {
         ManagementPanelConfig {
             manage_skill: true,
+            ask_names: false,
             done_rows: "all".into(),
             done_last: 5,
             columns: PaneColumns::default(),

@@ -1462,6 +1462,11 @@ fn manage_skill_on(cfg: &config::Config) -> bool {
     cfg.management_panel.manage_skill
 }
 
+/// Are sessions asked to name themselves (giverny#343)?
+fn names_on(cfg: &config::Config) -> bool {
+    cfg.management_panel.ask_names
+}
+
 /// Can account setup follow this config? Not when a value it reads — the
 /// `[claude]` section — is one that did not fit and was stood in for.
 fn accounts_readable(parsed: &config::Parsed) -> bool {
@@ -1494,7 +1499,12 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
-    claude.set_management_panel(management_panel_on(cfg), manage_skill_on(cfg), base);
+    claude.set_management_panel(
+        management_panel_on(cfg),
+        manage_skill_on(cfg),
+        names_on(cfg),
+        base,
+    );
 }
 
 fn bool_setting(cfg: &config::Config, key: &str) -> bool {
@@ -2245,6 +2255,7 @@ impl App {
                 self.claude.set_management_panel(
                     management_panel_on(&self.cfg),
                     manage_skill_on(&self.cfg),
+                    names_on(&self.cfg),
                     self.paths.base(),
                 );
             }
@@ -3288,10 +3299,12 @@ impl App {
         }
         if management_panel_on(&cfg) != management_panel_on(&self.cfg)
             || manage_skill_on(&cfg) != manage_skill_on(&self.cfg)
+            || names_on(&cfg) != names_on(&self.cfg)
         {
             self.claude.set_management_panel(
                 management_panel_on(&cfg),
                 manage_skill_on(&cfg),
+                names_on(&cfg),
                 self.paths.base(),
             );
             watch_sleeps(&cfg);
