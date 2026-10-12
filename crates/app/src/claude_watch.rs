@@ -1847,9 +1847,11 @@ impl ClaudeWatch {
     /// keys go and so does the directory. `skill` is
     /// `management_panel.manage_skill`: off, the plugin is written without
     /// its manage skill. `names` is `management_panel.ask_names`
-    /// (giverny#343): on (with the pane), the plugin asks each tab's session
-    /// to name itself at its start, and `<feeds>/names/on` tells the status
-    /// line to show the name; off, neither.
+    /// (giverny#343): on (with the pane), `<feeds>/names/on` tells the
+    /// plugin's hooks to ask each tab's session to name itself and the status
+    /// line to show the name; off, neither. The plugin's hooks are the same
+    /// either way, as Claude Code loads them only when a claude starts
+    /// (giverny#356).
     ///
     /// The setting is on by default, so it is not consent by itself: the
     /// keys are written only into an account that already holds our hooks
@@ -1874,7 +1876,6 @@ impl ClaudeWatch {
                 &dir,
                 &giverny_claude::plugin::exe_candidates(),
                 skill,
-                names,
             ) {
                 Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
                 Ok(false) => {}

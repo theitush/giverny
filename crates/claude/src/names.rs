@@ -19,6 +19,18 @@
 //! id (giverny#336). `<feeds>/names/on` exists while the switch is on; the
 //! app writes and removes it, and the status line and the session-start
 //! hook read it.
+//!
+//! **When a session is asked** (giverny#356). Claude Code reads a plugin's
+//! `hooks.json` once, when its process starts (and on `/reload-plugins`),
+//! never on `/clear`, a compaction or a resume, measured on 2.1.296: a claude
+//! started before the plugin gained a hook never runs it. So the plugin's
+//! `SessionStart` hook is always registered and reads the switch itself
+//! ([`session_start`]), and flipping it reaches every session started since
+//! at its next start. A session whose process predates the hook, or that
+//! started with the switch off, is asked on its next prompt instead, by the
+//! `UserPromptSubmit` hook it does run ([`first_prompt`]). Either way a
+//! session is asked once: `<feeds>/names/asked/<session>` marks the ones
+//! told.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +41,9 @@ pub const DIR: &str = "names";
 /// The switch, as a file in [`DIR`]: present while names are asked for and
 /// shown.
 const ON: &str = "on";
+/// Under [`DIR`], an empty file per session already told [`ask`], so the
+/// prompt hook's fallback ([`first_prompt`]) never asks twice.
+const ASKED: &str = "asked";
 
 /// Giverny's own surnames, drawn for a session that gives only a first name.
 pub const SURNAMES: &[&str] = &[
@@ -188,6 +203,10 @@ fn session_file(feeds: &Path, session: &str) -> Option<PathBuf> {
     safe(session).then(|| dir(feeds).join(format!("{session}.json")))
 }
 
+fn asked_file(feeds: &Path, session: &str) -> Option<PathBuf> {
+    safe(session).then(|| dir(feeds).join(ASKED).join(session))
+}
+
 fn root_file(feeds: &Path, root: &str) -> Option<PathBuf> {
     safe(root).then(|| dir(feeds).join("roots").join(format!("{root}.json")))
 }
@@ -344,32 +363,71 @@ pub fn ask(name: Option<&str>) -> String {
     }
 }
 
-/// The `SessionStart` hook's reply: [`ask`] as `additionalContext`, only with
-/// the switch `on`, only for a top-level session (`in_tab`: a Giverny tab's
-/// own, not a background job's or a nested claude's), never a subagent's.
-pub fn session_start(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
-    if !on || !in_tab || payload.get("agent_id").is_some() {
-        return None;
-    }
-    let session = payload
+/// The session a hook payload is for, as a usable id.
+fn session_of(payload: &Value) -> Option<&str> {
+    payload
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| safe(s))?;
+        .filter(|s| safe(s))
+}
+
+/// What `session` is told ([`ask`], with the name [`find`] gives it), marked
+/// as told so it is not asked again ([`ASKED`]).
+fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
     let transcript = payload
         .get("transcript_path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
     let name = find(feeds, session, transcript.as_deref());
+    if let Some(file) = asked_file(feeds, session) {
+        let _ = std::fs::create_dir_all(dir(feeds).join(ASKED));
+        let _ = std::fs::write(file, "");
+    }
+    ask(name.as_deref())
+}
+
+/// The `SessionStart` hook's reply: [`ask`] as `additionalContext`, only with
+/// the switch `on`, only for a top-level session (`in_tab`: a Giverny tab's
+/// own, not a background job's or a nested claude's), never a subagent's.
+/// Every start asks again (a `/clear` is a new session; a resume or a
+/// compaction is told its name), and is marked so the prompt hook stays
+/// quiet ([`first_prompt`]).
+pub fn session_start(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
+    if !on || !in_tab || payload.get("agent_id").is_some() {
+        return None;
+    }
+    let session = session_of(payload)?;
     Some(
         json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": ask(name.as_deref())
+                "additionalContext": tell(payload, feeds, session)
             }
         })
         .to_string(),
     )
+}
+
+/// The ask a `UserPromptSubmit` carries when the session's start did not:
+/// its claude predates the plugin's `SessionStart` hook, or the switch was
+/// off then (giverny#356). The same gates as [`session_start`], plus once per
+/// session; `in_tab` is asked only for a session not yet told, as it walks
+/// the process tree. Returns the context text, for the prompt hook's reply.
+pub fn first_prompt(
+    payload: &Value,
+    feeds: &Path,
+    on: bool,
+    in_tab: impl FnOnce() -> bool,
+) -> Option<String> {
+    if !on || payload.get("agent_id").is_some() {
+        return None;
+    }
+    let session = session_of(payload)?;
+    if asked_file(feeds, session)?.exists() || !in_tab() {
+        return None;
+    }
+    Some(tell(payload, feeds, session))
 }
 
 /// A `SessionStart` hook payload, parsed; `None` for any other event (read
@@ -509,6 +567,51 @@ mod tests {
         // The hook reads only a SessionStart payload.
         assert!(start_payload(&p.to_string()).is_some());
         assert!(start_payload(r#"{"hook_event_name":"PostToolUse"}"#).is_none());
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_session_whose_start_ran_no_hook_is_asked_on_its_next_prompt_once() {
+        // giverny#356: a claude started before the plugin carried its
+        // SessionStart hook, or with the switch off, runs only the prompt
+        // hook; that asks, once per session.
+        let feeds = scratch("first-prompt");
+        let prompt = |session: &str| {
+            json!({"session_id": session, "hook_event_name": "UserPromptSubmit",
+                   "prompt": "hi"})
+        };
+        let yes = || true;
+        let p = prompt("s1");
+        assert_eq!(first_prompt(&p, &feeds, false, yes), None, "switch off");
+        assert_eq!(
+            first_prompt(&p, &feeds, true, || false),
+            None,
+            "not a tab's own"
+        );
+        let mut sub = prompt("s1");
+        sub["agent_id"] = json!("a1");
+        assert_eq!(first_prompt(&sub, &feeds, true, yes), None, "a subagent");
+        let asked = first_prompt(&p, &feeds, true, yes).unwrap();
+        assert!(asked.contains("giverny-manage name <First>"), "{asked}");
+        assert_eq!(
+            first_prompt(&p, &feeds, true, || panic!("no walk once told")),
+            None,
+            "asked once"
+        );
+        // A session its start asked already is not asked again.
+        let start = json!({"session_id": "s2", "hook_event_name": "SessionStart",
+                           "source": "clear"});
+        assert!(session_start(&start, &feeds, true, true).is_some());
+        assert_eq!(first_prompt(&prompt("s2"), &feeds, true, yes), None);
+        // One named already is told its name, as its start would have.
+        record(&feeds, "s3", "Tamsin Camden", None, || panic!()).unwrap();
+        let told = first_prompt(&prompt("s3"), &feeds, true, yes).unwrap();
+        assert!(told.contains("Tamsin Camden"), "{told}");
+        // Off at its start, so neither asked nor marked: on later, its next
+        // prompt asks.
+        let s4 = json!({"session_id": "s4", "hook_event_name": "SessionStart"});
+        assert_eq!(session_start(&s4, &feeds, false, true), None);
+        assert!(first_prompt(&prompt("s4"), &feeds, true, yes).is_some());
         let _ = std::fs::remove_dir_all(&feeds);
     }
 }
