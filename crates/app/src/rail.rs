@@ -10,7 +10,9 @@ use giverny_core::tabs::{CategoryId, TabId};
 use giverny_term::render::bidi::egui_line;
 
 use crate::claude_watch::{ClaudeState, ClaudeWatch, Freshness};
+use crate::job_end::Ending;
 use crate::{Action, App, RenameTarget};
+use giverny_claude::jobs::End;
 use giverny_claude::use_reading::Use;
 
 const ROW_H: f32 = 40.0;
@@ -613,6 +615,32 @@ fn view_switch(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     ui.add_space(2.0);
 }
 
+const STOP_TIP: &str =
+    "stop this agent: `claude stop` — its conversation is kept, `claude attach` brings it back";
+
+/// The menu items that end a background job, for its BACKGROUND row and
+/// for the tab opened on it: stop, and delete behind a confirm.
+fn end_job_items(ui: &mut Ui, id: &str, stopping: bool, actions: &mut Vec<Action>) {
+    ui.separator();
+    if ui
+        .add_enabled(!stopping, egui::Button::new("stop agent"))
+        .on_hover_text(STOP_TIP)
+        .clicked()
+    {
+        actions.push(Action::EndJob(id.to_string(), End::Stop));
+        ui.close();
+    }
+    ui.add_enabled_ui(!stopping, |ui| {
+        ui.menu_button("delete agent…", |ui| {
+            ui.label("`claude rm`: deletes the agent and\nits worktree. It cannot be undone.");
+            if ui.button("delete").clicked() {
+                actions.push(Action::EndJob(id.to_string(), End::Delete));
+                ui.close();
+            }
+        });
+    });
+}
+
 /// Background agents, above the categories. Same grammar as tabs — spinner
 /// while working, flag when it wants you — because it is the same question.
 ///
@@ -634,7 +662,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
         .claude
         .jobs
         .iter()
-        .filter(|j| !opened(&j.id))
+        .filter(|j| !opened(&j.id) && !app.job_ends.hides(&j.id))
         .cloned()
         .collect();
     if tabs.is_empty() && jobs.is_empty() {
@@ -674,6 +702,8 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
     let turns = spin_turns(ui);
     let animate = animating(ui);
     for job in &jobs {
+        let ending = app.job_ends.get(&job.id).cloned();
+        let stopping = matches!(ending, Some(Ending::Running(_)));
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
@@ -730,12 +760,27 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
                         format!("{sub} · {detail}")
                     };
                 }
+                // Ending it outranks whatever it was doing.
+                let mut sub_color = dim;
+                match &ending {
+                    Some(Ending::Running(how)) => {
+                        sub = match how {
+                            End::Stop => "stopping…".into(),
+                            End::Delete => "deleting…".into(),
+                        };
+                    }
+                    Some(Ending::Failed(how, _)) => {
+                        sub = format!("{} failed", how.verb());
+                        sub_color = c.amber;
+                    }
+                    _ => {}
+                }
                 if !sub.is_empty() {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(egui_line(&truncate_chars(&sub, 30), None))
                                 .font(FontId::monospace(9.5))
-                                .color(dim),
+                                .color(sub_color),
                         )
                         .selectable(false),
                     );
@@ -745,6 +790,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
         if job.live && job.state == JobState::Working {
             keep_spinning(ui, resp.response.rect);
         }
+        let rect = resp.response.rect;
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -754,14 +800,55 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
         } else {
             "this agent is not running"
         };
-        let resp = resp.on_hover_text(format!(
+        let mut tip = format!(
             "{}\n{}",
             job.cwd
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             hover
-        ));
+        );
+        if let Some(Ending::Failed(how, said)) = &ending {
+            tip.push_str(&format!("\n\n{} failed: {said}", how.verb()));
+        }
+        let resp = resp.on_hover_text(tip);
+        // Stop on hover, where a tab has its close (giverny#331). Drawn
+        // after the row, so it is the one the click lands on.
+        if !stopping && ui.rect_contains_pointer(rect) {
+            let close_rect = Rect::from_min_size(
+                Pos2::new(rect.max.x - 24.0, rect.min.y + 2.0),
+                Vec2::splat(18.0),
+            );
+            let close = ui
+                .interact(
+                    close_rect,
+                    ui.id().with(("job-stop", job.id.as_str())),
+                    Sense::click(),
+                )
+                .on_hover_text(STOP_TIP);
+            ui.painter().text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::monospace(13.0),
+                if close.hovered() {
+                    Color32::from_rgb(0xd9, 0x7f, 0x70)
+                } else {
+                    dim
+                },
+            );
+            if close.clicked() {
+                actions.push(Action::EndJob(job.id.clone(), End::Stop));
+                continue;
+            }
+        }
+        resp.context_menu(|ui| {
+            if job.live && ui.button("open").clicked() {
+                actions.push(Action::AttachJob(Box::new(job.clone())));
+                ui.close();
+            }
+            end_job_items(ui, &job.id, stopping, actions);
+        });
         if resp.clicked() && job.live {
             actions.push(Action::AttachJob(Box::new(job.clone())));
         }
@@ -1308,6 +1395,18 @@ fn tab_row(
         if ui.button("close").clicked() {
             actions.push(Action::CloseTab(row.id));
             ui.close();
+        }
+        // A tab opened from BACKGROUND: closing it sends the job back
+        // there; these end it (giverny#331).
+        if let Some(job) = app
+            .ws
+            .tabs
+            .iter()
+            .find(|t| t.id == row.id)
+            .and_then(|t| t.bg_job.clone())
+        {
+            let stopping = matches!(app.job_ends.get(&job), Some(Ending::Running(_)));
+            end_job_items(ui, &job, stopping, actions);
         }
     });
 

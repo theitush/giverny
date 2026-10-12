@@ -7,6 +7,7 @@ mod claude_watch;
 mod desktop;
 mod hover_open;
 mod icon;
+mod job_end;
 mod keymap;
 mod management_live;
 mod management_panel;
@@ -949,6 +950,10 @@ pub enum Action {
     /// Attach a tab to a background agent: its directory, its account, its
     /// conversation.
     AttachJob(Box<giverny_claude::jobs::Job>),
+    /// Stop or delete a background job: `claude stop`/`claude rm` under
+    /// its account, off the UI thread. A tab showing it closes first
+    /// (giverny#331).
+    EndJob(String, giverny_claude::jobs::End),
     /// Group the rail by categories, or by repository.
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
@@ -1229,6 +1234,8 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    /// Background jobs being stopped or deleted from the rail (giverny#331).
+    pub job_ends: job_end::JobEnds,
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
@@ -1913,6 +1920,7 @@ impl App {
             update_rx,
             welcome,
             update_dismissed: false,
+            job_ends: job_end::JobEnds::default(),
             exe_mtime: update::binary_mtime(),
             update_job: None,
             update_installed: false,
@@ -2325,6 +2333,32 @@ impl App {
                 ));
                 self.focus_terminal = true;
                 self.state_dirty = true;
+            }
+            Action::EndJob(id, how) => {
+                let tab = self
+                    .ws
+                    .tabs
+                    .iter()
+                    .find(|t| t.bg_job.as_deref() == Some(id.as_str()));
+                let tab_id = tab.map(|t| t.id);
+                // The job's own account, as the scan found it; else the one
+                // its tab was opened under.
+                let Some(dir) = self
+                    .claude
+                    .job(&id)
+                    .map(|j| j.config_dir.clone())
+                    .or_else(|| tab.and_then(|t| t.claude_config_dir.clone()))
+                else {
+                    tracing::warn!("job {id}: no account to {} it under", how.verb());
+                    return;
+                };
+                // The tab only showed the job: with the job ending it has
+                // nothing left to show. Closed first, its attach goes
+                // quietly instead of reporting the job gone under it.
+                if let Some(t) = tab_id {
+                    self.apply(ctx, Action::CloseTab(t));
+                }
+                self.job_ends.start(ctx, id, dir, how);
             }
             Action::EditConfig => {
                 let editor = std::env::var("VISUAL")
@@ -4536,6 +4570,8 @@ impl App {
     /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
     /// * `wheel <lines> [<x> <y>]` — the wheel turned over a point (up when
     ///   positive), by default the terminal's top row;
+    /// * `movexy <x> <y>`, `rclickxy <x> <y>` — the pointer moved to a point
+    ///   and left there; a right click there;
     /// * `settings <section>` — the settings screen, on that section (its
     ///   rail title, `management panel`); `settings` alone closes it;
     /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
@@ -4752,6 +4788,30 @@ impl App {
                         phase: egui::TouchPhase::Move,
                         modifiers: egui::Modifiers::NONE,
                     }]);
+                }
+                // `movexy <x> <y>`: the pointer there, and left there (a
+                // hover); `rclickxy <x> <y>`: a right click there.
+                "movexy" | "rclickxy" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let [x, y] = n.as_slice() else {
+                        tracing::warn!("debug cmd: no such point {arg}");
+                        continue;
+                    };
+                    let pos = egui::pos2(*x, *y);
+                    feed(vec![egui::Event::PointerMoved(pos)]);
+                    if cmd == "rclickxy" {
+                        let button = |pressed| egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        feed(vec![button(true)]);
+                        feed(vec![button(false)]);
+                    }
                 }
                 // `shots <dir> <frames> <stride>`: photograph the window's
                 // next frames, leaving it open.
@@ -5153,6 +5213,9 @@ impl eframe::App for App {
         let effects = self
             .claude
             .tick(&shell_pids, self.ws.active, &titles, &opened);
+        let claude = &self.claude;
+        self.job_ends
+            .poll(|id| claude.job(id).is_some_and(|j| j.worth_watching()));
         // What each manager tab's rows ask of its manager, for the plugin's
         // hook to tell it (giverny#310).
         if self.cfg.claude.management_panel {

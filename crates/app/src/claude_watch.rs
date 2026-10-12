@@ -1141,6 +1141,11 @@ impl ClaudeWatch {
         })
     }
 
+    /// Job `id` as the last jobs scan found it, shown or not.
+    pub fn job(&self, id: &str) -> Option<&Job> {
+        self.all_jobs.iter().find(|j| j.id == id)
+    }
+
     /// Fold the last scan into per-tab state.
     fn merge_scan(&mut self, shell_pids: &HashMap<TabId, u32>, effects: &mut WatchEffects) {
         for tab in self.tabs.values_mut() {
