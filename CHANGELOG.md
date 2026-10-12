@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.5.0 — 2026-10-12
+
+Tab closing, the status line refresh and the prompt bar fixes are
+[@theitush](https://github.com/theitush)'s, merged from #6 to #9. The two
+macOS fixes are [@nirshabi10](https://github.com/nirshabi10)'s, merged from
+#10 and #11.
+
+- Hebrew reads right to left. A row runs in the direction of its first
+  letter, so a Hebrew answer sits against the right edge with its English
+  terms, paths and numbers in reading order, and a sentence Claude wrapped
+  keeps its direction on the next row. Clicks, selection and links land on
+  the letter under the pointer. Hebrew is drawn in Cascadia Mono's Hebrew,
+  which ships with Giverny, unless your font has its own.
+
+- The prompt bar shows only what you typed. A message from another Claude
+  session, a coordinator or a channel no longer shows as your prompt, and
+  something you pasted that opens the way those do stays in the history read
+  back from the transcript. `claude -c "go on"` now reads the earlier turns
+  back, a tab with two sessions under its shell holds the newer one instead
+  of switching every second, and a prompt that arrives while the transcript
+  is being read is neither lost nor counted twice.
+
+- Closing the active tab goes back to the tab you were on before, the one
+  Ctrl+Tab would switch to, rather than its neighbour in the rail. The tab it
+  lands on counts as seen, and closing the tab a Ctrl+Tab switch is
+  previewing goes back to where the switch started.
+
+- The status line's cold-cache warning now shows on an idle session. Giverny's
+  status line asks Claude Code to re-run it every 30 s. A `refreshInterval`
+  you set on it yourself is kept, and existing installs get it on first
+  launch.
+
+- On a Mac without the Linux fonts Giverny looks for, Claude's select prompts
+  draw their pointer, checkboxes and ticks. They drew as blank cells. Windows
+  falls back to Segoe UI Symbol for the same glyphs.
+
+- On macOS, pasting files copied in Finder types their paths, as dropping
+  them does, so Claude can attach a copied screenshot. Before, it typed the
+  file's name with no folder or extension.
+
+- A status line of yours whose command mentions giverny, like a script under
+  `~/giverny-tools/`, is no longer replaced with Giverny's at startup.
+
 ## v1.4.0 — 2026-10-10
 
 The prompt bar is [@theitush](https://github.com/theitush)'s, merged from #5.
