@@ -140,6 +140,44 @@ pub struct Peak {
     /// The window this belongs to. A different reset is a different window,
     /// and the mark starts again.
     pub resets: Option<jiff::Timestamp>,
+    /// When the reading behind the mark was taken, as far as known.
+    pub since: Sample,
+}
+
+/// When a reading was taken, as far as Giverny can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    /// The reading is no newer than this.
+    pub at: Option<jiff::Timestamp>,
+    pub how: Taken,
+}
+
+/// How much `Sample::at` can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// A push whose numbers have not been seen changing: they are no newer
+    /// than `at`, and may be from long before it.
+    Heard,
+    /// A push whose numbers were seen changing at `at`: an answer from the
+    /// API, just arrived.
+    Seen,
+    /// The on-disk cache, fetched at `at` — give or take the minutes
+    /// `/usage` can lag.
+    Cache,
+}
+
+impl Sample {
+    /// Heard, with no idea when it was taken.
+    pub fn heard() -> Sample {
+        Sample {
+            at: None,
+            how: Taken::Heard,
+        }
+    }
+
+    fn dated(&self) -> bool {
+        self.how != Taken::Heard
+    }
 }
 
 /// Where a reading falls against a high-water mark.
@@ -163,6 +201,9 @@ impl Peak {
     /// Without a reset time to go by, a number that has fallen this far below
     /// the mark is a new window rather than a source that is behind.
     const A_RESET_NOT_A_DISAGREEMENT: f64 = 25.0;
+    /// A cache fetched this recently and far below the mark says the usage
+    /// was reset.
+    const CACHE_SAYS_RESET_SECS: i64 = 15 * 60;
 
     /// Which window `read` is from, as far as this mark can tell.
     ///
@@ -193,6 +234,48 @@ impl Peak {
                 Window::Other
             }
             (_, None) => Window::Same,
+        }
+    }
+
+    /// Does `read` take over from the mark, or does the mark stand?
+    ///
+    /// Within a window usage only climbs — until the account's usage is
+    /// reset early (giverny#347): the window keeps its reset time and starts
+    /// again from zero, and every session that has not asked the API since
+    /// keeps pushing what it was answered before. So a lower number replaces
+    /// the mark only when it was seen arriving after the mark's own; a higher
+    /// one only when it is not known to be from before the mark; and a
+    /// number from an older window never does.
+    fn takes(&self, read: &Reading, sample: Sample, now: jiff::Timestamp) -> bool {
+        let mine = self.since;
+        let after_mine = mine.at.is_none_or(|m| sample.at.is_some_and(|t| t > m));
+        let far = Self::A_RESET_NOT_A_DISAGREEMENT;
+        match self.place(read, now) {
+            Window::Other => true,
+            Window::Older => false,
+            Window::Same if read.percent >= self.percent => {
+                let before_mine =
+                    matches!((sample.at, mine.at), (Some(theirs), Some(m)) if theirs <= m);
+                // A number of unknown age far above a dated one is what an
+                // idle session says after a reset, not a climb.
+                let stale = !sample.dated() && mine.dated() && read.percent >= self.percent + far;
+                !before_mine && !stale
+            }
+            Window::Same => match sample.how {
+                // A session's own numbers going down: it is how a reset looks.
+                Taken::Seen => after_mine,
+                // The cache lags by minutes, so only a fresh one far below
+                // speaks for a reset — and it is believed over numbers of
+                // unknown age whenever it was fetched.
+                Taken::Cache => {
+                    let fresh = sample.at.is_some_and(|t| {
+                        now.duration_since(t)
+                            < jiff::SignedDuration::from_secs(Self::CACHE_SAYS_RESET_SECS)
+                    });
+                    fresh && read.percent + far <= self.percent && (after_mine || !mine.dated())
+                }
+                Taken::Heard => false,
+            },
         }
     }
 }
@@ -236,6 +319,27 @@ pub struct LiveUsage {
     /// which is how a live 90% ends up with nothing next to it.
     pub five_hour_resets: Option<jiff::Timestamp>,
     pub seven_day_resets: Option<jiff::Timestamp>,
+    /// When these numbers were taken, as near as Giverny can tell: the
+    /// moment their session's numbers last changed, or, for numbers it has
+    /// not seen change, when it first heard them — they are no newer than
+    /// that. Nothing for a push that names no session.
+    pub since: Sample,
+}
+
+impl LiveUsage {
+    fn same_numbers(&self, other: &LiveUsage) -> bool {
+        (
+            self.five_hour,
+            self.seven_day,
+            self.five_hour_resets,
+            self.seven_day_resets,
+        ) == (
+            other.five_hour,
+            other.seven_day,
+            other.five_hour_resets,
+            other.seven_day_resets,
+        )
+    }
 }
 
 /// Side effects for the app to apply after a tick.
@@ -337,6 +441,12 @@ pub struct ClaudeWatch {
     /// When the hook stream was last drained: a message drained after it
     /// reached Giverny no earlier.
     hooks_drained: Instant,
+    /// Each session's last usage push, by account and session id: what an
+    /// account's `live` is chosen from ([`ClaudeWatch::apply_statusline`]).
+    pushes: HashMap<(PathBuf, String), LiveUsage>,
+    /// When this watcher began listening. A session first heard from long
+    /// after that is one that has just had its first answer.
+    listening: Instant,
     prompts_found: (
         crossbeam_channel::Sender<FoundPrompt>,
         crossbeam_channel::Receiver<FoundPrompt>,
@@ -411,6 +521,13 @@ const LEFT_ALONE: &str = "side instance (GIVERNY_NO_ACCOUNT_SETUP): account sett
 /// a statusline push, a finished refresh — updates the panel directly, so
 /// polling harder buys nothing.
 const USAGE_READ_INTERVAL: Duration = Duration::from_secs(60);
+/// Sessions heard from within this long of Giverny starting were already
+/// running: what they push is no newer than when it was heard, and may be
+/// much older. One first heard later has just been answered by the API.
+const HEARD_AT_START: Duration = Duration::from_secs(60);
+/// A session silent this long has ended; its last push is dropped. A running
+/// one pushes every second ([`hooks::STATUSLINE_REFRESH_S`]).
+const PUSH_FORGOTTEN: Duration = Duration::from_secs(300);
 /// How often the cache files are checked for having been rewritten.
 const CACHE_STAT_INTERVAL: Duration = Duration::from_secs(2);
 /// How often accounts are looked for again while none inside WSL is known.
@@ -656,6 +773,8 @@ impl ClaudeWatch {
             prompts_asked: HashMap::new(),
             reads_asked: 0,
             hooks_drained: Instant::now(),
+            pushes: HashMap::new(),
+            listening: Instant::now(),
             prompts_found: crossbeam_channel::unbounded(),
         };
         // Before any tab is restored: a tab holding a running job's
@@ -1294,17 +1413,24 @@ impl ClaudeWatch {
     }
 
     /// A statusline push: official `rate_limits` for one account.
+    ///
+    /// Every running `claude` pushes what *its own* last request was answered
+    /// with, so the account's sessions disagree whenever one has been idle —
+    /// and after an early reset they disagree by the whole window
+    /// (giverny#347). Each session's push is kept, dated by when its numbers
+    /// were seen to change, and the account shows the freshest.
     fn apply_statusline(&mut self, msg: &RelayMsg) {
         let window =
             |key: &str| -> Option<&serde_json::Value> { msg.event.get("rate_limits")?.get(key) };
         let pct = |key: &str| -> Option<f64> { window(key)?.get("used_percentage")?.as_f64() };
         let resets = |key: &str| -> Option<jiff::Timestamp> { reset_time(window(key)?) };
-        let live = LiveUsage {
+        let mut live = LiveUsage {
             at: Instant::now(),
             five_hour: pct("five_hour"),
             seven_day: pct("seven_day"),
             five_hour_resets: resets("five_hour"),
             seven_day_resets: resets("seven_day"),
+            since: Sample::heard(),
         };
         if live.five_hour.is_none() && live.seven_day.is_none() {
             return;
@@ -1314,13 +1440,52 @@ impl ClaudeWatch {
             .canonical_dir(msg.config_dir.as_deref())
             .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
         let Some(dir) = dir else { return };
-        if let Some(acc) = self
+        let Some(acc) = self
             .accounts
             .iter_mut()
             .find(|a| a.profile.config_dir == dir)
-        {
-            acc.live = Some(live);
+        else {
+            return;
+        };
+        let session = msg
+            .event
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !session.is_empty() {
+            let now = jiff::Timestamp::now();
+            live.since = match self.pushes.get(&(dir.clone(), session.clone())) {
+                Some(prev) if prev.same_numbers(&live) => prev.since,
+                Some(_) => Sample {
+                    at: Some(now),
+                    how: Taken::Seen,
+                },
+                // A session already running when Giverny started may be
+                // holding numbers from hours ago; one that turns up later
+                // has just had its first answer.
+                None => Sample {
+                    at: Some(now),
+                    how: if self.listening.elapsed() < HEARD_AT_START {
+                        Taken::Heard
+                    } else {
+                        Taken::Seen
+                    },
+                },
+            };
         }
+        self.pushes.insert((dir.clone(), session), live);
+        self.pushes.retain(|_, p| p.at.elapsed() < PUSH_FORGOTTEN);
+        // The freshest numbers, said to be as live as the latest push.
+        let mine = self.pushes.iter().filter(|((d, _), _)| *d == dir);
+        let last_heard = mine.clone().map(|(_, p)| p.at).max();
+        acc.live = mine
+            .map(|(_, p)| p)
+            .max_by_key(|p| (p.since.how == Taken::Seen, p.since.at, p.at))
+            .map(|p| LiveUsage {
+                at: last_heard.unwrap_or(p.at),
+                ..p.clone()
+            });
     }
 
     /// Watch the cache files for being rewritten, off the UI thread.
@@ -1361,34 +1526,84 @@ impl ClaudeWatch {
             });
     }
 
-    /// Keep each window's high-water mark up to date.
+    /// Keep each window's high-water mark up to date ([`Peak::takes`]).
     ///
-    /// A reading from the window the mark is for can only raise it; one from
-    /// a later window replaces it; one that belongs to no window the mark can
-    /// place is let in only if it has not fallen tens of points below the mark.
+    /// The cache is heard as well as the push it is usually behind: after an
+    /// early reset, a fresh cache may be the first to know.
     fn remember_peaks(&mut self) {
         let now = jiff::Timestamp::now();
         for acc in &mut self.accounts {
             let Some(usage) = &acc.usage else { continue };
             for limit in &usage.limits {
                 let read = Self::sampled(acc, limit, now);
-                let peak = acc.peak.entry(limit.kind.clone()).or_insert(Peak {
-                    percent: read.percent,
-                    resets: read.resets,
-                });
-                match peak.place(&read, now) {
-                    Window::Same => peak.percent = peak.percent.max(read.percent),
-                    // The mark's window is the current one; this number is
-                    // from before it.
-                    Window::Older => {}
-                    Window::Other => {
-                        *peak = Peak {
-                            percent: read.percent,
-                            resets: read.resets,
-                        }
+                let cache = Self::cached(acc, limit, now);
+                for (read, sample) in cache
+                    .into_iter()
+                    .chain([(read, Self::sample_of(acc, &read))])
+                {
+                    let peak = acc.peak.entry(limit.kind.clone()).or_insert(Peak {
+                        percent: read.percent,
+                        resets: read.resets,
+                        since: sample,
+                    });
+                    if !peak.takes(&read, sample, now) {
+                        continue;
                     }
+                    let climb =
+                        peak.place(&read, now) == Window::Same && read.percent >= peak.percent;
+                    *peak = Peak {
+                        percent: read.percent,
+                        // A climb is the mark's own window, however spelt.
+                        resets: if climb {
+                            peak.resets.or(read.resets)
+                        } else {
+                            read.resets
+                        },
+                        // A climb on a number of unknown age keeps the date
+                        // the mark had: it says nothing about when.
+                        since: if climb && !sample.dated() && peak.since.dated() {
+                            peak.since
+                        } else {
+                            sample
+                        },
+                    };
                 }
             }
+        }
+    }
+
+    /// The cache's own reading of a window it still describes.
+    fn cached(
+        acc: &AccountPanel,
+        limit: &giverny_claude::usage::LimitEntry,
+        now: jiff::Timestamp,
+    ) -> Option<(Reading, Sample)> {
+        let usage = acc.usage.as_ref()?;
+        let resets = limit.resets_at_ts().filter(|at| *at > now)?;
+        let percent = limit.effective_percent(now);
+        Some((
+            Reading {
+                percent,
+                live: false,
+                critical: percent >= 95.0 || limit.critical(),
+                resets: Some(resets),
+            },
+            Sample {
+                at: jiff::Timestamp::from_millisecond(usage.fetched_at_ms as i64).ok(),
+                how: Taken::Cache,
+            },
+        ))
+    }
+
+    /// When the reading [`ClaudeWatch::sampled`] gave was taken.
+    fn sample_of(acc: &AccountPanel, read: &Reading) -> Sample {
+        match (&acc.live, &acc.usage) {
+            (Some(live), _) if read.live => live.since,
+            (_, Some(usage)) => Sample {
+                at: jiff::Timestamp::from_millisecond(usage.fetched_at_ms as i64).ok(),
+                how: Taken::Cache,
+            },
+            _ => Sample::heard(),
         }
     }
 
@@ -1770,10 +1985,9 @@ impl ClaudeWatch {
         }
     }
 
-    /// What one bar should show: the statusline push where it is fresher than
-    /// the on-disk cache, the cache otherwise.
-    /// What one bar shows: the freshest sample, never lower than this window
-    /// has already been seen to reach.
+    /// What one bar shows: the freshest sample, unless the window's mark
+    /// stands against it ([`Peak::takes`]) — a number behind the mark, of
+    /// unknown age, or from an older window.
     pub fn reading(
         acc: &AccountPanel,
         limit: &giverny_claude::usage::LimitEntry,
@@ -1781,11 +1995,13 @@ impl ClaudeWatch {
     ) -> Reading {
         let mut read = Self::sampled(acc, limit, now);
         if let Some(peak) = acc.peak.get(&limit.kind)
-            && peak.place(&read, now) != Window::Other
-            && peak.percent > read.percent
+            && !peak.takes(&read, Self::sample_of(acc, &read), now)
         {
+            // Below the mark in its own window, the reading's severity still
+            // counts; a stale or older-window one says nothing at all.
+            let behind = peak.place(&read, now) == Window::Same && read.percent <= peak.percent;
+            read.critical = peak.percent >= 95.0 || (behind && read.critical);
             read.percent = peak.percent;
-            read.critical = read.critical || peak.percent >= 95.0;
             read.resets = peak.resets.or(read.resets);
         }
         read
@@ -1988,6 +2204,8 @@ impl ClaudeWatch {
             prompts_asked: HashMap::new(),
             reads_asked: 0,
             hooks_drained: Instant::now(),
+            pushes: HashMap::new(),
+            listening: Instant::now(),
             prompts_found: crossbeam_channel::unbounded(),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             attempted: Arc::new(Mutex::new(HashMap::new())),
@@ -3183,6 +3401,7 @@ mod tests {
                 seven_day: None,
                 five_hour_resets: None,
                 seven_day_resets: None,
+                since: Sample::heard(),
             }),
             peak: HashMap::new(),
             statusline_on: true,
@@ -3240,6 +3459,7 @@ mod tests {
                 seven_day: Some(40.0),
                 five_hour_resets: Some(at(35)),
                 seven_day_resets: None,
+                since: Sample::heard(),
             }),
         )];
         assert_eq!(w.window_reopens(Some("a")), Some(at(35)));
@@ -3312,6 +3532,7 @@ mod tests {
                     seven_day: None,
                     five_hour_resets: Some(resets),
                     seven_day_resets: None,
+                    since: Sample::heard(),
                 }),
                 peak: HashMap::new(),
                 statusline_on: true,
@@ -3429,6 +3650,7 @@ mod tests {
             Peak {
                 percent: 75.0,
                 resets: Some(resets),
+                since: Sample::heard(),
             },
         );
         let fresh: LimitEntry = serde_json::from_str(&format!(
@@ -3443,6 +3665,245 @@ mod tests {
         });
         w.remember_peaks();
         assert_eq!(shown(&w), 3.0);
+    }
+
+    /// One account as giverny#347 found it: its cache, and what each of its
+    /// sessions' status lines relays, in Claude Code's own payload shape.
+    struct Reset347 {
+        w: ClaudeWatch,
+        now: jiff::Timestamp,
+        /// The five-hour window before the reset, and the one after it.
+        old_5h: jiff::Timestamp,
+        new_5h: jiff::Timestamp,
+        /// The week: a reset leaves its reset time where it was.
+        week: jiff::Timestamp,
+    }
+
+    impl Reset347 {
+        const DIR: &str = "/tmp/giverny-test-347";
+
+        /// `cache`: (5h %, 7d %, minutes since `/usage` fetched it), the 5h
+        /// window being the pre-reset one.
+        fn new(session: u32, weekly: u32, cache_age_min: i64) -> Self {
+            use giverny_claude::usage::AccountUsage;
+            let now = jiff::Timestamp::now();
+            let at = |mins: i64| jiff::Timestamp::from_second(now.as_second() + mins * 60).unwrap();
+            let mut t = Reset347 {
+                w: ClaudeWatch::for_tests(),
+                now,
+                old_5h: at(40),
+                new_5h: at(5 * 60 - 5),
+                week: at(3 * 24 * 60),
+            };
+            t.w.accounts.push(AccountPanel {
+                profile: Profile {
+                    name: "acct".into(),
+                    config_dir: PathBuf::from(Self::DIR),
+                    email: None,
+                    account_uuid: None,
+                },
+                usage: Some(AccountUsage {
+                    fetched_at_ms: (now.as_millisecond() - cache_age_min * 60_000) as u64,
+                    limits: vec![],
+                }),
+                live: None,
+                peak: HashMap::new(),
+                statusline_on: true,
+            });
+            t.cache(session, t.old_5h, weekly, cache_age_min);
+            t
+        }
+
+        /// `/usage` writes the cache, as `cachedUsageUtilization` turns into
+        /// limits — the week's reset spelt with microseconds, as it does.
+        fn cache(&mut self, session: u32, five: jiff::Timestamp, weekly: u32, age_min: i64) {
+            use giverny_claude::usage::{AccountUsage, LimitEntry};
+            let week = self.week + jiff::SignedDuration::from_micros(790_221);
+            let limit = |kind: &str, percent: u32, resets: jiff::Timestamp| -> LimitEntry {
+                serde_json::from_str(&format!(
+                    r#"{{"kind":"{kind}","percent":{percent},"severity":"normal",
+                         "is_active":true,"resets_at":"{resets}"}}"#
+                ))
+                .unwrap()
+            };
+            self.w.accounts[0].usage = Some(AccountUsage {
+                fetched_at_ms: (self.now.as_millisecond() - age_min * 60_000) as u64,
+                limits: vec![
+                    limit("session", session, five),
+                    limit("weekly_all", weekly, week),
+                ],
+            });
+        }
+
+        /// One status line refresh from `session`, then a tick's marks.
+        fn push(&mut self, session: &str, five: (u32, jiff::Timestamp), weekly: u32) {
+            let m = msg(&format!(
+                r#"{{"tab_id":"giverny-7","config_dir":"{}",
+                    "event":{{"hook_event_name":"GivernyStatusLine","session_id":"{session}",
+                             "rate_limits":{{"five_hour":{{"used_percentage":{},"resets_at":{}}},
+                                            "seven_day":{{"used_percentage":{weekly},"resets_at":{}}}}}}}}}"#,
+                Self::DIR,
+                five.0,
+                five.1.as_second(),
+                self.week.as_second(),
+            ));
+            feed(&mut self.w, &m, Some(TAB));
+        }
+
+        /// What the two bars show, before and after the tick's marks: both
+        /// are drawn.
+        fn shown(&mut self) -> [(f64, f64); 2] {
+            let read = |w: &ClaudeWatch| {
+                let acc = &w.accounts[0];
+                let limits = &acc.usage.as_ref().unwrap().limits;
+                (
+                    ClaudeWatch::reading(acc, &limits[0], jiff::Timestamp::now()).percent,
+                    ClaudeWatch::reading(acc, &limits[1], jiff::Timestamp::now()).percent,
+                )
+            };
+            let before = read(&self.w);
+            self.w.remember_peaks();
+            [before, read(&self.w)]
+        }
+    }
+
+    /// giverny#347: ita's usage was reset early. The five-hour window started
+    /// again with a new reset time; the week kept its reset time and went
+    /// from 99% to 0. Every session that had not asked the API since kept
+    /// relaying its pre-reset numbers every second, between the ones that
+    /// had — the bars jumped, and the week, whose mark only ever climbed,
+    /// stuck at 99.
+    #[test]
+    fn an_early_reset_sticks_however_many_idle_sessions_remember_before() {
+        // Before the reset: two sessions, the cache saying the same.
+        let mut t = Reset347::new(60, 99, 10);
+        let old = t.old_5h;
+        for _ in 0..3 {
+            t.push("idle", (60, old), 99);
+            t.push("busy", (60, old), 99);
+        }
+        assert_eq!(t.shown(), [(60.0, 99.0); 2]);
+
+        // The reset. The busy session's next answer says so.
+        let new = t.new_5h;
+        t.push("busy", (2, new), 0);
+        assert_eq!(t.shown(), [(2.0, 0.0); 2]);
+
+        // The idle one keeps saying 60 and 99, between the busy one's
+        // refreshes, and the cache still holds what it fetched before.
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            t.push("idle", (60, old), 99);
+            seen.extend(t.shown());
+            t.push("busy", (2, new), 0);
+            seen.extend(t.shown());
+        }
+        assert!(seen.iter().all(|&s| s == (2.0, 0.0)), "jumped: {seen:?}");
+
+        // The same windows still climb.
+        t.push("busy", (3, new), 1);
+        t.push("idle", (60, old), 99);
+        assert_eq!(t.shown(), [(3.0, 1.0); 2]);
+
+        // The session that answered first ends. The idle one is all that is
+        // left pushing, and its numbers are still from before.
+        t.w.pushes.retain(|(_, s), _| s != "busy");
+        t.push("idle", (60, old), 99);
+        assert_eq!(t.shown(), [(3.0, 1.0); 2]);
+
+        // Once it is asked something, it is current again and agrees.
+        t.push("idle", (4, new), 1);
+        assert_eq!(t.shown(), [(4.0, 1.0); 2]);
+    }
+
+    /// Giverny started after the reset: every session's numbers are of
+    /// unknown age, and the stale ones are the highest. The cache, fetched
+    /// since the reset, is what says which are current.
+    #[test]
+    fn after_a_reset_a_fresh_cache_outweighs_sessions_of_unknown_age() {
+        let mut t = Reset347::new(0, 0, 0);
+        let (old, new) = (t.old_5h, t.new_5h);
+        t.cache(2, new, 0, 1);
+        // Ticks ran before the first push arrived.
+        t.w.remember_peaks();
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            t.push("fresh", (2, new), 3);
+            seen.extend(t.shown());
+            // Heard last, so the freshest-looking of the two.
+            t.push("idle", (60, old), 99);
+            seen.extend(t.shown());
+        }
+        // Never the stale 99; the fresh session's 3 is let in, and holds.
+        assert!(
+            seen.iter().all(|&(_, week)| week == 0.0 || week == 3.0),
+            "went stale: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|p| p[1].1 >= p[0].1),
+            "walked back: {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&(2.0, 3.0)));
+    }
+
+    /// The mark's rules one reading at a time, on the numbers of #347.
+    #[test]
+    fn a_window_mark_takes_what_is_newer_and_nothing_older() {
+        let now = jiff::Timestamp::now();
+        let at = |mins: i64| now + jiff::Span::new().minutes(mins);
+        let read = |percent: f64, resets: jiff::Timestamp| Reading {
+            percent,
+            live: true,
+            critical: false,
+            resets: Some(resets),
+        };
+        let seen = |mins: i64| Sample {
+            at: Some(at(mins)),
+            how: Taken::Seen,
+        };
+        let heard = |mins: i64| Sample {
+            at: Some(at(mins)),
+            how: Taken::Heard,
+        };
+        let (old_5h, new_5h) = (at(40), at(295));
+        let mark = Peak {
+            percent: 2.0,
+            resets: Some(new_5h),
+            since: seen(-1),
+        };
+        // A reading from the window before never moves the mark, however
+        // it was taken.
+        assert!(!mark.takes(&read(60.0, old_5h), seen(0), now));
+        assert!(!mark.takes(&read(60.0, old_5h), heard(0), now));
+        // The same window: a climb is taken, a newer answer below the mark
+        // too (a reset), a number heard before the mark was set is not.
+        assert!(mark.takes(&read(5.0, new_5h), seen(0), now));
+        assert!(mark.takes(&read(5.0, new_5h), heard(0), now));
+        assert!(!mark.takes(&read(5.0, new_5h), heard(-2), now));
+        let week = Peak {
+            percent: 99.0,
+            resets: Some(at(4_000)),
+            since: seen(-30),
+        };
+        assert!(week.takes(&read(0.0, at(4_000)), seen(0), now));
+        assert!(!week.takes(&read(0.0, at(4_000)), heard(0), now));
+        assert!(!week.takes(&read(0.0, at(4_000)), seen(-40), now));
+        // A cache far below speaks for a reset only while it is fresh.
+        let cache = |mins: i64| Sample {
+            at: Some(at(mins)),
+            how: Taken::Cache,
+        };
+        assert!(week.takes(&read(0.0, at(4_000)), cache(-1), now));
+        assert!(!week.takes(&read(0.0, at(4_000)), cache(-60), now));
+        assert!(!week.takes(&read(90.0, at(4_000)), cache(-1), now));
+        // The window rolling over is a new window.
+        assert!(mark.takes(&read(1.0, at(600)), heard(0), now));
+        let lapsed = Peak {
+            percent: 99.0,
+            resets: Some(at(-1)),
+            since: seen(-30),
+        };
+        assert!(lapsed.takes(&read(0.0, at(4_000)), heard(0), now));
     }
 
     /// An account whose cache has stopped being refreshed, which is every
@@ -3481,6 +3942,7 @@ mod tests {
             seven_day: Some(percent),
             five_hour_resets: None,
             seven_day_resets: resets.map(at),
+            since: Sample::heard(),
         };
 
         // The bar ita saw red at 21%: the percentage was the push's, the
