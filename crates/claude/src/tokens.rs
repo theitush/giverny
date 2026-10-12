@@ -147,14 +147,48 @@ pub struct LastReply {
     pub at_ms: i64,
     /// `None` when the reply wrote nothing to the cache, so its TTL is unknown.
     pub ttl_ms: Option<i64>,
-    pub recache: u64,
+    /// `None` right after a compaction that does not say what it kept.
+    pub recache: Option<u64>,
 }
 
 /// The last main-conversation reply in a transcript, read from its tail.
+///
+/// A compaction after it stands in for it: the compaction
+/// request was the last to touch the cache, at the boundary's time, and what
+/// the next request re-caches is the compacted context
+/// ([`after_compaction`]), not the reply's. Its TTL is the reply's.
 pub fn last_reply(path: &Path) -> Option<LastReply> {
-    tail_find(path, |buf| {
-        buf.split(|&c| c == b'\n').rev().find_map(reply_of)
-    })
+    let (mut last, compacted) = tail_find(path, |buf| {
+        let mut boundary = None;
+        for line in buf.split(|&c| c == b'\n').rev() {
+            if boundary.is_none()
+                && let Some(b) = boundary_at(line)
+            {
+                boundary = Some(b);
+            } else if let Some(reply) = reply_of(line) {
+                return Some((reply, boundary));
+            }
+        }
+        None
+    })?;
+    if let Some((at_ms, post)) = compacted {
+        last.at_ms = at_ms;
+        last.recache = post.map(|p| p + first_tokens(path).unwrap_or(0));
+    }
+    Some(last)
+}
+
+/// A `compact_boundary` line's time and `postTokens`.
+fn boundary_at(line: &[u8]) -> Option<(i64, Option<u64>)> {
+    let post = boundary_field(line, "postTokens")?;
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let at_ms = v
+        .get("timestamp")?
+        .as_str()?
+        .parse::<jiff::Timestamp>()
+        .ok()?
+        .as_millisecond();
+    Some((at_ms, post))
 }
 
 fn reply_of(line: &[u8]) -> Option<LastReply> {
@@ -196,7 +230,7 @@ fn reply_of(line: &[u8]) -> Option<LastReply> {
     Some(LastReply {
         at_ms,
         ttl_ms,
-        recache: a + b + c + output,
+        recache: Some(a + b + c + output),
     })
 }
 
@@ -1023,7 +1057,7 @@ mod tests {
             Some(LastReply {
                 at_ms: at,
                 ttl_ms: Some(3_600_000),
-                recache: 91_502
+                recache: Some(91_502)
             })
         );
         // A reply that wrote nothing to the cache leaves the TTL unknown.
@@ -1038,6 +1072,64 @@ mod tests {
         .unwrap();
         assert_eq!(last_reply(&t).map(|r| r.ttl_ms), Some(None));
         assert_eq!(last_reply(&d.join("missing.jsonl")), None);
+    }
+
+    #[test]
+    fn a_compaction_after_the_last_reply_stands_in_for_it() {
+        let d = tmpdir("last-reply-compact");
+        let t = d.join("s.jsonl");
+        let reply = |at: &str, usage: Value| {
+            json!({"type": "assistant", "timestamp": at,
+                "message": {"role": "assistant", "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "hi"}], "usage": usage}})
+            .to_string()
+        };
+        let compaction = |post: Option<u64>| {
+            let mut b: Value = serde_json::from_str(&boundary(Some(306_000))).unwrap();
+            b["timestamp"] = json!("2026-10-06T11:30:00Z");
+            match post {
+                Some(n) => b["compactMetadata"]["postTokens"] = json!(n),
+                None => {
+                    b["compactMetadata"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("postTokens");
+                }
+            }
+            let lines = [
+                // The session's first reply: system prompt, tools, memory.
+                reply(
+                    "2026-10-06T09:00:00Z",
+                    json!({"cache_creation_input_tokens": 41_000}),
+                ),
+                reply(
+                    "2026-10-06T11:00:00Z",
+                    json!({"input_tokens": 2, "cache_read_input_tokens": 305_000,
+                        "output_tokens": 500, "cache_creation_input_tokens": 1000,
+                        "cache_creation": {"ephemeral_1h_input_tokens": 1000}}),
+                ),
+                b.to_string(),
+                json!({"type": "user", "isCompactSummary": true}).to_string(),
+            ];
+            std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+            last_reply(&t)
+        };
+        let at = "2026-10-06T11:30:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        // Cold an hour after the compaction, and the next message re-caches
+        // the compacted context, not the 306k before it.
+        assert_eq!(
+            compaction(Some(7604)),
+            Some(LastReply {
+                at_ms: at,
+                ttl_ms: Some(3_600_000),
+                recache: Some(7604 + 41_000)
+            })
+        );
+        // A boundary that does not say what it kept leaves the figure unknown.
+        assert_eq!(compaction(None).map(|r| r.recache), Some(None));
     }
 
     #[test]
