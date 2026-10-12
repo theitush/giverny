@@ -11,13 +11,13 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `font.size` | `13.0` | Point size of the terminal grid. |
 | `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin, catppuccin-mauve, rouen, phosphor, abyss, synthwave, workbench, riso. |
 | `window.opacity` | `1.0` | How solid the window's background is; below 1.0 the desktop shows through. Takes effect on restart. |
+| `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
+| `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
+| `titles.strip_claude_glyph` | `false` | Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner). |
 | `rail.animate` | `true` | Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse. |
 | `rail.calm_busy` | `false` | A working tab breathes a slow dot in its colour instead of spinning. |
 | `rail.tab_figures` | `true` | Each tab's CPU and memory in the rail, and a collapsed group's sum. |
 | `rail.total_line` | `true` | The summed CPU and memory line under the account bars. |
-| `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
-| `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
-| `titles.strip_claude_glyph` | `false` | Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner). |
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
 | `behavior.history_per_tab` | `false` | Each tab's shell keeps its own history, back when the tab is restored. |
 | `behavior.history_also_shared` | `false` | With history per terminal, also append each command to the usual history (bash). |
