@@ -680,7 +680,9 @@ impl ClaudeWatch {
                 entry.state = ClaudeState::Busy;
                 // The hook fires for every turn, also the ones Claude Code or
                 // another agent sends (a finished background task, a
-                // subagent's hand-back): those are work, not prompts.
+                // subagent's hand-back, another session's message): those
+                // are work, not prompts. Its payload names no sender, so they
+                // are known by their text.
                 // A paste is spelled as the transcript has it once its tags
                 // are off, so a read of it meets this one.
                 if let Some(prompt) = msg
@@ -1708,6 +1710,15 @@ mod tests {
             "3 background agents were stopped by the user: \"giverny#21 drop pane total row\"",
             "Your claude.ai usage limit has reset. Continue the task you were working on.",
             "The pass-spike plugin sent a message:\npass-spike: worker t3 asks for a decision.",
+            // Another session's message, as Claude Code 2.1.296
+            // queued it and as it rendered it into the turn.
+            include_str!("../../claude/testdata/peer-message-prompt.txt"),
+            include_str!("../../claude/testdata/peer-message-rendered.txt"),
+            // The hook can't tell these from typed ones; the transcript can,
+            // and a later read brings them back.
+            "<channel>\n<title>Giverny releases</title>\n</channel>\n\nwhy is this feed empty?",
+            "<system-reminder id=\"7abcbf89088787d4\">\nhi\n</system-reminder id=\"7abcbf89088787d4\">",
+            "The coordinator sent a message: how does the prompt bar know that's not me?",
         ] {
             feed(&mut w, &submit(injected), Some(TAB));
             assert_eq!(w.state_of(TAB), ClaudeState::Busy, "still work: {injected}");
