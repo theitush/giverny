@@ -43,6 +43,13 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "Noto Sans Arabic",
     "DejaVu Sans Mono",
     "DejaVu Sans",
+    // Every name above is a Linux one. On a Mac with none of them the
+    // primary resolves to fontdb's generic monospace, Courier New, which has
+    // no ❯, ☐ or ✔, so Claude Code's pointer and checkboxes drew as blanks.
+    // Menlo ships with macOS and covers them; Segoe UI Symbol is Windows'.
+    "Menlo",
+    "Apple Symbols",
+    "Segoe UI Symbol",
 ];
 
 /// Hebrew comes with Giverny: Cascadia Mono's, drawn by Liron Lavi Turkenich
@@ -410,6 +417,17 @@ mod tests {
 
     fn set() -> FontSet {
         FontSet::load(None).expect("system should have a monospace font")
+    }
+
+    /// Claude Code's select prompts: the pointer, and the checkboxes and
+    /// tick of a multi-select. Stock macOS, with none of the Linux faces.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn claude_prompt_symbols_resolve() {
+        let s = set();
+        for ch in ['❯', '☐', '☒', '✔'] {
+            assert!(s.resolve(ch, false, false).is_some(), "{ch} has no face");
+        }
     }
 
     #[test]
