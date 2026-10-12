@@ -10,6 +10,14 @@
 //! worker yet`); the manager session that owns them hears of each once, as
 //! one line on its next tool call.
 //!
+//! **Only of drawn rows** (giverny#357). The chores come from the rows the
+//! pane draws, and a session that is no manager draws only rows a real
+//! subagent stands behind: a stray `start` of its own is no row, so it never
+//! hears "no worker", which would push it to spawn workers nobody asked
+//! for. A manager ([`crate::managers`]) still does: its Next up draws the
+//! row, and the chore catches a manager that started a task and forgot to
+//! spawn.
+//!
 //! **Who knows what.** Only the app sees Claude Code's live worker list (the
 //! relayed `subagentStatusLine`), so only the app can tell a finished worker
 //! from a busy one. It runs the panel's own row logic over every manager
