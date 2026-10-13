@@ -1,41 +1,19 @@
-//! What the whole Claude Code session uses right now, for the status line:
-//! CPU as a share of the machine, memory, and GPU memory when the machine
-//! has an NVIDIA GPU.
+//! What a tree of processes uses, one process at a time: the pieces the
+//! app's one reading ([`crate::use_reading`]) is taken with — `/proc`'s
+//! table ([`proc_table`], [`parse_stat`]), a process and everything below
+//! it ([`subtree`]), CPU as a share of the machine ([`cpu_pct`]), memory as
+//! the proportional set ([`with_real_memory`]), GPU memory from
+//! `nvidia-smi` ([`gpu`]) — and the figures as the management panel and the
+//! sidebar print them ([`gb`], [`cpu8`]).
 //!
-//! The session is the `claude` process the status line command runs under
-//! and every process below it: its Bash commands, their builds, `giverny
-//! manage run` commands (a `systemd-run --scope` execs the command in place,
-//! so a capped command stays in the tree), background shells. Its
-//! subagents run inside the `claude` process itself.
-//!
-//! The status line command is itself a child of that claude, so the walk
-//! goes up to the nearest claude ancestor ([`crate::lineage`]'s test of a
-//! claude) and sums its subtree from `/proc`. CPU needs two readings: the
-//! last one is kept in a small file per session, and the share is the
-//! CPU time spent since then over the wall time since then. With no
-//! recent reading (the first line of a session, or one long quiet), it
-//! reads twice [`SHORT_SAMPLE`] apart. GPU memory comes from `nvidia-smi
-//! --query-compute-apps`, which is slow: a copy of its answer is kept and
-//! refreshed in the background, never waited on.
+//! It once also measured the session for Claude Code's status line, which
+//! no longer shows its use (giverny#384).
 //!
 //! Linux only. Elsewhere there is nothing to show and nothing is spent.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
-
-/// The session's use now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SessionUse {
-    /// CPU, percent of the whole machine (every core busy is 100).
-    pub cpu_pct: u32,
-    /// Memory the session's processes really use, MiB: their proportional
-    /// sets summed (see [`with_real_memory`]).
-    pub mem_mb: u64,
-    /// GPU memory of the session's processes, MiB; `None` when the
-    /// machine has no NVIDIA GPU (or its answer is not in yet).
-    pub gpu_mb: Option<u64>,
-}
+use std::path::PathBuf;
 
 /// One process as the tree sum needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,14 +49,6 @@ pub fn subtree(procs: &[Proc], root: u32) -> HashSet<u32> {
     }
     seen.retain(|pid| procs.iter().any(|p| p.pid == *pid));
     seen
-}
-
-/// `(ticks, memory KiB)` summed over the processes in `pids`.
-pub fn sum(procs: &[Proc], pids: &HashSet<u32>) -> (u64, u64) {
-    procs
-        .iter()
-        .filter(|p| pids.contains(&p.pid))
-        .fold((0, 0), |(t, m), p| (t + p.ticks, m + p.mem_kb))
 }
 
 /// CPU spent between two readings, percent of `cores` cores, rounded and
@@ -124,168 +94,15 @@ pub fn cpu8(pct: u32) -> String {
     format!("{:>3}% CPU", pct.min(100))
 }
 
-/// ` 45% CPU`, `4.2G` and, with a GPU, `gpu 1.2G`. Every figure has a
-/// fixed width ([`cpu8`], [`gb4`]), so the part, joined with [`SEP`] and
-/// right-aligned, keeps each figure in the same columns as it changes —
-/// and in the same columns as the management panel's use cells drawn right
-/// under it, which are built from the same pieces.
-pub fn segments(u: &SessionUse) -> Vec<String> {
-    let mut out = vec![cpu8(u.cpu_pct), gb4(u.mem_mb)];
-    if let Some(g) = u.gpu_mb {
-        out.push(format!("gpu {}", gb4(g)));
-    }
-    out
-}
-
-/// Separates the status line's segments.
+/// Separates a use figure's pieces in the management panel's use cell
+/// (` 45% CPU  ·  4.2G`), and the status line's segments.
 pub const SEP: &str = "  ·  ";
-
-/// The fewest blanks between the line's left part and its right-aligned
-/// part, so a reader of the screen can tell the two apart (a [`SEP`] has
-/// two).
-pub const MIN_GAP: usize = 3;
 
 /// How many columns Claude Code takes from the terminal's width around the
 /// status line: it is drawn two columns in, and a line that reaches the
 /// last two columns is cut short with `…` (measured on Claude Code 2.1,
 /// whatever `padding` says).
 pub const CLAUDE_MARGIN: usize = 4;
-
-/// The status line's width out of the terminal's (`$COLUMNS`, which
-/// Claude Code sets for the command).
-pub fn line_width(columns: Option<&str>) -> Option<usize> {
-    let cols: usize = columns?.trim().parse().ok()?;
-    cols.checked_sub(CLAUDE_MARGIN).filter(|w| *w > 0)
-}
-
-/// `left` with `right` at the right edge of a `width`-column line, at
-/// least [`MIN_GAP`] blanks between; just appended after a [`SEP`] when
-/// the width is unknown. Columns are counted as characters: everything
-/// the line holds (`·`, model names, figures) is one column wide, and a
-/// colour escape none ([`columns`]).
-pub fn align(left: &str, right: &str, width: Option<usize>) -> String {
-    if right.is_empty() {
-        return left.to_string();
-    }
-    if left.is_empty() {
-        return match width {
-            Some(w) => format!("{right:>w$}"),
-            None => right.to_string(),
-        };
-    }
-    let Some(width) = width else {
-        return format!("{left}{SEP}{right}");
-    };
-    let used = columns(left) + columns(right);
-    let gap = width.saturating_sub(used).max(MIN_GAP);
-    format!("{left}{}{right}", " ".repeat(gap))
-}
-
-/// The columns `s` takes on screen: its characters, less its SGR colour
-/// escapes (`ESC [ … m`, giverny#223's red).
-fn columns(s: &str) -> usize {
-    let mut n = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            chars.by_ref().find(|c| *c == 'm');
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// The session's use now, for the session named `session_id` (the key of
-/// the remembered reading). `None` when this does not run under a claude
-/// or the platform has no `/proc`.
-#[cfg(target_os = "linux")]
-pub fn measure(session_id: Option<&str>) -> Option<SessionUse> {
-    let me = std::process::id();
-    let root = claude_root(me)?;
-    let dir = cache_dir()?;
-    let key = session_id
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-        .map_or_else(|| format!("pid-{root}"), str::to_string);
-    let cache = dir.join(format!("{key}.cpu"));
-    let ticks_per_s = sysconf(libc::_SC_CLK_TCK).unwrap_or(100);
-    let page_kb = sysconf(libc::_SC_PAGESIZE).unwrap_or(4096) / 1024;
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(1);
-
-    let read = || {
-        let procs = proc_table(page_kb);
-        let tree = subtree(&procs, root);
-        let (ticks, _) = sum(&procs, &tree);
-        (procs, tree, ticks, now_ms())
-    };
-    let (mut procs, tree, ticks, at) = read();
-    let prev = read_cache(&cache).filter(|c| c.root == root && c.at_ms <= at);
-    let (cpu_pct_now, write) = match prev {
-        // Asked again at once (Claude Code redraws in bursts): too short
-        // a stretch to measure, so the last figure stands.
-        Some(c) if at - c.at_ms < MIN_SPAN_MS => (c.pct, None),
-        Some(c) if at - c.at_ms <= MAX_SPAN_MS => {
-            let pct = cpu_pct(c.ticks, ticks, ticks_per_s, at - c.at_ms, cores);
-            (pct, Some((ticks, at, pct)))
-        }
-        _ => {
-            std::thread::sleep(SHORT_SAMPLE);
-            let (_, _, ticks2, at2) = read();
-            let pct = cpu_pct(ticks, ticks2, ticks_per_s, at2.saturating_sub(at), cores);
-            (pct, Some((ticks2, at2, pct)))
-        }
-    };
-    if let Some((ticks, at_ms, pct)) = write {
-        write_cache(
-            &dir,
-            &cache,
-            &Cached {
-                root,
-                ticks,
-                at_ms,
-                pct,
-            },
-        );
-    }
-    let gpu_mb = gpu::session_mb(&dir, &tree);
-    with_real_memory(&mut procs, &tree);
-    let (_, mem_kb) = sum(&procs, &tree);
-    Some(SessionUse {
-        cpu_pct: cpu_pct_now,
-        mem_mb: mem_kb.div_ceil(1024),
-        gpu_mb,
-    })
-}
-
-/// Where the status line keeps its readings and the kept `nvidia-smi`
-/// answer.
-#[cfg(target_os = "linux")]
-pub fn cache_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("giverny").join("statusline"))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn cache_dir() -> Option<std::path::PathBuf> {
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn measure(_session_id: Option<&str>) -> Option<SessionUse> {
-    None
-}
-
-/// Two readings closer than this say nothing about CPU.
-#[cfg(target_os = "linux")]
-const MIN_SPAN_MS: u64 = 300;
-/// A reading older than this says nothing about now.
-#[cfg(target_os = "linux")]
-const MAX_SPAN_MS: u64 = 30_000;
-/// The gap between two readings taken on the spot: long enough for a few
-/// clock ticks, short enough for a line Claude Code waits for.
-#[cfg(target_os = "linux")]
-const SHORT_SAMPLE: std::time::Duration = std::time::Duration::from_millis(60);
 
 #[cfg(target_os = "linux")]
 pub(crate) fn now_ms() -> u64 {
@@ -299,31 +116,6 @@ pub(crate) fn sysconf(name: libc::c_int) -> Option<u64> {
     // SAFETY: sysconf only reads a configuration value.
     let v = unsafe { libc::sysconf(name) };
     u64::try_from(v).ok().filter(|v| *v > 0)
-}
-
-/// The claude this process runs under: the nearest claude among its
-/// ancestors, else `$CLAUDE_PID` (which Claude Code sets for its commands)
-/// when that is one of them.
-#[cfg(target_os = "linux")]
-pub(crate) fn claude_root(me: u32) -> Option<u32> {
-    let mut ancestors = Vec::new();
-    let mut pid = me;
-    for _ in 0..64 {
-        match crate::lineage::proc_parent(pid) {
-            Some(p) if p != pid && p > 1 => {
-                if crate::lineage::proc_is_claude(p) {
-                    return Some(p);
-                }
-                ancestors.push(p);
-                pid = p;
-            }
-            _ => break,
-        }
-    }
-    std::env::var("CLAUDE_PID")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|p| ancestors.contains(p))
 }
 
 /// Every process in `/proc`.
@@ -388,61 +180,8 @@ pub(crate) fn with_real_memory(procs: &mut [Proc], pids: &HashSet<u32>) {
     }
 }
 
-/// The last reading, kept between two status lines.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cached {
-    root: u32,
-    ticks: u64,
-    at_ms: u64,
-    pct: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn read_cache(path: &Path) -> Option<Cached> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut f = text.split_whitespace().map(|w| w.parse::<u64>().ok());
-    Some(Cached {
-        root: f.next()?? as u32,
-        ticks: f.next()??,
-        at_ms: f.next()??,
-        pct: f.next()?? as u32,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn write_cache(dir: &Path, path: &PathBuf, c: &Cached) {
-    let _ = std::fs::create_dir_all(dir);
-    let tmp = path.with_extension(format!("cpu.{}.tmp", std::process::id()));
-    let body = format!("{} {} {} {}\n", c.root, c.ticks, c.at_ms, c.pct);
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
-    // Sessions come and go; their readings go a day later.
-    sweep(dir);
-}
-
-/// Remove readings untouched for a day, now and then.
-#[cfg(target_os = "linux")]
-fn sweep(dir: &Path) {
-    if !now_ms().is_multiple_of(50) {
-        return;
-    }
-    let day = std::time::Duration::from_secs(24 * 3600);
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > day);
-        if old && e.path().extension().is_some_and(|x| x == "cpu") {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-}
-
-/// GPU memory per process, from a kept copy of `nvidia-smi`'s answer.
+/// GPU memory per process, from `nvidia-smi --query-compute-apps`, which the
+/// app's sampler asks now and then ([`crate::use_reading::Sampler`]).
 pub mod gpu {
     use super::*;
 
@@ -462,10 +201,6 @@ pub mod gpu {
         m
     }
 
-    /// How old the kept answer may be before a fresh one is asked for.
-    #[cfg(target_os = "linux")]
-    const FRESH_MS: u64 = 5_000;
-
     /// Whether the machine has `nvidia-smi`, so a GPU to show: looked for
     /// once.
     #[cfg(target_os = "linux")]
@@ -479,76 +214,13 @@ pub mod gpu {
         false
     }
 
-    /// The GPU memory of the processes in `pids`, MiB: [`apps`] summed
-    /// over them.
+    /// The GPU memory of the processes in `pids`, MiB: `apps` (a
+    /// [`parse_compute_apps`] answer) summed over them.
     pub fn of(apps: &HashMap<u32, u64>, pids: &HashSet<u32>) -> u64 {
         apps.iter()
             .filter(|(pid, _)| pids.contains(pid))
             .map(|(_, mb)| mb)
             .sum()
-    }
-
-    /// The session's GPU memory, MiB: `None` with no `nvidia-smi` on the
-    /// machine or no answer kept yet.
-    #[cfg(target_os = "linux")]
-    pub fn session_mb(dir: &Path, tree: &HashSet<u32>) -> Option<u64> {
-        Some(of(&apps(dir)?, tree))
-    }
-
-    /// GPU memory per process, MiB, from the answer kept in `dir`: `None`
-    /// with no `nvidia-smi` on the machine or no fresh answer kept. Asks
-    /// for a fresh answer in the background when the kept one is old, and
-    /// never waits for it.
-    #[cfg(target_os = "linux")]
-    pub fn apps(dir: &Path) -> Option<HashMap<u32, u64>> {
-        let smi = find_on_path("nvidia-smi")?;
-        let answer = dir.join("gpu.csv");
-        let asked = dir.join("gpu.asked");
-        let age = |p: &Path| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_millis() as u64)
-        };
-        let stale = age(&answer).is_none_or(|a| a > FRESH_MS);
-        if stale && age(&asked).is_none_or(|a| a > FRESH_MS) {
-            refresh(dir, &smi, &answer, &asked);
-        }
-        let text = std::fs::read_to_string(&answer).ok()?;
-        // An answer older than a minute is no longer about now.
-        if age(&answer).is_some_and(|a| a > 60_000) {
-            return None;
-        }
-        Some(parse_compute_apps(&text))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn apps(_dir: &std::path::Path) -> Option<HashMap<u32, u64>> {
-        None
-    }
-
-    /// Run `nvidia-smi` detached, its answer written beside the readings.
-    #[cfg(target_os = "linux")]
-    fn refresh(dir: &Path, smi: &Path, answer: &Path, asked: &Path) {
-        use std::process::{Command, Stdio};
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(asked, b"");
-        let tmp = answer.with_extension("csv.tmp");
-        let q = |p: &str| format!("'{}'", p.replace('\'', r"'\''"));
-        let script = format!(
-            "{} --query-compute-apps=pid,used_memory --format=csv,noheader,nounits > {} && mv {} {}",
-            q(&smi.to_string_lossy()),
-            q(&tmp.to_string_lossy()),
-            q(&tmp.to_string_lossy()),
-            q(&answer.to_string_lossy()),
-        );
-        let _ = Command::new("sh")
-            .args(["-c", &script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
     }
 
     #[cfg(target_os = "linux")]
@@ -600,7 +272,6 @@ mod tests {
         let mut got: Vec<u32> = tree.iter().copied().collect();
         got.sort();
         assert_eq!(got, [20, 30, 31, 32, 40, 41]);
-        assert_eq!(sum(&procs, &tree), (553, 1_407_000));
         // A root that is gone is nothing.
         assert!(subtree(&procs, 77).is_empty());
         // A parent loop does not hang the walk.
@@ -659,24 +330,11 @@ mod tests {
         assert_eq!(gb(4300), "4.2G");
         assert_eq!(gb(12 * 1024), "12G");
         assert_eq!(gb(1536 * 1024), "1.5T");
-        let u = SessionUse {
-            cpu_pct: 45,
-            mem_mb: 4300,
-            gpu_mb: None,
-        };
-        assert_eq!(segments(&u), [" 45% CPU", "4.2G"]);
-        let u = SessionUse {
-            gpu_mb: Some(1229),
-            ..u
-        };
-        assert_eq!(segments(&u), [" 45% CPU", "4.2G", "gpu 1.2G"]);
         // Fixed widths: the figures keep their columns as they change.
-        let u = SessionUse {
-            cpu_pct: 100,
-            mem_mb: 12 * 1024,
-            gpu_mb: Some(0),
-        };
-        assert_eq!(segments(&u), ["100% CPU", " 12G", "gpu 0.0G"]);
+        assert_eq!(gb4(4300), "4.2G");
+        assert_eq!(gb4(12 * 1024), " 12G");
+        assert_eq!(cpu8(45), " 45% CPU");
+        assert_eq!(cpu8(140), "100% CPU");
     }
 
     #[test]
@@ -689,37 +347,6 @@ mod tests {
         assert_eq!(gpu::of(&m, &HashSet::new()), 0);
     }
 
-    #[test]
-    fn the_use_sits_at_the_right_edge() {
-        let left = "Opus 5.5  ·  session: 36.2k  ·  total: 90k";
-        let right = "45% CPU  ·  4.2G";
-        let line = align(left, right, Some(80));
-        assert_eq!(line.chars().count(), 80, "`·` is one column: {line:?}");
-        assert!(line.starts_with(left) && line.ends_with(right));
-        // Unknown width: appended like any other segment.
-        assert_eq!(align(left, right, None), format!("{left}{SEP}{right}"));
-        // Too narrow: never glued on, the gap stays.
-        let tight = align(left, right, Some(20));
-        assert_eq!(tight, format!("{left}   {right}"));
-        // Nothing to place: the line as it was.
-        assert_eq!(align(left, "", Some(80)), left);
-        assert_eq!(align("", right, Some(20)).chars().count(), 20);
-        // A red segment's escapes take no column (giverny#223).
-        let red = format!("{left}{SEP}\x1b[31mcache cold\x1b[0m");
-        let line = align(&red, right, Some(80));
-        assert_eq!(line.chars().count(), 80 + "\x1b[31m\x1b[0m".len());
-        assert!(line.ends_with(right));
-    }
-
-    #[test]
-    fn the_width_is_the_terminals_less_claude_codes_margin() {
-        assert_eq!(line_width(Some("120")), Some(116));
-        assert_eq!(line_width(Some(" 80\n")), Some(76));
-        assert_eq!(line_width(Some("4")), None);
-        assert_eq!(line_width(Some("wide")), None);
-        assert_eq!(line_width(None), None);
-    }
-
     /// The real table: this test's own process is in it, with a parent.
     #[cfg(target_os = "linux")]
     #[test]
@@ -729,6 +356,6 @@ mod tests {
         let mine = procs.iter().find(|p| p.pid == me).expect("in /proc");
         let tree = subtree(&procs, mine.ppid);
         assert!(tree.contains(&me));
-        assert!(sum(&procs, &tree).1 > 0, "some memory is resident");
+        assert!(mine.mem_kb > 0, "some memory is resident");
     }
 }
