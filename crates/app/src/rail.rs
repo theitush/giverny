@@ -373,11 +373,19 @@ fn row_data(
 }
 
 /// Counts a header carries: how many, how many working, how many want you.
+///
+/// Working is every tab whose mark says something runs — the agent itself
+/// ([`Mark::Busy`]) or what it left humming at its prompt ([`Mark::Wave`]:
+/// subagents, a background shell, seen or unseen). Counting only the busy
+/// state let the header's breathing dot go still while a tab still showed
+/// the wave (giverny#383); it should stop only once nothing in the group
+/// runs, collapsed or not. A tab not started this run has nothing running,
+/// whatever state lingers for it, so it is not counted.
 fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     (
         rows.len(),
         rows.iter()
-            .filter(|r| r.claude == ClaudeState::Busy)
+            .filter(|r| matches!(Mark::of(r), Mark::Busy | Mark::Wave))
             .count(),
         rows.iter()
             .filter(|r| r.claude == ClaudeState::NeedsYou)
@@ -2703,6 +2711,37 @@ mod tests {
         };
         assert_eq!(shell(ClaudeState::DoneUnseen), Mark::Wave);
         assert_eq!(shell(ClaudeState::Idle), Mark::Wave);
+    }
+
+    /// A header counts a tab showing the wave as working, so its breathing
+    /// dot and count stay while only the tab's subagents or background shell
+    /// run (giverny#383); the tick and the ring are not working.
+    #[test]
+    fn a_header_counts_a_waving_tab_as_working() {
+        let humming = |state| RowData {
+            background: true,
+            ..row(state)
+        };
+        assert_eq!(tallies(&[humming(ClaudeState::Idle)]), (1, 1, 0));
+        // Unseen with its work still running is the wave too (giverny#381).
+        assert_eq!(tallies(&[humming(ClaudeState::DoneUnseen)]), (1, 1, 0));
+        assert_eq!(
+            tallies(&[
+                row(ClaudeState::Busy),
+                humming(ClaudeState::Idle),
+                row(ClaudeState::DoneUnseen),
+                row(ClaudeState::Idle),
+                humming(ClaudeState::NeedsYou),
+            ]),
+            (5, 2, 1),
+            "busy and wave count; tick, ring and flag do not"
+        );
+        // A tab not started has nothing running, whatever state lingers.
+        let pending = RowData {
+            started: false,
+            ..humming(ClaudeState::Busy)
+        };
+        assert_eq!(tallies(&[pending]), (1, 0, 0));
     }
 
     /// A restored tab that has not spawned is told by what it comes back
