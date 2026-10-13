@@ -112,7 +112,9 @@ struct RowData {
     started: bool,
     color: Color32,
     claude: ClaudeState,
-    /// A background shell is alive while Claude itself waits at its prompt.
+    /// Something Claude started still works — a background shell, or
+    /// subagents it handed work to — while Claude itself waits at its
+    /// prompt, free to talk.
     background: bool,
 }
 
@@ -209,7 +211,7 @@ fn row_data(
         started: app.rt.contains_key(&t.id),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
-        background: ct.is_some_and(|c| c.background),
+        background: ct.is_some_and(|c| c.working_in_background()),
     }
 }
 
@@ -348,6 +350,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .resizable(false)
         .show_separator_line(true)
         .show(ui, |ui| {
+            wslg_banner(app, ui, &mut actions);
             update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
             usage_panel(app, ui, dim, fg, &mut actions);
@@ -999,10 +1002,11 @@ fn tab_row(
         // and movement.
         ClaudeState::DoneUnseen => tick(&p, dot, c.green),
         ClaudeState::Idle => {
-            // A background shell keeps running while Claude waits at its
-            // prompt. Worth showing — it is why a directory is still churning
-            // — but it is not the agent working, and animating it would say
-            // "come back later" about a tab that is waiting on you.
+            // A background shell or its subagents keep running while Claude
+            // waits at its prompt. Worth showing — it is why a directory is
+            // still churning — but it is not the agent working: it can take a
+            // message, and animating it would say "come back later" about a
+            // tab that is waiting on you.
             if row.background {
                 for i in -1..=1 {
                     p.circle_filled(dot + Vec2::new(i as f32 * 4.0, 0.0), 1.4, dim);
@@ -1157,6 +1161,73 @@ fn tab_row(
         );
     }
     rect
+}
+
+/// WSLg lost its shared memory with Windows: say why the window lags
+/// and hand over the command that fixes it. Red, since it is a failure the
+/// user has to act on, and there until dismissed; nothing when healthy.
+fn wslg_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let Some(fix) = app.wslg_slow else { return };
+    let c = app.chrome;
+    ui.add_space(4.0);
+    egui::Frame::NONE
+        .stroke(Stroke::new(1.0, c.poppy))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(6))
+        .outer_margin(egui::Margin::symmetric(6, 0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(
+                egui::RichText::new(
+                    "⚠ WSLg lost its shared memory with Windows, so every frame \
+                     is sent the slow way and typing will lag.",
+                )
+                .font(FontId::monospace(10.0))
+                .color(c.poppy),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Fix: in PowerShell as administrator. It ends all of WSL, \
+                     this window and its Claude sessions included, so reopen \
+                     Giverny after:",
+                )
+                .font(FontId::monospace(10.0))
+                .color(c.dim),
+            );
+            egui::Frame::NONE
+                .fill(c.fg.gamma_multiply(0.08))
+                .corner_radius(3.0)
+                .inner_margin(egui::Margin::symmetric(4, 2))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(fix)
+                                .font(FontId::monospace(10.5))
+                                .color(c.fg),
+                        )
+                        .selectable(true),
+                    );
+                });
+            ui.horizontal(|ui| {
+                let copied_id = ui.id().with("wslg-fix-copied");
+                let copied = ui.data(|d| d.get_temp::<bool>(copied_id).unwrap_or(false));
+                if ui
+                    .small_button(if copied { "copied" } else { "copy" })
+                    .on_hover_text("copy the command")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(fix.to_string());
+                    ui.data_mut(|d| d.insert_temp(copied_id, true));
+                }
+                if ui
+                    .small_button("dismiss")
+                    .on_hover_text("WSLg stays slow until the fix is run")
+                    .clicked()
+                {
+                    actions.push(Action::DismissWslgSlow);
+                }
+            });
+        });
 }
 
 /// Offer the new release the hourly check found, follow the install it

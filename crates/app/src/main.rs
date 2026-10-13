@@ -23,6 +23,8 @@ mod wayland_dnd;
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg_cursor;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg_watchdog;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -261,6 +263,23 @@ fn pick_renderer(gpu_gl: bool) -> (eframe::Renderer, Option<eframe::wgpu::Backen
     }
 }
 
+/// The fix to offer if WSLg is in its slow, no-shared-memory mode.
+/// Logged here; the rail says it to the user.
+fn wslg_slow_mode() -> Option<&'static str> {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg::slow_mode() {
+        tracing::warn!(
+            "WSLg started without its shared memory with Windows (weston.log: use_gfxredir = 0): \
+             every frame goes over RDP as a bitmap and typing will lag. \
+             Fix: `{}` in PowerShell as administrator. It ends all of WSL, this \
+             window and its Claude sessions included; reopen Giverny after",
+            wslg::SLOW_MODE_FIX
+        );
+        return Some(wslg::SLOW_MODE_FIX);
+    }
+    None
+}
+
 /// Whether OpenGL has been pointed at a GPU that wgpu cannot reach: WSLg's
 /// d3d12 driver. Logs the outcome either way, since it decides the CPU cost.
 fn gpu_opengl() -> bool {
@@ -269,6 +288,12 @@ fn gpu_opengl() -> bool {
         wslg::Gpu::NotApplicable => {}
         wslg::Gpu::D3d12(renderer) => {
             tracing::info!("renderer: OpenGL on the GPU through WSLg's d3d12 driver ({renderer})");
+            return true;
+        }
+        wslg::Gpu::Inherited => {
+            tracing::info!(
+                "renderer: OpenGL on the GPU through WSLg's d3d12 driver (GALLIUM_DRIVER=d3d12 inherited)"
+            );
             return true;
         }
         wslg::Gpu::Unavailable(why) => {
@@ -747,6 +772,9 @@ struct ComingForward {
     unmapped: Option<Option<egui::Pos2>>,
     /// Mapped again, and still to be put back here.
     move_to: Option<egui::Pos2>,
+    /// Asked by the WSLg watchdog, not by a launch: mapped again once, so
+    /// that Windows shows the window it lost, without taking the focus.
+    quiet: bool,
 }
 
 #[cfg(unix)]
@@ -759,6 +787,16 @@ impl ComingForward {
             asked: 0,
             unmapped: None,
             move_to: None,
+            quiet: false,
+        }
+    }
+
+    /// One remap for the WSLg watchdog.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    fn quiet() -> Self {
+        ComingForward {
+            quiet: true,
+            ..Self::new()
         }
     }
 }
@@ -848,6 +886,7 @@ pub enum Action {
     MoveTab(TabId, CategoryId),
     InstallHooks,
     DismissHooksBanner,
+    DismissWslgSlow,
     SetCategoryProfile(CategoryId, Option<PathBuf>),
     /// Jump to the next tab where Claude needs attention (then done-unseen).
     JumpAttention,
@@ -1026,6 +1065,9 @@ pub struct App {
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
     pub hooks_banner_dismissed: bool,
+    /// WSLg lost its shared memory with Windows and the window lags:
+    /// the command that fixes it, said in the rail until dismissed.
+    pub wslg_slow: Option<&'static str>,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
     pub palette: Option<overlays::PaletteState>,
@@ -1086,6 +1128,9 @@ pub struct App {
     /// That window's cursors, sized to the display (#100).
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     cursors: Option<wslg_cursor::Cursors>,
+    /// Brings the window back when WSLg loses it after a sleep.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    wslg_watchdog: Option<wslg_watchdog::Handle>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
@@ -1523,6 +1568,19 @@ impl App {
         // Asked before the workspace moves into the app: a restored tab is how
         // an upgrade is told apart from a first run.
         let welcome = splash::due(paths.base(), !ws.tabs.is_empty());
+        // One watchdog per WSLg: the Giverny holding the relay socket. A
+        // second window, or a side instance trying out a build, must not end
+        // the msrdc the first one's window lives in, nor end it twice.
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        let wslg_watchdog = (claude.relay_listening()
+            && std::env::var_os(claude_watch::NO_ACCOUNT_SETUP_ENV).is_none())
+        .then(|| {
+            let ctx = cc.egui_ctx.clone();
+            wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
+                ctx.request_repaint()
+            })
+        })
+        .flatten();
         let mut app = App {
             shared,
             ws,
@@ -1536,6 +1594,7 @@ impl App {
             last_save: Instant::now(),
             claude,
             hooks_banner_dismissed: false,
+            wslg_slow: wslg_slow_mode(),
             pending_inject: Vec::new(),
             palette: None,
             session_picker: None,
@@ -1561,6 +1620,8 @@ impl App {
             cursors: frameless
                 .then(|| wslg_cursor::Cursors::new(cc, wslg::desktop_scale()))
                 .flatten(),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
             repo_cache: HashMap::new(),
@@ -1836,6 +1897,7 @@ impl App {
                 Err(e) => tracing::error!("hook install: {e}"),
             },
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
+            Action::DismissWslgSlow => self.wslg_slow = None,
             Action::SetCategoryProfile(id, dir) => {
                 if let Some(cat) = self.ws.category_mut(id) {
                     cat.profile_dir = dir;
@@ -2462,7 +2524,9 @@ impl App {
         // it was, once it is shown.
         if let Some(corner) = forward.unmapped.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !forward.quiet {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             forward.move_to = corner;
             forward.asked += 1;
             soon(forward, Duration::from_millis(200));
@@ -2472,8 +2536,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(corner));
         }
         let focused = ctx.input(|i| i.focused);
-        if forward.asked > 0 && (focused || forward.asked >= COME_FORWARD_AT.len()) {
-            if !focused {
+        if forward.asked > 0 && (forward.quiet || focused || forward.asked >= COME_FORWARD_AT.len())
+        {
+            if !focused && !forward.quiet {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                     egui::UserAttentionType::Critical,
                 ));
@@ -2481,7 +2546,7 @@ impl App {
             self.coming_forward = None;
             return;
         }
-        if self.raise_by_remap {
+        if self.raise_by_remap || forward.quiet {
             // WSLg's Weston ignores `_NET_ACTIVE_WINDOW`, so on WSLg asking is
             // not enough: the window is unmapped and mapped again, which is a
             // new window to Windows, and comes to the front as a new window
@@ -3549,6 +3614,17 @@ impl eframe::App for App {
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         self.show_attention(&ctx, frame);
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        // Not while coming forward, which maps the window again anyway: the
+        // request waits for the next frame rather than being taken and lost.
+        if self.coming_forward.is_none()
+            && self
+                .wslg_watchdog
+                .as_ref()
+                .is_some_and(wslg_watchdog::Handle::take_remap)
+        {
+            self.coming_forward = Some(ComingForward::quiet());
+        }
         #[cfg(unix)]
         self.come_forward(&ctx);
         self.watch_for_limits();
@@ -4067,6 +4143,23 @@ fn doctor() {
                 (false, false) => "not installed (X11 uses the built-in window icon)".to_string(),
             }
         );
+        println!();
+    }
+
+    // What the WSLg watchdog did, if anything.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg_watchdog::applies() {
+        let recent = wslg_watchdog::recent(Paths::default_dirs().base(), 5);
+        println!(
+            "wslg watch   brings the window back when WSLg loses it after a sleep \
+             (GIVERNY_WSLG_WATCHDOG=0 turns it off)"
+        );
+        if recent.is_empty() {
+            println!("             nothing to do so far");
+        }
+        for line in recent {
+            println!("             {line}");
+        }
         println!();
     }
 

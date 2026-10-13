@@ -147,14 +147,48 @@ pub struct LastReply {
     pub at_ms: i64,
     /// `None` when the reply wrote nothing to the cache, so its TTL is unknown.
     pub ttl_ms: Option<i64>,
-    pub recache: u64,
+    /// `None` right after a compaction that does not say what it kept.
+    pub recache: Option<u64>,
 }
 
 /// The last main-conversation reply in a transcript, read from its tail.
+///
+/// A compaction after it stands in for it: the compaction
+/// request was the last to touch the cache, at the boundary's time, and what
+/// the next request re-caches is the compacted context
+/// ([`after_compaction`]), not the reply's. Its TTL is the reply's.
 pub fn last_reply(path: &Path) -> Option<LastReply> {
-    tail_find(path, |buf| {
-        buf.split(|&c| c == b'\n').rev().find_map(reply_of)
-    })
+    let (mut last, compacted) = tail_find(path, |buf| {
+        let mut boundary = None;
+        for line in buf.split(|&c| c == b'\n').rev() {
+            if boundary.is_none()
+                && let Some(b) = boundary_at(line)
+            {
+                boundary = Some(b);
+            } else if let Some(reply) = reply_of(line) {
+                return Some((reply, boundary));
+            }
+        }
+        None
+    })?;
+    if let Some((at_ms, post)) = compacted {
+        last.at_ms = at_ms;
+        last.recache = post.map(|p| p + first_tokens(path).unwrap_or(0));
+    }
+    Some(last)
+}
+
+/// A `compact_boundary` line's time and `postTokens`.
+fn boundary_at(line: &[u8]) -> Option<(i64, Option<u64>)> {
+    let post = boundary_field(line, "postTokens")?;
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let at_ms = v
+        .get("timestamp")?
+        .as_str()?
+        .parse::<jiff::Timestamp>()
+        .ok()?
+        .as_millisecond();
+    Some((at_ms, post))
 }
 
 fn reply_of(line: &[u8]) -> Option<LastReply> {
@@ -196,7 +230,7 @@ fn reply_of(line: &[u8]) -> Option<LastReply> {
     Some(LastReply {
         at_ms,
         ttl_ms,
-        recache: a + b + c + output,
+        recache: Some(a + b + c + output),
     })
 }
 
@@ -243,6 +277,12 @@ fn tail_find<T>(path: &Path, find: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
 /// compaction request itself. A boundary with no `preTokens` falls back to
 /// that last usage.
 fn boundary_tokens(line: &[u8]) -> Option<Option<u64>> {
+    boundary_field(line, "preTokens")
+}
+
+/// A count off a `compact_boundary` line's `compactMetadata`: `None` for any
+/// other line, `Some(None)` for a boundary without it.
+fn boundary_field(line: &[u8], key: &str) -> Option<Option<u64>> {
     find(line, b"\"compact_boundary\"")?;
     let v: Value = serde_json::from_slice(line).ok()?;
     if v.get("subtype").and_then(Value::as_str) != Some("compact_boundary") {
@@ -250,7 +290,7 @@ fn boundary_tokens(line: &[u8]) -> Option<Option<u64>> {
     }
     Some(
         v.get("compactMetadata")
-            .and_then(|m| m.get("preTokens"))
+            .and_then(|m| m.get(key))
             .and_then(Value::as_f64)
             .filter(|n| *n > 0.0)
             .map(|n| n as u64),
@@ -399,10 +439,33 @@ pub fn compact_cache_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("giverny").join("compactions"))
 }
 
+/// The session's own count, and whether it is only an estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Session {
+    pub tokens: u64,
+    pub estimated: bool,
+}
+
+impl Session {
+    pub fn measured(tokens: u64) -> Self {
+        Session {
+            tokens,
+            estimated: false,
+        }
+    }
+}
+
 /// The session's own count: `context_window.total_input_tokens` off the status
 /// line's stdin when it is there (the same number, a turn fresher), else its
-/// transcript.
-pub fn session_tokens(payload: &Value, transcript: Option<&Path>) -> Option<u64> {
+/// transcript — except right after a compaction, when neither knows yet
+/// ([`after_compaction`]).
+pub fn session_tokens(payload: &Value, transcript: Option<&Path>) -> Option<Session> {
+    if let Some(n) = transcript.and_then(after_compaction) {
+        return Some(Session {
+            tokens: n,
+            estimated: true,
+        });
+    }
     let live = payload
         .get("context_window")
         .and_then(|c| c.get("total_input_tokens"))
@@ -410,9 +473,45 @@ pub fn session_tokens(payload: &Value, transcript: Option<&Path>) -> Option<u64>
     if let Some(v) = live
         && v > 0.0
     {
-        return Some(v as u64);
+        return Some(Session::measured(v as u64));
     }
-    transcript.and_then(tokens_of)
+    transcript.and_then(tokens_of).map(Session::measured)
+}
+
+/// What the session carries now that it has compacted and sent nothing since,
+/// or `None` when a reply came after its last compaction (or it never
+/// compacted).
+///
+/// Until the next request nobody has measured the new context:
+/// Claude Code's `total_input_tokens` is the last usage among the messages it
+/// kept — stale or `0` — and the transcript's last usage is the one before the
+/// boundary. So this estimates it: the boundary's `postTokens`, Claude Code's
+/// count of the kept messages alone, plus the session's first reply's context
+/// for the system prompt, tools and memory that count leaves out. Measured on
+/// 30 compactions in 11 transcripts, 2026-10-12: that lands within ~10% of the
+/// next reply's real context (58.3k against 59k in ToLaD `6c6ccfc0`). A
+/// boundary without `postTokens` is left to the old count.
+pub fn after_compaction(path: &Path) -> Option<u64> {
+    let post = tail_find(path, |buf| {
+        buf.split(|&c| c == b'\n').rev().find_map(|line| {
+            if let Some(post) = boundary_field(line, "postTokens") {
+                Some(post)
+            } else {
+                line_tokens(line).map(|_| None)
+            }
+        })
+    })??;
+    Some(post + first_tokens(path).unwrap_or(0))
+}
+
+/// The context of a transcript's first reply, read from its head.
+fn first_tokens(path: &Path) -> Option<u64> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .find_map(|line| line_tokens(&line))
 }
 
 /// Every `subagents/` dir of this session: beside its transcript, and under
@@ -515,7 +614,7 @@ pub fn fmt_tokens(n: u64) -> String {
 /// tokens and `total: <n>` only when there is something besides the session's
 /// own count to add (giverny#95): otherwise the total would only repeat it.
 pub fn segments(
-    session: Option<u64>,
+    session: Option<Session>,
     compacted: u64,
     subagents: Option<u64>,
     total: Option<u64>,
@@ -524,7 +623,13 @@ pub fn segments(
     if session.is_none() && compacted == 0 && sub == 0 {
         return Vec::new();
     }
-    let mut head = format!("session: {}", fmt_tokens(session.unwrap_or(0)));
+    let mut head = match session {
+        Some(Session {
+            tokens,
+            estimated: true,
+        }) => format!("session: ~{}", fmt_tokens(tokens)),
+        _ => format!("session: {}", fmt_tokens(session.map_or(0, |s| s.tokens))),
+    };
     if compacted > 0 {
         head += &format!(" (+{})", fmt_tokens(compacted));
     }
@@ -630,10 +735,16 @@ mod tests {
         let p = d.join("s.jsonl");
         std::fs::write(&p, asst(json!({"input_tokens": 70}))).unwrap();
         let live = json!({"context_window": {"total_input_tokens": 500}});
-        assert_eq!(session_tokens(&live, Some(&p)), Some(500));
-        assert_eq!(session_tokens(&json!({}), Some(&p)), Some(70));
+        assert_eq!(
+            session_tokens(&live, Some(&p)),
+            Some(Session::measured(500))
+        );
+        assert_eq!(
+            session_tokens(&json!({}), Some(&p)),
+            Some(Session::measured(70))
+        );
         let zero = json!({"context_window": {"total_input_tokens": 0}});
-        assert_eq!(session_tokens(&zero, Some(&p)), Some(70));
+        assert_eq!(session_tokens(&zero, Some(&p)), Some(Session::measured(70)));
         assert_eq!(session_tokens(&json!({}), None), None);
     }
 
@@ -667,11 +778,14 @@ mod tests {
         let dirs = session_subagent_dirs(Some(&t), Some(&cfg), Some("sid1"));
         let files = subagent_transcripts(&dirs);
         assert_eq!(files.len(), 2);
-        let (s, sub, total) =
-            session_subagents_total(session_tokens(&json!({}), Some(&t)), 0, &files);
+        let (s, sub, total) = session_subagents_total(
+            session_tokens(&json!({}), Some(&t)).map(|s| s.tokens),
+            0,
+            &files,
+        );
         assert_eq!((s, sub, total), (Some(1000), Some(230), Some(1230)));
         assert_eq!(
-            segments(s, 0, sub, total),
+            segments(s.map(Session::measured), 0, sub, total),
             vec![
                 "session: 1k".to_string(),
                 "subagents: 230".to_string(),
@@ -681,7 +795,10 @@ mod tests {
         // A session with no subagent tokens shows only its own count.
         let (s, sub, total) = session_subagents_total(Some(1000), 0, &[]);
         assert_eq!((s, sub, total), (Some(1000), Some(0), Some(1000)));
-        assert_eq!(segments(s, 0, sub, total), vec!["session: 1k".to_string()]);
+        assert_eq!(
+            segments(s.map(Session::measured), 0, sub, total),
+            vec!["session: 1k".to_string()]
+        );
         // No session and no subagents: nothing to say.
         assert_eq!(session_subagents_total(None, 0, &[]), (None, None, None));
         assert!(segments(None, 0, None, None).is_empty());
@@ -712,7 +829,7 @@ mod tests {
         assert_eq!(compacted_tokens(&d.join("missing.jsonl")), 0);
         let (s, sub, total) = session_subagents_total(Some(95_500), 0, &[]);
         assert_eq!(
-            segments(s, 0, sub, total),
+            segments(s.map(Session::measured), 0, sub, total),
             vec!["session: 95.5k".to_string()]
         );
     }
@@ -738,7 +855,7 @@ mod tests {
         let (s, sub, total) = session_subagents_total(tokens_of(&p), compacted, &[]);
         assert_eq!((s, sub, total), (Some(95_500), Some(0), Some(550_710)));
         assert_eq!(
-            segments(s, compacted, sub, total),
+            segments(s.map(Session::measured), compacted, sub, total),
             vec![
                 "session: 95.5k (+455.2k)".to_string(),
                 "total: 550.7k".to_string()
@@ -746,12 +863,75 @@ mod tests {
         );
         // With subagents, all three parts are in the total.
         assert_eq!(
-            segments(Some(95_500), compacted, Some(1000), Some(551_710)),
+            segments(
+                Some(Session::measured(95_500)),
+                compacted,
+                Some(1000),
+                Some(551_710)
+            ),
             vec![
                 "session: 95.5k (+455.2k)".to_string(),
                 "subagents: 1k".to_string(),
                 "total: 551.7k".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn right_after_a_compaction_the_session_is_estimated_until_the_next_reply() {
+        let d = tmpdir("aftercompact");
+        let p = d.join("s.jsonl");
+        let user = |text: &str| json!({"type": "user", "message": {"content": text}}).to_string();
+        let mut lines = vec![
+            user("go"),
+            // The first reply: system prompt, tools and memory.
+            asst(json!({"input_tokens": 3, "cache_creation_input_tokens": 41_000})),
+            asst(json!({"input_tokens": 334_163})),
+            boundary(Some(335_210)),
+            user("This session is being continued from a previous conversation"),
+            user("<command-name>/compact</command-name>"),
+        ];
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        // Claude Code still reports the kept messages' old usage, or nothing.
+        let stale = json!({"context_window": {"total_input_tokens": 334_163}});
+        let want = Some(Session {
+            tokens: 7604 + 41_003,
+            estimated: true,
+        });
+        assert_eq!(after_compaction(&p), Some(48_607));
+        assert_eq!(session_tokens(&stale, Some(&p)), want);
+        assert_eq!(session_tokens(&json!({}), Some(&p)), want);
+        let compacted = compacted_tokens(&p);
+        let (_, sub, total) = session_subagents_total(Some(48_607), compacted, &[]);
+        assert_eq!(
+            segments(want, compacted, sub, total),
+            vec![
+                "session: ~48.6k (+335.2k)".to_string(),
+                "total: 383.8k".to_string()
+            ]
+        );
+        // The next reply measures it, and the estimate is gone.
+        lines.push(asst(json!({"input_tokens": 52_916})));
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert_eq!(after_compaction(&p), None);
+        let live = json!({"context_window": {"total_input_tokens": 52_916}});
+        assert_eq!(
+            session_tokens(&live, Some(&p)),
+            Some(Session::measured(52_916))
+        );
+        // A boundary without `postTokens` is left to the old count.
+        let bare = json!({"type": "system", "subtype": "compact_boundary",
+            "compactMetadata": {"trigger": "manual", "preTokens": 9}})
+        .to_string();
+        std::fs::write(
+            &p,
+            [asst(json!({"input_tokens": 70})), bare].join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(after_compaction(&p), None);
+        assert_eq!(
+            session_tokens(&json!({}), Some(&p)),
+            Some(Session::measured(70))
         );
     }
 
@@ -877,7 +1057,7 @@ mod tests {
             Some(LastReply {
                 at_ms: at,
                 ttl_ms: Some(3_600_000),
-                recache: 91_502
+                recache: Some(91_502)
             })
         );
         // A reply that wrote nothing to the cache leaves the TTL unknown.
@@ -892,6 +1072,64 @@ mod tests {
         .unwrap();
         assert_eq!(last_reply(&t).map(|r| r.ttl_ms), Some(None));
         assert_eq!(last_reply(&d.join("missing.jsonl")), None);
+    }
+
+    #[test]
+    fn a_compaction_after_the_last_reply_stands_in_for_it() {
+        let d = tmpdir("last-reply-compact");
+        let t = d.join("s.jsonl");
+        let reply = |at: &str, usage: Value| {
+            json!({"type": "assistant", "timestamp": at,
+                "message": {"role": "assistant", "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "hi"}], "usage": usage}})
+            .to_string()
+        };
+        let compaction = |post: Option<u64>| {
+            let mut b: Value = serde_json::from_str(&boundary(Some(306_000))).unwrap();
+            b["timestamp"] = json!("2026-10-06T11:30:00Z");
+            match post {
+                Some(n) => b["compactMetadata"]["postTokens"] = json!(n),
+                None => {
+                    b["compactMetadata"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("postTokens");
+                }
+            }
+            let lines = [
+                // The session's first reply: system prompt, tools, memory.
+                reply(
+                    "2026-10-06T09:00:00Z",
+                    json!({"cache_creation_input_tokens": 41_000}),
+                ),
+                reply(
+                    "2026-10-06T11:00:00Z",
+                    json!({"input_tokens": 2, "cache_read_input_tokens": 305_000,
+                        "output_tokens": 500, "cache_creation_input_tokens": 1000,
+                        "cache_creation": {"ephemeral_1h_input_tokens": 1000}}),
+                ),
+                b.to_string(),
+                json!({"type": "user", "isCompactSummary": true}).to_string(),
+            ];
+            std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+            last_reply(&t)
+        };
+        let at = "2026-10-06T11:30:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        // Cold an hour after the compaction, and the next message re-caches
+        // the compacted context, not the 306k before it.
+        assert_eq!(
+            compaction(Some(7604)),
+            Some(LastReply {
+                at_ms: at,
+                ttl_ms: Some(3_600_000),
+                recache: Some(7604 + 41_000)
+            })
+        );
+        // A boundary that does not say what it kept leaves the figure unknown.
+        assert_eq!(compaction(None).map(|r| r.recache), Some(None));
     }
 
     #[test]
