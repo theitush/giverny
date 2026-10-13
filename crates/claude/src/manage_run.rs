@@ -24,11 +24,18 @@
 //! build past its memory.
 //!
 //! **Anywhere else** (no user systemd, macOS, Windows,
-//! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease's RAM is advisory.
-//! On macOS, one of the supported platforms (with Linux and WSL), the
-//! command starts at low priority, `taskpolicy -c utility`, so the
-//! person's own work goes first ([`low_priority`]); elsewhere it runs as
-//! it always has.
+//! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain, registered as running like a
+//! scope ([`run_live`]) so the app and the ledger see it. On macOS, one
+//! of the supported platforms (with Linux and WSL), the command starts at
+//! low priority, `taskpolicy -c utility`, so the person's own work goes
+//! first ([`low_priority`]), and Giverny holds it itself, with no cgroups
+//! (giverny#389, [`crate::user_cap::RunGuard`]): four times a second its
+//! tree is measured, and killed — the biggest process in it, reported as
+//! an OOM kill — once it passes twice its lease (or the limit's RAM, if
+//! less); its CPU is held to the limit's cores by a duty cycle, unless a
+//! Giverny app holds it with the tabs' already. Linux without systemd and
+//! Windows run it as they always have, the lease advisory
+//! (`$GIVERNY_RUN_NO_SYSTEMD` on Linux stands in for macOS, for tests).
 //!
 //! **The lease.** The task's lease in the ledger ([`resources`]). With none,
 //! `run` claims one itself — the default lease (`[management_panel.lease]`,
@@ -59,7 +66,7 @@
 //! The exit code is the command's (128 + the signal when one killed it).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -67,7 +74,7 @@ use giverny_core::limits::Mem;
 use serde_json::{Map, Value, json};
 
 use crate::manage::{self, Flags};
-use crate::{manage_history, resources, run_live};
+use crate::{manage_history, resources, run_live, user_cap};
 
 /// How often a running command's session leases are beaten (the TTL is 20m).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -124,6 +131,7 @@ pub fn detect_mode() -> Mode {
     }
     #[cfg(target_os = "linux")]
     {
+        use std::process::Stdio;
         let quiet = |c: &mut Command| {
             c.stdin(Stdio::null()).stderr(Stdio::null());
         };
@@ -308,8 +316,11 @@ pub struct Measured {
     pub cpu_ms: Option<u64>,
     pub wall_ms: u64,
     pub oom_kills: u64,
-    /// Held by a systemd scope.
+    /// Held: by a systemd scope, or by Giverny itself ([`Measured::held_mb`]).
     pub capped: bool,
+    /// Held by Giverny itself, with no cgroups here (macOS;
+    /// [`crate::user_cap::RunGuard`]): the memory it was held to, MiB.
+    pub held_mb: Option<u64>,
 }
 
 /// Knobs a test turns.
@@ -360,14 +371,22 @@ pub fn run_with(
     let Some((lease, claimed)) = lease_for(dir, ledger, session, task, flags, cap)? else {
         return Ok((String::new(), resources::exit::REFUSED));
     };
-    // The limit's cores and the default lease, for the jobs.
-    let (cores, default_mb) = match cap {
-        Some(c) => (c.limits.cpu_cores, c.default_lease.ram.0),
+    // The limits (the jobs' cores; the ceiling where Giverny holds it
+    // itself) and the default lease.
+    let (limit, default_mb) = match cap {
+        Some(c) => (
+            user_cap::Ceiling {
+                ram_mb: c.limits.ram.0,
+                cpu_cores: c.limits.cpu_cores,
+            },
+            c.default_lease.ram.0,
+        ),
         None => (
-            limit_cores(),
+            user_cap::Ceiling::now(),
             giverny_core::config::DefaultLease::load().ram.0,
         ),
     };
+    let cores = limit.cpu_cores;
     let held = (|| {
         let _slots = lock_slots(dir, ledger, session, task, &lease.slots)?;
         let cap = Cap {
@@ -379,7 +398,7 @@ pub fn run_with(
             session.to_string(),
             opts.heartbeat_every,
         );
-        let m = execute(ledger, session, task, &cap, &flags.command, opts);
+        let m = execute(ledger, session, task, &cap, limit, &flags.command, opts);
         drop(hb);
         m.map(|m| (m, cap))
     })();
@@ -400,8 +419,20 @@ pub fn run_with(
         record_usage(row, &m, &cap, &flags.command, manage::now_ms())
     });
     say(task, &summary(&m, &cap));
-    if m.oom_kills > 0 {
-        let more = Mem((cap.ram_mb * 2).max(1024));
+    let more = Mem((cap.ram_mb * 2).max(1024));
+    if m.oom_kills > 0 && m.held_mb.is_some() {
+        say(
+            task,
+            &format!(
+                "killed (OOM): its command passed the memory Giverny holds it to on this \
+                 machine, which has no cgroups ({}: twice its lease, within the limits). Its \
+                 lease was {}. Ask for more: `giverny manage release {task}` then `giverny \
+                 manage claim {task} --ram {more}` (or have the manager do it), and run it again",
+                Mem(m.held_mb.unwrap_or(0)),
+                Mem(cap.ram_mb)
+            ),
+        );
+    } else if m.oom_kills > 0 {
         say(
             task,
             &format!(
@@ -412,6 +443,12 @@ pub fn run_with(
                 crate::tab_cap::SLICE,
                 Mem(cap.ram_mb)
             ),
+        );
+    } else if m.held_mb.is_some() && m.signal == Some(9) {
+        say(
+            task,
+            "killed by SIGKILL: perhaps the Giverny app's memory ceiling (the Claude work on \
+             this machine together passed the limits), perhaps someone else",
         );
     } else if m.capped && m.signal == Some(9) && cap.ram_mb > 0 {
         say(
@@ -426,15 +463,6 @@ pub fn run_with(
         );
     }
     Ok((String::new(), m.exit))
-}
-
-/// The limit's cores on this machine (`[manager.limits]`, `auto` where
-/// unreadable): the most build jobs a run is given.
-fn limit_cores() -> u32 {
-    let limits = giverny_core::limits::Limits::load().unwrap_or_default();
-    limits
-        .resolve(&giverny_core::limits::Machine::detect_cpu_ram())
-        .cpu_cores
 }
 
 /// `exit 0; peak 1.2G of 3G, 45.1s CPU in 30.2s`.
@@ -716,12 +744,14 @@ fn stats_path(ledger: &Path) -> Result<PathBuf, String> {
 }
 
 /// Run `cmd` under `cap` and measure it. A scope systemd would not make
-/// falls back to running plain.
+/// falls back to running plain, held by Giverny itself where it holds the
+/// limits (macOS: [`crate::user_cap`]) under `limit`.
 fn execute(
     ledger: &Path,
     session: &str,
     task: &str,
     cap: &Cap,
+    limit: user_cap::Ceiling,
     cmd: &[String],
     opts: Opts,
 ) -> Result<Measured, String> {
@@ -749,7 +779,7 @@ fn execute(
         );
         // Seen by the management panel while it runs.
         let live = run_live::register(&stats, task, session, manage::now_ms());
-        let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals);
+        let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals, |_| ()).map(|w| w.0);
         drop(live);
         let st = std::fs::read_to_string(&stats)
             .map(|t| parse_stats(&t))
@@ -768,6 +798,7 @@ fn execute(
                 wall_ms: w.wall_ms,
                 oom_kills: st.oom_kills,
                 capped: true,
+                held_mb: None,
             });
         }
         say(
@@ -777,15 +808,39 @@ fn execute(
                 w.exit
             ),
         );
-    } else {
-        say(
+    }
+    // No cgroups (macOS): Giverny holds the command itself (giverny#389).
+    let held = (opts.mode == Mode::Plain && user_cap::active())
+        .then(|| user_cap::Ceiling::for_run(cap.ram_mb, limit));
+    // The app, when one holds this work, holds its CPU with every other
+    // claude's: two duty cycles on one process would undo each other.
+    let hold_cpu = held.is_some() && !user_cap::app_holds();
+    match held {
+        Some(ceiling) => say(
+            task,
+            &format!(
+                "no cgroups here (macOS, or ${NO_SYSTEMD_ENV} set): leased {}, held by Giverny \
+                 itself: killed above {} (twice its lease, within the limits), its CPU held to \
+                 {} {}",
+                cap.describe(),
+                Mem(ceiling.ram_mb),
+                user_cap::cores_text(ceiling.cpu_cores),
+                if hold_cpu {
+                    "by this run"
+                } else {
+                    "by the Giverny app with the tabs'"
+                }
+            ),
+        ),
+        None if opts.mode == Mode::Plain => say(
             task,
             &format!(
                 "not capped (no user systemd here, or ${NO_SYSTEMD_ENV} set): \
                  running it plain, the lease ({}) advisory",
                 cap.describe()
             ),
-        );
+        ),
+        None => {}
     }
     // No scope weighs it: on macOS, low priority instead, so the person's
     // work goes first (giverny#387).
@@ -793,15 +848,30 @@ fn execute(
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]);
     jobs_env(&mut c, cap);
-    let w = spawn_wait(&mut c, &cmd[0], opts.ignore_signals)?;
+    // Seen by the app (which holds it with the tabs where there are no
+    // cgroups) and by the ledger's CPU-busy check, as a scope is.
+    let live = stats_path(ledger)
+        .ok()
+        .and_then(|stats| run_live::register(&stats, task, session, manage::now_ms()));
+    let t = task.to_string();
+    let (w, guard) = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, |pid| {
+        held.map(|ceiling| user_cap::RunGuard::start(pid, ceiling, hold_cpu, move |s| say(&t, s)))
+    })?;
+    drop(live);
+    let seen = guard.map(user_cap::RunGuard::finish).unwrap_or_default();
     Ok(Measured {
         exit: w.exit,
         signal: w.signal,
-        peak_mb: w.maxrss_mb,
+        // The whole tree's, where the guard watched it.
+        peak_mb: match (seen.peak_mb, w.maxrss_mb) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
         cpu_ms: w.cpu_ms,
         wall_ms: w.wall_ms,
-        oom_kills: 0,
-        capped: false,
+        oom_kills: seen.kills,
+        capped: held.is_some(),
+        held_mb: held.map(|c| c.ram_mb),
     })
 }
 
@@ -821,10 +891,18 @@ struct Waited {
     wall_ms: u64,
 }
 
-/// Spawn and reap `c`, with its rusage on Unix.
-fn spawn_wait(c: &mut Command, what: &str, ignore_signals: bool) -> Result<Waited, String> {
+/// Spawn and reap `c`, with its rusage on Unix; `watch` is handed the
+/// child's pid as it starts, and what it returns is held until the child
+/// is reaped.
+fn spawn_wait<G>(
+    c: &mut Command,
+    what: &str,
+    ignore_signals: bool,
+    watch: impl FnOnce(u32) -> G,
+) -> Result<(Waited, G), String> {
     let t0 = Instant::now();
     let mut child = c.spawn().map_err(|e| format!("{what}: {e}"))?;
+    let watching = watch(child.id());
     #[cfg(unix)]
     {
         let _ = &mut child;
@@ -862,25 +940,31 @@ fn spawn_wait(c: &mut Command, what: &str, ignore_signals: bool) -> Result<Waite
         } else {
             rss.div_ceil(1024)
         };
-        Ok(Waited {
-            exit,
-            signal,
-            cpu_ms: Some(cpu_ms),
-            maxrss_mb: (maxrss_mb > 0).then_some(maxrss_mb),
-            wall_ms,
-        })
+        Ok((
+            Waited {
+                exit,
+                signal,
+                cpu_ms: Some(cpu_ms),
+                maxrss_mb: (maxrss_mb > 0).then_some(maxrss_mb),
+                wall_ms,
+            },
+            watching,
+        ))
     }
     #[cfg(not(unix))]
     {
         let _ = ignore_signals;
         let st = child.wait().map_err(|e| format!("{what}: wait: {e}"))?;
-        Ok(Waited {
-            exit: st.code().unwrap_or(1),
-            signal: None,
-            cpu_ms: None,
-            maxrss_mb: None,
-            wall_ms: t0.elapsed().as_millis() as u64,
-        })
+        Ok((
+            Waited {
+                exit: st.code().unwrap_or(1),
+                signal: None,
+                cpu_ms: None,
+                maxrss_mb: None,
+                wall_ms: t0.elapsed().as_millis() as u64,
+            },
+            watching,
+        ))
     }
 }
 

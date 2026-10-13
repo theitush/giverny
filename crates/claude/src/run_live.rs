@@ -10,8 +10,11 @@
 //! processes (`cgroup.procs`) the way it measures everything else it
 //! shows.
 //!
-//! A command run plain (no user systemd) has no cgroup of its own and is
-//! not sampled. A `.live` file whose `run` is gone (killed) is skipped by
+//! A command run plain (no user systemd: macOS) registers the same file,
+//! with no cgroup in its stats: its processes are the `run` process's and
+//! everything below it ([`running_plain`]), which the app holds to the
+//! limits itself ([`crate::user_cap`], giverny#389) and the ledger counts
+//! as building. A `.live` file whose `run` is gone (killed) is skipped by
 //! readers and swept by the next `run`.
 
 use std::collections::HashSet;
@@ -215,6 +218,22 @@ pub fn running_since(runs_dir: &Path) -> Vec<(String, String, PathBuf, Option<u6
         .collect()
 }
 
+/// Every running command under `runs_dir` with no scope of its own (run
+/// plain): `(session, task, the run process)`, whose command is below it.
+pub fn running_plain(runs_dir: &Path) -> Vec<(String, String, u32)> {
+    read_dir(runs_dir)
+        .into_iter()
+        .filter(|(_, l)| alive(l.pid))
+        .filter(|(_, l)| {
+            std::fs::read_to_string(&l.stats)
+                .ok()
+                .and_then(|t| cgroup_of(&t))
+                .is_none()
+        })
+        .map(|(_, l)| (l.session, l.task, l.pid))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +290,30 @@ mod tests {
         drop(reg);
         assert!(!live_path(&stats).exists());
         assert!(running(&runs).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A plain run (no cgroup in its stats) is listed by its process, not
+    /// as a scope.
+    #[test]
+    fn a_plain_run_is_listed_by_its_process() {
+        let d = scratch("plain");
+        let runs = d.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let scoped = runs.join("1-0.stats");
+        std::fs::write(
+            &scoped,
+            format!("started\ncgroup {}\n", d.join("cg").display()),
+        )
+        .unwrap();
+        let _a = register(&scoped, "demo#1", "s1", 1_000).expect("registered");
+        // A plain run's stats file is never written.
+        let _b = register(&runs.join("1-1.stats"), "demo#2", "s1", 1_000).expect("registered");
+        assert_eq!(
+            running_plain(&runs),
+            [("s1".to_string(), "demo#2".to_string(), std::process::id())]
+        );
+        assert_eq!(running(&runs).len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
