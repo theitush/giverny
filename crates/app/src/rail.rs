@@ -112,7 +112,9 @@ struct RowData {
     started: bool,
     color: Color32,
     claude: ClaudeState,
-    /// A background shell is alive while Claude itself waits at its prompt.
+    /// Something Claude started still works — a background shell, or
+    /// subagents it handed work to — while Claude itself waits at its
+    /// prompt, free to talk.
     background: bool,
 }
 
@@ -209,7 +211,7 @@ fn row_data(
         started: app.rt.contains_key(&t.id),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
-        background: ct.is_some_and(|c| c.background),
+        background: ct.is_some_and(|c| c.working_in_background()),
     }
 }
 
@@ -1000,10 +1002,11 @@ fn tab_row(
         // and movement.
         ClaudeState::DoneUnseen => tick(&p, dot, c.green),
         ClaudeState::Idle => {
-            // A background shell keeps running while Claude waits at its
-            // prompt. Worth showing — it is why a directory is still churning
-            // — but it is not the agent working, and animating it would say
-            // "come back later" about a tab that is waiting on you.
+            // A background shell or its subagents keep running while Claude
+            // waits at its prompt. Worth showing — it is why a directory is
+            // still churning — but it is not the agent working: it can take a
+            // message, and animating it would say "come back later" about a
+            // tab that is waiting on you.
             if row.background {
                 for i in -1..=1 {
                     p.circle_filled(dot + Vec2::new(i as f32 * 4.0, 0.0), 1.4, dim);
