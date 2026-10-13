@@ -1186,9 +1186,13 @@ fn wslg_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
                 .color(c.poppy),
             );
             ui.label(
-                egui::RichText::new("Fix: in PowerShell as administrator, then reopen Giverny:")
-                    .font(FontId::monospace(10.0))
-                    .color(c.dim),
+                egui::RichText::new(
+                    "Fix: in PowerShell as administrator. It ends all of WSL, \
+                     this window and its Claude sessions included, so reopen \
+                     Giverny after:",
+                )
+                .font(FontId::monospace(10.0))
+                .color(c.dim),
             );
             egui::Frame::NONE
                 .fill(c.fg.gamma_multiply(0.08))

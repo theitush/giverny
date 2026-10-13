@@ -271,7 +271,8 @@ fn wslg_slow_mode() -> Option<&'static str> {
         tracing::warn!(
             "WSLg started without its shared memory with Windows (weston.log: use_gfxredir = 0): \
              every frame goes over RDP as a bitmap and typing will lag. \
-             Fix: `{}` in PowerShell as administrator, then reopen Giverny",
+             Fix: `{}` in PowerShell as administrator. It ends all of WSL, this \
+             window and its Claude sessions included; reopen Giverny after",
             wslg::SLOW_MODE_FIX
         );
         return Some(wslg::SLOW_MODE_FIX);
@@ -1567,13 +1568,19 @@ impl App {
         // Asked before the workspace moves into the app: a restored tab is how
         // an upgrade is told apart from a first run.
         let welcome = splash::due(paths.base(), !ws.tabs.is_empty());
+        // One watchdog per WSLg: the Giverny holding the relay socket. A
+        // second window, or a side instance trying out a build, must not end
+        // the msrdc the first one's window lives in, nor end it twice.
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-        let wslg_watchdog = {
+        let wslg_watchdog = (claude.relay_listening()
+            && std::env::var_os(claude_watch::NO_ACCOUNT_SETUP_ENV).is_none())
+        .then(|| {
             let ctx = cc.egui_ctx.clone();
             wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
                 ctx.request_repaint()
             })
-        };
+        })
+        .flatten();
         let mut app = App {
             shared,
             ws,
@@ -3608,11 +3615,13 @@ impl eframe::App for App {
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         self.show_attention(&ctx, frame);
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-        if self
-            .wslg_watchdog
-            .as_ref()
-            .is_some_and(wslg_watchdog::Handle::take_remap)
-            && self.coming_forward.is_none()
+        // Not while coming forward, which maps the window again anyway: the
+        // request waits for the next frame rather than being taken and lost.
+        if self.coming_forward.is_none()
+            && self
+                .wslg_watchdog
+                .as_ref()
+                .is_some_and(wslg_watchdog::Handle::take_remap)
         {
             self.coming_forward = Some(ComingForward::quiet());
         }
