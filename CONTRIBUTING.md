@@ -19,7 +19,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs exactly these on Linux, plus build-only jobs for macOS and Windows.
+CI runs exactly these on Linux. On macOS and Windows it builds and runs the same clippy, without tests.
 
 ## Where things live
 
