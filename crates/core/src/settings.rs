@@ -702,27 +702,19 @@ pub const SETTINGS: &[SettingDef] = &[
         needs_restart: false,
         kind: Kind::Bool { default: true },
     },
-    SettingDef {
-        key: "management_panel.lease.cpu_cores",
-        label: "CPU cores",
-        section: Section::ManagementPanel,
-        doc: "Cores a task's lease holds when nothing says otherwise. Also each Claude tab's CPU weight (100 a core) in `giverny-claude.slice`.",
-        note: &[
-            "What `giverny manage run` claims for a task that holds no lease, unless",
-            "--cpu says. `giverny manage resources` prints it.",
-        ],
-        needs_restart: false,
-        kind: Kind::Lease {
-            field: LimitField::Cores,
-            default: "3",
-        },
-    },
+    // No `management_panel.lease.cpu_cores` row since giverny#387: a lease
+    // reserves RAM only (CPU is shared and measured), so the key, still
+    // read where a file has it, counts for nothing.
     SettingDef {
         key: "management_panel.lease.ram",
         label: "RAM",
         section: Section::ManagementPanel,
-        doc: "Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`.",
-        note: &["A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it."],
+        doc: "Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`. A lease reserves RAM only: CPU is shared and measured.",
+        note: &[
+            "A size like \"3G\" or \"512M\" (a bare number is GiB); --ram overrides it.",
+            "What `giverny manage run` claims for a task that holds no lease;",
+            "it also sets the run's CARGO_BUILD_JOBS (a job a GiB).",
+        ],
         needs_restart: false,
         kind: Kind::Lease {
             field: LimitField::Ram,
@@ -733,11 +725,11 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "manager.limits.cpu_cores",
         label: "CPU cores",
         section: Section::ManagementPanel,
-        doc: "Cores all manager sessions together may hand to workers, and the hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = all but 2.",
+        doc: "The hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). Cores are shared, never leased: a claim waits only while they are measured busy. auto = all but 2.",
         note: &[
-            "The resource ledger (`giverny manage claim`) grants workers cores,",
-            "RAM and GPUs out of these limits, across every manager on",
-            "this machine, and reads them on each claim: an edit applies to the",
+            "The resource ledger (`giverny manage claim`) grants workers RAM",
+            "and GPUs out of these limits, across every manager on this",
+            "machine, and reads them on each claim: an edit applies to the",
             "next one. A number, or \"auto\" (cores - 2, at least 1).",
         ],
         needs_restart: false,
@@ -1113,8 +1105,8 @@ mod tests {
         assert_eq!(parsed.manager, defaults.manager);
         assert_eq!(parsed.management_panel, defaults.management_panel);
         assert!(
-            text.contains("\n[management_panel.lease]\n") && text.contains("\ncpu_cores = 3\n"),
-            "the lease's cores are an integer:\n{text}"
+            text.contains("\n[management_panel.lease]\n") && !text.contains("\ncpu_cores = 3\n"),
+            "the lease is RAM only (giverny#387):\n{text}"
         );
         assert!(
             text.contains("\n[manager.limits]\n"),
@@ -1441,12 +1433,13 @@ mod tests {
                 tokens: false,
             }
         );
-        let cfg = set("management_panel.lease.cpu_cores", Value::Text("2".into()));
-        assert_eq!(cfg.management_panel.lease.cpu_cores, 2);
         let cfg = set("management_panel.lease.ram", Value::Text("1536M".into()));
         assert_eq!(cfg.management_panel.lease.ram, Mem(1536));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("cpu_cores = 2\n"), "an integer: {text}");
+        assert!(
+            by_key("management_panel.lease.cpu_cores").is_none(),
+            "no cores to pick (giverny#387)"
+        );
         assert_eq!(
             config::DefaultLease::from_config_str(&text),
             cfg.management_panel.lease,
@@ -1457,14 +1450,7 @@ mod tests {
         assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(4));
         // Not a lease: refused, file untouched.
         let bad = Value::Text("0".into());
-        assert!(
-            write(
-                &dir,
-                by_key("management_panel.lease.cpu_cores").unwrap(),
-                &bad
-            )
-            .is_err()
-        );
+        assert!(write(&dir, by_key("management_panel.lease.ram").unwrap(), &bad).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         let _ = std::fs::remove_dir_all(&dir);
     }

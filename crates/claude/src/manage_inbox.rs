@@ -68,7 +68,7 @@ pub struct Message {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    /// What the sender holds for `from_task` (`3 cpu, 3G`), or `released`.
+    /// What the sender holds for `from_task` (`3G, slot cargo:/t`), or `released`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holds: Option<String>,
     /// What the sender waits for in the queue, and where.
@@ -473,8 +473,8 @@ fn ago(now: u64, at: u64) -> String {
     }
 }
 
-/// What the sender is: `task acme#5 — priority high, queued #1 for 4 cpu,
-/// 8G, ~10m of work`.
+/// What the sender is: `task acme#5 — priority high, queued #1 for 8G,
+/// ~10m of work`.
 fn sender(m: &Message) -> String {
     let mut s = format!("session {}", short(&m.from_session));
     if let Some(t) = &m.from_task {
@@ -532,7 +532,7 @@ pub fn render(m: &Message, me: &str, ledger: Option<&Ledger>, now: u64) -> Strin
                  Weigh its Priority and time left against yours. If you give way, do it first:\n\
                  - free it: `giverny-manage release {t}` (a worker's next `giverny-manage run {t}` \
                  claims afresh and waits its turn)\n\
-                 - or shrink it in place: `giverny-manage claim {t} --cpu <fewer> --ram <less>`\n\
+                 - or shrink it in place: `giverny-manage claim {t} --ram <less>`\n\
                  Then always answer, even to say no: `giverny-manage reply {id} \"<your answer>\"`, \
                  and carry on.",
                 id = m.id,
@@ -620,12 +620,12 @@ mod tests {
             default_lease: Default::default(),
             mem_use: Default::default(),
             cpu_use: Default::default(),
+            cpu: Default::default(),
         }
     }
 
-    fn slot(cpu: u32) -> resources::Request {
+    fn slot() -> resources::Request {
         resources::Request {
-            cpu,
             ram_mb: 3072,
             slots: vec!["cargo:/t".into()],
             ..Default::default()
@@ -636,8 +636,8 @@ mod tests {
     fn resolve_finds_the_holder_by_task_or_session() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "holder-session-1", "demo#12", None, &slot(3), T0);
-        l.claim(&c, "asker-session-2", "acme#5", None, &slot(1), T0);
+        l.claim(&c, "holder-session-1", "demo#12", None, &slot(), T0);
+        l.claim(&c, "asker-session-2", "acme#5", None, &slot(), T0);
         assert_eq!(
             resolve(&l, "asker-session-2", "demo#12").unwrap(),
             ("holder-session-1".into(), Some("demo#12".into()))
@@ -670,7 +670,7 @@ mod tests {
     fn messages_expire_with_the_askers_entry() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "a", "t", None, &slot(1), T0);
+        l.claim(&c, "a", "t", None, &slot(), T0);
         let mut m = Message {
             id: "m1".into(),
             kind: Kind::Ask,
@@ -705,7 +705,7 @@ mod tests {
     fn a_reply_says_what_the_replier_holds_when_it_is_read() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "h", "t12", None, &slot(3), T0);
+        l.claim(&c, "h", "t12", None, &slot(), T0);
         // The holder answered first, while it still held the lease...
         let m = Message {
             id: "m2".into(),
@@ -717,7 +717,7 @@ mod tests {
             about: Some("t5".into()),
             text: "yes, releasing".into(),
             in_reply_to: Some("m1".into()),
-            holds: Some("3 cpu, 3G, slot cargo:/t".into()),
+            holds: Some("3G, slot cargo:/t".into()),
             wants: None,
             position: None,
             priority: None,
@@ -726,7 +726,7 @@ mod tests {
             delivered_at: None,
         };
         let held = render(&m, "a", Some(&l), T0 + 2 * MIN);
-        assert!(held.contains("t12 now holds 3 cpu, 3G"), "{held}");
+        assert!(held.contains("t12 now holds 3G"), "{held}");
         assert!(held.contains("2m ago"), "{held}");
         // ... and released right after: the asker reads that.
         l.release("h", "t12", T0);

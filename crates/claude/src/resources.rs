@@ -1,19 +1,29 @@
 //! The machine ledger: what every manager on this machine holds.
 //!
 //! Before a worker starts, its manager *claims* what the worker needs
-//! (`giverny manage claim <task> --cpu 3 --ram 3G --slot cargo:/x/target`) and
-//! is answered *granted*, *granted smaller* (fewer cores, down to
-//! `--min-cpu`, or less RAM, down to `--min-ram`) or *queued* behind whoever holds what it needs. The answer is a
-//! [`Lease`] in one JSON file shared by every session on the machine; it is
-//! the "hello" managers say to each other, and the source of truth when
-//! they talk or when a worker's commands are capped to its
-//! grant.
+//! (`giverny manage claim <task> --ram 3G --slot cargo:/x/target`) and is
+//! answered *granted*, *granted smaller* (less RAM, down to `--min-ram`) or
+//! *queued* behind whoever holds what it needs. The answer is a [`Lease`]
+//! in one JSON file shared by every session on the machine; it is the
+//! "hello" managers say to each other, and the source of truth when they
+//! talk or when a worker's commands are capped to its grant.
+//!
+//! **Reserve RAM; CPU is shared and measured** (giverny#387). A lease holds
+//! memory (and GPUs, VRAM, slots), never cores: running out of memory kills
+//! a command, running out of CPU only slows everyone, and the kernel
+//! already shares the cores — every `run` scope at one `CPUWeight`, the
+//! Claude tabs above them, all under the slice's hard `CPUQuota`
+//! ([`crate::tab_cap`]). Declared cores only queued workers for cores the
+//! kernel would have shared anyway. So no manager says anything about CPU;
+//! a claim waits on it only when the CPU has really been saturated for
+//! about a minute *and* tasks are already building ([`Ledger::cpu_busy`]).
 //!
 //! **The file.** `<feed dir>/resources/ledger.json` (`$GIVERNY_LEDGER`
 //! overrides), every read-modify-write under an exclusive `flock` on the
 //! sibling `ledger.lock`, the write itself atomic (temp name, rename). Its
 //! format is [`Ledger`]; `docs/management-panel.md` (**Resources**) describes it
-//! for other writers.
+//! for other writers. A `cpu` on a lease or request written before
+//! giverny#387 is read and ignored.
 //!
 //! **Liveness.** A lease or a queued request lives [`TTL_MS`] past its
 //! `heartbeat_at`; every `giverny manage` command from its session refreshes
@@ -21,21 +31,16 @@
 //! what it held without anyone cleaning up.
 //!
 //! **The grant rule** ([`Ledger::try_fit`]): a request fits when
-//! - its CPU fits by **measured use**, not by the sum of leases
-//!   (giverny#318): every lease counts at the high end of the cores its
-//!   kind uses over a task's life (p90 of the history's CPU time over wall
-//!   time, [`crate::manage_history::expected_cpu_m`]), or at what its
-//!   running commands use now when that is more, never above its lease;
-//!   with too little history, at its lease ([`Capacity::counted_cpu_m`]).
-//!   Their sum is raised by a headroom, the largest gap between one lease
-//!   and what it counts at (at least a core), and never past the leases'
-//!   sum ([`Ledger::counted_cpu_m`]): one lease may start a build at any
-//!   moment. The new lease must then fit **whole** (it is the one about to
-//!   build) under the limit less that sum, and under the machine's cores
-//!   less that sum or the 1-minute load average, whichever is more: what
-//!   really runs now still blocks, idle reservations do not. An
-//!   over-admitted moment slows tasks by their `CPUWeight` shares rather
-//!   than starving any;
+//! - the CPU is not busy ([`Ledger::cpu_busy`]): busy is, on Linux, the
+//!   slice's CPU time over about the last minute at [`BUSY_PCT`] of its
+//!   quota or more, or its `cpu.pressure` (`some avg60`) at
+//!   [`PRESSURE_PCT`]; on macOS (no cgroups) the host's 1-minute load
+//!   average at that share of the limit's cores — *and* at
+//!   least [`MIN_BUILDERS`] leases have a `run` command going or were
+//!   granted in the last [`FRESH_MS`] (their build not yet in the measure).
+//!   So one busy build alone never holds the next worker back, nor does
+//!   load that is not the workers'; a third worker waits only while two
+//!   already fill the CPU ([`CpuBusy`]);
 //! - its memory fits by **expected peaks**, not by the sum of leases
 //!   (giverny#281): every task, running or about to, counts at its expected
 //!   peak — the high end of its kind's measured history (p90, as `claim`
@@ -70,7 +75,7 @@
 //! must kill, kills a command (never a claude, [`crate::tab_cap`]), which
 //! `run` reports and the history learns from.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use giverny_core::limits::{Limits, Load, Machine, Mem, Resolved};
@@ -90,6 +95,22 @@ pub const BEAT_EVERY_MS: u64 = 30 * 1000;
 pub const LEDGER_ENV: &str = "GIVERNY_LEDGER";
 /// A granted-smaller RAM figure is rounded down to this (MiB).
 const RAM_STEP_MB: u64 = 256;
+/// The CPU is saturated when it has been this busy, percent of the
+/// limit's cores, over about the last minute (giverny#387): close enough
+/// to the quota that a new build would only split the cores further.
+pub const BUSY_PCT: u64 = 90;
+/// …or when some task in the slice waited for a CPU this much of the last
+/// minute (`cpu.pressure`, `some avg60`, percent): work is already queuing
+/// for cores, whatever the counters say.
+pub const PRESSURE_PCT: f64 = 60.0;
+/// A saturated CPU holds a claim back only with at least this many leases
+/// building (or about to): one build alone, however busy, never starves
+/// the next worker, and load that is not the workers' never holds them.
+pub const MIN_BUILDERS: usize = 2;
+/// A lease granted this recently counts as building: its command has not
+/// started yet, so no measure can see it, and a burst of claims the
+/// moment the CPU frees must not all be granted at once.
+pub const FRESH_MS: u64 = 2 * 60 * 1000;
 
 /// Exit codes of `giverny manage claim`.
 pub mod exit {
@@ -143,12 +164,11 @@ pub(crate) mod ts {
     }
 }
 
-/// What a claim asks for.
+/// What a claim asks for: memory, GPUs and slots — never cores
+/// (giverny#387; a `cpu` in an older ledger is ignored).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Request {
-    /// Cores.
-    pub cpu: u32,
     pub ram_mb: u64,
     /// How many GPUs, each with `vram_mb` free.
     pub gpu: u32,
@@ -158,9 +178,6 @@ pub struct Request {
     /// Grant less RAM than `ram_mb`, down to this, rather than queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_ram_mb: Option<u64>,
-    /// Grant fewer cores than `cpu`, down to this, rather than queue.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_cpu: Option<u32>,
     /// The task's Priority (`asap`, `high`, `medium`, `low`): queued ahead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -169,14 +186,10 @@ pub struct Request {
     /// counts at its RAM (or the default lease when it asks none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_mb: Option<u64>,
-    /// The cores tasks like this one use over their life (the high end of
-    /// their history), thousandths: what its lease counts at once granted.
-    /// `None`: too little history, so it counts at its whole lease.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_use_m: Option<u64>,
 }
 
-/// What one session's task holds.
+/// What one session's task holds: memory, GPUs and slots, never cores
+/// (giverny#387; a `cpu` in an older ledger is ignored).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     /// `<session>:<task>`: one lease per task per session.
@@ -186,8 +199,6 @@ pub struct Lease {
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    #[serde(default)]
-    pub cpu: u32,
     #[serde(default)]
     pub ram_mb: u64,
     /// The GPUs granted, by index; each holds `vram_mb` of it.
@@ -201,10 +212,6 @@ pub struct Lease {
     /// gave one; else it counts at `ram_mb` (or the default lease).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_mb: Option<u64>,
-    /// The cores its kind's history says it uses, thousandths
-    /// (giverny#318); else it counts at its whole `cpu`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_use_m: Option<u64>,
     #[serde(with = "ts")]
     pub granted_at: u64,
     #[serde(with = "ts")]
@@ -259,8 +266,10 @@ pub struct Capacity {
     pub default_lease: giverny_core::config::DefaultLease,
     /// What the slice really holds now.
     pub mem_use: MemUse,
-    /// What the leases' running commands use now.
+    /// What the leases' running commands use now (shown, never admitted on).
     pub cpu_use: CpuUse,
+    /// How busy the CPU has been lately, and who is building.
+    pub cpu: CpuBusy,
 }
 
 impl Capacity {
@@ -270,14 +279,18 @@ impl Capacity {
     pub fn detect(ledger: &Path) -> Result<Capacity, String> {
         let machine = Machine::detect();
         let configured = Limits::load()?;
+        let load = Load::sample();
+        let now = manage::now_ms();
+        let runs = crate::run_live::runs_dir(ledger);
         Ok(Capacity {
             limits: configured.resolve(&machine),
             configured,
-            load: Load::sample(),
+            cpu: CpuBusy::sample(ledger, &load, now),
+            load,
             machine,
             default_lease: giverny_core::config::DefaultLease::load(),
-            mem_use: MemUse::sample(&crate::run_live::runs_dir(ledger)),
-            cpu_use: CpuUse::sample(&crate::run_live::runs_dir(ledger), manage::now_ms()),
+            mem_use: MemUse::sample(&runs),
+            cpu_use: CpuUse::sample(&runs, now),
         })
     }
 
@@ -291,23 +304,178 @@ impl Capacity {
         });
         expected.max(self.mem_use.of(&l.id))
     }
+}
 
-    /// What CPU admission counts `l` at, thousandths of a core: its kind's
-    /// expected use, or what its commands use now when that is more, never
-    /// above its lease; its whole lease when there is no history.
-    pub fn counted_cpu_m(&self, l: &Lease) -> u64 {
-        let lease = u64::from(l.cpu) * 1000;
-        match l.cpu_use_m {
-            Some(e) => e.max(self.cpu_use.of(&l.id)).min(lease),
-            None => lease,
+/// How busy the CPU has been over about the last minute, and which leases
+/// are building (giverny#387): what a claim waits on instead of declared
+/// cores. Measured, never declared.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CpuBusy {
+    /// The slice's cores busy on average, thousandths: its `cpu.stat`
+    /// `usage_usec` over the last minute or so, from the samples kept
+    /// beside the ledger ([`slice_busy_m`]). `None` without a slice (macOS,
+    /// no user systemd) or before a sample is old enough.
+    pub slice_m: Option<u64>,
+    /// macOS only, which has no slice: the host's 1-minute load average,
+    /// thousandths of a core. The supported platforms are Linux with
+    /// systemd (WSL too) and macOS; elsewhere nothing measures the CPU and
+    /// a claim never waits on it.
+    pub load_m: Option<u64>,
+    /// The slice's `cpu.pressure` `some avg60`, percent.
+    pub pressure: Option<f64>,
+    /// Leases with a `giverny manage run` command going now, by id.
+    pub running: HashSet<String>,
+    /// When it was sampled, epoch ms: what [`FRESH_MS`] is counted from.
+    pub at_ms: u64,
+}
+
+impl CpuBusy {
+    /// This machine now: the slice's use and pressure where it has one,
+    /// the host's load average on macOS, the `run` commands going under the
+    /// ledger at `ledger`.
+    pub fn sample(ledger: &Path, load: &Load, now: u64) -> CpuBusy {
+        let slice = slice_dir();
+        let slice_m = slice.as_ref().and_then(|d| {
+            let usec = std::fs::read_to_string(d.join("cpu.stat"))
+                .ok()
+                .and_then(|t| stat_field(&t, "usage_usec"))?;
+            slice_busy_m(&cpu_samples_path(ledger), now, usec)
+        });
+        let pressure = slice.as_ref().and_then(|d| {
+            std::fs::read_to_string(d.join("cpu.pressure"))
+                .ok()
+                .and_then(|t| some_avg60(&t))
+        });
+        CpuBusy {
+            slice_m,
+            load_m: load
+                .load1
+                .filter(|_| cfg!(target_os = "macos"))
+                .map(|l| (l.max(0.0) * 1000.0).round() as u64),
+            pressure,
+            running: crate::run_live::running_leases(&crate::run_live::runs_dir(ledger)),
+            at_ms: now,
         }
     }
+
+    /// The busy figure `resources` and a queued claim show, thousandths of
+    /// a core: the slice's own where it is known, else (macOS) the load
+    /// average.
+    pub fn busy_m(&self) -> Option<u64> {
+        self.slice_m.or(self.load_m)
+    }
+
+    /// Saturated over about the last minute, under limits of `limit`
+    /// cores: what measures it ([`CpuBusy::busy_m`]) at [`BUSY_PCT`] of
+    /// the limit, or the slice's pressure at [`PRESSURE_PCT`]. Nothing
+    /// measured is never saturated.
+    pub fn saturated(&self, limit: u32) -> bool {
+        let by_use = self
+            .busy_m()
+            .is_some_and(|m| limit > 0 && m * 100 >= u64::from(limit) * 1000 * BUSY_PCT);
+        let by_pressure = self.pressure.is_some_and(|p| p >= PRESSURE_PCT);
+        by_use || by_pressure
+    }
+
+    /// `6.3 of 8 busy (giverny-claude.slice, last minute; pressure 12%)`,
+    /// `2.5 of 12 busy (1-minute load average)` on macOS, or `? of 8 busy`
+    /// when nothing measures it (yet).
+    pub fn describe(&self, limit: u32) -> String {
+        let busy = self.busy_m().map(fmt_cores).unwrap_or_else(|| "?".into());
+        let mut why = Vec::new();
+        if self.slice_m.is_some() {
+            why.push(format!("{}, last minute", crate::tab_cap::SLICE));
+        } else if self.load_m.is_some() {
+            why.push("1-minute load average".into());
+        }
+        if let Some(p) = self.pressure {
+            why.push(format!("pressure {p:.0}%"));
+        }
+        let mut s = format!("{busy} of {limit} busy");
+        if !why.is_empty() {
+            s.push_str(&format!(" ({})", why.join("; ")));
+        }
+        s
+    }
+}
+
+/// `<ledger dir>/cpu-samples`: the slice's CPU counter as seen by recent
+/// `claim`s and `resources`, one `<epoch ms> <usage_usec>` a line.
+pub fn cpu_samples_path(ledger: &Path) -> PathBuf {
+    ledger
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("cpu-samples")
+}
+
+/// A sample younger than this is not a minute's measure yet (ms).
+const SAMPLE_MIN_MS: u64 = 20 * 1000;
+/// A new sample is kept when the newest is this old (ms).
+const SAMPLE_EVERY_MS: u64 = 30 * 1000;
+/// The window: the oldest sample is dropped once the next is this old.
+const SAMPLE_WINDOW_MS: u64 = 60 * 1000;
+/// A sample older than this says nothing about now (ms).
+const SAMPLE_MAX_MS: u64 = 5 * 60 * 1000;
+
+/// The slice's cores busy since the oldest sample in `samples` that is at
+/// least [`SAMPLE_MIN_MS`] old, thousandths, with `usec` its counter at
+/// `now`; and `samples` kept to about a minute's window. Samples from the
+/// future, older than [`SAMPLE_MAX_MS`] or above the counter (a reset
+/// slice) are dropped.
+pub fn busy_from_samples(samples: &mut Vec<(u64, u64)>, now: u64, usec: u64) -> Option<u64> {
+    samples.retain(|&(at, u)| at <= now && now - at <= SAMPLE_MAX_MS && u <= usec);
+    samples.sort_unstable();
+    // µs of CPU per ms of wall time is thousandths of a core.
+    let busy = samples
+        .iter()
+        .find(|&&(at, _)| now - at >= SAMPLE_MIN_MS)
+        .map(|&(at, u)| (usec - u) / (now - at));
+    if samples
+        .last()
+        .is_none_or(|&(at, _)| now - at >= SAMPLE_EVERY_MS)
+    {
+        samples.push((now, usec));
+    }
+    while samples.len() > 1 && now - samples[1].0 >= SAMPLE_WINDOW_MS {
+        samples.remove(0);
+    }
+    busy
+}
+
+/// [`busy_from_samples`] over the samples file at `path`, written back
+/// (atomically; two writers at once lose a sample, never the file).
+fn slice_busy_m(path: &Path, now: u64, usec: u64) -> Option<u64> {
+    let mut samples: Vec<(u64, u64)> = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
+        })
+        .collect();
+    let busy = busy_from_samples(&mut samples, now, usec);
+    let text: String = samples.iter().map(|(a, u)| format!("{a} {u}\n")).collect();
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+    busy
+}
+
+/// `some avg60=…` of a `cpu.pressure` file, percent.
+pub fn some_avg60(text: &str) -> Option<f64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("some "))?
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("avg60="))?
+        .parse()
+        .ok()
 }
 
 /// The cores the leases' running `giverny manage run` commands use now,
 /// thousandths, by lease id: each scope's `cpu.stat` `usage_usec` over the
-/// time it has run. An average since the command started, not an instant:
-/// the load average speaks for the instant.
+/// time it has run. An average since the command started, shown beside a
+/// lease by `resources`; admission never counts it (giverny#387).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CpuUse {
     pub by_lease: HashMap<String, u64>,
@@ -426,33 +594,23 @@ fn slice_dir() -> Option<PathBuf> {
     }
 }
 
-/// What is free now, after the leases and other programs' load.
+/// What is free now, after the leases and other programs' load. No
+/// cores: CPU is shared, not granted ([`Ledger::cpu_busy`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Free {
-    pub cpu: u32,
     pub ram_mb: u64,
     /// `(gpu index, free MiB of VRAM)` for each GPU under the limits.
     pub vram_mb: Vec<(u32, u64)>,
-    /// Load average beyond what the leases explain.
-    pub foreign_cpu: f64,
     /// RAM grantable by `MemAvailable` alone, when known: less the
     /// headroom and what the running tasks may still grow by.
     pub mem_room_mb: Option<u64>,
     /// What every lease counts at, summed ([`Capacity::counted_mb`]).
     pub counted_mb: u64,
-    /// What the leases count at for CPU with the headroom, thousandths
-    /// ([`Ledger::counted_cpu_m`]).
-    pub counted_cpu_m: u64,
-    /// The leases' cores, summed.
-    pub leased_cpu: u32,
-    /// The headroom in `counted_cpu_m`, thousandths.
-    pub cpu_headroom_m: u64,
 }
 
-/// A fitting grant: the cores, RAM and GPUs it gets.
+/// A fitting grant: the RAM and GPUs it gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fit {
-    pub cpu: u32,
     pub ram_mb: u64,
     pub gpus: Vec<u32>,
     /// What admission counted it at, MiB.
@@ -463,11 +621,9 @@ pub struct Fit {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Granted(Lease),
-    /// Fewer cores than asked (`wanted_cpu`), at least `--min-cpu`, or
-    /// less RAM (`wanted_mb`), at least `--min-ram`, or both.
+    /// Less RAM than asked (`wanted_mb`), at least `--min-ram`.
     GrantedSmaller {
         lease: Lease,
-        wanted_cpu: u32,
         wanted_mb: u64,
     },
     /// The task already holds this lease (a re-claim heartbeats it).
@@ -475,7 +631,8 @@ pub enum Outcome {
     /// In line at `position` (1-based); `blockers` are the leases holding
     /// what it needs, `ahead` the queued tasks before it, `short` what it
     /// is short of, `behind` who is really in the way ([`in_the_way`]),
-    /// and `request` what it asked.
+    /// `request` what it asked, and `cpu` how busy the CPU is when that is
+    /// what it waits on ([`CpuBusy::describe`]).
     Queued {
         position: usize,
         blockers: Vec<Lease>,
@@ -483,6 +640,7 @@ pub enum Outcome {
         short: Vec<String>,
         behind: Option<String>,
         request: Request,
+        cpu: Option<String>,
     },
     /// Larger than the limits allow: never queued.
     Refused(String),
@@ -587,30 +745,31 @@ impl Ledger {
             .find(|l| l.session == session && l.task == task)
     }
 
-    /// What the leases count at for CPU, thousandths, and the headroom in
-    /// it: each at [`Capacity::counted_cpu_m`], the sum raised by the
-    /// largest gap between one lease and what it counts at (at least a
-    /// core), never past the sum of the leases. With no history every lease
-    /// counts whole and this is that sum.
-    pub fn counted_cpu_m(&self, cap: &Capacity) -> (u64, u64) {
-        let leased: u64 = self.leases.iter().map(|l| u64::from(l.cpu) * 1000).sum();
-        let counted: u64 = self.leases.iter().map(|l| cap.counted_cpu_m(l)).sum();
-        let gap = self
-            .leases
+    /// The leases building now or about to (giverny#387): a `run` command
+    /// going, or granted in the last [`FRESH_MS`] — its build not started,
+    /// so no measure sees it yet.
+    pub fn builders(&self, cap: &Capacity) -> Vec<&Lease> {
+        self.leases
             .iter()
-            .map(|l| (u64::from(l.cpu) * 1000).saturating_sub(cap.counted_cpu_m(l)))
-            .max()
-            .unwrap_or(0)
-            .max(1000);
-        let total = (counted + gap).min(leased);
-        (total, total - counted)
+            .filter(|l| {
+                cap.cpu.running.contains(&l.id)
+                    || cap.cpu.at_ms.saturating_sub(l.granted_at) < FRESH_MS
+            })
+            .collect()
+    }
+
+    /// Is the CPU too busy for one more worker? Saturated over about the
+    /// last minute ([`CpuBusy::saturated`]) and at least [`MIN_BUILDERS`]
+    /// leases building ([`Ledger::builders`]). One busy build alone never
+    /// holds the next worker back, nor does load that is not the workers':
+    /// a claim waits only while workers already fill the CPU, so a new
+    /// build would only split the cores further.
+    pub fn cpu_busy(&self, cap: &Capacity) -> bool {
+        cap.cpu.saturated(cap.limits.cpu_cores) && self.builders(cap).len() >= MIN_BUILDERS
     }
 
     /// What is free now under `cap`.
     pub fn free(&self, cap: &Capacity) -> Free {
-        let leased_cpu: u32 = self.leases.iter().map(|l| l.cpu).sum();
-        let (counted_cpu_m, cpu_headroom_m) = self.counted_cpu_m(cap);
-        let counted_cpu = counted_cpu_m as f64 / 1000.0;
         let counted_mb: u64 = self.leases.iter().map(|l| cap.counted_mb(l)).sum();
         // What the leases may still grow by before their peaks: not yet
         // taken out of `MemAvailable`.
@@ -620,16 +779,6 @@ impl Ledger {
             .map(|l| cap.counted_mb(l).saturating_sub(cap.mem_use.of(&l.id)))
             .sum();
         let headroom = ram_headroom(&cap.machine).0;
-        let foreign_cpu = cap
-            .load
-            .load1
-            .map(|l| (l - counted_cpu).max(0.0))
-            .unwrap_or(0.0);
-        let by_limit = cap.limits.cpu_cores as f64 - counted_cpu;
-        // The cores less what really runs (the load average) or what the
-        // leases count at, whichever is more.
-        let by_machine = cap.machine.cores as f64 - cap.load.load1.unwrap_or(0.0).max(counted_cpu);
-        let cpu = by_limit.min(by_machine).floor().max(0.0) as u32;
         let mem_room_mb = cap
             .load
             .mem_available
@@ -657,15 +806,10 @@ impl Ledger {
             })
             .collect();
         Free {
-            cpu,
             ram_mb,
             vram_mb,
-            foreign_cpu,
             mem_room_mb,
             counted_mb,
-            counted_cpu_m,
-            leased_cpu,
-            cpu_headroom_m,
         }
     }
 
@@ -688,20 +832,14 @@ impl Ledger {
     }
 
     /// Does `req` fit now? `Ok(Fit)` with what it would get, else what is
-    /// short (`"cpu"`, `"ram"`, `"gpu"`, `"slot <name>"`).
+    /// short (`"cpu"` — the CPU is busy, [`Ledger::cpu_busy`] — `"ram"`,
+    /// `"gpu"`, `"slot <name>"`).
     pub fn try_fit(&self, cap: &Capacity, req: &Request) -> Result<Fit, Vec<String>> {
         let free = self.free(cap);
         let mut short = Vec::new();
-        // Fewer cores than asked, down to `--min-cpu` (at least one), when
-        // that is all that is free.
-        let cpu = if req.cpu <= free.cpu {
-            req.cpu
-        } else if req.min_cpu.is_some_and(|m| m.max(1) <= free.cpu) {
-            free.cpu
-        } else {
+        if self.cpu_busy(cap) {
             short.push("cpu".to_string());
-            0
-        };
+        }
         // The lease's RAM is the commands' protection; what must fit is
         // the task's expected peak. A smaller grant helps only a task with
         // no history, which counts at its RAM.
@@ -739,7 +877,6 @@ impl Ledger {
         }
         if short.is_empty() {
             Ok(Fit {
-                cpu,
                 ram_mb,
                 counted_mb: Ledger::counted_for(cap, req, ram_mb),
                 gpus: gpus
@@ -765,7 +902,6 @@ impl Ledger {
                 .try_fit(
                     cap,
                     &Request {
-                        cpu: 0,
                         ram_mb: 0,
                         slots: vec![],
                         ..r.clone()
@@ -778,15 +914,13 @@ impl Ledger {
                 session: w.session.clone(),
                 task: w.task.clone(),
                 repo: None,
-                cpu: r.cpu,
                 ram_mb: r.ram_mb,
                 gpus,
                 vram_mb: r.vram_mb,
                 slots: r.slots.clone(),
                 peak_mb: Some(Ledger::counted_for(cap, r, r.ram_mb)),
-                // Set aside whole: it is about to start.
-                cpu_use_m: None,
-                granted_at: w.queued_at,
+                // About to start: it counts as building, as a fresh grant.
+                granted_at: cap.cpu.at_ms,
                 heartbeat_at: w.heartbeat_at,
             });
         }
@@ -796,10 +930,6 @@ impl Ledger {
     /// Why `req` can never fit under the limits, if it cannot.
     pub fn never_fits(cap: &Capacity, req: &Request) -> Option<String> {
         let l = &cap.limits;
-        let cpu = req.min_cpu.unwrap_or(req.cpu).min(req.cpu);
-        if cpu > l.cpu_cores {
-            return Some(format!("{cpu} cores asked; the limit is {}", l.cpu_cores));
-        }
         let ram = req.min_ram_mb.unwrap_or(req.ram_mb).min(req.ram_mb);
         if ram > l.ram.0 {
             return Some(format!("{} RAM asked; the limit is {}", Mem(ram), l.ram));
@@ -873,21 +1003,18 @@ impl Ledger {
                     session: session.into(),
                     task: task.into(),
                     repo: repo.map(String::from),
-                    cpu: fit.cpu,
                     ram_mb: fit.ram_mb,
                     gpus: fit.gpus,
                     vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
                     slots: req.slots.clone(),
                     peak_mb: req.peak_mb.map(|_| fit.counted_mb),
-                    cpu_use_m: req.cpu_use_m,
                     granted_at: now,
                     heartbeat_at: now,
                 };
                 self.leases.push(lease.clone());
-                if lease.cpu < req.cpu || lease.ram_mb < req.ram_mb {
+                if lease.ram_mb < req.ram_mb {
                     Outcome::GrantedSmaller {
                         lease,
-                        wanted_cpu: req.cpu,
                         wanted_mb: req.ram_mb,
                     }
                 } else {
@@ -896,13 +1023,23 @@ impl Ledger {
             }
             fit => {
                 let short = fit.err().unwrap_or_default();
+                let building: HashSet<String> =
+                    self.builders(cap).iter().map(|l| l.id.clone()).collect();
+                let is_building = |l: &Lease| building.contains(&l.id);
                 let blockers: Vec<Lease> = self
                     .leases
                     .iter()
-                    .filter(|l| blocks(l, req, &short))
+                    .filter(|l| blocks(l, req, &short, &is_building))
                     .cloned()
                     .collect();
-                let behind = in_the_way(&blockers, &ahead, req, &short);
+                let behind = in_the_way(&blockers, &ahead, req, &short, &is_building);
+                let cpu = short.iter().any(|s| s == "cpu").then(|| {
+                    format!(
+                        "CPU busy: {}, {} tasks building",
+                        cap.cpu.describe(cap.limits.cpu_cores),
+                        building.len()
+                    )
+                });
                 Outcome::Queued {
                     position: position + 1,
                     blockers,
@@ -910,6 +1047,7 @@ impl Ledger {
                     short,
                     behind,
                     request: req.clone(),
+                    cpu,
                 }
             }
         }
@@ -925,7 +1063,6 @@ impl Ledger {
         &mut self,
         session: &str,
         task: &str,
-        cpu: Option<u32>,
         ram_mb: Option<u64>,
         vram_mb: Option<u64>,
         now: u64,
@@ -935,17 +1072,13 @@ impl Ledger {
             .iter_mut()
             .find(|l| l.session == session && l.task == task)?;
         let vram_mb = vram_mb.filter(|_| !l.gpus.is_empty());
-        let larger = cpu.is_some_and(|c| c > l.cpu)
-            || ram_mb.is_some_and(|r| r > l.ram_mb)
-            || vram_mb.is_some_and(|v| v > l.vram_mb);
-        let smaller = cpu.is_some_and(|c| c < l.cpu)
-            || ram_mb.is_some_and(|r| r < l.ram_mb)
-            || vram_mb.is_some_and(|v| v < l.vram_mb);
+        let larger = ram_mb.is_some_and(|r| r > l.ram_mb) || vram_mb.is_some_and(|v| v > l.vram_mb);
+        let smaller =
+            ram_mb.is_some_and(|r| r < l.ram_mb) || vram_mb.is_some_and(|v| v < l.vram_mb);
         if larger || !smaller {
             return None;
         }
         let before = l.clone();
-        l.cpu = cpu.unwrap_or(l.cpu);
         l.ram_mb = ram_mb.unwrap_or(l.ram_mb);
         l.vram_mb = vram_mb.unwrap_or(l.vram_mb);
         l.heartbeat_at = l.heartbeat_at.max(now);
@@ -960,20 +1093,6 @@ impl Ledger {
         for l in self.leases.iter_mut().filter(|l| l.peak_mb.is_none()) {
             if let Some(p) = peak(l) {
                 l.peak_mb = Some(p);
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Give each lease admitted before its kind had a CPU history (or before
-    /// giverny#318) the expected use `cpu` finds for it now, thousandths, so
-    /// it stops counting at its whole lease. True when any changed.
-    pub fn fill_cpu(&mut self, cpu: &dyn Fn(&Lease) -> Option<u64>) -> bool {
-        let mut changed = false;
-        for l in self.leases.iter_mut().filter(|l| l.cpu_use_m.is_none()) {
-            if let Some(c) = cpu(l) {
-                l.cpu_use_m = Some(c);
                 changed = true;
             }
         }
@@ -997,17 +1116,20 @@ impl Ledger {
 /// Who a queued `req` really waits on, given what it is `short` of: the
 /// first request queued `ahead` of it that wants any of that, since it goes
 /// first whatever frees (the queue is FIFO, no backfill); else the first
-/// of `leases` holding any of it; else nobody (other programs hold it).
+/// of `leases` holding any of it — for a busy CPU, the first `building`
+/// ([`Ledger::builders`]); else nobody (other programs hold it).
 pub fn in_the_way<'a>(
     leases: impl IntoIterator<Item = &'a Lease>,
     ahead: impl IntoIterator<Item = &'a Waiter>,
     req: &Request,
     short: &[String],
+    building: &dyn Fn(&Lease) -> bool,
 ) -> Option<String> {
     let wants = |w: &Waiter| {
         let r = &w.request;
         short.iter().any(|s| match s.as_str() {
-            "cpu" => r.cpu > 0,
+            // Every request waits on a busy CPU.
+            "cpu" => true,
             // Every request is set aside at some memory.
             "ram" => true,
             "gpu" => r.gpu > 0,
@@ -1023,15 +1145,15 @@ pub fn in_the_way<'a>(
         .or_else(|| {
             leases
                 .into_iter()
-                .find(|l| blocks(l, req, short))
+                .find(|l| blocks(l, req, short, building))
                 .map(|l| l.task.clone())
         })
 }
 
-/// What a queued request is short of, in its own sizes: `3 cores`, `3G`,
-/// `3 cores, 3G`, `gpu 8G`, `a slot`. Empty when nothing is known to be
+/// What a queued request is short of, in its own sizes: `CPU` (busy),
+/// `3G`, `CPU, 3G`, `gpu 8G`, `a slot`. Empty when nothing is known to be
 /// short. The panel's queued row and `claim`'s line both say it.
-pub fn short_need(short: &[String], cpu: u32, ram_mb: u64, vram_mb: u64) -> String {
+pub fn short_need(short: &[String], ram_mb: u64, vram_mb: u64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |p: String| {
         if !parts.contains(&p) {
@@ -1040,10 +1162,7 @@ pub fn short_need(short: &[String], cpu: u32, ram_mb: u64, vram_mb: u64) -> Stri
     };
     for s in short {
         match s.as_str() {
-            "cpu" => push(match cpu {
-                1 => "1 core".into(),
-                n => format!("{n} cores"),
-            }),
+            "cpu" => push("CPU".into()),
             "ram" if ram_mb > 0 => push(Mem(ram_mb).to_string()),
             "ram" => push("RAM".into()),
             "gpu" if vram_mb > 0 => push(format!("gpu {}", Mem(vram_mb))),
@@ -1054,10 +1173,11 @@ pub fn short_need(short: &[String], cpu: u32, ram_mb: u64, vram_mb: u64) -> Stri
     parts.join(", ")
 }
 
-/// Does lease `l` hold something `req` is short of?
-fn blocks(l: &Lease, req: &Request, short: &[String]) -> bool {
+/// Does lease `l` hold something `req` is short of? A busy CPU is held by
+/// the leases `building`.
+fn blocks(l: &Lease, req: &Request, short: &[String], building: &dyn Fn(&Lease) -> bool) -> bool {
     short.iter().any(|s| match s.as_str() {
-        "cpu" => l.cpu > 0,
+        "cpu" => building(l),
         // Every lease counts at some memory (its peak, RAM or the default).
         "ram" => true,
         "gpu" => !l.gpus.is_empty(),
@@ -1067,18 +1187,10 @@ fn blocks(l: &Lease, req: &Request, short: &[String]) -> bool {
     })
 }
 
-/// `2 cpu, 3G, gpu0 8G, slot cargo:/x`.
-pub fn describe_held(
-    cpu: u32,
-    ram_mb: u64,
-    gpus: &[u32],
-    vram_mb: u64,
-    slots: &[String],
-) -> String {
+/// `3G, gpu0 8G, slot cargo:/x`: what a lease holds — never cores
+/// (giverny#387).
+pub fn describe_held(ram_mb: u64, gpus: &[u32], vram_mb: u64, slots: &[String]) -> String {
     let mut parts = Vec::new();
-    if cpu > 0 {
-        parts.push(format!("{cpu} cpu"));
-    }
     if ram_mb > 0 {
         parts.push(Mem(ram_mb).to_string());
     }
@@ -1097,13 +1209,13 @@ pub fn describe_held(
 
 impl Lease {
     pub fn describe(&self) -> String {
-        describe_held(self.cpu, self.ram_mb, &self.gpus, self.vram_mb, &self.slots)
+        describe_held(self.ram_mb, &self.gpus, self.vram_mb, &self.slots)
     }
 }
 
 impl Request {
     pub fn describe(&self) -> String {
-        let mut s = describe_held(self.cpu, self.ram_mb, &[], 0, &self.slots);
+        let mut s = describe_held(self.ram_mb, &[], 0, &self.slots);
         if self.gpu > 0 {
             s.push_str(&format!(", {} gpu × {}", self.gpu, Mem(self.vram_mb)));
         }
@@ -1168,22 +1280,12 @@ pub fn ask_hint(
     ))
 }
 
-/// `, counted at its kind's 0.6 cpu, peak 1.2G` when admission counts a
-/// lease below its cores, or at an expected peak other than its RAM.
+/// `, counted at its kind's peak 1.2G` when admission counts a lease at an
+/// expected peak other than its RAM.
 fn counted(l: &Lease) -> String {
-    let mut parts = Vec::new();
-    match l.cpu_use_m {
-        Some(c) if c < u64::from(l.cpu) * 1000 => parts.push(format!("{} cpu", fmt_cores(c))),
-        _ => {}
-    }
     match l.peak_mb {
-        Some(p) if p != l.ram_mb => parts.push(format!("peak {}", Mem(p))),
-        _ => {}
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(", counted at its kind's {}", parts.join(", "))
+        Some(p) if p != l.ram_mb => format!(", counted at its kind's peak {}", Mem(p)),
+        _ => String::new(),
     }
 }
 
@@ -1198,25 +1300,12 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
     match o {
         Outcome::Granted(l) => format!("granted {task}: {}{}", l.describe(), counted(l)),
         Outcome::Held(l) => format!("{task} holds its lease already: {}", l.describe()),
-        Outcome::GrantedSmaller {
-            lease,
-            wanted_cpu,
-            wanted_mb,
-        } => {
-            let mut asked = Vec::new();
-            if lease.cpu < *wanted_cpu {
-                asked.push(format!("{wanted_cpu} cpu"));
-            }
-            if lease.ram_mb < *wanted_mb {
-                asked.push(Mem(*wanted_mb).to_string());
-            }
-            format!(
-                "granted smaller {task}: {}{} (asked {}, more is not free)",
-                lease.describe(),
-                counted(lease),
-                asked.join(", ")
-            )
-        }
+        Outcome::GrantedSmaller { lease, wanted_mb } => format!(
+            "granted smaller {task}: {}{} (asked {}, more is not free)",
+            lease.describe(),
+            counted(lease),
+            Mem(*wanted_mb)
+        ),
         Outcome::Queued {
             position,
             blockers,
@@ -1224,10 +1313,11 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
             short,
             behind,
             request,
+            cpu,
         } => {
             let mut s = format!("queued #{position}");
             // What is short, in the request's own sizes (the panel's words).
-            let need = short_need(short, request.cpu, request.ram_mb, request.vram_mb);
+            let need = short_need(short, request.ram_mb, request.vram_mb);
             if !need.is_empty() {
                 s.push_str(&format!(" for {need}"));
             }
@@ -1268,8 +1358,11 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
                         first.request.describe()
                     ));
                 }
-            } else if !short.is_empty() {
+            } else if short.iter().any(|x| x != "cpu") {
                 s.push_str(&format!(" ({} taken by other programs)", short.join(", ")));
+            }
+            if let Some(c) = cpu {
+                s.push_str(&format!("; {c}"));
             }
             s.push_str("; re-run the same claim to keep the place and take it when free");
             s
@@ -1284,16 +1377,12 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
         let mut v = json!({
             "state": state,
             "id": l.id,
-            "cpu": l.cpu,
             "ram_mb": l.ram_mb,
             "gpus": l.gpus,
             "vram_mb": l.vram_mb,
             "slots": l.slots,
             "granted_at": manage::stamp(l.granted_at),
         });
-        if state == "smaller" && l.cpu < req.cpu {
-            v["wanted_cpu"] = json!(req.cpu);
-        }
         if state == "smaller" && l.ram_mb < req.ram_mb {
             v["wanted_ram_mb"] = json!(req.ram_mb);
         }
@@ -1312,7 +1401,6 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
             "position": position,
             "behind": behind,
             "short": short,
-            "cpu": req.cpu,
             "ram_mb": req.ram_mb,
             "gpus": [],
             "vram_mb": req.vram_mb,
@@ -1540,29 +1628,27 @@ pub fn report(
         auto(cap.configured.gpus.get().is_none()),
     ));
     out.push_str(&format!(
-        "default   {} cores, {} RAM a task (Settings → Management panel)\n",
-        cap.default_lease.cpu_cores, cap.default_lease.ram
+        "default   {} RAM a task (Settings → Management panel)\n",
+        cap.default_lease.ram
+    ));
+    let building = l.builders(cap).len();
+    out.push_str(&format!(
+        "cpu       {} — shared, not reserved; {}\n",
+        cap.cpu.describe(lim.cpu_cores),
+        if l.cpu_busy(cap) {
+            format!("busy: claims wait ({building} tasks building)")
+        } else if cap.cpu.saturated(lim.cpu_cores) {
+            format!("saturated, but {building} task(s) building: claims go on")
+        } else {
+            "claims go on".to_string()
+        }
     ));
     out.push_str(&format!(
-        "cores     {} counted of {}: the {} leased at their kinds' use (or use now, \
-         or lease), {} headroom\n",
-        fmt_cores(free.counted_cpu_m),
-        lim.cpu_cores,
-        free.leased_cpu,
-        fmt_cores(free.cpu_headroom_m),
-    ));
-    out.push_str(&format!(
-        "others    load {:.1} beyond what the leases count; {} available{} (headroom {})\n",
-        free.foreign_cpu,
+        "others    {} available (headroom {})\n",
         cap.load
             .mem_available
             .map(|m| m.to_string())
             .unwrap_or_else(|| "?".into()),
-        if cap.load.load1.is_none() {
-            ", load ?"
-        } else {
-            ""
-        },
         ram_headroom(m),
     ));
     out.push_str(&format!(
@@ -1574,8 +1660,7 @@ pub fn report(
         ram_headroom(m),
     ));
     out.push_str(&format!(
-        "free now  {} cores, {} RAM{}\n",
-        free.cpu,
+        "free now  {} RAM{}\n",
         Mem(free.ram_mb),
         free.vram_mb
             .iter()
@@ -1594,11 +1679,10 @@ pub fn report(
             let using = cap.mem_use.of(&x.id);
             let counts = cap.counted_mb(x);
             let cpu_using = cap.cpu_use.of(&x.id);
-            let cpu_counts = format!("{} cpu", fmt_cores(cap.counted_cpu_m(x)));
             let mem = match (cpu_using > 0, using > 0) {
-                (false, false) => format!("  counts {cpu_counts}, {}", Mem(counts)),
+                (false, false) => format!("  counts {}", Mem(counts)),
                 (c, m) => format!(
-                    "  counts {cpu_counts}, {}, using {}",
+                    "  counts {}, using {}",
                     Mem(counts),
                     [
                         c.then(|| format!("{} cpu", fmt_cores(cpu_using))),
@@ -1675,12 +1759,16 @@ mod tests {
             default_lease: Default::default(),
             mem_use: Default::default(),
             cpu_use: Default::default(),
+            cpu: CpuBusy {
+                slice_m: Some(0),
+                at_ms: T0,
+                ..Default::default()
+            },
         }
     }
 
-    fn req(cpu: u32, ram_gb: u64) -> Request {
+    fn req(ram_gb: u64) -> Request {
         Request {
-            cpu,
             ram_mb: ram_gb * 1024,
             ..Default::default()
         }
@@ -1690,13 +1778,13 @@ mod tests {
     fn two_sessions_past_the_limit_queue_and_a_release_unblocks() {
         let c = cap();
         let mut l = Ledger::default();
-        let a = l.claim(&c, "a", "t1", None, &req(6, 7), T0);
+        let a = l.claim(&c, "a", "t1", None, &req(7), T0);
         assert!(matches!(a, Outcome::Granted(_)), "{a:?}");
-        let b = l.claim(&c, "b", "t2", None, &req(6, 7), T0);
+        let b = l.claim(&c, "b", "t2", None, &req(7), T0);
         assert!(matches!(b, Outcome::Granted(_)), "{b:?}");
-        // The limit (12 cores, 16 G less 1.15 G headroom) is full: a third
-        // waits behind both.
-        let q = l.claim(&c, "b", "t3", None, &req(2, 2), T0 + MIN);
+        // The limit (16 G less 1.15 G headroom) is full: a third waits
+        // behind both.
+        let q = l.claim(&c, "b", "t3", None, &req(2), T0 + MIN);
         let Outcome::Queued {
             position, blockers, ..
         } = &q
@@ -1707,34 +1795,219 @@ mod tests {
         assert_eq!(blockers.len(), 2);
         assert_eq!(q.exit_code(), exit::QUEUED);
         // A fourth from session a lines up behind it.
-        let q2 = l.claim(&c, "a", "t4", None, &req(1, 1), T0 + 2 * MIN);
+        let q2 = l.claim(&c, "a", "t4", None, &req(1), T0 + 2 * MIN);
         assert!(matches!(q2, Outcome::Queued { position: 2, .. }), "{q2:?}");
         // Once t1 is released, t4 may go first only with what is left after
-        // t3's share is set aside (6 cores, 7.85 G free; t3 wants 2 and 2 G).
+        // t3's share is set aside (7.85 G free; t3 wants 2 G).
         assert!(l.release("a", "t1", T0 + 3 * MIN).is_some());
-        let big = l.claim(&c, "a", "t4", None, &req(5, 1), T0 + 3 * MIN);
+        let big = l.claim(&c, "a", "t4", None, &req(6), T0 + 3 * MIN);
         assert!(
             matches!(big, Outcome::Queued { position: 2, .. }),
             "{big:?}"
         );
-        let g = l.claim(&c, "a", "t4", None, &req(1, 1), T0 + 3 * MIN);
+        let g = l.claim(&c, "a", "t4", None, &req(1), T0 + 3 * MIN);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
-        let g = l.claim(&c, "b", "t3", None, &req(2, 2), T0 + 3 * MIN);
+        let g = l.claim(&c, "b", "t3", None, &req(2), T0 + 3 * MIN);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
         assert!(l.queue.is_empty());
         // A re-claim is the same lease.
-        let h = l.claim(&c, "a", "t4", None, &req(1, 1), T0 + 4 * MIN);
+        let h = l.claim(&c, "a", "t4", None, &req(1), T0 + 4 * MIN);
         assert!(matches!(h, Outcome::Held(_)), "{h:?}");
+    }
+
+    /// giverny#387: a claim holds no cores and waits on none. Ten leases
+    /// on a 12-core limit leave the next one granted on its RAM alone; an
+    /// older ledger's `cpu` figures are read and count for nothing.
+    #[test]
+    fn a_claim_is_granted_on_ram_alone_and_old_cpu_figures_are_ignored() {
+        let c = cap();
+        let mut l = Ledger::default();
+        for i in 0..10 {
+            let g = l.claim(&c, "a", &format!("t{i}"), None, &req(1), T0);
+            assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        }
+        let g = l.claim(&c, "b", "next", None, &req(3), T0);
+        let Outcome::Granted(lease) = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!(outcome_line("next", &g, &|_, _| None), "granted next: 3G");
+        let text = serde_json::to_string(lease).unwrap();
+        assert!(!text.contains("cpu"), "a lease holds no cores: {text}");
+        // A ledger from before: its cores are ignored, its RAM is not.
+        let old = Ledger::parse(
+            br#"{"version":1,"leases":[
+              {"id":"o:fold","session":"o","task":"fold","cpu":12,"cpu_use_m":900,
+               "ram_mb":2048,"granted_at":"2026-10-14T10:00:00Z",
+               "heartbeat_at":"2026-10-14T10:00:00Z"}],
+             "queue":[
+              {"id":"o:w","session":"o","task":"w","cpu":3,"min_cpu":1,"ram_mb":1024,
+               "queued_at":"2026-10-14T10:00:00Z","heartbeat_at":"2026-10-14T10:00:00Z"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.leases[0].describe(), "2G");
+        assert_eq!(old.queue[0].request.describe(), "1G");
+        assert!(old.try_fit(&c, &req(3)).is_ok());
+    }
+
+    /// The machine with the CPU `slice_m` thousandths busy over the last
+    /// minute and `running` leases building.
+    fn busy(slice_m: u64, running: &[&str]) -> Capacity {
+        let mut c = cap();
+        c.cpu.slice_m = Some(slice_m);
+        c.cpu.running = running.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    /// giverny#387: a claim waits on CPU only while the CPU has been
+    /// saturated *and* at least two tasks are building (or about to): one
+    /// busy build alone never holds the next worker back.
+    #[test]
+    fn a_claim_waits_on_cpu_only_when_saturated_with_two_building() {
+        // 11 of the 12 cores busy: saturated (at 90 %).
+        let mut l = Ledger::default();
+        l.claim(&cap(), "a", "build", None, &req(2), T0 - 10 * MIN);
+        let c = busy(11_000, &["a:build"]);
+        assert!(c.cpu.saturated(12));
+        // One build alone, however busy: the next worker goes.
+        let g = l.claim(&c, "b", "second", None, &req(2), T0);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        // Now two build (one running, one granted a moment ago): a third
+        // waits for CPU, behind the first building.
+        let q = l.claim(&c, "b", "third", None, &req(2), T0);
+        let Outcome::Queued { short, behind, .. } = &q else {
+            panic!("{q:?}")
+        };
+        assert_eq!(short, &vec!["cpu".to_string()]);
+        assert_eq!(behind.as_deref(), Some("build"));
+        let line = outcome_line("third", &q, &|_, _| None);
+        assert!(
+            line.starts_with(
+                "queued #1 for CPU behind build (2G), second (2G); CPU busy: 11.0 of 12 busy"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("2 tasks building"), "{line}");
+        let row = row_lease(&q, &req(2)).unwrap();
+        assert_eq!(row["short"], json!(["cpu"]));
+        assert!(row.get("cpu").is_none(), "{row}");
+        // The second's grant is no longer fresh and it runs nothing: one
+        // builds, so the third goes.
+        let mut later = busy(11_000, &["a:build"]);
+        later.cpu.at_ms = T0 + FRESH_MS;
+        assert!(!l.cpu_busy(&later));
+        assert!(matches!(
+            l.claim(&later, "b", "third", None, &req(2), T0 + FRESH_MS),
+            Outcome::Granted(_)
+        ));
+        // Two running but the CPU not saturated: no wait.
+        let calm = busy(6_000, &["a:build", "b:second"]);
+        assert!(!calm.cpu.saturated(12));
+        assert!(!l.cpu_busy(&calm));
+    }
+
+    /// What says the CPU is saturated: on Linux the slice at 90 % of its
+    /// quota or its pressure at 60 %; on macOS the load average at 90 % of
+    /// the limit.
+    #[test]
+    fn saturation_is_read_from_the_slice_or_on_macos_the_load() {
+        let at = |slice_m: Option<u64>, load_m: Option<u64>, pressure: Option<f64>| {
+            CpuBusy {
+                slice_m,
+                load_m,
+                pressure,
+                ..Default::default()
+            }
+            .saturated(12)
+        };
+        assert!(at(Some(10_800), None, None));
+        assert!(!at(Some(10_700), Some(13_000), None), "the slice speaks");
+        assert!(at(None, Some(10_800), None), "macOS: the load average");
+        assert!(!at(None, Some(10_000), None));
+        assert!(at(Some(1_000), None, Some(61.0)), "pressure");
+        assert!(!at(Some(1_000), None, Some(12.0)));
+        assert!(!at(None, None, None), "nothing measures: never busy");
+        let c = CpuBusy {
+            slice_m: Some(6_300),
+            pressure: Some(12.4),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.describe(8),
+            "6.3 of 8 busy (giverny-claude.slice, last minute; pressure 12%)"
+        );
+        let mac = CpuBusy {
+            load_m: Some(2_500),
+            ..Default::default()
+        };
+        assert_eq!(mac.describe(12), "2.5 of 12 busy (1-minute load average)");
+        assert_eq!(CpuBusy::default().describe(12), "? of 12 busy");
+        assert_eq!(
+            some_avg60(
+                "some avg10=1.00 avg60=12.40 avg300=3.66 total=7\n\
+                 full avg10=0.00 avg60=0.24 avg300=2.50 total=5\n"
+            ),
+            Some(12.4)
+        );
+        assert_eq!(some_avg60(""), None);
+    }
+
+    /// The slice's busy cores are its CPU counter over about the last
+    /// minute, from samples kept between calls.
+    #[test]
+    fn the_slices_busy_cores_come_from_samples_a_minute_apart() {
+        let s = 1_000_000;
+        let mut v: Vec<(u64, u64)> = Vec::new();
+        // The first sample says nothing yet.
+        assert_eq!(busy_from_samples(&mut v, T0, s), None);
+        assert_eq!(v, vec![(T0, s)]);
+        // 10 s later: too young a window; no new sample either.
+        assert_eq!(busy_from_samples(&mut v, T0 + 10_000, s + 60_000_000), None);
+        assert_eq!(v.len(), 1);
+        // 30 s on, 4 cores busy since: 120 s of CPU in 30 s.
+        assert_eq!(
+            busy_from_samples(&mut v, T0 + 30_000, s + 120_000_000),
+            Some(4000)
+        );
+        assert_eq!(v.len(), 2);
+        // 90 s on: measured from the oldest (T0), and the window slides.
+        assert_eq!(
+            busy_from_samples(&mut v, T0 + 90_000, s + 360_000_000),
+            Some(4000)
+        );
+        assert_eq!(
+            v.iter().map(|x| x.0).collect::<Vec<_>>(),
+            [T0 + 30_000, T0 + 90_000]
+        );
+        // A slice made anew (its counter back at zero) or samples too old
+        // to speak for now are dropped.
+        assert_eq!(busy_from_samples(&mut v, T0 + 100_000, 5), None);
+        let mut old = vec![(T0, s)];
+        assert_eq!(
+            busy_from_samples(&mut old, T0 + SAMPLE_MAX_MS + 1, s * 2),
+            None
+        );
+        // The file round trip.
+        let dir = std::env::temp_dir().join(format!("giverny-cpusamples-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cpu_samples_path(&dir.join("ledger.json"));
+        assert_eq!(slice_busy_m(&path, T0, s), None);
+        assert_eq!(
+            slice_busy_m(&path, T0 + 60_000, s + 120_000_000),
+            Some(2000)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_expired_lease_frees_itself_and_a_heartbeat_keeps_one() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "a", "big", None, &req(12, 4), T0);
-        l.claim(&c, "b", "kept", None, &req(0, 4), T0);
+        l.claim(&c, "a", "big", None, &req(10), T0);
+        l.claim(&c, "b", "kept", None, &req(4), T0);
         assert!(matches!(
-            l.claim(&c, "c", "x", None, &req(4, 1), T0),
+            l.claim(&c, "c", "x", None, &req(4), T0),
             Outcome::Queued { .. }
         ));
         // Session b keeps beating; a goes silent; c polls.
@@ -1743,7 +2016,7 @@ mod tests {
             l.heartbeat("c", T0 + k * 5 * MIN);
         }
         let now = T0 + TTL_MS + MIN;
-        let g = l.claim(&c, "c", "x", None, &req(4, 1), now);
+        let g = l.claim(&c, "c", "x", None, &req(4), now);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
         assert!(l.lease("a", "big").is_none(), "expired");
         assert!(
@@ -1752,8 +2025,8 @@ mod tests {
         );
         // A queued request that stops polling expires too.
         let mut l = Ledger::default();
-        l.claim(&c, "a", "big", None, &req(12, 1), T0);
-        l.claim(&c, "z", "gone", None, &req(1, 1), T0);
+        l.claim(&c, "a", "big", None, &req(14), T0);
+        l.claim(&c, "z", "gone", None, &req(1), T0);
         l.heartbeat("a", T0 + TTL_MS - MIN);
         assert_eq!(l.queue.len(), 1);
         l.expire(T0 + TTL_MS + MIN);
@@ -1766,7 +2039,6 @@ mod tests {
         let c = cap();
         let mut l = Ledger::default();
         let slot = |s: &str| Request {
-            cpu: 1,
             slots: vec![s.to_string()],
             ..Default::default()
         };
@@ -1785,7 +2057,7 @@ mod tests {
         assert_eq!(blockers[0].task, "w1");
         let line = outcome_line("w2", &q, &|_, t| (t == "w1").then_some(14 * 60));
         assert!(
-            line.starts_with("queued #1 for a slot behind w1 (1 cpu, slot cargo:/t; ~14m)"),
+            line.starts_with("queued #1 for a slot behind w1 (slot cargo:/t; ~14m)"),
             "{line}"
         );
         // Another slot is free.
@@ -1806,48 +2078,46 @@ mod tests {
     /// row's lease agree. The grant rule is not this test's.
     #[test]
     fn a_queued_request_names_what_is_short_and_who_is_in_the_way() {
-        let c = cap();
         let queued = |o: &Outcome| match o {
             Outcome::Queued { short, behind, .. } => (short.clone(), behind.clone()),
             o => panic!("{o:?}"),
         };
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        // CPU short: 10 of the 12 cores are held; RAM is plenty.
+        // CPU busy: fold146 and idle build on a saturated CPU; RAM is plenty.
         let mut l = Ledger::default();
-        l.claim(&c, "o", "fold146", None, &req(10, 2), T0);
-        let q = l.claim(&c, "a", "899x", None, &req(3, 3), T0);
+        l.claim(&cap(), "o", "fold146", None, &req(2), T0 - 10 * MIN);
+        l.claim(&cap(), "o", "idle", None, &req(1), T0 - 10 * MIN);
+        let c = busy(12_000, &["o:fold146", "o:idle"]);
+        let q = l.claim(&c, "a", "899x", None, &req(3), T0);
         assert_eq!(queued(&q), (s(&["cpu"]), Some("fold146".into())));
         let line = outcome_line("899x", &q, &|_, _| None);
         assert!(
-            line.starts_with("queued #1 for 3 cores behind fold146 (10 cpu, 2G)"),
+            line.starts_with("queued #1 for CPU behind fold146 (2G), idle (1G); CPU busy"),
             "{line}"
         );
-        let row = row_lease(&q, &req(3, 3)).unwrap();
+        let row = row_lease(&q, &req(3)).unwrap();
         assert_eq!(row["short"], json!(["cpu"]));
         assert_eq!(row["behind"], "fold146");
 
         // Held back by the request ahead: 899x goes first whatever frees,
-        // so a later one waits on it, not on the lease holder — even one
-        // that asks for no more than is free now.
-        for (cpu, ram) in [(3, 3), (2, 1)] {
-            let q = l.claim(&c, "b", "283", None, &req(cpu, ram), T0 + MIN);
-            assert_eq!(queued(&q), (s(&["cpu"]), Some("899x".into())));
-            let line = outcome_line("283", &q, &|_, _| None);
-            assert!(
-                line.starts_with(&format!(
-                    "queued #2 for {cpu} cores behind 899x (queued #1: 3 cpu, 3G); \
-                     held by fold146 (10 cpu, 2G)"
-                )),
-                "{line}"
-            );
-            assert_eq!(row_lease(&q, &req(cpu, ram)).unwrap()["behind"], "899x");
-        }
+        // so a later one waits on it, not on the builders.
+        let q = l.claim(&c, "b", "283", None, &req(1), T0 + MIN);
+        assert_eq!(queued(&q), (s(&["cpu"]), Some("899x".into())));
+        let line = outcome_line("283", &q, &|_, _| None);
+        assert!(
+            line.starts_with(
+                "queued #2 for CPU behind 899x (queued #1: 3G); held by fold146 (2G), idle (1G)"
+            ),
+            "{line}"
+        );
+        assert_eq!(row_lease(&q, &req(1)).unwrap()["behind"], "899x");
 
-        // RAM short: 12G of the ~14.8G held; cores are plenty.
+        // RAM short: 12G of the ~14.8G held; the CPU is idle.
+        let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "o", "big", None, &req(2, 12), T0);
-        let q = l.claim(&c, "a", "t", None, &req(1, 4), T0);
+        l.claim(&c, "o", "big", None, &req(12), T0);
+        let q = l.claim(&c, "a", "t", None, &req(4), T0);
         assert_eq!(queued(&q), (s(&["ram"]), Some("big".into())));
         assert!(
             outcome_line("t", &q, &|_, _| None).starts_with("queued #1 for 4G behind big"),
@@ -1857,106 +2127,16 @@ mod tests {
 
         // Both short.
         let mut l = Ledger::default();
-        l.claim(&c, "o", "big", None, &req(10, 12), T0);
-        let q = l.claim(&c, "a", "t", None, &req(3, 4), T0);
+        l.claim(&cap(), "o", "big", None, &req(12), T0 - 10 * MIN);
+        l.claim(&cap(), "o", "x", None, &req(1), T0 - 10 * MIN);
+        let c = busy(12_000, &["o:big", "o:x"]);
+        let q = l.claim(&c, "a", "t", None, &req(4), T0);
         assert_eq!(queued(&q), (s(&["cpu", "ram"]), Some("big".into())));
         assert!(
-            outcome_line("t", &q, &|_, _| None).starts_with("queued #1 for 3 cores, 4G behind big"),
+            outcome_line("t", &q, &|_, _| None).starts_with("queued #1 for CPU, 4G behind big"),
             "{}",
             outcome_line("t", &q, &|_, _| None)
         );
-    }
-
-    #[test]
-    fn min_cpu_takes_the_free_cores_instead_of_queueing() {
-        let c = cap();
-        let mut l = Ledger::default();
-        // Another session holds 10 of the 12 leasable cores: 2 are free.
-        assert!(matches!(
-            l.claim(&c, "other", "big", None, &req(10, 2), T0),
-            Outcome::Granted(_)
-        ));
-        // Without --min-cpu, 3 cores wait.
-        let q = l.claim(&c, "a", "merge", None, &req(3, 3), T0);
-        let Outcome::Queued { short, .. } = &q else {
-            panic!("{q:?}")
-        };
-        assert_eq!(short, &vec!["cpu".to_string()]);
-        // With --min-cpu 1 it takes the 2 that are free, and leaves the queue.
-        let r = Request {
-            min_cpu: Some(1),
-            ..req(3, 3)
-        };
-        let g = l.claim(&c, "a", "merge", None, &r, T0);
-        let Outcome::GrantedSmaller {
-            lease,
-            wanted_cpu,
-            wanted_mb,
-        } = &g
-        else {
-            panic!("{g:?}")
-        };
-        assert_eq!((lease.cpu, lease.ram_mb), (2, 3 * 1024));
-        assert_eq!((*wanted_cpu, *wanted_mb), (3, 3 * 1024));
-        assert_eq!(g.exit_code(), exit::GRANTED_SMALLER);
-        assert!(l.queue.is_empty(), "{:?}", l.queue);
-        assert_eq!(
-            outcome_line("merge", &g, &|_, _| None),
-            "granted smaller merge: 2 cpu, 3G (asked 3 cpu, more is not free)"
-        );
-        let row = row_lease(&g, &r).unwrap();
-        assert_eq!(row["state"], "smaller");
-        assert_eq!(row["cpu"], 2);
-        assert_eq!(row["wanted_cpu"], 3);
-        assert!(row.get("wanted_ram_mb").is_none(), "{row}");
-        // Fewer free than --min-cpu: it queues as ever.
-        let r = Request {
-            min_cpu: Some(2),
-            ..req(3, 1)
-        };
-        let q = l.claim(&c, "b", "fix", None, &r, T0);
-        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
-        // --min-cpu as large as --cpu, or a request that fits, is a plain grant.
-        l.release("other", "big", T0 + MIN);
-        let g = l.claim(&c, "b", "fix", None, &r, T0 + MIN);
-        assert!(matches!(g, Outcome::Granted(ref x) if x.cpu == 3), "{g:?}");
-        // --min-cpu under the limit is not refused for a --cpu above it.
-        let r = Request {
-            min_cpu: Some(4),
-            ..req(20, 1)
-        };
-        assert_eq!(Ledger::never_fits(&c, &r), None);
-        assert!(Ledger::never_fits(&c, &req(20, 1)).is_some());
-    }
-
-    #[test]
-    fn min_cpu_and_min_ram_shrink_together() {
-        let mut c = cap();
-        c.load.mem_available = Some(Mem::gb(5));
-        c.load.load1 = Some(12.0);
-        let mut l = Ledger::default();
-        // 14 cores − 12 busy = 2 free; 5G − 1.15G headroom = 3.85G free.
-        let r = Request {
-            min_cpu: Some(1),
-            min_ram_mb: Some(2048),
-            ..req(3, 6)
-        };
-        let g = l.claim(&c, "a", "t", None, &r, T0);
-        let Outcome::GrantedSmaller { lease, .. } = &g else {
-            panic!("{g:?}")
-        };
-        assert_eq!((lease.cpu, lease.ram_mb), (2, 3840));
-        assert_eq!(
-            outcome_line("t", &g, &|_, _| None),
-            "granted smaller t: 2 cpu, 3.8G (asked 3 cpu, 6G, more is not free)"
-        );
-        // RAM short past --min-ram still queues, whatever the cores.
-        let r = Request {
-            min_cpu: Some(1),
-            ..req(1, 6)
-        };
-        let q = Ledger::default().claim(&c, "a", "u", None, &r, T0);
-        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
     }
 
     #[test]
@@ -1965,19 +2145,16 @@ mod tests {
         // A browser eats RAM: 5 G available, less 1.15 G headroom.
         c.load.mem_available = Some(Mem::gb(5));
         let mut l = Ledger::default();
-        let q = l.claim(&c, "a", "t", None, &req(1, 6), T0);
+        let q = l.claim(&c, "a", "t", None, &req(6), T0);
         assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
         assert!(outcome_line("t", &q, &|_, _| None).contains("taken by other programs"));
         // With --min-ram it is granted what is there.
         let r = Request {
             min_ram_mb: Some(2048),
-            ..req(1, 6)
+            ..req(6)
         };
         let g = l.claim(&c, "a", "t", None, &r, T0);
-        let Outcome::GrantedSmaller {
-            lease, wanted_mb, ..
-        } = &g
-        else {
+        let Outcome::GrantedSmaller { lease, wanted_mb } = &g else {
             panic!("{g:?}")
         };
         assert_eq!(*wanted_mb, 6 * 1024);
@@ -1986,20 +2163,25 @@ mod tests {
             "5G − 1.15G headroom, down to 256M steps"
         );
         assert_eq!(g.exit_code(), exit::GRANTED_SMALLER);
-        // Load beyond the leases takes cores: 14 − 9 busy = 5 free.
-        let mut c = cap();
-        c.load.load1 = Some(9.0);
-        let l = Ledger::default();
-        assert_eq!(l.free(&c).cpu, 5);
-        assert!(l.try_fit(&c, &req(6, 1)).is_err());
+        assert_eq!(
+            outcome_line("t", &g, &|_, _| None),
+            "granted smaller t: 3.8G (asked 6G, more is not free)"
+        );
+        let row = row_lease(&g, &r).unwrap();
+        assert_eq!(row["state"], "smaller");
+        assert_eq!(row["wanted_ram_mb"], 6 * 1024);
+        // Past --min-ram it queues.
+        let r = Request {
+            min_ram_mb: Some(4096),
+            ..req(6)
+        };
+        let q = Ledger::default().claim(&c, "a", "u", None, &r, T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
     }
 
     /// A lease as a 3G default, its kind peaking at `peak_mb`.
     fn idle(l: &mut Ledger, c: &Capacity, task: &str, peak_mb: Option<u64>) {
-        let r = Request {
-            peak_mb,
-            ..req(1, 3)
-        };
+        let r = Request { peak_mb, ..req(3) };
         let g = l.claim(c, "other", task, Some("demo"), &r, T0);
         assert!(matches!(g, Outcome::Granted(_)), "{task}: {g:?}");
     }
@@ -2018,7 +2200,7 @@ mod tests {
         assert_eq!(free.counted_mb, 5 * 1229);
         let new = Request {
             peak_mb: Some(1229),
-            ..req(1, 3)
+            ..req(3)
         };
         let g = l.claim(&c, "s", "new", Some("demo"), &new, T0);
         let Outcome::Granted(lease) = &g else {
@@ -2028,7 +2210,7 @@ mod tests {
         assert_eq!((lease.ram_mb, lease.peak_mb), (3 * 1024, Some(1229)));
         assert_eq!(
             outcome_line("new", &g, &|_, _| None),
-            "granted new: 1 cpu, 3G, counted at its kind's peak 1.2G"
+            "granted new: 3G, counted at its kind's peak 1.2G"
         );
 
         // Leases granted before their kind had a history (or before #281)
@@ -2051,7 +2233,7 @@ mod tests {
         // A lease of no RAM and no history counts at the default lease.
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "s", "slot", None, &req(1, 0), T0);
+        l.claim(&c, "s", "slot", None, &req(0), T0);
         assert_eq!(l.free(&c).counted_mb, 3 * 1024);
     }
 
@@ -2062,7 +2244,7 @@ mod tests {
     fn a_really_full_box_still_queues() {
         let new = Request {
             peak_mb: Some(1229),
-            ..req(1, 3)
+            ..req(3)
         };
         // Tasks that peak at 3.5G: four fill 16G less the headroom.
         let c = cap();
@@ -2139,121 +2321,14 @@ mod tests {
         assert_eq!(u.of("s1:demo#7"), 2048);
         assert_eq!(u.of("s1:other"), 0);
         assert_eq!(held_mb(&dir.join("none")), None);
+        // Who is building: every live run, scope or not.
+        let plain = runs.join("1-1.stats");
+        std::fs::write(&plain, "").unwrap();
+        let _p = crate::run_live::register(&plain, "acme#5", "s2", T0).unwrap();
+        let mut ids: Vec<String> = crate::run_live::running_leases(&runs).into_iter().collect();
+        ids.sort();
+        assert_eq!(ids, ["s1:demo#7", "s2:acme#5"]);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A 2-core lease whose kind uses `use_m` thousandths of a core.
-    fn busy(l: &mut Ledger, c: &Capacity, task: &str, use_m: Option<u64>) {
-        let r = Request {
-            cpu_use_m: use_m,
-            ..req(2, 1)
-        };
-        let g = l.claim(c, "tolad", task, Some("ToLaD"), &r, T0);
-        assert!(matches!(g, Outcome::Granted(_)), "{task}: {g:?}");
-    }
-
-    /// giverny#318: five 2-core leases of a kind that uses 0.58 cores over
-    /// a task's life count at 2.9 cores and one burst of headroom (1.42),
-    /// not at the 10 leased: a 3-core task starts beside them.
-    #[test]
-    fn idle_cores_are_counted_at_their_kinds_use_not_their_lease() {
-        let c = cap();
-        let mut l = Ledger::default();
-        for t in ["a", "b", "c", "d", "e"] {
-            busy(&mut l, &c, t, Some(580));
-        }
-        let free = l.free(&c);
-        assert_eq!(free.leased_cpu, 10);
-        assert_eq!((free.counted_cpu_m, free.cpu_headroom_m), (4320, 1420));
-        // 12 − 4.32 by the limit; 14 − max(load 0, 4.32) by the machine.
-        assert_eq!(free.cpu, 7);
-        let new = Request {
-            cpu_use_m: Some(580),
-            ..req(3, 1)
-        };
-        let g = l.claim(&c, "s", "new", Some("ToLaD"), &new, T0);
-        let Outcome::Granted(lease) = &g else {
-            panic!("{g:?}")
-        };
-        assert_eq!((lease.cpu, lease.cpu_use_m), (3, Some(580)));
-        assert_eq!(
-            outcome_line("new", &g, &|_, _| None),
-            "granted new: 3 cpu, 1G, counted at its kind's 0.6 cpu"
-        );
-        // The new lease must fit whole: 12 − (3.48 + 2.42) leaves 6.
-        assert_eq!(l.free(&c).cpu, 6);
-        let big = l.claim(&c, "s", "big", None, &req(7, 1), T0);
-        assert!(matches!(big, Outcome::Queued { .. }), "{big:?}");
-        l.release("s", "big", T0);
-        let smaller = Request {
-            min_cpu: Some(4),
-            ..req(7, 1)
-        };
-        let g = l.claim(&c, "s", "big", None, &smaller, T0);
-        assert!(
-            matches!(&g, Outcome::GrantedSmaller { lease, .. } if lease.cpu == 6),
-            "{g:?}"
-        );
-
-        // Without history the same leases count whole, as before.
-        let mut l = Ledger::default();
-        for t in ["a", "b", "c", "d", "e"] {
-            busy(&mut l, &c, t, None);
-        }
-        let free = l.free(&c);
-        assert_eq!((free.counted_cpu_m, free.cpu_headroom_m), (10_000, 0));
-        assert_eq!(free.cpu, 2);
-        assert!(matches!(
-            l.claim(&c, "s", "new", None, &req(3, 1), T0),
-            Outcome::Queued { .. }
-        ));
-        // Their kind's history arrives: they are counted by it from then.
-        l.release("s", "new", T0);
-        assert!(l.fill_cpu(&|x| (x.repo.as_deref() == Some("ToLaD")).then_some(580)));
-        assert!(!l.fill_cpu(&|_| Some(1)), "a figure once given stays");
-        assert_eq!(l.free(&c).cpu, 7);
-    }
-
-    /// giverny#318: what really runs still blocks — a lease building now
-    /// counts at its use (never past its lease), and the load average
-    /// counts what the history cannot see.
-    #[test]
-    fn busy_cores_still_queue() {
-        let mut c = cap();
-        let mut l = Ledger::default();
-        for t in ["a", "b", "c", "d", "e"] {
-            busy(&mut l, &c, t, Some(580));
-        }
-        // `a` builds on 1.8 cores now: 1.8 + 4 × 0.58, plus 1.42 headroom.
-        c.cpu_use.by_lease.insert(lease_id("tolad", "a"), 1800);
-        assert_eq!(c.counted_cpu_m(&l.leases[0]), 1800);
-        assert_eq!(l.free(&c).counted_cpu_m, 1800 + 4 * 580 + 1420);
-        // Past its lease it counts at the lease.
-        c.cpu_use.by_lease.insert(lease_id("tolad", "a"), 4000);
-        assert_eq!(c.counted_cpu_m(&l.leases[0]), 2000);
-        // The machine is busy on 12 of 14 cores: 2 are free, whatever the
-        // leases count at.
-        let mut c = cap();
-        c.load.load1 = Some(12.0);
-        let free = l.free(&c);
-        assert_eq!(free.cpu, 2);
-        assert!((free.foreign_cpu - (12.0 - 4.32)).abs() < 1e-9);
-        assert_eq!(l.try_fit(&c, &req(3, 1)), Err(vec!["cpu".to_string()]));
-        // One idle lease left: it counts at its use and a whole core of
-        // headroom, never past its lease.
-        let c = cap();
-        let mut l = Ledger::default();
-        busy(&mut l, &c, "a", Some(200));
-        assert_eq!(l.counted_cpu_m(&c), (2000, 1800));
-        let mut l = Ledger::default();
-        let r = Request {
-            cpu_use_m: Some(500),
-            ..req(4, 1)
-        };
-        l.claim(&c, "s", "x", None, &r, T0);
-        assert_eq!(l.counted_cpu_m(&c), (4000, 3500));
-        l.claim(&c, "s", "y", None, &r, T0);
-        assert_eq!(l.counted_cpu_m(&c), (4500, 3500));
     }
 
     /// A run's cores are its scope's CPU time over the time it has run.
@@ -2286,13 +2361,13 @@ mod tests {
     fn too_big_is_refused_not_queued_and_gpus_degrade_to_none() {
         let c = cap();
         let mut l = Ledger::default();
-        let r = l.claim(&c, "a", "huge", None, &req(13, 1), T0);
+        let r = l.claim(&c, "a", "huge", None, &req(17), T0);
         assert!(matches!(r, Outcome::Refused(_)), "{r:?}");
         assert_eq!(r.exit_code(), exit::REFUSED);
         let gpu = Request {
             gpu: 1,
             vram_mb: 8 * 1024,
-            ..req(1, 1)
+            ..req(1)
         };
         let r = l.claim(&c, "a", "train", None, &gpu, T0);
         let Outcome::Refused(why) = &r else {
@@ -2331,16 +2406,27 @@ mod tests {
     fn priority_goes_first_in_the_queue() {
         let c = cap();
         let mut l = Ledger::default();
-        l.claim(&c, "a", "big", None, &req(12, 1), T0);
-        l.claim(&c, "b", "early", None, &req(1, 1), T0);
+        l.claim(&c, "a", "big", None, &req(14), T0);
+        l.claim(&c, "b", "early", None, &req(1), T0);
         let urgent = Request {
             priority: Some("ASAP".into()),
-            ..req(1, 1)
+            ..req(1)
         };
         let q = l.claim(&c, "c", "urgent", None, &urgent, T0 + MIN);
         assert!(matches!(q, Outcome::Queued { position: 1, .. }), "{q:?}");
         let order: Vec<&str> = l.ordered_queue().iter().map(|w| w.task.as_str()).collect();
         assert_eq!(order, ["urgent", "early"]);
+    }
+
+    #[test]
+    fn a_held_lease_shrinks_in_place_never_grows() {
+        let c = cap();
+        let mut l = Ledger::default();
+        l.claim(&c, "a", "t", None, &req(3), T0);
+        let (was, now) = l.shrink("a", "t", Some(1024), None, T0).unwrap();
+        assert_eq!((was.ram_mb, now.ram_mb), (3072, 1024));
+        assert!(l.shrink("a", "t", Some(2048), None, T0).is_none());
+        assert!(l.shrink("a", "t", None, None, T0).is_none());
     }
 
     #[test]
@@ -2350,7 +2436,7 @@ mod tests {
         let path = dir.join("resources").join("ledger.json");
         let c = cap();
         let out = with_ledger(&path, T0, |l| {
-            l.claim(&c, "a", "t", Some("demo"), &req(2, 3), T0)
+            l.claim(&c, "a", "t", Some("demo"), &req(3), T0)
         })
         .unwrap();
         assert!(matches!(out, Outcome::Granted(_)));
@@ -2376,7 +2462,7 @@ mod tests {
                 let c = c.clone();
                 std::thread::spawn(move || {
                     with_ledger(&path, T0, |l| {
-                        l.claim(&c, &format!("s{i}"), "t", None, &req(1, 1), T0)
+                        l.claim(&c, &format!("s{i}"), "t", None, &req(1), T0)
                     })
                     .unwrap();
                 })

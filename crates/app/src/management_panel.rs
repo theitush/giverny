@@ -733,14 +733,12 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                     LeaseState::Granted
                 },
                 id: Some(l.id.clone()),
-                cpu: l.cpu,
                 ram_mb: l.ram_mb,
                 gpus: l.gpus.clone(),
                 vram_mb: l.vram_mb,
                 slots: l.slots.clone(),
                 granted_ms: Some(l.granted_at),
                 wanted_ram_mb: smaller.and_then(|c| c.wanted_ram_mb),
-                wanted_cpu: smaller.and_then(|c| c.wanted_cpu),
                 position: None,
                 behind: None,
                 short: Vec::new(),
@@ -774,19 +772,25 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                     })
                     .or_else(|| ahead.last().map(|a| a.task.clone()))
             } else {
-                resources::in_the_way(&ledger.leases, ahead.iter().copied(), &w.request, &short)
+                // Which leases are building the pane does not know; a busy
+                // CPU is then waited out behind the request ahead, if any.
+                resources::in_the_way(
+                    &ledger.leases,
+                    ahead.iter().copied(),
+                    &w.request,
+                    &short,
+                    &|_| false,
+                )
             };
             row.lease = Some(RowLease {
                 state: LeaseState::Queued,
                 id: None,
-                cpu: w.request.cpu,
                 ram_mb: w.request.ram_mb,
                 gpus: Vec::new(),
                 vram_mb: w.request.vram_mb,
                 slots: w.request.slots.clone(),
                 granted_ms: None,
                 wanted_ram_mb: None,
-                wanted_cpu: None,
                 position: Some(i as u64 + 1),
                 behind,
                 short,
@@ -947,12 +951,12 @@ fn usage_fact(u: &RowUsage) -> String {
     s
 }
 
-/// A Next up row waiting in the ledger, in its NOW cell: `queued for 3
-/// cores behind 899x` — what it is short of, in its own sizes
+/// A Next up row waiting in the ledger, in its NOW cell: `queued for 3G
+/// behind 899x`, `queued for CPU` — what it is short of, in its own sizes
 /// ([`resources::short_need`], as `claim` says it), and who is really in
 /// the way. Nothing named for a lease whose shortage is not known.
 pub fn queued_note(l: &RowLease) -> String {
-    let need = resources::short_need(&l.short, l.cpu, l.ram_mb, l.vram_mb);
+    let need = resources::short_need(&l.short, l.ram_mb, l.vram_mb);
     let mut s = "queued".to_string();
     if !need.is_empty() {
         s.push_str(&format!(" for {need}"));
@@ -963,7 +967,7 @@ pub fn queued_note(l: &RowLease) -> String {
     s
 }
 
-/// The lease in full for the row's overlay header: `holds 3 cpu, 3G, slot
+/// The lease in full for the row's overlay header: `holds 3G, slot
 /// cargo:/x`, or `queued #2 for …`.
 fn lease_fact(l: &RowLease) -> String {
     match l.state {
@@ -977,18 +981,12 @@ fn lease_fact(l: &RowLease) -> String {
         _ => {
             let mut s = format!(
                 "holds {}",
-                resources::describe_held(l.cpu, l.ram_mb, &l.gpus, l.vram_mb, &l.slots)
+                resources::describe_held(l.ram_mb, &l.gpus, l.vram_mb, &l.slots)
             );
-            if l.state == LeaseState::Smaller {
-                let asked: Vec<String> = l
-                    .wanted_cpu
-                    .map(|c| format!("{c} cpu"))
-                    .into_iter()
-                    .chain(l.wanted_ram_mb.map(mem))
-                    .collect();
-                if !asked.is_empty() {
-                    s.push_str(&format!(" (asked {})", asked.join(", ")));
-                }
+            if l.state == LeaseState::Smaller
+                && let Some(w) = l.wanted_ram_mb
+            {
+                s.push_str(&format!(" (asked {})", mem(w)));
             }
             s
         }
@@ -4506,17 +4504,11 @@ mod tests {
         // Granted smaller: what it asked for, beside what it holds.
         let mut s = l.clone();
         s.state = LeaseState::Smaller;
-        s.cpu = 2;
-        s.wanted_cpu = Some(3);
         s.wanted_ram_mb = None;
-        assert!(
-            lease_fact(&s).ends_with(" (asked 3 cpu)"),
-            "{}",
-            lease_fact(&s)
-        );
+        assert!(!lease_fact(&s).contains("asked"), "{}", lease_fact(&s));
         s.wanted_ram_mb = Some(4096);
         assert!(
-            lease_fact(&s).ends_with(" (asked 3 cpu, 4G)"),
+            lease_fact(&s).ends_with(" (asked 4G)"),
             "{}",
             lease_fact(&s)
         );
@@ -4613,7 +4605,7 @@ mod tests {
         assert_eq!(t.lines[0].usage.trim_end(), "      0% CPU  ·  0.0G");
         assert!(!t.lines[0].oom);
         let facts = &t.lines[0].click.facts;
-        assert!(facts.iter().any(|f| f == "holds 3 cpu, 3G"), "{facts:?}");
+        assert!(facts.iter().any(|f| f == "holds 3G"), "{facts:?}");
         assert!(
             facts
                 .iter()
@@ -4832,7 +4824,7 @@ mod tests {
             run.click
                 .facts
                 .iter()
-                .any(|f| f == "holds 3 cpu, 3G, slot cargo:/x/target"),
+                .any(|f| f == "holds 3G, slot cargo:/x/target"),
             "{:?}",
             run.click.facts
         );
@@ -4901,7 +4893,7 @@ mod tests {
             "the reason in full in the header"
         );
         assert_eq!(now("282-hold"), ("after 280-reuse", false));
-        assert_eq!(now("283-y"), ("queued for 3 cores behind 280-reuse", false));
+        assert_eq!(now("283-y"), ("queued for CPU behind 280-reuse", false));
         assert_eq!(now("284-idle"), ("", false), "idle 30m: the manager's");
         assert_eq!(now("285-new"), ("", false), "planned two minutes ago");
         assert_eq!(now("286-unheld"), ("", false), "free for two minutes");
@@ -5009,7 +5001,7 @@ mod tests {
         let g = with_ledger(&bare, &["s", "old"], &l);
         assert_eq!(
             lease_fact(g.rows[0].lease.as_ref().unwrap()),
-            "holds 1 cpu, 1G, slot cargo:/x/target"
+            "holds 1G, slot cargo:/x/target"
         );
         assert!(
             with_ledger(&bare, &["s"], &l).rows[0].lease.is_none(),
@@ -5032,8 +5024,8 @@ mod tests {
     /// behind whoever holds a lease.
     #[test]
     fn a_queued_row_names_what_is_short_and_who_is_in_the_way() {
-        // fold146 holds 10 cores; 899x, first in line, asks 3; 283 asks 3
-        // cores and 3G with 7G free.
+        // fold146 holds 2G; 899x, first in line, asks 3G; 283 asks 3G. The
+        // old `cpu` figures are ignored (giverny#387).
         let l = ledger(
             r#"{"version":1,"leases":[
               {"id":"o:fold146","session":"o","task":"fold146","cpu":10,"ram_mb":2048,
@@ -5053,15 +5045,12 @@ mod tests {
             let g = with_ledger(&f, &["s"], &l);
             queued_note(g.rows[0].lease.as_ref().unwrap())
         };
-        // CPU short, held back by the request ahead that wants cores.
-        assert_eq!(
-            note(r#"["cpu"]"#, "fold146"),
-            "queued for 3 cores behind 899x"
-        );
+        // CPU busy: held back by the request ahead, which goes first.
+        assert_eq!(note(r#"["cpu"]"#, "fold146"), "queued for CPU behind 899x");
         // Both short: both named, and 899x is still ahead.
         assert_eq!(
             note(r#"["cpu","ram"]"#, "fold146"),
-            "queued for 3 cores, 3G behind 899x"
+            "queued for CPU, 3G behind 899x"
         );
         // Short of a slot nobody ahead wants or holds now: behind nobody,
         // whatever its copy named.
@@ -5087,11 +5076,12 @@ mod tests {
             let g = with_ledger(&f, &["s"], &first);
             queued_note(g.rows[0].lease.as_ref().unwrap())
         };
-        assert_eq!(only(r#"["cpu"]"#), "queued for 3 cores behind fold146");
+        // A busy CPU with nobody ahead: the pane does not know who builds.
+        assert_eq!(only(r#"["cpu"]"#), "queued for CPU");
         assert_eq!(only(r#"["ram"]"#), "queued for 3G behind fold146");
         assert_eq!(
             only(r#"["cpu","ram"]"#),
-            "queued for 3 cores, 3G behind fold146"
+            "queued for CPU, 3G behind fold146"
         );
     }
 
