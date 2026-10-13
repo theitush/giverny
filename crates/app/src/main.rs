@@ -13,6 +13,7 @@ mod management_live;
 mod management_panel;
 mod oom;
 mod overlays;
+mod paste_image;
 mod prompt_bar;
 mod rail;
 mod sessions_load;
@@ -1232,6 +1233,9 @@ pub struct App {
     /// Wayland, where we track the drag ourselves and so know the position;
     /// winit's X11 drops report no coordinates at all.
     pub drag_hover: Option<egui::Pos2>,
+    /// A screenshot pasted with Ctrl+V: read, saved and typed in as a path
+    /// (giverny#395).
+    paste_image: paste_image::ImagePaste,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
     /// Repository root per directory, so the sweep over every tab is one
@@ -1980,6 +1984,7 @@ impl App {
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
+            paste_image: paste_image::ImagePaste::new(),
             row_rects: Vec::new(),
             attention: 0,
             coming_forward: None,
@@ -3434,6 +3439,21 @@ impl App {
         }
     }
 
+    /// Type each image pasted since the last frame into the tab it was
+    /// pasted in, as a drop types a file: Claude Code attaches an image path
+    /// pasted into its prompt (giverny#395). A tab closed meanwhile gets
+    /// nothing, and the user's attention may have moved on: no tab switch.
+    fn deliver_pasted_images(&mut self) {
+        for pasted in self.paste_image.poll() {
+            let text =
+                giverny_term::input::dropped_paths_text(&[pasted.path.display().to_string()]);
+            if let Some(session) = self.rt.get(&pasted.tab).and_then(|rt| rt.session.as_ref()) {
+                session.write(giverny_term::input::encode_paste(&text, session.mode()));
+                session.note_user_input();
+            }
+        }
+    }
+
     /// The tab whose rail row contains a point, if any.
     pub fn tab_at(&self, pos: egui::Pos2) -> Option<TabId> {
         self.row_rects
@@ -4749,6 +4769,9 @@ impl App {
     ///   rail title, `management panel`); `settings` alone closes it;
     /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
     ///   closing the active tab, closing the window;
+    /// * `paste-image [<file>]` — Ctrl+V on a clipboard with no text, as
+    ///   egui-winit leaves it (the V's release alone); the image is the PNG
+    ///   file when one is named, the real clipboard's otherwise;
     /// * `ctrl <down|up>` — Ctrl held down from now on, or let up;
     ///   `ctrltab`, `ctrlshifttab`, `ctrlpgdn`, `ctrlpgup` — that chord
     ///   pressed, leaving Ctrl held: a keyboard walk (giverny#365).
@@ -4906,6 +4929,18 @@ impl App {
                     };
                     feed(vec![ev(true)]);
                     feed(vec![ev(false)]);
+                }
+                "paste-image" => {
+                    if !arg.is_empty() {
+                        self.paste_image.debug_source = Some(PathBuf::from(arg));
+                    }
+                    feed(vec![egui::Event::Key {
+                        key: egui::Key::V,
+                        physical_key: Some(egui::Key::V),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    }]);
                 }
                 "drag" | "dragxy" => {
                     let n: Vec<f32> = arg
@@ -5381,10 +5416,12 @@ impl eframe::App for App {
             // races the compositor going away, and a frame that never
             // finishes writes nothing.
             self.persist_all();
+            self.paste_image.clean_up();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
+        self.deliver_pasted_images();
         self.process_pending(&ctx);
         self.process_attach(&ctx);
         self.process_hover(&ctx);
@@ -5724,6 +5761,9 @@ impl eframe::App for App {
                     grid_rect = Some(response.rect);
                     if rt.view.button_pressed {
                         actions.push(Action::BackToMain(active));
+                    }
+                    if rt.view.paste_image {
+                        self.paste_image.request(&ctx, active);
                     }
                     // Over the top of the terminal, on the worker's view:
                     // what it is working on, in full.
