@@ -1,14 +1,17 @@
 //! Session names (giverny#343): with Settings → Management panel → "ask
 //! sessions to name themselves" on, every Claude session in a Giverny tab is
-//! asked at its start to pick a one-word first name and record it with
-//! `giverny manage name <First>`. Giverny draws the surname, so every named
-//! session has a full name, and the status line shows it beside the model:
-//! `Opus 5.5 (Tamsin Camden)`.
+//! asked at its start to run `giverny manage name`, and Giverny gives it a
+//! full name, first name and surname both drawn here ([`draw_name`],
+//! giverny#364: sessions left to pick a first name kept picking the same
+//! few). The status line shows it beside the model: `Opus 5.5 (Tamsin
+//! Camden)`.
 //!
-//! The first name is the session's own choice, and two sessions are welcome
-//! to the same one; the surname is drawn here so both can keep it. A full
-//! name passed in is kept as given, and naming again with the same first name
-//! keeps the surname already drawn, so nobody is renamed halfway through.
+//! A name is drawn once: asking again prints the one recorded. A session may
+//! still give its own: a first name alone gets a drawn surname, a full name
+//! passed in (a revived session keeping its old one) is kept as given, and
+//! naming again with the same first name keeps the surname already drawn, so
+//! nobody is renamed halfway through. Two sessions may share a first name;
+//! the surnames tell them apart.
 //!
 //! **Where a name lives.** Beside the feeds, never in one: a session that
 //! only names itself is no manager, and a feed file would make it one.
@@ -45,7 +48,438 @@ const ON: &str = "on";
 /// prompt hook's fallback ([`first_prompt`]) never asks twice.
 const ASKED: &str = "asked";
 
-/// Giverny's own surnames, drawn for a session that gives only a first name.
+/// Giverny's own first names, drawn for a session that asks for a name
+/// without giving one (giverny#364): sessions left to pick kept picking the
+/// same few. Personal names of many origins, short and easy to say; none a
+/// famous single-name figure, a tool or language (`Ruby`, `Zig`), or a word
+/// that would read as part of a log line (`May`, `Max`, `Dev`).
+pub const FIRST_NAMES: &[&str] = &[
+    "Aarav",
+    "Abel",
+    "Abena",
+    "Adaeze",
+    "Ade",
+    "Adi",
+    "Aditi",
+    "Agata",
+    "Agnes",
+    "Aiko",
+    "Akira",
+    "Alba",
+    "Alden",
+    "Alexis",
+    "Ama",
+    "Amaia",
+    "Amara",
+    "Amir",
+    "Amit",
+    "Anh",
+    "Anika",
+    "Anjali",
+    "Anke",
+    "Ansel",
+    "Anya",
+    "Arda",
+    "Arjun",
+    "Arlo",
+    "Arne",
+    "Arthur",
+    "Asha",
+    "Astrid",
+    "Audrey",
+    "Ayla",
+    "Ayo",
+    "Bahar",
+    "Bao",
+    "Barnaby",
+    "Bastian",
+    "Beatrix",
+    "Beau",
+    "Benicio",
+    "Bisi",
+    "Bjorn",
+    "Bogdan",
+    "Borys",
+    "Bram",
+    "Briony",
+    "Britt",
+    "Bruno",
+    "Calla",
+    "Callum",
+    "Camila",
+    "Cassia",
+    "Catalina",
+    "Cecily",
+    "Cem",
+    "Cerys",
+    "Chiamaka",
+    "Chidi",
+    "Ciaran",
+    "Clara",
+    "Cole",
+    "Cormac",
+    "Cosima",
+    "Cyrus",
+    "Dafna",
+    "Dagny",
+    "Daiki",
+    "Dalia",
+    "Damon",
+    "Danica",
+    "Daphne",
+    "Darina",
+    "Dario",
+    "Dariush",
+    "Darya",
+    "Dayo",
+    "Declan",
+    "Defne",
+    "Delphine",
+    "Diego",
+    "Dimitra",
+    "Dirk",
+    "Dmitri",
+    "Dorothea",
+    "Dragan",
+    "Eamon",
+    "Ebba",
+    "Edda",
+    "Edith",
+    "Edwin",
+    "Eitan",
+    "Ekene",
+    "Elena",
+    "Eleni",
+    "Eli",
+    "Elif",
+    "Elin",
+    "Elio",
+    "Eliza",
+    "Elke",
+    "Ellis",
+    "Elsie",
+    "Elspeth",
+    "Emi",
+    "Emilio",
+    "Emre",
+    "Emrys",
+    "Enzo",
+    "Esme",
+    "Esteban",
+    "Etta",
+    "Ewan",
+    "Ezra",
+    "Fabio",
+    "Farah",
+    "Felix",
+    "Femi",
+    "Femke",
+    "Fenna",
+    "Fergus",
+    "Finn",
+    "Fiona",
+    "Flavia",
+    "Folake",
+    "Freya",
+    "Frida",
+    "Funmi",
+    "Gael",
+    "Gali",
+    "Gareth",
+    "Gideon",
+    "Greta",
+    "Gunnar",
+    "Gus",
+    "Gwen",
+    "Hana",
+    "Hanne",
+    "Harriet",
+    "Haruto",
+    "Hattie",
+    "Hedda",
+    "Henrik",
+    "Hester",
+    "Hila",
+    "Hiro",
+    "Hoa",
+    "Hollis",
+    "Hyun",
+    "Ido",
+    "Idris",
+    "Ignacio",
+    "Ilias",
+    "Ilse",
+    "Ilya",
+    "Imani",
+    "Imelda",
+    "Imogen",
+    "Ines",
+    "Ingo",
+    "Ingrid",
+    "Ione",
+    "Irina",
+    "Iris",
+    "Ishaan",
+    "Ishani",
+    "Isla",
+    "Ivana",
+    "Ivo",
+    "Ivor",
+    "Jabari",
+    "Jana",
+    "Jarek",
+    "Jasper",
+    "Jens",
+    "Jia",
+    "Jiwoo",
+    "Joaquin",
+    "Jonah",
+    "Jonas",
+    "Joost",
+    "Jude",
+    "Julieta",
+    "Juniper",
+    "Kagiso",
+    "Kai",
+    "Kaito",
+    "Kaja",
+    "Kasia",
+    "Kasimir",
+    "Katya",
+    "Kavya",
+    "Keiko",
+    "Keir",
+    "Kenji",
+    "Kerem",
+    "Kian",
+    "Kiran",
+    "Kjell",
+    "Klara",
+    "Kofi",
+    "Kojo",
+    "Kostas",
+    "Kwame",
+    "Kwesi",
+    "Lachlan",
+    "Lars",
+    "Layla",
+    "Leandro",
+    "Leda",
+    "Leela",
+    "Leif",
+    "Lena",
+    "Leo",
+    "Lerato",
+    "Lev",
+    "Liesel",
+    "Lindiwe",
+    "Linh",
+    "Linnea",
+    "Lionel",
+    "Lior",
+    "Liora",
+    "Lorcan",
+    "Lorena",
+    "Lorna",
+    "Lottie",
+    "Luca",
+    "Lucia",
+    "Luka",
+    "Mabel",
+    "Maeve",
+    "Magnus",
+    "Mairi",
+    "Makena",
+    "Malik",
+    "Marek",
+    "Maren",
+    "Marisol",
+    "Marit",
+    "Marlowe",
+    "Mateo",
+    "Matteo",
+    "Mavis",
+    "Maya",
+    "Meera",
+    "Mei",
+    "Mila",
+    "Milena",
+    "Milo",
+    "Mina",
+    "Minjun",
+    "Mio",
+    "Mirabel",
+    "Mirek",
+    "Nadia",
+    "Nalini",
+    "Nao",
+    "Naoko",
+    "Nasrin",
+    "Nathaniel",
+    "Navid",
+    "Ned",
+    "Neel",
+    "Nell",
+    "Neta",
+    "Nia",
+    "Nico",
+    "Nikhil",
+    "Nikos",
+    "Nils",
+    "Nina",
+    "Nkiru",
+    "Noa",
+    "Noam",
+    "Nolan",
+    "Nora",
+    "Obi",
+    "Odile",
+    "Oksana",
+    "Oliver",
+    "Omar",
+    "Omri",
+    "Oona",
+    "Oren",
+    "Orla",
+    "Oskar",
+    "Otis",
+    "Ottilie",
+    "Otto",
+    "Paloma",
+    "Parisa",
+    "Pavel",
+    "Percy",
+    "Petra",
+    "Phoebe",
+    "Pieter",
+    "Pilar",
+    "Pippa",
+    "Priya",
+    "Quan",
+    "Quentin",
+    "Quinn",
+    "Radek",
+    "Rahul",
+    "Ralf",
+    "Rami",
+    "Ramona",
+    "Ravi",
+    "Renata",
+    "Reuben",
+    "Reza",
+    "Rhys",
+    "Riku",
+    "Rin",
+    "Rocio",
+    "Rodrigo",
+    "Rohan",
+    "Ronan",
+    "Roni",
+    "Rosa",
+    "Rosalind",
+    "Rotem",
+    "Rowan",
+    "Rufus",
+    "Runa",
+    "Ruth",
+    "Sadie",
+    "Saki",
+    "Sameer",
+    "Samira",
+    "Sanjay",
+    "Sanne",
+    "Sasha",
+    "Selim",
+    "Seren",
+    "Seung",
+    "Shira",
+    "Shirin",
+    "Sigrid",
+    "Silas",
+    "Simeon",
+    "Sipho",
+    "Solveig",
+    "Soraya",
+    "Stavros",
+    "Stefan",
+    "Stellan",
+    "Sunil",
+    "Sven",
+    "Sybil",
+    "Tabitha",
+    "Takumi",
+    "Tal",
+    "Tamar",
+    "Tamsin",
+    "Tara",
+    "Tarek",
+    "Taro",
+    "Tegan",
+    "Tendai",
+    "Teodor",
+    "Tess",
+    "Thalia",
+    "Thandi",
+    "Thao",
+    "Thea",
+    "Themba",
+    "Theo",
+    "Tiago",
+    "Tobias",
+    "Tobin",
+    "Toby",
+    "Tomasz",
+    "Tove",
+    "Tuan",
+    "Tunde",
+    "Ulla",
+    "Una",
+    "Ursula",
+    "Valentin",
+    "Valeria",
+    "Varun",
+    "Vera",
+    "Vernon",
+    "Vesna",
+    "Vidar",
+    "Vikram",
+    "Walt",
+    "Wanjiru",
+    "Wei",
+    "Wes",
+    "Wilfred",
+    "Willa",
+    "Wim",
+    "Winifred",
+    "Wren",
+    "Xanthe",
+    "Ximena",
+    "Xin",
+    "Yael",
+    "Yannick",
+    "Yannis",
+    "Yara",
+    "Ylva",
+    "Yuki",
+    "Yuna",
+    "Yuri",
+    "Yusuf",
+    "Yuto",
+    "Zaira",
+    "Zara",
+    "Zawadi",
+    "Zeke",
+    "Zeynep",
+    "Ziv",
+    "Zoe",
+    "Zofia",
+    "Zola",
+    "Zoran",
+    "Zuri",
+];
+
+/// Giverny's own surnames, drawn for every session that gives only a first
+/// name or none.
 pub const SURNAMES: &[&str] = &[
     "Abernethy",
     "Aldridge",
@@ -312,15 +746,66 @@ pub fn full_name(
     }
 }
 
-/// A surname from [`SURNAMES`], at random.
-pub fn draw_surname() -> String {
+/// One of `list`, at random: the std hasher's random keys over the clock and
+/// the process id, enough to spread names and nothing to build a crate on.
+fn pick(list: &[&str]) -> String {
     use std::hash::BuildHasher;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let n = std::collections::hash_map::RandomState::new().hash_one((seed, std::process::id()));
-    SURNAMES[(n % SURNAMES.len() as u64) as usize].to_string()
+    list[(n % list.len() as u64) as usize].to_string()
+}
+
+/// A surname from [`SURNAMES`], at random.
+pub fn draw_surname() -> String {
+    pick(SURNAMES)
+}
+
+/// A first name from [`FIRST_NAMES`], at random.
+pub fn draw_first_name() -> String {
+    pick(FIRST_NAMES)
+}
+
+/// How many times [`draw_name`] draws again past a name already taken.
+const REDRAWS: usize = 16;
+
+/// A full name for a session that has none (giverny#364): a first name and a
+/// surname, both drawn, drawn again while the pair is one already recorded
+/// under `feeds` (a look at the names directory, no registry). Past
+/// [`REDRAWS`] the last draw stands: two sessions may share a name, they
+/// just rarely do.
+pub fn draw_name(feeds: &Path) -> String {
+    let taken = recorded(feeds);
+    untaken(&taken, || {
+        format!("{} {}", draw_first_name(), draw_surname())
+    })
+}
+
+/// Every name recorded under a session id in `feeds`' names directory.
+fn recorded(feeds: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_dir(dir(feeds))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| name_in(&p))
+        .collect()
+}
+
+/// The first of `draw`'s names not in `taken`, or its last after
+/// [`REDRAWS`] more.
+fn untaken(taken: &std::collections::HashSet<String>, mut draw: impl FnMut() -> String) -> String {
+    let mut name = draw();
+    for _ in 0..REDRAWS {
+        if !taken.contains(&name) {
+            break;
+        }
+        name = draw();
+    }
+    name
 }
 
 /// Record `session`'s name from `given` ([`full_name`]), under its id and,
@@ -349,16 +834,16 @@ pub fn record(
 }
 
 /// What a session in a Giverny tab is told at its start: its name, when it
-/// has one already (a resume, a compaction), else to pick one.
+/// has one already (a resume, a compaction), else to ask Giverny for one
+/// (giverny#364: Giverny draws the whole name, nothing is picked).
 pub fn ask(name: Option<&str>) -> String {
     match name {
         Some(n) => format!(
             "Your name in this session is {n} (Giverny shows it on the status line; \
              `giverny-manage name` prints it)."
         ),
-        None => "Giverny names its sessions: pick a one-word first name for yourself and run \
-                 `giverny-manage name <First>`; Giverny adds a surname, and `giverny-manage name` \
-                 prints your full name."
+        None => "Giverny names its sessions: run `giverny-manage name` and it gives you your \
+                 name, a first name and a surname; run it again any time to read it back."
             .to_string(),
     }
 }
@@ -492,6 +977,34 @@ mod tests {
     }
 
     #[test]
+    fn a_drawn_name_is_a_first_name_and_a_surname_not_already_taken() {
+        // giverny#364: Giverny draws the whole name from its own lists.
+        assert!(FIRST_NAMES.len() >= 300, "a few hundred");
+        assert!(FIRST_NAMES.iter().all(|s| is_word(s) && s.is_ascii()));
+        let unique: std::collections::HashSet<_> = FIRST_NAMES.iter().collect();
+        assert_eq!(unique.len(), FIRST_NAMES.len(), "no first name twice");
+        assert!(FIRST_NAMES.contains(&draw_first_name().as_str()));
+
+        let feeds = scratch("drawn");
+        let drawn = draw_name(&feeds);
+        let (first, last) = drawn.split_once(' ').unwrap();
+        assert!(FIRST_NAMES.contains(&first), "{drawn}");
+        assert!(SURNAMES.contains(&last), "{drawn}");
+        // Recorded as drawn: a full name, kept as given.
+        let (n, _) = record(&feeds, "s1", &drawn, None, || panic!("no draw")).unwrap();
+        assert_eq!(n, drawn);
+        assert!(recorded(&feeds).contains(&drawn));
+
+        // A pair already recorded is drawn again; past the redraws the last
+        // stands.
+        let taken = recorded(&feeds);
+        let mut draws = [drawn.clone(), "Tamsin Camden".into()].into_iter();
+        assert_eq!(untaken(&taken, || draws.next().unwrap()), "Tamsin Camden");
+        assert_eq!(untaken(&taken, || drawn.clone()), drawn);
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
     fn the_switch_hides_every_name() {
         let feeds = scratch("switch");
         record(&feeds, "s1", "Tamsin Camden", None, || panic!()).unwrap();
@@ -558,7 +1071,12 @@ mod tests {
         let sub = start(json!({"agent_id": "a1"}));
         assert_eq!(session_start(&sub, &feeds, true, true), None, "a subagent");
         let ask_out = context(session_start(&p, &feeds, true, true).unwrap());
-        assert!(ask_out.contains("giverny-manage name <First>"), "{ask_out}");
+        assert!(ask_out.contains("run `giverny-manage name`"), "{ask_out}");
+        // Giverny gives the name: nothing to pick (giverny#364).
+        assert!(
+            !ask_out.contains("pick") && !ask_out.contains("<First>"),
+            "{ask_out}"
+        );
         assert!(!ask_out.contains('\n'), "one line");
         // Named already (a resume, a compaction): told its name instead.
         record(&feeds, "s1", "Tamsin Camden", None, || panic!()).unwrap();
@@ -592,7 +1110,7 @@ mod tests {
         sub["agent_id"] = json!("a1");
         assert_eq!(first_prompt(&sub, &feeds, true, yes), None, "a subagent");
         let asked = first_prompt(&p, &feeds, true, yes).unwrap();
-        assert!(asked.contains("giverny-manage name <First>"), "{asked}");
+        assert!(asked.contains("run `giverny-manage name`"), "{asked}");
         assert_eq!(
             first_prompt(&p, &feeds, true, || panic!("no walk once told")),
             None,

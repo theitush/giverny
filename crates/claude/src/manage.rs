@@ -66,11 +66,12 @@ usage: giverny manage <command> [args] [--session <id>]
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
   drop  <task>                remove the task's row
   name  [<First> | <First Last>]
-                              record this session's name: Giverny draws a
-                              surname for a first name alone (the same first
-                              name again keeps it), a full name is kept as
-                              given; prints the full name. With no name, print
-                              the one recorded (exit 1 when there is none)
+                              this session's name, printed in full. With no
+                              name, the one recorded, else Giverny draws a
+                              first name and a surname and records them. A
+                              first name alone gets a drawn surname (the same
+                              first name again keeps it); a full name is kept
+                              as given
   show                        print the name and the rows
   accuracy [--repo R]         how every estimator's figures fared against the
                               time really worked, older tasks against recent
@@ -1652,7 +1653,8 @@ fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
 
 /// `name`: record `session`'s name from `given` and print the full name, or
 /// with none print the name it has ([`names`]; a manager named before names
-/// had their own home has it on its feed).
+/// had their own home has it on its feed), else draw it one and record that
+/// (giverny#364: Giverny gives the name, the session picks nothing).
 fn name(
     dir: &Path,
     session: &str,
@@ -1668,12 +1670,23 @@ fn name(
         None => {
             let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
             let transcript = cfg.and_then(|c| crate::subagents::session_transcript(&c, session));
-            names::find(dir, session, transcript.as_deref())
+            if let Some(name) = names::find(dir, session, transcript.as_deref())
                 .or_else(|| feed::find(dir, session)?.1.name)
-                .ok_or_else(|| {
-                    "no name recorded for this session: `giverny-manage name <First>` records one"
-                        .to_string()
-                })
+            {
+                return Ok(name);
+            }
+            let root = transcript
+                .as_deref()
+                .and_then(crate::subagents::conversation_root);
+            // A full name: `record` keeps it as given and draws nothing more.
+            names::record(
+                dir,
+                session,
+                &names::draw_name(dir),
+                root.as_deref(),
+                names::draw_surname,
+            )
+            .map(|(name, _)| name)
         }
     }
 }
@@ -2941,7 +2954,15 @@ mod tests {
             flags.claude_dir = Some(dir.join("claude"));
             run_in(&dir, "s1", &cmd, &flags, T0)
         };
-        assert!(name("name").is_err(), "nothing recorded yet");
+        // No name yet: Giverny draws a whole one and records it
+        // (giverny#364); asking again prints it, never a new draw.
+        let drawn = name("name").unwrap();
+        let (first, last) = drawn.split_once(' ').unwrap();
+        assert!(names::FIRST_NAMES.contains(&first), "{drawn}");
+        assert!(names::SURNAMES.contains(&last), "{drawn}");
+        assert_eq!(names::read(&dir, "s1").as_deref(), Some(drawn.as_str()));
+        assert_eq!(name("name").unwrap(), drawn, "read back, not redrawn");
+        // A first name given still gets a drawn surname, and keeps it.
         let full = name("name Juniper").unwrap();
         let (first, last) = full.split_once(' ').unwrap();
         assert_eq!(first, "Juniper");

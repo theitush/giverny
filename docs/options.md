@@ -33,7 +33,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
 | `management_panel.manage_skill` | `true` | Ship the /giverny:manage skill with the plugin the management panel installs. |
-| `management_panel.ask_names` | `false` | Ask every Claude session in a Giverny tab to pick a first name at its start; the full name shows on its status line. |
+| `management_panel.ask_names` | `false` | Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line. |
 | `management_panel.columns.stage` | `true` | STAGE: Running, Next up or Done. |
 | `management_panel.columns.id` | `true` | The task's id (a feed row's key, a subagent's name). |
 | `management_panel.columns.title` | `true` | The task's title, or a subagent's description: the column that takes the room left. |
