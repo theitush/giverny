@@ -49,7 +49,7 @@ use giverny_term::proxy::TabEvent;
 use giverny_term::pty::{self, GridSize, SpawnCfg};
 use giverny_term::render::theme::Theme;
 use giverny_term::session::TermSession;
-use giverny_term::tee::TeeEvent;
+use giverny_term::tee::{PromptMark, TeeEvent};
 use giverny_term::widget::{DEFAULT_FONT_SIZE, RenderShared, TabView};
 
 /// Where an attached agent's tab belongs.
@@ -1269,6 +1269,28 @@ pub struct App {
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
+    /// Tabs where something finished while you were on another tab, until
+    /// you look (giverny#388): a Claude turn (`DoneUnseen`, noted each
+    /// frame) or a plain shell's command. Apart from Claude's state, because
+    /// it outlives it: a turn you have not seen stays unseen when the agent
+    /// starts working again, and the rail wears its tick beside the spinner.
+    unseen_done: HashSet<TabId>,
+    /// Whether each tab's shell had a command in front at the last
+    /// foreground poll (`track_foreground`), as seen this run: the persisted
+    /// `Tab::foreground` is a restored tab's last command, not a live one,
+    /// and reading its going away as a command ending would tick every tab a
+    /// restart brings back.
+    fg_running: HashMap<TabId, bool>,
+    /// Tabs whose shell said OSC 133 `C` (a command's output begins) and not
+    /// yet `D`: a command running, seen the moment it starts and ends where
+    /// the shell marks its prompts, which the two-second foreground poll
+    /// would miss for an `ls` (giverny#388).
+    osc_running: HashSet<TabId>,
+    /// Each tab's input count (`Session::input_seq`) when its last command
+    /// finished. A finish with nothing typed since is none you ran: the rc
+    /// file's own `$(dircolors)` as a shell starts, a prompt hook's helper
+    /// caught by the poll — it would tick a tab nobody touched.
+    finish_input: HashMap<TabId, u64>,
     /// The welcome screen owed to this launch, until the tab for it opens.
     welcome: Option<splash::Welcome>,
     /// A newer release, once the background check finds one.
@@ -1973,6 +1995,10 @@ impl App {
             wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
+            unseen_done: HashSet::new(),
+            fg_running: HashMap::new(),
+            osc_running: HashSet::new(),
+            finish_input: HashMap::new(),
             repo_cache: HashMap::new(),
             repo_rx: None,
             wsl_cwd_rx: None,
@@ -2171,7 +2197,7 @@ impl App {
                 // a "done" mark on it has been seen.
                 if let Some(active) = self.ws.active {
                     self.refresh_tab_info(active);
-                    self.claude.mark_viewed(active);
+                    self.mark_seen(active);
                 }
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
@@ -2182,7 +2208,7 @@ impl App {
                 self.end_switch();
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
-                self.claude.mark_viewed(id);
+                self.mark_seen(id);
                 self.reveal_terminal();
             }
             Action::SwitchRecent(delta) => self.switch_recent(delta),
@@ -2193,7 +2219,7 @@ impl App {
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
-                    self.claude.mark_viewed(id);
+                    self.mark_seen(id);
                 }
                 self.reveal_terminal();
             }
@@ -2727,6 +2753,8 @@ impl App {
     /// BACKGROUND tab whose attach ended ([`closes_on_exit`]).
     fn drain_events(&mut self) -> Vec<TabId> {
         let mut cwd_updates: Vec<(TabId, PathBuf)> = Vec::new();
+        let mut prompt_marks: Vec<(TabId, PromptMark)> = Vec::new();
+        let mut ended: Vec<TabId> = Vec::new();
         let mut close = Vec::new();
         for (&id, rt) in &self.rt {
             let Some(session) = &rt.session else { continue };
@@ -2744,6 +2772,7 @@ impl App {
                                 TeeEvent::RemoteCwd(p) => {
                                     tracing::debug!("remote cwd on tab {id:?}: {p:?}");
                                 }
+                                TeeEvent::Prompt(mark) => prompt_marks.push((id, mark)),
                                 other => tracing::debug!("tee {id:?}: {other:?}"),
                             }
                         }
@@ -2753,6 +2782,7 @@ impl App {
                         tracing::info!("tab {id:?} child exited: {status:?}");
                     }
                     TabEvent::LoopDone(exit) => {
+                        ended.push(id);
                         if let Some(tab) = self.ws.tab_mut(id) {
                             tab.exited = true;
                             if closes_on_exit(tab, exit) {
@@ -2763,6 +2793,31 @@ impl App {
                     }
                 }
             }
+        }
+        for (id, mark) in prompt_marks {
+            match mark {
+                // Output begins: a command really runs. `B` alone is the
+                // prompt taking input, and an empty Enter goes from there
+                // straight to `D` — the prompt redrawn, nothing run.
+                PromptMark::OutputStart => {
+                    self.osc_running.insert(id);
+                }
+                // `D` ends it; a shell that skips `D` ends it with the next
+                // prompt's `A`.
+                PromptMark::CommandDone(_) | PromptMark::PromptStart => {
+                    if self.osc_running.remove(&id) {
+                        self.command_finished(id);
+                    }
+                }
+                PromptMark::CommandStart => {}
+            }
+        }
+        // A shell that is gone runs nothing, and its exit is no command
+        // finishing: the exited mark says it.
+        for id in ended {
+            self.osc_running.remove(&id);
+            self.fg_running.remove(&id);
+            self.finish_input.remove(&id);
         }
         for (id, cwd) in cwd_updates {
             if let Some(tab) = self.ws.tab_mut(id) {
@@ -3518,6 +3573,12 @@ impl App {
             })
             .collect();
         for (id, cmd) in seen {
+            // A command seen in front last time and gone now has finished
+            // (giverny#388). Only one seen this run: see `fg_running`.
+            let running = cmd.is_some();
+            if self.fg_running.insert(id, running) == Some(true) && !running {
+                self.command_finished(id);
+            }
             if let Some(tab) = self.ws.tab_mut(id)
                 && tab.foreground != cmd
             {
@@ -3525,6 +3586,49 @@ impl App {
                 self.state_dirty = true;
             }
         }
+    }
+
+    /// A command in tab `id`'s shell finished (giverny#388). On the tab you
+    /// are on you saw it end, so nothing is owed; anywhere else it is an
+    /// unseen finish, ticked in the rail until you look.
+    ///
+    /// Only a command typed: one with no input since the last finish (or
+    /// since the shell started) was the shell's own doing — its rc file, its
+    /// prompt — and finishes nothing you asked for (see `finish_input`).
+    fn command_finished(&mut self, id: TabId) {
+        let Some(seq) = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .map(|s| s.input_seq())
+        else {
+            return;
+        };
+        if self.finish_input.insert(id, seq).unwrap_or(0) == seq {
+            return;
+        }
+        if self.ws.active != Some(id) {
+            self.unseen_done.insert(id);
+        }
+    }
+
+    /// The user looked at tab `id`: its done-markers clear, Claude's tick and
+    /// the unseen-finish badge alike (giverny#388).
+    fn mark_seen(&mut self, id: TabId) {
+        self.claude.mark_viewed(id);
+        self.unseen_done.remove(&id);
+    }
+
+    /// Note each Claude turn that ended unseen, so its tick outlives the
+    /// state: the agent may start working again before you look, and the
+    /// rail then wears the tick beside its spinner (giverny#388).
+    fn note_unseen_turns(&mut self) {
+        for t in &self.ws.tabs {
+            if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen {
+                self.unseen_done.insert(t.id);
+            }
+        }
+        self.unseen_done.retain(|id| self.ws.tab(*id).is_some());
     }
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
@@ -4780,6 +4884,9 @@ impl App {
                         .and_then(|t| self.rt.get(&t))
                         .and_then(|rt| rt.session.as_ref());
                     if let Some(session) = session {
+                        // Typed, as the keyboard would: it counts as the
+                        // user's input (a command they ran, giverny#388).
+                        session.note_user_input();
                         // `\r` in the text stands for Enter.
                         session.write(arg.replace("\\r", "\r").into_bytes());
                     }
@@ -5105,7 +5212,7 @@ impl App {
         self.ws.commit_switch(sw.from);
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
-            self.claude.mark_viewed(id);
+            self.mark_seen(id);
         }
     }
 
@@ -5315,6 +5422,7 @@ impl eframe::App for App {
                 .is_some_and(|prev| prev != seq)
             {
                 self.claude.mark_attended(id);
+                self.unseen_done.remove(&id);
             }
         }
 
@@ -5349,6 +5457,7 @@ impl eframe::App for App {
         }
         self.come_forward(&ctx);
         self.watch_for_limits();
+        self.note_unseen_turns();
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
                 tab.claude_session = session;
