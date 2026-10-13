@@ -78,6 +78,17 @@ impl RelayMsg {
     pub fn prompt(&self) -> Option<&str> {
         self.event.get("prompt").and_then(|v| v.as_str())
     }
+    /// Was this hook fired by one of the session's subagents rather than the
+    /// session itself? A subagent's tool hooks arrive under its parent's
+    /// `session_id`, told apart only by the `agent_id` they carry; the
+    /// session's own calls carry none (measured on a `PostToolUse`,
+    /// giverny#374).
+    pub fn from_subagent(&self) -> bool {
+        self.event
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|a| !a.trim().is_empty())
+    }
 
     /// On `Stop`: is work this session delegated still running as the turn
     /// ends — a subagent, a workflow, a teammate, a cloud session?
