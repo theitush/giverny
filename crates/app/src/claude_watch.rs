@@ -1043,9 +1043,15 @@ impl ClaudeWatch {
                     entry.cap_prompts();
                 }
             }
-            // A tool call is work happening now, whoever asked for it. It is
-            // what tells a tab apart from the turn that ended before it: a
-            // session carrying on after a permission was granted, or an agent
+            // A subagent's tool call says the subagent works, not the
+            // session: it arrives under the parent's `session_id` with its
+            // own `agent_id`. A session free at its prompt while its workers
+            // run stays free, with the wave its `Stop` gave it, and one
+            // mid-turn keeps its spinner anyway (giverny#374).
+            Some("PostToolUse") if msg.from_subagent() => {}
+            // The session's own tool call is work happening now. It is what
+            // tells a tab apart from the turn that ended before it: a session
+            // carrying on after a permission was granted, or an agent
             // continuing by itself, emits nothing else.
             Some("PostToolUse") => {
                 entry.state = ClaudeState::Busy;
@@ -1064,6 +1070,9 @@ impl ClaudeWatch {
             }
             Some("Notification") => {
                 if let Some(kind) = msg.notification_type() {
+                    // Whoever asks — the session or one of its subagents —
+                    // the person owes it an answer, so a subagent's prompt
+                    // flags the tab too (giverny#374).
                     if needs_you(kind) {
                         entry.state = ClaudeState::NeedsYou;
                         effects.notify.push((
@@ -3421,6 +3430,62 @@ mod tests {
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
         assert!(waves(&w));
+    }
+
+    /// A subagent's tool calls arrive under its parent's session with its
+    /// own `agent_id`: they are the worker working, not the session. A tab
+    /// free at its prompt while its worker runs keeps the wave through them;
+    /// the session's own calls still mean busy; a subagent's permission
+    /// prompt still flags the tab (giverny#374, the poly manager's tab, the
+    /// busy dot while it sat free).
+    #[test]
+    fn a_subagents_tool_calls_leave_its_free_parent_free() {
+        let mut w = ClaudeWatch::for_tests();
+        let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+        let worker_call = hook(
+            "PostToolUse",
+            r#","agent_id":"a58ff8469ff4515c6","tool_name":"Bash""#,
+        );
+        let own_call = hook("PostToolUse", r#","tool_name":"Bash""#);
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w));
+
+        // The worker's calls: still free, still the wave.
+        for _ in 0..3 {
+            feed(&mut w, &worker_call, Some(TAB));
+            assert_eq!(w.state_of(TAB), ClaudeState::Idle, "the worker's call");
+            assert!(waves(&w), "the wave stays through the worker's calls");
+        }
+
+        // Out of sight, the tick stays through them too.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", agent), None);
+        feed(&mut w, &worker_call, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(waves(&w));
+
+        // The worker needs the person: the flag, whoever asks.
+        let ask = hook(
+            "Notification",
+            r#","agent_id":"a58ff8469ff4515c6","notification_type":"permission_prompt""#,
+        );
+        let fx = feed(&mut w, &ask, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::NeedsYou);
+        assert_eq!(fx.notify.len(), 1);
+
+        // The session's own call is the session working: the spinner.
+        feed(&mut w, &own_call, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        assert!(!waves(&w));
+
+        // Mid-turn, a foreground worker's calls keep the spinner.
+        feed(&mut w, &worker_call, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
     }
 
     #[test]
