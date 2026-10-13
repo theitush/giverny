@@ -23,7 +23,7 @@ giverny manage land  <task> [--outcome Done|Blocked|…] [--review TEXT] [--note
 giverny manage pause <task> [--note N]  /  giverny manage resume <task>          # stop / restart its clock
 giverny manage drop  <task>  ·  giverny manage show  ·  giverny manage path  ·  giverny manage clear
 giverny manage clear-done                                                        # clear the Done rows
-giverny manage name  [<First> | <First Last>]                                    # this session's name, on its status line; none: print it
+giverny manage name  [<First> | <First Last>]                                    # this session's name, on its status line; none: print it, or draw one
 ```
 
 - **A session has a name** (see **Session names**). `name` records it beside the feeds, not in one, and `show` prints it first.
@@ -325,9 +325,10 @@ With `claude.management_panel` on, Giverny carries a Claude Code plugin, `givern
 
 With **Settings → Management panel → ask sessions to name themselves** on (`management_panel.ask_names`, **off by default**), every Claude session in a Giverny tab has a full name, shown beside the model on its status line (`giverny statusline`) in the chrome's accent colour: `Opus 5.5 (Tamsin Camden)`.
 
-- **The ask.** At the session's start the plugin's `SessionStart` hook adds one line of context: pick a one-word first name and run `giverny-manage name <First>`. A session that has a name already (a resume, a compaction) is told it instead. Only a Giverny tab's own session is asked: never a subagent (a payload with `agent_id`), a background job's session, or a claude nested in a tab.
-- **The surname is Giverny's.** `giverny-manage name Tamsin` draws a surname from Giverny's own list and records `Tamsin Camden`; the first name is the session's choice, and two sessions may share one. A full name passed in (`name Pike Vance`) is kept as given. Naming again with the same first name keeps the surname already drawn, so nobody is renamed halfway through. A name is one or two words of letters, digits, hyphens and apostrophes. It prints the full name.
-- **Read it back** with `giverny-manage name` and no argument: it prints the full name, or exits 1 when the session has none.
+- **The ask.** At the session's start the plugin's `SessionStart` hook adds one line of context: run `giverny-manage name` and Giverny gives you your name. A session that has a name already (a resume, a compaction) is told it instead. Only a Giverny tab's own session is asked: never a subagent (a payload with `agent_id`), a background job's session, or a claude nested in a tab.
+- **The name is Giverny's** (giverny#364). `giverny-manage name` with no argument, on a session with no name, draws a first name and a surname from Giverny's own lists (a few hundred personal first names of many origins, about a hundred and twenty surnames), records it (`Tamsin Camden`) and prints it; a pair already recorded in the names directory is drawn again. Sessions left to pick a first name kept picking the same few. Two sessions may share a first name.
+- **Read it back** with the same `giverny-manage name`: once a session has a name it prints it and never draws again.
+- **A name may still be given.** `giverny-manage name Tamsin` draws only the surname; a full name passed in (`name Pike Vance`, a revived session keeping its old one) is kept as given. Naming again with the same first name keeps the surname already drawn, so nobody is renamed halfway through. A name is one or two words of letters, digits, hyphens and apostrophes.
 - **Where it lives.** `<feed dir>/names/<session>.json` (`{"session", "name", "root"}`), and the same under `names/roots/<root>.json`, keyed by the conversation's root (the uuid of its transcript's first turn, which Claude Code carries across a re-id). A session that only names itself writes no feed and is no manager: no rows, nothing in the pane. A resumed session has a new id but the same root, so its status line finds the name by the root and records it under the new id. A feed's `name` (from before names had their own home) is still shown for its session.
 - **The switch is a file.** `<feed dir>/names/on` exists while the switch is on and the pane is on; Giverny writes and removes it. Off, no session is asked, managers included, and no status line shows a name.
 
