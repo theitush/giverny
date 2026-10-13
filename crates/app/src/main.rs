@@ -435,7 +435,8 @@ fn scrub_inherited_claude_markers() {
         return;
     }
     for key in &inherited {
-        // SAFETY: single-threaded here — called first thing in main.
+        // SAFETY: single-threaded here — called before the window, or
+        // anything else, starts a thread.
         unsafe { std::env::remove_var(key) };
     }
     eprintln!(
@@ -472,8 +473,6 @@ fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
 }
 
 fn main() -> eframe::Result {
-    scrub_inherited_claude_markers();
-
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
@@ -534,8 +533,12 @@ fn main() -> eframe::Result {
         _ => {}
     }
 
-    // Past every subcommand: what follows is the window, and a console that
-    // exists only because Windows made one has nothing left to show.
+    // Past every subcommand: what follows is the window. Only its tabs need
+    // the markers gone; `relay` and `statusline` are run by Claude Code with
+    // them set, on every hook and refresh, and have nothing to clean.
+    scrub_inherited_claude_markers();
+    // A console that exists only because Windows made one has nothing left
+    // to show.
     release_own_console();
 
     tracing_subscriber::fmt()
