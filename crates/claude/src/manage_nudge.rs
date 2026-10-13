@@ -13,6 +13,14 @@
 //! `reestimate_asked`. A worker that holds no task is not this module's: its
 //! estimate is an agent ETA ([`crate::agent_eta`]).
 //!
+//! **Before the first figure** (giverny#366). A worker that reads fast gives
+//! its re-estimate before the five-minute ask, and learned how its kind's
+//! re-estimates fared only from the `eta` reply, after the figure was in. So
+//! the first call the hook sees from a worker on a row tells it that track,
+//! once, as information: the row is stamped `track_told` whether or not
+//! there is enough history to tell, so later calls read none. A worker handed
+//! its next task is told again, on that row.
+//!
 //! **Near the end.** Each figure is asked about again as it runs out: once
 //! when [`DEADLINE_LEFT_MS`] of it are left (only a figure that had more than
 //! that when it was given — one given that short is asked about only past
@@ -89,9 +97,32 @@ pub fn stamp_agent(doc: &mut Value, agent_id: &str, description: Option<&str>) -
     changed
 }
 
+/// The Running row this worker holds: the one its asks are about.
+fn running_row<'a>(
+    doc: &'a mut Value,
+    agent_id: &str,
+    description: Option<&str>,
+) -> Option<&'a mut Map<String, Value>> {
+    doc.get_mut("rows")?
+        .as_array_mut()?
+        .iter_mut()
+        .filter_map(Value::as_object_mut)
+        .filter(|r| manage::stage_of(r) == Some(feed::Stage::Running))
+        .find(|r| is_mine(r, agent_id, description))
+}
+
+/// Whether [`check`] would stamp this worker's Running row `track_told`:
+/// the hook writes the file back then, though nothing is said (too little
+/// history), so the next call finds the stamp and reads no history.
+pub fn track_untold(doc: &mut Value, agent_id: &str, description: Option<&str>) -> bool {
+    running_row(doc, agent_id, description).is_some_and(|r| !r.contains_key("track_told"))
+}
+
 /// The row this worker holds and whether it is due an ask at `now`: the
 /// five-minute one, else one near or past the end of its estimate
 /// ([`deadline`]). On a match the row is stamped and the request returned.
+/// On the first call seen on the row it is stamped `track_told`, and with no
+/// ask due the reply is the kind's re-estimate track (giverny#366).
 pub fn check(
     doc: &mut Value,
     agent_id: &str,
@@ -99,12 +130,32 @@ pub fn check(
     now: u64,
     history: Option<&Path>,
 ) -> Option<String> {
-    let rows = doc.get_mut("rows")?.as_array_mut()?;
-    let row = rows
-        .iter_mut()
-        .filter_map(Value::as_object_mut)
-        .filter(|r| manage::stage_of(r) == Some(feed::Stage::Running))
-        .find(|r| is_mine(r, agent_id, description))?;
+    let row = running_row(doc, agent_id, description)?;
+    // The track, told on the first call seen on this row: later calls
+    // find the stamp and read no history.
+    let first = !row.contains_key("track_told");
+    if first {
+        row.insert("track_told".into(), json!(manage::stamp(now)));
+    }
+    let ask = ask(row, now, history);
+    // An ask carries the track itself; a worker that has re-estimated
+    // already is past needing it.
+    if ask.is_some() || !first || row.contains_key("eta_first_s") {
+        return ask;
+    }
+    let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
+    track(row, history).map(|r| {
+        format!(
+            "Giverny: you are on task `{key}`. For calibration, {r}: weigh that in your figure \
+             when you re-estimate."
+        )
+    })
+}
+
+/// The re-estimate ask due on this worker's Running `row` at `now`, if any:
+/// the five-minute one, else one near or past the end of its estimate.
+/// Stamps the row when it asks.
+fn ask(row: &mut Map<String, Value>, now: u64, history: Option<&Path>) -> Option<String> {
     if row.contains_key("paused_since") {
         return None;
     }
@@ -144,20 +195,24 @@ fn span(s: u64) -> String {
 /// How this kind of re-estimate has fared, so the figure itself improves:
 /// told, never applied. Empty with too little history.
 fn record(row: &Map<String, Value>, history: Option<&Path>) -> String {
-    let s = |k: &str| row.get(k).and_then(Value::as_str);
-    let kind = s("title").and_then(manage_history::kind_of);
-    history
-        .map(manage_history::load)
-        .and_then(|h| {
-            manage_history::track_record(
-                &h,
-                manage_history::Track::Reestimate,
-                s("repo"),
-                kind.as_deref(),
-            )
-        })
+    track(row, history)
         .map(|r| format!(" For calibration, {r}: weigh that in your figure."))
         .unwrap_or_default()
+}
+
+/// The row's kind's re-estimate track ([`manage_history::track_record`]),
+/// `None` with too little history.
+fn track(row: &Map<String, Value>, history: Option<&Path>) -> Option<String> {
+    let s = |k: &str| row.get(k).and_then(Value::as_str);
+    let kind = s("title").and_then(manage_history::kind_of);
+    history.map(manage_history::load).and_then(|h| {
+        manage_history::track_record(
+            &h,
+            manage_history::Track::Reestimate,
+            s("repo"),
+            kind.as_deref(),
+        )
+    })
 }
 
 /// The near-the-end ask on a Running row that is not paused: see the
@@ -317,9 +372,10 @@ mod tests {
         assert!(ask.contains("no estimate"), "{ask}");
     }
 
-    #[test]
-    fn the_ask_shows_how_past_re_estimates_fared() {
-        let dir = std::env::temp_dir().join(format!("giverny-nudge-rec-{}", std::process::id()));
+    /// A history file under `name` with [`manage_history::MIN_SAMPLES`] BUG
+    /// re-estimates in repo `g` that each took twice the figure.
+    fn bug_history(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("giverny-nudge-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let h = dir.join(manage_history::FILE);
         for _ in 0..manage_history::MIN_SAMPLES {
@@ -335,6 +391,13 @@ mod tests {
             };
             manage_history::append(&h, &rec).unwrap();
         }
+        h
+    }
+
+    #[test]
+    fn the_ask_shows_how_past_re_estimates_fared() {
+        let h = bug_history("rec");
+        let dir = h.parent().unwrap().to_path_buf();
         let mut d = doc(json!([{"key": "g#2", "stage": "running", "repo": "g",
             "title": "BUG: x", "started": manage::stamp(T0), "eta_s": 1800}]));
         let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
@@ -346,6 +409,63 @@ mod tests {
             "{ask}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#366: the first call seen on a row tells its worker the
+    /// kind's re-estimate track, once, before any figure; the asks are as
+    /// they were.
+    #[test]
+    fn a_worker_is_told_its_track_on_its_first_call_once_per_row() {
+        let h = bug_history("told");
+        let mut d = doc(json!([{"key": "g#2", "stage": "running", "repo": "g",
+            "title": "BUG: x", "started": manage::stamp(T0), "eta_s": 1800, "agent_id": "w"}]));
+        // Someone else's call: nothing told, nothing stamped.
+        assert!(!track_untold(&mut d, "x", Some("other")));
+        assert_eq!(check(&mut d, "x", Some("other"), T0, Some(&h)), None);
+        assert!(d["rows"][0].get("track_told").is_none());
+        // The worker's first call.
+        assert!(track_untold(&mut d, "w", None));
+        let told = check(&mut d, "w", None, T0 + 10_000, Some(&h)).unwrap();
+        assert_eq!(
+            told,
+            "Giverny: you are on task `g#2`. For calibration, your last 5 BUG re-estimates in \
+             g took ×2.00 of what you said (median): weigh that in your figure when you \
+             re-estimate."
+        );
+        assert!(d["rows"][0].get("track_told").is_some());
+        assert!(!track_untold(&mut d, "w", None));
+        // Told once; the five-minute ask comes as before, track and all.
+        assert_eq!(check(&mut d, "w", None, T0 + MIN, Some(&h)), None);
+        let ask = check(&mut d, "w", None, T0 + 5 * MIN, Some(&h)).unwrap();
+        assert!(ask.contains("Now that you have read the code"), "{ask}");
+        assert!(ask.contains("×2.00 of what you said"), "{ask}");
+        // Handed its next task: told again, on the new row.
+        d["rows"][0]["stage"] = json!("done");
+        d["rows"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"key": "g#3", "stage": "running",
+            "repo": "g", "title": "BUG: y", "started": manage::stamp(T0 + 20 * MIN),
+            "agent_id": "w"}));
+        let told = check(&mut d, "w", None, T0 + 20 * MIN, Some(&h)).unwrap();
+        assert!(
+            told.starts_with("Giverny: you are on task `g#3`."),
+            "{told}"
+        );
+        assert_eq!(check(&mut d, "w", None, T0 + 21 * MIN, Some(&h)), None);
+        // Too little history: nothing said, as the asks say nothing then,
+        // but the row is stamped so no later call reads the history.
+        let mut d = doc(json!([{"key": "z#1", "stage": "running", "repo": "z",
+            "title": "BUG: z", "started": manage::stamp(T0), "agent_id": "w"}]));
+        let few = h.with_file_name("none.jsonl");
+        assert_eq!(check(&mut d, "w", None, T0, Some(&few)), None);
+        assert!(d["rows"][0].get("track_told").is_some());
+        // A worker that has re-estimated already is past needing it.
+        let mut d = doc(json!([{"key": "g#4", "stage": "running", "repo": "g",
+            "title": "BUG: q", "started": manage::stamp(T0), "agent_id": "w",
+            "eta_s": 600, "eta_first_s": 900}]));
+        assert_eq!(check(&mut d, "w", None, T0 + MIN, Some(&h)), None);
+        let _ = std::fs::remove_dir_all(h.parent().unwrap());
     }
 
     #[test]

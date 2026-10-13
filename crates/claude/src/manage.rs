@@ -1216,6 +1216,7 @@ pub fn apply(
                     "waiting_since",
                     "wait_s",
                     "reestimate_asked",
+                    "track_told",
                     "eta_at",
                     "deadline_asked",
                     "overdue_asked",

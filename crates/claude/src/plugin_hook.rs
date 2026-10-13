@@ -21,7 +21,9 @@
 //!   asked, once, to re-estimate, and again as each figure runs out (five
 //!   minutes left, then past it): on its manager task's row when it
 //!   holds one ([`manage_nudge::check`]), else on its agent ETA
-//!   ([`agent_eta::worker_ask`], [`agent_eta::deadline_ask`]). A worker
+//!   ([`agent_eta::worker_ask`], [`agent_eta::deadline_ask`]). A task
+//!   worker's first call on its row also tells it how its kind's
+//!   re-estimates have fared, before it gives a figure (giverny#366). A worker
 //!   spawned in the foreground blocks its dispatcher until it is done, so
 //!   only the worker's asks reach it.
 //! - **A manager session's upkeep.** Its leases are renewed
@@ -54,7 +56,7 @@ use std::time::SystemTime;
 use serde_json::{Map, Value, json};
 
 use crate::manage::{self, Lock};
-use crate::manage_nudge::{beat, check, holds_row, stamp_agent};
+use crate::manage_nudge::{beat, check, holds_row, stamp_agent, track_untold};
 use crate::{agent_eta, manage_chores, manage_history, manage_inbox, resources};
 
 /// What the hook payload says about who is calling.
@@ -278,6 +280,7 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String>
             let _lock = Lock::take(&file).ok()?;
             let mut d: Value = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
             let stamped = stamp_agent(&mut d, &caller.agent_id, desc);
+            let untold = track_untold(&mut d, &caller.agent_id, desc);
             let ask = check(
                 &mut d,
                 &caller.agent_id,
@@ -285,7 +288,7 @@ fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String>
                 now,
                 manage_history::path(dir).as_deref(),
             );
-            if stamped || ask.is_some() {
+            if stamped || untold || ask.is_some() {
                 manage::write(&file, &d).ok()?;
             }
             return ask;
@@ -730,6 +733,9 @@ mod tests {
         manage::write(&f, &d).unwrap();
         let p = worker_payload(&dir, "s1", "abc", "demo#143: better estimates", T0);
         assert_eq!(run(&p, &feeds, T0 + MIN, false), None);
+        // No history to tell, but the row is stamped so later calls read none.
+        let raw: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert!(raw["rows"][0].get("track_told").is_some(), "{raw}");
         let ctx = context(&run(&p, &feeds, T0 + 6 * MIN, false).unwrap());
         assert!(ctx.contains("giverny-manage eta demo#143"), "{ctx}");
         assert_eq!(run(&p, &feeds, T0 + 7 * MIN, false), None, "asked once");
