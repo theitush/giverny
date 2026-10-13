@@ -811,12 +811,17 @@ const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
 /// of the hooks. Returns whether this launch should end here.
 ///
 /// A test instance with its own `XDG_RUNTIME_DIR` has its own socket, and is
-/// never the same Giverny as the one the user runs.
+/// never the same Giverny as the one the user runs. One started with
+/// `GIVERNY_NO_ACCOUNT_SETUP` is a side window by definition: a build being
+/// tried out next to the installed one, which it must not hand over to.
 #[cfg(unix)]
 fn defer_to_running() -> bool {
     use giverny_claude::hooks::{self, Running};
-    if std::env::var_os(SECOND_WINDOW_ENV).is_some() {
-        tracing::info!("{SECOND_WINDOW_ENV} is set: opening a window whatever else runs");
+    if let Some(var) = [SECOND_WINDOW_ENV, claude_watch::NO_ACCOUNT_SETUP_ENV]
+        .into_iter()
+        .find(|var| std::env::var_os(var).is_some())
+    {
+        tracing::info!("{var} is set: opening a window whatever else runs");
         return false;
     }
     match hooks::ask_running_to_raise(Duration::from_secs(4)) {
@@ -2476,6 +2481,12 @@ impl App {
     fn come_forward(&mut self, ctx: &egui::Context) {
         for mut asker in self.claude.raise_requests() {
             use std::io::Write;
+            // Closing, as on a restart into a new version: the launch asking
+            // is the one taking over, and an answer would send it away just
+            // before this window goes. Left unanswered, it opens its own.
+            if self.closing {
+                continue;
+            }
             let _ = asker.set_write_timeout(Some(Duration::from_millis(500)));
             // A launch that waited longer than it would has given up and
             // opened its own window: this one jumping in front of that, late,
