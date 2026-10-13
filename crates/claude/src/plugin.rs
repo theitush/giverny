@@ -52,6 +52,12 @@
 //!   already running, not even at their `/clear` (giverny#356, measured on
 //!   2.1.296).
 //!
+//! - And as a `SubagentStop` hook: a subagent finishing with a background
+//!   shell or monitor of its own still running is asked, once, whether it
+//!   should keep running after it reports, and its parent session told of
+//!   what it kept ([`crate::leftovers`], giverny#370). By the same rule it
+//!   reaches only sessions started after the update that wrote it.
+//!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/` and without its
 //! prompt hook, so the tool hooks, the launchers and `/giverny:clear-done`
@@ -147,6 +153,12 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// says, which the hook reads as it runs: Claude Code loads `hooks.json` once
 /// per process, so a hook written only with the switch on misses every
 /// session started before it went on (giverny#356). Off, it costs a `stat`.
+///
+/// And it is a `SubagentStop` hook: a subagent finishing with a background
+/// command of its own still running is asked, once, whether it should keep
+/// running, and its parent told if it does ([`crate::leftovers`],
+/// giverny#370). Like any hook here it reaches only sessions started after
+/// the `hooks.json` that names it was written.
 fn session_hooks(skill: bool) -> Value {
     let hook = || {
         json!([{
@@ -157,7 +169,8 @@ fn session_hooks(skill: bool) -> Value {
     let mut hooks = json!({
         "PreToolUse": [{ "matcher": "Bash", "hooks": hook() }],
         "PostToolUse": [{ "matcher": "*", "hooks": hook() }],
-        "SessionStart": [{ "hooks": hook() }]
+        "SessionStart": [{ "hooks": hook() }],
+        "SubagentStop": [{ "hooks": hook() }]
     });
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
@@ -170,7 +183,8 @@ fn session_hooks(skill: bool) -> Value {
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
                         Bash commands kept inside their tab's resource cap, \
                         \"manage this\" sent to the manage skill, \
-                        and task work pointed at it",
+                        task work pointed at it, \
+                        and subagents asked about commands they leave running",
         "hooks": hooks
     })
 }
@@ -680,6 +694,10 @@ mod tests {
                 start["hooks"][0]["command"],
                 h["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
             );
+            // giverny#370: every subagent's finish, skill or not.
+            let stop = &h["hooks"]["SubagentStop"][0];
+            assert!(stop.get("matcher").is_none(), "every agent type");
+            assert_eq!(stop["hooks"][0]["command"], start["hooks"][0]["command"]);
         }
         assert!(remove_dir(&d).unwrap());
     }
