@@ -138,7 +138,8 @@ fn calm_breath(time: Option<f64>) -> f32 {
 }
 
 /// A working tab's mark at `at`, kept moving while `rect` is on screen. With
-/// `rail.animate` off the spinner is left out and the calm dot holds still.
+/// `rail.animate` off the spinner is left out and the calm ring holds still,
+/// full size.
 fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: BusyMark) {
     match mark {
         BusyMark::Spinner => {
@@ -151,19 +152,59 @@ fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: 
             if time.is_some() {
                 keep_animating(ui, rect);
             }
-            calm_dot(p, at, calm_breath(time), color);
+            calm_ring(p, at, calm_breath(time), color);
         }
     }
 }
 
-/// A dot that swells and brightens as it breathes in. Filled, and in the
-/// tab's colour: the idle ring is hollow and a shell's mark a still square.
-fn calm_dot(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
-    p.circle_filled(
-        at,
-        3.0 + 1.5 * breath,
-        color.gamma_multiply(0.4 + 0.6 * breath),
-    );
+/// The idle ring's radius: Claude at its prompt, and the size the calm busy
+/// ring breathes up to.
+const RING_R: f32 = 4.0;
+
+/// A plain shell's hollow square, across: at its prompt, exited, and the
+/// size a running command's square breathes up to.
+const SQUARE_SIDE: f32 = 7.0;
+
+/// A hollow ring of `radius` at `at`: Claude at its prompt.
+fn ring(p: &egui::Painter, at: Pos2, radius: f32, color: Color32) {
+    p.circle_stroke(at, radius, Stroke::new(1.4, color));
+}
+
+/// How big a breathing mark is, as a share of its resting size: from about
+/// a device pixel (`floor`) at `breath` 0 up to the whole mark at 1.
+fn breathed(floor: f32, breath: f32) -> f32 {
+    floor + (1.0 - floor) * breath
+}
+
+/// Claude's calm busy mark (`rail.calm_busy`): its idle ring breathing in
+/// size, from a pixel out to the ring and back (giverny#388). Hollow, so it
+/// reads as the ring at work, not a second kind of mark; full size when
+/// `breath` holds at 1, as with `rail.animate` off.
+fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
+    let px = 1.0 / p.pixels_per_point();
+    let radius = RING_R * breathed(px / RING_R, breath);
+    if radius <= px {
+        // Too small for a hollow middle: a pixel.
+        p.circle_filled(at, px, color);
+    } else {
+        ring(p, at, radius, color);
+    }
+}
+
+/// A shell running a command: its hollow square breathing in size, a pixel
+/// up to the square at its prompt and back, on the calm mark's slow breath
+/// (giverny#388). Kept moving on the animation clock while `rect` is on
+/// screen; with `rail.animate` off it holds still, full size.
+fn breathing_square(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) {
+    let time = animating(ui).then(anim_time);
+    if time.is_some() {
+        keep_animating(ui, rect);
+    }
+    let px = 1.0 / p.pixels_per_point();
+    let side = SQUARE_SIDE * breathed(px / SQUARE_SIDE, calm_breath(time));
+    // Two pixels across or less has no hollow middle, and an inside stroke
+    // that fills it all draws nothing: filled, it is the pixel it should be.
+    square(p, at, side, side <= 2.0 * px, color);
 }
 
 /// How lit each of a background shell's three dots is, 0 (dim) to 1 (the
@@ -252,6 +293,13 @@ struct RowData {
     /// subagents it handed work to (giverny#363) — while Claude itself waits
     /// at its prompt, free to talk.
     background: bool,
+    /// A plain shell with a command in front: seen by the foreground poll,
+    /// or between the shell's OSC 133 `C` and `D` (giverny#388).
+    running: bool,
+    /// Something finished here while you were on another tab and you have
+    /// not looked since: a Claude turn, or a shell's command (giverny#388).
+    /// Outlives Claude's `DoneUnseen`, which a new turn replaces.
+    unseen: bool,
     /// Its shell's CPU and memory now, with everything under it (Claude
     /// Code or not), from the reading the sidebar shows (giverny#267,
     /// giverny#289); `None` for a tab with no shell running.
@@ -361,6 +409,9 @@ fn row_data(
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.working_in_background()),
+        running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
+        unseen: app.unseen_done.contains(&t.id)
+            || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
         // Off (`rail.tab_figures`, giverny#304), a row has no figures, so
         // nothing reserves room for them and no group sums them.
         used: app
@@ -862,7 +913,7 @@ fn jobs_section(app: &mut App, ui: &mut Ui, dim: Color32, fg: Color32, actions: 
                 .selectable(false),
             );
             if working && mark == BusyMark::Breath {
-                calm_dot(
+                calm_ring(
                     ui.painter(),
                     glyph.rect.center(),
                     calm_breath(animate.then(anim_time)),
@@ -1142,7 +1193,7 @@ fn category_header(
     badge_x -= 20.0;
     if cat.busy > 0 {
         // Off, the spinner's place stays blank and the count keeps its spot;
-        // a calm dot holds still.
+        // a calm ring holds still.
         busy(
             ui,
             &p,
@@ -1332,20 +1383,32 @@ fn flag(p: &egui::Painter, at: Pos2, color: Color32) {
 
 /// A tick: finished while you were elsewhere.
 fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.8, color);
-    p.line_segment(
-        [at + Vec2::new(-4.5, 0.0), at + Vec2::new(-1.5, 3.5)],
-        stroke,
-    );
-    p.line_segment(
-        [at + Vec2::new(-1.5, 3.5), at + Vec2::new(4.5, -4.0)],
-        stroke,
-    );
+    tick_scaled(p, at, 1.0, 1.8, color);
+}
+
+/// How far left of a tab's mark the badge tick sits: clear of the widest
+/// mark beside it (the spinner, the three dots), inside the gutter before
+/// the active-tab bar.
+const BADGE_OFFSET: f32 = 13.0;
+
+/// The tick as a badge beside a mark that is still running (giverny#388):
+/// three quarters the size and a touch thinner, so it reads as a note on
+/// the mark and not a second mark.
+fn badge_tick(p: &egui::Painter, at: Pos2, color: Color32) {
+    tick_scaled(p, at, 0.75, 1.5, color);
+}
+
+/// A tick at `at`, `scale` times the full one, stroked `width` wide.
+fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, color: Color32) {
+    let stroke = Stroke::new(width, color);
+    let at_ = |x: f32, y: f32| at + Vec2::new(x, y) * scale;
+    p.line_segment([at_(-4.5, 0.0), at_(-1.5, 3.5)], stroke);
+    p.line_segment([at_(-1.5, 3.5), at_(4.5, -4.0)], stroke);
 }
 
 /// A plain shell's mark at `at` (giverny#361): a square `side` points
 /// across, filled or hollow. Every Claude mark is round or drawn — spinner,
-/// breathing dot, flag, tick, ring, three dots — so a square says "just a
+/// calm ring, flag, tick, ring, three dots — so a square says "just a
 /// shell" by shape alone, now that colour says the category for both.
 /// Snapped to whole device pixels, edges and all: a square straddling a
 /// pixel boundary smears into a blurred blob at this size, where a circle
@@ -1378,18 +1441,29 @@ fn square(p: &egui::Painter, at: Pos2, side: f32, filled: bool, color: Color32) 
 /// drawn; a plain shell's are square, so the two no longer pass for each
 /// other (an exited shell's ring was an idle Claude's, a live shell's dot
 /// the calm busy one's).
+///
+/// The tick says "finished while you were elsewhere", for both. Alone it is
+/// the whole mark: nothing runs after the finish you have not seen. When
+/// something does — the agent working again, its subagents or background
+/// shell humming on, a shell's next command — that is the mark, and the
+/// tick rides beside it as a badge ([`Mark::badged`]) until you look
+/// (giverny#388).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
-    /// Claude working: the spinner, or the breathing dot.
+    /// Claude working: the spinner, or with `rail.calm_busy` the idle ring
+    /// breathing in size (giverny#388).
     Busy,
-    /// Claude wants you: the pulsing flag.
+    /// Claude wants you: the pulsing flag. It wins over everything, the
+    /// badge too: what you owe it matters more than what you missed.
     Flag,
-    /// Claude finished while you were elsewhere, and nothing it started
-    /// runs on: the tick. A turn that ended with its subagents or a
+    /// Something finished while you were elsewhere, and nothing runs after
+    /// it: the tick. A Claude turn that ended with its subagents or a
     /// background shell still running is not done yet, seen or unseen, so
-    /// it wears [`Mark::Wave`] until they end (giverny#381).
+    /// it wears [`Mark::Wave`] until they end (giverny#381), with the tick
+    /// beside it while unseen (giverny#388). A shell whose command ended
+    /// on another tab ticks the same.
     Tick,
-    /// Claude idle at its prompt: a hollow ring.
+    /// Claude idle at its prompt, seen: a hollow ring.
     Ring,
     /// Claude at its prompt, free to talk, while something it started
     /// hums on — a background shell (giverny#352) or its subagents
@@ -1398,9 +1472,14 @@ enum Mark {
     /// which it cannot talk through, is [`Mark::Busy`], and wins; it asking
     /// for you is [`Mark::Flag`], and wins too.
     Wave,
-    /// A live plain shell: a filled square.
-    Shell,
-    /// A plain shell that has exited: a hollow square.
+    /// A plain shell running a command: the hollow square breathing in
+    /// size, a pixel up to [`Mark::Prompt`]'s and back (giverny#388).
+    Running,
+    /// A plain shell at its prompt, its last command seen: a hollow square,
+    /// as Claude at its prompt is a hollow ring (giverny#388).
+    Prompt,
+    /// A plain shell that has exited: the hollow square in gray, like a
+    /// tab not started — nothing runs there (giverny#388).
     Exited,
     /// A tab restored from a previous run whose process has not spawned:
     /// tiny and gray, a circle when it will come back as Claude, a square
@@ -1418,27 +1497,44 @@ impl Mark {
                 claude: row.resumes_claude,
             };
         }
-        match row.claude {
+        let mark = match row.claude {
             ClaudeState::Busy => Mark::Busy,
             ClaudeState::NeedsYou => Mark::Flag,
             // Unseen or not, a turn whose work still runs is not done: the
-            // tick waits for the last of it, the state staying `DoneUnseen`
-            // until you look (giverny#381, the manager's tab ticked while its
-            // worker built).
+            // wave says so, the state staying `DoneUnseen` until you look
+            // (giverny#381, the manager's tab ticked while its worker
+            // built), and the tick waits beside it ([`Mark::badged`]).
             ClaudeState::DoneUnseen | ClaudeState::Idle if row.background => Mark::Wave,
             ClaudeState::DoneUnseen => Mark::Tick,
             ClaudeState::Idle => Mark::Ring,
             ClaudeState::None if row.exited => Mark::Exited,
-            ClaudeState::None => Mark::Shell,
+            ClaudeState::None if row.running => Mark::Running,
+            ClaudeState::None => Mark::Prompt,
+        };
+        // Back at rest with a finish still unseen — a shell's command, or a
+        // turn the agent has since followed with another — the tick alone,
+        // as for a turn that ended once.
+        match mark {
+            Mark::Ring | Mark::Prompt if row.unseen => Mark::Tick,
+            mark => mark,
         }
     }
 
+    /// Whether the tick rides beside this mark (giverny#388): something
+    /// finished unseen, and something runs on after it — the agent working
+    /// again, what it left humming, a shell's next command. Not beside the
+    /// flag, which wins, nor an exited shell, which runs nothing.
+    fn badged(self, row: &RowData) -> bool {
+        row.unseen && matches!(self, Mark::Busy | Mark::Wave | Mark::Running)
+    }
+
     /// What it is drawn in: the tab's category `color`, Claude or shell,
-    /// except a tab that has not started, which is `dim` — gray says
-    /// "nothing here yet" in any category (giverny#361).
+    /// except a tab that has not started or a shell that has exited, which
+    /// is `dim` — gray says "nothing runs here" in any category
+    /// (giverny#361, giverny#388).
     fn color(self, color: Color32, dim: Color32) -> Color32 {
         match self {
-            Mark::NotStarted { .. } => dim,
+            Mark::NotStarted { .. } | Mark::Exited => dim,
             _ => color,
         }
     }
@@ -1513,7 +1609,8 @@ fn tab_row(
     let color = mark.color(row.color, dim);
     match mark {
         // Off, a working tab's spinner is not drawn, the only state left
-        // blank (a calm dot holds still). The title stays where it is.
+        // blank (a calm ring holds still, full size). The title stays
+        // where it is.
         Mark::Busy => busy(ui, &p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
         Mark::Flag => {
             // One breath every two seconds, sampled at the animation step.
@@ -1536,21 +1633,26 @@ fn tab_row(
         // through three small dots, the hum of something left running
         // (#352, #363). Off, they hold still and faded.
         Mark::Wave => shell_dots(ui, &p, rect, dot, color),
-        Mark::Ring => {
-            p.circle_stroke(dot, 4.0, Stroke::new(1.4, color));
-        }
-        // A plain shell, which most tabs are most of the time: a filled
-        // square while it runs, a hollow one once it has exited. Squares
-        // read larger than circles of the same width, so these are a
-        // touch narrower than the ring and the busy dot beside them.
-        Mark::Shell => square(&p, dot, 6.0, true, color),
-        Mark::Exited => square(&p, dot, 7.0, false, color),
+        Mark::Ring => ring(&p, dot, RING_R, color),
+        // A plain shell, which most tabs are most of the time: a hollow
+        // square at its prompt, breathing in size while a command runs, and
+        // gray once the shell has exited (giverny#388). Squares read larger
+        // than circles of the same width, so it is a touch narrower than
+        // the ring.
+        Mark::Running => breathing_square(ui, &p, rect, dot, color),
+        Mark::Prompt | Mark::Exited => square(&p, dot, SQUARE_SIDE, false, color),
         // A restored tab whose process has not started yet: small and
         // gray, since any colour would claim something running.
         Mark::NotStarted { claude: true } => {
             p.circle_filled(dot, 2.5, color);
         }
         Mark::NotStarted { claude: false } => square(&p, dot, 4.0, true, color),
+    }
+    // The unseen finish beside what runs after it (giverny#388): the tick,
+    // smaller, in the gutter left of the mark, so the mark keeps its place
+    // and the title never moves as the badge comes and goes.
+    if mark.badged(row) {
+        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
     }
 
     // Inline rename?
@@ -2552,10 +2654,10 @@ mod tests {
     }
 
     /// With `rail.animate` off a calm rail still marks a working tab: the
-    /// dot, full and still, and no frame asked for. The spinner it replaces
-    /// draws nothing at all (#266).
+    /// ring, full size and still, and no frame asked for. The spinner it
+    /// replaces draws nothing at all (#266, giverny#388).
     #[test]
-    fn a_still_rail_holds_the_calm_dot_full() {
+    fn a_still_rail_holds_the_calm_ring_full() {
         let ctx = egui::Context::default();
         let frame = |mark: BusyMark| {
             let out = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -2575,18 +2677,19 @@ mod tests {
         assert_eq!(
             delay,
             std::time::Duration::MAX,
-            "a still dot woke the window"
+            "a still ring woke the window"
         );
-        let dots: Vec<_> = shapes
+        let rings: Vec<_> = shapes
             .iter()
             .filter_map(|s| match s {
                 egui::Shape::Circle(c) => Some(c),
                 _ => None,
             })
             .collect();
-        assert_eq!(dots.len(), 1, "{shapes:?}");
-        assert_eq!(dots[0].radius, 4.5, "breathed in, all the way");
-        assert_eq!(dots[0].fill, Color32::WHITE, "at full strength");
+        assert_eq!(rings.len(), 1, "{shapes:?}");
+        assert_eq!(rings[0].radius, RING_R, "breathed in, all the way");
+        assert_eq!(rings[0].fill, Color32::TRANSPARENT, "hollow, as at rest");
+        assert_eq!(rings[0].stroke.color, Color32::WHITE);
         let (_, shapes) = frame(BusyMark::Spinner);
         assert!(shapes.is_empty(), "a spinner drawn with the switch off");
     }
@@ -2690,6 +2793,8 @@ mod tests {
             color: Color32::RED,
             claude,
             background: false,
+            running: false,
+            unseen: claude == ClaudeState::DoneUnseen,
             used: None,
         }
     }
@@ -2707,7 +2812,7 @@ mod tests {
             ..row(ClaudeState::Idle)
         };
         assert_eq!(Mark::of(&humming), Mark::Wave);
-        assert_eq!(Mark::of(&row(ClaudeState::None)), Mark::Shell);
+        assert_eq!(Mark::of(&row(ClaudeState::None)), Mark::Prompt);
         let exited = RowData {
             exited: true,
             ..row(ClaudeState::None)
@@ -2756,6 +2861,90 @@ mod tests {
         };
         assert_eq!(shell(ClaudeState::DoneUnseen), Mark::Wave);
         assert_eq!(shell(ClaudeState::Idle), Mark::Wave);
+    }
+
+    /// A turn that ended unseen keeps its tick as a badge beside what runs
+    /// after it — the wave of its workers, the agent working again — until
+    /// you look; alone, with nothing running, it is the tick itself. The
+    /// flag wins over all of it (giverny#388).
+    #[test]
+    fn an_unseen_turn_ticks_beside_what_runs_after_it() {
+        let marked = |row: RowData| {
+            let mark = Mark::of(&row);
+            (mark, mark.badged(&row))
+        };
+        // Its workers still running: the wave, the tick beside it.
+        let humming = RowData {
+            background: true,
+            ..row(ClaudeState::DoneUnseen)
+        };
+        assert_eq!(marked(humming), (Mark::Wave, true));
+        // Seen, the wave alone.
+        let seen = RowData {
+            background: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(marked(seen), (Mark::Wave, false));
+        // Unseen, then the agent works again: the spinner (or the calm
+        // ring), the tick beside it; that turn ends too, the tick alone.
+        let again = RowData {
+            unseen: true,
+            ..row(ClaudeState::Busy)
+        };
+        assert_eq!(marked(again), (Mark::Busy, true));
+        assert_eq!(marked(row(ClaudeState::DoneUnseen)), (Mark::Tick, false));
+        // Back at its prompt without a `Stop` while still unseen: the tick.
+        let idle = RowData {
+            unseen: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(marked(idle), (Mark::Tick, false));
+        // Nothing unseen: no badge on the spinner.
+        assert_eq!(marked(row(ClaudeState::Busy)), (Mark::Busy, false));
+        // The flag wins, badge and all.
+        let asks = RowData {
+            unseen: true,
+            ..row(ClaudeState::NeedsYou)
+        };
+        assert_eq!(marked(asks), (Mark::Flag, false));
+    }
+
+    /// A plain shell (giverny#388): a command running breathes its square;
+    /// one that finished on another tab ticks until you look; at its prompt,
+    /// seen, the hollow square; exited, the hollow square in gray. Its next
+    /// command, the first still unseen, breathes with the tick beside it.
+    #[test]
+    fn a_shell_breathes_ticks_then_rests_hollow() {
+        let shell = |running, unseen, exited| {
+            let row = RowData {
+                running,
+                unseen,
+                exited,
+                ..row(ClaudeState::None)
+            };
+            let mark = Mark::of(&row);
+            (mark, mark.badged(&row))
+        };
+        assert_eq!(shell(true, false, false), (Mark::Running, false));
+        assert_eq!(shell(false, true, false), (Mark::Tick, false));
+        assert_eq!(shell(false, false, false), (Mark::Prompt, false));
+        assert_eq!(shell(true, true, false), (Mark::Running, true));
+        // Exited is exited, whatever it last ran or left unseen.
+        assert_eq!(shell(false, true, true), (Mark::Exited, false));
+        assert_eq!(shell(true, false, true), (Mark::Exited, false));
+    }
+
+    /// The breathing marks start at a device pixel and breathe up to the
+    /// resting mark's size exactly, so at full breath (and with
+    /// `rail.animate` off) a working mark is the size of the idle one
+    /// (giverny#388).
+    #[test]
+    fn breathing_marks_go_from_a_pixel_to_the_resting_size() {
+        let floor = 1.0 / SQUARE_SIDE;
+        assert_eq!(SQUARE_SIDE * breathed(floor, 0.0), 1.0);
+        assert_eq!(SQUARE_SIDE * breathed(floor, 1.0), SQUARE_SIDE);
+        assert_eq!(RING_R * breathed(0.5 / RING_R, 1.0), RING_R);
+        assert!(breathed(floor, 0.5) > floor && breathed(floor, 0.5) < 1.0);
     }
 
     /// A header counts a tab showing the wave as working, so its breathing
@@ -2814,7 +3003,8 @@ mod tests {
     }
 
     /// Every mark is in the category's colour, Claude and shell alike; only
-    /// a tab not started yet is gray (giverny#361).
+    /// a tab not started yet, or a shell that has exited, is gray
+    /// (giverny#361, giverny#388).
     #[test]
     fn every_mark_wears_the_category_colour_but_not_started_is_gray() {
         let (cat, dim) = (Color32::from_rgb(200, 120, 40), Color32::from_gray(90));
@@ -2824,14 +3014,15 @@ mod tests {
             Mark::Tick,
             Mark::Ring,
             Mark::Wave,
-            Mark::Shell,
-            Mark::Exited,
+            Mark::Running,
+            Mark::Prompt,
         ] {
             assert_eq!(mark.color(cat, dim), cat, "{mark:?}");
         }
         for claude in [false, true] {
             assert_eq!(Mark::NotStarted { claude }.color(cat, dim), dim);
         }
+        assert_eq!(Mark::Exited.color(cat, dim), dim, "an exited shell is gray");
     }
 
     /// A shell's square lands on whole device pixels at any scale and any
