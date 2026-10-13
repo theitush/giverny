@@ -166,6 +166,7 @@ mod tests {
             usage_load: None,
             oom: false,
             flag: false,
+            landed_ms: None,
             click: RowClick {
                 stage: Stage::Running,
                 key: String::new(),

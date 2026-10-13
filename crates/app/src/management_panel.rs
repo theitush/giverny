@@ -57,7 +57,7 @@
 //! rows, copies it as plain text line by line when the drag ends, and
 //! `Ctrl+Shift+C` copies it again. The next press anywhere lets it go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -162,6 +162,85 @@ struct View {
     /// The chores last kept for this tab's manager, and for which session
     /// ([`Views::keep_chores`]): written again only when they change.
     chores: Option<(String, Vec<Chore>)>,
+    /// The Done rows this tab's pane has shown, by [`done_ident`]: what of
+    /// it was seen, kept up every frame it is drawn (giverny#394). `None`
+    /// until it is first drawn.
+    seen_done: Option<HashSet<String>>,
+    /// The tab was just looked at with its unseen-finish tick on
+    /// ([`Views::flash_new_done`]): the next drawing flashes what landed
+    /// since the last look.
+    flash_due: bool,
+    /// The newly done rows breathing now, if any.
+    flash: Option<Flash>,
+}
+
+/// The newly done rows' frames breathing together (giverny#394): which rows
+/// ([`done_ident`]) and from when, on the animation clock.
+struct Flash {
+    rows: HashSet<String>,
+    from: f64,
+}
+
+/// How many breaths the newly done rows' frames take: a few, together, then
+/// still.
+const FLASH_BREATHS: f64 = 3.0;
+
+/// How long a flash lasts, in seconds: its breaths on the rail's calm
+/// timing ([`crate::rail::CALM_PERIOD`]), so the pane and the rail's marks
+/// breathe alike.
+const FLASH_S: f64 = FLASH_BREATHS * crate::rail::CALM_PERIOD;
+
+/// How lit a flashing row's frame is `t` seconds into the flash, 0 to 1:
+/// the calm breath, out from nothing and back, [`FLASH_BREATHS`] times, so
+/// it ends where it began, unframed. With `rail.animate` off (`animate`) a
+/// steady frame for the same span instead. `None` once the flash is over
+/// (or before it began).
+fn flash_glow(t: f64, animate: bool) -> Option<f32> {
+    if !(0.0..FLASH_S).contains(&t) {
+        return None;
+    }
+    Some(if animate {
+        crate::rail::calm_breath(Some(t))
+    } else {
+        1.0
+    })
+}
+
+/// What a Done row is known by from one look at the pane to the next: the
+/// feed's key, else its worker's id, else its name — as
+/// [`RowClick::same_row`] tells rows apart.
+fn done_ident(c: &RowClick) -> String {
+    if !c.key.is_empty() {
+        format!("k:{}", c.key)
+    } else if let Some(a) = &c.agent_id {
+        format!("a:{a}")
+    } else {
+        format!("n:{}", c.name)
+    }
+}
+
+/// The Done rows of `lines` that landed since the pane was last looked at:
+/// those it never showed (`seen`). A pane not drawn since Giverny started
+/// (`seen` is `None`) knows nothing of what was seen before, so only rows
+/// that landed since then (`born_ms`) count as new.
+fn newly_done(lines: &[Line], seen: Option<&HashSet<String>>, born_ms: u64) -> HashSet<String> {
+    lines
+        .iter()
+        .filter(|l| l.stage == Stage::Done)
+        .filter(|l| match seen {
+            Some(seen) => !seen.contains(&done_ident(&l.click)),
+            None => l.landed_ms.is_some_and(|e| e >= born_ms),
+        })
+        .map(|l| done_ident(&l.click))
+        .collect()
+}
+
+/// Note every Done row of `lines` as seen: the pane is showing them.
+fn note_seen(seen: &mut Option<HashSet<String>>, lines: &[Line]) {
+    let seen = seen.get_or_insert_with(HashSet::new);
+    for l in lines.iter().filter(|l| l.stage == Stage::Done) {
+        seen.insert(done_ident(&l.click));
+    }
 }
 
 impl View {
@@ -227,7 +306,6 @@ pub fn poll_logs(logs: &mut Logs, live: &[SubagentRow]) {
 }
 
 /// Every tab's pane view state.
-#[derive(Default)]
 pub struct Views {
     tabs: HashMap<TabId, View>,
     /// The machine ledger, read off the UI thread: one for every tab, as
@@ -237,6 +315,21 @@ pub struct Views {
     chores_at: Option<Instant>,
     /// What the machine slept through: one log for the whole machine.
     sleeps: sleeps::Cache,
+    /// When Giverny started (epoch ms): a pane not drawn since knows only
+    /// that rows landed after it went unseen ([`newly_done`]).
+    born_ms: u64,
+}
+
+impl Default for Views {
+    fn default() -> Self {
+        Views {
+            tabs: HashMap::new(),
+            ledger: LedgerWatch::default(),
+            chores_at: None,
+            sleeps: sleeps::Cache::default(),
+            born_ms: now_ms(),
+        }
+    }
 }
 
 /// How often every manager tab's chores are worked out ([`Views::keep_chores`]).
@@ -302,6 +395,14 @@ impl Views {
                 Err(e) => tracing::warn!("management panel: chores not kept: {e}"),
             }
         }
+    }
+
+    /// The user looked at `tab` with its unseen-finish tick on
+    /// (giverny#388): when its pane is next drawn, the Done rows that landed
+    /// since they last looked breathe their frames together a few times,
+    /// then go still (giverny#394).
+    pub fn flash_new_done(&mut self, tab: TabId) {
+        self.tabs.entry(tab).or_default().flash_due = true;
     }
 
     /// Forget a closed tab.
@@ -1097,6 +1198,9 @@ pub struct Line {
     /// the warning colour. A worker that finished is its manager's to land,
     /// not the person's ([`chores`]): its row is drawn as any Running row.
     pub flag: bool,
+    /// When a Done row landed (epoch ms), when known; `None` on any other
+    /// row.
+    pub landed_ms: Option<u64>,
     pub click: RowClick,
 }
 
@@ -1625,6 +1729,7 @@ fn format_row(
         usage_load,
         oom,
         flag: flag.is_some(),
+        landed_ms: row.ended_ms().filter(|_| row.stage == Stage::Done),
         click: RowClick {
             stage: row.stage,
             key,
@@ -1972,6 +2077,12 @@ pub fn show(
     shared: &mut RenderShared,
     ui: &mut Ui,
 ) -> (Option<RowClick>, Option<Line>) {
+    // A look asks for one flash, at the drawing right after it: a pane with
+    // nothing to show now does not flash later (giverny#394).
+    let flash_due = views
+        .tabs
+        .get_mut(&tab)
+        .is_some_and(|v| std::mem::take(&mut v.flash_due));
     let Some(tracker) = tracker else {
         return (None, None);
     };
@@ -2044,6 +2155,31 @@ pub fn show(
     if table.is_empty() {
         return (None, None);
     }
+    // What landed since the last look breathes; whatever is drawn now has
+    // been seen (giverny#394).
+    if flash_due {
+        let rows = newly_done(&table.lines, view.seen_done.as_ref(), views.born_ms);
+        view.flash = (!rows.is_empty()).then(|| Flash {
+            rows,
+            from: crate::rail::anim_time(),
+        });
+    }
+    note_seen(&mut view.seen_done, &table.lines);
+    let animate = crate::rail::animating(ui);
+    let glow = view.flash.as_ref().and_then(|f| {
+        let t = crate::rail::anim_time() - f.from;
+        let glow = flash_glow(t, animate)?;
+        if !animate {
+            // Still: one frame, where the steady highlight ends.
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64((FLASH_S - t).max(0.0)));
+        }
+        Some(glow)
+    });
+    if glow.is_none() {
+        view.flash = None;
+    }
+    let flash = view.flash.as_ref().zip(glow).map(|(f, g)| (&f.rows, g));
     // The first of a worker's rows: the one with no ditto in it.
     let header_line = header.and_then(|id| {
         table
@@ -2104,6 +2240,8 @@ pub fn show(
                         &table,
                         &panel.columns,
                         viewed,
+                        flash,
+                        animate,
                         chrome,
                         shared,
                         cell,
@@ -2173,6 +2311,14 @@ fn follow_rows(ctx: &egui::Context, id: egui::Id, fit: &mut Option<f32>, want: f
 /// How strongly the row of the worker on view is lit: past a hover's, so
 /// it reads as the selection even under the pointer.
 const VIEWED_TINT: f32 = 0.26;
+
+/// How wide a newly done row's breathing frame is, in points (giverny#394).
+const FLASH_WIDTH: f32 = 1.5;
+/// How far out past the row's left edge the frame sits, in points: clear of
+/// the row's first glyph, and within the scroll area's clip margin, so it is
+/// not cut. The right edge is the row's own, which ends clear of its last
+/// glyph and at the clip.
+const FLASH_OUT: f32 = 3.0;
 
 fn row_tint(hovered: bool, pressed: bool) -> Option<f32> {
     if pressed {
@@ -2584,6 +2730,8 @@ fn draw_table(
     table: &Table,
     shown: &PaneColumns,
     viewed: Option<&str>,
+    flash: Option<(&HashSet<String>, f32)>,
+    animate: bool,
     chrome: &Chrome,
     shared: &mut RenderShared,
     cell: egui::Vec2,
@@ -2650,6 +2798,24 @@ fn draw_table(
             let here = hovered_line == Some(i);
             if let Some(alpha) = row_tint(here, here && input.pressed) {
                 p.rect_filled(rect, 2.0, color.gamma_multiply(alpha));
+            }
+            // Landed since the last look: its frame breathes with the
+            // others' (giverny#394). Painted only, over the row and a hair
+            // out to its left so it clears the first glyph: nothing moves.
+            // Kept moving only while the row is on screen.
+            if let Some((rows, glow)) = flash
+                && line.stage == Stage::Done
+                && rows.contains(&done_ident(&line.click))
+            {
+                p.rect_stroke(
+                    rect.with_min_x(rect.min.x - FLASH_OUT),
+                    2.0,
+                    egui::Stroke::new(FLASH_WIDTH, color.gamma_multiply(glow)),
+                    egui::StrokeKind::Inside,
+                );
+                if animate {
+                    crate::rail::keep_animating(ui, rect);
+                }
             }
         }
         // The selected text, behind the glyphs.
@@ -2886,6 +3052,68 @@ mod tests {
       {"key":"g#4","stage":"done","title":"four","started":1789990000000,"ended":1789994900000},
       {"key":"g#5","stage":"done","title":"five","started":1789990000000,"ended":1789995900000},
       {"key":"g#6","stage":"done","title":"six","started":1789990000000,"ended":1789996900000}]}"#;
+
+    /// The keys of a set of [`done_ident`]s, sorted, for asserting on.
+    fn flashed(rows: &HashSet<String>) -> Vec<String> {
+        let mut keys: Vec<String> = rows
+            .iter()
+            .map(|r| r.trim_start_matches("k:").to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Focusing a ticked manager flashes the Done rows that landed since
+    /// the last look, and only those (giverny#394).
+    #[test]
+    fn only_rows_landed_since_the_last_look_flash() {
+        // The last look saw g#3 and g#4 done.
+        let before = feed(
+            r#"{"rows":[
+          {"key":"g#3","stage":"done","title":"three","started":1789990000000,"ended":1789993900000},
+          {"key":"g#4","stage":"done","title":"four","started":1789990000000,"ended":1789994900000},
+          {"key":"g#5","stage":"running","title":"five","started":1789990000000,"eta_s":1800}]}"#,
+        );
+        let mut seen = None;
+        note_seen(&mut seen, &build(Some(&before), &[], T0).lines);
+        // Away, g#5 and g#6 landed: those two flash, Running and Next up
+        // never do.
+        let now = build(Some(&feed(DONE_FOUR)), &[], T0).lines;
+        let rows = newly_done(&now, seen.as_ref(), 0);
+        assert_eq!(flashed(&rows), ["g#5", "g#6"]);
+        // Once drawn they are seen: nothing landed since, nothing flashes.
+        note_seen(&mut seen, &now);
+        assert!(newly_done(&now, seen.as_ref(), 0).is_empty());
+    }
+
+    /// A pane not drawn since Giverny started knows nothing of what was
+    /// seen before: only rows that landed since the start flash.
+    #[test]
+    fn a_pane_never_drawn_flashes_what_landed_since_the_start() {
+        let lines = build(Some(&feed(DONE_FOUR)), &[], T0).lines;
+        // Started between g#4's and g#5's landings.
+        let rows = newly_done(&lines, None, 1_789_995_000_000);
+        assert_eq!(flashed(&rows), ["g#5", "g#6"]);
+        assert!(newly_done(&lines, None, T0).is_empty());
+    }
+
+    /// The flash breathes from nothing out and back, three times, then
+    /// ends unframed; with `rail.animate` off it holds steady as long.
+    #[test]
+    fn the_flash_breathes_a_few_times_then_ends() {
+        let half = crate::rail::CALM_PERIOD / 2.0;
+        assert_eq!(flash_glow(0.0, true), Some(0.0));
+        assert!(flash_glow(half, true).is_some_and(|g| g > 0.99));
+        assert!(flash_glow(crate::rail::CALM_PERIOD, true).is_some_and(|g| g < 0.01));
+        assert!(flash_glow(FLASH_S - half, true).is_some_and(|g| g > 0.99));
+        assert_eq!(flash_glow(FLASH_S, true), None, "over after three breaths");
+        assert_eq!(flash_glow(FLASH_S + 60.0, true), None);
+        assert_eq!(flash_glow(-1.0, true), None);
+        // Still: one steady frame, the same span.
+        assert_eq!(flash_glow(0.0, false), Some(1.0));
+        assert_eq!(flash_glow(FLASH_S - 0.25, false), Some(1.0));
+        assert_eq!(flash_glow(FLASH_S, false), None);
+    }
 
     #[test]
     fn done_rows_are_all_none_or_the_newest_few() {
