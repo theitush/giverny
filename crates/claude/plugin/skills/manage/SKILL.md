@@ -34,10 +34,10 @@ choose:
   row and its worker.
 - a **title**: one line saying what the task is. If the project types its
   tasks, start the title with the type word and a colon (`BUG: …`,
-  `FEATURE: …`): your track record is told per type.
-- an **estimate** in minutes for how long its worker will take, with your
-  track record (below) taken into account. The figure you give is the figure
-  the pane shows.
+  `FEATURE: …`): how your instinct runs is told per type.
+- an **estimate** in minutes for how long its worker will take: your instinct
+  scaled by the factor Giverny tells you (below). The figure you give is the
+  figure the pane shows.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another: plan
@@ -65,33 +65,38 @@ fine); a relative path is stored absolute. If the prompt changes before the
 spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
 Each `plan` (and `start --eta`) prints the figure the pane will count down
-from, which is the one you gave, and how your past guesses fared. Giverny
-keeps a history of every task that landed: its estimate, its wall time and its
-working time (wall time less pauses and waits). It takes the most recent 20
-landed tasks like this one (same project and type, else same project, else
-all; five at least) and tells you the median of working time ÷ estimate:
+from, which is the one you gave, and how your instinct runs. Giverny keeps a
+history of every task that landed: its estimate, the factor you had been
+shown when you gave it, its wall time and its working time (wall time less
+pauses and waits). It takes the most recent 20 landed tasks like this one
+(same project and type, else same project, else all; five at least) and tells
+you the median of working time ÷ your instinct figure (the figure you gave ÷
+the factor you had been shown):
 
 ```
 planned auth-fix: ~25m
-  your last 9 BUG guesses in myapp took ×0.48 of what you said (median)
+  your instinct on BUG in myapp runs ×0.48 (last 9, median): scale your figure by it
 ```
 
-Nothing is corrected for you: take the factor into account in the figure you
-give, and what you give is what the pane shows and what is scored. With too
-little history the second line says so. Pass `--repo <name>` when the task
+Nothing is corrected for you: scale your gut figure by the factor yourself,
+every time, and what you give is what the pane shows. The factor describes
+your instinct, not your last figures, so it does not fade as your scaled
+figures land on target: keep applying it. With too little history the second
+line says so. Pass `--repo <name>` when the task
 belongs to a project other than the directory you run in.
 
 A worker's re-estimate is scored too, on its own track: its first `eta` on a
 running task (the one Giverny asks for five minutes in, after it has read the
 code) goes on the pane as given and is later checked against the working
-time that was still to come. How its kind's re-estimates have fared reaches
-the worker before its first figure — Giverny puts it in its context on its
-first tool call on the task — and again in each ask and in the `eta`
-output, for it to weigh in its figure.
+time that was still to come. How the worker's instinct on its kind's
+re-estimates runs reaches it before its first figure — Giverny puts it in its
+context on its first tool call on the task — and again in each ask and in the
+`eta` output, for it to scale its figure by.
 
 `giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess and the worker's
-re-estimate. When the
+re-estimate, each with its instinct factor and how the figures as given
+landed (near ×1.00 when the factor is applied). When the
 user asks whether estimates are getting better, answer from it.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
@@ -198,14 +203,15 @@ When you spawn one:
   > how you checked it, and anything left undone.
 
   On the worker's first tool call on a task, Giverny's plugin puts one line
-  into its context, once per task: how its kind's re-estimates have fared
-  (nothing with too little history), to weigh when it re-estimates. It is
+  into its context, once per task: how its instinct on its kind's
+  re-estimates runs (nothing with too little history), to scale its figure by
+  when it re-estimates. It is
   told, not asked for anything. About five minutes into the task, the plugin
   puts a request for that re-estimate into the worker's context, once, unless
   it has re-estimated already. It asks again as each figure runs out: once when five minutes of
   it are left, and once if the work runs past it, unless the worker has just
-  re-estimated. Each ask tells the worker how its kind's re-estimates have
-  fared; none changes its figure. Its answer is the `eta` command.
+  re-estimated. Each ask tells the worker how its instinct on its kind's
+  re-estimates runs; none changes its figure. Its answer is the `eta` command.
 
 ## 3. While it runs
 

@@ -12,13 +12,25 @@
 //! as given. Each estimator is scored on its own **track** — the
 //! dispatcher's guess against the whole working time, and the worker's first
 //! re-estimate (made after reading the code) against the working time that
-//! was still to come when it was made — and is *told* how its past estimates
-//! fared ([`track_record`]): the median working-time ÷ estimate ratio over
-//! the most recent landed tasks of the same kind (the same repo and the same
-//! type word in the title, `BUG:`, `FEATURE:` …, else the same repo, else
-//! every task). Plain arithmetic over the file, nothing else. [`accuracy`]
-//! reports every track's error, older against recent, so whether estimates
-//! improve is read from the data.
+//! was still to come when it was made — and is *told* how its instinct runs
+//! ([`track_record`]): the median of working time ÷ its *instinct* figure
+//! over the most recent landed tasks of the same kind (the same repo and the
+//! same type word in the title, `BUG:`, `FEATURE:` …, else the same repo,
+//! else every task). Plain arithmetic over the file, nothing else.
+//! [`accuracy`] reports every track's error, older against recent, so
+//! whether estimates improve is read from the data.
+//!
+//! **The instinct, not the figure** (giverny#371). Each figure is kept with
+//! the factor its giver had been shown for its track when giving it
+//! (`told_x`, `reest_told_x`; none shown is ×1). The figure as given is the
+//! instinct already scaled by that factor, so the instinct figure is
+//! `given ÷ told_x` and the factor told is `median(work × told_x ÷ given)`.
+//! Scoring the figures as given instead undid itself: once givers applied
+//! the factor and landed on target, the records came in at ×1.0, the factor
+//! drifted to ×1.0, the givers went back to their instinct and it swung
+//! back. Learned from the instinct, the factor stays for as long as the
+//! instinct is off, and follows it to ×1.0 only when the instinct itself
+//! improves.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -60,9 +72,18 @@ pub struct Record {
     /// The last estimate, after any re-estimates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_final_s: Option<u64>,
+    /// The factor the dispatcher had been shown for its guess track when it
+    /// gave `estimate_s` (giverny#371): ×1 when none was shown, and on
+    /// lines written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub told_x: Option<f64>,
     /// The worker's first re-estimate of the time left, as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_s: Option<u64>,
+    /// The factor the worker had been shown for its re-estimate track when
+    /// it gave `reest_s` (giverny#371), as [`Record::told_x`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reest_told_x: Option<f64>,
     /// Working time already spent when the re-estimate was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_at_s: Option<u64>,
@@ -131,8 +152,27 @@ impl Track {
         (est > 0).then_some((est, took))
     }
 
-    /// Took ÷ estimated.
-    fn ratio(self, r: &Record) -> Option<f64> {
+    /// The factor the giver had been shown when giving this track's figure
+    /// on `r`: ×1 when none was (or the line predates giverny#371), and
+    /// for anything that is not a usable factor.
+    pub fn told_x(self, r: &Record) -> f64 {
+        let x = match self {
+            Track::Guess => r.told_x,
+            Track::Reestimate => r.reest_told_x,
+        };
+        x.filter(|x| x.is_finite() && *x > 0.0).unwrap_or(1.0)
+    }
+
+    /// How the giver's *instinct* ran on `r`: took ÷ the instinct figure,
+    /// which is the figure as given ÷ the factor shown. What the giver is
+    /// told ([`track_record`]).
+    pub fn ratio(self, r: &Record) -> Option<f64> {
+        self.given_ratio(r).map(|g| g * self.told_x(r))
+    }
+
+    /// How the figure *as given* ran on `r`: took ÷ estimated. Near ×1.0
+    /// when the factor told is being applied.
+    pub fn given_ratio(self, r: &Record) -> Option<f64> {
         self.pair(r).map(|(e, t)| t as f64 / e as f64)
     }
 
@@ -270,61 +310,98 @@ fn level_ratios(
         if ratios.len() < MIN_SAMPLES {
             continue;
         }
-        // `{}` is where the track's noun goes: `FEATURE {} in demo`.
+        // What the instinct is on: ` on FEATURE in demo`, ` in demo`, ``.
         let words = match (r, k) {
-            (Some(r), Some(k)) => format!("{k} {{}} in {r}"),
-            (Some(r), None) => format!("{{}} in {r}"),
-            _ => "{}".to_string(),
+            (Some(r), Some(k)) => format!(" on {k} in {r}"),
+            (Some(r), None) => format!(" in {r}"),
+            _ => String::new(),
         };
         return Some((ratios, words));
     }
     None
 }
 
-/// How an estimator's own past estimates fared, for it to see before it
-/// makes the next one: `your last 8 FEATURE guesses in giverny took ×0.21
-/// of what you said (median)`. Told, never applied: the figure it gives next
-/// is the figure the pane shows. `None` with too little history.
+/// How an estimator's instinct runs on tasks like this one (giverny#371):
+/// the factor it is told, how many tasks it is the median of, and the level
+/// it was found at (` on BUG in giverny`, ` in giverny` or empty), which is
+/// also what tells one line from another. `None` with too little history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instinct {
+    pub x: f64,
+    pub n: usize,
+    pub level: String,
+}
+
+impl Instinct {
+    /// The line its giver reads: `your instinct on BUG in giverny runs
+    /// ×0.30 (last 20, median): scale your figure by it`.
+    pub fn line(&self) -> String {
+        format!(
+            "your instinct{} runs ×{:.2} (last {}, median): scale your figure by it",
+            self.level, self.x, self.n
+        )
+    }
+}
+
+/// The instinct factor of `track` for a task of this repo and kind: the
+/// median of working time ÷ instinct figure over the most recent finished
+/// tasks at the narrowest level with [`MIN_SAMPLES`].
+pub fn instinct(
+    history: &[Record],
+    track: Track,
+    repo: Option<&str>,
+    kind: Option<&str>,
+) -> Option<Instinct> {
+    let (ratios, level) = level_ratios(history, track, repo, kind)?;
+    Some(Instinct {
+        n: ratios.len(),
+        x: median(ratios),
+        level,
+    })
+}
+
+/// How an estimator's instinct runs, for it to see before it makes the
+/// next figure: [`Instinct::line`]. Told, never applied: the figure it gives
+/// next is the figure the pane shows. `None` with too little history.
 pub fn track_record(
     history: &[Record],
     track: Track,
     repo: Option<&str>,
     kind: Option<&str>,
 ) -> Option<String> {
-    let (ratios, words) = level_ratios(history, track, repo, kind)?;
-    let n = ratios.len();
-    let r = median(ratios);
-    Some(format!(
-        "your last {n} {} took ×{r:.2} of what you said (median)",
-        words.replace("{}", track.noun())
-    ))
+    instinct(history, track, repo, kind).map(|i| i.line())
 }
 
-/// One group's figures on a track: how many, the median ratio (bias) and
-/// the typical miss either way (the median of `max(r, 1/r)`: ×1.5 means
-/// half the estimates were within half again of the truth).
+/// One group's figures on a track: how many, the median instinct ratio
+/// (the factor its givers are told, giverny#371), the median ratio of the
+/// figures as given (bias: near ×1.0 when the factor is applied) and their
+/// typical miss either way (the median of `max(r, 1/r)`: ×1.5 means half the
+/// figures were within half again of the truth).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Score {
     pub n: usize,
+    pub instinct: f64,
     pub bias: f64,
     pub off: f64,
 }
 
-/// [`Score`] of a set of ratios, `None` when empty.
-pub fn score(ratios: &[f64]) -> Option<Score> {
+/// [`Score`] of a set of `(instinct, as given)` ratios, `None` when empty.
+pub fn score(ratios: &[(f64, f64)]) -> Option<Score> {
     if ratios.is_empty() {
         return None;
     }
     Some(Score {
         n: ratios.len(),
-        bias: median(ratios.to_vec()),
-        off: median(ratios.iter().map(|r| r.max(1.0 / r)).collect()),
+        instinct: median(ratios.iter().map(|r| r.0).collect()),
+        bias: median(ratios.iter().map(|r| r.1).collect()),
+        off: median(ratios.iter().map(|(_, r)| r.max(1.0 / r)).collect()),
     })
 }
 
 /// `giverny manage accuracy`: every track's error, older half
 /// against recent half, for all tasks, each repo, and each repo's types with
-/// [`MIN_SAMPLES`] or more. `repo` narrows it to one repo.
+/// [`MIN_SAMPLES`] or more. `repo` narrows it to one repo. Each group shows
+/// both the instinct factor and how the figures as given landed.
 pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
     let history: Vec<&Record> = history
         .iter()
@@ -332,10 +409,12 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
         .collect();
     let mut out = format!(
         "Estimate accuracy over {} landed task{}{}.\n\
-         ratio = time worked ÷ time estimated (median): ×1.00 is right, under it the \
-         estimates ran long.\n\
-         off = the typical miss either way (median of the ratio or its inverse): ×1.00 \
-         is perfect.\n\
+         instinct = time worked ÷ the figure before the factor shown (median): the \
+         factor the line tells; ×1.00 is an instinct that is right.\n\
+         given = time worked ÷ the figure as given (median): near ×1.00 when the line \
+         is applied, drifting from it when it is not.\n\
+         off = the typical miss of the figures as given, either way (median of the \
+         ratio or its inverse): ×1.00 is perfect.\n\
          older / recent = the first and second half of each group, oldest first.\n",
         history.len(),
         if history.len() == 1 { "" } else { "s" },
@@ -345,23 +424,29 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
     repos.sort_unstable();
     repos.dedup();
     let fmt = |s: Option<Score>| match s {
-        Some(s) => format!("{:>3}  ×{:<5.2} ×{:<5.2}", s.n, s.bias, s.off),
-        None => format!("{:>3}  {:<6} {:<6}", 0, "—", "—"),
+        Some(s) => format!(
+            "{:>3}  ×{:<7.2} ×{:<5.2} ×{:<5.2}",
+            s.n, s.instinct, s.bias, s.off
+        ),
+        None => format!("{:>3}  {:<8} {:<6} {:<6}", 0, "—", "—", "—"),
     };
     for track in Track::ALL {
+        // Each half's column names sit over its figures.
+        let cols = "  n  instinct given  off";
         out.push_str(&format!(
-            "\n{}\n  {:<24}{:<20}{:<20}\n",
+            "\n{}\n  {:<24}{:<34}{:<34}\n  {:<24}{cols:<34}{cols:<34}\n",
             track.heading(),
             "",
-            "older: n ratio off",
-            "recent: n ratio off"
+            "older",
+            "recent",
+            "",
         ));
-        let mut groups: Vec<(String, Vec<f64>)> = Vec::new();
-        let ratios = |f: &dyn Fn(&Record) -> bool| -> Vec<f64> {
+        let mut groups: Vec<(String, Vec<(f64, f64)>)> = Vec::new();
+        let ratios = |f: &dyn Fn(&Record) -> bool| -> Vec<(f64, f64)> {
             history
                 .iter()
                 .filter(|h| f(h))
-                .filter_map(|h| track.ratio(h))
+                .filter_map(|h| Some((track.ratio(h)?, track.given_ratio(h)?)))
                 .collect()
         };
         let all = ratios(&|_| true);
@@ -391,7 +476,7 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
         for (name, v) in groups.into_iter().filter(|(_, v)| !v.is_empty()) {
             let (old, new) = v.split_at(v.len() / 2);
             out.push_str(&format!(
-                "  {:<24}{:<20}{:<20}\n",
+                "  {:<24}{:<34}{:<34}\n",
                 name,
                 fmt(score(old)),
                 fmt(score(new))
@@ -637,17 +722,17 @@ mod tests {
         let told = |repo, kind| track_record(&h, Track::Guess, repo, kind).unwrap();
         assert_eq!(
             told(Some("demo"), Some("FEATURE")),
-            "your last 5 FEATURE guesses in demo took ×0.40 of what you said (median)"
+            "your instinct on FEATURE in demo runs ×0.40 (last 5, median): scale your figure by it"
         );
         // No RESEARCH history in demo: repo alone, median of 0.4 and 1.0.
         assert_eq!(
             told(Some("demo"), Some("RESEARCH")),
-            "your last 10 guesses in demo took ×0.70 of what you said (median)"
+            "your instinct in demo runs ×0.70 (last 10, median): scale your figure by it"
         );
         // A repo with no history at all: everything (0.4, 1, 2 → 1).
         assert_eq!(
             told(Some("planets"), Some("BUG")),
-            "your last 15 guesses took ×1.00 of what you said (median)"
+            "your instinct runs ×1.00 (last 15, median): scale your figure by it"
         );
         // No repo known: straight to everything.
         assert_eq!(told(None, Some("BUG")), told(Some("planets"), None));
@@ -673,13 +758,13 @@ mod tests {
         h.extend([blocked, guessless, review]);
         assert_eq!(
             track_record(&h, Track::Guess, Some("g"), None).unwrap(),
-            "your last 20 guesses in g took ×0.50 of what you said (median)"
+            "your instinct in g runs ×0.50 (last 20, median): scale your figure by it"
         );
         // A wild history is told as measured.
         let wild: Vec<Record> = (0..5).map(|_| rec("w", None, 10, 1000)).collect();
         assert_eq!(
             track_record(&wild, Track::Guess, Some("w"), None).unwrap(),
-            "your last 5 guesses in w took ×100.00 of what you said (median)"
+            "your instinct in w runs ×100.00 (last 5, median): scale your figure by it"
         );
     }
 
@@ -733,11 +818,11 @@ mod tests {
             .collect();
         assert_eq!(
             track_record(&h, Track::Guess, Some("g"), Some("FEATURE")).unwrap(),
-            "your last 6 FEATURE guesses in g took ×0.20 of what you said (median)"
+            "your instinct on FEATURE in g runs ×0.20 (last 6, median): scale your figure by it"
         );
         assert_eq!(
             track_record(&h, Track::Reestimate, Some("x"), None).unwrap(),
-            "your last 6 re-estimates took ×1.50 of what you said (median)"
+            "your instinct runs ×1.50 (last 6, median): scale your figure by it"
         );
         assert_eq!(track_record(&h[..4], Track::Guess, None, None), None);
     }
@@ -753,8 +838,8 @@ mod tests {
             h.push(reest("g", "BUG", 50, 40, 2, 38));
         }
         h.push(rec("other", None, 10, 10));
-        let s = score(&[0.5, 2.0, 1.0]).unwrap();
-        assert_eq!((s.n, s.bias, s.off), (3, 1.0, 2.0));
+        let s = score(&[(0.5, 0.5), (2.0, 2.0), (1.0, 1.0)]).unwrap();
+        assert_eq!((s.n, s.instinct, s.bias, s.off), (3, 1.0, 1.0, 2.0));
         let out = accuracy(&h, None);
         assert!(
             out.starts_with("Estimate accuracy over 11 landed tasks."),
@@ -763,10 +848,12 @@ mod tests {
         let guess = out
             .lines()
             .skip_while(|l| !l.starts_with("dispatcher's guess"))
-            .nth(2)
+            .nth(3)
             .unwrap();
         assert!(guess.trim_start().starts_with("all"), "{out}");
         assert!(guess.contains("×0.20") && guess.contains("×0.80"), "{out}");
+        // Nothing was shown on these lines: the instinct is the figure.
+        assert_eq!(guess.matches("×0.20").count(), 2, "{out}");
         assert!(out.contains("  g BUG"), "{out}");
         assert!(out.contains("re-estimate of the time left"), "{out}");
         // One repo only.
@@ -794,5 +881,158 @@ mod tests {
         assert_eq!(got[0], a);
         assert!(load(&d.join("missing")).is_empty());
         let _ = std::fs::remove_dir_all(&d);
+    }
+    /// One dispatcher's guess: `instinct_m` is what its gut says, `shown`
+    /// the factor it had been told (applied: the figure is the gut scaled by
+    /// it), and the work takes `runs` × the gut.
+    fn applied(instinct_m: f64, shown: Option<f64>, runs: f64) -> Record {
+        let x = shown.unwrap_or(1.0);
+        Record {
+            told_x: Some(x),
+            estimate_s: Some((instinct_m * x * 60.0).round() as u64),
+            ..rec("giverny", Some("BUG"), 0, 0)
+        }
+        .worked((instinct_m * runs * 60.0).round() as u64)
+    }
+
+    impl Record {
+        fn worked(mut self, s: u64) -> Record {
+            self.work_s = s;
+            self.wall_s = s;
+            self
+        }
+    }
+
+    /// Thirty BUGs in a row, each given as the gut figure scaled by the
+    /// factor `told` says before it, the work taking `runs(i)` × the gut;
+    /// returns each task's told factor (`None`: too little history).
+    fn simulate(
+        runs: impl Fn(usize) -> f64,
+        told: impl Fn(&[Record]) -> Option<f64>,
+    ) -> (Vec<Record>, Vec<Option<f64>>) {
+        let mut h = Vec::new();
+        let mut shown = Vec::new();
+        for i in 0..30 {
+            let x = told(&h);
+            shown.push(x);
+            h.push(applied(60.0, x, runs(i)));
+        }
+        (h, shown)
+    }
+
+    /// The factor a giver is told, learned from the instinct (giverny#371).
+    fn told_now(h: &[Record]) -> Option<f64> {
+        instinct(h, Track::Guess, Some("giverny"), Some("BUG")).map(|i| i.x)
+    }
+
+    /// The factor as it was told before giverny#371: the median of working
+    /// time ÷ the figure *as given*.
+    fn told_before(h: &[Record]) -> Option<f64> {
+        let (ratios, _) = level_ratios(h, Track::Guess, Some("giverny"), Some("BUG"))?;
+        let given: Vec<f64> = h
+            .iter()
+            .rev()
+            .filter_map(|r| Track::Guess.given_ratio(r))
+            .take(ratios.len())
+            .collect();
+        Some(median(given))
+    }
+
+    /// giverny#371: an instinct that runs ×0.3, givers applying the factor
+    /// shown and landing on target. Learned from the instinct, the factor
+    /// stays ×0.30 for good; learned from the figures as given (the code
+    /// before), it told ×1.0 once the corrected figures landed on target,
+    /// and the givers went back to their instinct.
+    #[test]
+    fn the_factor_learned_from_the_instinct_does_not_undo_itself() {
+        let (h, shown) = simulate(|_| 0.3, told_now);
+        assert_eq!(&shown[..MIN_SAMPLES], &[None; MIN_SAMPLES][..]);
+        for (i, x) in shown.iter().enumerate().skip(MIN_SAMPLES) {
+            assert!((x.unwrap() - 0.3).abs() < 0.01, "task {i} told {x:?}");
+        }
+        // Those last figures were applied and landed on target.
+        let last = h.last().unwrap();
+        assert_eq!(Track::Guess.given_ratio(last), Some(1.0));
+        assert!((Track::Guess.ratio(last).unwrap() - 0.3).abs() < 0.01);
+        assert_eq!(
+            track_record(&h, Track::Guess, Some("giverny"), Some("BUG")).as_deref(),
+            Some(
+                "your instinct on BUG in giverny runs ×0.30 (last 20, median): scale your figure by it"
+            )
+        );
+
+        // The old reading of those same thirty: the twenty applied figures
+        // landed on target, so it told ×1.00, and the next giver went back
+        // to its gut.
+        assert_eq!(told_before(&h), Some(1.0));
+        // Run under the old reading from the start, the factor fades: each
+        // applied figure lands nearer ×1.0 and pulls the median after it,
+        // until it sits at √0.3 ≈ ×0.55, nowhere near the ×0.30 the gut runs.
+        let (_, before) = simulate(|_| 0.3, told_before);
+        assert_eq!(before[MIN_SAMPLES], Some(0.3));
+        let last = before.last().unwrap().unwrap();
+        assert!((last - 0.3_f64.sqrt()).abs() < 0.01, "{before:?}");
+    }
+
+    /// An instinct that improves takes the factor with it, toward ×1.0.
+    #[test]
+    fn an_instinct_that_improves_moves_the_factor_to_one() {
+        let (h, shown) = simulate(|i| if i < 10 { 0.3 } else { 1.0 }, told_now);
+        assert!((shown[9].unwrap() - 0.3).abs() < 0.01);
+        assert!((told_now(&h).unwrap() - 1.0).abs() < 0.01, "{shown:?}");
+        // On the way, while the window still holds the old gut.
+        assert!(shown[15].unwrap() < shown[25].unwrap(), "{shown:?}");
+    }
+
+    /// Lines from before giverny#371 have no `told_x`: they count as ×1,
+    /// which is what they were (mostly untold); a new line keeps both.
+    #[test]
+    fn old_lines_count_as_untold_and_new_ones_keep_the_factor() {
+        let old: Record = serde_json::from_str(
+            r#"{"key":"x","estimate_s":600,"reest_s":300,"reest_at_s":60,"wall_s":300,"work_s":300,"outcome":"Done"}"#,
+        )
+        .unwrap();
+        assert_eq!((old.told_x, old.reest_told_x), (None, None));
+        assert_eq!(Track::Guess.told_x(&old), 1.0);
+        assert_eq!(Track::Guess.ratio(&old), Some(0.5));
+        assert_eq!(
+            Track::Reestimate.ratio(&old),
+            Track::Reestimate.given_ratio(&old)
+        );
+        let new = Record {
+            told_x: Some(0.5),
+            reest_told_x: Some(2.0),
+            ..old.clone()
+        };
+        let line = serde_json::to_string(&new).unwrap();
+        assert!(line.contains(r#""told_x":0.5"#) && line.contains(r#""reest_told_x":2.0"#));
+        // Said 600s while shown ×0.5: the gut said 1200s, and took 300s.
+        assert_eq!(Track::Guess.ratio(&new), Some(0.25));
+        // 300s said while shown ×2: the gut said 150s, and 240s were left.
+        assert_eq!(Track::Reestimate.ratio(&new), Some(1.6));
+        // A factor that is no factor counts as none.
+        let bad = Record {
+            told_x: Some(0.0),
+            ..old
+        };
+        assert_eq!(Track::Guess.told_x(&bad), 1.0);
+    }
+
+    /// `accuracy` shows both: the instinct factor and the figures as given,
+    /// which sit at ×1.00 when the line is applied.
+    #[test]
+    fn accuracy_shows_the_instinct_and_the_figures_as_given() {
+        let (h, _) = simulate(|_| 0.3, told_now);
+        let out = accuracy(&h, None);
+        assert!(out.contains("instinct = time worked"), "{out}");
+        let all = out
+            .lines()
+            .skip_while(|l| !l.starts_with("dispatcher's guess"))
+            .nth(3)
+            .unwrap();
+        // Older: five untold (given ×0.30) and ten applied (×1.00), so ×1.00
+        // in the median; recent: all applied. The instinct is ×0.30 in both.
+        assert_eq!(all.matches("×0.30").count(), 2, "{out}");
+        assert!(all.ends_with("×1.00  ×1.00"), "{all}");
     }
 }
