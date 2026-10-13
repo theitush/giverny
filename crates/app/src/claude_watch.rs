@@ -45,6 +45,14 @@ pub struct ClaudeTab {
     /// A background shell is alive in this session while the agent itself is
     /// at its prompt. Not a working state — marked, never animated.
     pub background: bool,
+    /// Work this session delegated — subagents, a workflow, teammates, a
+    /// cloud session — was still running when its last turn ended, and the
+    /// registry has not said since that it stopped: the agent is free to
+    /// talk while its workers go on (giverny#363). Set by the `Stop` hook's
+    /// `background_tasks`, kept while the registry says `busy` (which, with
+    /// the turn over, is that work: Claude Code counts it as working), and
+    /// cleared by the first scan that does not, or by the next turn.
+    pub agents: bool,
     /// The user's prompts in this session, oldest first, in full (at most
     /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
     /// from the transcript for a session adopted mid-way or resumed.
@@ -82,6 +90,13 @@ fn cap_history(prompts: &mut Vec<String>) {
 }
 
 impl ClaudeTab {
+    /// Something this session started still works while the agent waits at
+    /// its prompt: a background shell or delegated work. What the rail's
+    /// three-dot wave says (giverny#352, giverny#363).
+    pub fn working_in_background(&self) -> bool {
+        self.background || self.agents
+    }
+
     /// Is a claude running in this tab now: seen in the last scan, or heard
     /// from in the last few seconds.
     fn has_claude(&self) -> bool {
@@ -576,16 +591,24 @@ fn finished_kind(notification_type: &str) -> bool {
 /// Hooks and the registry answer different questions. Hooks bracket a *turn*;
 /// the registry says what the session is doing right now, including the one
 /// state no hook marks the start of: blocked on the user (`waiting`).
+///
+/// `agents`: the turn that ended left delegated work running
+/// ([`ClaudeTab::agents`]). Claude Code's `busy` counts that work as the
+/// session working, so while it runs `busy` is no evidence of a new turn.
 fn merge_registry(
     current: ClaudeState,
     hooks_own: bool,
+    agents: bool,
     live: &giverny_claude::registry::SessionEntry,
 ) -> ClaudeState {
-    // Working is unambiguous evidence Claude is running again, so it always
-    // clears a stale flag — even under hook authority. A declined permission
-    // prompt emits no hook to clear the one it raised, and a turn that ended
-    // before this one left a tick behind that "finished" no longer describes.
-    if live.busy() && matches!(current, ClaudeState::NeedsYou | ClaudeState::DoneUnseen) {
+    // Working is evidence Claude is running again, so it clears a stale
+    // flag — even under hook authority. A declined permission prompt emits
+    // no hook to clear the one it raised, and a turn that ended before this
+    // one left a tick behind that "finished" no longer describes. Not while
+    // its subagents run on: that `busy` is theirs, and the tick for the turn
+    // they outlived stays (giverny#363).
+    if live.busy() && !agents && matches!(current, ClaudeState::NeedsYou | ClaudeState::DoneUnseen)
+    {
         return ClaudeState::Busy;
     }
     if hooks_own {
@@ -979,6 +1002,7 @@ impl ClaudeWatch {
         match msg.hook_event() {
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
+                entry.agents = false;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
@@ -995,6 +1019,9 @@ impl ClaudeWatch {
             }
             Some("UserPromptSubmit") => {
                 entry.state = ClaudeState::Busy;
+                // A turn is running: whatever it leaves behind, its `Stop`
+                // says.
+                entry.agents = false;
                 // The hook fires for every turn, also the ones Claude Code or
                 // another agent sends (a finished background task, a
                 // subagent's hand-back, another session's message): those
@@ -1020,13 +1047,20 @@ impl ClaudeWatch {
             // what tells a tab apart from the turn that ended before it: a
             // session carrying on after a permission was granted, or an agent
             // continuing by itself, emits nothing else.
-            Some("PostToolUse") => entry.state = ClaudeState::Busy,
+            Some("PostToolUse") => {
+                entry.state = ClaudeState::Busy;
+                entry.agents = false;
+            }
             Some("Stop") => {
                 entry.state = if is_active {
                     ClaudeState::Idle
                 } else {
                     ClaudeState::DoneUnseen
                 };
+                // The turn is over; are its subagents? The hook says so
+                // exactly as the turn ends, where the registry's `busy`
+                // cannot yet tell them from the turn itself (giverny#363).
+                entry.agents = msg.delegated_work_running();
             }
             Some("Notification") => {
                 if let Some(kind) = msg.notification_type() {
@@ -1057,6 +1091,7 @@ impl ClaudeWatch {
             Some("SessionEnd") => {
                 self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
+                entry.agents = false;
                 entry.set_session(None, &mut self.prompts_asked);
                 entry.session_name = None;
                 effects.captured.push((tab_id, None, None));
@@ -1374,7 +1409,13 @@ impl ClaudeWatch {
                 // evidence keeps the registry driving exactly those.
                 let hooks_own = entry.last_hook.is_some();
                 let was = entry.state;
-                entry.state = merge_registry(entry.state, hooks_own, &live.entry);
+                entry.state = merge_registry(entry.state, hooks_own, entry.agents, &live.entry);
+                // Delegated work the last `Stop` reported runs for as long as
+                // the registry says `busy`; the first scan that says
+                // otherwise is its end, and the wave goes with it
+                // (giverny#363). A session without hooks never sets it: its
+                // `busy` is a spinner, as it cannot tell the two apart.
+                entry.agents &= hooks_own && live.entry.busy();
                 // A session new to the tab has its earlier turns read back
                 // from the transcript, once: adopted mid-way, resumed after a
                 // restart, or resumed with a prompt on the command line
@@ -1402,6 +1443,7 @@ impl ClaudeWatch {
                 if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
                     tab.state = ClaudeState::None;
                     tab.background = false;
+                    tab.agents = false;
                     tab.session_name = None;
                     // The session is gone — its hook evidence goes with it, so
                     // a future claude (with or without hooks) starts fresh.
@@ -3256,35 +3298,129 @@ mod tests {
         // Hooks mark the end of a turn exactly. The registry may not re-open
         // one they closed — a session left with a background shell reads as
         // "shell" for as long as that shell lives, which is hours.
-        assert_eq!(merge_registry(Idle, true, &session("shell")), Idle);
-        assert_eq!(merge_registry(Idle, true, &session("busy")), Idle);
-        assert_eq!(merge_registry(Busy, true, &session("idle")), Busy);
+        assert_eq!(merge_registry(Idle, true, false, &session("shell")), Idle);
+        assert_eq!(merge_registry(Idle, true, false, &session("busy")), Idle);
+        assert_eq!(merge_registry(Busy, true, false, &session("idle")), Busy);
         assert_eq!(
-            merge_registry(DoneUnseen, true, &session("idle")),
+            merge_registry(DoneUnseen, true, false, &session("idle")),
             DoneUnseen
         );
         // The one exception: a working session clears a stale attention flag,
         // because declining a prompt emits no hook to clear it.
-        assert_eq!(merge_registry(NeedsYou, true, &session("busy")), Busy);
-        assert_eq!(merge_registry(NeedsYou, true, &session("idle")), NeedsYou);
+        assert_eq!(
+            merge_registry(NeedsYou, true, false, &session("busy")),
+            Busy
+        );
+        assert_eq!(
+            merge_registry(NeedsYou, true, false, &session("idle")),
+            NeedsYou
+        );
+        // ...unless the turn's subagents are what keeps it `busy`: the tick
+        // for the turn they outlived stays (giverny#363).
+        assert_eq!(
+            merge_registry(DoneUnseen, true, true, &session("busy")),
+            DoneUnseen
+        );
+        assert_eq!(merge_registry(Idle, true, true, &session("busy")), Idle);
     }
 
     #[test]
     fn without_hooks_the_registry_drives_every_state() {
         use ClaudeState::*;
-        assert_eq!(merge_registry(Idle, false, &session("busy")), Busy);
-        assert_eq!(merge_registry(Busy, false, &session("idle")), Idle);
+        assert_eq!(merge_registry(Idle, false, false, &session("busy")), Busy);
+        assert_eq!(merge_registry(Busy, false, false, &session("idle")), Idle);
         // A background shell leaves the agent idle: marked in the rail, not
         // spun.
-        assert_eq!(merge_registry(Busy, false, &session("shell")), Idle);
+        assert_eq!(merge_registry(Busy, false, false, &session("shell")), Idle);
         // A session blocked on a permission prompt with no hook to report it
         // used to read as idle: the flag now comes from the registry.
-        assert_eq!(merge_registry(Idle, false, &session("waiting")), NeedsYou);
+        assert_eq!(
+            merge_registry(Idle, false, false, &session("waiting")),
+            NeedsYou
+        );
         // Attention states are the user's to clear, not the registry's.
         assert_eq!(
-            merge_registry(DoneUnseen, false, &session("idle")),
+            merge_registry(DoneUnseen, false, false, &session("idle")),
             DoneUnseen
         );
+    }
+
+    /// A turn that ends with its subagents still at work leaves the agent
+    /// free to talk while they run: Idle, and working in the background —
+    /// the rail's wave — until the registry stops saying `busy`, which is
+    /// how Claude Code says the last of them is done (giverny#363, the poly
+    /// manager's tab, a hollow ring while its worker ran).
+    #[test]
+    fn subagents_outliving_the_turn_are_background_work_until_they_end() {
+        let mut w = ClaudeWatch::for_tests();
+        let me = std::process::id();
+        let shells = HashMap::from([(TAB, me)]);
+        let scan = |w: &mut ClaudeWatch, status: &str| {
+            let mut live = session(status);
+            live.pid = me;
+            w.scanned = ScanResult {
+                live: vec![registry::LiveSession {
+                    entry: live,
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-363"),
+                }],
+                ..ScanResult::default()
+            };
+            w.merge_scan(&shells, &mut WatchEffects::default());
+        };
+        let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+
+        // The turn ends with a worker running: the agent is at its prompt.
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w), "Idle with its worker running: the wave");
+
+        // Asked something meanwhile, it is working again, workers or not:
+        // the spinner, and the next `Stop` says what still runs.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        scan(&mut w, "busy");
+        assert!(waves(&w));
+
+        // The last worker is done: the registry's next word is `idle`.
+        scan(&mut w, "idle");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(!waves(&w), "nothing runs: the ring");
+
+        // A turn that leaves nothing behind is not mistaken for one that
+        // did by a registry not yet rewritten at its end.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(
+            &mut w,
+            &hook("Stop", r#","background_tasks":[]"#),
+            Some(TAB),
+        );
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(!waves(&w));
+
+        // Workers done but a background shell left: still the wave, now
+        // the shell's.
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        scan(&mut w, "shell");
+        assert!(!w.tabs[&TAB].agents);
+        assert!(waves(&w));
+
+        // In a tab you are not looking at, the turn's tick stays while its
+        // workers keep the registry `busy`: that is not a new turn.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", agent), None);
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(waves(&w));
     }
 
     #[test]

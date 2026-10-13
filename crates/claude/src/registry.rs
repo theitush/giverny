@@ -50,6 +50,11 @@ impl SessionEntry {
     /// The agent is working: thinking, or running a tool call. Measured, not
     /// assumed — a session stays `busy` through minutes of back-to-back Bash
     /// calls.
+    ///
+    /// Or work it delegated is: Claude Code (2.1.296) writes `busy` while a
+    /// subagent, workflow, teammate or cloud session it started runs, its
+    /// turn over or not, and `idle` only once they are all done. With hooks
+    /// saying the turn ended, `busy` is that work (giverny#363).
     pub fn busy(&self) -> bool {
         self.status == "busy"
     }

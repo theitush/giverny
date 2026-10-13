@@ -78,6 +78,42 @@ impl RelayMsg {
     pub fn prompt(&self) -> Option<&str> {
         self.event.get("prompt").and_then(|v| v.as_str())
     }
+
+    /// On `Stop`: is work this session delegated still running as the turn
+    /// ends — a subagent, a workflow, a teammate, a cloud session?
+    ///
+    /// Claude Code hands every `Stop` hook a `background_tasks` list, its
+    /// in-flight background work (running or pending), "to distinguish
+    /// session is done from session is paused waiting for background work"
+    /// (2.1.296). Each entry's `type` is a friendly label (`subagent`,
+    /// `shell`, `monitor`, …) or, for a type it has no label for, the raw
+    /// one; both spellings of the four kinds its own session status counts
+    /// as working are taken here. A background shell is not: the registry's
+    /// `shell` already says that one (giverny#352), and a monitor or a cron
+    /// is a watcher that may never end. No list (an older Claude Code): no.
+    /// (giverny#363)
+    pub fn delegated_work_running(&self) -> bool {
+        const DELEGATED: &[&str] = &[
+            "subagent",
+            "local_agent",
+            "workflow",
+            "local_workflow",
+            "teammate",
+            "in_process_teammate",
+            "cloud session",
+            "remote_agent",
+        ];
+        self.event
+            .get("background_tasks")
+            .and_then(|v| v.as_array())
+            .is_some_and(|tasks| {
+                tasks.iter().any(|task| {
+                    let field = |key| task.get(key).and_then(|v| v.as_str());
+                    field("type").is_some_and(|t| DELEGATED.contains(&t))
+                        && field("status").is_none_or(|s| matches!(s, "running" | "pending"))
+                })
+            })
+    }
 }
 
 pub fn socket_path() -> PathBuf {
@@ -2202,6 +2238,36 @@ mod tests {
         assert_eq!(msg.session_id(), Some("s1"));
         assert_eq!(msg.notification_type(), Some("permission_prompt"));
         assert_eq!(msg.message(), Some("needs ok"));
+    }
+
+    /// A `Stop` whose session left subagents running says so in its
+    /// `background_tasks`; a background shell or a monitor alone is not
+    /// delegated work, and a finished entry or an older Claude Code that
+    /// sends no list is none (giverny#363).
+    #[test]
+    fn a_stop_says_whether_delegated_work_still_runs() {
+        let stop = |tasks: &str| -> RelayMsg {
+            serde_json::from_str(&format!(
+                r#"{{"tab_id":"giverny-3","config_dir":null,
+                    "event":{{"hook_event_name":"Stop","session_id":"s1"{tasks}}}}}"#
+            ))
+            .unwrap()
+        };
+        let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running",
+            "description":"23: held orders","agent_type":"general-purpose"}]"#;
+        assert!(stop(agent).delegated_work_running());
+        let raw = r#","background_tasks":[{"id":"w1","type":"local_workflow","status":"pending"}]"#;
+        assert!(stop(raw).delegated_work_running(), "a raw type counts too");
+        let shell = r#","background_tasks":[{"id":"b1","type":"shell","status":"running",
+            "command":"sleep 99"},{"id":"m1","type":"monitor","status":"running"}]"#;
+        assert!(!stop(shell).delegated_work_running());
+        let done = r#","background_tasks":[{"id":"a1","type":"subagent","status":"completed"}]"#;
+        assert!(!stop(done).delegated_work_running());
+        assert!(!stop(r#","background_tasks":[]"#).delegated_work_running());
+        assert!(
+            !stop("").delegated_work_running(),
+            "no list, as before 2.1.296"
+        );
     }
 
     /// The model, then the session's full name in the accent and a reset

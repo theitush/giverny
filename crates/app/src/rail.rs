@@ -248,7 +248,9 @@ struct RowData {
     resumes_claude: bool,
     color: Color32,
     claude: ClaudeState,
-    /// A background shell is alive while Claude itself waits at its prompt.
+    /// Something Claude started still works — a background shell, or
+    /// subagents it handed work to (giverny#363) — while Claude itself waits
+    /// at its prompt, free to talk.
     background: bool,
     /// Its shell's CPU and memory now, with everything under it (Claude
     /// Code or not), from the reading the sidebar shows (giverny#267,
@@ -358,7 +360,7 @@ fn row_data(
                 .is_some(),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
-        background: ct.is_some_and(|c| c.background),
+        background: ct.is_some_and(|c| c.working_in_background()),
         // Off (`rail.tab_figures`, giverny#304), a row has no figures, so
         // nothing reserves room for them and no group sums them.
         used: app
@@ -1334,7 +1336,10 @@ enum Mark {
     Tick,
     /// Claude idle at its prompt: a hollow ring.
     Ring,
-    /// Claude idle with a background shell humming: the three-dot wave.
+    /// Claude at its prompt, free to talk, while something it started
+    /// hums on — a background shell (giverny#352) or its subagents
+    /// (giverny#363): the three-dot wave. The agent itself working, which
+    /// it cannot talk through, is [`Mark::Busy`], and wins.
     Wave,
     /// A live plain shell: a filled square.
     Shell,
@@ -1463,11 +1468,12 @@ fn tab_row(
         // Still: finished, nothing owed. The flag above is the one that
         // wants something; the two differ in shape and movement.
         Mark::Tick => tick(&p, dot, color),
-        // A background shell keeps running while Claude waits at its
-        // prompt. Worth showing — it is why a directory is still churning —
-        // but it is not the agent working. So no spinner and no flag: a
-        // slow colour drifting through three small dots, the hum of
-        // something left running (#352). Off, they hold still and faded.
+        // A background shell or its subagents keep running while Claude
+        // waits at its prompt. Worth showing — it is why a directory is
+        // still churning — but it is not the agent working: it can take a
+        // message. So no spinner and no flag: a slow colour drifting
+        // through three small dots, the hum of something left running
+        // (#352, #363). Off, they hold still and faded.
         Mark::Wave => shell_dots(ui, &p, rect, dot, color),
         Mark::Ring => {
             p.circle_stroke(dot, 4.0, Stroke::new(1.4, color));
@@ -2635,6 +2641,29 @@ mod tests {
             ..exited
         };
         assert_eq!(Mark::of(&exited_unstarted), Mark::Exited);
+    }
+
+    /// The mark says whether the agent can take a message: busy, it
+    /// cannot; at its prompt with subagents still working, the wave; with
+    /// nothing left running, the ring (giverny#363).
+    #[test]
+    fn subagents_running_after_the_turn_wave_and_a_working_agent_spins() {
+        use crate::claude_watch::ClaudeTab;
+        let mark = |state, agents| {
+            let mut tab = ClaudeTab::default();
+            tab.state = state;
+            tab.agents = agents;
+            Mark::of(&RowData {
+                background: tab.working_in_background(),
+                ..row(state)
+            })
+        };
+        assert_eq!(mark(ClaudeState::Idle, true), Mark::Wave);
+        assert_eq!(mark(ClaudeState::Busy, true), Mark::Busy, "busy wins");
+        assert_eq!(mark(ClaudeState::Idle, false), Mark::Ring, "agents gone");
+        // The flag and the tick are unchanged by what runs behind them.
+        assert_eq!(mark(ClaudeState::NeedsYou, true), Mark::Flag);
+        assert_eq!(mark(ClaudeState::DoneUnseen, true), Mark::Tick);
     }
 
     /// A restored tab that has not spawned is told by what it comes back
