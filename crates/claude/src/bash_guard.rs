@@ -34,10 +34,10 @@ pub fn refusal(what: &str) -> String {
     format!(
         "Giverny refused this command: {what} would take work out of this tab's \
          resource cap. Every claude in a Giverny tab runs capped (in {SLICE}), and \
-         all it starts with it. For more, ask for it: `giverny-manage claim <task> \
-         --cpu <n> --ram <size>`, then run the heavy command as `giverny-manage run \
-         <task> -- <command>`, which gives it a capped scope of its own inside the \
-         machine's budget."
+         all it starts with it. For more memory, ask for it: `giverny-manage claim \
+         <task> --ram <size>` (reserve RAM; CPU is shared and measured, no cores to \
+         pick), then run the heavy command as `giverny-manage run <task> -- \
+         <command>`, which gives it a scope of its own inside the machine's budget."
     )
 }
 

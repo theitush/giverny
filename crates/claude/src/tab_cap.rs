@@ -15,14 +15,18 @@
 //!   set), for all Claude tabs and every `giverny manage run` scope
 //!   together ([`crate::manage_run`] puts its scopes here too). It is what
 //!   keeps the desktop responsive.
-//! - **A tab's scope holds guarantees, not ceilings**: `CPUWeight` from the
-//!   default lease's cores (`[management_panel.lease]`, 3 unless changed;
-//!   100 a core) and `MemoryLow` at its RAM. Idle cores and free memory
-//!   are anyone's; under contention the CPU splits by weight, and when the
-//!   slice is at its ceiling the kernel reclaims from scopes above their
-//!   protection first. (The protection counts against the slice's own
-//!   limit; under pressure on the whole machine it does not, as the
-//!   slices above ours protect nothing.)
+//! - **A tab's scope holds guarantees, not ceilings**: `CPUWeight`
+//!   [`TAB_CPU_WEIGHT`], above every `giverny manage run` scope's
+//!   ([`crate::manage_run::RUN_CPU_WEIGHT`]), so the person's interactive
+//!   claude wins contention against worker builds; and `MemoryLow` at the
+//!   default lease's RAM (`[management_panel.lease]`). CPU is shared and
+//!   measured, never reserved (giverny#387): no lease's cores weigh
+//!   anything. Idle cores and free memory are anyone's; under contention
+//!   the CPU splits by weight, and when the slice is at its ceiling the
+//!   kernel reclaims from scopes above their protection first. (The
+//!   protection counts against the slice's own limit; under pressure on
+//!   the whole machine it does not, as the slices above ours protect
+//!   nothing.)
 //! - **Commands die before claude.** When the slice runs out of memory the
 //!   kernel kills the process with the highest badness in it. Every
 //!   process under a claude in the slice, but no claude, gets
@@ -88,11 +92,14 @@ pub fn slice_props(limits: &Resolved) -> Vec<String> {
     a
 }
 
-/// A lease's cores as a `CPUWeight`: 100 (systemd's default, one
-/// unleased unit) per core.
-pub fn cpu_weight(cores: u32) -> u64 {
-    (u64::from(cores) * 100).clamp(1, 10_000)
-}
+/// Every Claude tab's scope's `CPUWeight` (giverny#387): four times a
+/// `run` scope's ([`crate::manage_run::RUN_CPU_WEIGHT`]), so when the cores
+/// are contended the person's interactive claude (and the commands it runs
+/// itself) goes ahead of the workers' builds, which still get every idle
+/// core.
+pub const TAB_CPU_WEIGHT: u64 = 400;
+// The tabs win contention against the runs, or this does not build.
+const _: () = assert!(TAB_CPU_WEIGHT > crate::manage_run::RUN_CPU_WEIGHT);
 
 /// What a claude's commands get in `oom_score_adj`: when the slice runs
 /// out of memory the kernel kills the process with the highest badness
@@ -101,7 +108,7 @@ pub fn cpu_weight(cores: u32) -> u64 {
 pub const COMMAND_OOM_ADJ: i32 = 500;
 
 /// `busctl` arguments that start `unit`, a scope in [`SLICE`] holding
-/// `pids`, weighted and protected for `lease`.
+/// `pids`, weighted at [`TAB_CPU_WEIGHT`] and protected at `lease`'s RAM.
 pub fn adopt_args(unit: &str, pids: &[u32], lease: &DefaultLease) -> Vec<String> {
     let mut a: Vec<String> = [
         "--user",
@@ -125,9 +132,8 @@ pub fn adopt_args(unit: &str, pids: &[u32], lease: &DefaultLease) -> Vec<String>
         "Description".into(),
         "s".into(),
         format!(
-            "Giverny: claude {}, leased {} cpu, {}",
+            "Giverny: claude {}, {} protected",
             pids.first().copied().unwrap_or(0),
-            lease.cpu_cores,
             lease.ram
         ),
     ]);
@@ -135,7 +141,7 @@ pub fn adopt_args(unit: &str, pids: &[u32], lease: &DefaultLease) -> Vec<String>
     props.push(vec![
         "CPUWeight".into(),
         "t".into(),
-        cpu_weight(lease.cpu_cores).to_string(),
+        TAB_CPU_WEIGHT.to_string(),
     ]);
     if lease.ram.0 > 0 {
         props.push(vec![
@@ -306,9 +312,8 @@ impl Adopter {
                 Ok(()) => {
                     self.capped.insert(pid);
                     tracing::info!(
-                        "claude {pid} in {SLICE}/{unit}: weight {}, {} protected \
+                        "claude {pid} in {SLICE}/{unit}: weight {TAB_CPU_WEIGHT}, {} protected \
                          ({} process(es) moved)",
-                        cpu_weight(lease.cpu_cores),
                         lease.ram,
                         pids.len()
                     );
@@ -462,9 +467,10 @@ mod tests {
     }
 
     #[test]
-    fn the_scope_is_weighted_and_protected_for_the_lease_never_capped() {
+    fn the_scope_is_weighted_above_the_runs_and_protected_never_capped() {
+        // The lease's cores weigh nothing (giverny#387).
         let lease = DefaultLease {
-            cpu_cores: 3,
+            cpu_cores: 1,
             ram: Mem::gb(3),
         };
         let a = adopt_args("giverny-claude-7.scope", &[7, 9], &lease);
@@ -480,17 +486,15 @@ mod tests {
         );
         assert!(
             s.ends_with(
-                "CPUWeight t 300 MemoryLow t 3221225472 \
+                "CPUWeight t 400 MemoryLow t 3221225472 \
                  OOMPolicy s continue CollectMode s inactive-or-failed 0"
             ),
             "{s}"
         );
         assert!(!s.contains("MemoryMax") && !s.contains("CPUQuota"), "{s}");
-        assert_eq!(cpu_weight(0), 1);
-        assert_eq!(cpu_weight(500), 10_000);
         // The description is one argument, however many words it has.
         let d = a.iter().position(|x| x == "Description").unwrap();
-        assert_eq!(a[d + 2], "Giverny: claude 7, leased 3 cpu, 3G");
+        assert_eq!(a[d + 2], "Giverny: claude 7, 3G protected");
     }
 
     #[test]

@@ -174,8 +174,8 @@ pub struct RowUsage {
     pub last_cmd: Option<String>,
     pub last_exit: Option<i64>,
     pub last_peak_mb: Option<u64>,
-    /// The last run's cap: cores and RAM, when it was held to one.
-    pub cap_cpu: Option<u64>,
+    /// The last run's cap: its RAM, when it was held to one (a `cap_cpu`
+    /// from before giverny#387 is ignored: a lease holds no cores).
     pub cap_ram_mb: Option<u64>,
     /// The last run was capped by a systemd scope (else ran plain).
     pub capped: bool,
@@ -195,7 +195,6 @@ fn parse_usage(v: &Value) -> Option<RowUsage> {
         last_cmd: str_field(u, "last_cmd"),
         last_exit: i64_field(u, "last_exit"),
         last_peak_mb: u64_field(u, "last_peak_mb"),
-        cap_cpu: u64_field(u, "cap_cpu"),
         cap_ram_mb: u64_field(u, "cap_ram_mb"),
         capped: u.get("capped").and_then(Value::as_bool) == Some(true),
     })
@@ -206,34 +205,32 @@ fn parse_usage(v: &Value) -> Option<RowUsage> {
 pub enum LeaseState {
     /// Holds what it asked for.
     Granted,
-    /// Holds fewer cores (`wanted_cpu`) or less RAM (`wanted_ram_mb`) than
-    /// it asked for.
+    /// Holds less RAM (`wanted_ram_mb`) than it asked for.
     Smaller,
     /// Waiting, at `position`, `behind` a holder.
     Queued,
 }
 
 /// A row's `lease` object. For a queued row the figures are the request.
+/// No cores: a `cpu` or `wanted_cpu` from before giverny#387 is ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowLease {
     pub state: LeaseState,
     /// The ledger's lease id (`<session>:<task>`); none while queued.
     pub id: Option<String>,
-    pub cpu: u32,
     pub ram_mb: u64,
     pub gpus: Vec<u32>,
     pub vram_mb: u64,
     pub slots: Vec<String>,
     pub granted_ms: Option<u64>,
     pub wanted_ram_mb: Option<u64>,
-    pub wanted_cpu: Option<u32>,
     /// 1-based place in the ledger's queue when it was last asked.
     pub position: Option<u64>,
     /// Who it really waits on: the queued request ahead that wants what it
     /// is short of, else a lease holding that ([`crate::resources::in_the_way`]).
     pub behind: Option<String>,
-    /// What it is short of, as of its last claim (`cpu`, `ram`, `gpu`,
-    /// `slot <name>`); empty when not known.
+    /// What it is short of, as of its last claim (`cpu` — the CPU was
+    /// busy — `ram`, `gpu`, `slot <name>`); empty when not known.
     pub short: Vec<String>,
 }
 
@@ -268,7 +265,6 @@ fn parse_lease(v: &Value) -> Option<RowLease> {
     Some(RowLease {
         state,
         id: str_field(l, "id"),
-        cpu: u64_field(l, "cpu").unwrap_or(0) as u32,
         ram_mb: u64_field(l, "ram_mb").unwrap_or(0),
         gpus: l
             .get("gpus")
@@ -284,7 +280,6 @@ fn parse_lease(v: &Value) -> Option<RowLease> {
         slots: strings("slots"),
         granted_ms: millis_field(l, "granted_at"),
         wanted_ram_mb: u64_field(l, "wanted_ram_mb"),
-        wanted_cpu: u64_field(l, "wanted_cpu").map(|c| c as u32),
         position: u64_field(l, "position"),
         behind: str_field(l, "behind"),
         short: strings("short"),
@@ -2136,7 +2131,7 @@ mod tests {
         .unwrap();
         let a = f.rows[0].lease.as_ref().unwrap();
         assert_eq!(a.state, LeaseState::Granted);
-        assert_eq!((a.cpu, a.ram_mb, a.vram_mb), (3, 3072, 8192));
+        assert_eq!((a.ram_mb, a.vram_mb), (3072, 8192), "an old cpu is ignored");
         assert_eq!(a.gpus, vec![0]);
         assert_eq!(a.slots, vec!["cargo:/t".to_string()]);
         assert_eq!(a.id.as_deref(), Some("s:a"));
@@ -2144,8 +2139,8 @@ mod tests {
         let b = f.rows[1].lease.as_ref().unwrap();
         assert_eq!(b.state, LeaseState::Queued);
         assert_eq!(
-            (b.position, b.behind.as_deref(), b.cpu),
-            (Some(2), Some("a"), 2)
+            (b.position, b.behind.as_deref(), b.ram_mb),
+            (Some(2), Some("a"), 1024)
         );
         assert_eq!(f.rows[2].lease, None);
         assert_eq!(f.rows[3].lease, None);

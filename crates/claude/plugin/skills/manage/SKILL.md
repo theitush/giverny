@@ -127,32 +127,40 @@ record what it waits for.
 ## 2. Start a task
 
 First claim what its worker needs from the machine. Every Giverny session
-shares one ledger of CPU, RAM, GPUs and exclusive slots, so a claim is how two
+shares one ledger of RAM, GPUs and exclusive slots, so a claim is how two
 managers stay out of each other's way. You claim, because the lease is
 yours; workers never do.
 
 ```bash
-giverny-manage claim auth-fix --cpu 3 --ram 3G
+giverny-manage claim auth-fix --ram 3G
 ```
 
-Size it from the hint `claim` prints once there is history (`the last 4 BUG
-tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the default
-lease (Settings → Management panel; `giverny-manage resources` prints it). Add
-`--slot <name>` for something only one task at a time may use (a shared build
-folder), `--priority` when the task is urgent, `--gpu N --vram 8G` for a GPU.
-A light task (a merge, a review, docs, a small fix) adds `--min-cpu 1`
-(`--cpu 3 --min-cpu 1`), so it takes the cores that are free rather than
-queue for all three. Once tasks like it have landed, a lease's cores and RAM
-count at what such tasks really used (`counted at its kind's 0.6 cpu, peak
-1.3G`), not at their size, so ask for what a build needs: idle cores do not
-keep others waiting. The answer is one line and an exit code:
+**Reserve RAM; CPU is shared and measured.** There are no cores to pick: a
+lease holds memory, never CPU. Running out of memory kills a build; running
+out of CPU only slows everyone, and the kernel already shares the cores (every
+worker's `run` at the same weight, the user's own Claude tabs ahead of them).
+`claim` itself watches the CPU and answers `queued … CPU busy` while it has been
+saturated for about a minute with workers already building; then wait as for
+any queue. `giverny-manage resources` shows how busy it is (`cpu  6.3 of 8
+busy`).
+
+Size the RAM from the hint `claim` prints once there is history (`the last 4
+BUG tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the
+default lease (Settings → Management panel; `giverny-manage resources` prints
+it). The RAM also sets the worker's build jobs (`CARGO_BUILD_JOBS`, a job a
+GiB), so a build never outgrows its memory. Add `--slot <name>` for something
+only one task at a time may use (a shared build folder), `--priority` when the
+task is urgent, `--gpu N --vram 8G` for a GPU. Once tasks like it have landed,
+a lease counts at what such tasks really peaked at (`counted at its kind's
+peak 1.3G`), not at its size, so ask for what a build needs: idle memory does
+not keep others waiting. The answer is one line and an exit code:
 
 - `granted` (0): go on.
-- `granted smaller` (3, only with `--min-cpu` or `--min-ram`): go on, with what
-  it says; `run` caps the worker at it.
-- `queued` (4): something it needs is held; its row says so. Start another
-  planned task from a free lane instead, and re-run the same `claim` now and then until it is
-  granted (nothing calls back). When it says the wait is longer than the task
+- `granted smaller` (3, only with `--min-ram`): go on, with what it says; `run`
+  holds the worker to it.
+- `queued` (4): something it needs is held, or the CPU is busy; its row says
+  so. Start another planned task from a free lane instead, and re-run the same
+  `claim` now and then until it is granted (nothing calls back). When it says the wait is longer than the task
   itself and suggests `ask`, send `giverny-manage ask <holder's task> "<why, the
   priority, how long you need it>"` and keep polling; the holder may release.
 - `refused` (5): larger than this machine's limits (Settings → Management panel →
@@ -198,8 +206,9 @@ When you spawn one:
   > with `--why wait`; your next `eta` without it ends the wait. Do not run
   > `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy
   > commands (builds, test suites, anything that eats CPU or memory) as
-  > `giverny-manage run <task> -- <command>`: it keeps them inside what was
-  > granted and measures them. Never set CPU or memory caps by hand. If `run`
+  > `giverny-manage run <task> -- <command>`: it keeps them inside the memory
+  > granted, shares the CPU fairly, and measures them. Never set CPU or memory
+  > caps or build jobs by hand. If `run`
   > says the memory cap killed your command (OOM), do not retry it: report that
   > to the dispatcher, who claims more. End with a short report: what you did,
   > how you checked it, and anything left undone.
@@ -235,7 +244,7 @@ When you spawn one:
   against your task's, then answer, always, even with no:
   - give way: `giverny-manage release <task>` frees everything, slots included
     (the worker's next `run` claims afresh and waits its turn), or
-    `giverny-manage claim <task> --cpu <fewer> --ram <less>` shrinks in place and
+    `giverny-manage claim <task> --ram <less>` shrinks in place and
     keeps the slots (a `run` already going keeps its cap; the next one uses the
     new grant), which does not help an asker waiting for your slot: release for that;
   - `giverny-manage reply <id> "<answer>"`, then carry on.

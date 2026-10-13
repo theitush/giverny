@@ -81,22 +81,24 @@ usage: giverny manage <command> [args] [--session <id>]
                               and from the management panel of the Giverny tab it runs in
   clear                       delete this session's feed
 
-  claim <task> [--cpu N] [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
-               [--min-cpu N] [--min-ram 2G] [--priority asap|high|medium|low]
-                              ask the machine ledger for what the task's worker
-                              needs: granted (exit 0), granted smaller (3:
-                              fewer cores or less RAM, down to --min-cpu/--min-ram),
-                              queued behind its holders (4; re-run to poll),
-                              refused as larger than the limits (5)
+  claim <task> [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
+               [--min-ram 2G] [--priority asap|high|medium|low]
+                              ask the machine ledger for the memory (and GPUs,
+                              slots) the task's worker needs — never cores: CPU
+                              is shared and measured. Granted (exit 0), granted
+                              smaller (3: less RAM, down to --min-ram), queued
+                              behind its holders or while the CPU is busy (4;
+                              re-run to poll), refused as larger than the
+                              limits (5)
   release <task>              give the task's lease back (land and drop do it)
-  resources                   capacity, limits, other programs' load, leases
+  resources                   capacity, limits, how busy the CPU is, leases
   ask   <task-or-session> \"<msg>\" [--task <yours>] [--priority P]
                               when the ledger is not enough, ask the session
                               holding <task>'s lease (or a session id); the
                               message reaches it on its next tool call
   reply <msg-id> \"<text>\"     answer an ask (or a reply); it reaches the asker
                               the same way
-  run   <task> [--cpu N --ram 3G ...] -- <cmd…>
+  run   <task> [--ram 3G ...] -- <cmd…>
                               run a worker's heavy command under the task's
                               lease: capped by a systemd scope where there is
                               one (else plain, advisory), its slots locked for
@@ -128,10 +130,15 @@ Resources: one ledger for every session on the machine, at
 20 minutes after their session's last `giverny manage` command. Limits are
 [manager.limits] in Giverny's config.toml, else auto (cores-2, 70% RAM,
 90% of each GPU's VRAM). A slot (`cargo:/path/target`) is held by one lease.
+Reserve RAM; CPU is shared and measured: a lease holds no cores, every `run`
+gets the same CPU weight (the Claude tabs more), and a claim waits on CPU only
+while it has been saturated for about a minute with tasks already building.
+`run` sets CARGO_BUILD_JOBS from the lease's RAM (a job a GiB) unless set.
+--cpu and --min-cpu are accepted and ignored (giverny#387).
 `run` with no lease claims one first (the default lease, [management_panel.lease]
-in config.toml: 3 cpu, 3G unless set; --cpu/--ram override), waits while it is
+in config.toml: 3G unless set; --ram overrides), waits while it is
 queued, and releases it when the command ends.
-`claim` on a held lease with a smaller --cpu/--ram/--vram shrinks it in place.
+`claim` on a held lease with a smaller --ram/--vram shrinks it in place.
 Messages go to <feed dir>/inbox/<session>.jsonl; the plugin's hook delivers
 them, and renews the calling session's leases, on every tool call.";
 
@@ -190,14 +197,15 @@ pub struct Flags {
     /// `plan --after`: the task this one waits for (empty clears it).
     pub after: Option<String>,
     /// `claim`: what the worker needs.
-    pub cpu: Option<u32>,
     pub ram_mb: Option<u64>,
     pub gpu: Option<u32>,
     pub vram_mb: Option<u64>,
     pub slots: Vec<String>,
     pub min_ram_mb: Option<u64>,
-    pub min_cpu: Option<u32>,
     pub priority: Option<String>,
+    /// `--cpu`/`--min-cpu` were given: accepted and ignored, with a note
+    /// (giverny#387) — stale skills and briefs still pass them.
+    pub cpu_ignored: bool,
     /// `run`: the command, everything after `--`.
     pub command: Vec<String>,
     /// `ask`: the asker's own task, when the ledger does not make it plain.
@@ -220,22 +228,28 @@ pub struct Flags {
 }
 
 impl Flags {
-    /// The ledger request these flags make: one core and no RAM unless said.
+    /// The ledger request these flags make: no RAM unless said.
     pub fn request(&self) -> resources::Request {
         resources::Request {
-            cpu: self.cpu.unwrap_or(1),
             ram_mb: self.ram_mb.unwrap_or(0),
             gpu: self.gpu.unwrap_or(0),
             vram_mb: self.vram_mb.unwrap_or(0),
             slots: self.slots.clone(),
             min_ram_mb: self.min_ram_mb,
-            min_cpu: self.min_cpu,
             priority: self.priority.clone(),
             peak_mb: None,
-            cpu_use_m: None,
         }
     }
+
+    /// The one line said when `--cpu`/`--min-cpu` were given, else `None`.
+    pub fn cpu_note(&self) -> Option<&'static str> {
+        self.cpu_ignored.then_some(CPU_IGNORED)
+    }
 }
+
+/// What `claim` and `run` say to a `--cpu` or `--min-cpu` (giverny#387).
+pub const CPU_IGNORED: &str = "--cpu/--min-cpu ignored: a lease reserves RAM only; CPU is shared \
+     and measured (a claim waits while it is saturated)";
 
 fn parse_mem(name: &str, v: &str) -> Result<u64, String> {
     giverny_core::limits::Mem::parse(v)
@@ -319,15 +333,16 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--why" => flags.why = Some(val("--why")?),
             "--repo" => flags.repo = Some(val("--repo")?),
             "--after" => flags.after = Some(val("--after")?.trim().to_string()),
-            "--cpu" => flags.cpu = Some(parse_count("--cpu", &val("--cpu")?)?),
+            // Old flags, still passed by stale skills and briefs: taken,
+            // value and all, and ignored (giverny#387).
+            "--cpu" | "--min-cpu" => {
+                val(a)?;
+                flags.cpu_ignored = true;
+            }
             "--gpu" => flags.gpu = Some(parse_count("--gpu", &val("--gpu")?)?),
             "--ram" => flags.ram_mb = Some(parse_mem("--ram", &val("--ram")?)?),
             "--vram" => flags.vram_mb = Some(parse_mem("--vram", &val("--vram")?)?),
             "--min-ram" => flags.min_ram_mb = Some(parse_mem("--min-ram", &val("--min-ram")?)?),
-            "--min-cpu" => match parse_count("--min-cpu", &val("--min-cpu")?)? {
-                0 => return Err("--min-cpu: at least 1".into()),
-                n => flags.min_cpu = Some(n),
-            },
             "--slot" => flags.slots.push(val("--slot")?),
             "--priority" => flags.priority = Some(val("--priority")?),
             "--task" => flags.task = Some(val("--task")?),
@@ -1864,14 +1879,13 @@ fn claim(
     let peaks = Peaks::load(dir);
     let req = resources::Request {
         peak_mb: peaks.expected(session, task, repo.as_deref()),
-        cpu_use_m: peaks.expected_cpu(session, task, repo.as_deref()),
         ..flags.request()
     };
     // Figures given on a held lease, each no larger, shrink it in place: the
     // answer to an ask. Otherwise it is a claim as ever.
     let (out, shrunk) = resources::with_ledger(ledger, now, |l| {
         peaks.fill(l);
-        if let Some(s) = l.shrink(session, task, flags.cpu, flags.ram_mb, flags.vram_mb, now) {
+        if let Some(s) = l.shrink(session, task, flags.ram_mb, flags.vram_mb, now) {
             l.heartbeat(session, now);
             return (resources::Outcome::Held(s.1.clone()), Some(s.0));
         }
@@ -1882,16 +1896,24 @@ fn claim(
     })?;
     resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
     let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
+    // The note on an old `--cpu` goes first, on a line of its own.
+    let note = flags
+        .cpu_note()
+        .map(|n| format!("{n}\n"))
+        .unwrap_or_default();
     if let (Some(was), resources::Outcome::Held(l)) = (&shrunk, &out) {
         return Ok((
-            format!("shrunk {task}: {} (was {})", l.describe(), was.describe()),
+            format!(
+                "{note}shrunk {task}: {} (was {})",
+                l.describe(),
+                was.describe()
+            ),
             resources::exit::GRANTED,
         ));
     }
-    let mut line = resources::outcome_line(task, &out, &eta);
+    let mut line = format!("{note}{}", resources::outcome_line(task, &out, &eta));
     if let resources::Outcome::Held(l) = &out {
-        let grow = flags.cpu.is_some_and(|c| c > l.cpu)
-            || flags.ram_mb.is_some_and(|r| r > l.ram_mb)
+        let grow = flags.ram_mb.is_some_and(|r| r > l.ram_mb)
             || flags
                 .vram_mb
                 .is_some_and(|v| v > l.vram_mb && !l.gpus.is_empty());
@@ -1968,25 +1990,9 @@ impl<'a> Peaks<'a> {
         self.expected(&l.session, &l.task, l.repo.as_deref())
     }
 
-    /// What CPU admission counts the task at (giverny#318), thousandths of
-    /// a core: the high end of the cores tasks like it used over their life.
-    pub(crate) fn expected_cpu(
-        &self,
-        session: &str,
-        task: &str,
-        repo: Option<&str>,
-    ) -> Option<u64> {
-        if self.history.is_empty() {
-            return None;
-        }
-        let kind = self.kind(session, task);
-        manage_history::expected_cpu_m(&self.history, repo, kind.as_deref())
-    }
-
-    /// Give the ledger's leases that have none their expected peak and CPU.
+    /// Give the ledger's leases that have none their expected peak.
     pub(crate) fn fill(&self, l: &mut resources::Ledger) {
         l.fill_peaks(&|x| self.of_lease(x));
-        l.fill_cpu(&|x| self.expected_cpu(&x.session, &x.task, x.repo.as_deref()));
     }
 }
 
@@ -3317,6 +3323,10 @@ mod tests {
             default_lease: Default::default(),
             mem_use: Default::default(),
             cpu_use: Default::default(),
+            cpu: resources::CpuBusy {
+                slice_m: Some(0),
+                ..Default::default()
+            },
         }
     }
 
@@ -3329,23 +3339,20 @@ mod tests {
     fn claim_queues_past_the_limit_across_sessions_and_land_releases() {
         let dir = scratch("claim");
         run_as(&dir, "a", "start t1 --eta 30", T0);
-        let (msg, code) = run_as(&dir, "a", "claim t1 --cpu 8 --ram 10G --slot cargo:/t", T0);
+        let (msg, code) = run_as(&dir, "a", "claim t1 --ram 10G --slot cargo:/t", T0);
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
-        assert_eq!(msg, "granted t1: 8 cpu, 10G, slot cargo:/t");
+        assert_eq!(msg, "granted t1: 10G, slot cargo:/t");
         // The row carries its lease for the pane.
         let f = feed::read(&feed::feed_path(&dir, "a")).unwrap();
         let l = f.rows[0].lease.as_ref().unwrap();
-        assert_eq!(
-            (l.state, l.cpu, l.ram_mb),
-            (feed::LeaseState::Granted, 8, 10240)
-        );
+        assert_eq!((l.state, l.ram_mb), (feed::LeaseState::Granted, 10240));
 
         // Session b asks past the limit: queued behind t1, with t1's ETA.
         run_as(&dir, "b", "plan t2 --eta 10", T0);
-        let (msg, code) = run_as(&dir, "b", "claim t2 --cpu 6 --ram 2G", T0 + 16 * MIN);
+        let (msg, code) = run_as(&dir, "b", "claim t2 --ram 6G", T0 + 16 * MIN);
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
         assert!(
-            msg.starts_with("queued #1 for 6 cores behind t1 (8 cpu, 10G, slot cargo:/t; ~14m)"),
+            msg.starts_with("queued #1 for 6G behind t1 (10G, slot cargo:/t; ~14m)"),
             "{msg}"
         );
         let f = feed::read(&feed::feed_path(&dir, "b")).unwrap();
@@ -3354,11 +3361,11 @@ mod tests {
         assert_eq!((l.position, l.behind.as_deref()), (Some(1), Some("t1")));
         assert_eq!(
             l.short,
-            vec!["cpu".to_string()],
+            vec!["ram".to_string()],
             "the pane says what the line says"
         );
         // The slot is exclusive whatever the size.
-        let (_, code) = run_as(&dir, "b", "claim t3 --cpu 1 --slot cargo:/t", T0 + 16 * MIN);
+        let (_, code) = run_as(&dir, "b", "claim t3 --slot cargo:/t", T0 + 16 * MIN);
         assert_eq!(code, resources::exit::QUEUED);
         run_as(&dir, "b", "release t3", T0 + 16 * MIN);
 
@@ -3369,16 +3376,21 @@ mod tests {
         );
         assert!(shown.contains("t1"), "{shown}");
         assert!(shown.contains("#1 t2"), "{shown}");
+        assert!(
+            shown.contains("cpu       0.0 of 12 busy (giverny-claude.slice, last minute) — shared, not reserved; claims go on"),
+            "{shown}"
+        );
+        assert!(!shown.contains(" cpu,"), "no cores leased: {shown}");
 
         // t1 lands: its lease goes, and t2's re-claim is granted.
         let (msg, _) = run_as(&dir, "a", "land t1", T0 + 18 * MIN);
-        assert!(msg.contains("released 8 cpu, 10G, slot cargo:/t"), "{msg}");
+        assert!(msg.contains("released 10G, slot cargo:/t"), "{msg}");
         let f = feed::read(&feed::feed_path(&dir, "a")).unwrap();
         assert_eq!(f.rows[0].lease, None, "a landed row holds nothing");
-        let (msg, code) = run_as(&dir, "b", "claim t2 --cpu 6 --ram 2G", T0 + 19 * MIN);
+        let (msg, code) = run_as(&dir, "b", "claim t2 --ram 6G", T0 + 19 * MIN);
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
         // Too big for the limits is refused, not queued.
-        let (msg, code) = run_as(&dir, "a", "claim huge --cpu 20", T0 + 19 * MIN);
+        let (msg, code) = run_as(&dir, "a", "claim huge --ram 20G", T0 + 19 * MIN);
         assert_eq!(code, resources::exit::REFUSED, "{msg}");
         // `drop` releases too; `release` of nothing says so.
         let (msg, _) = run_as(&dir, "b", "drop t2", T0 + 22 * MIN);
@@ -3413,69 +3425,86 @@ mod tests {
             let (msg, code) = run_as(&dir, "a", &format!("claim {key} --ram 3G"), T0);
             assert_eq!(code, resources::exit::GRANTED, "{msg}");
             assert!(
-                msg.contains("1 cpu, 3G, counted at its kind's peak 1.3G"),
+                msg.contains(&format!(
+                    "granted {key}: 3G, counted at its kind's peak 1.3G"
+                )),
                 "{msg}"
             );
         }
         let shown = run_as(&dir, "a", "resources", T0).0;
         assert!(shown.contains("memory    7.6G counted of 16G"), "{shown}");
-        assert!(shown.contains("counts 1.0 cpu, 1.3G"), "{shown}");
+        assert!(shown.contains("counts 1.3G"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// giverny#318: a claim's cores count at its kind's measured use, so
-    /// 3-core leases of tasks that use 0.6 cores leave room past the
-    /// limit ÷ 3; `resources` says what each counts at.
+    /// giverny#387: an old `--cpu`/`--min-cpu` is taken and ignored with a
+    /// note; a claim waits on CPU only while it is measured busy, and
+    /// `resources` says how busy.
     #[test]
-    fn claim_counts_a_lease_at_its_kinds_cpu() {
+    fn claim_ignores_old_cpu_flags_and_waits_only_on_a_busy_cpu() {
         let dir = scratch("claim-cpu");
-        let h = dir.join(manage_history::FILE);
-        for cpu_s in [300, 360, 240] {
-            let rec = manage_history::Record {
-                key: "demo#1".into(),
-                repo: Some("demo".into()),
-                kind: Some("BUG".into()),
-                cpu_s: Some(cpu_s),
-                wall_s: 600,
-                ..manage_history::Record::default()
-            };
-            manage_history::append(&h, &rec).unwrap();
-        }
-        // Five 3-core leases are 15 cores, past the 12-core limit; at 0.6
-        // each and one burst (2.4) of headroom, 5.4.
-        for n in 2..=6 {
-            let key = format!("demo#{n}");
-            run_as(&dir, "a", &format!("plan {key} --eta 10 --title BUG:x"), T0);
-            let (msg, code) = run_as(&dir, "a", &format!("claim {key} --cpu 3 --ram 1G"), T0);
-            assert_eq!(code, resources::exit::GRANTED, "{msg}");
-            assert!(
-                msg.contains("3 cpu, 1G, counted at its kind's 0.6 cpu"),
-                "{msg}"
-            );
-        }
-        let shown = run_as(&dir, "a", "resources", T0).0;
+        run_as(&dir, "a", "plan t --eta 10", T0);
+        let (msg, code) = run_as(&dir, "a", "claim t --cpu 3 --min-cpu 1 --ram 1G", T0);
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        assert_eq!(msg, format!("{CPU_IGNORED}\ngranted t: 1G"));
+        let (msg, _) = run_as(&dir, "a", "claim t --cpu 1", T0);
+        assert!(msg.starts_with(CPU_IGNORED), "{msg}");
+        assert!(msg.contains("t holds its lease already: 1G"), "{msg}");
+        // `run` takes it too; any value will do, but it needs one.
         assert!(
-            shown.contains("cores     5.4 counted of 12: the 15 leased"),
+            parse_args(&args("run t --cpu 2 -- true"))
+                .unwrap()
+                .1
+                .cpu_ignored
+        );
+        assert!(parse_args(&args("claim t --cpu lots")).is_ok());
+        assert!(parse_args(&args("claim t --cpu")).is_err());
+        assert!(!parse_args(&args("claim t --ram 1G")).unwrap().1.cpu_ignored);
+
+        // Saturated, with t and u building: a third claim waits for CPU.
+        run_as(&dir, "b", "claim u --ram 1G", T0);
+        let mut busy = machine();
+        busy.cpu.slice_m = Some(11_500);
+        busy.cpu.running = ["a:t", "b:u"].map(String::from).into();
+        busy.cpu.at_ms = T0 + 10 * MIN;
+        let at = |session: &str, l: &str| {
+            let (cmd, flags) = parse_args(&args(l)).unwrap();
+            run_in_code(&dir, session, &cmd, &flags, T0 + 10 * MIN, Some(&busy)).unwrap()
+        };
+        let (msg, code) = at("c", "claim v --ram 1G");
+        assert_eq!(code, resources::exit::QUEUED, "{msg}");
+        assert!(
+            msg.starts_with("queued #1 for CPU behind t (1G), u (1G)"),
+            "{msg}"
+        );
+        assert!(msg.contains("CPU busy: 11.5 of 12 busy"), "{msg}");
+        let shown = at("c", "resources").0;
+        assert!(shown.contains("cpu       11.5 of 12 busy"), "{shown}");
+        assert!(
+            shown.contains("busy: claims wait (2 tasks building)"),
             "{shown}"
         );
-        assert!(shown.contains("counts 0.6 cpu, 1G"), "{shown}");
-        assert!(shown.contains("free now  6 cores"), "{shown}");
+        // Not saturated: it goes.
+        busy.cpu.slice_m = Some(4_000);
+        let (cmd, flags) = parse_args(&args("claim v --ram 1G")).unwrap();
+        let (msg, code) = run_in_code(&dir, "c", &cmd, &flags, T0 + 10 * MIN, Some(&busy)).unwrap();
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_expired_lease_frees_itself_and_any_command_keeps_it() {
         let dir = scratch("claim-ttl");
-        run_as(&dir, "a", "claim dead --cpu 12", T0);
-        run_as(&dir, "b", "claim live --cpu 0 --ram 4G", T0);
-        let (_, code) = run_as(&dir, "c", "claim x --cpu 4", T0);
+        run_as(&dir, "a", "claim dead --ram 12G", T0);
+        run_as(&dir, "b", "claim live --ram 2G", T0);
+        let (_, code) = run_as(&dir, "c", "claim x --ram 4G", T0);
         assert_eq!(code, resources::exit::QUEUED);
         // b and c run manage commands every few minutes; a is gone.
         for k in 1..=5 {
             run_as(&dir, "b", "show", T0 + k * 5 * MIN);
             run_as(&dir, "c", "show", T0 + k * 5 * MIN);
         }
-        let (msg, code) = run_as(&dir, "c", "claim x --cpu 4", T0 + 26 * MIN);
+        let (msg, code) = run_as(&dir, "c", "claim x --ram 4G", T0 + 26 * MIN);
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
         let shown = run_as(&dir, "c", "resources", T0 + 26 * MIN).0;
         assert!(!shown.contains("dead"), "{shown}");
@@ -3518,18 +3547,13 @@ mod tests {
         let dir = scratch("ask");
         // a holds the cargo slot for a long task; b's short task needs it.
         run_as(&dir, "sess-a", "start demo#12 --eta 60", T0);
-        let (msg, _) = run_as(
-            &dir,
-            "sess-a",
-            "claim demo#12 --cpu 3 --ram 6G --slot cargo:/t",
-            T0,
-        );
+        let (msg, _) = run_as(&dir, "sess-a", "claim demo#12 --ram 6G --slot cargo:/t", T0);
         assert!(msg.starts_with("granted"), "{msg}");
         run_as(&dir, "sess-b", "plan acme#5 --eta 10", T0);
         let (msg, code) = run_as(
             &dir,
             "sess-b",
-            "claim acme#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            "claim acme#5 --ram 2G --slot cargo:/t --priority high",
             T0 + MIN,
         );
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
@@ -3558,29 +3582,24 @@ mod tests {
         for want in [
             "session sess-b, task acme#5",
             "priority high",
-            "queued #1 for 2 cpu, 2G, slot cargo:/t",
+            "queued #1 for 2G, slot cargo:/t",
             "~10m left on it",
-            "your lease demo#12 (3 cpu, 6G, slot cargo:/t)",
+            "your lease demo#12 (6G, slot cargo:/t)",
             "\"a 2-minute test needs the slot\"",
             &format!("giverny-manage reply {id} "),
             "giverny-manage release demo#12",
-            "giverny-manage claim demo#12 --cpu <fewer> --ram <less>",
+            "giverny-manage claim demo#12 --ram <less>",
         ] {
             assert!(ctx.contains(want), "{want:?} in {ctx}");
         }
         assert_eq!(hook(&dir, "sess-a", T0 + 3 * MIN), None, "delivered once");
 
-        // a shrinks in place: fewer cores, less RAM, the slot kept.
-        let (msg, code) = run_as(
-            &dir,
-            "sess-a",
-            "claim demo#12 --cpu 2 --ram 3G",
-            T0 + 4 * MIN,
-        );
+        // a shrinks in place: less RAM, the slot kept.
+        let (msg, code) = run_as(&dir, "sess-a", "claim demo#12 --ram 3G", T0 + 4 * MIN);
         assert_eq!(code, resources::exit::GRANTED);
         assert_eq!(
             msg,
-            "shrunk demo#12: 2 cpu, 3G, slot cargo:/t (was 3 cpu, 6G, slot cargo:/t)"
+            "shrunk demo#12: 3G, slot cargo:/t (was 6G, slot cargo:/t)"
         );
         let (msg, _) = run_as(&dir, "sess-a", "claim demo#12 --ram 8G", T0 + 4 * MIN);
         assert!(msg.contains("is not grown"), "{msg}");
@@ -3608,7 +3627,7 @@ mod tests {
         let (msg, code) = run_as(
             &dir,
             "sess-b",
-            "claim acme#5 --cpu 2 --ram 2G --slot cargo:/t --priority high",
+            "claim acme#5 --ram 2G --slot cargo:/t --priority high",
             T0 + 6 * MIN,
         );
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
@@ -3620,8 +3639,8 @@ mod tests {
         assert!(parse_args(&line("ask demo#12")).is_err(), "no message");
 
         // A message expires with the asker's lease: b asks a, then lands.
-        run_as(&dir, "sess-a", "claim other --cpu 1", T0 + 7 * MIN);
-        run_line(&dir, "sess-b", r#"ask other "spare a core?""#, T0 + 7 * MIN).unwrap();
+        run_as(&dir, "sess-a", "claim other --ram 1G", T0 + 7 * MIN);
+        run_line(&dir, "sess-b", r#"ask other "spare a gig?""#, T0 + 7 * MIN).unwrap();
         run_as(&dir, "sess-b", "release acme#5", T0 + 8 * MIN);
         assert_eq!(hook(&dir, "sess-a", T0 + 9 * MIN), None, "expired unread");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3630,8 +3649,8 @@ mod tests {
     #[test]
     fn the_hook_keeps_a_busy_managers_leases_alive() {
         let dir = scratch("hook-beat");
-        run_as(&dir, "busy", "claim t --cpu 2", T0);
-        run_as(&dir, "idle", "claim u --cpu 2", T0);
+        run_as(&dir, "busy", "claim t --ram 1G", T0);
+        run_as(&dir, "idle", "claim u --ram 1G", T0);
         // `busy` runs no manage command, but its (and its workers') tool calls
         // fire the hook every minute; `idle` does nothing.
         for k in 1..=25 {
@@ -3641,8 +3660,8 @@ mod tests {
             let _ = hook(&dir, "busy", now + 1000);
         }
         let shown = run_as(&dir, "other", "resources", T0 + 25 * MIN).0;
-        assert!(shown.contains("t   "), "busy's lease kept: {shown}");
-        assert!(!shown.contains("u   "), "idle's expired: {shown}");
+        assert!(shown.contains("\n  t   "), "busy's lease kept: {shown}");
+        assert!(!shown.contains("\n  u   "), "idle's expired: {shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3654,11 +3673,11 @@ mod tests {
         .unwrap();
         assert_eq!(cmd, Cmd::Claim("t".into()));
         let r = f.request();
-        assert_eq!((r.cpu, r.ram_mb, r.gpu, r.vram_mb), (3, 1536, 1, 8192));
+        assert_eq!((r.ram_mb, r.gpu, r.vram_mb), (1536, 1, 8192));
         assert_eq!(r.slots, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(r.min_ram_mb, Some(512));
-        assert_eq!(r.min_cpu, Some(2));
-        assert!(parse_args(&args("claim t --min-cpu 0")).is_err());
+        assert!(f.cpu_ignored, "the old cores flags are taken, and ignored");
+        assert!(parse_args(&args("claim t --min-cpu 0")).is_ok());
         assert_eq!(r.priority.as_deref(), Some("high"));
         assert!(parse_args(&args("claim t --ram lots")).is_err());
         assert!(
@@ -3708,12 +3727,12 @@ mod tests {
         let dir = scratch("handoff-noid");
         // plan → claim → start with no --agent → spawn (description `parse-fix: …`).
         run_cfg(&dir, "s1", "plan parse-fix --eta 30", None, T0);
-        let (msg, code) = run_cfg(&dir, "s1", "claim parse-fix --cpu 3 --ram 3G", None, T0);
+        let (msg, code) = run_cfg(&dir, "s1", "claim parse-fix --ram 3G", None, T0);
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
         run_cfg(&dir, "s1", "start parse-fix", None, T0);
         let cfg = spawned(&dir, "s1", "w1", "parse-fix: the parser");
         // Another session needs more than is left: it queues behind parse-fix.
-        let (msg, code) = run_cfg(&dir, "s2", "claim big --cpu 10 --ram 2G", None, T0 + MIN);
+        let (msg, code) = run_cfg(&dir, "s2", "claim big --ram 12G", None, T0 + MIN);
         assert_eq!(code, resources::exit::QUEUED, "{msg}");
 
         // Fifteen minutes on, the dispatcher hands that worker its next task.
@@ -3725,7 +3744,7 @@ mod tests {
             T0 + 15 * MIN,
         );
         assert!(said.contains("handed on from parse-fix"), "{said}");
-        assert!(said.contains("released 3 cpu, 3G"), "{said}");
+        assert!(said.contains("released 3G"), "{said}");
         let f = read_feed_of(&dir, "s1");
         let row = |k: &str| f.rows.iter().find(|r| r.key == k).unwrap();
         assert_eq!(row("parse-fix").stage(), feed::Stage::Done);
@@ -3738,13 +3757,7 @@ mod tests {
             !held(&dir, "s1", "parse-fix", T0 + 15 * MIN),
             "the lease went back"
         );
-        let (msg, code) = run_cfg(
-            &dir,
-            "s2",
-            "claim big --cpu 10 --ram 2G",
-            None,
-            T0 + 16 * MIN,
-        );
+        let (msg, code) = run_cfg(&dir, "s2", "claim big --ram 12G", None, T0 + 16 * MIN);
         assert_eq!(code, resources::exit::GRANTED, "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3753,7 +3766,7 @@ mod tests {
     fn the_hook_puts_the_workers_id_on_a_row_started_without_it() {
         let dir = scratch("handoff-hook");
         run_cfg(&dir, "s1", "plan cfg-keys --eta 30", None, T0);
-        run_cfg(&dir, "s1", "claim cfg-keys --cpu 3 --ram 3G", None, T0);
+        run_cfg(&dir, "s1", "claim cfg-keys --ram 3G", None, T0);
         run_cfg(&dir, "s1", "start cfg-keys", None, T0);
         let cfg = spawned(&dir, "s1", "w2", "cfg-keys: config keys");
         // The worker's first tool call: the hook joins it to its row by the
@@ -3774,7 +3787,7 @@ mod tests {
             T0 + 15 * MIN,
         );
         assert!(said.contains("handed on from cfg-keys"), "{said}");
-        assert!(said.contains("released 3 cpu, 3G"), "{said}");
+        assert!(said.contains("released 3G"), "{said}");
         assert!(!held(&dir, "s1", "cfg-keys", T0 + 15 * MIN));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4423,7 +4436,7 @@ mod tests {
     fn no_lease_outlives_its_task() {
         let dir = scratch("lease-landed");
         run_cfg(&dir, "s1", "start t", None, T0);
-        run_cfg(&dir, "s1", "claim t --cpu 3 --ram 3G", None, T0);
+        run_cfg(&dir, "s1", "claim t --ram 3G", None, T0);
         // The row lands by a path that missed the ledger (an older writer,
         // an edit by hand): the lease is still there…
         assert!(edit_row(&dir, "s1", "t", |r| {
@@ -4434,13 +4447,13 @@ mod tests {
         // rather than renewing it.
         run_cfg(&dir, "s1", "show", None, T0 + 2 * MIN);
         assert!(!held(&dir, "s1", "t", T0 + 2 * MIN));
-        run_cfg(&dir, "s1", "claim t2 --cpu 1", None, T0 + 2 * MIN);
+        run_cfg(&dir, "s1", "claim t2 --ram 1G", None, T0 + 2 * MIN);
         // A task landed with no row in the manager session still gives its lease back.
-        run_cfg(&dir, "s1", "claim u --cpu 1", None, T0 + 3 * MIN);
+        run_cfg(&dir, "s1", "claim u --ram 1G", None, T0 + 3 * MIN);
         let (cmd, flags) = parse_args(&args("land u")).unwrap();
         let err =
             run_in_code(&dir, "s1", &cmd, &flags, T0 + 4 * MIN, Some(&machine())).unwrap_err();
-        assert!(err.contains("released 1 cpu"), "{err}");
+        assert!(err.contains("released 1G"), "{err}");
         assert!(!held(&dir, "s1", "u", T0 + 4 * MIN));
         assert!(
             held(&dir, "s1", "t2", T0 + 4 * MIN),

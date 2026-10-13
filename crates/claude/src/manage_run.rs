@@ -4,23 +4,36 @@
 //! **The cap.** On Linux with a user systemd the command runs in a scope of
 //! its own, in the slice every Claude tab's claude sits in
 //! ([`crate::tab_cap::SLICE`]): `systemd-run --user --scope
-//! --slice=giverny-claude.slice -p CPUWeight=<cpu×100> -p MemoryLow=<ram>
-//! -p MemoryHigh=<2×ram>` (and `OOMPolicy=continue`, so the scope outlives
-//! a kill and can be read), visible in `systemctl --user status
+//! --slice=giverny-claude.slice -p MemoryLow=<ram> -p MemoryHigh=<2×ram>
+//! -p CPUWeight=`[`RUN_CPU_WEIGHT`] (and `OOMPolicy=continue`, so the scope
+//! outlives a kill and can be read), visible in `systemctl --user status
 //! giverny-run-…` while it runs. The grant is a guarantee, not a ceiling:
 //! the slice's hard `CPUQuota`/`MemoryMax` at `[manager.limits]` is the one
 //! ceiling, and inside it the command may use idle cores and free memory;
-//! under contention the CPU splits by weight, its grant's RAM is protected
-//! from reclaim, and above twice its grant it is slowed (reclaimed), never
-//! killed. When the slice does run out, the command (`oom_score_adj` 500)
-//! is killed before any claude. `CARGO_BUILD_JOBS=<cpu>` is exported unless
-//! set. Anywhere else (no user systemd, macOS, Windows,
-//! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease is advisory.
+//! its grant's RAM is protected from reclaim, and above twice its grant it
+//! is slowed (reclaimed), never killed. When the slice does run out, the
+//! command (`oom_score_adj` 500) is killed before any claude.
+//!
+//! **CPU is shared, not reserved** (giverny#387): a lease holds no cores.
+//! Every `run` scope gets the same `CPUWeight`, below the Claude tabs'
+//! ([`crate::tab_cap::TAB_CPU_WEIGHT`]), so when the cores are contended
+//! the builds split them evenly and Ita's interactive claude goes first;
+//! the ledger holds a claim back only while the CPU is measured busy.
+//! `CARGO_BUILD_JOBS` follows the lease's RAM ([`jobs_for`], a job a GiB,
+//! at most the limit's cores) unless set, so more idle cores never push a
+//! build past its memory.
+//!
+//! **Anywhere else** (no user systemd, macOS, Windows,
+//! `$GIVERNY_RUN_NO_SYSTEMD`) it runs plain: the lease's RAM is advisory.
+//! On macOS, one of the supported platforms (with Linux and WSL), the
+//! command starts at low priority, `taskpolicy -c utility`, so the
+//! person's own work goes first ([`low_priority`]); elsewhere it runs as
+//! it always has.
 //!
 //! **The lease.** The task's lease in the ledger ([`resources`]). With none,
 //! `run` claims one itself — the default lease (`[management_panel.lease]`,
-//! Settings → Management panel; 3 cores and 3G unless changed there) unless
-//! `--cpu`/`--ram` say —
+//! Settings → Management panel; 3G unless changed there) unless `--ram`
+//! says —
 //! waits while that is queued (the row waiting, as `eta --why wait`), and
 //! releases it when the command ends. Refused (larger than the limits): the
 //! command does not run, exit 5.
@@ -64,6 +77,10 @@ const QUEUED_POLL: Duration = Duration::from_secs(15);
 pub const NO_SYSTEMD_ENV: &str = "GIVERNY_RUN_NO_SYSTEMD";
 /// Where the shim writes what it read of the scope.
 const STATS_ENV: &str = "GIVERNY_RUN_STATS";
+/// Every `run` scope's `CPUWeight` (giverny#387): systemd's default, the
+/// same for every worker's command — CPU is shared, not leased — and below
+/// the Claude tabs' ([`crate::tab_cap::TAB_CPU_WEIGHT`]).
+pub const RUN_CPU_WEIGHT: u64 = 100;
 
 /// Runs the command inside its scope, then reads the scope's cgroup while
 /// it still exists. `started` first, so an empty file means the scope never
@@ -138,29 +155,58 @@ pub fn detect_mode() -> Mode {
     Mode::Plain
 }
 
-/// What the command is held to: the lease's cores and RAM (0 = no cap).
+/// What the command is held to: the lease's RAM (0 = no memory cap), and
+/// the build jobs that RAM pays for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cap {
-    pub cpu: u32,
     pub ram_mb: u64,
+    /// `CARGO_BUILD_JOBS` unless set ([`jobs_for`]).
+    pub jobs: u32,
 }
 
 impl Cap {
+    /// `3G, 3 jobs`.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
-        if self.cpu > 0 {
-            parts.push(format!("{} cpu", self.cpu));
-        }
         if self.ram_mb > 0 {
             parts.push(Mem(self.ram_mb).to_string());
         }
-        if parts.is_empty() {
-            "nothing".into()
-        } else {
-            parts.join(", ")
-        }
+        parts.push(match self.jobs {
+            1 => "1 job".to_string(),
+            n => format!("{n} jobs"),
+        });
+        parts.join(", ")
     }
 }
+
+/// Build jobs for a lease of `ram_mb` (giverny#387): about one a GiB —
+/// what a rustc job peaks at — at least one, at most `cores` (the limit's).
+/// From RAM, not from cores: more idle cores must never push a build past
+/// the memory it holds. A lease of no RAM builds by `default_mb`.
+pub fn jobs_for(ram_mb: u64, default_mb: u64, cores: u32) -> u32 {
+    let mb = if ram_mb > 0 { ram_mb } else { default_mb };
+    let jobs = u32::try_from(mb / 1024).unwrap_or(u32::MAX);
+    jobs.min(cores.max(1)).max(1)
+}
+
+/// `cmd` as a plain run starts it (giverny#387): on macOS, which has no
+/// systemd scope to weigh it, at low priority — `taskpolicy -c utility`,
+/// when it is there — so the person's own work goes first and a build
+/// still gets every idle core. As given anywhere else: Linux has its
+/// scope, and other platforms are not supported for this.
+pub fn low_priority(cmd: &[String]) -> Vec<String> {
+    if cfg!(target_os = "macos") && Path::new(TASKPOLICY).exists() {
+        return [TASKPOLICY, "-c", "utility"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(cmd.iter().cloned())
+            .collect();
+    }
+    cmd.to_vec()
+}
+
+/// macOS's tool for a process's QoS clamp.
+const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
 /// A unit name from `task`: `giverny-run-giverny_161-4242`.
 pub fn unit_name(task: &str, pid: u32) -> String {
@@ -212,9 +258,8 @@ pub fn scope_args(
         prop(format!("MemoryLow={}M", cap.ram_mb));
         prop(format!("MemoryHigh={}M", high_mb(cap)));
     }
-    if cap.cpu > 0 {
-        prop(format!("CPUWeight={}", crate::tab_cap::cpu_weight(cap.cpu)));
-    }
+    // One weight for every run, below the tabs': CPU is shared (giverny#387).
+    prop(format!("CPUWeight={RUN_CPU_WEIGHT}"));
     // A kill when the slice runs out stops only the command: the shim lives
     // on to read the cgroup, and the scope is not torn down under it.
     prop("OOMPolicy=continue".into());
@@ -309,14 +354,25 @@ pub fn run_with(
     cap: Option<&resources::Capacity>,
     opts: Opts,
 ) -> Result<(String, i32), String> {
+    if let Some(n) = flags.cpu_note() {
+        say(task, n);
+    }
     let Some((lease, claimed)) = lease_for(dir, ledger, session, task, flags, cap)? else {
         return Ok((String::new(), resources::exit::REFUSED));
+    };
+    // The limit's cores and the default lease, for the jobs.
+    let (cores, default_mb) = match cap {
+        Some(c) => (c.limits.cpu_cores, c.default_lease.ram.0),
+        None => (
+            limit_cores(),
+            giverny_core::config::DefaultLease::load().ram.0,
+        ),
     };
     let held = (|| {
         let _slots = lock_slots(dir, ledger, session, task, &lease.slots)?;
         let cap = Cap {
-            cpu: lease.cpu,
             ram_mb: lease.ram_mb,
+            jobs: jobs_for(lease.ram_mb, default_mb, cores),
         };
         let hb = Heartbeat::start(
             ledger.to_path_buf(),
@@ -372,7 +428,16 @@ pub fn run_with(
     Ok((String::new(), m.exit))
 }
 
-/// `exit 0; peak 1.2G of 3G, 45.1s CPU in 30.2s (3 cpu cap)`.
+/// The limit's cores on this machine (`[manager.limits]`, `auto` where
+/// unreadable): the most build jobs a run is given.
+fn limit_cores() -> u32 {
+    let limits = giverny_core::limits::Limits::load().unwrap_or_default();
+    limits
+        .resolve(&giverny_core::limits::Machine::detect_cpu_ram())
+        .cpu_cores
+}
+
+/// `exit 0; peak 1.2G of 3G, 45.1s CPU in 30.2s`.
 pub fn summary(m: &Measured, cap: &Cap) -> String {
     let secs = |ms: u64| format!("{:.1}s", ms as f64 / 1000.0);
     let mut s = match m.signal {
@@ -422,10 +487,8 @@ fn lease_for(
     });
     let peaks = manage::Peaks::load(dir);
     let req = resources::Request {
-        cpu: flags.cpu.unwrap_or(default.cpu_cores),
         ram_mb: flags.ram_mb.unwrap_or(default.ram.0),
         peak_mb: peaks.expected(session, task, repo.as_deref()),
-        cpu_use_m: peaks.expected_cpu(session, task, repo.as_deref()),
         ..flags.request()
     };
     let mut waiting = false;
@@ -724,6 +787,9 @@ fn execute(
             ),
         );
     }
+    // No scope weighs it: on macOS, low priority instead, so the person's
+    // work goes first (giverny#387).
+    let cmd = low_priority(cmd);
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]);
     jobs_env(&mut c, cap);
@@ -739,10 +805,11 @@ fn execute(
     })
 }
 
-/// `CARGO_BUILD_JOBS=<cpu>` unless it is set already.
+/// `CARGO_BUILD_JOBS=<jobs>` (from the lease's RAM) unless it is set
+/// already.
 fn jobs_env(c: &mut Command, cap: &Cap) {
-    if cap.cpu > 0 && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
-        c.env("CARGO_BUILD_JOBS", cap.cpu.to_string());
+    if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+        c.env("CARGO_BUILD_JOBS", cap.jobs.max(1).to_string());
     }
 }
 
@@ -890,12 +957,12 @@ pub fn record_usage(
     u.insert("last_cmd".into(), json!(line));
     u.insert("last_exit".into(), json!(m.exit));
     u.insert("capped".into(), json!(m.capped));
-    for (k, v) in [("cap_cpu", cap.cpu as u64), ("cap_ram_mb", cap.ram_mb)] {
-        if m.capped && v > 0 {
-            u.insert(k.into(), json!(v));
-        } else {
-            u.remove(k);
-        }
+    // A lease holds no cores since giverny#387: an old `cap_cpu` goes.
+    u.remove("cap_cpu");
+    if m.capped && cap.ram_mb > 0 {
+        u.insert("cap_ram_mb".into(), json!(cap.ram_mb));
+    } else {
+        u.remove("cap_ram_mb");
     }
     u.insert("last_at".into(), json!(manage::stamp(now)));
     row.insert("usage".into(), Value::Object(u));
@@ -937,6 +1004,10 @@ mod tests {
             default_lease: Default::default(),
             mem_use: Default::default(),
             cpu_use: Default::default(),
+            cpu: resources::CpuBusy {
+                slice_m: Some(0),
+                ..Default::default()
+            },
         }
     }
 
@@ -967,10 +1038,11 @@ mod tests {
             .1
     }
 
-    /// `CARGO_BUILD_JOBS` a command sees: the cap's cores, unless this
-    /// test itself runs with it set (as under `giverny manage run`).
-    fn jobs(cpu: u32) -> String {
-        std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| cpu.to_string())
+    /// `CARGO_BUILD_JOBS` a command sees: the jobs its lease's RAM pays
+    /// for, unless this test itself runs with it set (as under `giverny
+    /// manage run`).
+    fn jobs(n: u32) -> String {
+        std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| n.to_string())
     }
 
     fn row(dir: &Path, key: &str) -> feed::FeedRow {
@@ -994,7 +1066,7 @@ mod tests {
             .collect();
         let (c, f) = parse_args(&a).unwrap();
         assert_eq!(c, Cmd::Run("t".into()));
-        assert_eq!(f.cpu, Some(2));
+        assert!(f.cpu_ignored, "an old --cpu is taken, and ignored");
         assert_eq!(
             f.command,
             ["cargo", "test", "--release", "-p", "x", "--", "--nocapture"]
@@ -1005,11 +1077,48 @@ mod tests {
         assert!(parse_args(&no_task).is_err());
     }
 
+    /// giverny#387: build jobs follow the lease's RAM, a job a GiB, at
+    /// least one and at most the limit's cores, never the cores free.
+    #[test]
+    fn jobs_follow_the_leases_ram() {
+        assert_eq!(jobs_for(3072, 3072, 12), 3);
+        assert_eq!(jobs_for(512, 3072, 12), 1, "at least one");
+        assert_eq!(
+            jobs_for(64 * 1024, 3072, 12),
+            12,
+            "at most the limit's cores"
+        );
+        assert_eq!(jobs_for(0, 2048, 12), 2, "no RAM: the default lease's");
+        assert_eq!(jobs_for(8192, 3072, 0), 1);
+        assert_eq!(
+            Cap {
+                ram_mb: 3072,
+                jobs: 3
+            }
+            .describe(),
+            "3G, 3 jobs"
+        );
+        assert_eq!(Cap { ram_mb: 0, jobs: 1 }.describe(), "1 job");
+    }
+
+    /// giverny#387: on macOS, with no scope to weigh it, a command starts
+    /// at low priority (`taskpolicy -c utility`); elsewhere as given.
+    #[test]
+    fn a_plain_run_starts_at_low_priority_on_macos() {
+        let argv: Vec<String> = ["cargo", "build"].map(String::from).into();
+        let low = low_priority(&argv);
+        if cfg!(target_os = "macos") && Path::new(TASKPOLICY).exists() {
+            assert_eq!(low, [TASKPOLICY, "-c", "utility", "cargo", "build"]);
+        } else if !cfg!(target_os = "macos") {
+            assert_eq!(low, argv, "Linux runs it as it always has");
+        }
+    }
+
     #[test]
     fn the_scope_carries_the_cap() {
         let cap = Cap {
-            cpu: 3,
             ram_mb: 3072,
+            jobs: 3,
         };
         let cmd: Vec<String> = ["cargo", "test", "$HOME"].map(String::from).into();
         let a = scope_args(
@@ -1025,8 +1134,8 @@ mod tests {
         assert!(s.contains("--unit=giverny-run-demo_161-42"), "{s}");
         assert!(s.contains("--slice=giverny-claude.slice"), "{s}");
         assert!(
-            s.contains("-p MemoryLow=3072M -p MemoryHigh=6144M -p CPUWeight=300"),
-            "{s}"
+            s.contains("-p MemoryLow=3072M -p MemoryHigh=6144M -p CPUWeight=100"),
+            "the same weight for every run: {s}"
         );
         assert!(s.contains("-p OOMPolicy=continue"), "{s}");
         assert!(s.ends_with("-- sh /l/run-shim.sh cargo test $HOME"), "{s}");
@@ -1035,12 +1144,13 @@ mod tests {
             false,
             "u",
             "t",
-            &Cap { cpu: 1, ram_mb: 0 },
+            &Cap { ram_mb: 0, jobs: 1 },
             Path::new("/s"),
             &cmd,
         )
         .join(" ");
         assert!(!a.contains("Memory") && !a.contains("expand"), "{a}");
+        assert!(a.contains("-p CPUWeight=100"), "{a}");
         // The slice is the one hard ceiling.
         assert!(!s.contains("MemoryMax") && !s.contains("CPUQuota"), "{s}");
         assert_eq!(slot_file("cargo:/x/t"), "cargo_3a_2fx_2ft.lock");
@@ -1059,7 +1169,7 @@ mod tests {
     fn a_leased_run_keeps_its_exit_and_lands_its_usage_on_the_row_and_in_the_history() {
         let dir = scratch("leased");
         cmd(&dir, "start demo#7 --eta 30 --title BUG:x");
-        let (_, code) = cmd(&dir, "claim demo#7 --cpu 2 --ram 1G");
+        let (_, code) = cmd(&dir, "claim demo#7 --ram 2G");
         assert_eq!(code, 0);
         let code = run(
             &dir,
@@ -1070,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             code, 3,
-            "the command's exit, with CARGO_BUILD_JOBS from the lease"
+            "the command's exit, with CARGO_BUILD_JOBS from the lease's 2G"
         );
         let u = row(&dir, "demo#7").usage.unwrap();
         assert_eq!((u.runs, u.last_exit, u.capped), (1, Some(3), false));
@@ -1112,7 +1222,7 @@ mod tests {
             seen.display()
         );
         assert_eq!(run(&dir, "t", &[], &script, plain(60_000)), 0);
-        assert!(seen.exists(), "the default claim is 3 cpu");
+        assert!(seen.exists(), "the default claim is 3G: 3 jobs");
         let l = ledger(&dir);
         assert!(l.leases.is_empty(), "released after: {l:?}");
         assert_eq!(row(&dir, "t").lease, None);
@@ -1121,7 +1231,7 @@ mod tests {
         let code = run(
             &dir,
             "t",
-            &["--cpu", "99"],
+            &["--ram", "99G"],
             &format!("touch {}", never.display()),
             plain(60_000),
         );
@@ -1136,8 +1246,8 @@ mod tests {
         cmd(&dir, "start t --eta 30");
         let mut cap = machine();
         cap.default_lease = giverny_core::config::DefaultLease {
-            cpu_cores: 2,
-            ram: Mem::gb(1),
+            cpu_cores: 9,
+            ram: Mem::gb(2),
         };
         let seen = dir.join("seen");
         let script = format!(
@@ -1153,7 +1263,7 @@ mod tests {
         let (said, code) =
             run_with(&dir, &ledger, "s1", "t", &f, Some(&cap), plain(60_000)).unwrap();
         assert_eq!(code, 0, "{said}");
-        assert!(seen.exists(), "the default lease's cores are the cap");
+        assert!(seen.exists(), "the default lease's RAM gives the jobs");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1168,10 +1278,7 @@ mod tests {
                 "s1",
                 "t",
                 None,
-                &resources::Request {
-                    cpu: 1,
-                    ..Default::default()
-                },
+                &resources::Request::default(),
                 t0,
             )
         })
@@ -1188,7 +1295,7 @@ mod tests {
     fn a_second_run_on_a_held_slot_waits_and_marks_the_row_waiting() {
         let dir = scratch("slot");
         cmd(&dir, "start t --eta 30");
-        assert_eq!(cmd(&dir, "claim t --cpu 1 --slot cargo:/x").1, 0);
+        assert_eq!(cmd(&dir, "claim t --slot cargo:/x").1, 0);
         let ledger_path = resources::ledger_path(&dir);
         let held = lock_slot(&ledger_path, "cargo:/x", false).unwrap().unwrap();
         assert!(
@@ -1226,7 +1333,7 @@ mod tests {
         };
         let dir = scratch("scope");
         cmd(&dir, "start t --eta 30");
-        assert_eq!(cmd(&dir, "claim t --cpu 1 --ram 256M").1, 0);
+        assert_eq!(cmd(&dir, "claim t --ram 256M").1, 0);
         let opts = Opts {
             mode: detect_mode(),
             ..plain(60_000)
@@ -1234,7 +1341,7 @@ mod tests {
         assert_eq!(run(&dir, "t", &[], "exit 4", opts), 4);
         let u = row(&dir, "t").usage.unwrap();
         if u.capped {
-            assert_eq!((u.cap_cpu, u.cap_ram_mb), (Some(1), Some(256)));
+            assert_eq!(u.cap_ram_mb, Some(256));
             assert!(u.peak_mb.is_some(), "{u:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);

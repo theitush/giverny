@@ -142,13 +142,35 @@ fn read_dir(dir: &Path) -> Vec<(PathBuf, LiveFile)> {
         .collect()
 }
 
-/// The process is there (Linux: `/proc/<pid>`; elsewhere assumed).
+/// The process is there (Linux: `/proc/<pid>`; other Unix: `kill(pid,
+/// 0)`, which only asks; elsewhere assumed).
 fn alive(pid: u32) -> bool {
     if cfg!(target_os = "linux") {
-        Path::new(&format!("/proc/{pid}")).exists()
-    } else {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 sends nothing; it only checks the pid exists.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
         true
     }
+}
+
+/// The leases (`<session>:<task>`) with a `giverny manage run` command
+/// going under `runs_dir`, scope or not: who is building now, for the
+/// ledger's CPU-busy check (giverny#387), which must work where there is
+/// no cgroup (macOS) too.
+pub fn running_leases(runs_dir: &Path) -> HashSet<String> {
+    read_dir(runs_dir)
+        .into_iter()
+        .filter(|(_, l)| alive(l.pid))
+        .map(|(_, l)| crate::resources::lease_id(&l.session, &l.task))
+        .collect()
 }
 
 /// The `cgroup <dir>` line the shim wrote into a stats file.

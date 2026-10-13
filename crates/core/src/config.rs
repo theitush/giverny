@@ -110,12 +110,15 @@ impl Default for PaneColumns {
     }
 }
 
-/// `[management_panel.lease]`: the CPU cores and RAM a task's lease holds when
-/// nothing says otherwise — what `giverny manage run` claims for a task that
-/// holds none.
+/// `[management_panel.lease]`: the RAM a task's lease holds when nothing
+/// says otherwise — what `giverny manage run` claims for a task that holds
+/// none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DefaultLease {
+    /// Read so a file that has it still parses (giverny#130), and counts
+    /// for nothing: a lease reserves RAM only, CPU is shared and measured
+    /// (giverny#387).
     pub cpu_cores: u32,
     pub ram: crate::limits::Mem,
 }
