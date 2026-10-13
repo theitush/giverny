@@ -16,6 +16,7 @@ mod taskbar;
 mod titlebar;
 mod translucency;
 mod update;
+mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -1034,6 +1035,14 @@ pub struct App {
     /// A Ctrl+Tab walk in progress: where it started, the recency order it
     /// snapshotted, and how far into it the user has stepped.
     switcher: Option<Switcher>,
+    /// A Ctrl+PageUp/PageDown walk in progress: Ctrl has been held since the
+    /// last press. Like `switcher`, it keeps a tab the walk passes over from
+    /// starting until Ctrl comes up; unlike it, it records nothing, since
+    /// rail-order cycling commits each step as it goes.
+    cycling: bool,
+    /// What the not-started tab a walk is on shows meanwhile: its saved
+    /// scrollback, read once when the walk reaches it.
+    walk_preview: Option<walk::Preview>,
     /// Wayland file drops, which winit 0.30 cannot deliver.
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     dnd: Option<wayland_dnd::DragDrop>,
@@ -1529,6 +1538,8 @@ impl App {
             dragging: None,
             dragging_category: None,
             switcher: None,
+            cycling: false,
+            walk_preview: None,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
@@ -1746,6 +1757,8 @@ impl App {
             Action::SwitchRecent(delta) => self.switch_recent(delta),
             Action::Cycle(delta) => {
                 self.end_switch();
+                // Held until Ctrl comes up, which the end of `update` sees.
+                self.cycling = true;
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
@@ -3339,9 +3352,20 @@ impl App {
         self.focus_terminal = true;
     }
 
+    /// Whether a keyboard walk through the tabs is held: Ctrl+Tab's, or
+    /// Ctrl+PageUp/PageDown's. While it is, a tab it passes over that has
+    /// not started stays that way.
+    fn walking(&self) -> bool {
+        self.switcher.is_some() || self.cycling
+    }
+
     /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
-    /// and only now does it count as seen.
+    /// and only now does it count as seen. Any keyboard walk ends here, so
+    /// the tab it is on may start: Ctrl coming up, and every other way of
+    /// choosing a tab, which starts it at once as ever.
     fn end_switch(&mut self) {
+        self.cycling = false;
+        self.walk_preview = None;
         let Some(sw) = self.switcher.take() else {
             return;
         };
@@ -3678,8 +3702,15 @@ impl eframe::App for App {
             }
 
             // Lazy restore: a tab from a previous run spawns its shell on
-            // first focus, pre-seeded with its saved scrollback.
-            if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
+            // first focus, pre-seeded with its saved scrollback. Not while a
+            // keyboard walk is held over it: the walk may only be passing
+            // through, and the tab it stops on starts when Ctrl comes up.
+            let walking = self.walking();
+            if walk::starts_now(
+                self.rt.contains_key(&active),
+                self.ws.tab(active).is_some_and(|t| t.exited),
+                walking,
+            ) {
                 let preseed = state::load_snapshot(&self.paths, active)
                     .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
@@ -3751,6 +3782,17 @@ impl eframe::App for App {
                         ui.label("no session");
                     });
                 }
+            } else if walking {
+                // A walk passing over a tab that has not started: its saved
+                // scrollback, read-only, until Ctrl comes up.
+                if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
+                    let dump = state::load_snapshot(&self.paths, active);
+                    self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
+                }
+                if let Some(preview) = &self.walk_preview {
+                    let rect = ui.available_rect_before_wrap();
+                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
+                }
             }
         });
         if let Some((slot, painter)) = backdrop {
@@ -3777,16 +3819,19 @@ impl eframe::App for App {
             self.apply(&ctx, action);
         }
 
-        // A Ctrl+Tab walk ends the way Alt+Tab does: when Ctrl comes up, or
+        // A keyboard walk ends the way Alt+Tab does: when Ctrl comes up, or
         // when the window stops being the one receiving keys at all.
-        if self.switcher.is_some() {
-            let holding = ctx.input(|i| i.modifiers.ctrl && i.focused);
+        if self.walking() {
+            let holding = ctx.input(|i| walk::still_held(i.modifiers.ctrl, i.focused));
             if holding {
                 // Modifier releases arrive as events on every platform we
                 // support, but a missed one would strand the walk open.
                 ctx.request_repaint_after(Duration::from_millis(250));
             } else {
                 self.end_switch();
+                // The tab the walk ended on starts in the next frame, which
+                // nothing else may be about to draw.
+                ctx.request_repaint();
             }
         }
     }
