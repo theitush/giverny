@@ -5,8 +5,10 @@
 //!
 //! * the **total**: the app and everything under it, every tab, Claude or
 //!   not (the sidebar's line);
+//! * each **tab**: its shell and everything under it (the sidebar's tab
+//!   rows and category headers);
 //! * each **session**: a claude process and everything under it, keyed by
-//!   the claude's pid (its status line);
+//!   the claude's pid;
 //! * each **run**: the processes in a `giverny manage run` scope's cgroup
 //!   (the management panel's rows). A scope's command is a descendant of the
 //!   claude that ran it (`systemd-run --scope` execs it in place), so a run
@@ -20,22 +22,15 @@
 //! `nvidia-smi`. So a run never reads more than its session, nor a session
 //! more than the total.
 //!
-//! The reading is also written to a small file beside the app's socket
-//! ([`snapshot_path`]), where `giverny statusline` — a process of its own,
-//! run by Claude Code — finds its session's figure ([`session_now`]).
-//!
-//! Claude Code runs the status line on a timer of its own, so the line
-//! would show a reading up to a second after the app drew it. So the line
-//! leads: it says which reading it showed, per tab ([`Shown`], in
-//! [`shown_dir`]), and the app draws that tab's pane and the sidebar from
-//! the same reading once the line is on screen ([`follow`]).
+//! Claude Code's status line shows none of it (giverny#384): the app draws
+//! every figure from its newest pass.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session_use::{Proc, SessionUse, subtree};
+use crate::session_use::{Proc, subtree};
 
 /// One group's use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,17 +46,6 @@ pub struct Use {
     /// reports it per process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_pct: Option<u32>,
-}
-
-impl Use {
-    /// As the status line shows it.
-    pub fn session(&self) -> SessionUse {
-        SessionUse {
-            cpu_pct: self.cpu_pct,
-            mem_mb: self.mem_mb,
-            gpu_mb: self.gpu_mb,
-        }
-    }
 }
 
 /// One `giverny manage run` task's commands' use (its scopes summed).
@@ -82,10 +66,6 @@ pub struct RunUse {
 pub struct Reading {
     /// When it was taken, ms since the epoch.
     pub at_ms: u64,
-    /// Which pass of the app's sampler it is (the first is 1): two figures
-    /// with the same number are from the same moment.
-    #[serde(default)]
-    pub seq: u64,
     /// The app's pid, the root of [`Reading::total`].
     pub app: u32,
     pub total: Use,
@@ -195,7 +175,6 @@ impl Table {
             .collect();
         Reading {
             at_ms,
-            seq: 0,
             app,
             total: self.use_of(&tree),
             sessions,
@@ -354,124 +333,6 @@ pub fn gpu_pct(pmon: &Pmon, pids: &HashSet<u32>) -> u32 {
     (used / pmon.gpus as u32).min(100)
 }
 
-// ---- the snapshot file ----------------------------------------------------
-
-/// Where the app leaves its last reading: beside its socket, so a status
-/// line run in one of its tabs (which inherits the same runtime dir)
-/// finds that app's, and a test instance's stays its own.
-pub fn snapshot_path() -> PathBuf {
-    crate::hooks::socket_path().with_extension("use.json")
-}
-
-/// A reading older than this is not about now: the app samples every
-/// second, so one tick late is still the last; two, it has stopped.
-pub const FRESH_MS: u64 = 2_500;
-
-/// Write `r` to `path` whole (a reader never sees half of it).
-pub fn write_snapshot(path: &Path, r: &Reading) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(r)?)?;
-    std::fs::rename(&tmp, path)
-}
-
-/// The figure for the session whose claude is `claude`, from the snapshot
-/// at `path`, with the reading's [`Reading::seq`], if it is fresh at
-/// `now_ms` and has that session: else `None`, and the caller measures for
-/// itself (no Giverny running, or a claude outside its tabs).
-pub fn session_from(path: &Path, claude: u32, now_ms: u64) -> Option<(u64, Use)> {
-    let r: Reading = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    if now_ms.saturating_sub(r.at_ms) > FRESH_MS || r.at_ms > now_ms + FRESH_MS {
-        return None;
-    }
-    r.sessions.get(&claude).map(|u| (r.seq, *u))
-}
-
-/// The status line's session figure from the running app's last reading,
-/// with that reading's number.
-#[cfg(target_os = "linux")]
-pub fn session_now() -> Option<(u64, Use)> {
-    let claude = crate::session_use::claude_root(std::process::id())?;
-    session_from(&snapshot_path(), claude, crate::session_use::now_ms())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn session_now() -> Option<(u64, Use)> {
-    None
-}
-
-// ---- what each tab's status line showed -----------------------------------
-
-/// What a tab's status line last showed: the reading it took its figures
-/// from, when, and the figures as printed (how the app tells the line is
-/// on its screen).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Shown {
-    pub seq: u64,
-    pub at_ms: u64,
-    pub text: String,
-}
-
-/// Where the status lines say what they showed: a file per tab, beside
-/// the snapshot (so a test instance's stay its own).
-pub fn shown_dir() -> PathBuf {
-    snapshot_path().with_extension("shown")
-}
-
-/// The file for the tab `tab` (`$GIVERNY_TAB_ID`) in `dir`; `None` for an
-/// id that is not a plain name.
-pub fn shown_path(dir: &Path, tab: &str) -> Option<PathBuf> {
-    let plain = !tab.is_empty()
-        && tab
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-    plain.then(|| dir.join(format!("{tab}.json")))
-}
-
-/// Say that `tab`'s status line shows `shown` (whole, as the snapshot).
-pub fn write_shown(dir: &Path, tab: &str, shown: &Shown) -> std::io::Result<()> {
-    let Some(path) = shown_path(dir, tab) else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(shown)?)?;
-    std::fs::rename(&tmp, path)
-}
-
-/// What `tab`'s status line last said it showed.
-pub fn read_shown(dir: &Path, tab: &str) -> Option<Shown> {
-    serde_json::from_slice(&std::fs::read(shown_path(dir, tab)?).ok()?).ok()
-}
-
-/// A status line that has said nothing for this long has stopped (its
-/// claude ended, or the tab runs none): the newest reading is shown.
-pub const QUIET_MS: u64 = 3_000;
-
-/// How long the app waits to see a line's figures on its screen before it
-/// follows the line anyway (cut short, or drawn where it is not read).
-pub const ON_SCREEN_WITHIN_MS: u64 = 1_000;
-
-/// Which reading to draw a tab's figures from, `None` for the newest:
-/// the one its status line showed (`shown`), from the frame its figures
-/// are on the tab's screen (`on_screen`), so the line, the pane and the
-/// sidebar change together; `adopted` (this function's last answer) until
-/// then. A line quiet past [`QUIET_MS`] is not followed.
-pub fn follow(
-    adopted: Option<u64>,
-    shown: Option<&Shown>,
-    now_ms: u64,
-    on_screen: impl FnOnce(&str) -> bool,
-) -> Option<u64> {
-    let shown = shown.filter(|s| now_ms.saturating_sub(s.at_ms) <= QUIET_MS)?;
-    if adopted == Some(shown.seq)
-        || now_ms.saturating_sub(shown.at_ms) > ON_SCREEN_WITHIN_MS
-        || on_screen(&shown.text)
-    {
-        return Some(shown.seq);
-    }
-    adopted
-}
-
 // ---- the sampler ----------------------------------------------------------
 
 /// Takes the passes, keeping what the next one diffs against. GPU answers
@@ -486,7 +347,6 @@ pub struct Sampler {
     pmon_child: Option<std::process::Child>,
     pmon_at: Option<std::time::Instant>,
     workers: crate::worker_pids::Attributor,
-    seq: u64,
     /// Puts each tab's claude under its cap ([`crate::tab_cap`]); only the
     /// app's own sampler ([`Sampler::capping_tabs`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -556,10 +416,7 @@ impl Sampler {
         let agents = self
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
-        self.seq += 1;
-        let mut r = table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents);
-        r.seq = self.seq;
-        Some(r)
+        Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -823,97 +680,6 @@ mod tests {
         assert_eq!(gpu_pct(&Pmon::default(), &HashSet::from([1])), 0);
     }
 
-    #[test]
-    fn the_status_line_takes_a_fresh_snapshot_or_measures_itself() {
-        let dir = std::env::temp_dir().join(format!("giverny-use-reading-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("giverny.use.json");
-        let t = table(machine(), None, None);
-        let r = t.reading(10_000, 100, |p| p == 120, &[], &HashMap::new());
-        write_snapshot(&path, &r).unwrap();
-        let r = Reading { seq: 7, ..r };
-        write_snapshot(&path, &r).unwrap();
-        let a = (7, r.sessions[&120]);
-        assert_eq!(session_from(&path, 120, 10_500), Some(a));
-        assert_eq!(session_from(&path, 120, 10_000 + FRESH_MS), Some(a));
-        assert_eq!(session_from(&path, 120, 10_001 + FRESH_MS), None, "stale");
-        assert_eq!(
-            session_from(&path, 999, 10_500),
-            None,
-            "not one of its sessions"
-        );
-        assert_eq!(
-            session_from(&dir.join("none"), 120, 10_500),
-            None,
-            "no Giverny"
-        );
-        std::fs::write(&path, "{half").unwrap();
-        assert_eq!(session_from(&path, 120, 10_500), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_tab_says_what_its_status_line_showed() {
-        let dir = std::env::temp_dir().join(format!("giverny-shown-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let shown = Shown {
-            seq: 41,
-            at_ms: 5_000,
-            text: " 12% cpu  ·  1.2G".into(),
-        };
-        write_shown(&dir, "giverny-3", &shown).unwrap();
-        assert_eq!(read_shown(&dir, "giverny-3"), Some(shown));
-        assert_eq!(read_shown(&dir, "giverny-4"), None, "another tab");
-        assert_eq!(shown_path(&dir, "../x"), None, "not a plain name");
-        assert!(
-            write_shown(
-                &dir,
-                "",
-                &Shown {
-                    seq: 1,
-                    at_ms: 1,
-                    text: String::new()
-                }
-            )
-            .is_ok()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_pane_follows_the_status_line_once_it_is_on_screen() {
-        let line = |seq| Shown {
-            seq,
-            at_ms: 10_000,
-            text: "7% cpu".into(),
-        };
-        let (s5, s6) = (line(5), line(6));
-        let never = |_: &str| false;
-        let shows = |t: &str| t == "7% cpu";
-        // No line, or a quiet one: the newest.
-        assert_eq!(follow(Some(5), None, 10_000, shows), None);
-        assert_eq!(
-            follow(Some(5), Some(&s5), 10_000 + QUIET_MS + 1, shows),
-            None
-        );
-        // A new reading in the line: not before its figures are drawn.
-        assert_eq!(follow(Some(5), Some(&s6), 10_100, never), Some(5));
-        assert_eq!(
-            follow(None, Some(&s6), 10_100, never),
-            None,
-            "the newest till then"
-        );
-        assert_eq!(follow(Some(5), Some(&s6), 10_100, shows), Some(6));
-        // Followed: stays, whatever the screen.
-        assert_eq!(follow(Some(6), Some(&s6), 10_900, never), Some(6));
-        // Never seen on the screen (cut short): followed anyway, a second on.
-        assert_eq!(
-            follow(Some(5), Some(&s6), 10_001 + ON_SCREEN_WITHIN_MS, never),
-            Some(6)
-        );
-    }
-
     /// A real pass over this machine: the test process's own tree.
     #[cfg(target_os = "linux")]
     #[test]
@@ -924,9 +690,6 @@ mod tests {
         let first = s.sample(me, &none).expect("a /proc");
         assert_eq!(first.total.cpu_pct, 0);
         assert!(first.total.mem_mb > 0);
-        // Each pass numbered, so two figures can be told to be one moment's.
-        assert_eq!(first.seq, 1);
-        assert_eq!(s.sample(me, &none).map(|r| r.seq), Some(2));
     }
 }
 

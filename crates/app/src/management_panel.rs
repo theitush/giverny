@@ -836,12 +836,11 @@ fn usage_w(gpu: bool) -> usize {
     if gpu { w + GPU_W } else { w }
 }
 
-/// A row's use in its cell, read like the status line's use part right
-/// above the pane and built from the same pieces, so the figures sit in
-/// the same columns: a Running row's commands now, ` 14% CPU  ·  4.2G` (CPU
-/// as a share of the whole machine, so at most `100%`), a Done row's
-/// memory peak alone in the same place, `4.2G`; on a machine with a GPU
-/// (`gpu`), a Running row's GPU memory after, `  ·  gpu 1.2G`. `OOM`
+/// A row's use in its cell: a Running row's commands now,
+/// ` 14% CPU  ·  4.2G` (CPU as a share of the whole machine, so at most
+/// `100%`), a Done row's memory peak alone in the same place, `4.2G`; on a
+/// machine with a GPU (`gpu`), a Running row's GPU memory after,
+/// `  ·  gpu 1.2G`. `OOM`
 /// leads when the memory cap killed a run, so the figures keep their
 /// places. Nothing measured reads as zero, `0.0G`, never as a blank: the
 /// cell is always there. Every slot has a fixed width, so every cell is
@@ -1992,8 +1991,8 @@ pub fn show(
     let drawn = Drawn::of(view.manager);
     let now = now_ms();
     track(&mut view.holds, limit.as_ref(), now);
-    // What the rows' processes use: the reading the tab's status line
-    // shows, which the sidebar shows the sum of (`sessions_load::for_tab`).
+    // What the rows' processes use: this frame's reading, the one the
+    // sidebar shows the sums of (`sessions_load::latest`).
     let runs = reading
         .map(crate::sessions_load::task_lives)
         .unwrap_or_default();
@@ -2203,10 +2202,10 @@ const INSET: usize = session_use::CLAUDE_MARGIN / 2;
 /// terminal's area, and is drawn on its grid ([`INSET`] whole cells in).
 /// The table is as wide as the status line Claude Code draws over it
 /// (the terminal's columns less [`session_use::CLAUDE_MARGIN`]), so its
-/// last column, the use column, ends exactly under the status line's use
-/// part and the figures line up. The bar's lane is always left free, so it
-/// never paints over a cell and the columns never move when it appears; on
-/// the usual sizes it fits in the two cells right of the table anyway.
+/// last column, the use column, ends where the status line does. The bar's
+/// lane is always left free, so it never paints over a cell and the
+/// columns never move when it appears; on the usual sizes it fits in the
+/// two cells right of the table anyway.
 fn table_cols(width: f32, cell_w: f32, ppp: f32, bar_lane: f32) -> usize {
     let cw = cell_w.max(0.1);
     // The terminal counts its columns in whole device pixels
@@ -2235,8 +2234,8 @@ struct Cols {
     x_tok_end: usize,
     /// The use column, the last: a [`usage_cell`] wide while any row is Running
     /// or Done, not there at all while every row is Next up. It ends on
-    /// the table's last column, so it sits right under the status line's
-    /// use part ([`table_cols`]).
+    /// the table's last column, so it ends where the status line above
+    /// does ([`table_cols`]).
     usew: usize,
     x_use: usize,
 }
@@ -5160,24 +5159,14 @@ mod tests {
         assert_eq!(table_cols(1200.0, 6.0, 1.5, 10.0), 196);
     }
 
-    /// The use column is the last, and on screen its figures sit in the
-    /// very columns of the status line's use part drawn right above it:
-    /// both start [`INSET`] cells into the terminal, both are as wide, and
-    /// both are built from the same fixed-width pieces.
+    /// The use column is the last, and on screen it ends where the status
+    /// line drawn right above the pane does: [`INSET`] cells in from the
+    /// terminal's edges. The status line no longer shows the session's use
+    /// for it to line up under (giverny#384).
     #[test]
-    fn the_use_column_lines_up_under_the_status_line() {
+    fn the_use_column_ends_where_the_status_line_does() {
         let gpu_live = |gpu_mb| task_live_gpu("demo#12", 14, 4300, gpu_mb);
         for (columns, gpu) in [(120usize, None), (137, None), (160, Some(1229))] {
-            let su = session_use::SessionUse {
-                cpu_pct: 14,
-                mem_mb: 4300,
-                gpu_mb: gpu,
-            };
-            let right = session_use::segments(&su).join(session_use::SEP);
-            let width = session_use::line_width(Some(&columns.to_string()));
-            let status = session_use::align("Opus 5.5  ·  session: 1.2k", &right, width);
-            let status = format!("{}{status}", " ".repeat(INSET));
-
             let width_pt = columns as f32 * 8.0 + 3.0;
             let cols = table_cols(width_pt, 8.0, 1.0, 10.0);
             let mut f = with_live(feed(LEASED), &["s"], &[gpu_live(gpu)]);
@@ -5200,17 +5189,8 @@ mod tests {
             assert_eq!(cell, &line.usage);
             assert_eq!(at + cell.chars().count(), cols);
             let row = format!("{}{}", " ".repeat(INSET), compose(&segs));
-            // Character for character under the status line's part.
-            assert_eq!(
-                status.chars().count(),
-                row.chars().count(),
-                "{status:?}\n{row:?}"
-            );
-            let tail = right.chars().count();
-            let above: String = status.chars().skip(status.chars().count() - tail).collect();
-            let below: String = row.chars().skip(row.chars().count() - tail).collect();
-            assert_eq!(above, below, "{columns} columns");
-            // And it ends where the status line does: two columns in from
+            assert!(row.ends_with(&line.usage), "{row:?}");
+            // It ends where the status line does: two columns in from
             // the terminal's right edge.
             assert_eq!(row.chars().count(), columns - INSET);
         }

@@ -731,7 +731,8 @@ fn shell_quote(path: &str) -> String {
 }
 
 /// How often Claude Code reruns our status line, seconds, besides its own
-/// events: the app's sampler's cadence ([`crate::use_reading`]).
+/// events: each run pushes the session's usage to the app and tells a
+/// cache that has gone cold.
 pub const STATUSLINE_REFRESH_S: u64 = 1;
 
 /// Synthetic event name for statusline pushes (not a Claude hook event).
@@ -740,9 +741,9 @@ pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 /// The `giverny statusline` entrypoint: Claude Code runs this after every
 /// assistant message and displays our stdout. We forward the payload's
 /// official `rate_limits` to the app (fresh usage without any API call) and
-/// print a compact line back: model and token counts on the
-/// left, the session's CPU, memory and GPU at the right edge
-/// ([`crate::session_use`]).
+/// print a compact line back: model, token counts and a cold cache. The
+/// session's CPU and memory are not on it (giverny#384): Giverny's sidebar
+/// and management panel show them.
 pub fn run_statusline(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
@@ -763,7 +764,7 @@ pub fn run_statusline(spool: &Path) {
     // Usage is no tab's, so a session the relay would not speak for still
     // delivers it; a background job's says which job it is.
     let target = Target::of_this_process();
-    let msg = match target.clone() {
+    let msg = match target {
         Some(target) => {
             let account = target.account();
             target.msg(account, serde_json::Value::Object(event))
@@ -777,10 +778,19 @@ pub fn run_statusline(spool: &Path) {
     };
     deliver(&msg, spool);
 
-    // What Claude displays. Keep it short and useful.
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    println!("{}", statusline_text(&payload, now_ms));
+}
+
+/// What Claude Code displays for the status line payload `payload` at
+/// `now_ms`. Keep it short and useful: the model with the session's name,
+/// its tokens, and a cache gone cold. No 5h or week usage, and no CPU,
+/// memory or GPU (giverny#384): the sidebar shows the usage, and its tab
+/// rows and category headers and the management panel's rows the use.
+fn statusline_text(payload: &serde_json::Value, now_ms: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
-    let transcript = transcript_of(&payload);
+    let transcript = transcript_of(payload);
     if let Some(model) = payload
         .get("model")
         .and_then(|m| m.get("display_name"))
@@ -792,36 +802,9 @@ pub fn run_statusline(spool: &Path) {
             accent_sgr(&statusline_accent_path())
         }));
     }
-    // No 5h or week usage here: Giverny's sidebar shows both.
-    parts.extend(statusline_tokens(&payload, transcript.as_deref()));
-    let now_ms = jiff::Timestamp::now().as_millisecond();
-    parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
-    // The whole session's CPU, memory and GPU now, at the right edge: the
-    // running Giverny's last reading, the same figure its management panel and
-    // sidebar are parts and sums of; measured here only without one (a
-    // plain terminal, or a claude outside its tabs).
-    let reading = crate::use_reading::session_now();
-    let used = reading
-        .map(|(_, u)| u.session())
-        .or_else(|| crate::session_use::measure(session_id))
-        .map(|u| crate::session_use::segments(&u).join(crate::session_use::SEP))
-        .unwrap_or_default();
-    // Which reading this is, for the tab's pane and the sidebar to show
-    // the same one as the line goes up (giverny#235).
-    // A background job's inherited tab id is not its tab's.
-    if let (Some((seq, _)), Some(Target::Tab(tab))) = (reading, target) {
-        let shown = crate::use_reading::Shown {
-            seq,
-            at_ms: u64::try_from(now_ms).unwrap_or(0),
-            text: used.clone(),
-        };
-        let _ = crate::use_reading::write_shown(&crate::use_reading::shown_dir(), &tab, &shown);
-    }
-    let width = crate::session_use::line_width(std::env::var("COLUMNS").ok().as_deref());
-    println!(
-        "{}",
-        crate::session_use::align(&parts.join(crate::session_use::SEP), &used, width)
-    );
+    parts.extend(statusline_tokens(payload, transcript.as_deref()));
+    parts.extend(cache_cold_segment(payload, transcript.as_deref(), now_ms));
+    parts.join(crate::session_use::SEP)
 }
 
 /// Red `cache cold · next msg <n>` once the main conversation's prompt cache
@@ -875,8 +858,7 @@ fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> Strin
 }
 
 /// Where the app leaves its chrome's accent colour for the status line: beside
-/// its socket, as [`crate::use_reading::snapshot_path`] is, so a test
-/// instance's stays its own.
+/// its socket, so a test instance's stays its own.
 pub fn statusline_accent_path() -> PathBuf {
     socket_path().with_extension("accent")
 }
@@ -2309,6 +2291,24 @@ mod tests {
             !stop("").delegated_work_running(),
             "no list, as before 2.1.296"
         );
+    }
+
+    /// The line is the model and the session's tokens, and no CPU, memory
+    /// or GPU (giverny#384), though this test runs under a claude whose
+    /// tree the line used to measure.
+    #[test]
+    fn the_status_line_shows_no_use() {
+        let payload = serde_json::json!({
+            "model": {"display_name": "Opus 5.5"},
+            "context_window": {"total_input_tokens": 12_345},
+            "transcript_path": "",
+        });
+        let tokens = statusline_tokens(&payload, None);
+        assert!(!tokens.is_empty(), "{tokens:?}");
+        let line = statusline_text(&payload, 0);
+        let sep = crate::session_use::SEP;
+        assert_eq!(line, format!("Opus 5.5{sep}{}", tokens.join(sep)));
+        assert!(!line.contains("CPU") && !line.contains('%'), "{line}");
     }
 
     /// The model, then the session's full name in the accent and a reset

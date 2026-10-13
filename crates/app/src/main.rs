@@ -1294,11 +1294,9 @@ pub struct App {
     /// Each tab's management panel view state (`claude.management_panel`); the rows
     /// are `claude.agents`'.
     pub agent_views: management_panel::Views,
-    /// Which use reading each tab's figures are drawn from, and this
-    /// frame's for the active tab: the one its status line shows
-    /// (`sessions_load::for_tab`), so the line, the pane and the sidebar
-    /// agree.
-    use_follow: sessions_load::Follow,
+    /// This frame's use reading, the sampler's newest
+    /// (`sessions_load::latest`): taken once a frame so the sidebar and the
+    /// management panel draw the same one.
     pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
     /// The overlay a management-panel row opens: a brief, or a worker's
     /// transcript (`overlays::BriefOverlay`).
@@ -1994,7 +1992,6 @@ impl App {
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
             agent_views: management_panel::Views::default(),
-            use_follow: sessions_load::Follow::default(),
             use_now: None,
             brief: None,
             brief_row: None,
@@ -5406,16 +5403,9 @@ impl eframe::App for App {
         }
 
         // The use figures this frame draws, read before the rail and the
-        // pane so both show the reading the active tab's status line does.
-        self.use_now = match self.ws.active {
-            Some(tab) => {
-                let session = self.rt.get(&tab).and_then(|rt| rt.session.as_ref());
-                sessions_load::for_tab(&ctx, &mut self.use_follow, &tab_env_id(tab), || {
-                    session.map(|s| s.screen_text())
-                })
-            }
-            None => sessions_load::latest(&ctx),
-        };
+        // pane so both show the same reading: the newest, since the status
+        // line no longer shows one to follow (giverny#384).
+        self.use_now = sessions_load::latest(&ctx);
 
         egui::Panel::left("rail")
             .resizable(true)
