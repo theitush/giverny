@@ -618,7 +618,7 @@ mod tests {
     /// defaults, and is left exactly as the user wrote it.
     #[test]
     fn unparseable_config_is_an_error_not_defaults() {
-        let dir = scratch("broken");
+        let dir = scratch("unparseable");
         let broken = "[font\nsize = 16.0\n";
         std::fs::write(config_path(&dir), broken).unwrap();
         assert!(load_checked(&dir, &Config::default()).is_err());
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(config_path(&dir)).unwrap(), broken);
 
         // A missing file is a first run, not an error.
-        let fresh = scratch("broken-fresh");
+        let fresh = scratch("unparseable-fresh");
         assert!(load_checked(&fresh, &Config::default()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fresh);
