@@ -1,14 +1,16 @@
 //! A manager's chores, told to the manager rather than drawn for the person
 //! (giverny#310, giverny#284).
 //!
-//! Three of the management panel's states are the dispatcher's to act on,
+//! Four of the management panel's states are the dispatcher's to act on,
 //! not the person's: a Running row whose worker has **finished** and that
-//! nobody has landed; a Next up row that has sat with **nothing recorded to
-//! wait on** (no hold, no queued lease, no task before it); and a Running row
-//! with **no worker** at all, that its manager has not paused (giverny#334).
-//! The panel draws each as an ordinary row (the last under Next up, `no
-//! worker yet`); the manager session that owns them hears of each once, as
-//! one line on its next tool call.
+//! nobody has landed; the same row **paused**, its worker finished before
+//! or during the pause (giverny#379); a Next up row that has sat with
+//! **nothing recorded to wait on** (no hold, no queued lease, no task before
+//! it); and a Running row with **no worker** at all, that its manager has
+//! not paused (giverny#334). The panel draws each as an ordinary row (the
+//! paused one under Next up, `paused · worker finished`; the last there
+//! too, `no worker yet`); the manager session that owns them hears of each
+//! once, as one line on its next tool call.
 //!
 //! **Only of drawn rows** (giverny#357). The chores come from the rows the
 //! pane draws, and a session that is no manager draws only rows a real
@@ -34,8 +36,8 @@
 //! a hold that ends — is told again; the same one never is.
 //!
 //! **Thresholds.** A Next up row is the manager's after [`IDLE_PLANNED_MS`]
-//! (the panel's idle mark since giverny#282). A finished worker's row after
-//! [`LAND_GRACE_MS`]. A row with no worker [`feed::HANDOFF_WINDOW_MS`] after
+//! (the panel's idle mark since giverny#282). A finished worker's row,
+//! paused or not, after [`LAND_GRACE_MS`]. A row with no worker [`feed::HANDOFF_WINDOW_MS`] after
 //! it was handed out, when a spawn or a pick-up would have come.
 
 use std::path::{Path, PathBuf};
@@ -68,6 +70,14 @@ pub const CHORES_DIR: &str = "chores";
 pub enum Kind {
     /// Its worker finished: read the report and land it.
     Land,
+    /// Its worker finished and its row is paused (giverny#379): land it, or
+    /// resume it. A row paused for a Giverny restart whose worker finished
+    /// meanwhile sat under Next up as `paused since …`, work done, and
+    /// nothing told its manager: [`Kind::Land`] spoke only of Running rows.
+    /// The same finish as [`Kind::Land`], stamped on the same field, so a
+    /// row told of it Running and then paused is not told again.
+    #[serde(rename = "land_paused")]
+    LandPaused,
     /// It waits on nothing recorded: start it, or hold it with a reason.
     Start,
     /// It is Running with no worker: spawn or hand it one, or pause or drop
@@ -79,7 +89,7 @@ impl Kind {
     /// The row field delivering it stamps.
     fn field(self) -> &'static str {
         match self {
-            Kind::Land => "land_nudged",
+            Kind::Land | Kind::LandPaused => "land_nudged",
             Kind::Start => "start_nudged",
             Kind::Worker => "worker_nudged",
         }
@@ -88,11 +98,12 @@ impl Kind {
     /// Whether a row of the manager session's file in `stage` is still
     /// this chore's: a Next up row still planned; a finished worker's row
     /// not landed — Running, or still planned in the file for a task the
-    /// dispatcher handed over by message and never `start`ed; a row with
-    /// no worker still Running.
+    /// dispatcher handed over by message and never `start`ed — paused or not
+    /// (whether it still is, [`stamp`] asks); a row with no worker still
+    /// Running.
     fn stands_in(self, stage: Option<Stage>) -> bool {
         match self {
-            Kind::Land => matches!(stage, Some(Stage::Running | Stage::Planned)),
+            Kind::Land | Kind::LandPaused => matches!(stage, Some(Stage::Running | Stage::Planned)),
             Kind::Start => stage == Some(Stage::Planned),
             Kind::Worker => stage == Some(Stage::Running),
         }
@@ -100,7 +111,7 @@ impl Kind {
 
     fn threshold_ms(self) -> u64 {
         match self {
-            Kind::Land => LAND_GRACE_MS,
+            Kind::Land | Kind::LandPaused => LAND_GRACE_MS,
             Kind::Start => IDLE_PLANNED_MS,
             Kind::Worker => feed::HANDOFF_WINDOW_MS,
         }
@@ -113,7 +124,8 @@ pub struct Chore {
     /// The row's key in the manager session's file.
     pub key: String,
     pub kind: Kind,
-    /// Since when, epoch ms: the worker's end ([`Kind::Land`]), the last
+    /// Since when, epoch ms: the worker's end ([`Kind::Land`],
+    /// [`Kind::LandPaused`]), the last
     /// instant the row could have started ([`Kind::Start`]: planned, unheld,
     /// the task before it landed, its lease granted), or when it was handed
     /// out ([`Kind::Worker`]: started, or handed to a worker that never
@@ -134,7 +146,7 @@ impl Chore {
     /// The manager has been told of it already: `row` carries its stamp.
     pub fn told(&self, row: &FeedRow) -> bool {
         let stamp = match self.kind {
-            Kind::Land => row.land_nudged_ms,
+            Kind::Land | Kind::LandPaused => row.land_nudged_ms,
             Kind::Start => row.start_nudged_ms,
             Kind::Worker => row.worker_nudged_ms,
         };
@@ -157,6 +169,13 @@ impl Chore {
                      `giverny-manage land {key}`."
                 )
             }
+            // Its worker may have finished before the pause as well as
+            // during it: the line says only that both are so.
+            Kind::LandPaused => format!(
+                "Giverny: `{key}`'s worker finished {ago} ago and its row is paused: \
+                 check its report and `giverny-manage land {key}`, or \
+                 `giverny-manage resume {key}`."
+            ),
             Kind::Start => format!(
                 "Giverny: `{key}` has waited {ago} with a free lane: start it, or \
                  `giverny-manage hold {key} --why \"<reason>\"`."
@@ -229,8 +248,9 @@ pub fn publish(feed_dir: &Path, session: &str, chores: &[Chore]) -> Result<(), S
 /// A chore stands while its row is still in its stage under its key in the
 /// session's file (this writer's), unstamped for that instant, and — for a
 /// Next up row, or a Running one with no worker — still not held (nor, for
-/// the latter, paused). Every chore read leaves the file but the
-/// ones not yet due.
+/// the latter, paused), and for a paused row's finished worker still paused
+/// (resumed, it is [`Kind::Land`]'s to tell). Every chore read leaves the
+/// file but the ones not yet due.
 pub fn deliver(feed_dir: &Path, session: &str, now: u64) -> Option<String> {
     if !safe(session) {
         return None;
@@ -282,6 +302,9 @@ fn stamp(feed_dir: &Path, session: &str, due: &[Chore], now: u64) -> Vec<String>
         if c.kind == Kind::Worker && (row.contains_key("held") || row.contains_key("paused_since"))
         {
             continue; // set aside now
+        }
+        if c.kind == Kind::LandPaused && !row.contains_key("paused_since") {
+            continue; // resumed: the Running row's land chore says it
         }
         row.insert(c.kind.field().into(), json!(c.since));
         lines.push(c.line(now));
@@ -457,6 +480,70 @@ mod tests {
         assert_eq!(back.rows[1].worker_nudged_ms, None);
         publish(&dir, "s1", &[worker("a", T0)]).unwrap();
         assert_eq!(deliver(&dir, "s1", T0 + 6 * MIN), None, "told once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn land_paused(key: &str, since: u64) -> Chore {
+        Chore {
+            kind: Kind::LandPaused,
+            ..land(key, since)
+        }
+    }
+
+    /// giverny#379: a paused row whose worker finished is its manager's to
+    /// land or resume, told once past the land grace; one resumed before
+    /// the hook runs is the Running row's land chore to tell, and a finish
+    /// told while Running is not told again once paused.
+    #[test]
+    fn a_paused_rows_finished_worker_reaches_its_manager_once() {
+        let l = land_paused("demo#9", T0);
+        assert!(!l.is_due(T0 + 2 * MIN));
+        assert!(l.is_due(T0 + 3 * MIN));
+        assert_eq!(
+            l.line(T0 + 4 * MIN),
+            "Giverny: `demo#9`'s worker finished 4m ago and its row is paused: \
+             check its report and `giverny-manage land demo#9`, or \
+             `giverny-manage resume demo#9`."
+        );
+        let dir = temp("paused");
+        let f = feed::feed_path(&dir, "s1");
+        manage::write(
+            &f,
+            &doc(json!([
+                {"key": "a", "stage": "running", "started": manage::stamp(T0),
+                 "paused_since": manage::stamp(T0 + MIN)},
+                {"key": "b", "stage": "running", "started": manage::stamp(T0)},
+                {"key": "c", "stage": "running", "started": manage::stamp(T0),
+                 "paused_since": manage::stamp(T0 + MIN), "land_nudged": T0}
+            ])),
+        )
+        .unwrap();
+        let chores = [
+            land_paused("a", T0),
+            land_paused("b", T0),
+            land_paused("c", T0),
+        ];
+        publish(&dir, "s1", &chores).unwrap();
+        let said = deliver(&dir, "s1", T0 + 4 * MIN).unwrap();
+        assert!(
+            said.contains("`a`'s worker finished 4m ago and its row is paused"),
+            "{said}"
+        );
+        assert!(!said.contains("`b`"), "resumed: {said}");
+        assert!(!said.contains("`c`"), "told while Running: {said}");
+        let back = feed::read(&f).unwrap();
+        assert_eq!(back.rows[0].land_nudged_ms, Some(T0));
+        assert_eq!(back.rows[1].land_nudged_ms, None);
+        assert!(chores[0].told(&back.rows[0]) && chores[2].told(&back.rows[2]));
+        publish(&dir, "s1", &chores[..1]).unwrap();
+        assert_eq!(deliver(&dir, "s1", T0 + 5 * MIN), None, "told once");
+        // Resumed, the same finish is Running and told as such, once.
+        publish(&dir, "s1", &[land("b", T0)]).unwrap();
+        assert!(
+            deliver(&dir, "s1", T0 + 5 * MIN)
+                .unwrap()
+                .contains("`b`'s worker finished 5m ago: check its report")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
