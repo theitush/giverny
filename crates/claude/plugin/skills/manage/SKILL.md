@@ -84,8 +84,10 @@ belongs to a project other than the directory you run in.
 A worker's re-estimate is scored too, on its own track: its first `eta` on a
 running task (the one Giverny asks for five minutes in, after it has read the
 code) goes on the pane as given and is later checked against the working
-time that was still to come. The ask, and the `eta` output, tell the worker
-how its kind's re-estimates have fared, for it to weigh in its figure.
+time that was still to come. How its kind's re-estimates have fared reaches
+the worker before its first figure — Giverny puts it in its context on its
+first tool call on the task — and again in each ask and in the `eta`
+output, for it to weigh in its figure.
 
 `giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess and the worker's
@@ -195,9 +197,12 @@ When you spawn one:
   > to the dispatcher, who claims more. End with a short report: what you did,
   > how you checked it, and anything left undone.
 
-  About five minutes into the task, Giverny's plugin puts a request for that
-  re-estimate into the worker's context, once, unless it has re-estimated
-  already. It asks again as each figure runs out: once when five minutes of
+  On the worker's first tool call on a task, Giverny's plugin puts one line
+  into its context, once per task: how its kind's re-estimates have fared
+  (nothing with too little history), to weigh when it re-estimates. It is
+  told, not asked for anything. About five minutes into the task, the plugin
+  puts a request for that re-estimate into the worker's context, once, unless
+  it has re-estimated already. It asks again as each figure runs out: once when five minutes of
   it are left, and once if the work runs past it, unless the worker has just
   re-estimated. Each ask tells the worker how its kind's re-estimates have
   fared; none changes its figure. Its answer is the `eta` command.
