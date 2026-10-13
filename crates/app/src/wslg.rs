@@ -153,11 +153,16 @@ fn parse_desktop_scale(log: &str) -> Option<f32> {
         .map(|pct| pct as f32 / 100.0)
 }
 
-/// The fix for [`slow_mode`], to paste into a PowerShell run as administrator.
-/// Restarting the WSL VM alone keeps the shared memory broken: it is Windows'
-/// side of WSLg that has lost it, and the service restart brings it back
-/// (#312).
-pub const SLOW_MODE_FIX: &str = "wsl --shutdown; Restart-Service wslservice";
+/// The first fix for [`slow_mode`], for any PowerShell or cmd: no
+/// administrator needed. Restarting the WSL VM is often enough to bring the
+/// shared memory back (#372).
+pub const SLOW_MODE_FIX: &str = "wsl --shutdown";
+
+/// The fix for when [`SLOW_MODE_FIX`] was not enough, to paste into a
+/// PowerShell run as administrator. The VM restart alone sometimes keeps the
+/// shared memory broken: it is Windows' side of WSLg that has lost it, and the
+/// service restart brings it back (#312).
+pub const SLOW_MODE_FIX_ADMIN: &str = "wsl --shutdown; Restart-Service wslservice";
 
 /// Whether WSLg started without its shared memory with Windows (#312).
 ///
