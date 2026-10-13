@@ -21,6 +21,11 @@
 //! there is enough history to tell, so later calls read none. A worker handed
 //! its next task is told again, on that row.
 //!
+//! What it is told is how its *instinct* runs (giverny#371), and the factor
+//! told is stamped on the row (`track_x`): its first `eta` keeps it beside
+//! the figure, so the history learns the instinct behind a figure that
+//! already applied it.
+//!
 //! **Near the end.** Each figure is asked about again as it runs out: once
 //! when [`DEADLINE_LEFT_MS`] of it are left (only a figure that had more than
 //! that when it was given — one given that short is asked about only past
@@ -29,7 +34,7 @@
 //! figure is asked about once each way and a fresh one starts over. No ask
 //! within [`QUIET_MS`] of the worker's last re-estimate (`eta_at`) or of the
 //! five-minute ask, nor on a paused row. Every ask tells the worker how its
-//! kind's re-estimates fared; none changes its figure.
+//! instinct on its kind's re-estimates runs; none changes its figure.
 //!
 //! **Heartbeats**. On every call the hook also renews the calling session's
 //! ledger leases — `session_id` is the manager's for its own calls and
@@ -143,13 +148,11 @@ pub fn check(
     if ask.is_some() || !first || row.contains_key("eta_first_s") {
         return ask;
     }
+    let line = tell(row, history)?;
     let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
-    track(row, history).map(|r| {
-        format!(
-            "Giverny: you are on task `{key}`. For calibration, {r}: weigh that in your figure \
-             when you re-estimate."
-        )
-    })
+    Some(format!(
+        "Giverny: you are on task `{key}`. For calibration, {line} when you re-estimate."
+    ))
 }
 
 /// The re-estimate ask due on this worker's Running `row` at `now`, if any:
@@ -167,7 +170,11 @@ fn ask(row: &mut Map<String, Value>, now: u64, history: Option<&Path>) -> Option
             return None;
         }
         row.insert("reestimate_asked".into(), json!(manage::stamp(now)));
-        let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
+        let key = row
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
         let estimate = match manage::u64_of(row, "eta_s") {
             Some(eta) => format!(
                 "Its estimate was {}, so the pane shows about {} left.",
@@ -192,27 +199,34 @@ fn span(s: u64) -> String {
     feed::fmt_span(s as i64)
 }
 
-/// How this kind of re-estimate has fared, so the figure itself improves:
-/// told, never applied. Empty with too little history.
-fn record(row: &Map<String, Value>, history: Option<&Path>) -> String {
-    track(row, history)
-        .map(|r| format!(" For calibration, {r}: weigh that in your figure."))
+/// How the worker's instinct on this kind of re-estimate runs, so the
+/// figure itself improves: told, never applied. Empty with too little
+/// history. Stamps the row with the factor told ([`tell`]).
+fn record(row: &mut Map<String, Value>, history: Option<&Path>) -> String {
+    tell(row, history)
+        .map(|r| format!(" For calibration, {r}."))
         .unwrap_or_default()
 }
 
-/// The row's kind's re-estimate track ([`manage_history::track_record`]),
-/// `None` with too little history.
-fn track(row: &Map<String, Value>, history: Option<&Path>) -> Option<String> {
+/// The row's kind's re-estimate instinct line ([`manage_history::Instinct`]),
+/// `None` with too little history. The factor told is stamped on the row
+/// (`track_x`, the latest one told): the worker's first `eta` keeps it as
+/// the factor it had been shown (giverny#371). The hook replies after the
+/// call it rides on (`PostToolUse`), so a stamp is always one the worker
+/// had read before any later `eta`.
+fn tell(row: &mut Map<String, Value>, history: Option<&Path>) -> Option<String> {
     let s = |k: &str| row.get(k).and_then(Value::as_str);
     let kind = s("title").and_then(manage_history::kind_of);
-    history.map(manage_history::load).and_then(|h| {
-        manage_history::track_record(
+    let told = history.map(manage_history::load).and_then(|h| {
+        manage_history::instinct(
             &h,
             manage_history::Track::Reestimate,
             s("repo"),
             kind.as_deref(),
         )
-    })
+    })?;
+    row.insert("track_x".into(), json!(told.x));
+    Some(told.line())
 }
 
 /// The near-the-end ask on a Running row that is not paused: see the
@@ -260,7 +274,11 @@ fn deadline(
         return None;
     };
     row.insert(stamp.into(), json!(eta));
-    let key = row.get("key").and_then(Value::as_str).unwrap_or("?");
+    let key = row
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
     Some(format!(
         "Giverny: task `{key}` {said} ({} in all, {} so far). Re-estimate it once: run \
          `giverny-manage eta {key} <minutes left> --note \"<why>\"`, even if \
@@ -403,8 +421,8 @@ mod tests {
         let ask = check(&mut d, "w", Some("g#2"), T0 + 5 * MIN, Some(&h)).unwrap();
         assert!(
             ask.contains(
-                "For calibration, your last 5 BUG re-estimates in g took ×2.00 of what you \
-                 said (median): weigh that in your figure."
+                "For calibration, your instinct on BUG in g runs ×2.00 (last 5, median): scale \
+                 your figure by it."
             ),
             "{ask}"
         );
@@ -428,17 +446,18 @@ mod tests {
         let told = check(&mut d, "w", None, T0 + 10_000, Some(&h)).unwrap();
         assert_eq!(
             told,
-            "Giverny: you are on task `g#2`. For calibration, your last 5 BUG re-estimates in \
-             g took ×2.00 of what you said (median): weigh that in your figure when you \
-             re-estimate."
+            "Giverny: you are on task `g#2`. For calibration, your instinct on BUG in g runs \
+             ×2.00 (last 5, median): scale your figure by it when you re-estimate."
         );
+        // The factor told is on the row, for the worker's first `eta`.
+        assert_eq!(d["rows"][0]["track_x"], 2.0);
         assert!(d["rows"][0].get("track_told").is_some());
         assert!(!track_untold(&mut d, "w", None));
         // Told once; the five-minute ask comes as before, track and all.
         assert_eq!(check(&mut d, "w", None, T0 + MIN, Some(&h)), None);
         let ask = check(&mut d, "w", None, T0 + 5 * MIN, Some(&h)).unwrap();
         assert!(ask.contains("Now that you have read the code"), "{ask}");
-        assert!(ask.contains("×2.00 of what you said"), "{ask}");
+        assert!(ask.contains("runs ×2.00 (last 5, median)"), "{ask}");
         // Handed its next task: told again, on the new row.
         d["rows"][0]["stage"] = json!("done");
         d["rows"]
@@ -460,6 +479,7 @@ mod tests {
         let few = h.with_file_name("none.jsonl");
         assert_eq!(check(&mut d, "w", None, T0, Some(&few)), None);
         assert!(d["rows"][0].get("track_told").is_some());
+        assert!(d["rows"][0].get("track_x").is_none(), "no factor told");
         // A worker that has re-estimated already is past needing it.
         let mut d = doc(json!([{"key": "g#4", "stage": "running", "repo": "g",
             "title": "BUG: q", "started": manage::stamp(T0), "agent_id": "w",

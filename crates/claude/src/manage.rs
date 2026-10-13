@@ -59,7 +59,7 @@ usage: giverny manage <command> [args] [--session <id>]
                               until its next eta, and that span is not work;
                               a worker's first eta on a Running row is its
                               re-estimate: taken as given, scored, and told
-                              how past re-estimates fared; --agent moves the
+                              how its instinct runs; --agent moves the
                               row to that worker, as on `start`
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
                               the task landed now (Done)
@@ -73,8 +73,9 @@ usage: giverny manage <command> [args] [--session <id>]
                               first name again keeps it); a full name is kept
                               as given
   show                        print the name and the rows
-  accuracy [--repo R]         how every estimator's figures fared against the
-                              time really worked, older tasks against recent
+  accuracy [--repo R]         how every estimator's instinct and figures fared
+                              against the time really worked, older tasks
+                              against recent
   path                        print the feed file's path
   clear-done                  clear the Done rows: from this session's feed,
                               and from the management panel of the Giverny tab it runs in
@@ -113,9 +114,10 @@ Estimates are told, never corrected: the pane counts down from the figure
 given. Every landed task appends its estimate, wall time
 and working time (wall minus pauses and waits) to history.jsonl beside the feeds
 ($GIVERNY_MANAGE_HISTORY overrides; empty turns it off). `plan`/`start --eta N`
-print how such guesses have fared: the median working-time/estimate ratio of
-the last 20 tasks of the same kind (repo + the title's type word, as `BUG:`),
-else the repo, else all. A worker's first `eta` on a running task (its
+print how your instinct on such guesses runs: the median of working time ÷
+the figure before the factor you had been shown, over the last 20 tasks of
+the same kind (repo + the title's type word, as `BUG:`), else the repo, else
+all; scale your figure by it. A worker's first `eta` on a running task (its
 re-estimate, made after reading the code) is scored and told the same way,
 against the working time that was still to come. `accuracy` shows each track. The plugin's
 hook (`giverny hook`) asks a worker to re-estimate five minutes into its task.
@@ -207,6 +209,14 @@ pub struct Flags {
     /// The Claude config dir to read spawn descriptions from: tests set it;
     /// else `$CLAUDE_CONFIG_DIR`, `$GIVERNY_PROFILE_DIR`, `~/.claude`.
     pub claude_dir: Option<PathBuf>,
+    /// Set by [`tell_record`], not parsed: the factor the giver of this
+    /// command's guess had been shown for its track (giverny#371), kept on
+    /// the row as `eta_told_x`. `None` is ×1.
+    pub told_x: Option<f64>,
+    /// Set by [`tell_record`], not parsed: the level of the instinct line
+    /// this command prints for its guess, kept on the row as `guess_level`
+    /// so a later figure of the session knows its giver has seen that line.
+    pub guess_level: Option<String>,
 }
 
 impl Flags {
@@ -529,6 +539,16 @@ fn drop_old_guess(row: &mut Map<String, Value>, f: &Flags) {
     if f.eta_s.is_some() {
         row.remove("eta_guess_s");
         row.remove("eta_basis");
+    }
+}
+
+/// A new guess on a row keeps the factor its giver had been shown
+/// (`eta_told_x`, giverny#371) and the level of the instinct line printed
+/// with it (`guess_level`). Called only where the command gave a figure.
+fn told_guess(row: &mut Map<String, Value>, f: &Flags) {
+    row.insert("eta_told_x".into(), json!(f.told_x.unwrap_or(1.0)));
+    if let Some(level) = &f.guess_level {
+        row.insert("guess_level".into(), json!(level));
     }
 }
 
@@ -1184,6 +1204,7 @@ pub fn apply(
                 _ => {}
             }
             row.insert("eta_s".into(), json!(f.eta_s.unwrap_or(0)));
+            told_guess(row, f);
             drop_old_guess(row, f);
             set_str(row, "title", &f.title);
             set_str(row, "note", &f.note);
@@ -1217,6 +1238,7 @@ pub fn apply(
                     "wait_s",
                     "reestimate_asked",
                     "track_told",
+                    "track_x",
                     "eta_at",
                     "deadline_asked",
                     "overdue_asked",
@@ -1234,6 +1256,7 @@ pub fn apply(
                 // When the figure was given: the hook's near-the-end ask
                 // leaves a fresh one alone a while.
                 row.insert("eta_at".into(), json!(stamp(now)));
+                told_guess(row, f);
             }
             drop_old_guess(row, f);
             set_str(row, "repo", &f.repo);
@@ -1290,6 +1313,14 @@ pub fn apply(
                 // when it was made in working time, to be scored at landing.
                 row.insert("reest_s".into(), json!(left));
                 row.insert("reest_at_s".into(), json!(worked_s(row, now, sleeps)));
+                // With the factor the hook had told the worker before this
+                // call, if any (giverny#371): its instinct is the figure ÷ it.
+                let shown = row.get("track_x").and_then(Value::as_f64).unwrap_or(1.0);
+                row.insert("reest_told_x".into(), json!(shown));
+            }
+            if stage == Some(feed::Stage::Planned) {
+                // A dispatcher's new guess on a row not started yet.
+                row.insert("eta_told_x".into(), json!(f.told_x.unwrap_or(1.0)));
             }
             let eta = match stage {
                 Some(feed::Stage::Running) => {
@@ -2234,32 +2265,47 @@ fn no_brief(key: &str) -> String {
 }
 
 /// `plan`/`start` with `--eta N`, and a worker's first `eta` on a Running
-/// row (its re-estimate): how such estimates have fared, from the history,
-/// told and never applied — the figure given is the figure stored and shown.
-/// Also fills in the repo the row will remember. Returns what to add to the
-/// command's line, or `None` for a command with no estimate.
+/// row (its re-estimate): how the giver's instinct on such estimates runs,
+/// from the history, told and never applied — the figure given is the figure
+/// stored and shown. Also fills in the repo the row will remember, and for a
+/// guess the factor its giver had been shown ([`Flags::told_x`]) and the
+/// level of the line printed now ([`Flags::guess_level`]). Returns what to
+/// add to the command's line, or `None` for a command that prints none.
+///
+/// **What the dispatcher had been shown** (giverny#371). The line `plan`
+/// and `start` print comes after the figure, so a figure was given under
+/// the line only when this manager session printed the same line before —
+/// on an earlier `plan`/`start --eta` of a row whose guess was told at the
+/// same level (same repo and kind, same repo, or all). Then the factor
+/// counted as shown is the one in effect now, which is what that line
+/// would say today; otherwise ×1. A worker's factor is the hook's stamp
+/// on its row ([`apply`] reads it).
 fn tell_record(
     doc: &Value,
     cmd: &Cmd,
     flags: &mut Flags,
     history: Option<&Path>,
 ) -> Option<String> {
+    let rows = doc.get("rows").and_then(Value::as_array);
     let (key, track, given) = match cmd {
         Cmd::Plan(key) | Cmd::Start(key) => (key, manage_history::Track::Guess, flags.eta_s?),
         Cmd::Eta(key, left) => (key, manage_history::Track::Reestimate, *left),
         _ => return None,
     };
-    let row = doc
-        .get("rows")
-        .and_then(Value::as_array)
+    let row = rows
         .and_then(|rows| find(rows, key).map(|i| &rows[i]))
         .and_then(Value::as_object);
+    // A dispatcher's `eta` on a row not started yet is a new guess: its
+    // factor is kept, its line not printed.
+    let planned_eta = track == manage_history::Track::Reestimate
+        && row.is_some_and(|r| stage_of(r) == Some(feed::Stage::Planned));
     if track == manage_history::Track::Reestimate
+        && !planned_eta
         && !row.is_some_and(|r| {
             stage_of(r) == Some(feed::Stage::Running) && !r.contains_key("reest_s")
         })
     {
-        // Not a first re-estimate: a later one, or a plan's, is not scored.
+        // Not a first re-estimate: a later one is not scored.
         return None;
     }
     let row_str = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
@@ -2273,15 +2319,29 @@ fn tell_record(
     let kind = manage_history::kind_of(title);
     let past = history.map(manage_history::load).unwrap_or_default();
     let (repo, kind) = (flags.repo.as_deref(), kind.as_deref());
-    let record = manage_history::track_record(&past, track, repo, kind);
-    if track == manage_history::Track::Reestimate {
-        return record.map(|r| format!("\n  {r}"));
+    if track == manage_history::Track::Reestimate && !planned_eta {
+        return manage_history::track_record(&past, track, repo, kind).map(|r| format!("\n  {r}"));
     }
-    let told = record.unwrap_or_else(|| {
+    let told = manage_history::instinct(&past, manage_history::Track::Guess, repo, kind);
+    let seen = |level: &str| {
+        rows.into_iter()
+            .flatten()
+            .any(|r| r.get("guess_level").and_then(Value::as_str) == Some(level))
+    };
+    flags.told_x = Some(
+        told.as_ref()
+            .filter(|t| seen(&t.level))
+            .map_or(1.0, |t| t.x),
+    );
+    if planned_eta {
+        return None;
+    }
+    flags.guess_level = told.as_ref().map(|t| t.level.clone());
+    let line = told.map(|t| t.line()).unwrap_or_else(|| {
         let n = past.len();
-        format!("too few landed tasks to tell how such guesses fare ({n} in the history)")
+        format!("too few landed tasks to tell how your instinct on such guesses runs ({n} in the history)")
     });
-    Some(format!(": ~{}\n  {told}", feed::fmt_span(given as i64)))
+    Some(format!(": ~{}\n  {line}", feed::fmt_span(given as i64)))
 }
 
 /// `accuracy`: the history's report.
@@ -2357,7 +2417,11 @@ pub fn record_of(
             .or_else(|| u64_of(r, "eta_s")),
         eta_s: u64_of(r, "eta_first_s").or_else(|| u64_of(r, "eta_s")),
         eta_final_s: u64_of(r, "eta_s"),
+        // The factors shown with the guess and the re-estimate (giverny#371);
+        // a row from before has none, which counts as ×1.
+        told_x: r.get("eta_told_x").and_then(Value::as_f64),
         reest_s: u64_of(r, "reest_s"),
+        reest_told_x: r.get("reest_told_x").and_then(Value::as_f64),
         reest_at_s: u64_of(r, "reest_at_s"),
         wall_s,
         paused_s,
@@ -2682,19 +2746,25 @@ mod tests {
         }
         let said = run(&dir, "plan demo#9 --eta 50 --title FEATURE:x", T0).unwrap();
         assert!(
-            said.contains("your last 5 FEATURE guesses in demo took ×0.40"),
+            said.contains("your instinct on FEATURE in demo runs ×0.40"),
             "{said}"
         );
         run(&dir, "start demo#9", T0).unwrap();
+        // The hook told the worker its re-estimate track on an earlier call
+        // (giverny#371): the factor is on the row.
+        let file = feed::feed_path(&dir, "s1");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        doc["rows"][0]["track_x"] = json!(1.5);
+        std::fs::write(&file, serde_json::to_vec(&doc).unwrap()).unwrap();
         // Paused two minutes: not working time.
         run(&dir, "pause demo#9", T0 + MIN).unwrap();
         run(&dir, "resume demo#9", T0 + 3 * MIN).unwrap();
-        // Told how such re-estimates fared, but the figure stands.
+        // Told how its instinct on such re-estimates runs; the figure stands.
         let said = run(&dir, "eta demo#9 10", T0 + 6 * MIN).unwrap();
         assert_eq!(
             said,
-            "demo#9: ~10m left\n  your last 5 FEATURE re-estimates in demo took \
-             ×1.50 of what you said (median)"
+            "demo#9: ~10m left\n  your instinct on FEATURE in demo runs ×1.50 (last 5, \
+             median): scale your figure by it"
         );
         let row = |k: &str| {
             let doc: Value =
@@ -2703,6 +2773,11 @@ mod tests {
             doc["rows"][0][k].clone()
         };
         assert_eq!(row("reest_s"), 600, "kept as given");
+        assert_eq!(
+            row("reest_told_x"),
+            1.5,
+            "with the factor the worker had been told"
+        );
         assert_eq!(row("reest_at_s"), 4 * 60, "four minutes worked");
         assert_eq!(row("eta_s"), 4 * 60 + 600, "not corrected");
         assert_eq!(
@@ -2720,6 +2795,9 @@ mod tests {
         let last = manage_history::load(&h).pop().unwrap();
         assert_eq!(last.reest_s, Some(600));
         assert_eq!(last.reest_at_s, Some(240));
+        assert_eq!(last.reest_told_x, Some(1.5));
+        // The guess was the session's first under its line: nothing shown.
+        assert_eq!(last.told_x, Some(1.0));
         assert_eq!(last.work_s, 28 * 60);
         // `accuracy` reads the same history.
         let out = run(&dir, "accuracy --repo demo", T0).unwrap();
@@ -3045,7 +3123,7 @@ mod tests {
             said.lines().take(2).collect::<Vec<_>>(),
             [
                 "planned demo#1: ~40m",
-                "  your last 5 BUG guesses in demo took ×0.50 of what you said (median)"
+                "  your instinct on BUG in demo runs ×0.50 (last 5, median): scale your figure by it"
             ]
         );
         let doc: Value =
@@ -3063,14 +3141,16 @@ mod tests {
         let said = run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
         assert!(said.starts_with("started demo#2: ~40m\n"), "{said}");
         assert!(
-            said.contains("your last 5 FEATURE guesses in demo took ×0.25"),
+            said.contains(
+                "your instinct on FEATURE in demo runs ×0.25 (last 5, median): scale your figure by it"
+            ),
             "{said}"
         );
 
         // Another repo: everything (0.25 ×5, 0.5 ×5 → 0.375).
         let said = run(&dir, "plan acme#3 --eta 40", T0).unwrap();
         assert!(
-            said.contains("your last 10 guesses took ×0.38 of what you said (median)"),
+            said.contains("your instinct runs ×0.38 (last 10, median): scale your figure by it"),
             "{said}"
         );
 
@@ -3093,8 +3173,8 @@ mod tests {
         let said = run(&empty, "plan a --eta 40", T0).unwrap();
         assert!(
             said.starts_with(
-                "planned a: ~40m\n  too few landed tasks to tell how such guesses fare \
-                 (0 in the history)"
+                "planned a: ~40m\n  too few landed tasks to tell how your instinct on such \
+                 guesses runs (0 in the history)"
             ),
             "{said}"
         );
@@ -3102,6 +3182,59 @@ mod tests {
         assert_eq!(r.eta_s, Some(2400));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// giverny#371: a guess keeps the factor its dispatcher had been shown:
+    /// the line `plan` prints comes after the figure, so a figure counts as
+    /// given under it only once this session printed the same line before.
+    #[test]
+    fn a_guess_keeps_the_factor_its_giver_had_been_shown() {
+        let dir = scratch("told-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = dir.join(manage_history::FILE);
+        // Five demo BUGs whose instinct ran ×0.5.
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
+                key: "x".into(),
+                repo: Some("demo".into()),
+                kind: Some("BUG".into()),
+                estimate_s: Some(1800),
+                wall_s: 900,
+                work_s: 900,
+                outcome: Some("Done".into()),
+                ..Default::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        let file = feed::feed_path(&dir, "s1");
+        let row = |key: &str, k: &str| {
+            let doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let rows = doc["rows"].as_array().unwrap().clone();
+            rows.into_iter().find(|r| r["key"] == key).unwrap()[k].clone()
+        };
+        // The session's first BUG guess: given before the line, ×1.
+        run(&dir, "plan demo#1 --eta 40 --title BUG:a", T0).unwrap();
+        assert_eq!(row("demo#1", "eta_told_x"), 1.0);
+        assert_eq!(row("demo#1", "guess_level"), " on BUG in demo");
+        // The next one was given after it: ×0.5, as is a re-plan of the first.
+        run(&dir, "plan demo#2 --eta 20 --title BUG:b", T0).unwrap();
+        assert_eq!(row("demo#2", "eta_told_x"), 0.5);
+        run(&dir, "start demo#1 --eta 20", T0).unwrap();
+        assert_eq!(row("demo#1", "eta_told_x"), 0.5);
+        // Another line (no FEATURE history: the repo's) not seen yet: ×1.
+        run(&dir, "plan demo#3 --eta 40 --title FEATURE:c", T0).unwrap();
+        assert_eq!(row("demo#3", "eta_told_x"), 1.0);
+        assert_eq!(row("demo#3", "guess_level"), " in demo");
+        // A dispatcher's `eta` on a row not started is a new guess, seen.
+        run(&dir, "eta demo#3 30", T0).unwrap();
+        assert_eq!(row("demo#3", "eta_told_x"), 0.5);
+        // Landed, the record carries it, and the instinct is learned from it:
+        // said 20m under ×0.5, the gut said 40m; took 10m: ×0.25.
+        run(&dir, "land demo#1", T0 + 10 * MIN).unwrap();
+        let last = manage_history::load(&h).pop().unwrap();
+        assert_eq!((last.estimate_s, last.told_x), (Some(1200), Some(0.5)));
+        assert_eq!(manage_history::Track::Guess.ratio(&last), Some(0.25));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

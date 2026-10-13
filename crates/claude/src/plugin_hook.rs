@@ -22,8 +22,8 @@
 //!   minutes left, then past it): on its manager task's row when it
 //!   holds one ([`manage_nudge::check`]), else on its agent ETA
 //!   ([`agent_eta::worker_ask`], [`agent_eta::deadline_ask`]). A task
-//!   worker's first call on its row also tells it how its kind's
-//!   re-estimates have fared, before it gives a figure (giverny#366). A worker
+//!   worker's first call on its row also tells it how its instinct on its
+//!   kind's re-estimates runs, before it gives a figure (giverny#366, #371). A worker
 //!   spawned in the foreground blocks its dispatcher until it is done, so
 //!   only the worker's asks reach it.
 //! - **A manager session's upkeep.** Its leases are renewed
