@@ -3613,8 +3613,15 @@ impl App {
     }
 
     /// The user looked at tab `id`: its done-markers clear, Claude's tick and
-    /// the unseen-finish badge alike (giverny#388).
+    /// the unseen-finish badge alike (giverny#388). A look at a tab that wore
+    /// the tick flashes its management panel's rows that landed since the
+    /// last one (giverny#394).
     fn mark_seen(&mut self, id: TabId) {
+        let ticked = self.unseen_done.contains(&id)
+            || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
+        if ticked {
+            self.agent_views.flash_new_done(id);
+        }
         self.claude.mark_viewed(id);
         self.unseen_done.remove(&id);
     }
