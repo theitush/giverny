@@ -60,8 +60,10 @@ giverny-manage plan docs-api --eta 15 --title "Document the new endpoints" --bri
 giverny-manage plan auth-tests --eta 10 --title "Test the refresh race" --after auth-fix --brief briefs/auth-tests.md
 ```
 
-Keep the briefs somewhere that outlives the manager session (a scratch directory is
-fine); a relative path is stored absolute. If the prompt changes before the
+Keep the briefs somewhere that outlives the manager session and the machine: a
+folder inside the project that git ignores (`.claude/briefs/`, say), not a scratch
+directory under `/tmp`, which a WSL restart or a reboot wipes. A relative path is
+stored absolute. If the prompt changes before the
 spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
 Each `plan` (and `start --eta`) prints the figure the pane will count down

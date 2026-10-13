@@ -45,6 +45,14 @@
 //!   manage skill marks it a manager ([`crate::managers`], giverny#357), as
 //!   does the person typing `/giverny:manage` (the prompt hook): what lets
 //!   its pane open before any worker, and draw its Next up.
+//! - **What happened while it was away.** A session's next call after a
+//!   reboot, a restart of its `claude`, a sleep or a long absence tells it
+//!   once, in one short paragraph, what that took: its processes, `/tmp`,
+//!   its connections and clocks, or only the person's patience to trust
+//!   the last picture — and, for a manager, the Running rows whose workers
+//!   went ([`crate::away`], giverny#373). On its start, its prompt or its
+//!   own tool call, every session, in a tab or not; a subagent's call only
+//!   keeps the record and passes what it saw to its parent.
 //!
 //! **Only where something tracks the worker.** Every ask is for the pane:
 //! it goes out only when the session runs in a Giverny tab
@@ -54,10 +62,10 @@
 //! reads would raise a permission prompt for it.
 //!
 //! **Cheap when idle.** A call that is not a spawn and not a worker's costs a
-//! few `stat`s and reads no file; a worker's call before its five minutes, a
-//! `stat` of its spawn metadata, and after them a read of its small agent-ETA
-//! file. A `SubagentStop` with no background command in flight reads no
-//! file either. Whatever happens the hook exits 0, so it
+//! few `stat`s, the clocks and the session's small away record; a worker's
+//! call before its five minutes, a `stat` of its spawn metadata, and after
+//! them a read of its small agent-ETA file. A `SubagentStop` with no
+//! background command in flight reads no file either. Whatever happens the hook exits 0, so it
 //! never fails the tool call it rides on.
 
 use std::path::{Path, PathBuf};
@@ -67,7 +75,7 @@ use serde_json::{Map, Value, json};
 
 use crate::manage::{self, Lock};
 use crate::manage_nudge::{beat, check, holds_row, stamp_agent, track_untold};
-use crate::{agent_eta, manage_chores, manage_history, manage_inbox, resources};
+use crate::{agent_eta, away, manage_chores, manage_history, manage_inbox, resources};
 
 /// What the hook payload says about who is calling.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -229,6 +237,18 @@ fn manager_doc(dir: &Path, session: &str) -> Result<Option<(PathBuf, Value)>, ()
 /// feed directory, `in_tab` whether the session runs in a Giverny tab
 /// ([`in_giverny_tab`]). Returns what to print (the hook reply), or nothing.
 pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
+    run_with(payload, dir, now, in_tab, None)
+}
+
+/// [`run`], with what happened while the session was away ([`crate::away`])
+/// told first on the dispatcher's own call.
+pub fn run_with(
+    payload: &Value,
+    dir: &Path,
+    now: u64,
+    in_tab: bool,
+    away: Option<String>,
+) -> Option<String> {
     let session = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -248,6 +268,7 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
     // worker it just started, and the commands a finished subagent left
     // running (giverny#370).
     let asks: Vec<String> = [
+        away,
         manage_inbox::deliver(dir, &ledger, session, now),
         manage_chores::deliver(dir, session, now),
         spawned(payload, dir, session, in_tab),
@@ -385,13 +406,20 @@ fn session_of(input: &str) -> Option<String> {
 /// The `UserPromptSubmit` reply carrying every context given, one paragraph
 /// each: a prompt can both ask to manage ([`crate::manage_trigger`]) and be
 /// the first its session's name ask rides on ([`crate::names::first_prompt`]),
-/// and bring what a finished subagent left running ([`crate::leftovers`]).
+/// and bring what a finished subagent left running ([`crate::leftovers`])
+/// and what happened while the session was away ([`crate::away`]).
 fn prompt_reply(contexts: &[Option<&str>]) -> Option<String> {
+    context_reply("UserPromptSubmit", contexts)
+}
+
+/// `event`'s reply carrying every context given, one paragraph each, or
+/// nothing when none is.
+fn context_reply(event: &str, contexts: &[Option<&str>]) -> Option<String> {
     let all: Vec<&str> = contexts.iter().flatten().copied().collect();
     (!all.is_empty()).then(|| {
         json!({
             "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
+                "hookEventName": event,
                 "additionalContext": all.join("\n\n")
             }
         })
@@ -433,8 +461,16 @@ pub fn main() -> i32 {
             .then_some(crate::manage_trigger::CONTEXT);
         // What a finished subagent left running, if its parent has not
         // heard yet (giverny#370).
-        let left = session_of(&input).and_then(|s| crate::leftovers::deliver(&feeds, &s));
-        if let Some(out) = prompt_reply(&[manage, name.as_deref(), left.as_deref()]) {
+        let session = session_of(&input);
+        let left = session
+            .as_deref()
+            .and_then(|s| crate::leftovers::deliver(&feeds, s));
+        // What happened since its last turn, first (giverny#373).
+        let away = session
+            .as_deref()
+            .and_then(|s| away::on_call(&feeds, s, manage::now_ms(), away::Call::Prompt));
+        let contexts = [away.as_deref(), manage, name.as_deref(), left.as_deref()];
+        if let Some(out) = prompt_reply(&contexts) {
             println!("{out}");
         }
         return 0;
@@ -442,7 +478,12 @@ pub fn main() -> i32 {
     if let Some(start) = crate::names::start_payload(&input) {
         let feeds = crate::feed::feed_dir();
         let on = crate::names::is_on(&feeds);
-        if let Some(out) = crate::names::session_start(&start, &feeds, on, on && tabs_own()) {
+        let name = crate::names::start_context(&start, &feeds, on, on && tabs_own());
+        // A resume after a reboot or a relaunch hears of it here (giverny#373).
+        let away = text(&start, "session_id")
+            .filter(|_| start.get("agent_id").is_none())
+            .and_then(|s| away::on_call(&feeds, &s, manage::now_ms(), away::Call::Start));
+        if let Some(out) = context_reply("SessionStart", &[away.as_deref(), name.as_deref()]) {
             println!("{out}");
         }
         return 0;
@@ -462,15 +503,20 @@ pub fn main() -> i32 {
         }
         return 0;
     }
-    if let Some(payload) = payload_of(&input)
-        && let Some(out) = run(
-            &payload,
-            &crate::feed::feed_dir(),
-            manage::now_ms(),
-            in_giverny_tab(),
-        )
-    {
-        println!("{out}");
+    if let Some(payload) = payload_of(&input) {
+        let feeds = crate::feed::feed_dir();
+        let now = manage::now_ms();
+        // A subagent's call keeps its session's record and queues what it
+        // saw for the parent; the parent's is told (giverny#373).
+        let call = if payload.get("agent_id").is_some() {
+            away::Call::Subagent
+        } else {
+            away::Call::Tool
+        };
+        let away = text(&payload, "session_id").and_then(|s| away::on_call(&feeds, &s, now, call));
+        if let Some(out) = run_with(&payload, &feeds, now, in_giverny_tab(), away) {
+            println!("{out}");
+        }
     }
     0
 }
@@ -798,6 +844,24 @@ mod tests {
              running in the background (task bgej3bpqh)."
         );
         assert_eq!(run(&me, &dir, T0 + 2 * MIN, false), None, "told once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#373: what happened while the session was away goes first
+    /// in the dispatcher's reply, beside whatever else it is told.
+    #[test]
+    fn the_away_note_leads_the_dispatchers_reply() {
+        let dir = temp("away");
+        let me = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Read"});
+        let away = Some("Giverny: the computer slept.".to_string());
+        assert_eq!(
+            context(&run_with(&me, &dir, T0, false, away.clone()).unwrap()),
+            "Giverny: the computer slept."
+        );
+        let spawn = payload_of(&spawn_input("s1", "a1", "Classify chunk 0", true)).unwrap();
+        let ctx = context(&run_with(&spawn, &dir, T0, true, away).unwrap());
+        assert!(ctx.starts_with("Giverny: the computer slept.\n\n"), "{ctx}");
+        assert!(ctx.contains("giverny-eta a1"), "{ctx}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

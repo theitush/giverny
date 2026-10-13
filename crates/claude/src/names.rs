@@ -872,26 +872,33 @@ fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
     ask(name.as_deref())
 }
 
-/// The `SessionStart` hook's reply: [`ask`] as `additionalContext`, only with
-/// the switch `on`, only for a top-level session (`in_tab`: a Giverny tab's
-/// own, not a background job's or a nested claude's), never a subagent's.
-/// Every start asks again (a `/clear` is a new session; a resume or a
-/// compaction is told its name), and is marked so the prompt hook stays
-/// quiet ([`first_prompt`]).
+/// The `SessionStart` hook's reply: [`start_context`] as
+/// `additionalContext`.
 pub fn session_start(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
-    if !on || !in_tab || payload.get("agent_id").is_some() {
-        return None;
-    }
-    let session = session_of(payload)?;
+    let context = start_context(payload, feeds, on, in_tab)?;
     Some(
         json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": tell(payload, feeds, session)
+                "additionalContext": context
             }
         })
         .to_string(),
     )
+}
+
+/// What a session start is told: [`ask`], only with the switch `on`, only
+/// for a top-level session (`in_tab`: a Giverny tab's own, not a background
+/// job's or a nested claude's), never a subagent's. Every start asks again
+/// (a `/clear` is a new session; a resume or a compaction is told its
+/// name), and is marked so the prompt hook stays quiet ([`first_prompt`]).
+/// The text alone, for a hook reply that carries more (giverny#373).
+pub fn start_context(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
+    if !on || !in_tab || payload.get("agent_id").is_some() {
+        return None;
+    }
+    let session = session_of(payload)?;
+    Some(tell(payload, feeds, session))
 }
 
 /// The ask a `UserPromptSubmit` carries when the session's start did not:
