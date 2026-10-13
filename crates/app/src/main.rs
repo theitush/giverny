@@ -16,6 +16,7 @@ mod taskbar;
 mod titlebar;
 mod translucency;
 mod update;
+mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -570,6 +571,11 @@ fn main() -> eframe::Result {
         )
         .init();
 
+    #[cfg(unix)]
+    if defer_to_running() {
+        return Ok(());
+    }
+
     if oom::at_risk() {
         tracing::warn!(
             "this scope stops on an OOM kill: one tab's process being killed \
@@ -738,6 +744,98 @@ fn main() -> eframe::Result {
         }
     }
     result
+}
+
+/// When, after a second launch asked, this window asks to come forward,
+/// counted from the request: for as long as it is not yet focused, and
+/// covering the seconds WSLg takes to bring its windows back on Windows' side.
+#[cfg(unix)]
+const COME_FORWARD_AT: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_secs(3),
+    Duration::from_secs(6),
+];
+
+/// One second launch's request to come forward, in progress.
+#[cfg(unix)]
+struct ComingForward {
+    since: Instant,
+    next: Instant,
+    /// How many of [`COME_FORWARD_AT`] have been sent.
+    asked: usize,
+    /// Unmapped to be mapped again, and the inner corner to put it back at.
+    unmapped: Option<Option<egui::Pos2>>,
+    /// Mapped again, and still to be put back here.
+    move_to: Option<egui::Pos2>,
+}
+
+#[cfg(unix)]
+impl ComingForward {
+    fn new() -> Self {
+        let now = Instant::now();
+        ComingForward {
+            since: now,
+            next: now,
+            asked: 0,
+            unmapped: None,
+            move_to: None,
+        }
+    }
+}
+
+/// Set to open a second window although a Giverny is running. That window
+/// gets no hook events (the running one has the relay); a window of its own
+/// wants its own `XDG_RUNTIME_DIR` instead.
+#[cfg(unix)]
+const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
+
+/// One Giverny per relay socket: when one is already running, ask it to
+/// come to the front instead of opening a second window that would get none
+/// of the hooks. Returns whether this launch should end here.
+///
+/// A test instance with its own `XDG_RUNTIME_DIR` has its own socket, and is
+/// never the same Giverny as the one the user runs.
+#[cfg(unix)]
+fn defer_to_running() -> bool {
+    use giverny_claude::hooks::{self, Running};
+    if std::env::var_os(SECOND_WINDOW_ENV).is_some() {
+        tracing::info!("{SECOND_WINDOW_ENV} is set: opening a window whatever else runs");
+        return false;
+    }
+    match hooks::ask_running_to_raise(Duration::from_secs(4)) {
+        Running::Nobody => false,
+        Running::Raised { pid } => {
+            let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            tracing::info!("Giverny is already running{pid}; it was asked to the front");
+            eprintln!("giverny: already running{pid} — brought its window to the front");
+            true
+        }
+        Running::Silent(holder) => {
+            tracing::warn!(
+                "{holder} holds the relay at {} but did not answer (hung, or older \
+                 than this build); opening a window anyway",
+                hooks::socket_path().display()
+            );
+            false
+        }
+    }
+}
+
+/// Does this window come to the front only by being mapped again? An X11
+/// window on WSLg: its Weston does nothing with `_NET_ACTIVE_WINDOW`. X11 is the
+/// default there, chosen by taking `WAYLAND_DISPLAY` away before it opens.
+#[cfg(unix)]
+fn raises_by_remap() -> bool {
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    {
+        wslg::is_wslg() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(any(target_os = "macos", target_os = "android"))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,6 +1061,14 @@ pub struct App {
     /// A Ctrl+Tab walk in progress: where it started, the recency order it
     /// snapshotted, and how far into it the user has stepped.
     switcher: Option<Switcher>,
+    /// A Ctrl+PageUp/PageDown walk in progress: Ctrl has been held since the
+    /// last press. Like `switcher`, it keeps a tab the walk passes over from
+    /// starting until Ctrl comes up; unlike it, it records nothing, since
+    /// rail-order cycling commits each step as it goes.
+    cycling: bool,
+    /// What the not-started tab a walk is on shows meanwhile: its saved
+    /// scrollback, read once when the walk reaches it.
+    walk_preview: Option<walk::Preview>,
     /// Wayland file drops, which winit 0.30 cannot deliver.
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     dnd: Option<wayland_dnd::DragDrop>,
@@ -985,6 +1091,12 @@ pub struct App {
     /// How many tabs wanted you at the last frame, so the taskbar is only
     /// told when that changes.
     attention: usize,
+    /// Coming to the front for a second launch, still (`come_forward`).
+    #[cfg(unix)]
+    coming_forward: Option<ComingForward>,
+    /// An X11 window on WSLg, which comes to the front only as a new window.
+    #[cfg(unix)]
+    raise_by_remap: bool,
     /// The window has no decorations and draws its own caption (#69).
     frameless: bool,
     /// The window was opened see-through and can show it, so
@@ -1453,11 +1565,17 @@ impl App {
             dragging: None,
             dragging_category: None,
             switcher: None,
+            cycling: false,
+            walk_preview: None,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
             row_rects: Vec::new(),
             attention: 0,
+            #[cfg(unix)]
+            coming_forward: None,
+            #[cfg(unix)]
+            raise_by_remap: raises_by_remap(),
             frameless,
             see_through,
             maximize,
@@ -1666,6 +1784,8 @@ impl App {
             Action::SwitchRecent(delta) => self.switch_recent(delta),
             Action::Cycle(delta) => {
                 self.end_switch();
+                // Held until Ctrl comes up, which the end of `update` sees.
+                self.cycling = true;
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
@@ -2311,6 +2431,103 @@ impl App {
         ));
         self.pending_inject
             .push((Instant::now() + Duration::from_secs(9), id, wake(CONTINUE)));
+    }
+
+    /// Come to the front for a second launch of Giverny, which asked over the
+    /// relay socket ([`giverny_claude::hooks::ask_running_to_raise`]) and
+    /// exits once this answers.
+    ///
+    /// The answer is written here, on the UI thread, so that an answer means a
+    /// window that is alive. Then the window asks to come forward, again a
+    /// few times over several seconds while it is not focused: the launch that
+    /// asked is often the thing that brings WSLg's link to Windows back, and
+    /// a window raised before that link is up is raised where nobody sees it.
+    /// What the desktop does with the request is its own call (focus-stealing
+    /// rules); one that will not hand over the focus is asked at the end to
+    /// mark the window instead.
+    #[cfg(unix)]
+    fn come_forward(&mut self, ctx: &egui::Context) {
+        for mut asker in self.claude.raise_requests() {
+            use std::io::Write;
+            let _ = asker.set_write_timeout(Some(Duration::from_millis(500)));
+            // A launch that waited longer than it would has given up and
+            // opened its own window: this one jumping in front of that, late,
+            // helps nobody.
+            if asker
+                .write_all(giverny_claude::hooks::raise_reply().as_bytes())
+                .is_err()
+            {
+                tracing::info!("a launch asked this window forward, and gave up waiting");
+                continue;
+            }
+            tracing::info!("another launch of Giverny asked this window to come forward");
+            self.coming_forward = Some(ComingForward::new());
+        }
+        let Some(forward) = &mut self.coming_forward else {
+            return;
+        };
+        let now = Instant::now();
+        if now < forward.next {
+            ctx.request_repaint_after(forward.next - now);
+            return;
+        }
+        let soon = |forward: &mut ComingForward, after: Duration| {
+            forward.next = now + after;
+            ctx.request_repaint_after(after);
+        };
+        // The second half of a remap (below): shown again, then back where
+        // it was, once it is shown.
+        if let Some(corner) = forward.unmapped.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            forward.move_to = corner;
+            forward.asked += 1;
+            soon(forward, Duration::from_millis(200));
+            return;
+        }
+        if let Some(corner) = forward.move_to.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(corner));
+        }
+        let focused = ctx.input(|i| i.focused);
+        if forward.asked > 0 && (focused || forward.asked >= COME_FORWARD_AT.len()) {
+            if !focused {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+            }
+            self.coming_forward = None;
+            return;
+        }
+        if self.raise_by_remap {
+            // WSLg's Weston ignores `_NET_ACTIVE_WINDOW`, so on WSLg asking is
+            // not enough: the window is unmapped and mapped again, which is a
+            // new window to Windows, and comes to the front as a new window
+            // would. Weston maps it a frame's width up and to the left of
+            // where it was, so it is put back by its inner corner, which is
+            // what WSLg takes a move to mean (see `titlebar::Maximize::place`).
+            // A window the window manager maximised keeps its own place.
+            let (corner, maximized) = ctx.input(|i| {
+                let vp = i.viewport();
+                (vp.inner_rect.map(|r| r.min), vp.maximized.unwrap_or(false))
+            });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            forward.unmapped = Some(corner.filter(|_| !maximized));
+            soon(forward, Duration::from_millis(150));
+            return;
+        }
+        // Shown, out of the taskbar, then on top with the focus. On X11 the
+        // last two are both `_NET_ACTIVE_WINDOW`; on Wayland, an activation
+        // the compositor may refuse.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        forward.asked += 1;
+        let at = forward.since
+            + COME_FORWARD_AT
+                .get(forward.asked)
+                .copied()
+                .unwrap_or_default();
+        soon(forward, at.saturating_duration_since(now));
     }
 
     /// Say outside the window what the rail says inside it.
@@ -3163,9 +3380,20 @@ impl App {
         self.focus_terminal = true;
     }
 
+    /// Whether a keyboard walk through the tabs is held: Ctrl+Tab's, or
+    /// Ctrl+PageUp/PageDown's. While it is, a tab it passes over that has
+    /// not started stays that way.
+    fn walking(&self) -> bool {
+        self.switcher.is_some() || self.cycling
+    }
+
     /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
-    /// and only now does it count as seen.
+    /// and only now does it count as seen. Any keyboard walk ends here, so
+    /// the tab it is on may start: Ctrl coming up, and every other way of
+    /// choosing a tab, which starts it at once as ever.
     fn end_switch(&mut self) {
+        self.cycling = false;
+        self.walk_preview = None;
         let Some(sw) = self.switcher.take() else {
             return;
         };
@@ -3338,6 +3566,8 @@ impl eframe::App for App {
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
         self.show_attention(&ctx, frame);
+        #[cfg(unix)]
+        self.come_forward(&ctx);
         self.watch_for_limits();
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
@@ -3500,8 +3730,15 @@ impl eframe::App for App {
             }
 
             // Lazy restore: a tab from a previous run spawns its shell on
-            // first focus, pre-seeded with its saved scrollback.
-            if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
+            // first focus, pre-seeded with its saved scrollback. Not while a
+            // keyboard walk is held over it: the walk may only be passing
+            // through, and the tab it stops on starts when Ctrl comes up.
+            let walking = self.walking();
+            if walk::starts_now(
+                self.rt.contains_key(&active),
+                self.ws.tab(active).is_some_and(|t| t.exited),
+                walking,
+            ) {
                 let preseed = state::load_snapshot(&self.paths, active)
                     .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
@@ -3573,6 +3810,17 @@ impl eframe::App for App {
                         ui.label("no session");
                     });
                 }
+            } else if walking {
+                // A walk passing over a tab that has not started: its saved
+                // scrollback, read-only, until Ctrl comes up.
+                if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
+                    let dump = state::load_snapshot(&self.paths, active);
+                    self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
+                }
+                if let Some(preview) = &self.walk_preview {
+                    let rect = ui.available_rect_before_wrap();
+                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
+                }
             }
         });
         if let Some((slot, painter)) = backdrop {
@@ -3599,16 +3847,19 @@ impl eframe::App for App {
             self.apply(&ctx, action);
         }
 
-        // A Ctrl+Tab walk ends the way Alt+Tab does: when Ctrl comes up, or
+        // A keyboard walk ends the way Alt+Tab does: when Ctrl comes up, or
         // when the window stops being the one receiving keys at all.
-        if self.switcher.is_some() {
-            let holding = ctx.input(|i| i.modifiers.ctrl && i.focused);
+        if self.walking() {
+            let holding = ctx.input(|i| walk::still_held(i.modifiers.ctrl, i.focused));
             if holding {
                 // Modifier releases arrive as events on every platform we
                 // support, but a missed one would strand the walk open.
                 ctx.request_repaint_after(Duration::from_millis(250));
             } else {
                 self.end_switch();
+                // The tab the walk ended on starts in the next frame, which
+                // nothing else may be about to draw.
+                ctx.request_repaint();
             }
         }
     }
@@ -3647,6 +3898,56 @@ fn app_is_running() -> bool {
                 .to_ascii_lowercase()
                 .starts_with("giverny")
     })
+}
+
+/// Giverny windows, other than this process and `holder`, that would use
+/// the same relay socket as this one: second windows, which get no hooks.
+///
+/// Read from each process's environment, so a test instance with its own
+/// `XDG_RUNTIME_DIR` is not one of them, and neither is a subcommand
+/// (`relay`, `statusline`, this `doctor`).
+#[cfg(unix)]
+fn giverny_windows(holder: Option<u32>) -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let me = std::process::id();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let mut pids: Vec<u32> = sys
+        .processes()
+        .iter()
+        .filter(|(pid, proc)| {
+            let pid = pid.as_u32();
+            pid != me
+                && Some(pid) != holder
+                // A thread shows up as a process of the same name.
+                && proc.thread_kind().is_none()
+                && proc.name().to_string_lossy().starts_with("giverny")
+                // The window takes no command: a bare word is a subcommand.
+                && proc.cmd().get(1).is_none_or(|arg| {
+                    let arg = arg.to_string_lossy();
+                    !is_unknown_subcommand(&arg, false)
+                        && !matches!(&*arg, "-V" | "--version" | "-h" | "--help")
+                })
+                && {
+                    let theirs = proc.environ().iter().find_map(|kv| {
+                        kv.to_str()?
+                            .strip_prefix("XDG_RUNTIME_DIR=")
+                            .map(std::ffi::OsString::from)
+                    });
+                    theirs.filter(|d| !d.is_empty()) == runtime
+                }
+        })
+        .map(|(pid, _)| pid.as_u32())
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// What each saved tab would do when it is next opened.
@@ -3729,14 +4030,35 @@ fn doctor() {
     #[cfg(unix)]
     {
         let socket = hooks::socket_path();
-        let listening = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        let holder = hooks::socket_holder(&socket);
         println!(
-            "relay        unix socket {} — {}\n",
+            "relay        unix socket {} — {}",
             socket.display(),
-            if listening {
-                "listening (hooks deliver live)"
-            } else {
-                "nobody listening (events spool to disk)"
+            match holder.and_then(|h| h.pid) {
+                Some(pid) => format!("listening: Giverny pid {pid} (hooks deliver live)"),
+                None if holder.is_some() => "listening (hooks deliver live)".to_string(),
+                None => "nobody listening (events spool to disk)".to_string(),
+            }
+        );
+        // One Giverny per socket: whoever has it gets every hook.
+        println!(
+            "one window   a second launch brings {} to the front instead of opening;\n             \
+             a side window wants its own XDG_RUNTIME_DIR ({SECOND_WINDOW_ENV}=1\n             \
+             opens one anyway, without hooks){}\n",
+            match holder.and_then(|h| h.pid) {
+                Some(pid) => format!("pid {pid}"),
+                None => "the running one".to_string(),
+            },
+            match giverny_windows(holder.and_then(|h| h.pid)) {
+                others if others.is_empty() => String::new(),
+                others => format!(
+                    "\n             ⚠ more Giverny windows run without the relay: pid {}",
+                    others
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             }
         );
     }
