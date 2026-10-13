@@ -8,6 +8,7 @@ mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod paste_image;
 mod prompt_bar;
 mod rail;
 mod settings_ui;
@@ -1097,6 +1098,9 @@ pub struct App {
     /// Wayland, where we track the drag ourselves and so know the position;
     /// winit's X11 drops report no coordinates at all.
     pub drag_hover: Option<egui::Pos2>,
+    /// A screenshot pasted with Ctrl+V (Cmd+V): read, saved and typed in as
+    /// a path.
+    paste_image: paste_image::ImagePaste,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
     /// Repository root per directory, so the sweep over every tab is one
@@ -1607,6 +1611,7 @@ impl App {
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
+            paste_image: paste_image::ImagePaste::new(),
             row_rects: Vec::new(),
             attention: 0,
             #[cfg(unix)]
@@ -2934,6 +2939,22 @@ impl App {
         }
     }
 
+    /// Type each image pasted since the last frame into the tab it was
+    /// pasted in, as a drop types a file: Claude Code attaches an image path
+    /// pasted into its prompt. A tab closed meanwhile gets nothing, and the
+    /// user's attention may have moved on: no tab switch.
+    fn deliver_pasted_images(&mut self) {
+        for pasted in self.paste_image.poll() {
+            if let Some(session) = self.rt.get(&pasted.tab).and_then(|rt| rt.session.as_ref()) {
+                session.write(giverny_term::input::encode_paste(
+                    &pasted.text,
+                    session.mode(),
+                ));
+                session.note_user_input();
+            }
+        }
+    }
+
     /// The tab whose rail row contains a point, if any.
     pub fn tab_at(&self, pos: egui::Pos2) -> Option<TabId> {
         self.row_rects
@@ -3575,10 +3596,12 @@ impl eframe::App for App {
             // races the compositor going away, and a frame that never
             // finishes writes nothing.
             self.persist_all();
+            self.paste_image.clean_up();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
+        self.deliver_pasted_images();
         self.process_pending(&ctx);
 
         // Claude awareness: hooks + registry + usage.
@@ -3814,6 +3837,9 @@ impl eframe::App for App {
                     rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
+                    if rt.view.paste_image {
+                        self.paste_image.request(&ctx, active);
+                    }
                     // Typing goes to the terminal. egui drops a widget's
                     // focus on any press outside it — the rail, the
                     // taskbar, a header button — and the keys typed after
