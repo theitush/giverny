@@ -881,6 +881,10 @@ impl ClaudeWatch {
             // what tells a tab apart from the turn that ended before it: a
             // session carrying on after a permission was granted, or an agent
             // continuing by itself, emits nothing else.
+            // Except a subagent's once the turn has ended with it running:
+            // it arrives under this session with its `agent_id`, and is the
+            // delegated work the dots already show, not the session busy.
+            Some("PostToolUse") if entry.agents && msg.agent_id().is_some() => {}
             Some("PostToolUse") => {
                 entry.state = ClaudeState::Busy;
                 entry.agents = false;
@@ -2618,6 +2622,17 @@ mod tests {
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
         assert!(dots(&w), "Idle with its worker running: the dots");
+
+        // The worker's own tool calls come under this session, named by its
+        // `agent_id`: still the dots, not a spinner.
+        feed(
+            &mut w,
+            &hook("PostToolUse", r#","agent_id":"a1","tool_name":"Bash""#),
+            Some(TAB),
+        );
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(dots(&w), "a worker's tool call keeps the dots");
 
         // Asked something meanwhile, it is working again, workers or not:
         // the spinner, and the next `Stop` says what still runs.

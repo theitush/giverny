@@ -73,6 +73,13 @@ impl RelayMsg {
     pub fn prompt(&self) -> Option<&str> {
         self.event.get("prompt").and_then(|v| v.as_str())
     }
+    /// The subagent a tool hook fired in. Claude Code (2.1.296) builds the
+    /// tool hooks from the tool call's context, so a subagent's tool calls
+    /// arrive under the parent's `session_id` with this set.
+    /// `UserPromptSubmit` never carries it.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.event.get("agent_id").and_then(|v| v.as_str())
+    }
 
     /// On `Stop`: is work this session delegated still running as the turn
     /// ends — a subagent, a workflow, a teammate, a cloud session?
