@@ -11,7 +11,10 @@
 //! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
 //! hook that, with names on, asks a tab's session to name itself
 //! ([`crate::names`]) — or, for a session whose start ran no such hook, its
-//! next prompt does (giverny#356).
+//! next prompt does (giverny#356). And it is the `SubagentStop` hook, which
+//! holds a subagent's finish once to ask whether a background command of its
+//! own should keep running after it reports ([`crate::leftovers`],
+//! giverny#370).
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -32,6 +35,12 @@
 //!   ([`manage_inbox`]), and its rows' chores — a finished worker's task to
 //!   land, a Next up task idle with nothing to wait on — told once each
 //!   ([`manage_chores`]).
+//! - **What a subagent leaves running.** A subagent finishing with a
+//!   background shell or monitor of its own still running is asked, once,
+//!   whether it should keep running ([`crate::leftovers::subagent_stop`]);
+//!   if it does, its parent session hears of it once, on its next tool call
+//!   or prompt ([`crate::leftovers::deliver`]). Every subagent in a Giverny
+//!   tab, managed or not (giverny#370).
 //! - **The manager mark.** The session's own `Skill` call running the
 //!   manage skill marks it a manager ([`crate::managers`], giverny#357), as
 //!   does the person typing `/giverny:manage` (the prompt hook): what lets
@@ -47,7 +56,8 @@
 //! **Cheap when idle.** A call that is not a spawn and not a worker's costs a
 //! few `stat`s and reads no file; a worker's call before its five minutes, a
 //! `stat` of its spawn metadata, and after them a read of its small agent-ETA
-//! file. Whatever happens the hook exits 0, so it
+//! file. A `SubagentStop` with no background command in flight reads no
+//! file either. Whatever happens the hook exits 0, so it
 //! never fails the tool call it rides on.
 
 use std::path::{Path, PathBuf};
@@ -234,12 +244,14 @@ pub fn run(payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String
     if let Some(caller) = Caller::of(payload) {
         return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
     }
-    // The dispatcher's own call: its messages, its rows' chores, and the
-    // worker it just started.
+    // The dispatcher's own call: its messages, its rows' chores, the
+    // worker it just started, and the commands a finished subagent left
+    // running (giverny#370).
     let asks: Vec<String> = [
         manage_inbox::deliver(dir, &ledger, session, now),
         manage_chores::deliver(dir, session, now),
         spawned(payload, dir, session, in_tab),
+        crate::leftovers::deliver(dir, session),
     ]
     .into_iter()
     .flatten()
@@ -361,9 +373,19 @@ pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
     )
 }
 
+/// A prompt payload's `session_id`, read alone.
+fn session_of(input: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Prompt {
+        session_id: Option<String>,
+    }
+    serde_json::from_str::<Prompt>(input).ok()?.session_id
+}
+
 /// The `UserPromptSubmit` reply carrying every context given, one paragraph
 /// each: a prompt can both ask to manage ([`crate::manage_trigger`]) and be
-/// the first its session's name ask rides on ([`crate::names::first_prompt`]).
+/// the first its session's name ask rides on ([`crate::names::first_prompt`]),
+/// and bring what a finished subagent left running ([`crate::leftovers`]).
 fn prompt_reply(contexts: &[Option<&str>]) -> Option<String> {
     let all: Vec<&str> = contexts.iter().flatten().copied().collect();
     (!all.is_empty()).then(|| {
@@ -382,6 +404,17 @@ fn prompt_reply(contexts: &[Option<&str>]) -> Option<String> {
 pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    // A subagent's finish: held once when a background command of its own
+    // still runs (giverny#370).
+    if let Some(stop) = crate::leftovers::stop_payload(&input) {
+        let feeds = crate::feed::feed_dir();
+        if let Some(out) =
+            crate::leftovers::subagent_stop(&stop, &feeds, manage::now_ms(), in_giverny_tab)
+        {
+            println!("{out}");
+        }
+        return 0;
+    }
     if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
         let feeds = crate::feed::feed_dir();
         // The person typed the skill's command: Claude Code expands it with
@@ -398,7 +431,10 @@ pub fn main() -> i32 {
             .and_then(|p| crate::names::first_prompt(&p, &feeds, on, tabs_own));
         let manage = crate::manage_trigger::asks_to_manage(&prompt)
             .then_some(crate::manage_trigger::CONTEXT);
-        if let Some(out) = prompt_reply(&[manage, name.as_deref()]) {
+        // What a finished subagent left running, if its parent has not
+        // heard yet (giverny#370).
+        let left = session_of(&input).and_then(|s| crate::leftovers::deliver(&feeds, &s));
+        if let Some(out) = prompt_reply(&[manage, name.as_deref(), left.as_deref()]) {
             println!("{out}");
         }
         return 0;
@@ -719,6 +755,49 @@ mod tests {
              `giverny-manage land demo#9`."
         );
         assert_eq!(run(&me, &dir, T0 + 15 * MIN, false), None, "told once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#370: what a finished subagent left running reaches its
+    /// parent on the parent's own next tool call, once, and never a
+    /// worker's call.
+    #[test]
+    fn a_leftover_reaches_the_parent_on_its_next_tool_call() {
+        let dir = temp("leftover");
+        let sub = dir.join("proj/s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let t = sub.join("agent-a1.jsonl");
+        std::fs::write(
+            &t,
+            json!({"type": "user", "timestamp": "2026-10-13T09:47:31.823Z",
+                   "message": {"content": [{"type": "tool_result",
+                   "content": "Command running in background with ID: bgej3bpqh. …"}]}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let stop = json!({"session_id": "s1", "agent_id": "a1",
+            "hook_event_name": "SubagentStop", "agent_transcript_path": t.display().to_string(),
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running",
+                 "description": "Start a sleeper"},
+                {"id": "bgej3bpqh", "type": "shell", "status": "running",
+                 "command": "sleep 371"}]})
+        .to_string();
+        let stop = crate::leftovers::stop_payload(&stop).unwrap();
+        let now = T0;
+        assert!(crate::leftovers::subagent_stop(&stop, &dir, now, || true).is_some());
+        assert!(crate::leftovers::subagent_stop(&stop, &dir, now, || true).is_none());
+        let w = worker_payload(&dir, "s1", "w2", "other work", T0);
+        let said = run(&w, &dir, T0 + MIN, false).map(|o| context(&o));
+        assert!(!said.unwrap_or_default().contains("sleep 371"));
+        let me = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Read"});
+        assert_eq!(
+            context(&run(&me, &dir, T0 + MIN, false).unwrap()),
+            "Giverny: your subagent \"Start a sleeper\" finished with `sleep 371` still \
+             running in the background (task bgej3bpqh)."
+        );
+        assert_eq!(run(&me, &dir, T0 + 2 * MIN, false), None, "told once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

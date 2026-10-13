@@ -91,29 +91,59 @@ impl RelayMsg {
     /// as working are taken here. A background shell is not: the registry's
     /// `shell` already says that one (giverny#352), and a monitor or a cron
     /// is a watcher that may never end. No list (an older Claude Code): no.
-    /// (giverny#363)
+    /// (giverny#363) The list is read by [`in_flight`].
     pub fn delegated_work_running(&self) -> bool {
-        const DELEGATED: &[&str] = &[
-            "subagent",
-            "local_agent",
-            "workflow",
-            "local_workflow",
-            "teammate",
-            "in_process_teammate",
-            "cloud session",
-            "remote_agent",
-        ];
-        self.event
-            .get("background_tasks")
-            .and_then(|v| v.as_array())
-            .is_some_and(|tasks| {
-                tasks.iter().any(|task| {
-                    let field = |key| task.get(key).and_then(|v| v.as_str());
-                    field("type").is_some_and(|t| DELEGATED.contains(&t))
-                        && field("status").is_none_or(|s| matches!(s, "running" | "pending"))
-                })
-            })
+        in_flight(&self.event).any(|task| {
+            task.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| DELEGATED.contains(&t))
+        })
     }
+}
+
+/// The `background_tasks` types that are work a session delegated — a
+/// subagent, a workflow, a teammate, a cloud session — in both spellings:
+/// the friendly label Claude Code gives a type it knows and the raw type
+/// (giverny#363).
+pub const DELEGATED: &[&str] = &[
+    "subagent",
+    "local_agent",
+    "workflow",
+    "local_workflow",
+    "teammate",
+    "in_process_teammate",
+    "cloud session",
+    "remote_agent",
+];
+
+/// The `background_tasks` types that are commands rather than agents: a
+/// background shell (a Bash `run_in_background`, or one the person sent to
+/// the background) and a monitor, both spellings (giverny#370).
+pub const COMMANDS: &[&str] = &[
+    "shell",
+    "local_bash",
+    "monitor",
+    "monitor_mcp",
+    "monitor_ws",
+];
+
+/// A `Stop` or `SubagentStop` payload's `background_tasks` still in flight:
+/// running or pending, or with no status at all. No list (a Claude Code
+/// before 2.1.296): none. Claude Code fills the list from the session's one
+/// task registry, so a subagent's `SubagentStop` lists its parent's tasks
+/// and its own alike, the subagent itself among them, and no entry says
+/// whose it is (measured on 2.1.296, giverny#370).
+pub fn in_flight(event: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    event
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|task| {
+            task.get("status")
+                .and_then(|v| v.as_str())
+                .is_none_or(|s| matches!(s, "running" | "pending"))
+        })
 }
 
 pub fn socket_path() -> PathBuf {

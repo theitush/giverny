@@ -12,6 +12,7 @@ pub mod continuation;
 pub mod feed;
 pub mod hooks;
 pub mod jobs;
+pub mod leftovers;
 pub mod lineage;
 pub mod manage;
 pub mod manage_chores;
