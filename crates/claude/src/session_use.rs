@@ -9,7 +9,10 @@
 //! It once also measured the session for Claude Code's status line, which
 //! no longer shows its use (giverny#384).
 //!
-//! Linux only. Elsewhere there is nothing to show and nothing is spent.
+//! Linux reads `/proc`. macOS has its own table ([`proc_table`] there, from
+//! `libproc`), read only for the ceilings Giverny holds itself
+//! ([`crate::user_cap`], giverny#389); nothing is shown from it. Elsewhere
+//! there is nothing to show and nothing is spent.
 
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
@@ -151,6 +154,172 @@ pub fn parse_stat(pid: u32, stat: &str, page_kb: u64) -> Option<Proc> {
     })
 }
 
+/// Every process macOS lets this user read (giverny#389), as `/proc`'s
+/// table is on Linux, with each one's short name (`p_comm`, at most 16
+/// bytes) beside it. From `libproc`: `proc_listallpids`, the short BSD
+/// info (parent, name) and `proc_pid_rusage` (`RUSAGE_INFO_V2`):
+///
+/// - **ticks** are milliseconds (a table read here is diffed at 1000 a
+///   second): user + system time, its own and its reaped children's, as on
+///   Linux, so a command that ended is still counted in its parent;
+/// - **memory** is the physical footprint, what Activity Monitor shows as a
+///   process's memory and what the kernel's memory pressure counts: its
+///   private pages, compressed ones included, and not the shared libraries
+///   every process maps (which a resident set counts once per process);
+/// - **start** is the process's start in Mach absolute time: a pid that
+///   comes back with another is another process.
+///
+/// A process whose usage cannot be read (another user's) is listed with
+/// none, so the tree above it still holds together.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_table() -> (Vec<Proc>, HashMap<u32, String>) {
+    use std::mem::{size_of, zeroed};
+    // SAFETY: a null buffer asks only for the count.
+    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return (Vec::new(), HashMap::new());
+    }
+    // Room for processes started since the count.
+    let mut pids: Vec<libc::c_int> = vec![0; n as usize + 256];
+    let bytes = (pids.len() * size_of::<libc::c_int>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes; the call fills at most that.
+    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(got.max(0) as usize);
+    let (numer, denom) = mach_timebase();
+    let abs_ms =
+        |t: u64| (u128::from(t) * u128::from(numer) / u128::from(denom) / 1_000_000) as u64;
+    let mut procs = Vec::with_capacity(pids.len());
+    let mut comm = HashMap::with_capacity(pids.len());
+    for pid in pids.into_iter().filter(|&p| p > 0) {
+        // SAFETY: zeroed is a valid value of these plain C structs, and
+        // each call writes at most the size it is given.
+        let mut info: libc::proc_bsdshortinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        let r = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+                size,
+            )
+        };
+        if r != size {
+            continue;
+        }
+        let mut ru: libc::rusage_info_v2 = unsafe { zeroed() };
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut ru as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+            )
+        } == 0;
+        let name: Vec<u8> = info
+            .pbsi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        comm.insert(pid as u32, String::from_utf8_lossy(&name).into_owned());
+        procs.push(Proc {
+            pid: pid as u32,
+            ppid: info.pbsi_ppid,
+            ticks: if ok {
+                abs_ms(
+                    ru.ri_user_time
+                        + ru.ri_system_time
+                        + ru.ri_child_user_time
+                        + ru.ri_child_system_time,
+                )
+            } else {
+                0
+            },
+            mem_kb: if ok { ru.ri_phys_footprint / 1024 } else { 0 },
+            start: if ok { ru.ri_proc_start_abstime } else { 0 },
+        });
+    }
+    (procs, comm)
+}
+
+/// Mach absolute time's ratio to nanoseconds (1/1 on Intel, 125/3 on
+/// Apple Silicon), which `rusage_info`'s times are counted in.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc points at `mach2` for this one call.
+fn mach_timebase() -> (u32, u32) {
+    static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *TB.get_or_init(|| {
+        let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: fills the struct it is given.
+        let ok = unsafe { libc::mach_timebase_info(&mut tb) } == 0;
+        if ok && tb.numer > 0 && tb.denom > 0 {
+            (tb.numer, tb.denom)
+        } else {
+            (1, 1)
+        }
+    })
+}
+
+/// A process's `argv[0]` on macOS (`sysctl kern.procargs2`): what Claude
+/// Code's launcher renames itself to (`process.title = "claude"`), which
+/// its short name (`node`) does not show. `None` for another user's.
+#[cfg(target_os = "macos")]
+pub(crate) fn argv0(pid: u32) -> Option<String> {
+    static ARGMAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max = *ARGMAX.get_or_init(|| {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: an int-sized out value for an int-valued name.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut v as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 && v > 0 { v as usize } else { 1 << 20 }
+    });
+    let mut buf = vec![0u8; max];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    // SAFETY: `buf` holds `len` bytes; the call writes at most that.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    parse_procargs2(&buf)
+}
+
+/// `argv[0]` from a `kern.procargs2` answer: `argc` (a native `int`), the
+/// executable's path, NUL padding, then `argv` NUL-separated.
+pub fn parse_procargs2(buf: &[u8]) -> Option<String> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    if argc < 1 {
+        return None;
+    }
+    let rest = &buf[4..];
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let args = &rest[path_end..];
+    let start = args.iter().position(|b| *b != 0)?;
+    let args = &args[start..];
+    let end = args.iter().position(|b| *b == 0).unwrap_or(args.len());
+    Some(String::from_utf8_lossy(&args[..end]).into_owned())
+}
+
 /// The `Pss:` line of a `/proc/<pid>/smaps_rollup`, KiB.
 pub fn parse_pss(smaps_rollup: &str) -> Option<u64> {
     smaps_rollup
@@ -288,6 +457,15 @@ mod tests {
         assert_eq!(got.ticks, 150 + 50 + 7 + 3);
         assert_eq!(got.mem_kb, 2048 * 4);
         assert_eq!(parse_stat(1, "garbage", 4), None);
+    }
+
+    #[test]
+    fn argv0_is_read_past_the_executables_path() {
+        let mut b = 2i32.to_ne_bytes().to_vec();
+        b.extend_from_slice(b"/opt/homebrew/bin/node\0\0\0\0claude\0--resume\0PATH=/x\0");
+        assert_eq!(parse_procargs2(&b).as_deref(), Some("claude"));
+        assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None);
+        assert_eq!(parse_procargs2(b"ab"), None);
     }
 
     #[test]

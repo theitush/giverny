@@ -340,6 +340,9 @@ pub fn gpu_pct(pmon: &Pmon, pids: &HashSet<u32>) -> u32 {
 /// [`Sampler::GPU_EVERY`], its compute (`pmon`, which watches for a second)
 /// started then and collected on a later pass, never waited for.
 #[derive(Debug, Default)]
+// macOS reads only the table (for its ceilings), none of the GPU or
+// worker figures.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Sampler {
     prev: Option<(Seen, std::time::Instant)>,
     gpu: Option<(HashMap<u32, u64>, std::time::Instant)>,
@@ -351,14 +354,24 @@ pub struct Sampler {
     /// app's own sampler ([`Sampler::capping_tabs`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     caps: Option<crate::tab_cap::Adopter>,
+    /// Where the kernel holds no ceiling (macOS), Giverny's own hold on
+    /// the tabs' claudes and the plain runs ([`crate::user_cap`],
+    /// giverny#389); only the app's sampler, only there.
+    holder: Option<crate::user_cap::Holder>,
+    /// Which processes are claudes, asked once each (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    claudes: crate::user_cap::Claudes,
 }
 
 impl Sampler {
     /// The app's sampler: each pass also puts every claude it finds under
-    /// a tab into its capped scope ([`crate::tab_cap`]).
+    /// a tab into its capped scope ([`crate::tab_cap`]), or, where there
+    /// are no cgroups (macOS), holds the limits itself
+    /// ([`crate::user_cap`]).
     pub fn capping_tabs() -> Sampler {
         Sampler {
             caps: Some(crate::tab_cap::Adopter::default()),
+            holder: crate::user_cap::active().then(crate::user_cap::Holder::default),
             ..Sampler::default()
         }
     }
@@ -381,10 +394,16 @@ impl Sampler {
             return None;
         }
         let now = std::time::Instant::now();
-        let runs: Vec<(String, String, HashSet<u32>)> = crate::run_live::running(runs_dir)
-            .into_iter()
-            .map(|(session, task, cg)| (session, task, crate::run_live::cgroup_pids(&cg)))
-            .collect();
+        let plain = crate::run_live::running_plain(runs_dir);
+        let runs: Vec<(String, String, HashSet<u32>)> =
+            crate::run_live::running(runs_dir)
+                .into_iter()
+                .map(|(session, task, cg)| (session, task, crate::run_live::cgroup_pids(&cg)))
+                // A plain run's command: the `run` process and all below it.
+                .chain(plain.iter().map(|(session, task, pid)| {
+                    (session.clone(), task.clone(), subtree(&procs, *pid))
+                }))
+                .collect();
         // Memory is read for what is shown: the app's tree and the runs.
         let mut shown = subtree(&procs, app);
         shown.extend(runs.iter().flat_map(|r| r.2.iter().copied()));
@@ -413,13 +432,50 @@ impl Sampler {
         if let Some(caps) = &mut self.caps {
             caps.tick(&table.procs, &claudes);
         }
+        if let Some(holder) = &mut self.holder {
+            let runs: HashSet<u32> = plain.iter().map(|r| r.2).collect();
+            holder.tick(&table, &claudes, &runs);
+        }
         let agents = self
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
         Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// macOS: no figures are shown (the reading is Linux's), but the app's
+    /// sampler reads the table each pass to hold the limits itself
+    /// ([`crate::user_cap`], giverny#389): every claude under the app and
+    /// every plain `run` under `runs_dir`.
+    #[cfg(target_os = "macos")]
+    pub fn sample(&mut self, app: u32, runs_dir: &Path) -> Option<Reading> {
+        let holder = self.holder.as_mut()?;
+        let snap = crate::user_cap::Snapshot::take()?;
+        let now = std::time::Instant::now();
+        let tree = subtree(&snap.procs, app);
+        let claudes = self.claudes.among(&snap, &tree);
+        let table = Table {
+            spent: pid_ticks(&snap.procs, self.prev.as_ref().map(|p| &p.0)),
+            over_ms: self
+                .prev
+                .as_ref()
+                .map_or(0, |(_, at)| now.duration_since(*at).as_millis() as u64),
+            ticks_per_s: snap.ticks_per_s,
+            cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
+            procs: snap.procs,
+            ..Table::default()
+        };
+        self.prev = Some((seen(&table.procs), now));
+        let runs: HashSet<u32> = crate::run_live::running_plain(runs_dir)
+            .into_iter()
+            .map(|r| r.2)
+            .collect();
+        holder.tick(&table, &claudes, &runs);
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn sample(&mut self, _app: u32, _runs_dir: &Path) -> Option<Reading> {
         None
     }

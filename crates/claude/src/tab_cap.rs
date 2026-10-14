@@ -42,7 +42,11 @@
 //! A claude already inside the slice (one started by a capped claude, or
 //! adopted on an earlier pass) is left alone. Where there is no user
 //! systemd (or `$GIVERNY_RUN_NO_SYSTEMD` is set) nothing is moved, and the
-//! log says so once.
+//! log says so once. On macOS, which has no cgroups, the same sampler
+//! holds the same limits itself instead ([`crate::user_cap`],
+//! giverny#389): it kills the biggest command over the RAM limit and
+//! duty-cycles the busy ones over the CPU limit, from what it measures,
+//! with the gaps a sampler has.
 //!
 //! What it does not hold: a process a claude started and that detached
 //! before the first pass saw the claude, a command's first second before
