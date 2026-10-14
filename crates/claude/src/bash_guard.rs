@@ -31,13 +31,29 @@ pub fn verdict(cmd: &str) -> Option<String> {
 
 /// The message Claude is shown when a command is refused.
 pub fn refusal(what: &str) -> String {
+    refusal_on(what, cfg!(target_os = "macos"))
+}
+
+/// [`refusal`] as said on macOS (`macos`), where no slice holds the tab
+/// but Giverny itself does ([`crate::user_cap`], giverny#389), or on Linux.
+pub fn refusal_on(what: &str, macos: bool) -> String {
+    let (held, run) = if macos {
+        (
+            "is held to the machine's limits by Giverny itself (no cgroups on macOS)".to_string(),
+            "which holds it to its lease inside the machine's budget",
+        )
+    } else {
+        (
+            format!("runs capped (in {SLICE})"),
+            "which gives it a scope of its own inside the machine's budget",
+        )
+    };
     format!(
         "Giverny refused this command: {what} would take work out of this tab's \
-         resource cap. Every claude in a Giverny tab runs capped (in {SLICE}), and \
-         all it starts with it. For more memory, ask for it: `giverny-manage claim \
-         <task> --ram <size>` (reserve RAM; CPU is shared and measured, no cores to \
-         pick), then run the heavy command as `giverny-manage run <task> -- \
-         <command>`, which gives it a scope of its own inside the machine's budget."
+         resource cap. Every claude in a Giverny tab {held}, and all it starts with \
+         it. For more memory, ask for it: `giverny-manage claim <task> --ram <size>` \
+         (reserve RAM; CPU is shared and measured, no cores to pick), then run the \
+         heavy command as `giverny-manage run <task> -- <command>`, {run}."
     )
 }
 
@@ -576,6 +592,25 @@ fn through_run(args: &[String], depth: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refusal_names_what_holds_the_tab_where_it_runs() {
+        let linux = refusal_on("`taskset`", false);
+        assert!(
+            linux.contains("runs capped (in giverny-claude.slice)"),
+            "{linux}"
+        );
+        let mac = refusal_on("`taskset`", true);
+        assert!(!mac.contains("slice") && !mac.contains("scope"), "{mac}");
+        assert!(
+            mac.contains("by Giverny itself (no cgroups on macOS)"),
+            "{mac}"
+        );
+        assert!(
+            mac.contains("giverny-manage run <task> -- <command>"),
+            "{mac}"
+        );
+    }
 
     fn refused(cmd: &str) -> bool {
         verdict(cmd).is_some()

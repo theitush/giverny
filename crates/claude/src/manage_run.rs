@@ -332,6 +332,11 @@ pub struct Opts {
     /// the command's usage is still recorded (the CLI only: it is
     /// process-wide).
     pub ignore_signals: bool,
+    /// A plain command is held by Giverny itself ([`crate::user_cap`]):
+    /// [`user_cap::active`] for the CLI (macOS, or the Linux stand-in);
+    /// said outright by a test, so the suite means the same whatever its
+    /// environment (giverny#389).
+    pub hold: bool,
 }
 
 /// `giverny manage run`, from [`manage::run_in_code`].
@@ -347,6 +352,7 @@ pub fn run(
         mode: detect_mode(),
         heartbeat_every: HEARTBEAT_EVERY,
         ignore_signals: true,
+        hold: user_cap::active(),
     };
     run_with(dir, ledger, session, task, flags, cap, opts)
 }
@@ -810,7 +816,7 @@ fn execute(
         );
     }
     // No cgroups (macOS): Giverny holds the command itself (giverny#389).
-    let held = (opts.mode == Mode::Plain && user_cap::active())
+    let held = (opts.mode == Mode::Plain && opts.hold)
         .then(|| user_cap::Ceiling::for_run(cap.ram_mb, limit));
     // The app, when one holds this work, holds its CPU with every other
     // claude's: two duty cycles on one process would undo each other.
@@ -1106,6 +1112,7 @@ mod tests {
             mode: Mode::Plain,
             heartbeat_every: Duration::from_millis(every_ms),
             ignore_signals: false,
+            hold: false,
         }
     }
 
@@ -1405,6 +1412,29 @@ mod tests {
         let f = std::fs::read_to_string(feed::feed_path(&dir, "s1")).unwrap();
         assert!(!f.contains("waiting_since"), "the wait closed: {f}");
         assert!(f.contains("\"wait_s\""), "{f}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Held by Giverny itself (macOS; giverny#389): the run is recorded as
+    /// capped at its lease, and a command past twice its lease is killed
+    /// and counted as an OOM kill.
+    #[test]
+    fn a_held_run_is_capped_and_its_runaway_killed() {
+        let dir = scratch("held");
+        cmd(&dir, "start t --eta 30");
+        assert_eq!(cmd(&dir, "claim t --ram 64M").1, 0);
+        let held = Opts {
+            hold: true,
+            ..plain(60_000)
+        };
+        assert_eq!(run(&dir, "t", &[], "exit 0", held), 0);
+        let u = row(&dir, "t").usage.unwrap();
+        assert_eq!((u.capped, u.cap_ram_mb), (true, Some(64)), "{u:?}");
+        // Past 128M (twice 64M): killed, its usage an OOM kill.
+        let hog = "exec python3 -c \"import time\na=[]\nwhile True:\n a.append(bytearray(b'x')*(16<<20)); time.sleep(0.05)\"";
+        assert_eq!(run(&dir, "t", &[], hog, held), 137);
+        let u = row(&dir, "t").usage.unwrap();
+        assert_eq!(u.oom_kills, 1, "{u:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
