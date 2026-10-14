@@ -44,8 +44,9 @@
 //!
 //! - It runs as a `SessionStart` hook as well: with
 //!   `management_panel.ask_names` on (off by default, giverny#343), a
-//!   session in a Giverny tab is asked to run `giverny-manage name`, which
-//!   draws it a name and records it ([`crate::names`], giverny#364). The hook is there with
+//!   session in a Giverny tab is named right there, before its first turn:
+//!   the hook draws a name, records it and tells the session
+//!   ([`crate::names`], giverny#364, giverny#401). The hook is there with
 //!   the switch off too, and reads `<feeds>/names/on` itself: Claude Code
 //!   reads `hooks.json` only when a claude starts (or on `/reload-plugins`),
 //!   so a hook added when the switch goes on would never reach the sessions

@@ -618,9 +618,9 @@ pub const SETTINGS: &[SettingDef] = &[
         doc: "Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line.",
         note: &[
             "Giverny draws first name and surname: `Opus 5.5 (Tamsin Camden)`.",
-            "A session gets it, and reads it back, with `giverny-manage name`. Off,",
-            "no session is asked, managers included, and no name shows on any",
-            "status line.",
+            "A session has it before its first turn; `giverny-manage name` reads",
+            "it back. Off, no session is named, managers included, and no name",
+            "shows on any status line.",
         ],
         needs_restart: false,
         kind: Kind::Bool { default: false },

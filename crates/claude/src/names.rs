@@ -1,12 +1,13 @@
 //! Session names (giverny#343): with Settings → Management panel → "ask
 //! sessions to name themselves" on, every Claude session in a Giverny tab is
-//! asked at its start to run `giverny manage name`, and Giverny gives it a
-//! full name, first name and surname both drawn here ([`draw_name`],
-//! giverny#364: sessions left to pick a first name kept picking the same
-//! few). The status line shows it beside the model: `Opus 5.5 (Tamsin
-//! Camden)`.
+//! named at its start, before its first turn (giverny#401): its
+//! `SessionStart` hook draws a full name, first name and surname both drawn
+//! here ([`draw_name`], giverny#364: sessions left to pick a first name kept
+//! picking the same few), records it, and tells the session. The status line
+//! shows it beside the model from the start: `Opus 5.5 (Tamsin Camden)`.
 //!
-//! A name is drawn once: asking again prints the one recorded. A session may
+//! A name is drawn once: `giverny-manage name` prints the one recorded. A
+//! session may
 //! still give its own: a first name alone gets a drawn surname, a full name
 //! passed in (a revived session keeping its old one) is kept as given, and
 //! naming again with the same first name keeps the surname already drawn, so
@@ -19,21 +20,23 @@
 //! `<feeds>/names/roots/<root>.json` the same, keyed by the conversation's
 //! root ([`crate::continuation`]): a resumed session has a new id but the same
 //! root, so the status line finds its name there and copies it under the new
-//! id (giverny#336). `<feeds>/names/on` exists while the switch is on; the
-//! app writes and removes it, and the status line and the session-start
-//! hook read it.
+//! id (giverny#336). A session named at its start has no root yet (its
+//! transcript holds no turn), so its first prompt and the status line stamp
+//! one in as soon as the transcript has it ([`keep_root`]). `<feeds>/names/on`
+//! exists while the switch is on; the app writes and removes it, and the
+//! status line and the session-start hook read it.
 //!
-//! **When a session is asked** (giverny#356). Claude Code reads a plugin's
+//! **When a session is named** (giverny#356). Claude Code reads a plugin's
 //! `hooks.json` once, when its process starts (and on `/reload-plugins`),
 //! never on `/clear`, a compaction or a resume, measured on 2.1.296: a claude
 //! started before the plugin gained a hook never runs it. So the plugin's
 //! `SessionStart` hook is always registered and reads the switch itself
 //! ([`session_start`]), and flipping it reaches every session started since
 //! at its next start. A session whose process predates the hook, or that
-//! started with the switch off, is asked on its next prompt instead, by the
+//! started with the switch off, is named on its next prompt instead, by the
 //! `UserPromptSubmit` hook it does run ([`first_prompt`]). Either way a
-//! session is asked once: `<feeds>/names/asked/<session>` marks the ones
-//! told.
+//! session is named and told once: `<feeds>/names/asked/<session>` marks the
+//! ones told.
 
 use std::path::{Path, PathBuf};
 
@@ -41,11 +44,12 @@ use serde_json::{Value, json};
 
 /// The names directory under the feed directory.
 pub const DIR: &str = "names";
-/// The switch, as a file in [`DIR`]: present while names are asked for and
-/// shown.
+/// The switch, as a file in [`DIR`]: present while sessions are named and
+/// their names shown.
 const ON: &str = "on";
-/// Under [`DIR`], an empty file per session already told [`ask`], so the
-/// prompt hook's fallback ([`first_prompt`]) never asks twice.
+/// Under [`DIR`], an empty file per session already told its name
+/// ([`tell`]), so the prompt hook's fallback ([`first_prompt`]) never tells
+/// it twice.
 const ASKED: &str = "asked";
 
 /// Giverny's own first names, drawn for a session that asks for a name
@@ -607,7 +611,7 @@ pub fn dir(feeds: &Path) -> PathBuf {
     feeds.join(DIR)
 }
 
-/// Are sessions asked to name themselves, and their names shown? A `stat`.
+/// Are sessions named, and their names shown? A `stat`.
 pub fn is_on(feeds: &Path) -> bool {
     dir(feeds).join(ON).is_file()
 }
@@ -647,7 +651,16 @@ fn root_file(feeds: &Path, root: &str) -> Option<PathBuf> {
 
 /// The `name` a names document at `file` holds.
 fn name_in(file: &Path) -> Option<String> {
-    let doc: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    doc_name(&read_doc(file)?)
+}
+
+/// A names document, parsed.
+fn read_doc(file: &Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(file).ok()?).ok()
+}
+
+/// The `name` a names document holds.
+fn doc_name(doc: &Value) -> Option<String> {
     doc.get("name")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -687,19 +700,44 @@ pub fn find(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<St
     Some(name)
 }
 
+/// The `name` on `session`'s manager feed: one named before names had their
+/// own home (giverny#330). One read, no search.
+fn on_feed(feeds: &Path, session: &str) -> Option<String> {
+    crate::feed::read(&crate::feed::feed_path(feeds, session))?
+        .name
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// Stamp `session`'s conversation root into its name, once its `transcript`
+/// has one (giverny#401): a session named at its start has no turn yet, so
+/// no root, and without one a resume (a new id, the same conversation)
+/// would not find the name ([`find`]). Writes the root's file too. Returns
+/// the name recorded, if any; a session already stamped costs one read.
+pub fn keep_root(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<String> {
+    let file = session_file(feeds, session)?;
+    let mut doc = read_doc(&file)?;
+    let name = doc_name(&doc)?;
+    if doc.get("root").and_then(Value::as_str).is_none()
+        && let Some(root) = transcript.and_then(crate::subagents::conversation_root)
+    {
+        doc["root"] = json!(root);
+        let _ = write_doc(&file, &doc);
+        if let Some(rf) = root_file(feeds, &root) {
+            let _ = write_doc(&rf, &doc);
+        }
+    }
+    Some(name)
+}
+
 /// The name the status line shows for `session`: none while the switch is
-/// off; else its name ([`find`]), else the `name` on its manager feed (one
-/// named before names had their own home, giverny#330).
+/// off; else its name ([`find`], its root stamped in once known,
+/// [`keep_root`]), else the `name` on its manager feed ([`on_feed`]).
 pub fn shown(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<String> {
     if !is_on(feeds) {
         return None;
     }
-    read(feeds, session)
-        .or_else(|| {
-            crate::feed::read(&crate::feed::feed_path(feeds, session))?
-                .name
-                .filter(|n| !n.trim().is_empty())
-        })
+    keep_root(feeds, session, transcript)
+        .or_else(|| on_feed(feeds, session))
         .or_else(|| find(feeds, session, transcript))
 }
 
@@ -833,9 +871,30 @@ pub fn record(
     Ok((name, previous))
 }
 
-/// What a session in a Giverny tab is told at its start: its name, when it
-/// has one already (a resume, a compaction), else to ask Giverny for one
-/// (giverny#364: Giverny draws the whole name, nothing is picked).
+/// Draw `session` a full name ([`draw_name`]) and record it, under its
+/// conversation's root when its `transcript` has one: what a session with
+/// no name gets, from `giverny-manage name` or its start (giverny#401).
+pub fn draw_and_record(
+    feeds: &Path,
+    session: &str,
+    transcript: Option<&Path>,
+) -> Result<String, String> {
+    let root = transcript.and_then(crate::subagents::conversation_root);
+    // A full name: `record` keeps it as given and draws nothing more.
+    record(
+        feeds,
+        session,
+        &draw_name(feeds),
+        root.as_deref(),
+        draw_surname,
+    )
+    .map(|(name, _)| name)
+}
+
+/// What a session in a Giverny tab is told at its start: its name (drawn
+/// there unless it had one, giverny#401), else, only when recording it
+/// failed, to ask Giverny for one (giverny#364: Giverny draws the whole
+/// name, nothing is picked).
 pub fn ask(name: Option<&str>) -> String {
     match name {
         Some(n) => format!(
@@ -857,14 +916,29 @@ fn session_of(payload: &Value) -> Option<&str> {
         .filter(|s| safe(s))
 }
 
-/// What `session` is told ([`ask`], with the name [`find`] gives it), marked
-/// as told so it is not asked again ([`ASKED`]).
-fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
-    let transcript = payload
+/// The transcript a hook payload names.
+fn transcript_of(payload: &Value) -> Option<PathBuf> {
+    payload
         .get("transcript_path")
         .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let name = find(feeds, session, transcript.as_deref());
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Name `session` and say so ([`ask`]): the name it has ([`find`], else
+/// the one on its manager feed), else one drawn and recorded right here
+/// ([`draw_and_record`], giverny#401), so the session has its name before
+/// its first turn. Marked as told, so it is not told again ([`ASKED`]).
+fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
+    let transcript = transcript_of(payload);
+    let name = find(feeds, session, transcript.as_deref())
+        .or_else(|| on_feed(feeds, session))
+        .or_else(|| {
+            draw_and_record(feeds, session, transcript.as_deref())
+                .inspect_err(|e| eprintln!("giverny hook: naming {session}: {e}"))
+                .ok()
+        });
     if let Some(file) = asked_file(feeds, session) {
         let _ = std::fs::create_dir_all(dir(feeds).join(ASKED));
         let _ = std::fs::write(file, "");
@@ -887,12 +961,13 @@ pub fn session_start(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> O
     )
 }
 
-/// What a session start is told: [`ask`], only with the switch `on`, only
-/// for a top-level session (`in_tab`: a Giverny tab's own, not a background
-/// job's or a nested claude's), never a subagent's. Every start asks again
-/// (a `/clear` is a new session; a resume or a compaction is told its
-/// name), and is marked so the prompt hook stays quiet ([`first_prompt`]).
-/// The text alone, for a hook reply that carries more (giverny#373).
+/// What a session start is told, naming it first ([`tell`]): only with the
+/// switch `on`, only for a top-level session (`in_tab`: a Giverny tab's own,
+/// not a background job's or a nested claude's), never a subagent's. Every
+/// start tells again (a `/clear` is a new session and draws a new name; a
+/// resume or a compaction keeps its name), and is marked so the prompt hook
+/// stays quiet ([`first_prompt`]). The text alone, for a hook reply that
+/// carries more (giverny#373).
 pub fn start_context(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> Option<String> {
     if !on || !in_tab || payload.get("agent_id").is_some() {
         return None;
@@ -901,11 +976,14 @@ pub fn start_context(payload: &Value, feeds: &Path, on: bool, in_tab: bool) -> O
     Some(tell(payload, feeds, session))
 }
 
-/// The ask a `UserPromptSubmit` carries when the session's start did not:
-/// its claude predates the plugin's `SessionStart` hook, or the switch was
-/// off then (giverny#356). The same gates as [`session_start`], plus once per
-/// session; `in_tab` is asked only for a session not yet told, as it walks
-/// the process tree. Returns the context text, for the prompt hook's reply.
+/// The naming a `UserPromptSubmit` carries when the session's start did
+/// not: its claude predates the plugin's `SessionStart` hook, or the switch
+/// was off then (giverny#356). It names the session as its start would have
+/// ([`tell`], giverny#401). The same gates as [`session_start`], plus once
+/// per session; `in_tab` is asked only for a session not yet told, as it
+/// walks the process tree. A session told already has its root stamped in
+/// instead, once its transcript has one ([`keep_root`]). Returns the context
+/// text, for the prompt hook's reply.
 pub fn first_prompt(
     payload: &Value,
     feeds: &Path,
@@ -916,7 +994,11 @@ pub fn first_prompt(
         return None;
     }
     let session = session_of(payload)?;
-    if asked_file(feeds, session)?.exists() || !in_tab() {
+    if asked_file(feeds, session)?.exists() {
+        keep_root(feeds, session, transcript_of(payload).as_deref());
+        return None;
+    }
+    if !in_tab() {
         return None;
     }
     Some(tell(payload, feeds, session))
@@ -1050,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ask_goes_out_only_with_the_switch_on_and_never_to_a_subagent() {
+    fn the_name_is_given_only_with_the_switch_on_and_never_to_a_subagent() {
         let feeds = scratch("ask");
         let start = |extra: Value| {
             let mut v = json!({"session_id": "s1", "hook_event_name": "SessionStart",
@@ -1077,18 +1159,29 @@ mod tests {
         );
         let sub = start(json!({"agent_id": "a1"}));
         assert_eq!(session_start(&sub, &feeds, true, true), None, "a subagent");
-        let ask_out = context(session_start(&p, &feeds, true, true).unwrap());
-        assert!(ask_out.contains("run `giverny-manage name`"), "{ask_out}");
-        // Giverny gives the name: nothing to pick (giverny#364).
-        assert!(
-            !ask_out.contains("pick") && !ask_out.contains("<First>"),
-            "{ask_out}"
-        );
-        assert!(!ask_out.contains('\n'), "one line");
-        // Named already (a resume, a compaction): told its name instead.
-        record(&feeds, "s1", "Tamsin Camden", None, || panic!()).unwrap();
+        assert_eq!(read(&feeds, "s1"), None, "nobody named yet");
+        assert!(recorded(&feeds).is_empty());
+        // A fresh start is named right there, before any turn (giverny#401).
         let told = context(session_start(&p, &feeds, true, true).unwrap());
-        assert!(told.contains("Tamsin Camden"), "{told}");
+        let name = read(&feeds, "s1").expect("recorded at the start");
+        let (first, last) = name.split_once(' ').unwrap();
+        assert!(FIRST_NAMES.contains(&first) && SURNAMES.contains(&last));
+        assert!(
+            told.starts_with(&format!("Your name in this session is {name} ")),
+            "{told}"
+        );
+        // Giverny gives the name: nothing to run, nothing to pick
+        // (giverny#364).
+        assert!(!told.contains("run `giverny-manage name`"), "{told}");
+        assert!(
+            !told.contains("pick") && !told.contains("<First>"),
+            "{told}"
+        );
+        assert!(!told.contains('\n'), "one line");
+        // Started again (a compaction): the same name, nothing drawn.
+        let again = context(session_start(&p, &feeds, true, true).unwrap());
+        assert_eq!(again, told);
+        assert_eq!(recorded(&feeds).len(), 1);
         // The hook reads only a SessionStart payload.
         assert!(start_payload(&p.to_string()).is_some());
         assert!(start_payload(r#"{"hook_event_name":"PostToolUse"}"#).is_none());
@@ -1116,27 +1209,97 @@ mod tests {
         let mut sub = prompt("s1");
         sub["agent_id"] = json!("a1");
         assert_eq!(first_prompt(&sub, &feeds, true, yes), None, "a subagent");
+        assert_eq!(read(&feeds, "s1"), None, "nobody named yet");
+        // Named on the prompt, as its start would have (giverny#401).
         let asked = first_prompt(&p, &feeds, true, yes).unwrap();
-        assert!(asked.contains("run `giverny-manage name`"), "{asked}");
+        let name = read(&feeds, "s1").expect("recorded on the prompt");
+        assert!(asked.contains(&name), "{asked}");
+        assert!(!asked.contains("run `giverny-manage name`"), "{asked}");
         assert_eq!(
             first_prompt(&p, &feeds, true, || panic!("no walk once told")),
             None,
             "asked once"
         );
-        // A session its start asked already is not asked again.
+        // A session its start named already is not told again, nor renamed.
         let start = json!({"session_id": "s2", "hook_event_name": "SessionStart",
                            "source": "clear"});
         assert!(session_start(&start, &feeds, true, true).is_some());
+        let s2 = read(&feeds, "s2").unwrap();
         assert_eq!(first_prompt(&prompt("s2"), &feeds, true, yes), None);
+        assert_eq!(read(&feeds, "s2"), Some(s2));
         // One named already is told its name, as its start would have.
         record(&feeds, "s3", "Tamsin Camden", None, || panic!()).unwrap();
         let told = first_prompt(&prompt("s3"), &feeds, true, yes).unwrap();
         assert!(told.contains("Tamsin Camden"), "{told}");
-        // Off at its start, so neither asked nor marked: on later, its next
-        // prompt asks.
+        // Off at its start, so neither named nor marked: on later, its next
+        // prompt names it.
         let s4 = json!({"session_id": "s4", "hook_event_name": "SessionStart"});
         assert_eq!(session_start(&s4, &feeds, false, true), None);
+        assert_eq!(read(&feeds, "s4"), None);
         assert!(first_prompt(&prompt("s4"), &feeds, true, yes).is_some());
+        assert!(read(&feeds, "s4").is_some());
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_session_named_at_its_start_keeps_its_name_across_a_resume() {
+        // giverny#401: named before its first turn, a session has no root
+        // yet; its first prompt or the status line stamps one in once the
+        // transcript has it, and a resume (a new id) finds the name by it.
+        let feeds = scratch("start-resume");
+        set_on(&feeds, true).unwrap();
+        let t = feeds.join("s1.jsonl");
+        let payload = |session: &str, event: &str| {
+            json!({"session_id": session, "hook_event_name": event,
+                   "transcript_path": t.to_str().unwrap()})
+        };
+        // A fresh start: no transcript yet, so no root.
+        session_start(&payload("s1", "SessionStart"), &feeds, true, true).unwrap();
+        let name = read(&feeds, "s1").unwrap();
+        assert!(read_doc(&session_file(&feeds, "s1").unwrap()).unwrap()["root"].is_null());
+        // A prompt before the transcript has a turn: still nothing to stamp.
+        assert_eq!(
+            first_prompt(&payload("s1", "UserPromptSubmit"), &feeds, true, || true),
+            None
+        );
+        assert!(!dir(&feeds).join("roots").exists());
+        // The first turn lands; the next prompt stamps the root.
+        std::fs::write(
+            &t,
+            "{\"type\":\"user\",\"uuid\":\"root-1\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        first_prompt(&payload("s1", "UserPromptSubmit"), &feeds, true, || true);
+        assert_eq!(
+            name_in(&root_file(&feeds, "root-1").unwrap()).as_deref(),
+            Some(name.as_str())
+        );
+        // Resumed under a new id, the same transcript's conversation: the
+        // same name, nothing drawn.
+        let told = session_start(&payload("s2", "SessionStart"), &feeds, true, true).unwrap();
+        assert!(told.contains(&name), "{told}");
+        assert_eq!(read(&feeds, "s2"), Some(name.clone()));
+        assert_eq!(recorded(&feeds).len(), 1, "one name, under two ids");
+
+        // The status line stamps it too, for a session with no prompt hook.
+        let u = feeds.join("s3.jsonl");
+        session_start(
+            &json!({"session_id": "s3", "hook_event_name": "SessionStart",
+                    "transcript_path": u.to_str().unwrap()}),
+            &feeds,
+            true,
+            true,
+        )
+        .unwrap();
+        let s3 = read(&feeds, "s3").unwrap();
+        assert_eq!(shown(&feeds, "s3", Some(&u)), Some(s3.clone()));
+        std::fs::write(
+            &u,
+            "{\"type\":\"user\",\"uuid\":\"root-3\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        assert_eq!(shown(&feeds, "s3", Some(&u)), Some(s3.clone()));
+        assert_eq!(name_in(&root_file(&feeds, "root-3").unwrap()), Some(s3));
         let _ = std::fs::remove_dir_all(&feeds);
     }
 }
