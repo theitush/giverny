@@ -213,6 +213,12 @@ pub struct TabView {
     pub hold: bool,
     /// The frame on screen was held: the next frame is drawn afresh.
     was_held: bool,
+    /// Watches for a paste chord that found no text (giverny#395).
+    paste_chord: input::PasteChord,
+    /// Set by [`TabView::show`] for a frame in which a paste chord found no
+    /// text in the clipboard while the terminal had the keyboard: the app
+    /// looks for an image there and pastes its file (giverny#395).
+    pub paste_image: bool,
 }
 
 /// What the app paints over a tab's grid (the management panel
@@ -321,6 +327,8 @@ impl Default for TabView {
             button_rect: None,
             hold: false,
             was_held: false,
+            paste_chord: input::PasteChord::default(),
+            paste_image: false,
         }
     }
 }
@@ -799,6 +807,19 @@ impl TabView {
                 },
             )
         });
+        // Watched whether focused or not, so a V pressed while a text field
+        // had the keyboard is still known to be pressed when it comes up.
+        let paste_chord = &mut self.paste_chord;
+        // Every event is fed, not just up to the first hit: the tracker has
+        // to see them all.
+        let empty_paste = ui.input(|i| {
+            i.events
+                .iter()
+                .filter(|ev| paste_chord.on_event(ev))
+                .count()
+                > 0
+        });
+        self.paste_image = empty_paste && response.has_focus();
         if !response.has_focus() {
             return;
         }
