@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.6.0 — 2026-10-14
+
+The second-launch raise, the tab walk and every fix below but the last are
+[@theitush](https://github.com/theitush)'s, merged from #13 and #14.
+
+- Launching Giverny while it is already running brings the open window to the
+  front. Before, it opened a second window that never got hook events, so it
+  showed no live Claude states. `GIVERNY_SECOND_WINDOW=1` still opens one, and
+  a build started with `GIVERNY_NO_ACCOUNT_SETUP=1` opens alongside. Linux and
+  macOS; Windows is unchanged.
+
+- Ctrl+Tab and Ctrl+PageUp/PageDown start only the tab you stop on. A restored
+  tab you pass over shows its saved output, dimmed, instead of starting a
+  shell and a `claude --resume` just for being looked at.
+
+- A Claude tab whose subagents are still running after its turn ends shows the
+  background dots, not the idle ring, until they finish.
+
+- After an early usage reset the meter stays at the new number. Sessions that
+  had not asked since used to push it back to the old one.
+
+- Right after `/compact` the status line estimates the new context. `session:`
+  shows it as `~<n>` until the next reply, where it used to keep the figure
+  from before the compaction, and the cold-cache warning counts what the
+  compacted context will cache again.
+
+- WSLg: when a resume from sleep leaves the window missing, Giverny maps it
+  again, and if Windows still does not show it, restarts WSLg's own display
+  client. It does this at most twice before waiting for the window to come
+  back, logs each step to `giverny doctor`, and `GIVERNY_WSLG_WATCHDOG=0`
+  turns it off. When WSLg starts without its shared memory, which makes typing
+  lag, the rail says so and gives the fix. A Giverny started from inside
+  Giverny stays on OpenGL, where it used to crash on an inherited d3d12
+  driver.
+
+- Run from inside a Claude session, `giverny --version` and the commands
+  Claude Code runs for hooks and the status line no longer print "cleared N
+  inherited Claude session marker(s)".
+
 ## v1.5.0 — 2026-10-12
 
 Tab closing, the status line refresh and the prompt bar fixes are
