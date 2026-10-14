@@ -110,6 +110,32 @@ pub struct FeedRow {
     /// How late (`+`) or early (`-`) a Done row landed against `eta_s`, when
     /// the writer knows better than `(ended − started) − eta_s`.
     pub eta_delta_s: Option<i64>,
+    /// What the worker said was left at its latest `eta` on the Running row,
+    /// in seconds (giverny#402): the pane counts down from it, less the work
+    /// done since [`Self::left_at_ms`]. `eta_s` beside it adds the wall time
+    /// up to the figure, so counting down from `eta_s` less the work so far
+    /// took every off-clock span before the figure off twice. `None` on a
+    /// row never re-estimated since its `start`, and in feeds from before.
+    pub left_s: Option<u64>,
+    /// When `left_s` was given, on the row's clock: a pause closed after it
+    /// moves it on as it moves `started` on, and one open when it was given
+    /// puts it at the pause's start.
+    pub left_at_ms: Option<u64>,
+    /// `giverny manage`: the seconds of closed waiting spans (`eta --why
+    /// wait`), left out of the working time a Done row is measured by.
+    pub wait_s: Option<u64>,
+    /// `giverny manage`: the dispatcher's figure at the start, kept when a
+    /// worker's `eta` replaced `eta_s`; `eta_guess_s` the raw guess a row
+    /// from before giverny#229 kept beside a corrected `eta_s`. A Done row
+    /// with no worker's re-estimate is measured against the first of
+    /// them, else `eta_s` ([`done_delta`]).
+    pub eta_first_s: Option<u64>,
+    pub eta_guess_s: Option<u64>,
+    /// `giverny manage`: the worker's first re-estimate of the time left,
+    /// and the working time it was given at: what a Done row is measured
+    /// against when it has one (giverny#402, [`done_delta`]).
+    pub reest_s: Option<u64>,
+    pub reest_at_s: Option<u64>,
     pub landing: Option<String>,
     pub tokens: Option<u64>,
     /// What a reused worker's task spent, written when it landed: its
@@ -427,6 +453,13 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         paused_since_ms: millis_field(v, "paused_since"),
         eta_s: u64_field(v, "eta_s"),
         eta_delta_s: i64_field(v, "eta_delta_s"),
+        left_s: u64_field(v, "left_s"),
+        left_at_ms: millis_field(v, "left_at"),
+        wait_s: u64_field(v, "wait_s"),
+        eta_first_s: u64_field(v, "eta_first_s"),
+        eta_guess_s: u64_field(v, "eta_guess_s"),
+        reest_s: u64_field(v, "reest_s"),
+        reest_at_s: u64_field(v, "reest_at_s"),
         landing: str_field(v, "landing"),
         tokens: u64_field(v, "tokens"),
         task_tokens: u64_field(v, "task_tokens"),
@@ -890,23 +923,87 @@ impl<L: LiveAgent> PaneRow<'_, L> {
             .or_else(|| self.feed.and_then(|f| f.tokens))
     }
 
-    /// A Done row's ETA cell, in seconds: `eta_delta_s` when the feed sent
-    /// it, else `(ended − started) − eta_s`, less the ms `off_ms` says of
-    /// that span nothing ran (the machine slept, [`crate::sleeps`]). `None`
-    /// on any other stage, or when there is no estimate to compare with.
-    pub fn eta_delta_s(&self, off_ms: &dyn Fn(u64, u64) -> u64) -> Option<i64> {
+    /// The worker's latest figure on a re-estimated row (giverny#402): when
+    /// it was given, never before the row's clock starts, and the seconds it
+    /// said were left then. A Running row's time left is that figure less
+    /// the work done since; `None` on a row never re-estimated since its
+    /// `start`, which counts down from `eta_s` and its start.
+    pub fn last_figure(&self) -> Option<(u64, u64)> {
+        let f = self.feed?;
+        let (at, left) = f.left_at_ms.zip(f.left_s)?;
+        Some((self.row_started_ms().map_or(at, |s| at.max(s)), left))
+    }
+
+    /// A Done row's ETA cell, in seconds, and the figure it is measured
+    /// against: `eta_delta_s` when the feed sent it, else [`done_delta`]
+    /// over the row's working time as the history counts it — its clock's
+    /// end less its start (already moved on by pauses), its waits
+    /// (`wait_s`) and the ms `off_ms` says of it nothing ran (the machine
+    /// slept, [`crate::sleeps`]). `None` on any other stage, or when there is no
+    /// estimate to compare with.
+    pub fn eta_delta_s(&self, off_ms: &dyn Fn(u64, u64) -> u64) -> Option<(i64, Against)> {
         if self.stage != Stage::Done {
             return None;
         }
         let f = self.feed?;
         if let Some(d) = f.eta_delta_s {
-            return Some(d);
+            return Some((d, Against::Given));
         }
-        let eta = f.eta_s? as i64;
+        // The row's own clock, as its ELAPSED: a writer may stamp a reused
+        // worker's task late. `giverny manage`'s `started` is the worker's
+        // start to within the seconds of a spawn, which is where
+        // `reest_at_s` and the history count from.
         let (start, end) = (self.row_started_ms()?, self.ended_ms()?);
-        let took_ms = end as i64 - start as i64 - off_ms(start, end) as i64;
-        Some(took_ms.div_euclid(1000) - eta)
+        let work_s = end.saturating_sub(start).saturating_sub(off_ms(start, end)) / 1000;
+        let work_s = work_s.saturating_sub(f.wait_s.unwrap_or(0));
+        let estimate = f.eta_guess_s.or(f.eta_first_s).or(f.eta_s);
+        done_delta(work_s, f.reest_s.zip(f.reest_at_s), estimate)
     }
+}
+
+/// What a Done row's ± was measured against (giverny#402): the overlay
+/// header names it, `vs worker's 40m` or `vs estimate 30m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Against {
+    /// The worker's first re-estimate of the time left, in seconds.
+    Worker(u64),
+    /// The dispatcher's figure at the start, in seconds.
+    Estimate(u64),
+    /// The writer's own `eta_delta_s`, whose figure is not known.
+    Given,
+}
+
+impl Against {
+    /// The words after `vs` in the overlay header.
+    pub fn label(self) -> String {
+        match self {
+            Against::Worker(s) => format!("worker's {}", fmt_span(s as i64)),
+            Against::Estimate(s) => format!("estimate {}", fmt_span(s as i64)),
+            Against::Given => "estimate".into(),
+        }
+    }
+}
+
+/// How late (`+`) or early (`-`) a landed task was, in seconds, and against
+/// what (giverny#402): with the worker's first re-estimate (`reest`: the
+/// seconds it said were left, and the working seconds it was given at),
+/// the work done after it less that figure; else the whole work less the
+/// dispatcher's `estimate`. The two pairs `manage_history`'s tracks score
+/// (`Track::Reestimate`, `Track::Guess`), so the pane's ± and `accuracy`
+/// read the same. Not the latest figure: one given five minutes before the
+/// landing says nothing of how the estimate went. `work_s` is the task's
+/// working time as the history counts it.
+pub fn done_delta(
+    work_s: u64,
+    reest: Option<(u64, u64)>,
+    estimate: Option<u64>,
+) -> Option<(i64, Against)> {
+    if let Some((left, at)) = reest {
+        let after = work_s.saturating_sub(at);
+        return Some((after as i64 - left as i64, Against::Worker(left)));
+    }
+    let e = estimate?;
+    Some((work_s as i64 - e as i64, Against::Estimate(e)))
 }
 
 /// Which of a session's merged rows its pane draws (giverny#357): every
@@ -2311,12 +2408,13 @@ mod tests {
     fn done_row_eta_delta() {
         let f = parse(FULL.as_bytes()).unwrap();
         let rows = merge::<Live>(Some(&f), &[]);
+        let est = Against::Estimate(2400);
         // 45 min taken against a 40 min estimate: 5 min late.
         let done = rows.iter().find(|r| r.stage == Stage::Done).unwrap();
-        assert_eq!(done.eta_delta_s(&|_, _| 0), Some(300));
-        assert_eq!(fmt_delta(done.eta_delta_s(&|_, _| 0).unwrap()), "(+5m)");
+        assert_eq!(done.eta_delta_s(&|_, _| 0), Some((300, est)));
+        assert_eq!(fmt_delta(done.eta_delta_s(&|_, _| 0).unwrap().0), "(+5m)");
         // Ten minutes of it the machine slept: five under, not five over.
-        assert_eq!(done.eta_delta_s(&|_, _| 600_000), Some(-300));
+        assert_eq!(done.eta_delta_s(&|_, _| 600_000), Some((-300, est)));
         // Only Done rows carry one.
         assert!(
             rows.iter()
@@ -2328,32 +2426,36 @@ mod tests {
         r.eta_s = Some(7200);
         r.started_ms = Some(0);
         r.ended_ms = Some(2_400_000);
-        let f = Feed {
-            rows: vec![r.clone()],
-            ..Default::default()
+        let delta = |r: &FeedRow| {
+            let f = Feed {
+                rows: vec![r.clone()],
+                ..Default::default()
+            };
+            merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0)
         };
-        assert_eq!(
-            merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0),
-            Some(-4800)
-        );
+        assert_eq!(delta(&r), Some((-4800, Against::Estimate(7200))));
+        // giverny#402: a worker's re-estimate replaced `eta_s`; the row is
+        // measured against the dispatcher's figure, kept as `eta_first_s`,
+        // by the whole work less its waits.
+        r.eta_first_s = Some(1800);
+        r.wait_s = Some(300);
+        assert_eq!(delta(&r), Some((300, Against::Estimate(1800))));
+        // With the worker's first re-estimate, against it: "20m left" at
+        // 15 minutes of work, landed at 35: on the minute, whatever later
+        // figure ended in `eta_s`.
+        r.reest_s = Some(1200);
+        r.reest_at_s = Some(900);
+        assert_eq!(delta(&r), Some((0, Against::Worker(1200))));
+        assert_eq!(Against::Worker(1200).label(), "worker's 20m");
+        assert_eq!(Against::Estimate(1800).label(), "estimate 30m");
         // The writer's own delta wins.
         r.eta_delta_s = Some(60);
-        let f = Feed {
-            rows: vec![r.clone()],
-            ..Default::default()
-        };
-        assert_eq!(
-            merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0),
-            Some(60)
-        );
+        assert_eq!(delta(&r), Some((60, Against::Given)));
         // No estimate, no cell.
-        r.eta_delta_s = None;
-        r.eta_s = None;
-        let f = Feed {
-            rows: vec![r],
-            ..Default::default()
-        };
-        assert_eq!(merge::<Live>(Some(&f), &[])[0].eta_delta_s(&|_, _| 0), None);
+        let mut r = row("k", Stage::Done, None);
+        r.started_ms = Some(0);
+        r.ended_ms = Some(2_400_000);
+        assert_eq!(delta(&r), None);
     }
 
     #[test]
