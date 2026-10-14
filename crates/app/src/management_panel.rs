@@ -1572,21 +1572,28 @@ fn format_row(
         .filter(|_| row.stage == Stage::Running)
         .and_then(|l| l.stopped());
     let error_ms = |s: u64, e: u64| l.map_or(0, |l| l.stopped_ms(s, e));
-    let work_s = match (row.stage, row_start) {
+    // Where a Running row's clock stands now.
+    let stop = match (row.stage, row_start) {
         (Stage::Running, Some(s)) => {
             let mut stop = clock_stop(paused, written, now_ms);
             if let Some((since, _)) = &stopped {
                 stop = stop.min((*since).max(s));
             }
-            Some(
-                stop.saturating_sub(s)
-                    .saturating_sub(off_ms(holds, clock.sleeps, s, stop))
-                    .saturating_sub(error_ms(s, stop))
-                    / 1000,
-            )
+            Some(stop)
         }
         _ => None,
     };
+    // The work in `[from, stop]`, in seconds: its wall time less every span
+    // the account was out of its limit, the machine slept or the worker
+    // stood on an error.
+    let work_since = |from: u64, stop: u64| {
+        let from = from.min(stop);
+        stop.saturating_sub(from)
+            .saturating_sub(off_ms(holds, clock.sleeps, from, stop))
+            .saturating_sub(error_ms(from, stop))
+            / 1000
+    };
+    let work_s = row_start.zip(stop).map(|(s, stop)| work_since(s, stop));
     let elapsed = match row.stage {
         Stage::Planned => String::new(),
         Stage::Running => work_s.map(stopwatch).unwrap_or_default(),
@@ -1604,29 +1611,46 @@ fn format_row(
         }
     };
     // A worker no feed row carries: its agent ETA, counted from its start.
-    let agent_eta = l
+    let agent = l
         .filter(|_| f.is_none())
-        .and_then(|l| clock.etas.get(&l.id))
-        .zip(row_start)
-        .map(|(e, s)| e.total_s(s));
+        .and_then(|l| clock.etas.get(&l.id));
+    let agent_eta = agent.zip(row_start).map(|(e, s)| e.total_s(s));
     let eta_s = f.and_then(|f| f.eta_s).or(agent_eta);
+    // The latest figure given mid-run, and when: a re-estimated feed row's,
+    // else the agent ETA's, never before the row's clock starts.
+    let figure = row
+        .last_figure()
+        .or_else(|| agent.map(|e| (row_start.map_or(e.at_ms, |s| e.at_ms.max(s)), e.left_s)));
+    // A Done row's ± and the figure it was measured against (giverny#402):
+    // the feed row's ([`feed::PaneRow::eta_delta_s`]), else an agent ETA's
+    // first figure, by the work since it. Its later figures are the
+    // worker's, but which came first from it is not kept.
+    let delta = match row.stage {
+        Stage::Done => row.eta_delta_s(&slept_ms).or_else(|| {
+            let e = agent?;
+            let at = row_start.map_or(e.first_at_ms, |s| e.first_at_ms.max(s));
+            let end = row.ended_ms()?.max(at);
+            let work_s = (end - at).saturating_sub(slept_ms(at, end)) / 1000;
+            feed::done_delta(work_s, None, Some(e.first_left_s))
+        }),
+        _ => None,
+    };
     let eta = match row.stage {
-        Stage::Running => match (eta_s, work_s) {
-            (Some(eta), Some(work)) => countdown(eta as i64 - work as i64),
+        // Re-estimated: the worker's latest figure less the work since it
+        // was given (giverny#402). Off-clock spans before it are in neither,
+        // those after still come off; `eta_s` less the work since the start
+        // took the ones before it off twice, being wall time up to the figure.
+        Stage::Running => match (figure, stop, eta_s, work_s) {
+            (Some((at, left)), Some(stop), _, _) => {
+                countdown(left as i64 - work_since(at, stop) as i64)
+            }
+            (_, _, Some(eta), Some(work)) => countdown(eta as i64 - work as i64),
             _ => String::new(),
         },
         Stage::Planned => eta_s
             .map(|e| format!("~{}", feed::fmt_span(e as i64)))
             .unwrap_or_default(),
-        Stage::Done => row
-            .eta_delta_s(&slept_ms)
-            .or_else(|| {
-                let (s, e) = (row_start?, row.ended_ms()?);
-                let took_ms = e.checked_sub(s)?.saturating_sub(slept_ms(s, e));
-                Some((took_ms / 1000) as i64 - agent_eta? as i64)
-            })
-            .map(feed::fmt_delta)
-            .unwrap_or_default(),
+        Stage::Done => delta.map(|(d, _)| feed::fmt_delta(d)).unwrap_or_default(),
     };
     let no_eta = row.stage == Stage::Running && eta_s.is_none();
     // What the task holds in the machine ledger is in the overlay header; a
@@ -1697,7 +1721,8 @@ fn format_row(
             .unwrap_or_default(),
     };
     let tokens = row.tokens().map(fmt_tokens).unwrap_or_default();
-    let mut facts = row_facts(row.stage, &elapsed, &eta, &now, &tokens);
+    let vs = delta.map_or_else(|| "estimate".into(), |(_, a)| a.label());
+    let mut facts = row_facts(row.stage, &elapsed, &eta, &vs, &now, &tokens);
     if no_eta {
         facts.insert(
             1.min(facts.len()),
@@ -1910,13 +1935,22 @@ pub const NO_WORKER_YET: &str = "no worker yet";
 pub const PAUSED_FINISHED: &str = "paused · worker finished";
 
 /// The overlay header's facts, from the row's own cells before any ditto.
-fn row_facts(stage: Stage, elapsed: &str, eta: &str, now: &str, tokens: &str) -> Vec<String> {
+/// `vs` names what a Done row's ± was measured against (giverny#402):
+/// `worker's 40m`, `estimate 30m`.
+fn row_facts(
+    stage: Stage,
+    elapsed: &str,
+    eta: &str,
+    vs: &str,
+    now: &str,
+    tokens: &str,
+) -> Vec<String> {
     let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
     let v = match stage {
         Stage::Done => [
             some(now),
             some(elapsed).map(|e| format!("took {e}")),
-            some(eta).map(|d| format!("{d} vs estimate")),
+            some(eta).map(|d| format!("{d} vs {vs}")),
             some(tokens).map(|t| format!("{t} tokens")),
         ],
         Stage::Running => [
@@ -3340,6 +3374,22 @@ mod tests {
         );
         let t = build_at(None, &done, T0, &clock, &Logs::new());
         assert_eq!(t.lines[0].eta, feed::fmt_delta(300 - 540));
+
+        // Asleep from ten seconds in until the figure (giverny#402): the
+        // figure is less the work since it, the sleep in neither.
+        let nap = [sleeps::Span {
+            since: 1_789_999_710_000,
+            until: at,
+        }];
+        let napped = Clock {
+            sleeps: &nap,
+            etas: &etas,
+            ..Clock::plain()
+        };
+        let t = build_at(None, &rows, T0, &napped, &Logs::new());
+        assert_eq!(t.lines[0].eta, countdown(240), "not ~5m");
+        let t = build_at(None, &done, T0, &napped, &Logs::new());
+        assert_eq!(t.lines[0].eta, feed::fmt_delta(240 - 480), "not (-5m)");
 
         // A feed row's estimate wins, and so does its key.
         let f = feed(r#"{"rows":[{"key":"g#3","stage":"running","agent_id":"a1","eta_s":1800}]}"#);
@@ -5775,6 +5825,155 @@ mod tests {
             &Logs::new(),
         );
         assert_eq!(t.lines[0].elapsed, "5:00");
+    }
+
+    /// A Running row re-estimated at `T0 + at` minutes: "`left` minutes
+    /// left", ten minutes after its worker started at `T0 − 10m`. `eta_s`
+    /// is what the CLI writes beside the figure: the wall time up to it
+    /// plus the figure.
+    fn re_estimated(at: u64, left: u64) -> Feed {
+        feed(&format!(
+            r#"{{"rows":[{{"key":"g#1","stage":"running","agent_id":"a1",
+                "started":{s},"eta_s":{eta},"eta_at":{t},"left_s":{l},"left_at":{t}}}]}}"#,
+            s = T0 - 10 * MIN,
+            eta = (at + 10) * 60 + left * 60,
+            t = T0 + at * MIN,
+            l = left * 60,
+        ))
+    }
+
+    #[test]
+    fn a_re_estimate_counts_down_by_the_work_since_it() {
+        // giverny#402: ten minutes of work, then a five-hour limit, then
+        // "30m left" as the limit lifts. Ten minutes on, 20 are left: the
+        // hold before the figure is in neither the figure nor the work.
+        let (rows, _) = ten_minutes_in();
+        let f = re_estimated(300, 30);
+        let hold = |until| Hold {
+            since_ms: T0,
+            until_ms: until,
+            reopens_ms: Some(T0 + 300 * MIN),
+        };
+        let held = [hold(Some(T0 + 300 * MIN))];
+        let now = T0 + 310 * MIN;
+        let t = build_at(Some(&f), &rows, now, &utc(&held, None), &Logs::new());
+        assert_eq!(t.lines[0].elapsed, "20:00");
+        assert_eq!(t.lines[0].eta, "~20m", "not ~5h20m");
+        // A night asleep before the figure is the same.
+        let night = [sleeps::Span {
+            since: T0,
+            until: T0 + 300 * MIN,
+        }];
+        let clock = Clock {
+            sleeps: &night,
+            ..utc(&[], None)
+        };
+        let t = build_at(Some(&f), &rows, now, &clock, &Logs::new());
+        assert_eq!(t.lines[0].eta, "~20m");
+        // A limit out after the figure still stops the countdown.
+        let after = [
+            hold(Some(T0 + 300 * MIN)),
+            Hold {
+                since_ms: T0 + 305 * MIN,
+                until_ms: None,
+                reopens_ms: None,
+            },
+        ];
+        for later in [310, 400, 900] {
+            let t = build_at(
+                Some(&f),
+                &rows,
+                T0 + later * MIN,
+                &utc(&after, None),
+                &Logs::new(),
+            );
+            assert_eq!(t.lines[0].eta, "~25m", "{later}");
+        }
+        // A feed from before the figure was kept counts down as it did.
+        let old = feed(&format!(
+            r#"{{"rows":[{{"key":"g#1","stage":"running","agent_id":"a1",
+                "started":{},"eta_s":{},"eta_at":{}}}]}}"#,
+            T0 - 10 * MIN,
+            340 * 60,
+            T0 + 300 * MIN,
+        ));
+        let t = build_at(Some(&old), &rows, now, &utc(&held, None), &Logs::new());
+        assert_eq!(t.lines[0].eta, "~5h20m");
+    }
+
+    #[test]
+    fn a_done_row_is_measured_against_the_workers_first_re_estimate() {
+        // giverny#402: guessed 20m, "30m left" ten minutes in, then asleep
+        // five hours, "5m left" at the last; landed 25 minutes of work
+        // after the first re-estimate: five minutes early against it, not
+        // against the last figure nor the wall time in `eta_s`.
+        let night = [sleeps::Span {
+            since: T0,
+            until: T0 + 300 * MIN,
+        }];
+        let clock = Clock {
+            sleeps: &night,
+            ..utc(&[], None)
+        };
+        let done = |reest: &str| {
+            feed(&format!(
+                r#"{{"rows":[{{"key":"g#1","stage":"done","agent_id":"a1",
+                    "started":{},"ended":{},"eta_s":{},"eta_first_s":1200{reest}}}]}}"#,
+                T0 - 10 * MIN,
+                T0 + 325 * MIN,
+                (330 + 5) * 60,
+            ))
+        };
+        let f = done(r#","reest_s":1800,"reest_at_s":600"#);
+        let t = build_at(Some(&f), &[], T0 + 400 * MIN, &clock, &Logs::new());
+        assert_eq!(t.lines[0].elapsed, "35:00");
+        assert_eq!(t.lines[0].eta, "(-5m)");
+        let facts = &t.lines[0].click.facts;
+        assert!(
+            facts.iter().any(|x| x == "(-5m) vs worker's 30m"),
+            "{facts:?}"
+        );
+        // Never re-estimated by its worker: against the dispatcher's 20m.
+        let f = done("");
+        let t = build_at(Some(&f), &[], T0 + 400 * MIN, &clock, &Logs::new());
+        assert_eq!(t.lines[0].eta, "(+15m)");
+        let facts = &t.lines[0].click.facts;
+        assert!(
+            facts.iter().any(|x| x == "(+15m) vs estimate 20m"),
+            "{facts:?}"
+        );
+    }
+
+    #[test]
+    fn ines_night_row_reads_its_ninety_minutes() {
+        // giverny#402, poly's `44-r4`: started 02:05:10Z, 38s of work, then
+        // the account out of its limit until 07:26:36Z, when Ines said
+        // "90m left". At 07:57:30Z the pane read ~6h20m; 59m is right.
+        let started = 1_791_943_510_000;
+        let given = 1_791_962_796_000;
+        let now = 1_791_964_650_000;
+        let rows = live(&format!(
+            r#"{{"session_id":"s","tasks":[{{"id":"ae934e0c75035a881","status":"running",
+                "startTime":{started},"label":"Editing"}}]}}"#
+        ));
+        let row = |figure: &str| {
+            feed(&format!(
+                r#"{{"rows":[{{"key":"44-r4","stage":"running","agent_id":"ae934e0c75035a881",
+                    "started":"2026-10-14T02:05:10Z","eta_s":24686,
+                    "eta_at":"2026-10-14T07:26:36Z"{figure}}}]}}"#
+            ))
+        };
+        let held = [Hold {
+            since_ms: started + 38_000,
+            until_ms: Some(given),
+            reopens_ms: Some(given),
+        }];
+        let f = row(r#","left_s":5400,"left_at":"2026-10-14T07:26:36Z""#);
+        let t = build_at(Some(&f), &rows, now, &utc(&held, None), &Logs::new());
+        assert_eq!(t.lines[0].eta, "~59m");
+        // Her feed as it is, from before the figure was kept: the bug.
+        let t = build_at(Some(&row("")), &rows, now, &utc(&held, None), &Logs::new());
+        assert_eq!(t.lines[0].eta, "~6h20m");
     }
 
     #[test]

@@ -509,6 +509,11 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
         }
         row.insert("started".into(), Value::String(stamp(started + span)));
     }
+    // The latest figure's moment stands on the same clock (giverny#402):
+    // the pane counts the work since it, which the pause was not.
+    if let Some(at) = ms_of(row, "left_at") {
+        row.insert("left_at".into(), Value::String(stamp(at + span)));
+    }
     let total = u64_of(row, "paused_s").unwrap_or(0) + span / 1000;
     row.insert("paused_s".into(), json!(total));
 }
@@ -1255,6 +1260,8 @@ pub fn apply(
                     "track_told",
                     "track_x",
                     "eta_at",
+                    "left_s",
+                    "left_at",
                     "deadline_asked",
                     "overdue_asked",
                     "after",
@@ -1271,6 +1278,10 @@ pub fn apply(
                 // When the figure was given: the hook's near-the-end ask
                 // leaves a fresh one alone a while.
                 row.insert("eta_at".into(), json!(stamp(now)));
+                // A whole estimate again, counted from `started`: an older
+                // `eta`'s figure no longer stands (giverny#402).
+                row.remove("left_s");
+                row.remove("left_at");
                 told_guess(row, f);
             }
             drop_old_guess(row, f);
@@ -1355,6 +1366,14 @@ pub fn apply(
             row.insert("eta_s".into(), json!(eta));
             if stage == Some(feed::Stage::Running) {
                 row.insert("eta_at".into(), json!(stamp(now)));
+                // The figure itself, and where the row's clock stood when it
+                // was given (giverny#402): the pane and `show` count down from
+                // it by the work since. `eta_s` above is wall time to here
+                // plus the figure, so `eta_s` less the work so far took every
+                // hold, sleep and error span before this off twice.
+                row.insert("left_s".into(), json!(left));
+                let at = ms_of(row, "paused_since").unwrap_or(now);
+                row.insert("left_at".into(), json!(stamp(at)));
             }
             set_str(row, "note", &f.note);
             if stage == Some(feed::Stage::Running) {
@@ -1515,6 +1534,23 @@ fn planned_wait(r: &Map<String, Value>, rows: &[Value]) -> Option<String> {
     })
 }
 
+/// The ms of `[from, upto]` the machine was awake: `show`'s working time.
+/// Empty when `upto` is not after `from`.
+fn work_ms(sleeps: &[sleeps::Span], from: u64, upto: u64) -> u64 {
+    upto.saturating_sub(from)
+        .saturating_sub(sleeps::slept_ms(sleeps, from, upto.max(from)))
+}
+
+/// A re-estimated row's latest figure (giverny#402): where its clock stood
+/// when it was given, never before `started`, and the seconds it said were
+/// left. `None` on a row never re-estimated since its `start`, and in
+/// feeds from before the figure was kept.
+fn last_figure(r: &Map<String, Value>) -> Option<(u64, u64)> {
+    let at = ms_of(r, "left_at")?;
+    let left = u64_of(r, "left_s")?;
+    Some((ms_of(r, "started").map_or(at, |s| at.max(s)), left))
+}
+
 /// The rows as text, in the pane's section order.
 pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
     let rows = doc
@@ -1543,12 +1579,16 @@ pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
             let cell = match want {
                 feed::Stage::Running => {
                     let upto = ms_of(r, "paused_since").unwrap_or(now);
-                    let el = started.map(|s| {
-                        upto.saturating_sub(s)
-                            .saturating_sub(sleeps::slept_ms(sleeps, s, upto))
-                            / 1000
-                    });
-                    let left = eta.zip(el).map(|(e, el)| e as i64 - el as i64);
+                    let el = started.map(|s| work_ms(sleeps, s, upto) / 1000);
+                    // The latest figure less the work since it, as the pane
+                    // counts (giverny#402); else the whole estimate less
+                    // the work since the start.
+                    let left = match last_figure(r) {
+                        Some((at, left)) => {
+                            Some(left as i64 - (work_ms(sleeps, at, upto) / 1000) as i64)
+                        }
+                        None => eta.zip(el).map(|(e, el)| e as i64 - el as i64),
+                    };
                     format!(
                         "{} elapsed, {}{}",
                         el.map(|e| feed::fmt_span(e as i64)).unwrap_or("?".into()),
@@ -1571,17 +1611,23 @@ pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
                     }
                 }
                 feed::Stage::Done => {
-                    let took = started.zip(ms_of(r, "ended")).map(|(s, e)| {
-                        e.saturating_sub(s)
-                            .saturating_sub(sleeps::slept_ms(sleeps, s, e))
-                            / 1000
+                    let took = started
+                        .zip(ms_of(r, "ended"))
+                        .map(|(s, e)| work_ms(sleeps, s, e) / 1000);
+                    // Against the worker's first re-estimate, else the
+                    // dispatcher's figure, by the work the history counts:
+                    // as the pane's Done row (giverny#402).
+                    let delta = record_of(r, "", sleeps).and_then(|h| {
+                        let reest = h.reest_s.zip(h.reest_at_s);
+                        feed::done_delta(h.work_s, reest, h.estimate_s).map(|(d, _)| d)
                     });
                     let landing = r.get("landing").and_then(Value::as_str).unwrap_or("Done");
                     match took {
                         Some(t) => format!(
                             "{landing}, took {}{}",
                             feed::fmt_span(t as i64),
-                            eta.map(|e| format!(" {}", feed::fmt_delta(t as i64 - e as i64)))
+                            delta
+                                .map(|d| format!(" {}", feed::fmt_delta(d)))
                                 .unwrap_or_default()
                         ),
                         None => landing.to_string(),
@@ -3083,10 +3129,84 @@ mod tests {
         let doc: Value =
             serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap()).unwrap();
         assert_eq!(doc["rows"][0]["reest_at_s"], 15 * 60);
+        // The night before the figure is off neither it nor the work
+        // since (giverny#402): not ~8h left.
+        let shown = run(&dir, "show", T0 + 497 * MIN).unwrap();
+        assert!(shown.contains("17m elapsed, ~8m left"), "{shown}");
         run(&dir, "land demo#3", T0 + 500 * MIN).unwrap();
+        let shown = run(&dir, "show", T0 + 500 * MIN).unwrap();
+        assert!(shown.contains("Done, took 20m (-5m)"), "{shown}");
         let last = history(&dir).pop().unwrap();
         assert_eq!((last.wall_s, last.slept_s), (500 * 60, 480 * 60));
         assert_eq!(last.work_s, 20 * 60);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_figure_counts_down_by_the_work_since_it() {
+        // giverny#402: `eta` keeps the figure and where the row's clock
+        // stood, so `show` and the pane count down from it.
+        let dir = scratch("figure");
+        run(&dir, "start a --eta 60", T0).unwrap();
+        let row = |k: &str| {
+            let doc: Value =
+                serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap())
+                    .unwrap();
+            doc["rows"][0][k].clone()
+        };
+        assert_eq!(row("left_s"), Value::Null, "a start is no figure");
+        run(&dir, "eta a 30", T0 + 10 * MIN).unwrap();
+        assert_eq!(row("left_s"), 30 * 60);
+        assert_eq!(row("left_at"), json!(stamp(T0 + 10 * MIN)));
+        assert_eq!(row("eta_s"), 40 * 60, "wall time to it, plus it");
+        let shown = run(&dir, "show", T0 + 20 * MIN).unwrap();
+        assert!(shown.contains("20m elapsed, ~20m left"), "{shown}");
+        // An hour paused after the figure moves its moment on, as `started`.
+        run(&dir, "pause a", T0 + 25 * MIN).unwrap();
+        run(&dir, "resume a", T0 + 85 * MIN).unwrap();
+        assert_eq!(row("left_at"), json!(stamp(T0 + 70 * MIN)));
+        let shown = run(&dir, "show", T0 + 90 * MIN).unwrap();
+        assert!(shown.contains("30m elapsed, ~10m left"), "{shown}");
+        // Given while paused: it counts from the resume.
+        run(&dir, "pause a", T0 + 90 * MIN).unwrap();
+        run(&dir, "eta a 15", T0 + 100 * MIN).unwrap();
+        assert_eq!(row("left_at"), json!(stamp(T0 + 90 * MIN)));
+        let shown = run(&dir, "show", T0 + 120 * MIN).unwrap();
+        assert!(shown.contains("~15m left, paused"), "{shown}");
+        run(&dir, "resume a", T0 + 130 * MIN).unwrap();
+        let shown = run(&dir, "show", T0 + 135 * MIN).unwrap();
+        assert!(shown.contains("35m elapsed, ~10m left"), "{shown}");
+        // A dispatcher's `start --eta` is a whole estimate again.
+        run(&dir, "start a --eta 50", T0 + 140 * MIN).unwrap();
+        assert_eq!(row("left_s"), Value::Null);
+        assert_eq!(row("left_at"), Value::Null);
+        let shown = run(&dir, "show", T0 + 140 * MIN).unwrap();
+        assert!(shown.contains("40m elapsed, ~10m left"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_landing_is_measured_against_the_workers_first_re_estimate() {
+        // giverny#402, part 2: "20m left" at 15 minutes in, "5m" at 40,
+        // landed at 45: ten minutes over the worker's first figure, not
+        // on the minute against the last one.
+        let dir = scratch("against");
+        run(&dir, "start a --eta 30", T0).unwrap();
+        run(&dir, "eta a 20", T0 + 15 * MIN).unwrap();
+        run(&dir, "eta a 5", T0 + 40 * MIN).unwrap();
+        run(&dir, "land a", T0 + 45 * MIN).unwrap();
+        // Never re-estimated: against the dispatcher's figure.
+        run(&dir, "start b --eta 30", T0).unwrap();
+        run(&dir, "land b", T0 + 40 * MIN).unwrap();
+        let shown = run(&dir, "show", T0 + 50 * MIN).unwrap();
+        let line = |k: &str| {
+            let l = shown
+                .lines()
+                .find(|l| l.split_whitespace().nth(1) == Some(k));
+            l.unwrap_or_default().to_string()
+        };
+        assert!(line("a").contains("Done, took 45m (+10m)"), "{shown}");
+        assert!(line("b").contains("Done, took 40m (+10m)"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
