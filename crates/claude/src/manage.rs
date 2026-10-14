@@ -1699,9 +1699,10 @@ fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
 }
 
 /// `name`: record `session`'s name from `given` and print the full name, or
-/// with none print the name it has ([`names`]; a manager named before names
-/// had their own home has it on its feed), else draw it one and record that
-/// (giverny#364: Giverny gives the name, the session picks nothing).
+/// with none print the name it has ([`names`]: in a Giverny tab with the
+/// switch on, recorded at its start, giverny#401; a manager named before
+/// names had their own home has it on its feed), else draw it one and record
+/// that (giverny#364: Giverny gives the name, the session picks nothing).
 fn name(
     dir: &Path,
     session: &str,
@@ -1722,18 +1723,7 @@ fn name(
             {
                 return Ok(name);
             }
-            let root = transcript
-                .as_deref()
-                .and_then(crate::subagents::conversation_root);
-            // A full name: `record` keeps it as given and draws nothing more.
-            names::record(
-                dir,
-                session,
-                &names::draw_name(dir),
-                root.as_deref(),
-                names::draw_surname,
-            )
-            .map(|(name, _)| name)
+            names::draw_and_record(dir, session, transcript.as_deref())
         }
     }
 }
