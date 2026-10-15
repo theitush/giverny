@@ -297,7 +297,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "agents run. A title you typed yourself is never touched.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "rail.animate",
@@ -324,7 +324,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "colour and pace.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "behavior.scrollback_lines",
@@ -820,15 +820,15 @@ mod tests {
         }
     }
 
-    /// Both change how the rail looks, so neither is on until someone
-    /// turns it on, and a file without them reads as off.
+    /// The rail's calm look is the default: both are on until someone
+    /// turns them off, and a file without them reads as on.
     #[test]
-    fn calm_marks_are_opt_in() {
+    fn calm_marks_are_on_by_default() {
         let absent: Config = toml::from_str("[rail]\n[titles]\n").unwrap();
         for key in ["rail.calm_busy", "titles.strip_claude_glyph"] {
             let def = by_key(key).expect("declared");
-            assert!(matches!(def.kind, Kind::Bool { default: false }), "{key}");
-            assert_eq!(current(&absent, def), Some(Value::Bool(false)), "{key}");
+            assert!(matches!(def.kind, Kind::Bool { default: true }), "{key}");
+            assert_eq!(current(&absent, def), Some(Value::Bool(true)), "{key}");
         }
     }
 

@@ -2200,15 +2200,15 @@ mod tests {
     }
 
     #[test]
-    fn the_busy_mark_spins_unless_asked_to_breathe() {
+    fn the_busy_mark_breathes_unless_asked_to_spin() {
         let mut cfg = giverny_core::config::RailConfig::default();
         assert_eq!(
             BusyMark::of(&cfg),
-            BusyMark::Spinner,
-            "the spinner by default"
+            BusyMark::Breath,
+            "the breath by default"
         );
-        cfg.calm_busy = true;
-        assert_eq!(BusyMark::of(&cfg), BusyMark::Breath);
+        cfg.calm_busy = false;
+        assert_eq!(BusyMark::of(&cfg), BusyMark::Spinner);
     }
 
     /// One breath every three seconds, out of step with the amber flag's two,

@@ -50,7 +50,7 @@ impl Default for TitlesConfig {
         TitlesConfig {
             strip_host_prefix: true,
             shorten_paths: false,
-            strip_claude_glyph: false,
+            strip_claude_glyph: true,
         }
     }
 }
@@ -267,7 +267,7 @@ impl Default for RailConfig {
     fn default() -> Self {
         RailConfig {
             animate: true,
-            calm_busy: false,
+            calm_busy: true,
         }
     }
 }
@@ -814,7 +814,11 @@ mod tests {
 
     #[test]
     fn host_prefix_is_stripped_only_when_it_really_is_one() {
-        let cfg = TitlesConfig::default();
+        // Claude's glyph left on, so its title shows the host rule alone.
+        let cfg = TitlesConfig {
+            strip_claude_glyph: false,
+            ..TitlesConfig::default()
+        };
         // The actual shape oh-my-zsh sets, and the reason for the option.
         assert_eq!(
             display_title("yoz@yoz-framework:~/Dev/bobo", &cfg),
@@ -840,14 +844,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_glyph_is_stripped_only_when_asked() {
-        let off = TitlesConfig::default();
-        assert!(!off.strip_claude_glyph, "off unless asked for");
-        assert_eq!(display_title("✳ Fix the parser", &off), "✳ Fix the parser");
-        let on = TitlesConfig {
-            strip_claude_glyph: true,
+    fn claude_glyph_is_stripped_unless_turned_off() {
+        let on = TitlesConfig::default();
+        assert!(on.strip_claude_glyph, "on unless turned off");
+        let off = TitlesConfig {
+            strip_claude_glyph: false,
             ..TitlesConfig::default()
         };
+        assert_eq!(display_title("✳ Fix the parser", &off), "✳ Fix the parser");
         assert_eq!(display_title("✳ Fix the parser", &on), "Fix the parser");
         assert_eq!(display_title("⠐ Fix the parser", &on), "Fix the parser");
         assert_eq!(display_title("◐ Fix the parser", &on), "Fix the parser");
