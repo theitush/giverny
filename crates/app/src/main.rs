@@ -263,19 +263,22 @@ fn pick_renderer(gpu_gl: bool) -> (eframe::Renderer, Option<eframe::wgpu::Backen
     }
 }
 
-/// The fix to offer if WSLg is in its slow, no-shared-memory mode.
-/// Logged here; the rail says it to the user.
-fn wslg_slow_mode() -> Option<&'static str> {
+/// The fixes to offer if WSLg is in its slow, no-shared-memory mode: the one
+/// any shell can run, then the administrator one if that was not enough.
+/// Logged here; the rail says them to the user.
+fn wslg_slow_mode() -> Option<[&'static str; 2]> {
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     if wslg::slow_mode() {
         tracing::warn!(
             "WSLg started without its shared memory with Windows (weston.log: use_gfxredir = 0): \
              every frame goes over RDP as a bitmap and typing will lag. \
-             Fix: `{}` in PowerShell as administrator. It ends all of WSL, this \
-             window and its Claude sessions included; reopen Giverny after",
-            wslg::SLOW_MODE_FIX
+             Fix: `{}` in any PowerShell or cmd (no administrator needed); still slow \
+             after that, `{}` in PowerShell as administrator. Either ends all of WSL, \
+             this window and its Claude sessions included; reopen Giverny after",
+            wslg::SLOW_MODE_FIX,
+            wslg::SLOW_MODE_FIX_ADMIN
         );
-        return Some(wslg::SLOW_MODE_FIX);
+        return Some([wslg::SLOW_MODE_FIX, wslg::SLOW_MODE_FIX_ADMIN]);
     }
     None
 }
@@ -1066,8 +1069,9 @@ pub struct App {
     pub claude: claude_watch::ClaudeWatch,
     pub hooks_banner_dismissed: bool,
     /// WSLg lost its shared memory with Windows and the window lags:
-    /// the command that fixes it, said in the rail until dismissed.
-    pub wslg_slow: Option<&'static str>,
+    /// the commands that fix it, the no-administrator one first, said in the
+    /// rail until dismissed.
+    pub wslg_slow: Option<[&'static str; 2]>,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
     pub palette: Option<overlays::PaletteState>,
