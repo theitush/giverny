@@ -1,29 +1,39 @@
 //! Session names (giverny#343): with Settings → Management panel → "ask
 //! sessions to name themselves" on, every Claude session in a Giverny tab is
 //! named at its start, before its first turn (giverny#401): its
-//! `SessionStart` hook draws a full name, first name and surname both drawn
-//! here ([`draw_name`], giverny#364: sessions left to pick a first name kept
-//! picking the same few), records it, and tells the session. The status line
-//! shows it beside the model from the start: `Opus 5.5 (Tamsin Camden)`.
+//! `SessionStart` hook draws it a first name ([`draw_name`], giverny#364:
+//! sessions left to pick one kept picking the same few), gives it the
+//! surname of where it was born ([`surname`], giverny#434), records it, and
+//! tells the session. The status line shows it beside the model from the
+//! start: `Opus 5.5 (Rotem Giverny)`.
 //!
-//! A name is drawn once: `giverny-manage name` prints the one recorded. A
-//! session may
-//! still give its own: a first name alone gets a drawn surname, a full name
-//! passed in (a revived session keeping its old one) is kept as given, and
-//! naming again with the same first name keeps the surname already drawn, so
-//! nobody is renamed halfway through.
+//! **The surname is the session's category** (giverny#434), as surnames
+//! once were: the rail category its tab sits in when it is named, as Ita
+//! wrote it with the first letter capitalised (`giverny` → `Giverny`,
+//! `ToLaD` stays), else, in no category, its repo. Not drawn. It is fixed
+//! at birth like a real one: recorded with the first name and never
+//! recomputed, so moving or renaming the tab renames nobody, and a resumed
+//! session keeps the name it had, an older drawn one (`Rotem Ashby`) too.
+//!
+//! A name is given once: `giverny-manage name` prints the one recorded. A
+//! session may still give its own: a first name alone takes its category
+//! surname, a full name passed in (a revived session keeping its old one) is
+//! kept as given, and naming again with the same first name keeps the
+//! surname already recorded, so nobody is renamed halfway through.
 //!
 //! **No two live sessions share a first name** (giverny#425): Ita tells his
-//! sessions apart by it. A session is live while its claude runs, by Claude
-//! Code's own registry ([`live_sessions`]), so a first name comes free again
-//! once its session ends and the pool never fills up over months. A drawn
-//! first name is drawn from the pool less the ones live sessions hold
-//! ([`draw_name`]); one given by hand that another live session holds is
-//! refused, naming the holder ([`record`]); and a resumed session takes its
-//! conversation's old name back only while nobody live took that first name
-//! meanwhile ([`find`]), else it is drawn a new one. The same session, or
-//! another id of the same conversation, re-taking its own name is fine. The
-//! full name stays unique against every name ever recorded.
+//! sessions apart by it, two managers in one category above all. A session
+//! is live while its claude runs, by Claude Code's own registry
+//! ([`live_sessions`]), so a first name comes free again once its session
+//! ends and the pool never fills up over months. A drawn first name is
+//! drawn from the pool less the ones live sessions hold ([`draw_name`]); one
+//! given by hand that another live session holds is refused, naming the
+//! holder ([`record`]); and a resumed session takes its conversation's old
+//! name back only while nobody live took that first name meanwhile
+//! ([`find`]), else it is drawn a new one. The same session, or another id
+//! of the same conversation, re-taking its own name is fine. A full name
+//! need not be unique over time: a second Rotem Giverny once the first has
+//! ended is fine.
 //!
 //! **Where a name lives.** Beside the feeds, never in one: a session that
 //! only names itself is no manager, and a feed file would make it one.
@@ -493,129 +503,106 @@ pub const FIRST_NAMES: &[&str] = &[
     "Zuri",
 ];
 
-/// Giverny's own surnames, drawn for every session that gives only a first
-/// name or none.
-pub const SURNAMES: &[&str] = &[
-    "Abernethy",
-    "Aldridge",
-    "Amberley",
-    "Appleyard",
-    "Arkwright",
-    "Ashby",
-    "Atherton",
-    "Bagshaw",
-    "Bainbridge",
-    "Barrowclough",
-    "Beaumont",
-    "Birchall",
-    "Blakemore",
-    "Bosworth",
-    "Bramhall",
-    "Brindley",
-    "Brockhurst",
-    "Burnside",
-    "Cardew",
-    "Carlisle",
-    "Chadwick",
-    "Chalcott",
-    "Cholmondeley",
-    "Clayborne",
-    "Coverdale",
-    "Crabtree",
-    "Cranwell",
-    "Dalloway",
-    "Dashwood",
-    "Dewhurst",
-    "Draycott",
-    "Dunstan",
-    "Edgerton",
-    "Elsworth",
-    "Esterbrook",
-    "Fairfax",
-    "Fanshawe",
-    "Fernley",
-    "Fothergill",
-    "Foxcroft",
-    "Gainsford",
-    "Garside",
-    "Glenister",
-    "Goodenough",
-    "Gresham",
-    "Hadley",
-    "Halliwell",
-    "Hanbury",
-    "Harcourt",
-    "Heathcote",
-    "Hepworth",
-    "Highsmith",
-    "Holbrook",
-    "Huntley",
-    "Ingleby",
-    "Inchbald",
-    "Jarrold",
-    "Keswick",
-    "Kettleby",
-    "Kilbride",
-    "Lambourne",
-    "Langley",
-    "Lavenham",
-    "Lindqvist",
-    "Lowther",
-    "Maplethorpe",
-    "Marchbank",
-    "Merriweather",
-    "Middleton",
-    "Moorcroft",
-    "Morland",
-    "Nettleford",
-    "Newbold",
-    "Northam",
-    "Oldcastle",
-    "Ormerod",
-    "Oxley",
-    "Padgett",
-    "Partridge",
-    "Penrose",
-    "Pinkerton",
-    "Ponsonby",
-    "Quennell",
-    "Radley",
-    "Ramsbottom",
-    "Ravenscroft",
-    "Redfern",
-    "Rowntree",
-    "Rushworth",
-    "Saltonstall",
-    "Seddon",
-    "Shackleton",
-    "Sherwood",
-    "Slingsby",
-    "Southwell",
-    "Spalding",
-    "Stainforth",
-    "Stirling",
-    "Swaffham",
-    "Tattersall",
-    "Tennyson",
-    "Thackeray",
-    "Thirlwell",
-    "Tolland",
-    "Trevelyan",
-    "Tunstall",
-    "Upcott",
-    "Verity",
-    "Wainwright",
-    "Walbrook",
-    "Warburton",
-    "Westbrook",
-    "Whitcombe",
-    "Willoughby",
-    "Winterbourne",
-    "Woodhouse",
-    "Wrexham",
-    "Yardley",
-    "Youngblood",
-];
+/// The environment variable a Giverny tab's shell carries the name of the
+/// rail category the tab sits in when its shell starts (giverny#434): what a
+/// session born there takes as its surname ([`surname`]).
+pub const CATEGORY_ENV: &str = "GIVERNY_CATEGORY";
+
+/// The surname a session is born with (giverny#434): the name of the rail
+/// category its tab sits in, as Ita wrote it, first letter capitalised
+/// (`giverny` → `Giverny`, `ToLaD` stays); with no category, the repo it
+/// runs in (`cwd`'s git root, a worktree counting as its main checkout,
+/// else `cwd`'s own name). Not drawn: like a real surname it says where a
+/// session comes from, and it is fixed at birth: recorded with the first
+/// name, it is never recomputed, so moving or renaming the tab later
+/// renames nobody. `feeds` is the app's feed directory, which finds its
+/// `state/tabs.json` when the tab's shell predates [`CATEGORY_ENV`].
+pub fn surname(feeds: &Path, cwd: Option<&Path>) -> String {
+    surname_in(&|name| std::env::var(name).ok(), feeds, cwd)
+}
+
+/// [`surname`], reading the environment through `get`.
+pub fn surname_in(
+    get: &dyn Fn(&str) -> Option<String>,
+    feeds: &Path,
+    cwd: Option<&Path>,
+) -> String {
+    let var = |name: &str| crate::lineage::giverny_var_in(name, get);
+    var(CATEGORY_ENV)
+        .and_then(|c| as_surname(&c))
+        .or_else(|| as_surname(&tab_category(&tabs_file(feeds)?, &var("GIVERNY_TAB_ID")?)?))
+        .or_else(|| {
+            let cwd = cwd
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())?;
+            as_surname(&crate::manage_history::repo_of("", &cwd)?)
+        })
+        .unwrap_or_else(|| "Giverny".to_string())
+}
+
+/// The app's saved workspace beside its feed directory
+/// (`<base>/feeds` → `<base>/state/tabs.json`); none for a feed directory
+/// that is not one of the app's own.
+fn tabs_file(feeds: &Path) -> Option<PathBuf> {
+    if feeds.file_name()? != "feeds" {
+        return None;
+    }
+    Some(feeds.parent()?.join("state").join("tabs.json"))
+}
+
+/// The name of the category tab `tab` (`giverny-<n>`, as `GIVERNY_TAB_ID`
+/// carries it) sits in, by the workspace saved at `tabs`. Read only: the
+/// app owns the file.
+fn tab_category(tabs: &Path, tab: &str) -> Option<String> {
+    let n: u64 = tab.trim().strip_prefix("giverny-")?.parse().ok()?;
+    let doc: Value = serde_json::from_slice(&std::fs::read(tabs).ok()?).ok()?;
+    let ws = doc.get("workspace")?;
+    let category = ws
+        .get("tabs")?
+        .as_array()?
+        .iter()
+        .find(|t| t.get("id").and_then(Value::as_u64) == Some(n))?
+        .get("category")?
+        .as_u64()?;
+    ws.get("categories")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(Value::as_u64) == Some(category))?
+        .get("name")?
+        .as_str()
+        .map(String::from)
+}
+
+/// `name` as a surname: one word of a name ([`is_word`]), kept readable
+/// rather than refused. Letters, digits and apostrophes stay; spaces and any
+/// other character become one hyphen (`lead machine` → `Lead-machine`);
+/// what does not start with a letter loses its lead (`3D prints` →
+/// `D-prints`); the first letter is capitalised, the rest kept as written.
+/// `None` when no letter is left.
+pub fn as_surname(name: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        let c = if c.is_alphanumeric() || c == '\'' {
+            c
+        } else {
+            '-'
+        };
+        if out.is_empty() && !c.is_alphabetic() {
+            continue;
+        }
+        if c == '-' && out.ends_with('-') {
+            continue;
+        }
+        out.push(c);
+    }
+    let mut out: String = out.chars().take(40).collect();
+    while out.ends_with(['-', '\'']) {
+        out.pop();
+    }
+    let mut chars = out.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
 
 /// `<feeds>/names`.
 pub fn dir(feeds: &Path) -> PathBuf {
@@ -780,11 +767,11 @@ fn is_word(w: &str) -> bool {
 
 /// The full name `given` makes: two words are kept as given; one word keeps
 /// `previous` when its first name is the same (case aside), else takes the
-/// surname `draw()` gives.
+/// session's surname, `surname()` ([`surname`], giverny#434).
 pub fn full_name(
     given: &str,
     previous: Option<&str>,
-    draw: impl FnOnce() -> String,
+    surname: impl FnOnce() -> String,
 ) -> Result<String, String> {
     let words: Vec<&str> = given.split_whitespace().collect();
     let bad = || {
@@ -805,7 +792,7 @@ pub fn full_name(
             });
             Ok(match kept {
                 Some(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
-                None => format!("{first} {}", draw()),
+                None => format!("{first} {}", surname()),
             })
         }
         _ => Err(bad()),
@@ -822,11 +809,6 @@ fn pick(list: &[&str]) -> String {
         .unwrap_or(0);
     let n = std::collections::hash_map::RandomState::new().hash_one((seed, std::process::id()));
     list[(n % list.len() as u64) as usize].to_string()
-}
-
-/// A surname from [`SURNAMES`], at random.
-pub fn draw_surname() -> String {
-    pick(SURNAMES)
 }
 
 /// A first name from [`FIRST_NAMES`], at random.
@@ -914,49 +896,20 @@ fn held_by<'a>(held: &'a [Holder], name: &str) -> Option<&'a Holder> {
         .find(|h| first_of(&h.name).as_deref() == Some(first.as_str()))
 }
 
-/// How many times [`draw_name`] draws again past a name already taken.
-const REDRAWS: usize = 16;
-
 /// A full name for a session that has none (giverny#364): a first name no
 /// session in `held` holds (giverny#425: drawn from the pool less theirs,
-/// not hoped for), and a surname, drawn again while the pair is one already
-/// recorded under `feeds`. Past [`REDRAWS`] the last draw stands: two
-/// sessions may share a full name, they just rarely do. Every first name
-/// held (hundreds of live sessions) draws from the whole pool.
-pub fn draw_name(feeds: &Path, held: &[Holder]) -> String {
-    let taken = recorded(feeds);
+/// not hoped for), and its `surname` ([`surname`], giverny#434). Every first
+/// name held (hundreds of live sessions) draws from the whole pool. Two
+/// sessions may share a full name over time (a second Rotem Giverny once the
+/// first has ended); no two live ones share a first name.
+pub fn draw_name(held: &[Holder], surname: &str) -> String {
     let free: Vec<&str> = FIRST_NAMES
         .iter()
         .copied()
         .filter(|f| held_by(held, f).is_none())
         .collect();
     let pool: &[&str] = if free.is_empty() { FIRST_NAMES } else { &free };
-    untaken(&taken, || format!("{} {}", pick(pool), draw_surname()))
-}
-
-/// Every name recorded under a session id in `feeds`' names directory.
-fn recorded(feeds: &Path) -> std::collections::HashSet<String> {
-    std::fs::read_dir(dir(feeds))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| name_in(&p))
-        .collect()
-}
-
-/// The first of `draw`'s names not in `taken`, or its last after
-/// [`REDRAWS`] more.
-fn untaken(taken: &std::collections::HashSet<String>, mut draw: impl FnMut() -> String) -> String {
-    let mut name = draw();
-    for _ in 0..REDRAWS {
-        if !taken.contains(&name) {
-            break;
-        }
-        name = draw();
-    }
-    name
+    format!("{} {surname}", pick(pool))
 }
 
 /// Record `session`'s name from `given` ([`full_name`]), under its id and,
@@ -969,9 +922,9 @@ pub fn record(
     session: &str,
     given: &str,
     root: Option<&str>,
-    draw: impl FnOnce() -> String,
+    surname: impl FnOnce() -> String,
 ) -> Result<(String, Option<String>), String> {
-    record_among(feeds, session, given, root, draw, &live_sessions(None))
+    record_among(feeds, session, given, root, surname, &live_sessions(None))
 }
 
 /// [`record`] against the `live` sessions given.
@@ -980,7 +933,7 @@ pub fn record_among(
     session: &str,
     given: &str,
     root: Option<&str>,
-    draw: impl FnOnce() -> String,
+    surname: impl FnOnce() -> String,
     live: &Live,
 ) -> Result<(String, Option<String>), String> {
     record_held(
@@ -988,7 +941,7 @@ pub fn record_among(
         session,
         given,
         root,
-        draw,
+        surname,
         &holders(feeds, live, session, root),
     )
 }
@@ -999,13 +952,13 @@ fn record_held(
     session: &str,
     given: &str,
     root: Option<&str>,
-    draw: impl FnOnce() -> String,
+    surname: impl FnOnce() -> String,
     held: &[Holder],
 ) -> Result<(String, Option<String>), String> {
     let file =
         session_file(feeds, session).ok_or_else(|| format!("not a session id: {session:?}"))?;
     let previous = name_in(&file).or_else(|| name_in(&root_file(feeds, root?)?));
-    let name = full_name(given, previous.as_deref(), draw)?;
+    let name = full_name(given, previous.as_deref(), surname)?;
     if let Some(h) = held_by(held, &name) {
         let first = name.split_whitespace().next().unwrap_or(&name);
         return Err(format!(
@@ -1024,15 +977,17 @@ fn record_held(
     Ok((name, previous))
 }
 
-/// Draw `session` a full name ([`draw_name`]) and record it, under its
-/// conversation's root when its `transcript` has one: what a session with
-/// no name gets, from `giverny-manage name` or its start (giverny#401).
+/// Draw `session` a first name and record it with its `surname`
+/// ([`draw_name`]), under its conversation's root when its `transcript` has
+/// one: what a session with no name gets, from `giverny-manage name` or its
+/// start (giverny#401).
 pub fn draw_and_record(
     feeds: &Path,
     session: &str,
     transcript: Option<&Path>,
+    surname: &str,
 ) -> Result<String, String> {
-    draw_and_record_among(feeds, session, transcript, &live_sessions(None))
+    draw_and_record_among(feeds, session, transcript, surname, &live_sessions(None))
 }
 
 /// [`draw_and_record`] against the `live` sessions given: the first name
@@ -1041,19 +996,20 @@ pub fn draw_and_record_among(
     feeds: &Path,
     session: &str,
     transcript: Option<&Path>,
+    surname: &str,
     live: &Live,
 ) -> Result<String, String> {
     let root = transcript.and_then(crate::subagents::conversation_root);
     let held = holders(feeds, live, session, root.as_deref());
-    // A full name: `record` keeps it as given and draws nothing more. Drawn
+    // A full name: `record` keeps it as given and adds nothing. Drawn
     // clear of `held` already, so checked against nobody: with every first
     // name held, the draw from the whole pool still stands.
     record_held(
         feeds,
         session,
-        &draw_name(feeds, &held),
+        &draw_name(&held, surname),
         root.as_deref(),
-        draw_surname,
+        || surname.to_string(),
         &[],
     )
     .map(|(name, _)| name)
@@ -1084,6 +1040,16 @@ fn session_of(payload: &Value) -> Option<&str> {
         .filter(|s| safe(s))
 }
 
+/// The working directory a hook payload names.
+fn cwd_of(payload: &Value) -> Option<PathBuf> {
+    payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The transcript a hook payload names.
 fn transcript_of(payload: &Value) -> Option<PathBuf> {
     payload
@@ -1096,14 +1062,16 @@ fn transcript_of(payload: &Value) -> Option<PathBuf> {
 
 /// Name `session` and say so ([`ask`]): the name it has ([`find`], else
 /// the one on its manager feed), else one drawn and recorded right here
-/// ([`draw_and_record`], giverny#401), so the session has its name before
+/// ([`draw_and_record`], giverny#401) with the surname of the tab it was
+/// born in ([`surname`], giverny#434), so the session has its name before
 /// its first turn. Marked as told, so it is not told again ([`ASKED`]).
 fn tell(payload: &Value, feeds: &Path, session: &str) -> String {
     let transcript = transcript_of(payload);
     let name = find(feeds, session, transcript.as_deref())
         .or_else(|| on_feed(feeds, session))
         .or_else(|| {
-            draw_and_record(feeds, session, transcript.as_deref())
+            let born = surname(feeds, cwd_of(payload).as_deref());
+            draw_and_record(feeds, session, transcript.as_deref(), &born)
                 .inspect_err(|e| eprintln!("giverny hook: naming {session}: {e}"))
                 .ok()
         });
@@ -1196,6 +1164,27 @@ mod tests {
         move || s.to_string()
     }
 
+    /// Every name recorded under a session id in `feeds`' names directory.
+    fn recorded(feeds: &Path) -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir(feeds))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter_map(|p| name_in(&p))
+            .collect()
+    }
+
+    /// An environment of `vars` alone.
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
     #[test]
     fn a_first_name_gets_a_drawn_surname_once_and_keeps_it() {
         let feeds = scratch("draw");
@@ -1228,14 +1217,13 @@ mod tests {
             );
         }
         assert!(read(&feeds, "s3").is_none());
-        assert!(SURNAMES.iter().all(|s| is_word(s)));
-        assert!(SURNAMES.contains(&draw_surname().as_str()));
         let _ = std::fs::remove_dir_all(&feeds);
     }
 
     #[test]
-    fn a_drawn_name_is_a_first_name_and_a_surname_not_already_taken() {
-        // giverny#364: Giverny draws the whole name from its own lists.
+    fn a_drawn_name_is_a_first_name_and_the_sessions_surname() {
+        // giverny#364: Giverny draws the first name from its own list;
+        // giverny#434: the surname is the session's category, not drawn.
         assert!(FIRST_NAMES.len() >= 300, "a few hundred");
         assert!(FIRST_NAMES.iter().all(|s| is_word(s) && s.is_ascii()));
         let unique: std::collections::HashSet<_> = FIRST_NAMES.iter().collect();
@@ -1243,21 +1231,150 @@ mod tests {
         assert!(FIRST_NAMES.contains(&draw_first_name().as_str()));
 
         let feeds = scratch("drawn");
-        let drawn = draw_name(&feeds, &[]);
+        let drawn = draw_name(&[], "Giverny");
         let (first, last) = drawn.split_once(' ').unwrap();
         assert!(FIRST_NAMES.contains(&first), "{drawn}");
-        assert!(SURNAMES.contains(&last), "{drawn}");
+        assert_eq!(last, "Giverny");
         // Recorded as drawn: a full name, kept as given.
         let (n, _) = record(&feeds, "s1", &drawn, None, || panic!("no draw")).unwrap();
         assert_eq!(n, drawn);
-        assert!(recorded(&feeds).contains(&drawn));
+        // Another session, later, in the same category may be the same full
+        // name: only live first names are kept apart (giverny#425).
+        let (n, _) =
+            record_among(&feeds, "s2", first, None, || "Giverny".into(), &Live::new()).unwrap();
+        assert_eq!(n, drawn);
+        let name = draw_and_record_among(&feeds, "s3", None, "ToLaD", &Live::new()).unwrap();
+        assert!(name.ends_with(" ToLaD"), "{name}");
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
 
-        // A pair already recorded is drawn again; past the redraws the last
-        // stands.
-        let taken = recorded(&feeds);
-        let mut draws = [drawn.clone(), "Tamsin Camden".into()].into_iter();
-        assert_eq!(untaken(&taken, || draws.next().unwrap()), "Tamsin Camden");
-        assert_eq!(untaken(&taken, || drawn.clone()), drawn);
+    #[test]
+    fn a_category_as_a_surname_is_kept_readable() {
+        for (category, surname) in [
+            ("giverny", "Giverny"),
+            ("ToLaD", "ToLaD"),
+            ("COO", "COO"),
+            ("lead-machine", "Lead-machine"),
+            ("lead machine", "Lead-machine"),
+            ("  Inbar  ", "Inbar"),
+            ("WeatherBaseline", "WeatherBaseline"),
+            ("3D prints", "D-prints"),
+            ("café ☕ club", "Café-club"),
+            ("poly/markets!", "Poly-markets"),
+            ("o'brien's", "O'brien's"),
+            ("élan", "Élan"),
+        ] {
+            assert_eq!(
+                as_surname(category).as_deref(),
+                Some(surname),
+                "{category:?}"
+            );
+            assert!(is_word(surname), "{surname}");
+            // A first name and it make a full name that is kept as given.
+            assert_eq!(
+                full_name("Rotem", None, || surname.to_string()),
+                Ok(format!("Rotem {surname}"))
+            );
+        }
+        for none in ["", "   ", "123", "☕☕", "--"] {
+            assert_eq!(as_surname(none), None, "{none:?}");
+        }
+        let long = as_surname(&"a-".repeat(60)).unwrap();
+        assert!(is_word(&long) && long.chars().count() <= 40, "{long}");
+    }
+
+    #[test]
+    fn the_surname_is_the_tabs_category_else_its_repo() {
+        let base = scratch("surname");
+        let feeds = base.join("feeds");
+        // A repo, and a worktree of it under its `.claude/worktrees`.
+        let repo = base.join("ToLaD");
+        std::fs::create_dir_all(repo.join(".git/worktrees/w1")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let wt = repo.join(".claude/worktrees/task-1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}/.git/worktrees/w1\n", repo.display()),
+        )
+        .unwrap();
+        let plain = base.join("scratch-dir");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        // The category the tab's shell was started in.
+        let tab = [(CATEGORY_ENV, "giverny"), ("GIVERNY_TAB_ID", "giverny-12")];
+        let at = |vars: &[(&str, &str)], cwd: &Path| surname_in(&env_of(vars), &feeds, Some(cwd));
+        assert_eq!(at(&tab, &repo), "Giverny", "the category, not the repo");
+        assert_eq!(at(&[(CATEGORY_ENV, "lead machine")], &repo), "Lead-machine");
+        // No category: the repo, a worktree counting as its main checkout,
+        // else the directory's own name.
+        assert_eq!(at(&[], &repo.join("src")), "ToLaD");
+        assert_eq!(at(&[], &wt), "ToLaD");
+        assert_eq!(at(&[], &plain), "Scratch-dir");
+        assert_eq!(at(&[(CATEGORY_ENV, " ")], &repo), "ToLaD", "blank is none");
+        assert_eq!(at(&[(CATEGORY_ENV, "☕")], &repo), "ToLaD", "no letter");
+
+        // A shell started before Giverny set the variable: the tab's
+        // category by the workspace the app saved beside its feeds.
+        std::fs::create_dir_all(base.join("state")).unwrap();
+        std::fs::write(
+            base.join("state/tabs.json"),
+            json!({"version": 1, "workspace": {
+                "categories": [{"id": 3, "name": "WeatherBaseline"},
+                               {"id": 21, "name": "inbar"}],
+                "tabs": [{"id": 12, "category": 21}, {"id": 7, "category": 3}]}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(at(&[("GIVERNY_TAB_ID", "giverny-12")], &repo), "Inbar");
+        assert_eq!(
+            at(&[("GIVERNY_TAB_ID", "giverny-7")], &repo),
+            "WeatherBaseline"
+        );
+        assert_eq!(at(&[("GIVERNY_TAB_ID", "giverny-99")], &repo), "ToLaD");
+        // The variable wins: it is the tab's own word for it.
+        assert_eq!(at(&tab, &repo), "Giverny");
+        // A feed directory not the app's own has no workspace beside it.
+        assert_eq!(
+            surname_in(
+                &env_of(&[("GIVERNY_TAB_ID", "giverny-12")]),
+                &base,
+                Some(&repo)
+            ),
+            "ToLaD"
+        );
+        // Inside a background job the tab's variables are some other tab's:
+        // the repo.
+        let job = [
+            ("CLAUDE_JOB_DIR", "/home/x/.claude/jobs/abc"),
+            (CATEGORY_ENV, "giverny"),
+            ("GIVERNY_TAB_ID", "giverny-12"),
+        ];
+        assert_eq!(at(&job, &repo), "ToLaD");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_name_it_was_born_with() {
+        // giverny#434: fixed at birth. One named before surnames were
+        // categories keeps its drawn surname across a resume, and naming
+        // again by its first name keeps it too.
+        let feeds = scratch("born");
+        set_on(&feeds, true).unwrap();
+        record(&feeds, "old", "Rotem Ashby", Some("root-1"), || panic!()).unwrap();
+        let t = feeds.join("new.jsonl");
+        std::fs::write(
+            &t,
+            "{\"type\":\"user\",\"uuid\":\"root-1\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        let start = json!({"session_id": "new", "hook_event_name": "SessionStart",
+                           "transcript_path": t.to_str().unwrap(), "source": "resume"});
+        let told = session_start(&start, &feeds, true, true).unwrap();
+        assert!(told.contains("Rotem Ashby"), "{told}");
+        assert_eq!(read(&feeds, "new").as_deref(), Some("Rotem Ashby"));
+        let (n, _) = record(&feeds, "new", "Rotem", Some("root-1"), drawn("Giverny")).unwrap();
+        assert_eq!(n, "Rotem Ashby", "not renamed");
         let _ = std::fs::remove_dir_all(&feeds);
     }
 
@@ -1333,7 +1450,8 @@ mod tests {
         let told = context(session_start(&p, &feeds, true, true).unwrap());
         let name = read(&feeds, "s1").expect("recorded at the start");
         let (first, last) = name.split_once(' ').unwrap();
-        assert!(FIRST_NAMES.contains(&first) && SURNAMES.contains(&last));
+        assert!(FIRST_NAMES.contains(&first), "{name}");
+        assert_eq!(last, surname(&feeds, None), "the session's own surname");
         assert!(
             told.starts_with(&format!("Your name in this session is {name} ")),
             "{told}"
@@ -1499,16 +1617,16 @@ mod tests {
         }
         let mut live = live_of(&ids.iter().map(String::as_str).collect::<Vec<_>>());
         for _ in 0..20 {
-            let name = draw_name(&feeds, &holders(&feeds, &live, "me", None));
+            let name = draw_name(&holders(&feeds, &live, "me", None), "Giverny");
             assert_eq!(name.split_once(' ').unwrap().0, *last, "{name}");
         }
-        let name = draw_and_record_among(&feeds, "me", None, &live).unwrap();
+        let name = draw_and_record_among(&feeds, "me", None, "Giverny", &live).unwrap();
         assert!(name.starts_with(&format!("{last} ")), "{name}");
         // Its session ended: h0's first name is free again (two now, the
         // last being taken by "me" is not live).
         live.remove("h0");
         live.insert("me".into(), PathBuf::new());
-        let name = draw_and_record_among(&feeds, "you", None, &live).unwrap();
+        let name = draw_and_record_among(&feeds, "you", None, "Giverny", &live).unwrap();
         assert!(name.starts_with(&format!("{} ", held[0])), "{name}");
         let _ = std::fs::remove_dir_all(&feeds);
     }

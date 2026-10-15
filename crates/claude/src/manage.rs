@@ -68,10 +68,11 @@ usage: giverny manage <command> [args] [--session <id>]
   name  [<First> | <First Last>]
                               this session's name, printed in full. With no
                               name, the one recorded, else Giverny draws a
-                              first name and a surname and records them. A
-                              first name alone gets a drawn surname (the same
-                              first name again keeps it); a full name is kept
-                              as given
+                              first name, gives it the surname of this tab's
+                              category (else its repo) and records them. A
+                              first name alone takes that surname (the same
+                              first name again keeps the one recorded); a
+                              full name is kept as given
   show                        print the name and the rows
   accuracy [--repo R]         how every estimator's instinct and figures fared
                               against the time really worked, older tasks
@@ -1755,7 +1756,9 @@ fn adopt_continued(dir: &Path, session: &str, cfg: Option<&Path>) {
 /// with none print the name it has ([`names`]: in a Giverny tab with the
 /// switch on, recorded at its start, giverny#401; a manager named before
 /// names had their own home has it on its feed), else draw it one and record
-/// that (giverny#364: Giverny gives the name, the session picks nothing).
+/// that (giverny#364: Giverny gives the name, the session picks nothing). A
+/// first name, given or drawn, takes the surname of the tab's category, else
+/// the repo ([`names::surname`], giverny#434).
 fn name(
     dir: &Path,
     session: &str,
@@ -1765,18 +1768,12 @@ fn name(
     // Live sessions hold their first names (giverny#425): `cfg`'s registry
     // and every account's.
     let live = || names::live_sessions(cfg);
+    let surname = || names::surname(dir, None);
     match given {
         Some(given) => {
             let root = continuation::root_of(cfg, session);
-            names::record_among(
-                dir,
-                session,
-                given,
-                root.as_deref(),
-                names::draw_surname,
-                &live(),
-            )
-            .map(|(name, _)| name)
+            names::record_among(dir, session, given, root.as_deref(), surname, &live())
+                .map(|(name, _)| name)
         }
         None => {
             let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
@@ -1786,7 +1783,7 @@ fn name(
             {
                 return Ok(name);
             }
-            names::draw_and_record_among(dir, session, transcript.as_deref(), &live())
+            names::draw_and_record_among(dir, session, transcript.as_deref(), &surname(), &live())
         }
     }
 }
@@ -3186,19 +3183,19 @@ mod tests {
             flags.claude_dir = Some(dir.join("claude"));
             run_in(&dir, "s1", &cmd, &flags, T0)
         };
-        // No name yet: Giverny draws a whole one and records it
-        // (giverny#364); asking again prints it, never a new draw.
+        // No name yet: Giverny draws a first name, gives it the surname of
+        // where the session runs (giverny#364, #434) and records it; asking
+        // again prints it, never a new draw.
+        let born = names::surname(&dir, None);
         let drawn = name("name").unwrap();
         let (first, last) = drawn.split_once(' ').unwrap();
         assert!(names::FIRST_NAMES.contains(&first), "{drawn}");
-        assert!(names::SURNAMES.contains(&last), "{drawn}");
+        assert_eq!(last, born, "{drawn}");
         assert_eq!(names::read(&dir, "s1").as_deref(), Some(drawn.as_str()));
         assert_eq!(name("name").unwrap(), drawn, "read back, not redrawn");
-        // A first name given still gets a drawn surname, and keeps it.
+        // A first name given takes that surname too, and keeps it.
         let full = name("name Juniper").unwrap();
-        let (first, last) = full.split_once(' ').unwrap();
-        assert_eq!(first, "Juniper");
-        assert!(names::SURNAMES.contains(&last), "{full}");
+        assert_eq!(full, format!("Juniper {born}"));
         assert_eq!(name("name").unwrap(), full, "read back");
         assert_eq!(name("name Juniper").unwrap(), full, "the surname stands");
         // A session that only names itself is no manager: no feed, so no

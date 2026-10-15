@@ -617,7 +617,8 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::ManagementPanel,
         doc: "Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line.",
         note: &[
-            "Giverny draws first name and surname: `Opus 5.5 (Tamsin Camden)`.",
+            "Giverny draws the first name; the surname is the tab's category",
+            "(else its repo): `Opus 5.5 (Rotem Giverny)`.",
             "A session has it before its first turn; `giverny-manage name` reads",
             "it back. Off, no session is named, managers included, and no name",
             "shows on any status line.",

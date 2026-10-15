@@ -853,7 +853,7 @@ const RESET: &str = "\x1b[0m";
 
 /// The model's name, and beside it the session's full name (`giverny manage
 /// name`, giverny#330, giverny#343) in the chrome's accent:
-/// `Opus 5.5 (Tamsin Camden)`. `accent` is asked only when there is a name.
+/// `Opus 5.5 (Rotem Giverny)`. `accent` is asked only when there is a name.
 fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> String) -> String {
     match name {
         Some(name) => format!("{model} {}({name}){RESET}", accent()),
