@@ -128,6 +128,27 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// The config dirs a session on this machine may run under: this process's
+/// own ([`crate::continuation::config_dir`]) and every account found the
+/// way discovery finds them ([`crate::profiles::ambient_dirs`]), `extra`
+/// first when given, each once.
+pub fn ambient_config_dirs(extra: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let candidates = extra
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::continuation::config_dir())
+        .chain(crate::profiles::ambient_dirs());
+    for d in candidates {
+        let key = d.canonicalize().unwrap_or_else(|_| d.clone());
+        if seen.insert(key) {
+            out.push(d);
+        }
+    }
+    out
+}
+
 /// Scan the registries of every config dir for live sessions.
 pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> {
     let mut out = Vec::new();

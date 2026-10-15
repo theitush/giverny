@@ -11,8 +11,19 @@
 //! still give its own: a first name alone gets a drawn surname, a full name
 //! passed in (a revived session keeping its old one) is kept as given, and
 //! naming again with the same first name keeps the surname already drawn, so
-//! nobody is renamed halfway through. Two sessions may share a first name;
-//! the surnames tell them apart.
+//! nobody is renamed halfway through.
+//!
+//! **No two live sessions share a first name** (giverny#425): Ita tells his
+//! sessions apart by it. A session is live while its claude runs, by Claude
+//! Code's own registry ([`live_sessions`]), so a first name comes free again
+//! once its session ends and the pool never fills up over months. A drawn
+//! first name is drawn from the pool less the ones live sessions hold
+//! ([`draw_name`]); one given by hand that another live session holds is
+//! refused, naming the holder ([`record`]); and a resumed session takes its
+//! conversation's old name back only while nobody live took that first name
+//! meanwhile ([`find`]), else it is drawn a new one. The same session, or
+//! another id of the same conversation, re-taking its own name is fine. The
+//! full name stays unique against every name ever recorded.
 //!
 //! **Where a name lives.** Beside the feeds, never in one: a session that
 //! only names itself is no manager, and a feed file would make it one.
@@ -684,13 +695,30 @@ pub fn read(feeds: &Path, session: &str) -> Option<String> {
 
 /// `session`'s name: its own, else the one recorded for the conversation its
 /// transcript holds (a resumed session's new id, giverny#336), which is then
-/// recorded under the new id too, so the next look is one read again.
+/// recorded under the new id too, so the next look is one read again. Not
+/// the conversation's name when another live session took its first name
+/// while this one was gone (giverny#425): then none, and the session is
+/// drawn a new one where it is named.
 pub fn find(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<String> {
+    find_among(feeds, session, transcript, || live_sessions(None))
+}
+
+/// [`find`], asking `live` for the live sessions only when it takes a
+/// conversation's name.
+pub fn find_among(
+    feeds: &Path,
+    session: &str,
+    transcript: Option<&Path>,
+    live: impl FnOnce() -> Live,
+) -> Option<String> {
     if let Some(name) = read(feeds, session) {
         return Some(name);
     }
     let root = crate::subagents::conversation_root(transcript?)?;
     let name = name_in(&root_file(feeds, &root)?)?;
+    if held_by(&holders(feeds, &live(), session, Some(&root)), &name).is_some() {
+        return None;
+    }
     if let Some(file) = session_file(feeds, session) {
         let _ = write_doc(
             &file,
@@ -806,19 +834,104 @@ pub fn draw_first_name() -> String {
     pick(FIRST_NAMES)
 }
 
+/// The sessions live now, each with the directory its claude runs in.
+pub type Live = std::collections::HashMap<String, PathBuf>;
+
+/// The sessions whose claude runs now: Claude Code's own registry
+/// (`sessions/<pid>.json`, pid-checked, [`crate::registry::scan`]) in every
+/// account on the machine, `cfg` first when given. What the panel and the
+/// reach guard call live; a session gone is gone from it, whatever its
+/// files say.
+pub fn live_sessions(cfg: Option<&Path>) -> Live {
+    crate::registry::scan(crate::registry::ambient_config_dirs(cfg))
+        .into_iter()
+        .map(|s| (s.entry.session_id, s.entry.cwd))
+        .collect()
+}
+
+/// A live session and the name it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    pub session: String,
+    pub name: String,
+    /// Where its claude runs: the repo, or the worktree its task is in.
+    pub cwd: PathBuf,
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefix: String = self.session.chars().take(8).collect();
+        write!(f, "{} (session {prefix}", self.name)?;
+        if !self.cwd.as_os_str().is_empty() {
+            let cwd = match dirs::home_dir().and_then(|h| self.cwd.strip_prefix(h).ok()) {
+                Some(rel) => Path::new("~").join(rel),
+                None => self.cwd.clone(),
+            };
+            write!(f, ", in {}", cwd.display())?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// Every `live` session but `session` itself that holds a name: its own
+/// ([`DIR`]), else the one on its manager feed. A session of the same
+/// conversation (`root`: a resume's other id, a job's tab) is `session`
+/// itself under another id, so it holds nothing against it.
+fn holders(feeds: &Path, live: &Live, session: &str, root: Option<&str>) -> Vec<Holder> {
+    let mut out: Vec<Holder> = live
+        .iter()
+        .filter(|(id, _)| id.as_str() != session)
+        .filter_map(|(id, cwd)| {
+            let doc = session_file(feeds, id).and_then(|f| read_doc(&f));
+            let theirs = doc.as_ref().and_then(|d| d.get("root")?.as_str());
+            if root.is_some() && theirs == root {
+                return None;
+            }
+            let name = doc
+                .as_ref()
+                .and_then(doc_name)
+                .or_else(|| on_feed(feeds, id))?;
+            Some(Holder {
+                session: id.clone(),
+                name,
+                cwd: cwd.clone(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.session.cmp(&b.session));
+    out
+}
+
+/// A name's first name, for comparing: case aside.
+fn first_of(name: &str) -> Option<String> {
+    name.split_whitespace().next().map(str::to_lowercase)
+}
+
+/// The holder whose first name is `name`'s, if any.
+fn held_by<'a>(held: &'a [Holder], name: &str) -> Option<&'a Holder> {
+    let first = first_of(name)?;
+    held.iter()
+        .find(|h| first_of(&h.name).as_deref() == Some(first.as_str()))
+}
+
 /// How many times [`draw_name`] draws again past a name already taken.
 const REDRAWS: usize = 16;
 
-/// A full name for a session that has none (giverny#364): a first name and a
-/// surname, both drawn, drawn again while the pair is one already recorded
-/// under `feeds` (a look at the names directory, no registry). Past
-/// [`REDRAWS`] the last draw stands: two sessions may share a name, they
-/// just rarely do.
-pub fn draw_name(feeds: &Path) -> String {
+/// A full name for a session that has none (giverny#364): a first name no
+/// session in `held` holds (giverny#425: drawn from the pool less theirs,
+/// not hoped for), and a surname, drawn again while the pair is one already
+/// recorded under `feeds`. Past [`REDRAWS`] the last draw stands: two
+/// sessions may share a full name, they just rarely do. Every first name
+/// held (hundreds of live sessions) draws from the whole pool.
+pub fn draw_name(feeds: &Path, held: &[Holder]) -> String {
     let taken = recorded(feeds);
-    untaken(&taken, || {
-        format!("{} {}", draw_first_name(), draw_surname())
-    })
+    let free: Vec<&str> = FIRST_NAMES
+        .iter()
+        .copied()
+        .filter(|f| held_by(held, f).is_none())
+        .collect();
+    let pool: &[&str] = if free.is_empty() { FIRST_NAMES } else { &free };
+    untaken(&taken, || format!("{} {}", pick(pool), draw_surname()))
 }
 
 /// Every name recorded under a session id in `feeds`' names directory.
@@ -848,7 +961,9 @@ fn untaken(taken: &std::collections::HashSet<String>, mut draw: impl FnMut() -> 
 
 /// Record `session`'s name from `given` ([`full_name`]), under its id and,
 /// when known, its conversation's `root`. Returns the full name and the one
-/// it replaced.
+/// it replaced. Refused when another live session ([`live_sessions`]) holds
+/// its first name (giverny#425), naming who; `session` re-taking its own,
+/// under this id or another of its conversation, is fine.
 pub fn record(
     feeds: &Path,
     session: &str,
@@ -856,10 +971,48 @@ pub fn record(
     root: Option<&str>,
     draw: impl FnOnce() -> String,
 ) -> Result<(String, Option<String>), String> {
+    record_among(feeds, session, given, root, draw, &live_sessions(None))
+}
+
+/// [`record`] against the `live` sessions given.
+pub fn record_among(
+    feeds: &Path,
+    session: &str,
+    given: &str,
+    root: Option<&str>,
+    draw: impl FnOnce() -> String,
+    live: &Live,
+) -> Result<(String, Option<String>), String> {
+    record_held(
+        feeds,
+        session,
+        given,
+        root,
+        draw,
+        &holders(feeds, live, session, root),
+    )
+}
+
+/// [`record`], refused when a session in `held` holds the first name.
+fn record_held(
+    feeds: &Path,
+    session: &str,
+    given: &str,
+    root: Option<&str>,
+    draw: impl FnOnce() -> String,
+    held: &[Holder],
+) -> Result<(String, Option<String>), String> {
     let file =
         session_file(feeds, session).ok_or_else(|| format!("not a session id: {session:?}"))?;
     let previous = name_in(&file).or_else(|| name_in(&root_file(feeds, root?)?));
     let name = full_name(given, previous.as_deref(), draw)?;
+    if let Some(h) = held_by(held, &name) {
+        let first = name.split_whitespace().next().unwrap_or(&name);
+        return Err(format!(
+            "{first} is taken: {h} holds it, and no two live sessions share a first name; \
+             give another, or run `giverny-manage name` alone to be drawn one"
+        ));
+    }
     let mut doc = json!({"session": session, "name": name});
     if let Some(r) = root {
         doc["root"] = json!(r);
@@ -879,14 +1032,29 @@ pub fn draw_and_record(
     session: &str,
     transcript: Option<&Path>,
 ) -> Result<String, String> {
+    draw_and_record_among(feeds, session, transcript, &live_sessions(None))
+}
+
+/// [`draw_and_record`] against the `live` sessions given: the first name
+/// drawn is none of theirs.
+pub fn draw_and_record_among(
+    feeds: &Path,
+    session: &str,
+    transcript: Option<&Path>,
+    live: &Live,
+) -> Result<String, String> {
     let root = transcript.and_then(crate::subagents::conversation_root);
-    // A full name: `record` keeps it as given and draws nothing more.
-    record(
+    let held = holders(feeds, live, session, root.as_deref());
+    // A full name: `record` keeps it as given and draws nothing more. Drawn
+    // clear of `held` already, so checked against nobody: with every first
+    // name held, the draw from the whole pool still stands.
+    record_held(
         feeds,
         session,
-        &draw_name(feeds),
+        &draw_name(feeds, &held),
         root.as_deref(),
         draw_surname,
+        &[],
     )
     .map(|(name, _)| name)
 }
@@ -1075,7 +1243,7 @@ mod tests {
         assert!(FIRST_NAMES.contains(&draw_first_name().as_str()));
 
         let feeds = scratch("drawn");
-        let drawn = draw_name(&feeds);
+        let drawn = draw_name(&feeds, &[]);
         let (first, last) = drawn.split_once(' ').unwrap();
         assert!(FIRST_NAMES.contains(&first), "{drawn}");
         assert!(SURNAMES.contains(&last), "{drawn}");
@@ -1300,6 +1468,138 @@ mod tests {
         .unwrap();
         assert_eq!(shown(&feeds, "s3", Some(&u)), Some(s3.clone()));
         assert_eq!(name_in(&root_file(&feeds, "root-3").unwrap()), Some(s3));
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    /// A live map: each session with where it runs.
+    fn live_of(ids: &[&str]) -> Live {
+        ids.iter()
+            .map(|id| (id.to_string(), PathBuf::from(format!("/work/{id}"))))
+            .collect()
+    }
+
+    #[test]
+    fn a_drawn_first_name_is_none_a_live_session_holds() {
+        // giverny#425: two live managers were both Rotem. Every first name
+        // but the last is held by a live session: the draw is the last,
+        // every time, not a hope of redraws.
+        let feeds = scratch("live-draw");
+        let (last, held) = FIRST_NAMES.split_last().unwrap();
+        let ids: Vec<String> = (0..held.len()).map(|i| format!("h{i}")).collect();
+        for (id, first) in ids.iter().zip(held) {
+            record_held(
+                &feeds,
+                id,
+                &format!("{first} Ashby"),
+                None,
+                || panic!(),
+                &[],
+            )
+            .unwrap();
+        }
+        let mut live = live_of(&ids.iter().map(String::as_str).collect::<Vec<_>>());
+        for _ in 0..20 {
+            let name = draw_name(&feeds, &holders(&feeds, &live, "me", None));
+            assert_eq!(name.split_once(' ').unwrap().0, *last, "{name}");
+        }
+        let name = draw_and_record_among(&feeds, "me", None, &live).unwrap();
+        assert!(name.starts_with(&format!("{last} ")), "{name}");
+        // Its session ended: h0's first name is free again (two now, the
+        // last being taken by "me" is not live).
+        live.remove("h0");
+        live.insert("me".into(), PathBuf::new());
+        let name = draw_and_record_among(&feeds, "you", None, &live).unwrap();
+        assert!(name.starts_with(&format!("{} ", held[0])), "{name}");
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn live_is_a_running_claude_by_the_registry() {
+        let feeds = scratch("registry");
+        let cfg = feeds.join("claude");
+        std::fs::create_dir_all(cfg.join("sessions")).unwrap();
+        let entry = |pid: u32, sid: &str| {
+            std::fs::write(
+                cfg.join("sessions").join(format!("{pid}.json")),
+                json!({"pid": pid, "sessionId": sid, "cwd": "/home/x/Inbar"}).to_string(),
+            )
+            .unwrap();
+        };
+        entry(std::process::id(), "names-test-live");
+        entry(4_294_967_000, "names-test-dead");
+        let live = live_sessions(Some(&cfg));
+        assert_eq!(
+            live.get("names-test-live"),
+            Some(&PathBuf::from("/home/x/Inbar"))
+        );
+        assert!(!live.contains_key("names-test-dead"), "its pid is gone");
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_first_name_a_live_session_holds_is_refused_by_hand() {
+        let feeds = scratch("hand");
+        record_held(
+            &feeds,
+            "819f7e9cabc",
+            "Rotem Tennyson",
+            Some("r9"),
+            || panic!(),
+            &[],
+        )
+        .unwrap();
+        let live = live_of(&["819f7e9cabc", "me"]);
+        for given in ["Rotem", "rotem Ashby", "ROTEM"] {
+            let e = record_among(&feeds, "me", given, None, drawn("Ashby"), &live).unwrap_err();
+            assert!(
+                e.contains("Rotem Tennyson (session 819f7e9c, in /work/819f7e9cabc)"),
+                "{e}"
+            );
+        }
+        assert_eq!(read(&feeds, "me"), None, "nothing recorded");
+        // Another first name is fine.
+        let (n, _) = record_among(&feeds, "me", "Wren", None, drawn("Ashby"), &live).unwrap();
+        assert_eq!(n, "Wren Ashby");
+        // The holder gone, its first name is free.
+        let gone = live_of(&["me"]);
+        let (n, _) = record_among(&feeds, "you", "Rotem", None, drawn("Ashby"), &gone).unwrap();
+        assert_eq!(n, "Rotem Ashby");
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_session_re_takes_its_own_name() {
+        let feeds = scratch("own");
+        record_held(&feeds, "me", "Rotem Ashby", Some("r1"), || panic!(), &[]).unwrap();
+        // Itself, live: naming again, by first name or in full, is fine.
+        let live = live_of(&["me"]);
+        let (n, _) = record_among(&feeds, "me", "Rotem", Some("r1"), || panic!(), &live).unwrap();
+        assert_eq!(n, "Rotem Ashby");
+        record_among(&feeds, "me", "Rotem Ashby", Some("r1"), || panic!(), &live).unwrap();
+        // Revived under a new id while the old one still runs (the same
+        // conversation): its own name, not a clash.
+        let both = live_of(&["me", "new"]);
+        let (n, _) =
+            record_among(&feeds, "new", "Rotem Ashby", Some("r1"), || panic!(), &both).unwrap();
+        assert_eq!(n, "Rotem Ashby");
+
+        // Resumed: the conversation's name comes back by its root...
+        let t = feeds.join("t.jsonl");
+        std::fs::write(
+            &t,
+            "{\"type\":\"user\",\"uuid\":\"r1\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_among(&feeds, "again", Some(&t), || live_of(&["again"])).as_deref(),
+            Some("Rotem Ashby")
+        );
+        // ...unless another live session took that first name meanwhile:
+        // then none, and the session is drawn a new one.
+        record_held(&feeds, "other", "Rotem Tennyson", None, || panic!(), &[]).unwrap();
+        let taken = || live_of(&["other", "later"]);
+        assert_eq!(find_among(&feeds, "later", Some(&t), taken), None);
+        assert_eq!(read(&feeds, "later"), None);
         let _ = std::fs::remove_dir_all(&feeds);
     }
 }
