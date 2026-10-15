@@ -50,6 +50,10 @@ pub struct ClaudeTab {
     /// the turn over, is that work: Claude Code counts it as working), and
     /// cleared by the first scan that does not, or by the next turn.
     pub agents: bool,
+    /// What the tab was when a compaction began: Busy for one Claude Code
+    /// started mid-turn, whatever the last turn left for a `/compact`. The
+    /// compaction's `SessionStart` puts it back.
+    before_compact: Option<ClaudeState>,
     /// The user's prompts in this session, oldest first, in full (at most
     /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
     /// from the transcript for a session adopted mid-way or resumed.
@@ -840,9 +844,27 @@ impl ClaudeWatch {
         let is_active = active == Some(tab_id);
 
         match msg.hook_event() {
+            // A compaction is the same session carrying on: the turn it
+            // interrupted, or the wave of work still running at the prompt
+            // it was asked from, goes on after it.
+            Some("SessionStart")
+                if msg.event.get("source").and_then(|v| v.as_str()) == Some("compact") =>
+            {
+                if let Some(was) = entry.before_compact.take() {
+                    entry.state = was;
+                }
+                entry.set_session(
+                    msg.session_id().map(str::to_string),
+                    &mut self.prompts_asked,
+                );
+                effects
+                    .captured
+                    .push((tab_id, msg.session_id().map(str::to_string), config_dir));
+            }
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
                 entry.agents = false;
+                entry.before_compact = None;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
@@ -853,6 +875,8 @@ impl ClaudeWatch {
             }
             Some("UserPromptSubmit") => {
                 entry.state = ClaudeState::Busy;
+                // A compaction cancelled with Esc says nothing more.
+                entry.before_compact = None;
                 // A turn is running: whatever it leaves behind, its `Stop`
                 // says.
                 entry.agents = false;
@@ -889,7 +913,17 @@ impl ClaudeWatch {
                 entry.state = ClaudeState::Busy;
                 entry.agents = false;
             }
+            // A subagent compacting its own context is its work, as its
+            // tool calls are.
+            Some("PreCompact") if msg.agent_id().is_some() => {}
+            // Compacting is work, and nothing else says so: `/compact` sends
+            // no `UserPromptSubmit`.
+            Some("PreCompact") => {
+                entry.before_compact.get_or_insert(entry.state);
+                entry.state = ClaudeState::Busy;
+            }
             Some("Stop") => {
+                entry.before_compact = None;
                 entry.state = if is_active {
                     ClaudeState::Idle
                 } else {
@@ -911,6 +945,7 @@ impl ClaudeWatch {
                                 .to_string(),
                         ));
                     } else if idle_kind(kind) {
+                        entry.before_compact = None;
                         entry.state = if is_active {
                             ClaudeState::Idle
                         } else {
@@ -929,6 +964,7 @@ impl ClaudeWatch {
             Some("SessionEnd") => {
                 entry.state = ClaudeState::None;
                 entry.agents = false;
+                entry.before_compact = None;
                 entry.set_session(None, &mut self.prompts_asked);
                 entry.session_name = None;
                 effects.captured.push((tab_id, None, None));
@@ -1931,6 +1967,71 @@ mod tests {
         let mut fx = WatchEffects::default();
         w.handle_msg(m, active, "tab", &mut fx);
         fx
+    }
+
+    /// A `/compact` is work the rail shows, and once it is done the tab is
+    /// what it was: idle, or waving for work still running. One Claude Code
+    /// starts mid-turn keeps the turn busy.
+    #[test]
+    fn a_compaction_breathes_and_gives_the_tab_back() {
+        let mut w = ClaudeWatch::for_tests();
+        let compact = || hook("SessionStart", r#","source":"compact""#);
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w));
+
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"manual""#),
+            Some(TAB),
+        );
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "compacting");
+        feed(&mut w, &compact(), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle, "back at the prompt");
+        assert!(waves(&w), "its subagent still runs");
+
+        // Auto-compacted mid-turn: the turn goes on.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"auto""#),
+            Some(TAB),
+        );
+        feed(&mut w, &compact(), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "still the turn");
+        // Hooks installed before `PreCompact` was relayed: kept, not idled.
+        feed(&mut w, &compact(), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        feed(&mut w, &hook("Stop", ""), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // A subagent compacting its own context is not the session's.
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"auto","agent_id":"a1""#),
+            Some(TAB),
+        );
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // Cancelled with Esc: no `SessionStart`, and the next turn's
+        // compaction is not handed the old prompt's state.
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"manual""#),
+            Some(TAB),
+        );
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"auto""#),
+            Some(TAB),
+        );
+        feed(&mut w, &compact(), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
     }
 
     #[test]
