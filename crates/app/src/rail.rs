@@ -156,7 +156,7 @@ fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: 
 }
 
 /// A dot that swells and brightens as it breathes in. Filled, and in the
-/// tab's colour: the idle ring is hollow and the shell's dot green and still.
+/// tab's colour: the idle ring is hollow and a shell's mark a still square.
 fn calm_dot(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     p.circle_filled(
         at,
@@ -192,22 +192,30 @@ fn shell_wave(time: Option<f64>) -> [f32; 3] {
 }
 
 /// A Claude tab's background shell at `at`: three small dots, a colour
-/// moving through them from `dim` toward the tab's `color`, kept moving
-/// while `rect` is on screen. With `rail.animate` off they hold still and
-/// dim, and nothing asks for a frame.
-fn shell_dots(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, dim: Color32, color: Color32) {
+/// moving through them from a faded `color` up to the full one, kept moving
+/// while `rect` is on screen. All in the tab's category colour, like every
+/// other mark: the wave's motion says "humming", the colour
+/// says whose. With `rail.animate` off they hold still and faded, and
+/// nothing asks for a frame.
+fn shell_dots(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) {
     let time = animating(ui).then(anim_time);
     if time.is_some() {
         keep_animating(ui, rect);
     }
+    let faded = color.gamma_multiply(WAVE_REST);
     for (i, lit) in shell_wave(time).into_iter().enumerate() {
         p.circle_filled(
             at + Vec2::new((i as f32 - 1.0) * 4.0, 0.0),
             1.4,
-            dim.lerp_to_gamma(color, lit),
+            faded.lerp_to_gamma(color, lit),
         );
     }
 }
+
+/// How lit a wave dot is between peaks, as a share of the category colour:
+/// faint enough that the moving peak stands out, enough that the three
+/// still read as the tab's colour and not as gray.
+const WAVE_REST: f32 = 0.35;
 
 fn braille(turns: f64) -> String {
     let step = if giverny_term::pace::cheap_frames() {
@@ -230,6 +238,11 @@ struct RowData {
     /// Its shell has been spawned. A tab restored from a previous run has
     /// none until it is first focused.
     started: bool,
+    /// Started, it comes back as Claude: it recorded a conversation to
+    /// resume, or a `claude --resume` it was last running (what
+    /// `queue_resume` acts on). What tells a not-started Claude tab from a
+    /// not-started shell.
+    resumes_claude: bool,
     color: Color32,
     claude: ClaudeState,
     /// Something Claude started still works — a background shell, or
@@ -329,6 +342,11 @@ fn row_data(
         active: app.ws.active == Some(t.id),
         exited: t.exited,
         started: app.rt.contains_key(&t.id),
+        resumes_claude: t.claude_session.is_some()
+            || t.foreground
+                .as_deref()
+                .and_then(giverny_core::procs::resume_session_of)
+                .is_some(),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.working_in_background()),
@@ -1069,6 +1087,95 @@ fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
     );
 }
 
+/// A plain shell's mark at `at`: a square `side` points
+/// across, filled or hollow. Every Claude mark is round or drawn — spinner,
+/// breathing dot, flag, tick, ring, three dots — so a square says "just a
+/// shell" by shape alone, now that colour says the category for both.
+/// Snapped to whole device pixels, edges and all: a square straddling a
+/// pixel boundary smears into a blurred blob at this size, where a circle
+/// only softens.
+fn square(p: &egui::Painter, at: Pos2, side: f32, filled: bool, color: Color32) {
+    let ppp = p.pixels_per_point();
+    let px = (side * ppp).round().max(1.0);
+    let min = Pos2::new(
+        (at.x * ppp - px / 2.0).round() / ppp,
+        (at.y * ppp - px / 2.0).round() / ppp,
+    );
+    let rect = Rect::from_min_size(min, Vec2::splat(px / ppp));
+    if filled {
+        p.rect_filled(rect, 0.0, color);
+    } else {
+        // A whole number of pixels, at least one, drawn inside the edge so
+        // the hollow square is exactly as wide as the filled one would be.
+        let width = (1.2 * ppp).round().max(1.0) / ppp;
+        p.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(width, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// A tab's status mark: its shape says what the tab is
+/// doing, its colour which category it is in. Claude's marks are round or
+/// drawn; a plain shell's are square, so the two no longer pass for each
+/// other (an exited shell's ring was an idle Claude's, a live shell's dot
+/// the calm busy one's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// Claude working: the spinner, or the breathing dot.
+    Busy,
+    /// Claude wants you: the pulsing flag.
+    Flag,
+    /// Claude finished while you were elsewhere: the tick.
+    Tick,
+    /// Claude idle at its prompt: a hollow ring.
+    Ring,
+    /// Claude idle with a background shell humming: the three-dot wave.
+    Wave,
+    /// A live plain shell: a filled square.
+    Shell,
+    /// A plain shell that has exited: a hollow square.
+    Exited,
+    /// A tab restored from a previous run whose process has not spawned:
+    /// tiny and gray, a circle when it will come back as Claude, a square
+    /// when it will come back as a shell.
+    NotStarted { claude: bool },
+}
+
+impl Mark {
+    /// The mark `row` wears. A tab that has not started has nothing
+    /// running, so whatever Claude state lingers for it is not shown: the
+    /// gray mark is the whole truth until it is focused.
+    fn of(row: &RowData) -> Mark {
+        if !row.started && !row.exited {
+            return Mark::NotStarted {
+                claude: row.resumes_claude,
+            };
+        }
+        match row.claude {
+            ClaudeState::Busy => Mark::Busy,
+            ClaudeState::NeedsYou => Mark::Flag,
+            ClaudeState::DoneUnseen => Mark::Tick,
+            ClaudeState::Idle if row.background => Mark::Wave,
+            ClaudeState::Idle => Mark::Ring,
+            ClaudeState::None if row.exited => Mark::Exited,
+            ClaudeState::None => Mark::Shell,
+        }
+    }
+
+    /// What it is drawn in: the tab's category `color`, Claude or shell,
+    /// except a tab that has not started, which is `dim` — gray says
+    /// "nothing here yet" in any category.
+    fn color(self, color: Color32, dim: Color32) -> Color32 {
+        match self {
+            Mark::NotStarted { .. } => dim,
+            _ => color,
+        }
+    }
+}
+
 fn tab_row(
     app: &mut App,
     ui: &mut Ui,
@@ -1123,7 +1230,7 @@ fn tab_row(
         );
     }
 
-    // Status mark: Claude state wins over the plain shell dot.
+    // Status mark (see [`Mark`]): Claude state wins over the plain shell square.
     //
     // Drawn, not typed. These were characters — a braille spinner, a braille
     // ⠿ for a background shell — and a font without the braille block turns
@@ -1134,52 +1241,48 @@ fn tab_row(
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     let time = anim_time();
-    match row.claude {
+    let mark = Mark::of(row);
+    let color = mark.color(row.color, dim);
+    match mark {
         // Off, a working tab's spinner is not drawn, the only state left
         // blank (a calm dot holds still). The title stays where it is.
-        ClaudeState::Busy => {
-            busy(ui, &p, rect, dot, row.color, BusyMark::of(&app.cfg.rail));
-        }
-        ClaudeState::NeedsYou => {
-            // Off, no pulse: the flag in plain amber.
+        Mark::Busy => busy(ui, &p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
+        Mark::Flag => {
+            // One breath every two seconds, sampled at the animation step.
+            // Off, no pulse: the flag held at full colour.
             let pulse = if animating(ui) {
                 keep_animating(ui, rect);
                 breath(time)
             } else {
                 1.0
             };
-            flag(&p, dot, c.amber.gamma_multiply(pulse));
+            flag(&p, dot, color.gamma_multiply(pulse));
         }
-        // Green and still: finished, nothing owed. The amber flag above is
-        // the one that wants something, and the two differ in colour, shape
-        // and movement.
-        ClaudeState::DoneUnseen => tick(&p, dot, c.green),
-        ClaudeState::Idle => {
-            // A background shell or its subagents keep running while Claude
-            // waits at its prompt. Worth showing — it is why a directory is
-            // still churning — but it is not the agent working: it can take a
-            // message. So no spinner and no amber: a slow colour drifting
-            // through three small dots, the hum of something left running.
-            // Off, they hold still and dim.
-            if row.background {
-                shell_dots(ui, &p, rect, dot, dim, row.color);
-            } else {
-                p.circle_stroke(dot, 4.0, Stroke::new(1.4, dim));
-            }
+        // Still: finished, nothing owed. The flag above is the one that
+        // wants something; the two differ in shape and movement.
+        Mark::Tick => tick(&p, dot, color),
+        // A background shell or its subagents keep running while Claude
+        // waits at its prompt. Worth showing — it is why a directory is
+        // still churning — but it is not the agent working: it can take a
+        // message. So no spinner and no flag: a slow colour drifting
+        // through three small dots, the hum of something left running.
+        // Off, they hold still and faded.
+        Mark::Wave => shell_dots(ui, &p, rect, dot, color),
+        Mark::Ring => {
+            p.circle_stroke(dot, 4.0, Stroke::new(1.4, color));
         }
-        ClaudeState::None => {
-            // A plain shell, which most tabs are most of the time: a small
-            // green dot for a live shell, an outline once it has exited, and
-            // a small dim dot for a restored tab whose shell has not started
-            // yet: green there would claim a shell that is not running.
-            if row.exited {
-                p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
-            } else if !row.started {
-                p.circle_filled(dot, 2.5, dim);
-            } else {
-                p.circle_filled(dot, 3.5, c.green);
-            }
+        // A plain shell, which most tabs are most of the time: a filled
+        // square while it runs, a hollow one once it has exited. Squares
+        // read larger than circles of the same width, so these are a
+        // touch narrower than the ring and the busy dot beside them.
+        Mark::Shell => square(&p, dot, 6.0, true, color),
+        Mark::Exited => square(&p, dot, 7.0, false, color),
+        // A restored tab whose process has not started yet: small and
+        // gray, since any colour would claim something running.
+        Mark::NotStarted { claude: true } => {
+            p.circle_filled(dot, 2.5, color);
         }
+        Mark::NotStarted { claude: false } => square(&p, dot, 4.0, true, color),
     }
 
     // Inline rename?
@@ -1993,18 +2096,18 @@ mod tests {
     }
 
     /// The shell's dots: moving, they wake the window on the shared clock;
-    /// with `rail.animate` off they are drawn still and dim, as they used to be,
-    /// and ask for no frame.
+    /// with `rail.animate` off they are drawn still and faded, in the tab's
+    /// colour rather than gray, and ask for no frame.
     #[test]
-    fn the_shell_dots_hold_still_and_dim_when_the_rail_does_not_move() {
+    fn the_shell_dots_hold_still_and_faded_when_the_rail_does_not_move() {
         let ctx = egui::Context::default();
-        let dim = Color32::from_gray(90);
+        let faded = Color32::RED.gamma_multiply(WAVE_REST);
         let frame = |animate: bool| {
             let out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.ctx()
                     .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
                 let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
-                shell_dots(ui, ui.painter(), rect, rect.center(), dim, Color32::RED);
+                shell_dots(ui, ui.painter(), rect, rect.center(), Color32::RED);
             });
             let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
             let dots: Vec<egui::epaint::CircleShape> = out
@@ -2034,9 +2137,136 @@ mod tests {
         );
         assert_eq!(dots.len(), 3);
         for (i, d) in dots.iter().enumerate() {
-            assert_eq!(d.fill, dim, "dot {i}");
+            assert_eq!(d.fill, faded, "dot {i}");
             assert_eq!(d.radius, 1.4);
             assert_eq!(d.center.x, 5.0 + (i as f32 - 1.0) * 4.0);
+        }
+    }
+
+    /// A row in `claude` state, started, live, in no background shell.
+    fn row(claude: ClaudeState) -> RowData {
+        RowData {
+            id: TabId(1),
+            title: String::new(),
+            sub: String::new(),
+            active: false,
+            exited: false,
+            started: true,
+            resumes_claude: false,
+            color: Color32::RED,
+            claude,
+            background: false,
+        }
+    }
+
+    /// Every state gets its own mark, and a plain shell's are squares no
+    /// Claude state shares.
+    #[test]
+    fn each_state_has_its_mark_and_shells_are_square() {
+        assert_eq!(Mark::of(&row(ClaudeState::Busy)), Mark::Busy);
+        assert_eq!(Mark::of(&row(ClaudeState::NeedsYou)), Mark::Flag);
+        assert_eq!(Mark::of(&row(ClaudeState::DoneUnseen)), Mark::Tick);
+        assert_eq!(Mark::of(&row(ClaudeState::Idle)), Mark::Ring);
+        let humming = RowData {
+            background: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(Mark::of(&humming), Mark::Wave);
+        assert_eq!(Mark::of(&row(ClaudeState::None)), Mark::Shell);
+        let exited = RowData {
+            exited: true,
+            ..row(ClaudeState::None)
+        };
+        assert_eq!(Mark::of(&exited), Mark::Exited);
+        // An exited tab never spawned this run is still exited, not pending.
+        let exited_unstarted = RowData {
+            started: false,
+            ..exited
+        };
+        assert_eq!(Mark::of(&exited_unstarted), Mark::Exited);
+    }
+
+    /// A restored tab that has not spawned is told by what it comes back
+    /// as, whatever Claude state lingers for it.
+    #[test]
+    fn a_tab_not_started_is_a_circle_if_it_resumes_claude_else_a_square() {
+        let pending = |resumes_claude, claude| RowData {
+            started: false,
+            resumes_claude,
+            ..row(claude)
+        };
+        assert_eq!(
+            Mark::of(&pending(false, ClaudeState::None)),
+            Mark::NotStarted { claude: false }
+        );
+        assert_eq!(
+            Mark::of(&pending(true, ClaudeState::None)),
+            Mark::NotStarted { claude: true }
+        );
+        assert_eq!(
+            Mark::of(&pending(true, ClaudeState::Busy)),
+            Mark::NotStarted { claude: true },
+            "nothing is running, so nothing is busy"
+        );
+    }
+
+    /// Every mark is in the category's colour, Claude and shell alike; only
+    /// a tab not started yet is gray.
+    #[test]
+    fn every_mark_wears_the_category_colour_but_not_started_is_gray() {
+        let (cat, dim) = (Color32::from_rgb(200, 120, 40), Color32::from_gray(90));
+        for mark in [
+            Mark::Busy,
+            Mark::Flag,
+            Mark::Tick,
+            Mark::Ring,
+            Mark::Wave,
+            Mark::Shell,
+            Mark::Exited,
+        ] {
+            assert_eq!(mark.color(cat, dim), cat, "{mark:?}");
+        }
+        for claude in [false, true] {
+            assert_eq!(Mark::NotStarted { claude }.color(cat, dim), dim);
+        }
+    }
+
+    /// A shell's square lands on whole device pixels at any scale and any
+    /// fractional position, and is as many pixels across as asked: a square
+    /// straddling a pixel edge blurs at this size.
+    #[test]
+    fn a_shell_square_sits_on_whole_pixels() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            for filled in [true, false] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+                let mut out = None;
+                for _ in 0..2 {
+                    let shapes = ctx
+                        .run_ui(egui::RawInput::default(), |ui| {
+                            square(
+                                ui.painter(),
+                                Pos2::new(32.3, 13.7),
+                                6.0,
+                                filled,
+                                Color32::RED,
+                            );
+                        })
+                        .shapes;
+                    out = shapes.into_iter().find_map(|c| match c.shape {
+                        egui::Shape::Rect(r) => Some(r.rect),
+                        _ => None,
+                    });
+                }
+                let r = out.expect("a square was drawn");
+                let whole = |v: f32| ((v * ppp) - (v * ppp).round()).abs() < 1e-3;
+                assert!(
+                    whole(r.min.x) && whole(r.min.y) && whole(r.max.x) && whole(r.max.y),
+                    "{ppp}: {r:?}"
+                );
+                assert!(((r.width() * ppp) - (6.0 * ppp).round()).abs() < 1e-3);
+                assert!((r.width() - r.height()).abs() < 1e-3, "{r:?}");
+            }
         }
     }
 }
