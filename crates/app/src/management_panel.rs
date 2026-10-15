@@ -843,6 +843,8 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                 position: None,
                 behind: None,
                 short: Vec::new(),
+                uncollected: l.uncollected.is_some(),
+                lapsed: false,
             });
         } else if let Some(i) = queue
             .iter()
@@ -895,6 +897,8 @@ pub fn with_ledger(feed: &Feed, sessions: &[&str], ledger: &Ledger) -> Feed {
                 position: Some(i as u64 + 1),
                 behind,
                 short,
+                uncollected: false,
+                lapsed: w.lapsed.is_some(),
             });
         }
     }
@@ -1059,6 +1063,11 @@ fn usage_fact(u: &RowUsage) -> String {
 pub fn queued_note(l: &RowLease) -> String {
     let need = resources::short_need(&l.short, l.ram_mb, l.vram_mb);
     let mut s = "queued".to_string();
+    if l.lapsed {
+        // giverny#429: its grant went untaken; nothing is held for it now.
+        s.push_str(", grant lapsed, waiting for its manager");
+        return s;
+    }
     if !need.is_empty() {
         s.push_str(&format!(" for {need}"));
     }
@@ -1067,6 +1076,10 @@ pub fn queued_note(l: &RowLease) -> String {
     }
     s
 }
+
+/// What a row whose lease was granted on another session's call, and not
+/// yet taken up, waits on (giverny#429).
+pub const GRANTED_WAITING: &str = "granted, waiting for its manager";
 
 /// The lease in full for the row's overlay header: `holds 3G, slot
 /// cargo:/x`, or `queued #2 for …`.
@@ -1088,6 +1101,9 @@ fn lease_fact(l: &RowLease) -> String {
                 && let Some(w) = l.wanted_ram_mb
             {
                 s.push_str(&format!(" (asked {})", mem(w)));
+            }
+            if l.uncollected {
+                s.push_str(&format!("; {GRANTED_WAITING}"));
             }
             s
         }
@@ -1896,6 +1912,9 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
     let lease = f.and_then(|f| f.lease.as_ref());
     if let Some(l) = lease.filter(|l| l.state == LeaseState::Queued) {
         return waits(queued_note(l));
+    }
+    if lease.is_some_and(|l| l.uncollected) {
+        return waits(GRANTED_WAITING.to_string());
     }
     // The task it was planned after: waited for until it is drawn Done; one
     // gone from the feed is no wait.
@@ -4790,6 +4809,21 @@ mod tests {
             "{}",
             lease_fact(&s)
         );
+        // giverny#429: granted on another session's call, untaken; and
+        // queued again once that grant lapsed.
+        let mut g = l.clone();
+        g.state = LeaseState::Granted;
+        g.uncollected = true;
+        assert_eq!(
+            lease_fact(&g),
+            "holds 3G, slot cargo:/x/target; granted, waiting for its manager"
+        );
+        let mut q = l.clone();
+        q.lapsed = true;
+        assert_eq!(
+            queued_note(&q),
+            "queued, grant lapsed, waiting for its manager"
+        );
     }
 
     /// Every cell is as wide as every other, whatever
@@ -5264,6 +5298,25 @@ mod tests {
             "demo#12 holds nothing now"
         );
         assert_eq!(queued_note(q), "queued for 3G behind acme#5");
+
+        // giverny#429: granted on another session's call and untaken; a
+        // grant that lapsed is queued again, waiting for its manager.
+        let l = ledger(
+            r#"{"version":1,"leases":[
+              {"id":"s:demo#12","session":"s","task":"demo#12","ram_mb":3072,
+               "granted_at":1790000000000,"heartbeat_at":1790000000000,
+               "uncollected":{"queued_at":1790000000000,"request":{"ram_mb":3072}}}],
+             "queue":[
+              {"id":"s:demo#13","session":"s","task":"demo#13","ram_mb":3072,
+               "queued_at":1790000000000,"heartbeat_at":1790000000000,
+               "lapsed":{"at":1790000000000}}]}"#,
+        );
+        let g = with_ledger(&f, &["s"], &l);
+        assert!(g.rows[0].lease.as_ref().unwrap().uncollected);
+        assert_eq!(
+            queued_note(g.rows[1].lease.as_ref().unwrap()),
+            "queued, grant lapsed, waiting for its manager"
+        );
 
         // A lease in the ledger the row never got a copy of (another
         // writer, or the tab's older session id) is drawn.

@@ -374,6 +374,7 @@ pub fn run_with(
     if let Some(n) = flags.cpu_note() {
         say(task, n);
     }
+    let ledger_cap = cap;
     let Some((lease, claimed)) = lease_for(dir, ledger, session, task, flags, cap)? else {
         return Ok((String::new(), resources::exit::REFUSED));
     };
@@ -411,7 +412,7 @@ pub fn run_with(
     // Whatever happened, a lease `run` claimed goes back.
     if claimed {
         let now = manage::now_ms();
-        match resources::release_at(ledger, session, task, now) {
+        match resources::release_at(ledger, Some(dir), session, task, now, ledger_cap) {
             Ok(_) => resources::annotate_row(dir, session, task, None),
             Err(e) => say(
                 task,
@@ -420,7 +421,7 @@ pub fn run_with(
         }
     }
     let (m, cap) = held?;
-    let _ = resources::heartbeat(ledger, None, session, manage::now_ms());
+    let _ = resources::heartbeat(ledger, Some(dir), session, manage::now_ms(), ledger_cap);
     let recorded = manage::edit_row(dir, session, task, |row| {
         record_usage(row, &m, &cap, &flags.command, manage::now_ms())
     });
@@ -704,7 +705,9 @@ impl Heartbeat {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(every) {
-                if let Err(e) = resources::heartbeat(&ledger, None, &session, manage::now_ms()) {
+                if let Err(e) =
+                    resources::heartbeat(&ledger, None, &session, manage::now_ms(), None)
+                {
                     eprintln!("giverny manage run: heartbeat: {e}");
                 }
             }
@@ -1100,6 +1103,7 @@ mod tests {
                 slice_m: Some(0),
                 ..Default::default()
             },
+            live_sessions: None,
         }
     }
 
@@ -1341,6 +1345,7 @@ mod tests {
         cap.default_lease = giverny_core::config::DefaultLease {
             cpu_cores: 9,
             ram: Mem::gb(2),
+            ..Default::default()
         };
         let seen = dir.join("seen");
         let script = format!(

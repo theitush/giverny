@@ -476,6 +476,7 @@ mod tests {
         let lease = DefaultLease {
             cpu_cores: 1,
             ram: Mem::gb(3),
+            ..Default::default()
         };
         let a = adopt_args("giverny-claude-7.scope", &[7, 9], &lease);
         let s = a.join(" ");
