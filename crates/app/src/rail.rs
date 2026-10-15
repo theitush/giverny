@@ -1128,11 +1128,19 @@ enum Mark {
     Busy,
     /// Claude wants you: the pulsing flag.
     Flag,
-    /// Claude finished while you were elsewhere: the tick.
+    /// Claude finished while you were elsewhere, and nothing it started
+    /// runs on: the tick. A turn that ended with its subagents or a
+    /// background shell still running is not done yet, seen or unseen, so
+    /// it wears [`Mark::Wave`] until they end.
     Tick,
     /// Claude idle at its prompt: a hollow ring.
     Ring,
-    /// Claude idle with a background shell humming: the three-dot wave.
+    /// Claude at its prompt, free to talk, while something it started
+    /// hums on — a background shell or its subagents: the three-dot wave,
+    /// whether or not you have seen the turn that left them running. The
+    /// agent itself working, which it cannot talk through, is
+    /// [`Mark::Busy`], and wins; it asking for you is [`Mark::Flag`], and
+    /// wins too.
     Wave,
     /// A live plain shell: a filled square.
     Shell,
@@ -1157,8 +1165,11 @@ impl Mark {
         match row.claude {
             ClaudeState::Busy => Mark::Busy,
             ClaudeState::NeedsYou => Mark::Flag,
+            // Unseen or not, a turn whose work still runs is not done: the
+            // tick waits for the last of it, the state staying `DoneUnseen`
+            // until you look (a manager's tab ticked while its worker built).
+            ClaudeState::DoneUnseen | ClaudeState::Idle if row.background => Mark::Wave,
             ClaudeState::DoneUnseen => Mark::Tick,
-            ClaudeState::Idle if row.background => Mark::Wave,
             ClaudeState::Idle => Mark::Ring,
             ClaudeState::None if row.exited => Mark::Exited,
             ClaudeState::None => Mark::Shell,
@@ -2184,6 +2195,42 @@ mod tests {
             ..exited
         };
         assert_eq!(Mark::of(&exited_unstarted), Mark::Exited);
+    }
+
+    /// The mark says whether the agent can take a message: busy, it
+    /// cannot; at its prompt with subagents still working, the wave; with
+    /// nothing left running, the ring. A turn you have not seen waves too
+    /// while its work runs, and ticks only once it is all done.
+    #[test]
+    fn subagents_running_after_the_turn_wave_and_a_working_agent_spins() {
+        use crate::claude_watch::ClaudeTab;
+        let mark = |state, agents| {
+            let mut tab = ClaudeTab::default();
+            tab.state = state;
+            tab.agents = agents;
+            Mark::of(&RowData {
+                background: tab.working_in_background(),
+                ..row(state)
+            })
+        };
+        assert_eq!(mark(ClaudeState::Idle, true), Mark::Wave);
+        assert_eq!(mark(ClaudeState::Busy, true), Mark::Busy, "busy wins");
+        assert_eq!(mark(ClaudeState::Idle, false), Mark::Ring, "agents gone");
+        // The flag is unchanged by what runs behind it.
+        assert_eq!(mark(ClaudeState::NeedsYou, true), Mark::Flag);
+        // Unseen, the turn's workers still running: not done, the wave;
+        // they end, the tick.
+        assert_eq!(mark(ClaudeState::DoneUnseen, true), Mark::Wave);
+        assert_eq!(mark(ClaudeState::DoneUnseen, false), Mark::Tick);
+        // A background shell holds the tick back the same.
+        let shell = |state| {
+            Mark::of(&RowData {
+                background: true,
+                ..row(state)
+            })
+        };
+        assert_eq!(shell(ClaudeState::DoneUnseen), Mark::Wave);
+        assert_eq!(shell(ClaudeState::Idle), Mark::Wave);
     }
 
     /// A restored tab that has not spawned is told by what it comes back

@@ -2667,13 +2667,86 @@ mod tests {
         assert!(!w.tabs[&TAB].agents);
         assert!(dots(&w));
 
-        // In a tab you are not looking at, the turn's tick stays while its
-        // workers keep the registry `busy`: that is not a new turn.
+        // In a tab you are not looking at, the turn stays unseen while its
+        // workers keep the registry `busy`: that is not a new turn. The
+        // rail waves for them, and ticks once they end.
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
         feed(&mut w, &hook("Stop", agent), None);
         scan(&mut w, "busy");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
         assert!(dots(&w));
+    }
+
+    /// A turn that ends with work still running is not done: the tab waves
+    /// for it, seen or unseen, and is left holding what the turn left —
+    /// unseen, the tick; seen, the ring — once the last of it ends. Nothing
+    /// on the way may drop an unseen turn to `Idle`, or the tick would never
+    /// show (a manager's tab ticked while its worker built).
+    #[test]
+    fn a_turn_whose_work_runs_on_waves_and_ticks_only_once_it_ends() {
+        let me = std::process::id();
+        let shells = HashMap::from([(TAB, me)]);
+        let scan = |w: &mut ClaudeWatch, status: &str| {
+            let mut live = session(status);
+            live.pid = me;
+            w.scanned = ScanResult {
+                live: vec![registry::LiveSession {
+                    entry: live,
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-unseen"),
+                }],
+            };
+            w.merge_scan(&shells, &mut WatchEffects::default());
+        };
+        let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+        let worker_call = hook(
+            "PostToolUse",
+            r#","agent_id":"a58ff8469ff4515c6","tool_name":"Bash""#,
+        );
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+
+        // Unseen: the turn ends with a worker running, out of sight.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        scan(&mut w, "busy");
+        feed(&mut w, &hook("Stop", agent), None);
+        for _ in 0..3 {
+            feed(&mut w, &worker_call, None);
+            scan(&mut w, "busy");
+            assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+            assert!(waves(&w), "the worker runs: the wave, not the tick");
+        }
+        // The worker ends: still unseen, nothing running — the tick.
+        scan(&mut w, "idle");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(!waves(&w), "nothing runs: the tick");
+        // Looked at, the tick clears to the ring.
+        w.mark_viewed(TAB);
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // Seen: the wave while the worker runs, the ring after.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", agent), Some(TAB));
+        scan(&mut w, "busy");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w));
+        scan(&mut w, "idle");
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(!waves(&w), "the ring");
+
+        // A background shell holds the tick back the same.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", r#","background_tasks":[]"#), None);
+        scan(&mut w, "shell");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(waves(&w), "the shell runs: the wave");
+        scan(&mut w, "idle");
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(!waves(&w), "the shell is gone: the tick");
     }
 
     #[test]
