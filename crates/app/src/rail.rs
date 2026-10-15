@@ -1316,7 +1316,7 @@ fn header_badges(
 /// [`RING_R`] so the two read as one size beside each other.
 const HEADER_DOT_R: f32 = 3.5;
 
-/// "+ new category": the row under the last category that adds one, drawn
+/// "+ add category": the row under the last category that adds one, drawn
 /// as a ghost of [`category_header`] rather than a framed button that looked
 /// dropped in (giverny#382). The same height, font and places: a `+` where
 /// the fold triangle sits, its words where a name starts. Dim and frameless
@@ -1358,7 +1358,7 @@ fn new_category_row(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     p.text(
         Pos2::new(rect.min.x + 20.0, rect.center().y),
         Align2::LEFT_CENTER,
-        "new category",
+        "add category",
         FontId::monospace(11.5),
         color,
     );
