@@ -1059,20 +1059,8 @@ impl System {
     }
 
     fn config_dirs(&self) -> &[PathBuf] {
-        self.config_dirs.get_or_init(|| {
-            let mut out: Vec<PathBuf> = Vec::new();
-            let mut seen = HashSet::new();
-            let candidates = crate::continuation::config_dir()
-                .into_iter()
-                .chain(crate::profiles::ambient_dirs());
-            for d in candidates {
-                let key = d.canonicalize().unwrap_or_else(|_| d.clone());
-                if seen.insert(key) {
-                    out.push(d);
-                }
-            }
-            out
-        })
+        self.config_dirs
+            .get_or_init(|| crate::registry::ambient_config_dirs(None))
     }
 
     fn ledger(&self) -> PathBuf {

@@ -1762,21 +1762,31 @@ fn name(
     given: Option<&str>,
     cfg: Option<&Path>,
 ) -> Result<String, String> {
+    // Live sessions hold their first names (giverny#425): `cfg`'s registry
+    // and every account's.
+    let live = || names::live_sessions(cfg);
     match given {
         Some(given) => {
             let root = continuation::root_of(cfg, session);
-            names::record(dir, session, given, root.as_deref(), names::draw_surname)
-                .map(|(name, _)| name)
+            names::record_among(
+                dir,
+                session,
+                given,
+                root.as_deref(),
+                names::draw_surname,
+                &live(),
+            )
+            .map(|(name, _)| name)
         }
         None => {
             let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
             let transcript = cfg.and_then(|c| crate::subagents::session_transcript(&c, session));
-            if let Some(name) = names::find(dir, session, transcript.as_deref())
+            if let Some(name) = names::find_among(dir, session, transcript.as_deref(), live)
                 .or_else(|| feed::find(dir, session)?.1.name)
             {
                 return Ok(name);
             }
-            names::draw_and_record(dir, session, transcript.as_deref())
+            names::draw_and_record_among(dir, session, transcript.as_deref(), &live())
         }
     }
 }
@@ -3112,6 +3122,52 @@ mod tests {
             theirs.to_vec()
         );
         assert_eq!(parse_args(&args("clear-done")).unwrap().0, Cmd::ClearDone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_name_a_live_session_holds_is_refused_by_hand() {
+        // giverny#425: a live session (its claude in the registry) holds
+        // its first name against a hand pick; the refusal names it.
+        let dir = scratch("name-held");
+        let cfg = dir.join("claude");
+        std::fs::create_dir_all(cfg.join("sessions")).unwrap();
+        std::fs::write(
+            cfg.join("sessions")
+                .join(format!("{}.json", std::process::id())),
+            json!({"pid": std::process::id(), "sessionId": "819f7e9c-held",
+                   "cwd": "/srv/Inbar"})
+            .to_string(),
+        )
+        .unwrap();
+        names::record_among(
+            &dir,
+            "819f7e9c-held",
+            "Rotem Tennyson",
+            None,
+            || panic!(),
+            &names::Live::new(),
+        )
+        .unwrap();
+        let name = |line: &str| {
+            let (cmd, mut flags) = parse_args(&args(line))?;
+            flags.claude_dir = Some(cfg.clone());
+            run_in(&dir, "s1", &cmd, &flags, T0)
+        };
+        let e = name("name Rotem Ashby").unwrap_err();
+        assert!(
+            e.contains("Rotem Tennyson (session 819f7e9c, in /srv/Inbar)"),
+            "{e}"
+        );
+        assert_eq!(names::read(&dir, "s1"), None);
+        assert_eq!(name("name Wren Ashby").unwrap(), "Wren Ashby");
+        // The holder itself re-takes its own.
+        let (cmd, mut flags) = parse_args(&args("name Rotem")).unwrap();
+        flags.claude_dir = Some(cfg.clone());
+        assert_eq!(
+            run_in(&dir, "819f7e9c-held", &cmd, &flags, T0).unwrap(),
+            "Rotem Tennyson"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
