@@ -167,6 +167,7 @@ mod tests {
             oom: false,
             flag: false,
             landed_ms: None,
+            why: Vec::new(),
             click: RowClick {
                 stage: Stage::Running,
                 key: String::new(),

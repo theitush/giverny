@@ -1077,6 +1077,24 @@ pub fn queued_note(l: &RowLease) -> String {
     s
 }
 
+/// [`queued_note`] in the row's hover (giverny#423): `queued — waiting for
+/// 3G behind 899x in the machine ledger`.
+fn queued_why(l: &RowLease) -> String {
+    if l.lapsed {
+        return "queued — its grant lapsed untaken; waiting for its manager".into();
+    }
+    let need = resources::short_need(&l.short, l.ram_mb, l.vram_mb);
+    let mut s = "queued — waiting".to_string();
+    if !need.is_empty() {
+        s.push_str(&format!(" for {need}"));
+    }
+    if let Some(b) = &l.behind {
+        s.push_str(&format!(" behind {b}"));
+    }
+    s.push_str(" in the machine ledger");
+    s
+}
+
 /// What a row whose lease was granted on another session's call, and not
 /// yet taken up, waits on (giverny#429).
 pub const GRANTED_WAITING: &str = "granted, waiting for its manager";
@@ -1217,7 +1235,26 @@ pub struct Line {
     /// When a Done row landed (epoch ms), when known; `None` on any other
     /// row.
     pub landed_ms: Option<u64>,
+    /// The hover's lines under the title (giverny#423): where the row is
+    /// and why, in words ([`running_why`], [`Wait::why`], [`done_why`]).
+    pub why: Vec<String>,
     pub click: RowClick,
+}
+
+impl Line {
+    /// The row's tooltip: its whole title, then [`Line::why`].
+    pub fn tip(&self) -> String {
+        let head = if self.title.is_empty() {
+            &self.id
+        } else {
+            &self.title
+        };
+        std::iter::once(head.as_str())
+            .chain(self.why.iter().map(String::as_str))
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// The whole table: rows and the feed's footer line.
@@ -1651,18 +1688,19 @@ fn format_row(
         }),
         _ => None,
     };
+    // Re-estimated: the worker's latest figure less the work since it
+    // was given (giverny#402). Off-clock spans before it are in neither,
+    // those after still come off; `eta_s` less the work since the start
+    // took the ones before it off twice, being wall time up to the figure.
+    let left_s = match (row.stage, figure, stop, eta_s, work_s) {
+        (Stage::Running, Some((at, left)), Some(stop), _, _) => {
+            Some(left as i64 - work_since(at, stop) as i64)
+        }
+        (Stage::Running, _, _, Some(eta), Some(work)) => Some(eta as i64 - work as i64),
+        _ => None,
+    };
     let eta = match row.stage {
-        // Re-estimated: the worker's latest figure less the work since it
-        // was given (giverny#402). Off-clock spans before it are in neither,
-        // those after still come off; `eta_s` less the work since the start
-        // took the ones before it off twice, being wall time up to the figure.
-        Stage::Running => match (figure, stop, eta_s, work_s) {
-            (Some((at, left)), Some(stop), _, _) => {
-                countdown(left as i64 - work_since(at, stop) as i64)
-            }
-            (_, _, Some(eta), Some(work)) => countdown(eta as i64 - work as i64),
-            _ => String::new(),
-        },
+        Stage::Running => left_s.map(countdown).unwrap_or_default(),
         Stage::Planned => eta_s
             .map(|e| format!("~{}", feed::fmt_span(e as i64)))
             .unwrap_or_default(),
@@ -1757,10 +1795,70 @@ fn format_row(
             facts.push(fact);
         }
     }
+    // The hover's lines under the title: where the row is and why
+    // (giverny#423), from the cells above before any ditto.
+    let note = f.and_then(|f| f.note.as_deref());
+    let why = match row.stage {
+        Stage::Running => {
+            let who = match l {
+                Some(l) => {
+                    let mut w = format!("worker {}", l.display_name());
+                    if let Some(m) = l.model.as_deref().and_then(short_model) {
+                        w.push_str(&format!(" ({m})"));
+                    }
+                    w
+                }
+                None if f.is_some_and(|f| f.live.is_some()) => {
+                    "no worker; its own commands run".into()
+                }
+                None => "no worker on it".into(),
+            };
+            let since = f
+                .and_then(|f| f.spawned_ms)
+                .or(row_start)
+                .map(|s| clock_at(s, now_ms, &clock.tz));
+            let state = match unworked(row, now_ms) {
+                Some(Unworked::Stopped(r)) => {
+                    Some(format!("stopped: {r} — its worker is not working"))
+                }
+                Some(Unworked::Finished { how, .. }) => {
+                    Some(format!("its worker {how} — not landed yet"))
+                }
+                _ => None,
+            }
+            .or_else(|| {
+                limit.map(|lim| {
+                    format!(
+                        "{} — out of usage; its clock is held",
+                        limit_note(lim, now_ms, &clock.tz)
+                    )
+                })
+            })
+            .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
+            running_why(&who, since.as_deref(), eta_s, left_s, state)
+        }
+        Stage::Planned => {
+            let line =
+                match benched_pause.filter(|_| wait.as_ref().is_none_or(|w| w.held.is_none())) {
+                    Some(_) if now == PAUSED_FINISHED => {
+                        format!("{PAUSED_FINISHED} — its work is done, to land or resume")
+                    }
+                    Some(p) => paused_why(&clock_at(p, now_ms, &clock.tz), note),
+                    None => wait.as_ref().map(|w| w.why.clone()).unwrap_or_default(),
+                };
+            let est = (!eta.is_empty()).then(|| format!("estimate {eta}"));
+            [Some(line).filter(|l| !l.is_empty()), est]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+        Stage::Done => done_why(&now, &elapsed, delta, f.and_then(|f| f.review.as_deref())),
+    };
     Line {
         stage: row.stage,
         id,
         title,
+        why,
         elapsed,
         eta,
         no_eta,
@@ -1874,6 +1972,8 @@ pub struct Wait {
     pub idle_since: Option<u64>,
     /// The dispatcher's hold, in full, for the overlay header.
     pub held: Option<String>,
+    /// The row's hover line (giverny#423): the note, and why it is there.
+    pub why: String,
 }
 
 /// What a Next up row waits for (giverny#282). A planned task may wait only
@@ -1890,31 +1990,39 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
         return None;
     }
     let f = row.feed;
-    let waits = |note: String| {
+    let waits = |note: String, why: String| {
         Some(Wait {
             note,
             idle_since: None,
             held: None,
+            why,
         })
     };
     if let Some(why) = f.and_then(|f| f.held.clone()) {
         return Some(Wait {
             note: format!("held: {why}"),
             idle_since: None,
+            why: format!("held — not started; waiting for: {why}"),
             held: Some(why),
         });
     }
     // A Running row benched for want of a worker ([`benched`]): a paused
     // one says since when ([`format_row`]).
     if f.is_some_and(|f| f.stage() == Stage::Running) {
-        return waits(NO_WORKER_YET.to_string());
+        return waits(
+            NO_WORKER_YET.to_string(),
+            format!("{NO_WORKER_YET} — started, but no worker has picked it up"),
+        );
     }
     let lease = f.and_then(|f| f.lease.as_ref());
     if let Some(l) = lease.filter(|l| l.state == LeaseState::Queued) {
-        return waits(queued_note(l));
+        return waits(queued_note(l), queued_why(l));
     }
     if lease.is_some_and(|l| l.uncollected) {
-        return waits(GRANTED_WAITING.to_string());
+        return waits(
+            GRANTED_WAITING.to_string(),
+            format!("{GRANTED_WAITING} — its lease is granted; its manager is to start it"),
+        );
     }
     // The task it was planned after: waited for until it is drawn Done; one
     // gone from the feed is no wait.
@@ -1922,10 +2030,17 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
         .and_then(|f| f.after.as_deref())
         .and_then(|a| rows.iter().find(|r| r.feed.is_some_and(|f| f.key == a)));
     if let Some(r) = before.filter(|r| r.stage != Stage::Done) {
-        return waits(format!("after {}", r.feed.map_or("", |f| f.key.as_str())));
+        let k = r.feed.map_or("", |f| f.key.as_str());
+        return waits(
+            format!("after {k}"),
+            format!("after {k} — starts when that lands"),
+        );
     }
     if let Some(k) = &row.after_key {
-        return waits(format!("after {k}"));
+        return waits(
+            format!("after {k}"),
+            format!("after {k} — starts when its worker is done with that"),
+        );
     }
     let f = f?;
     let since = [
@@ -1941,8 +2056,13 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
         note: String::new(),
         idle_since: since,
         held: None,
+        why: IDLE_WHY.to_string(),
     })
 }
+
+/// The hover of a Next up row that waits on nothing recorded
+/// ([`Wait::idle_since`]).
+pub const IDLE_WHY: &str = "not started — waits on nothing; its manager is to start it";
 
 /// NOW of a Running row with no worker, drawn under Next up ([`benched`]).
 pub const NO_WORKER_YET: &str = "no worker yet";
@@ -1981,6 +2101,79 @@ fn row_facts(
         Stage::Planned => [some(eta).map(|e| format!("est {e}")), None, None, None],
     };
     v.into_iter().flatten().collect()
+}
+
+/// A Running row's hover (giverny#423): who works on it and since when,
+/// what holds it when something does (`state`), and its estimate against
+/// the time left (`left_s`, below zero once over).
+fn running_why(
+    who: &str,
+    since: Option<&str>,
+    estimate_s: Option<u64>,
+    left_s: Option<i64>,
+    state: Option<String>,
+) -> Vec<String> {
+    let mut head = format!("Running: {who}");
+    if let Some(s) = since {
+        head.push_str(&format!(" since {s}"));
+    }
+    let est = match (estimate_s, left_s) {
+        (Some(e), Some(left)) if left < 0 && feed::fmt_span(left) != "0m" => format!(
+            "estimate {}: {} over it",
+            feed::fmt_span(e as i64),
+            feed::fmt_span(-left)
+        ),
+        (Some(e), Some(left)) => format!(
+            "estimate {}: {} left, on track",
+            feed::fmt_span(e as i64),
+            countdown(left)
+        ),
+        (Some(e), None) => format!("estimate {}", feed::fmt_span(e as i64)),
+        (None, _) => "no estimate yet".into(),
+    };
+    std::iter::once(head).chain(state).chain([est]).collect()
+}
+
+/// A paused row's hover: `paused since 15:10: <note>`, else why its
+/// clock stands.
+fn paused_why(since: &str, note: Option<&str>) -> String {
+    match note.filter(|n| !n.is_empty()) {
+        Some(n) => format!("paused since {since}: {n}"),
+        None => format!("paused since {since} — its clock is stopped"),
+    }
+}
+
+/// A Done row's hover (giverny#423): how it landed (`now`, the row's NOW)
+/// and how long it took against its estimate, then who is to review it and
+/// where, when someone is.
+fn done_why(
+    now: &str,
+    elapsed: &str,
+    delta: Option<(i64, feed::Against)>,
+    review: Option<&str>,
+) -> Vec<String> {
+    let mut head = "Done".to_string();
+    // A landing that says only Done is not said twice.
+    if !now.is_empty() && !now.eq_ignore_ascii_case("done") {
+        head.push_str(&format!(": {now}"));
+    }
+    if !elapsed.is_empty() {
+        head.push_str(&format!("; took {elapsed}"));
+        head.push_str(&match delta {
+            Some((d, a)) => {
+                let what = format!("its {}", a.label());
+                match feed::fmt_span(d.abs()) {
+                    s if s == "0m" => format!(", on {what}"),
+                    s if d > 0 => format!(", {s} over {what}"),
+                    s => format!(", {s} under {what}"),
+                }
+            }
+            None => ", no estimate".into(),
+        });
+    }
+    std::iter::once(head)
+        .chain(review.map(|r| format!("awaiting review: {r}")))
+        .collect()
 }
 
 /// How a Running row with no estimate gets one, as the overlay header says
@@ -2535,14 +2728,6 @@ impl Cols {
         }
     }
 
-    /// `line`'s whole title when TASK cuts it, for the row's tooltip
-    /// (giverny#350); `None` when it fits or is not shown.
-    fn cut_title<'l>(&self, line: &'l Line) -> Option<&'l str> {
-        self.title_w()
-            .filter(|&w| line.title.chars().count() > w)
-            .map(|_| line.title.as_str())
-    }
-
     /// A row's cells as drawn: each one's text and the column it starts at.
     /// Always the same seven, in this order ([`ETA_SEG`], [`LEASE_SEG`]); a
     /// column switched off is an empty cell.
@@ -2815,19 +3000,17 @@ fn draw_table(
     if hovered_line.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    // A title TASK cut is read whole on hover; one that fits has no
-    // tooltip (giverny#110). Every row shares the one response, so the
+    // Every row's hover reads its whole title and why it is where it is
+    // (giverny#350, giverny#423). Every row shares the one response, so the
     // tooltip is anchored to the hovered row's rect: it sits under that
-    // row, and moving to another cut row keeps it open (same id, the
-    // pointer still inside) with the new title. egui keeps it closed
-    // while a drag selects or just after a click.
-    if let Some(i) = hovered_line
-        && let Some(title) = layout.cut_title(&table.lines[i])
-    {
+    // row, and moving to another row keeps it open (same id, the pointer
+    // still inside) with the new text. egui keeps it closed while a drag
+    // selects or just after a click.
+    if let Some(i) = hovered_line {
         let mut row = resp.clone();
         row.rect = rects[i];
         row.interact_rect = rects[i];
-        row.on_hover_text(title);
+        row.on_hover_text(table.lines[i].tip());
     }
     let sel_fill = ui.visuals().selection.bg_fill;
     let p = ui.painter().clone();
@@ -3303,49 +3486,156 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_title_is_offered_whole_and_one_that_fits_is_not() {
-        // giverny#350: the row's tooltip carries the whole title only when
-        // TASK cut it; a title that fits gets none (giverny#110).
-        let mut t = build(Some(&feed(DONE_FOUR)), &[], T0);
-        let long = "a title far too long to fit in the narrow pane's TASK column";
-        t.lines[0].title = long.into();
-        let narrow = Cols::new(&t, 60);
-        let w = narrow.title_w().expect("the title is on");
-        assert!(long.chars().count() > w, "the test needs the title cut");
-        let drawn = compose(&narrow.segments(&t.lines[0]));
-        assert!(drawn.contains('…') && !drawn.contains(long), "{drawn}");
-        assert_eq!(narrow.cut_title(&t.lines[0]), Some(long));
-        // A short title fits: no tooltip.
-        assert_eq!(t.lines[1].title, "two");
-        assert_eq!(narrow.cut_title(&t.lines[1]), None);
-        // Exactly the width fits too, one more is cut.
-        t.lines[1].title = "x".repeat(w);
-        assert_eq!(narrow.cut_title(&t.lines[1]), None);
-        t.lines[1].title.push('x');
+    fn every_rows_hover_reads_its_whole_title_and_why_it_is_there() {
+        // giverny#423 (after giverny#350): the tooltip is the whole title,
+        // cut or not, then what the row's state is and why.
+        let t = build(Some(&feed(DONE_FOUR)), &[], T0);
+        for l in &t.lines {
+            let tip = l.tip();
+            assert!(tip.starts_with(&l.title), "{tip}");
+            assert!(tip.lines().count() >= 2, "a line of why: {tip}");
+        }
+        // A row with no title is named by its id.
+        let mut l = t.lines[0].clone();
+        l.title.clear();
+        assert!(l.tip().starts_with(&l.id), "{}", l.tip());
+    }
+
+    #[test]
+    fn a_running_rows_hover_says_who_since_when_and_how_it_goes() {
+        let who = "worker Wren (opus)";
         assert_eq!(
-            narrow.cut_title(&t.lines[1]),
-            Some(t.lines[1].title.as_str())
+            running_why(who, Some("14:02"), Some(1800), Some(18 * 60), None),
+            [
+                "Running: worker Wren (opus) since 14:02",
+                "estimate 30m: ~18m left, on track"
+            ]
         );
-        // Wide enough, the long one fits whole.
-        let wide = Cols::new(&t, 200);
-        assert!(compose(&wide.segments(&t.lines[0])).contains(long));
-        assert_eq!(wide.cut_title(&t.lines[0]), None);
-        // The id off: the title has TASK to itself, and the same rule holds.
-        let no_id = PaneColumns {
-            id: false,
-            ..PaneColumns::default()
-        };
-        let cols = Cols::shown(&t, 60, &no_id);
-        assert_eq!(cols.title_w(), Some(cols.taskw));
-        assert_eq!(cols.cut_title(&t.lines[0]), Some(long));
-        // The title off: nothing to read whole.
-        let off = PaneColumns {
-            title: false,
-            ..PaneColumns::default()
-        };
-        let cols = Cols::shown(&t, 60, &off);
-        assert_eq!(cols.title_w(), None);
-        assert!(t.lines.iter().all(|l| cols.cut_title(l).is_none()));
+        assert_eq!(
+            running_why(who, Some("14:02"), Some(1800), Some(-5 * 60), None),
+            [
+                "Running: worker Wren (opus) since 14:02",
+                "estimate 30m: 5m over it"
+            ]
+        );
+        // Seconds past is not over yet.
+        assert_eq!(
+            running_why(who, None, Some(1800), Some(-10), None)[1],
+            "estimate 30m: ~0m left, on track"
+        );
+        let paused = paused_why("15:10", None);
+        assert_eq!(paused, "paused since 15:10 — its clock is stopped");
+        assert_eq!(
+            running_why("no worker on it", None, None, None, Some(paused)),
+            [
+                "Running: no worker on it",
+                "paused since 15:10 — its clock is stopped",
+                "no estimate yet"
+            ]
+        );
+        assert_eq!(
+            paused_why("15:10", Some("waits for the slot")),
+            "paused since 15:10: waits for the slot"
+        );
+    }
+
+    #[test]
+    fn a_running_row_with_a_live_worker_names_it_in_its_hover() {
+        let rows = live(&format!(
+            r#"{{"session_id":"s","tasks":[{{"id":"w","status":"running",
+                "description":"Work acme#9","startTime":{}}}]}}"#,
+            T0 - 10 * 60_000
+        ));
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#9","stage":"running","agent_id":"w","started":{s},
+                "eta_s":1800,"title":"a task"}}]}}"#,
+            s = T0 - 10 * 60_000,
+        ));
+        let t = build(Some(&f), &rows, T0);
+        let why = &t.lines[0].why;
+        assert!(
+            why[0].starts_with("Running: worker Work acme#9 since "),
+            "{why:?}"
+        );
+        assert_eq!(why[1], "estimate 30m: ~20m left, on track");
+        assert_eq!(why.len(), 2, "{why:?}");
+    }
+
+    #[test]
+    fn a_next_up_rows_hover_says_why_it_waits() {
+        let at = |m: u64| ts(T0 + m * 60_000);
+        let json = format!(
+            r#"{{"version":1,"rows":[
+              {{"key":"280-reuse","stage":"running","started":"{p}","eta_s":1800}},
+              {{"key":"265-x","stage":"planned","planned":"{p}","held":"your answer on the layout",
+                "eta_s":1200}},
+              {{"key":"282-after","stage":"planned","planned":"{p}","after":"280-reuse"}},
+              {{"key":"283-y","stage":"planned","planned":"{p}",
+                "lease":{{"state":"queued","position":2,"behind":"280-reuse","short":["ram"],
+                          "cpu":3,"ram_mb":3072}}}},
+              {{"key":"284-idle","stage":"planned","planned":"{p}"}}]}}"#,
+            p = at(0),
+        );
+        let t = build(Some(&feed(&json)), &[], T0 + 30 * 60_000);
+        let why = |k: &str| t.lines.iter().find(|l| l.id == k).unwrap().why.clone();
+        assert_eq!(
+            why("280-reuse"),
+            [
+                "no worker yet — started, but no worker has picked it up",
+                "estimate ~30m"
+            ]
+        );
+        assert_eq!(
+            why("265-x"),
+            [
+                "held — not started; waiting for: your answer on the layout",
+                "estimate ~20m"
+            ]
+        );
+        assert_eq!(
+            why("282-after"),
+            ["after 280-reuse — starts when that lands"]
+        );
+        assert_eq!(
+            why("283-y"),
+            ["queued — waiting for 3G behind 280-reuse in the machine ledger"]
+        );
+        assert_eq!(why("284-idle"), [IDLE_WHY]);
+    }
+
+    #[test]
+    fn a_done_rows_hover_says_how_it_went_against_its_estimate() {
+        use feed::Against;
+        assert_eq!(
+            done_why("Done", "25:00", Some((300, Against::Estimate(1200))), None),
+            ["Done; took 25:00, 5m over its estimate 20m"]
+        );
+        assert_eq!(
+            done_why("Blocked", "", None, None),
+            ["Done: Blocked"],
+            "no clock, no estimate said"
+        );
+        assert_eq!(
+            done_why("", "15:00", Some((-300, Against::Worker(1200))), None),
+            ["Done; took 15:00, 5m under its worker's 20m"]
+        );
+        assert_eq!(
+            done_why("done", "20:00", Some((10, Against::Given)), None),
+            ["Done; took 20:00, on its estimate"]
+        );
+        assert_eq!(
+            done_why(
+                "Review — ita",
+                "20:00",
+                None,
+                Some("ita — the hover — window PID 1")
+            ),
+            [
+                "Done: Review — ita; took 20:00, no estimate",
+                "awaiting review: ita — the hover — window PID 1"
+            ]
+        );
     }
 
     #[test]
