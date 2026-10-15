@@ -1925,8 +1925,9 @@ fn claim(
             l.heartbeat(session, now);
             return (resources::Outcome::Held(s.1.clone()), Some(s.0));
         }
+        let left = |s: &str, t: &str| resources::eta_or_estimate_s(dir, s, t, now);
         (
-            l.claim(&cap, session, task, repo.as_deref(), &req, now),
+            l.claim_timed(&cap, session, task, repo.as_deref(), &req, now, &left),
             None,
         )
     })?;
