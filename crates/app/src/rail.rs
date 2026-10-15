@@ -567,18 +567,11 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                 }
                 ui.add_space(6.0);
             }
-            ui.add_space(4.0);
+            // One more header's height, in the categories' own rhythm: the
+            // next category, not yet named. A repository group is not made
+            // by hand, so the repos view has none.
             if arrangeable {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    if ui
-                        .small_button("+ category")
-                        .on_hover_text("add a category")
-                        .clicked()
-                    {
-                        actions.push(Action::NewCategory);
-                    }
-                });
+                new_category_row(app, ui, &mut actions);
             }
             ui.add_space(8.0);
         });
@@ -1041,6 +1034,57 @@ fn category_header(
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
     rect
+}
+
+/// "+ add category": the row under the last category that adds one, drawn
+/// as a ghost of [`category_header`] rather than a framed button that looked
+/// dropped in. The same height, font and places: a `+` where
+/// the fold triangle sits, its words where a name starts. Dim and frameless
+/// at rest; hovered, it takes a tab row's faint highlight and the colour the
+/// new category will wear (the palette's next, as `add_category` picks it),
+/// so the row previews what a click makes. Lower case, unlike the names
+/// above it: it is an offer, not a category.
+fn new_category_row(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let c = app.chrome;
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), HEADER_H), Sense::click());
+    let p = ui.painter_at(rect);
+    // `hovered` and not the pointer's position: a tab or category being
+    // dragged over it is not aimed at it.
+    let hovered = resp.hovered();
+    if hovered {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+        );
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+    }
+    let color = if hovered {
+        c.category(app.ws.categories.len())
+    } else {
+        c.dim
+    };
+    // Centred on the header's fold triangle, which starts 8 in.
+    let tri_font = FontId::monospace(10.0);
+    let tri_w = ui.ctx().fonts_mut(|f| f.glyph_width(&tri_font, '▾'));
+    p.text(
+        Pos2::new(rect.min.x + 8.0 + tri_w / 2.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        "+",
+        FontId::monospace(11.5),
+        color,
+    );
+    p.text(
+        Pos2::new(rect.min.x + 20.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "add category",
+        FontId::monospace(11.5),
+        color,
+    );
+    if resp.clicked() {
+        actions.push(Action::NewCategory);
+    }
 }
 
 /// A ring with a gap, turned `turns` of the way round (see [`spin`]). What
