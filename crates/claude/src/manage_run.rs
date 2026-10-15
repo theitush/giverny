@@ -64,10 +64,18 @@
 //! A command the memory cap killed is reported as such.
 //!
 //! The exit code is the command's (128 + the signal when one killed it).
+//!
+//! **Killed, it takes its command with it** (giverny#426). Under a scope,
+//! a `run` that gets SIGTERM, SIGHUP or SIGINT stops its own scope
+//! ([`ScopeStop`]: SIGTERM to its processes, [`STOP_GRACE`] later
+//! `cgroup.kill`), records and releases as usual, and exits 128 + the
+//! signal. One that dies before it can (SIGKILL) is covered by the shim's
+//! watcher, which stops the scope once `run`'s pid is gone. A command that
+//! ends on its own is unchanged: what it left running on purpose stays.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use giverny_core::limits::Mem;
@@ -84,6 +92,10 @@ const QUEUED_POLL: Duration = Duration::from_secs(15);
 pub const NO_SYSTEMD_ENV: &str = "GIVERNY_RUN_NO_SYSTEMD";
 /// Where the shim writes what it read of the scope.
 const STATS_ENV: &str = "GIVERNY_RUN_STATS";
+/// The scope's unit, for the shim's watcher (giverny#426).
+const UNIT_ENV: &str = "GIVERNY_RUN_UNIT";
+/// `run`'s pid: the shim's watcher stops the scope once it is gone.
+const PID_ENV: &str = "GIVERNY_RUN_PID";
 /// Every `run` scope's `CPUWeight` (giverny#387): systemd's default, the
 /// same for every worker's command — CPU is shared, not leased — and below
 /// the Claude tabs' ([`crate::tab_cap::TAB_CPU_WEIGHT`]).
@@ -99,10 +111,33 @@ cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
 [ -n "$cg" ] || cg=/nonexistent
 d="/sys/fs/cgroup$cg"
 [ -n "$s" ] && printf 'started\ncgroup %s\n' "$d" > "$s" 2>/dev/null
+# giverny#426: a `run` that dies before its command (SIGKILL, say) must not
+# leave the command running here. A watcher, in a session of its own so a
+# signal to run's group does not take it, stops this scope once run's pid
+# is gone: SIGTERM to its processes, then cgroup.kill. Only this scope, and
+# only when it is the unit run named; any doubt and there is no watcher.
+w=
+u="$GIVERNY_RUN_UNIT"
+case "$d" in
+  */"$u".scope)
+    if [ -n "$u" ] && [ -n "$GIVERNY_RUN_PID" ] && [ -e "$d/cgroup.procs" ]; then
+      ss=; command -v setsid >/dev/null 2>&1 && ss=setsid
+      $ss sh -c 'trap "" TERM HUP INT QUIT
+while kill -0 "$1" 2>/dev/null; do sleep 1; done
+for p in $(cat "$2/cgroup.procs" 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
+sleep 3
+echo 1 > "$2/cgroup.kill" 2>/dev/null || systemctl --user kill --signal=KILL "$3.scope" >/dev/null 2>&1' \
+        sh "$GIVERNY_RUN_PID" "$d" "$u" </dev/null >/dev/null 2>&1 &
+      w=$!
+    fi;;
+esac
 # The command goes first when the slice runs out of memory, before any
 # claude and before this shim, which still has to read the cgroup.
 sh -c 'echo 500 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"' sh "$@"
 rc=$?
+# Ended on its own: the watcher goes (with its group, when setsid made one),
+# and whatever the command left running on purpose stays.
+[ -n "$w" ] && { kill -9 -"$w" 2>/dev/null || kill -9 "$w" 2>/dev/null; }
 if [ -n "$s" ]; then
   {
     echo started
@@ -321,6 +356,9 @@ pub struct Measured {
     /// Held by Giverny itself, with no cgroups here (macOS;
     /// [`crate::user_cap::RunGuard`]): the memory it was held to, MiB.
     pub held_mb: Option<u64>,
+    /// `run` itself got this signal and stopped the command's scope
+    /// (giverny#426); `exit` is then 128 + it.
+    pub stopped_by: Option<i32>,
 }
 
 /// Knobs a test turns.
@@ -337,7 +375,19 @@ pub struct Opts {
     /// said outright by a test, so the suite means the same whatever its
     /// environment (giverny#389).
     pub hold: bool,
+    /// Under a scope: where a signal `run` caught is set (giverny#426), and
+    /// the scope is stopped once it is. The CLI's is [`CAUGHT`], set by the
+    /// SIGTERM/SIGHUP/SIGINT handlers it takes while the command runs; a
+    /// test sets its own.
+    pub stop: Option<&'static AtomicI32>,
+    /// How long the scope's processes have between SIGTERM and SIGKILL.
+    pub stop_grace: Duration,
 }
+
+/// The signal `run` caught while its scope ran (0: none).
+pub static CAUGHT: AtomicI32 = AtomicI32::new(0);
+/// Between a stopped scope's SIGTERM and its SIGKILL.
+pub const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// `giverny manage run`, from [`manage::run_in_code`].
 pub fn run(
@@ -353,6 +403,8 @@ pub fn run(
         heartbeat_every: HEARTBEAT_EVERY,
         ignore_signals: true,
         hold: user_cap::active(),
+        stop: Some(&CAUGHT),
+        stop_grace: STOP_GRACE,
     };
     run_with(dir, ledger, session, task, flags, cap, opts)
 }
@@ -475,9 +527,10 @@ pub fn run_with(
 /// `exit 0; peak 1.2G of 3G, 45.1s CPU in 30.2s`.
 pub fn summary(m: &Measured, cap: &Cap) -> String {
     let secs = |ms: u64| format!("{:.1}s", ms as f64 / 1000.0);
-    let mut s = match m.signal {
-        Some(sig) => format!("exit {} (signal {sig})", m.exit),
-        None => format!("exit {}", m.exit),
+    let mut s = match (m.stopped_by, m.signal) {
+        (Some(sig), _) => format!("exit {} (stopped: run got {})", m.exit, signal_name(sig)),
+        (None, Some(sig)) => format!("exit {} (signal {sig})", m.exit),
+        (None, None) => format!("exit {}", m.exit),
     };
     let peak = m
         .peak_mb
@@ -778,7 +831,10 @@ fn execute(
         }
         let mut c = Command::new("systemd-run");
         c.args(scope_args(expand_flag, &unit, task, cap, &shim, cmd))
-            .env(STATS_ENV, &stats);
+            .env(STATS_ENV, &stats)
+            // The shim's watcher stops the scope if `run` dies first.
+            .env(UNIT_ENV, &unit)
+            .env(PID_ENV, std::process::id().to_string());
         jobs_env(&mut c, cap);
         say(
             task,
@@ -790,25 +846,57 @@ fn execute(
         );
         // Seen by the management panel while it runs.
         let live = run_live::register(&stats, task, session, manage::now_ms());
-        let w = spawn_wait(&mut c, "systemd-run", opts.ignore_signals, |_| ()).map(|w| w.0);
+        // giverny#426: a signal to `run` stops its scope, as Ctrl-C would
+        // stop the command, and `run` still releases and records. Taken
+        // before the spawn: a caught signal is the default again after exec.
+        let mut stop = opts.stop.map(|caught| {
+            caught.store(0, Ordering::Relaxed);
+            ScopeStop::new(caught, &unit, opts.stop_grace)
+        });
+        #[cfg(unix)]
+        let catching = (opts.ignore_signals && stop.is_some()).then(CatchSignals::new);
+        let w = spawn_wait(
+            &mut c,
+            "systemd-run",
+            opts.ignore_signals,
+            stop.as_mut(),
+            |_| (),
+        )
+        .map(|w| w.0);
+        #[cfg(unix)]
+        drop(catching);
         drop(live);
+        let stopped_by = stop.as_ref().and_then(ScopeStop::signal);
+        if let Some(sig) = stopped_by {
+            say(
+                task,
+                &format!(
+                    "got {}: stopped its own scope {unit}.scope (SIGTERM, SIGKILL after {}s)",
+                    signal_name(sig),
+                    opts.stop_grace.as_secs()
+                ),
+            );
+        }
         let st = std::fs::read_to_string(&stats)
             .map(|t| parse_stats(&t))
             .unwrap_or_default();
         let _ = std::fs::remove_file(&stats);
         let w = w?;
-        if st.started {
+        // Stopped, it never falls back to a plain run.
+        if st.started || stopped_by.is_some() {
             let cg_mb = st.peak_bytes.map(|b| b.div_ceil(1024 * 1024));
             return Ok(Measured {
-                exit: w.exit,
+                // Stopped: `run` exits as the signal it got would have.
+                exit: stopped_by.map_or(w.exit, |s| 128 + s),
                 signal: w.signal,
+                stopped_by,
                 // What the cap measures; RSS only where the kernel has no
                 // `memory.peak`.
                 peak_mb: cg_mb.or(w.maxrss_mb),
                 cpu_ms: w.cpu_ms,
                 wall_ms: w.wall_ms,
                 oom_kills: st.oom_kills,
-                capped: true,
+                capped: st.started,
                 held_mb: None,
             });
         }
@@ -865,7 +953,7 @@ fn execute(
         .ok()
         .and_then(|stats| run_live::register(&stats, task, session, manage::now_ms()));
     let t = task.to_string();
-    let (w, guard) = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, |pid| {
+    let (w, guard) = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, None, |pid| {
         held.map(|ceiling| user_cap::RunGuard::start(pid, ceiling, hold_cpu, move |s| say(&t, s)))
     })?;
     drop(live);
@@ -883,6 +971,7 @@ fn execute(
         oom_kills: seen.kills,
         capped: held.is_some(),
         held_mb: held.map(|c| c.ram_mb),
+        stopped_by: None,
     })
 }
 
@@ -905,10 +994,13 @@ struct Waited {
 /// Spawn and reap `c`, with its rusage on Unix; `watch` is handed the
 /// child's pid as it starts, and what it returns is held until the child
 /// is reaped.
+/// With `stop`, the wait polls it, and once it has stopped the scope it
+/// sees the scope empty (or killed) before returning.
 fn spawn_wait<G>(
     c: &mut Command,
     what: &str,
     ignore_signals: bool,
+    mut stop: Option<&mut ScopeStop>,
     watch: impl FnOnce(u32) -> G,
 ) -> Result<(Waited, G), String> {
     let t0 = Instant::now();
@@ -917,21 +1009,34 @@ fn spawn_wait<G>(
     #[cfg(unix)]
     {
         let _ = &mut child;
-        let _quiet = ignore_signals.then(IgnoreSignals::new);
+        // SIGINT is the scope stopper's when there is one; SIGQUIT is left
+        // to the command either way.
+        let _quiet = ignore_signals.then(|| IgnoreSignals::new(stop.is_none()));
         let pid = child.id() as libc::pid_t;
         let mut status: libc::c_int = 0;
         // SAFETY: zeroed rusage is a valid value; wait4 fills it.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let flags = if stop.is_some() { libc::WNOHANG } else { 0 };
         loop {
             // SAFETY: our own child's pid, valid out-pointers.
-            let r = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+            let r = unsafe { libc::wait4(pid, &mut status, flags, &mut ru) };
             if r == pid {
                 break;
+            }
+            if r == 0 {
+                if let Some(s) = stop.as_deref_mut() {
+                    s.tick(child.id());
+                }
+                std::thread::sleep(STOP_POLL);
+                continue;
             }
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::EINTR) {
                 return Err(format!("{what}: wait: {e}"));
             }
+        }
+        if let Some(s) = stop {
+            s.finish();
         }
         let wall_ms = t0.elapsed().as_millis() as u64;
         let (exit, signal) = if libc::WIFEXITED(status) {
@@ -964,7 +1069,7 @@ fn spawn_wait<G>(
     }
     #[cfg(not(unix))]
     {
-        let _ = ignore_signals;
+        let _ = (ignore_signals, stop);
         let st = child.wait().map_err(|e| format!("{what}: wait: {e}"))?;
         Ok((
             Waited {
@@ -979,21 +1084,21 @@ fn spawn_wait<G>(
     }
 }
 
-/// SIGINT and SIGQUIT ignored in this process until dropped. Taken after
-/// the spawn, so the command keeps its own defaults.
+/// SIGQUIT, and SIGINT when `int`, ignored in this process until dropped.
+/// Taken after the spawn, so the command keeps its own defaults.
 #[cfg(unix)]
 struct IgnoreSignals {
-    int: libc::sighandler_t,
+    int: Option<libc::sighandler_t>,
     quit: libc::sighandler_t,
 }
 
 #[cfg(unix)]
 impl IgnoreSignals {
-    fn new() -> IgnoreSignals {
+    fn new(int: bool) -> IgnoreSignals {
         // SAFETY: setting a disposition to SIG_IGN is always sound.
         unsafe {
             IgnoreSignals {
-                int: libc::signal(libc::SIGINT, libc::SIG_IGN),
+                int: int.then(|| libc::signal(libc::SIGINT, libc::SIG_IGN)),
                 quit: libc::signal(libc::SIGQUIT, libc::SIG_IGN),
             }
         }
@@ -1005,11 +1110,269 @@ impl Drop for IgnoreSignals {
     fn drop(&mut self) {
         // SAFETY: restoring the dispositions `new` replaced.
         unsafe {
-            libc::signal(libc::SIGINT, self.int);
+            if let Some(int) = self.int {
+                libc::signal(libc::SIGINT, int);
+            }
             libc::signal(libc::SIGQUIT, self.quit);
         }
     }
 }
+
+/// SIGTERM, SIGHUP and SIGINT caught into [`CAUGHT`] until dropped
+/// (giverny#426), so a `run` told to go stops its scope first. One this
+/// process ignored (`nohup`) stays ignored.
+#[cfg(unix)]
+struct CatchSignals {
+    old: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+#[cfg(unix)]
+extern "C" fn on_signal(sig: libc::c_int) {
+    // Async-signal-safe: one atomic store.
+    CAUGHT.store(sig, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+impl CatchSignals {
+    fn new() -> CatchSignals {
+        let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let mut old = Vec::new();
+        for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            // SAFETY: a handler that only stores an atomic.
+            let prev = unsafe { libc::signal(sig, handler) };
+            if prev == libc::SIG_IGN {
+                // SAFETY: putting back the ignore it replaced.
+                unsafe { libc::signal(sig, libc::SIG_IGN) };
+            } else if prev != libc::SIG_ERR {
+                old.push((sig, prev));
+            }
+        }
+        CatchSignals { old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CatchSignals {
+    fn drop(&mut self) {
+        for &(sig, prev) in &self.old {
+            // SAFETY: restoring the disposition `new` replaced.
+            unsafe { libc::signal(sig, prev) };
+        }
+    }
+}
+
+/// How often a wait with a [`ScopeStop`] looks again.
+const STOP_POLL: Duration = Duration::from_millis(100);
+/// How long a stopped scope is still watched after its SIGKILL.
+const STOP_AFTER_KILL: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+const SIGTERM: i32 = libc::SIGTERM;
+#[cfg(unix)]
+const SIGKILL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIGTERM: i32 = 15;
+#[cfg(not(unix))]
+const SIGKILL: i32 = 9;
+
+/// `SIGTERM`, `SIGHUP`, `SIGINT`, else `signal <n>`.
+fn signal_name(sig: i32) -> String {
+    match sig {
+        15 => "SIGTERM".into(),
+        1 => "SIGHUP".into(),
+        2 => "SIGINT".into(),
+        n => format!("signal {n}"),
+    }
+}
+
+/// Stops the run's own scope once `run` has caught a signal (giverny#426):
+/// SIGTERM to every process in it, and after the grace `cgroup.kill` (or,
+/// where that cannot be written, SIGKILL to each process still listed).
+/// The scope is found from the child's own cgroup, and only when that is
+/// the unit `run` named; else only the child itself (systemd-run, not yet
+/// in its scope) is signalled. Doubt falls on the side of killing nothing.
+pub struct ScopeStop {
+    caught: &'static AtomicI32,
+    unit: String,
+    grace: Duration,
+    /// Where `/proc` and the cgroup tree are (a test's fakes).
+    proc_root: PathBuf,
+    cgroup_root: PathBuf,
+    /// The scope's directory, learnt from the child while it lives (so a
+    /// child that dies with the signal still leaves it known).
+    scope: Option<PathBuf>,
+    stopping: Option<Stopping>,
+}
+
+/// A stop under way.
+struct Stopping {
+    signal: i32,
+    at: Instant,
+    /// The child, signalled itself when the scope is not known.
+    child: Option<u32>,
+    killed: bool,
+}
+
+impl ScopeStop {
+    pub fn new(caught: &'static AtomicI32, unit: &str, grace: Duration) -> ScopeStop {
+        ScopeStop::with_roots(caught, unit, grace, "/proc", CGROUP_ROOT)
+    }
+
+    pub fn with_roots(
+        caught: &'static AtomicI32,
+        unit: &str,
+        grace: Duration,
+        proc_root: impl Into<PathBuf>,
+        cgroup_root: impl Into<PathBuf>,
+    ) -> ScopeStop {
+        ScopeStop {
+            caught,
+            unit: unit.to_string(),
+            grace,
+            proc_root: proc_root.into(),
+            cgroup_root: cgroup_root.into(),
+            scope: None,
+            stopping: None,
+        }
+    }
+
+    /// The signal it stopped the scope for.
+    pub fn signal(&self) -> Option<i32> {
+        self.stopping.as_ref().map(|s| s.signal)
+    }
+
+    /// While the child (not yet reaped, so its pid is its own) runs: learns
+    /// the scope, starts the stop once a signal is in, kills past the grace.
+    pub fn tick(&mut self, child: u32) {
+        if self.scope.is_none() {
+            self.scope =
+                std::fs::read_to_string(self.proc_root.join(child.to_string()).join("cgroup"))
+                    .ok()
+                    .and_then(|text| scope_dir(&text, &self.unit, &self.cgroup_root));
+        }
+        self.begin(Some(child));
+        self.escalate();
+    }
+
+    /// A caught signal starts the stop: SIGTERM to the scope's processes,
+    /// else to the child alone.
+    fn begin(&mut self, child: Option<u32>) {
+        if self.stopping.is_some() {
+            return;
+        }
+        let sig = self.caught.load(Ordering::Relaxed);
+        if sig == 0 {
+            return;
+        }
+        match (&self.scope, child) {
+            (Some(dir), _) => signal_procs(dir, SIGTERM),
+            (None, Some(pid)) => send(pid, SIGTERM),
+            (None, None) => {}
+        }
+        self.stopping = Some(Stopping {
+            signal: sig,
+            at: Instant::now(),
+            child,
+            killed: false,
+        });
+    }
+
+    /// Past the grace: SIGKILL, once.
+    fn escalate(&mut self) {
+        let Some(s) = self.stopping.as_mut() else {
+            return;
+        };
+        if s.killed || s.at.elapsed() < self.grace {
+            return;
+        }
+        s.killed = true;
+        match (&self.scope, s.child) {
+            (Some(dir), _) => {
+                if std::fs::write(dir.join("cgroup.kill"), "1").is_err() {
+                    signal_procs(dir, SIGKILL);
+                }
+            }
+            (None, Some(pid)) => send(pid, SIGKILL),
+            (None, None) => {}
+        }
+    }
+
+    /// After the child is reaped (its pid no longer ours): a signal caught
+    /// meanwhile still stops the scope, which is watched until it is empty,
+    /// killed past the grace, and let go a little after that.
+    pub fn finish(&mut self) {
+        if let Some(s) = self.stopping.as_mut() {
+            s.child = None;
+        }
+        self.begin(None);
+        let Some(dir) = self.scope.clone() else {
+            return;
+        };
+        while let Some(s) = self.stopping.as_ref() {
+            if live_procs(&dir).is_empty() || s.at.elapsed() >= self.grace + STOP_AFTER_KILL {
+                return;
+            }
+            self.escalate();
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+}
+
+/// The cgroup v2 tree.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// The directory of the scope `cgroup_text` (a `/proc/<pid>/cgroup`) puts
+/// its process in, under `cgroup_root`, when that scope is `<unit>.scope`;
+/// else None.
+pub fn scope_dir(cgroup_text: &str, unit: &str, cgroup_root: &Path) -> Option<PathBuf> {
+    let path = cgroup_text
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))?
+        .trim();
+    let name = path.rsplit('/').next()?;
+    if unit.is_empty() || name != format!("{unit}.scope") || path.split('/').any(|p| p == "..") {
+        return None;
+    }
+    Some(cgroup_root.join(path.trim_start_matches('/')))
+}
+
+/// The pids `dir`'s `cgroup.procs` lists that are still there.
+fn live_procs(dir: &Path) -> Vec<u32> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok())
+        .filter(|&p| p > 1 && alive(p))
+        .collect()
+}
+
+fn signal_procs(dir: &Path, sig: i32) {
+    for pid in live_procs(dir) {
+        send(pid, sig);
+    }
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn send(pid: u32, sig: i32) {
+    if pid > 1 {
+        // SAFETY: a plain kill(2) of one positive pid.
+        unsafe { libc::kill(pid as libc::pid_t, sig) };
+    }
+}
+
+#[cfg(not(unix))]
+fn alive(_: u32) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn send(_: u32, _: i32) {}
 
 /// Add one run to the row's `usage` (see `docs/management-panel.md`, **Row**).
 pub fn record_usage(
@@ -1119,6 +1482,8 @@ mod tests {
             heartbeat_every: Duration::from_millis(every_ms),
             ignore_signals: false,
             hold: false,
+            stop: None,
+            stop_grace: STOP_GRACE,
         }
     }
 
@@ -1465,6 +1830,394 @@ mod tests {
             assert_eq!(u.cap_ram_mb, Some(256));
             assert!(u.peak_mb.is_some(), "{u:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child process, and a guard that kills and reaps it whatever the
+    /// test does.
+    struct Proc(std::process::Child);
+
+    impl Proc {
+        fn sh(script: &str) -> Proc {
+            Proc(
+                Command::new("sh")
+                    .args(["-c", script])
+                    .spawn()
+                    .expect("spawn sh"),
+            )
+        }
+        /// One that ignores SIGTERM, returned once its `trap` has run (a
+        /// busy machine could otherwise signal it first).
+        fn stubborn(dir: &Path, name: &str) -> Proc {
+            std::fs::create_dir_all(dir).unwrap();
+            let flag = dir.join(format!("{name}.ready"));
+            let p = Proc::sh(&format!(
+                "trap '' TERM; : > {}; exec sleep 30",
+                flag.display()
+            ));
+            ready(&flag);
+            p
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+        /// How it ended, waiting for that at most `secs`.
+        fn ended(&mut self, secs: u64) -> Option<std::process::ExitStatus> {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(secs) {
+                if let Some(st) = self.0.try_wait().unwrap() {
+                    return Some(st);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+        /// The signal it died of, waiting for it at most `secs`.
+        fn died_of(&mut self, secs: u64) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+            self.ended(secs).and_then(|st| st.signal())
+        }
+        fn running(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
+    }
+
+    impl Drop for Proc {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn ready(flag: &Path) {
+        let t0 = Instant::now();
+        while !flag.exists() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "never ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A fake `/proc/<child>/cgroup` putting `child` in `<unit>.scope`, and
+    /// that scope's directory listing `procs`.
+    fn fake_scope(root: &Path, unit: &str, child: u32, procs: &[u32]) -> PathBuf {
+        let rel = format!("user.slice/giverny-claude.slice/{unit}.scope");
+        let pd = root.join("proc").join(child.to_string());
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(pd.join("cgroup"), format!("0::/{rel}\n")).unwrap();
+        let scope = root.join("cg").join(rel);
+        std::fs::create_dir_all(&scope).unwrap();
+        let list: String = procs.iter().map(|p| format!("{p}\n")).collect();
+        std::fs::write(scope.join("cgroup.procs"), list).unwrap();
+        scope
+    }
+
+    #[test]
+    fn only_the_runs_own_unit_is_its_scope() {
+        let root = Path::new("/cg");
+        let line = "0::/user.slice/giverny-claude.slice/giverny-run-t-42.scope\n";
+        assert_eq!(
+            scope_dir(line, "giverny-run-t-42", root),
+            Some(PathBuf::from(
+                "/cg/user.slice/giverny-claude.slice/giverny-run-t-42.scope"
+            ))
+        );
+        // Not in its scope yet (still the tab's), another run's, nothing.
+        let tab = "0::/user.slice/giverny-claude.slice/giverny-claude-7.scope\n";
+        assert_eq!(scope_dir(tab, "giverny-run-t-42", root), None);
+        assert_eq!(scope_dir(line, "giverny-run-t-43", root), None);
+        assert_eq!(scope_dir(line, "", root), None);
+        assert_eq!(scope_dir("", "giverny-run-t-42", root), None);
+        let up = "0::/a/../giverny-run-t-42.scope\n";
+        assert_eq!(scope_dir(up, "giverny-run-t-42", root), None);
+    }
+
+    /// giverny#426: a `run` signalled mid-command stops every process in
+    /// its own scope — SIGTERM, then SIGKILL for one that ignores it — and
+    /// nothing outside the scope. Fake cgroup files, real processes; here
+    /// `cgroup.kill` cannot be written, so the kill goes pid by pid.
+    #[test]
+    fn a_signalled_run_stops_its_scope_and_nothing_else() {
+        static CAUGHT_T: AtomicI32 = AtomicI32::new(0);
+        let root = scratch("stop-fake");
+        let unit = "giverny-run-t-1";
+        let mut inner = Proc::sh("exec sleep 30");
+        let mut stubborn = Proc::stubborn(&root, "stubborn");
+        let mut outside = Proc::sh("exec sleep 30");
+        // The child stands in for systemd-run (the shim, in the scope).
+        let mut c = Command::new("sh");
+        c.args(["-c", "exec sleep 30"]);
+        let mut stop = ScopeStop::with_roots(
+            &CAUGHT_T,
+            unit,
+            Duration::from_millis(400),
+            root.join("proc"),
+            root.join("cg"),
+        );
+        let (ip, sp) = (inner.pid(), stubborn.pid());
+        let r = root.clone();
+        let signaller = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            CAUGHT_T.store(libc::SIGTERM, Ordering::Relaxed);
+        });
+        let t0 = Instant::now();
+        let (w, scope) = spawn_wait(&mut c, "stand-in", false, Some(&mut stop), |child| {
+            let scope = fake_scope(&r, unit, child, &[child, ip, sp]);
+            // No cgroup.kill to write here.
+            std::fs::create_dir_all(scope.join("cgroup.kill")).unwrap();
+            scope
+        })
+        .unwrap();
+        signaller.join().unwrap();
+        assert_eq!(stop.signal(), Some(libc::SIGTERM));
+        assert_eq!((w.exit, w.signal), (143, Some(libc::SIGTERM)));
+        assert_eq!(inner.died_of(2), Some(libc::SIGTERM));
+        assert_eq!(
+            stubborn.died_of(2),
+            Some(libc::SIGKILL),
+            "killed past the grace"
+        );
+        assert!(outside.running(), "not in the scope: untouched");
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        assert!(scope.join("cgroup.kill").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same with `cgroup.kill` there: it is what kills past the grace.
+    /// And a run that is not signalled ends as before, killing nothing.
+    #[test]
+    fn past_the_grace_the_scope_is_cgroup_killed_and_a_normal_exit_is_unchanged() {
+        static CAUGHT_K: AtomicI32 = AtomicI32::new(0);
+        static CAUGHT_N: AtomicI32 = AtomicI32::new(0);
+        let root = scratch("stop-kill");
+        let unit = "giverny-run-t-2";
+        let stubborn = Proc::stubborn(&root, "stubborn");
+        let sp = stubborn.pid();
+        let r = root.clone();
+        let mut stop = ScopeStop::with_roots(
+            &CAUGHT_K,
+            unit,
+            Duration::from_millis(200),
+            root.join("proc"),
+            root.join("cg"),
+        );
+        let flag = root.join("child.ready");
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            &format!("trap '' TERM; : > {}; sleep 1", flag.display()),
+        ]);
+        let signaller = std::thread::spawn(move || {
+            ready(&flag);
+            CAUGHT_K.store(libc::SIGHUP, Ordering::Relaxed);
+        });
+        let (w, scope) = spawn_wait(&mut c, "stand-in", false, Some(&mut stop), |child| {
+            let scope = fake_scope(&r, unit, child, &[child, sp]);
+            std::fs::write(scope.join("cgroup.kill"), "").unwrap();
+            scope
+        })
+        .unwrap();
+        signaller.join().unwrap();
+        assert_eq!(stop.signal(), Some(libc::SIGHUP));
+        assert_eq!(
+            (w.exit, w.signal),
+            (0, None),
+            "it ignored the SIGTERM; only the cgroup.kill, a plain file here, would end it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scope.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        drop(stubborn);
+        // Not signalled: the command's own exit, nothing written or killed.
+        let bystander = Proc::sh("exec sleep 30");
+        let bp = bystander.pid();
+        let mut quiet = ScopeStop::with_roots(
+            &CAUGHT_N,
+            "giverny-run-t-3",
+            Duration::from_millis(100),
+            root.join("proc"),
+            root.join("cg"),
+        );
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 0.3; exit 3"]);
+        let (w, scope) = spawn_wait(&mut c, "stand-in", false, Some(&mut quiet), |child| {
+            let scope = fake_scope(&r, "giverny-run-t-3", child, &[child, bp]);
+            std::fs::write(scope.join("cgroup.kill"), "").unwrap();
+            scope
+        })
+        .unwrap();
+        assert_eq!((w.exit, w.signal, quiet.signal()), (3, None, None));
+        assert_eq!(
+            std::fs::read_to_string(scope.join("cgroup.kill")).unwrap(),
+            ""
+        );
+        let mut bystander = bystander;
+        assert!(bystander.running());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Waits up to `secs` for the scope at `cg` (a `/proc/self/cgroup`
+    /// path) to hold no process.
+    fn scope_empties(cg: &str, secs: u64) -> bool {
+        let dir = Path::new(CGROUP_ROOT).join(cg.trim().trim_start_matches('/'));
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if live_procs(&dir).is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn wait_for(path: &Path, secs: u64) -> String {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if let Ok(t) = std::fs::read_to_string(path)
+                && !t.trim().is_empty()
+            {
+                return t;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{} never written", path.display());
+    }
+
+    /// The real thing, where this machine has a user systemd (giverny#426):
+    /// a `run` signalled mid-command — its command ignoring SIGTERM, one
+    /// child in a session of its own — exits 143 and leaves its scope
+    /// empty; a normal end leaves what the command meant to outlive it.
+    #[test]
+    fn under_systemd_a_signalled_run_leaves_no_scope_behind() {
+        static CAUGHT_S: AtomicI32 = AtomicI32::new(0);
+        let Mode::Systemd { .. } = detect_mode() else {
+            return;
+        };
+        let dir = scratch("stop-real");
+        cmd(&dir, "start t426 --eta 30");
+        assert_eq!(cmd(&dir, "claim t426 --ram 64M").1, 0);
+        let opts = Opts {
+            mode: detect_mode(),
+            stop: Some(&CAUGHT_S),
+            stop_grace: Duration::from_millis(500),
+            ..plain(60_000)
+        };
+        // A task of its own: two tests under one task share a unit name.
+        let (cg, pids) = (dir.join("cg"), dir.join("pids"));
+        let script = format!(
+            "sed -n 's/^0:://p' /proc/self/cgroup > {}; trap '' TERM; \
+             setsid sleep 600 & echo $! $$ > {}; exec sleep 600",
+            cg.display(),
+            pids.display()
+        );
+        let d = dir.clone();
+        let worker = std::thread::spawn(move || run(&d, "t426", &[], &script, opts));
+        let path = wait_for(&cg, 20);
+        if !path.contains("giverny-run-t426-") {
+            // systemd-run made no scope here: it ran plain, and nothing
+            // stops a plain run's command but this.
+            for p in wait_for(&pids, 5).split_whitespace() {
+                send(p.parse().unwrap_or(0), libc::SIGKILL);
+            }
+            let _ = worker.join();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        CAUGHT_S.store(libc::SIGTERM, Ordering::Relaxed);
+        assert_eq!(worker.join().unwrap(), 143);
+        assert!(scope_empties(&path, 5), "{path} still holds processes");
+        let u = row(&dir, "t426").usage.unwrap();
+        assert_eq!(u.last_exit, Some(143), "recorded: {u:?}");
+        // A normal end: what the command left running on purpose lives on.
+        let pidf = dir.join("bg");
+        let script = format!(
+            "setsid sleep 30 >/dev/null 2>&1 & echo $! > {}; exit 4",
+            pidf.display()
+        );
+        assert_eq!(run(&dir, "t426", &[], &script, opts), 4);
+        let bg: u32 = wait_for(&pidf, 5).trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(alive(bg), "a normal end stops nothing");
+        send(bg, libc::SIGKILL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shim's watcher (giverny#426): when `run` dies with no chance to
+    /// stop its scope (SIGKILL), the scope stops itself. A stand-in process
+    /// plays `run`; the scope is a real one, where there is a user systemd.
+    #[test]
+    fn under_systemd_a_scope_outliving_its_run_stops_itself() {
+        let Mode::Systemd { expand_flag } = detect_mode() else {
+            return;
+        };
+        let dir = scratch("watcher");
+        let ledger = resources::ledger_path(&dir);
+        let shim = shim_path(&ledger).unwrap();
+        // The shim under a stand-in `run`, `script` after the cgroup is
+        // written to `<dir>/cg<n>`.
+        let start = |n: u32, fake_run: &Proc, script: &str| {
+            let unit = unit_name(&format!("watch426-{n}"), fake_run.pid());
+            let cg = dir.join(format!("cg{n}"));
+            let cmd: Vec<String> = [
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "sed -n 's/^0:://p' /proc/self/cgroup > {}; {script}",
+                    cg.display()
+                ),
+            ]
+            .into();
+            let cap = Cap { ram_mb: 0, jobs: 1 };
+            let scope = Proc(
+                Command::new("systemd-run")
+                    .args(scope_args(
+                        expand_flag,
+                        &unit,
+                        "watch426",
+                        &cap,
+                        &shim,
+                        &cmd,
+                    ))
+                    .env(UNIT_ENV, &unit)
+                    .env(PID_ENV, fake_run.pid().to_string())
+                    .spawn()
+                    .expect("systemd-run"),
+            );
+            let path = wait_for(&cg, 20);
+            (scope, path.contains(&unit).then_some(path))
+        };
+        let mut fake_run = Proc::sh("exec sleep 600");
+        let (mut scope, Some(path)) = start(1, &fake_run, "trap '' TERM; sleep 600") else {
+            return;
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(scope.running(), "alive while its run is");
+        send(fake_run.pid(), libc::SIGKILL);
+        assert_eq!(fake_run.died_of(2), Some(libc::SIGKILL));
+        assert!(scope.died_of(10).is_some(), "the shim went with its run");
+        assert!(scope_empties(&path, 10), "{path} still holds processes");
+        // The shim ended on its own: its watcher went with it, and what
+        // the command left running on purpose outlives the run.
+        let mut fake_run = Proc::sh("exec sleep 600");
+        let bgf = dir.join("bg");
+        let script = format!(
+            "setsid sleep 30 >/dev/null 2>&1 & echo $! > {}; exit 0",
+            bgf.display()
+        );
+        let (mut scope, Some(_)) = start(2, &fake_run, &script) else {
+            return;
+        };
+        assert_eq!(
+            scope.ended(10).and_then(|s| s.code()),
+            Some(0),
+            "exited on its own"
+        );
+        let bg: u32 = wait_for(&bgf, 5).trim().parse().unwrap();
+        send(fake_run.pid(), libc::SIGKILL);
+        assert_eq!(fake_run.died_of(2), Some(libc::SIGKILL));
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(alive(bg), "no watcher left to stop it");
+        send(bg, libc::SIGKILL);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
