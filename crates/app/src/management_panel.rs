@@ -1835,7 +1835,15 @@ fn format_row(
                 })
             })
             .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
-            running_why(&who, since.as_deref(), eta_s, left_s, state)
+            // What the worker is doing right now, whole: NOW cuts it to fit.
+            let doing = l
+                .filter(|l| l.running())
+                .and_then(|l| l.activity.clone())
+                .filter(|a| !a.is_empty());
+            doing
+                .into_iter()
+                .chain(running_why(&who, since.as_deref(), eta_s, left_s, state))
+                .collect()
         }
         Stage::Planned => {
             let line =
@@ -3920,6 +3928,8 @@ mod tests {
             assert_eq!(l.eta, "~50m");
             assert_eq!(l.click.agent_id.as_deref(), Some("w82"));
             assert_eq!(l.now, format!("Edit: {file}"));
+            // The hover says it whole, right under the title.
+            assert_eq!(l.why[0], format!("Edit: {file}"), "{}", l.tip());
             seen.push(l.tokens.clone());
         }
         assert_eq!(seen, ["50k", "61.2k", "74.9k"]);
