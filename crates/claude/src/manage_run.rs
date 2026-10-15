@@ -535,14 +535,16 @@ fn lease_for(
         let now = manage::now_ms();
         let out = resources::with_ledger(ledger, now, |l| {
             peaks.fill(l);
-            l.claim(&capacity, session, task, repo.as_deref(), &req, now)
+            let left = |s: &str, t: &str| resources::eta_or_estimate_s(dir, s, t, now);
+            l.claim_timed(&capacity, session, task, repo.as_deref(), &req, now, &left)
         })?;
         resources::annotate_row(dir, session, task, resources::row_lease(&out, &req));
         let line =
             resources::outcome_line(task, &out, &|s, t| resources::eta_left_s(dir, s, t, now));
         let got = match out {
             resources::Outcome::Granted(l)
-            | resources::Outcome::GrantedSmaller { lease: l, .. } => {
+            | resources::Outcome::GrantedSmaller { lease: l, .. }
+            | resources::Outcome::Backfilled { lease: l, .. } => {
                 say(task, &format!("held no lease, so claimed one: {line}"));
                 Some((l, true))
             }

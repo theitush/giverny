@@ -58,11 +58,15 @@
 //!
 //! **The queue** is FIFO, a request with a task Priority ahead of one
 //! without (`asap` › `high` › `medium` › `low` › none). A request is
-//! granted only when it fits in what is left after every request queued
-//! ahead of it is set aside ([`Ledger::with_reserved`]): a small task may
-//! go past a big one that is waiting, never take what the big one waits
-//! for. A queued manager polls by running the same `claim` again,
-//! which also keeps its place alive.
+//! granted when it fits in what is left after every request queued ahead
+//! of it is set aside ([`Ledger::with_reserved`]) — or by **backfill**
+//! (giverny#414): beside those ahead that fit now, when it delays none
+//! ahead that do not, by the holders' expected ends ([`Ledger::fit_behind`]).
+//! So one big claim at the head no longer stalls the smaller ones behind
+//! it, and none takes what the head will need when it can start. A
+//! request that fits is never jumped, so nothing starves. A queued manager
+//! polls by running the same `claim` again, which also keeps its place
+//! alive.
 //!
 //! **Leases are protections.** Since giverny#262 the kernel holds the one
 //! ceiling (the slice's `MemoryMax`) and a lease's RAM is its commands'
@@ -626,19 +630,29 @@ pub enum Outcome {
         lease: Lease,
         wanted_mb: u64,
     },
+    /// Granted ahead of `past`, a request queued before it that does not
+    /// fit yet, which this grant does not delay ([`Ledger::fit_behind`]);
+    /// `wanted_mb` is the RAM asked (more than the lease's when smaller).
+    Backfilled {
+        lease: Lease,
+        wanted_mb: u64,
+        past: String,
+    },
     /// The task already holds this lease (a re-claim heartbeats it).
     Held(Lease),
     /// In line at `position` (1-based); `blockers` are the leases holding
     /// what it needs, `ahead` the queued tasks before it, `short` what it
-    /// is short of, `behind` who is really in the way ([`in_the_way`]),
-    /// `request` what it asked, and `cpu` how busy the CPU is when that is
-    /// what it waits on ([`CpuBusy::describe`]).
+    /// is short of, `behind` who is really in the way ([`in_the_way`], or
+    /// the waiter a backfill would delay), `only_queue` true when it would
+    /// fit were nobody queued ahead, `request` what it asked, and `cpu` how
+    /// busy the CPU is when that is what it waits on ([`CpuBusy::describe`]).
     Queued {
         position: usize,
         blockers: Vec<Lease>,
         ahead: Vec<Waiter>,
         short: Vec<String>,
         behind: Option<String>,
+        only_queue: bool,
         request: Request,
         cpu: Option<String>,
     },
@@ -651,6 +665,15 @@ impl Outcome {
         match self {
             Outcome::Granted(_) | Outcome::Held(_) => exit::GRANTED,
             Outcome::GrantedSmaller { .. } => exit::GRANTED_SMALLER,
+            Outcome::Backfilled {
+                lease, wanted_mb, ..
+            } => {
+                if lease.ram_mb < *wanted_mb {
+                    exit::GRANTED_SMALLER
+                } else {
+                    exit::GRANTED
+                }
+            }
             Outcome::Queued { .. } => exit::QUEUED,
             Outcome::Refused(_) => exit::REFUSED,
         }
@@ -951,9 +974,9 @@ impl Ledger {
         None
     }
 
-    /// Claim `req` for `session`'s `task` at `now`. Mutates the ledger: a
-    /// grant becomes a lease, a request that waits joins (or keeps) its
-    /// place in the queue. Expires and heartbeats first.
+    /// Claim `req` for `session`'s `task` at `now`, knowing no task's time
+    /// left: [`Ledger::claim_timed`] with every time unknown, so a backfill
+    /// is granted only beside what is waiting, never before it.
     pub fn claim(
         &mut self,
         cap: &Capacity,
@@ -962,6 +985,26 @@ impl Ledger {
         repo: Option<&str>,
         req: &Request,
         now: u64,
+    ) -> Outcome {
+        self.claim_timed(cap, session, task, repo, req, now, &|_, _| None)
+    }
+
+    /// Claim `req` for `session`'s `task` at `now`. Mutates the ledger: a
+    /// grant becomes a lease, a request that waits joins (or keeps) its
+    /// place in the queue. Expires and heartbeats first. `left` is a task's
+    /// expected time left, seconds, by `(session, task)` — a running one's
+    /// ETA, a planned one's estimate ([`eta_or_estimate_s`]): what a
+    /// backfill is weighed by ([`Ledger::fit_behind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_timed(
+        &mut self,
+        cap: &Capacity,
+        session: &str,
+        task: &str,
+        repo: Option<&str>,
+        req: &Request,
+        now: u64,
+        left: &dyn Fn(&str, &str) -> Option<i64>,
     ) -> Outcome {
         self.expire(now);
         self.heartbeat(session, now);
@@ -994,7 +1037,7 @@ impl Ledger {
         let order = self.ordered_queue();
         let position = order.iter().position(|w| w.id == id).unwrap_or(0);
         let ahead: Vec<Waiter> = order[..position].iter().map(|w| (*w).clone()).collect();
-        let fit = self.with_reserved(cap, &ahead).try_fit(cap, req);
+        let (fit, past) = self.fit_behind(cap, &ahead, session, task, req, now, left);
         match fit {
             Ok(fit) => {
                 self.queue.retain(|w| w.id != id);
@@ -1012,7 +1055,13 @@ impl Ledger {
                     heartbeat_at: now,
                 };
                 self.leases.push(lease.clone());
-                if lease.ram_mb < req.ram_mb {
+                if let Some(past) = past {
+                    Outcome::Backfilled {
+                        lease,
+                        wanted_mb: req.ram_mb,
+                        past,
+                    }
+                } else if lease.ram_mb < req.ram_mb {
                     Outcome::GrantedSmaller {
                         lease,
                         wanted_mb: req.ram_mb,
@@ -1032,7 +1081,11 @@ impl Ledger {
                     .filter(|l| blocks(l, req, &short, &is_building))
                     .cloned()
                     .collect();
-                let behind = in_the_way(&blockers, &ahead, req, &short, &is_building);
+                // Fitting now, it waits only on the queue: on the one it
+                // would delay, else on whoever ahead wants what it would take.
+                let only_queue = self.try_fit(cap, req).is_ok();
+                let behind =
+                    past.or_else(|| in_the_way(&blockers, &ahead, req, &short, &is_building));
                 let cpu = short.iter().any(|s| s == "cpu").then(|| {
                     format!(
                         "CPU busy: {}, {} tasks building",
@@ -1046,11 +1099,116 @@ impl Ledger {
                     ahead,
                     short,
                     behind,
+                    only_queue,
                     request: req.clone(),
                     cpu,
                 }
             }
         }
+    }
+
+    /// Does `req` fit behind the requests queued `ahead` of it? It fits when
+    /// it fits in what is left after every one of them is set aside
+    /// ([`Ledger::with_reserved`]) — or, by **backfill** (giverny#414),
+    /// when it fits beside those ahead that fit now and does not delay any
+    /// that do not (EASY backfill, conservative):
+    ///
+    /// - a waiter ahead that does not fit now is *blocked*; its *shadow* is
+    ///   the soonest it could fit, by the holders' expected ends (`left`;
+    ///   an unknown end counts as now, so the shadow is never late), where
+    ///   it needs its own expected peak and every blocked waiter's before
+    ///   it, all at once;
+    /// - `req` may go before each blocked waiter whose slots and GPUs it
+    ///   does not want, when either it is expected to end by that shadow,
+    ///   or what is surely free at the shadow (only known ends count)
+    ///   still covers them all with `req` holding its share.
+    ///
+    /// Free memory only grows as holders end, so a waiter's real start is no
+    /// sooner than its shadow and finds at least that much free: a backfill
+    /// never pushes it back, by the estimates. Nothing jumps a waiter that
+    /// fits now, so a waiter is granted the moment it fits; no starvation.
+    ///
+    /// The fit and, for a backfill, the blocked waiter it went past; for a
+    /// refused backfill, the waiter it would have delayed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_behind(
+        &self,
+        cap: &Capacity,
+        ahead: &[Waiter],
+        session: &str,
+        task: &str,
+        req: &Request,
+        now: u64,
+        left: &dyn Fn(&str, &str) -> Option<i64>,
+    ) -> (Result<Fit, Vec<String>>, Option<String>) {
+        let all = self.with_reserved(cap, ahead).try_fit(cap, req);
+        if all.is_ok() {
+            return (all, None);
+        }
+        // Set aside the waiters ahead that fit now, in order; the rest are
+        // blocked.
+        let mut v = self.with_reserved(cap, &[]);
+        let mut blocked: Vec<&Waiter> = Vec::new();
+        for w in ahead {
+            if v.try_fit(cap, &w.request).is_ok() {
+                v = v.with_reserved(cap, std::slice::from_ref(w));
+            } else {
+                blocked.push(w);
+            }
+        }
+        let Some(head) = blocked.first() else {
+            return (all, None);
+        };
+        let Ok(fit) = v.try_fit(cap, req) else {
+            return (all, None);
+        };
+        let free_now = v.free(cap).ram_mb;
+        let end_of = |s: &str, t: &str| left(s, t).map(|x| now + x.max(0) as u64 * 1000);
+        // Every holder (a lease, or a waiter set aside): what it frees, when.
+        let mut holders: Vec<(Option<u64>, u64)> = v
+            .leases
+            .iter()
+            .map(|l| (end_of(&l.session, &l.task), cap.counted_mb(l)))
+            .collect();
+        holders.sort_by_key(|&(end, _)| end.unwrap_or(now));
+        // Its own end: a figure already spent says nothing.
+        let own_end = left(session, task)
+            .filter(|&x| x > 0)
+            .map(|x| now + x as u64 * 1000);
+        let mut need = 0;
+        for w in &blocked {
+            let r = &w.request;
+            if (r.gpu > 0 && req.gpu > 0) || r.slots.iter().any(|s| req.slots.contains(s)) {
+                return (all, Some(w.task.clone()));
+            }
+            need += Ledger::counted_for(cap, r, r.ram_mb);
+            // The shadow: the soonest enough could be free.
+            let mut freed = free_now;
+            let mut shadow = now;
+            for &(end, mb) in &holders {
+                if freed >= need {
+                    break;
+                }
+                freed += mb;
+                shadow = end.unwrap_or(now);
+            }
+            if freed < need {
+                // Not even every holder ending frees enough: it waits on
+                // other programs, which may free it any moment.
+                shadow = now;
+            }
+            let sure: u64 = free_now
+                + holders
+                    .iter()
+                    .filter(|(end, _)| end.is_some_and(|e| e <= shadow))
+                    .map(|&(_, mb)| mb)
+                    .sum::<u64>();
+            let done_first = own_end.is_some_and(|e| e <= shadow);
+            if !done_first && sure < need + fit.counted_mb {
+                return (all, Some(w.task.clone()));
+            }
+        }
+        (Ok(fit), Some(head.task.clone()))
     }
 
     /// Shrink `session`'s lease for `task` in place to the figures given
@@ -1115,7 +1273,8 @@ impl Ledger {
 
 /// Who a queued `req` really waits on, given what it is `short` of: the
 /// first request queued `ahead` of it that wants any of that, since it goes
-/// first whatever frees (the queue is FIFO, no backfill); else the first
+/// first whatever frees (a backfill past it was refused,
+/// [`Ledger::fit_behind`]); else the first
 /// of `leases` holding any of it — for a busy CPU, the first `building`
 /// ([`Ledger::builders`]); else nobody (other programs hold it).
 pub fn in_the_way<'a>(
@@ -1306,12 +1465,29 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
             counted(lease),
             Mem(*wanted_mb)
         ),
+        Outcome::Backfilled {
+            lease,
+            wanted_mb,
+            past,
+        } => {
+            let smaller = if lease.ram_mb < *wanted_mb {
+                format!(" (asked {}, more is not free)", Mem(*wanted_mb))
+            } else {
+                String::new()
+            };
+            format!(
+                "granted {task}: {}{}{smaller}, backfilled ahead of {past}, which it does not delay",
+                lease.describe(),
+                counted(lease),
+            )
+        }
         Outcome::Queued {
             position,
             blockers,
             ahead,
             short,
             behind,
+            only_queue,
             request,
             cpu,
         } => {
@@ -1338,7 +1514,16 @@ pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<
                 }
                 names.join(", ")
             };
-            if let Some(k) = waiter {
+            if let (Some(k), true) = (waiter, *only_queue) {
+                // Nothing but the queue holds it back.
+                let w = &ahead[k];
+                s.push_str(&format!(
+                    " behind {}'s {} (queued #{}), the only thing in the way",
+                    w.task,
+                    w.request.describe(),
+                    k + 1
+                ));
+            } else if let Some(k) = waiter {
                 let w = &ahead[k];
                 s.push_str(&format!(
                     " behind {} (queued #{}: {})",
@@ -1391,6 +1576,18 @@ pub fn row_lease(o: &Outcome, req: &Request) -> Option<Value> {
     match o {
         Outcome::Granted(l) | Outcome::Held(l) => Some(granted(l, "granted")),
         Outcome::GrantedSmaller { lease, .. } => Some(granted(lease, "smaller")),
+        Outcome::Backfilled { lease, past, .. } => {
+            let mut v = granted(
+                lease,
+                if lease.ram_mb < req.ram_mb {
+                    "smaller"
+                } else {
+                    "granted"
+                },
+            );
+            v["backfilled_past"] = json!(past);
+            Some(v)
+        }
         Outcome::Queued {
             position,
             short,
@@ -2416,6 +2613,177 @@ mod tests {
         assert!(matches!(q, Outcome::Queued { position: 1, .. }), "{q:?}");
         let order: Vec<&str> = l.ordered_queue().iter().map(|w| w.task.as_str()).collect();
         assert_eq!(order, ["urgent", "early"]);
+    }
+
+    /// giverny#414: 9G held for ~11m more leaves 5.85G of the ~14.85G; the
+    /// head of the queue wants 6G. A smaller claim behind it is granted now
+    /// when it does not delay the head, and waits when it would.
+    #[test]
+    fn a_small_claim_backfills_past_a_big_head_that_does_not_fit() {
+        let c = cap();
+        let times = |own: Option<i64>, holder: Option<i64>| {
+            move |_: &str, t: &str| match t {
+                "a" => holder,
+                "small" => own,
+                _ => None,
+            }
+        };
+        let start = |head_gb: u64| {
+            let mut l = Ledger::default();
+            l.claim(&c, "o", "a", None, &req(9), T0);
+            let q = l.claim_timed(
+                &c,
+                "h",
+                "spx",
+                None,
+                &req(head_gb),
+                T0,
+                &times(None, Some(660)),
+            );
+            assert!(matches!(q, Outcome::Queued { position: 1, .. }), "{q:?}");
+            l
+        };
+
+        // Done (~5m) before the head can start (~11m): granted now.
+        let mut l = start(6);
+        let g = l.claim_timed(
+            &c,
+            "s",
+            "small",
+            None,
+            &req(3),
+            T0,
+            &times(Some(300), Some(660)),
+        );
+        let Outcome::Backfilled { past, .. } = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!(past, "spx");
+        assert_eq!(g.exit_code(), exit::GRANTED);
+        let line = outcome_line("small", &g, &|_, _| None);
+        assert_eq!(
+            line,
+            "granted small: 3G, backfilled ahead of spx, which it does not delay"
+        );
+        assert_eq!(row_lease(&g, &req(3)).unwrap()["backfilled_past"], "spx");
+        assert_eq!(l.ordered_queue()[0].task, "spx", "the head keeps its place");
+
+        // No time of its own, but when the 9G ends there is room for both.
+        let mut l = start(6);
+        let g = l.claim_timed(&c, "s", "small", None, &req(3), T0, &times(None, Some(660)));
+        assert!(matches!(g, Outcome::Backfilled { .. }), "{g:?}");
+
+        // The holder's end unknown: the head may fit any moment, so the
+        // small one would delay it and waits — on the head alone.
+        let mut l = start(6);
+        let q = l.claim_timed(&c, "s", "small", None, &req(3), T0, &times(Some(300), None));
+        let Outcome::Queued {
+            behind, only_queue, ..
+        } = &q
+        else {
+            panic!("{q:?}")
+        };
+        assert_eq!((behind.as_deref(), *only_queue), (Some("spx"), true));
+        let line = outcome_line("small", &q, &|_, _| None);
+        assert!(
+            line.starts_with(
+                "queued #2 for 3G behind spx's 6G (queued #1), the only thing in the way;"
+            ),
+            "{line}"
+        );
+
+        // A 12G head needs the 9G back and then has no room for 3G more: a
+        // small one still going at ~11m would push it back, one done by
+        // then would not.
+        let mut l = start(12);
+        let q = l.claim_timed(
+            &c,
+            "s",
+            "small",
+            None,
+            &req(3),
+            T0,
+            &times(Some(1200), Some(660)),
+        );
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        let g = l.claim_timed(
+            &c,
+            "s",
+            "small",
+            None,
+            &req(3),
+            T0,
+            &times(Some(300), Some(660)),
+        );
+        assert!(matches!(g, Outcome::Backfilled { .. }), "{g:?}");
+
+        // A slot the head wants is never backfilled into.
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "a", None, &req(9), T0);
+        let slot = |gb| Request {
+            slots: vec!["cargo:/t".into()],
+            ..req(gb)
+        };
+        l.claim(&c, "h", "spx", None, &slot(6), T0);
+        let q = l.claim_timed(
+            &c,
+            "s",
+            "small",
+            None,
+            &slot(3),
+            T0,
+            &times(Some(300), Some(660)),
+        );
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+    }
+
+    /// The head is granted first the moment it fits: once it fits nobody
+    /// takes its share, and it is granted as ever, not as a backfill.
+    #[test]
+    fn a_head_that_fits_goes_first() {
+        let c = cap();
+        let t = |_: &str, _: &str| Some(60);
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "a", None, &req(9), T0);
+        l.claim_timed(&c, "h", "spx", None, &req(6), T0, &t);
+        assert!(l.release("o", "a", T0 + MIN).is_some());
+        // 14.85G free, 6G of it the head's: 10G more would take its share.
+        let q = l.claim_timed(&c, "s", "wide", None, &req(10), T0 + MIN, &t);
+        let Outcome::Queued {
+            behind, only_queue, ..
+        } = &q
+        else {
+            panic!("{q:?}")
+        };
+        assert_eq!((behind.as_deref(), *only_queue), (Some("spx"), true));
+        let g = l.claim_timed(&c, "h", "spx", None, &req(6), T0 + MIN, &t);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+    }
+
+    /// Priority still beats first come with backfill on: a later ASAP
+    /// claim is ahead of an earlier plain one, which may not take its share.
+    #[test]
+    fn priority_still_goes_first_with_backfill() {
+        let c = cap();
+        let t = |_: &str, t: &str| (t == "a").then_some(660);
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "a", None, &req(9), T0);
+        l.claim_timed(&c, "h", "plain", None, &req(8), T0, &t);
+        let urgent = Request {
+            priority: Some("asap".into()),
+            ..req(8)
+        };
+        let q = l.claim_timed(&c, "u", "urgent", None, &urgent, T0 + MIN, &t);
+        assert!(matches!(q, Outcome::Queued { position: 1, .. }), "{q:?}");
+        assert!(l.release("o", "a", T0 + 2 * MIN).is_some());
+        // Room for one 8G: the plain one, polling first, waits on urgent.
+        let q = l.claim_timed(&c, "h", "plain", None, &req(8), T0 + 2 * MIN, &t);
+        let Outcome::Queued { behind, .. } = &q else {
+            panic!("{q:?}")
+        };
+        assert_eq!(behind.as_deref(), Some("urgent"));
+        let g = l.claim_timed(&c, "u", "urgent", None, &urgent, T0 + 2 * MIN, &t);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
     }
 
     #[test]
