@@ -438,6 +438,11 @@ pub struct RailConfig {
     /// A working tab breathes a slow dot in its colour instead of spinning.
     /// With `animate` off the dot holds still, full.
     pub calm_busy: bool,
+    /// Title a Claude tab after its session's name, as a place: `Rotem's
+    /// Workshop` (giverny#435). Only while sessions are named
+    /// (`management_panel.ask_names`); Claude's own title moves to the
+    /// tab's hover, and a title you typed still wins.
+    pub place_titles: bool,
 }
 
 impl Default for RailConfig {
@@ -447,6 +452,7 @@ impl Default for RailConfig {
             tab_figures: true,
             total_line: true,
             calm_busy: false,
+            place_titles: false,
         }
     }
 }

@@ -373,6 +373,20 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: true },
     },
     SettingDef {
+        key: "rail.place_titles",
+        label: "name Claude tabs after their session",
+        section: Section::Titles,
+        doc: "Title a Claude tab after its session's name, as a place: Rotem's Workshop.",
+        note: &[
+            "Only for a session that has a name (management panel → ask",
+            "sessions to name themselves); the room is drawn once per",
+            "session and kept across resumes. Claude's own title moves to",
+            "the tab's hover. A title you typed yourself still wins.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "rail.total_line",
         label: "total CPU/mem line",
         section: Section::Appearance,
@@ -1197,6 +1211,13 @@ mod tests {
             titles[glyph + 1..glyph + 4],
             ["rail.animate", "rail.calm_busy", "rail.tab_figures"]
         );
+        // Tabs titled after their session's place, next to the figures
+        // (giverny#435), off unless asked for: upstream's rail unchanged.
+        assert_eq!(titles.get(glyph + 4), Some(&"rail.place_titles"));
+        assert!(matches!(
+            by_key("rail.place_titles").unwrap().kind,
+            Kind::Bool { default: false }
+        ));
         assert_eq!(
             by_key("rail.total_line").unwrap().section,
             Section::Appearance

@@ -37,7 +37,8 @@
 //!
 //! **Where a name lives.** Beside the feeds, never in one: a session that
 //! only names itself is no manager, and a feed file would make it one.
-//! `<feeds>/names/<session>.json` holds `{session, name, root}`, and
+//! `<feeds>/names/<session>.json` holds `{session, name, room, root}` (the
+//! room its tab can be titled after, [`ROOMS`], giverny#435), and
 //! `<feeds>/names/roots/<root>.json` the same, keyed by the conversation's
 //! root ([`crate::continuation`]): a resumed session has a new id but the same
 //! root, so the status line finds its name there and copies it under the new
@@ -503,6 +504,52 @@ pub const FIRST_NAMES: &[&str] = &[
     "Zuri",
 ];
 
+/// The rooms a session's tab can be titled after (giverny#435): with
+/// Settings → tabs & titles → "name Claude tabs after their session" on, a
+/// named session's tab reads as its place, `Rotem's Workshop`. One is drawn
+/// per session at its birth and recorded beside its name ([`room`]), so the
+/// title holds across refreshes and resumes. Rooms someone works in, one
+/// word, short enough for the rail.
+pub const ROOMS: &[&str] = &[
+    "Atelier",
+    "Attic",
+    "Cabin",
+    "Cellar",
+    "Conservatory",
+    "Den",
+    "Forge",
+    "Gallery",
+    "Garden",
+    "Greenhouse",
+    "Lab",
+    "Library",
+    "Lighthouse",
+    "Loft",
+    "Nook",
+    "Observatory",
+    "Office",
+    "Parlour",
+    "Porch",
+    "Shed",
+    "Studio",
+    "Study",
+    "Tower",
+    "Workshop",
+];
+
+/// A room from [`ROOMS`], at random.
+pub fn draw_room() -> String {
+    pick(ROOMS)
+}
+
+/// `name` at home in `room`: `Rotem Giverny` in the Workshop is
+/// `Rotem's Workshop`. The first name alone, as Ita calls his sessions.
+pub fn place_of(name: &str, room: &str) -> Option<String> {
+    let first = name.split_whitespace().next()?;
+    let room = room.trim();
+    (!room.is_empty()).then(|| format!("{first}'s {room}"))
+}
+
 /// The environment variable a Giverny tab's shell carries the name of the
 /// rail category the tab sits in when its shell starts (giverny#434): what a
 /// session born there takes as its surname ([`surname`]).
@@ -666,6 +713,15 @@ fn doc_name(doc: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The `room` a names document holds (giverny#435).
+fn doc_room(doc: &Value) -> Option<String> {
+    doc.get("room")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(String::from)
+}
+
 fn write_doc(file: &Path, doc: &Value) -> std::io::Result<()> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -702,15 +758,19 @@ pub fn find_among(
         return Some(name);
     }
     let root = crate::subagents::conversation_root(transcript?)?;
-    let name = name_in(&root_file(feeds, &root)?)?;
+    let doc = read_doc(&root_file(feeds, &root)?)?;
+    let name = doc_name(&doc)?;
     if held_by(&holders(feeds, &live(), session, Some(&root)), &name).is_some() {
         return None;
     }
     if let Some(file) = session_file(feeds, session) {
-        let _ = write_doc(
-            &file,
-            &json!({"session": session, "name": name, "root": root}),
-        );
+        let mut copy = json!({"session": session, "name": name, "root": root});
+        // Its room comes with it (giverny#435): the same conversation, the
+        // same place.
+        if let Some(room) = doc_room(&doc) {
+            copy["room"] = json!(room);
+        }
+        let _ = write_doc(&file, &copy);
     }
     Some(name)
 }
@@ -754,6 +814,46 @@ pub fn shown(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<S
     keep_root(feeds, session, transcript)
         .or_else(|| on_feed(feeds, session))
         .or_else(|| find(feeds, session, transcript))
+}
+
+/// `session`'s room (giverny#435): the one recorded beside its name, else
+/// its conversation's (another id of it, by the root its document holds),
+/// else, for a document from before rooms, one drawn now and recorded under
+/// both, so it is drawn once. None for a session with no name recorded.
+pub fn room(feeds: &Path, session: &str) -> Option<String> {
+    let file = session_file(feeds, session)?;
+    let mut doc = read_doc(&file)?;
+    doc_name(&doc)?;
+    if let Some(room) = doc_room(&doc) {
+        return Some(room);
+    }
+    let root = doc.get("root").and_then(Value::as_str).map(String::from);
+    let rf = root.as_deref().and_then(|r| root_file(feeds, r));
+    let mut root_doc = rf.as_deref().and_then(read_doc);
+    let room = root_doc
+        .as_ref()
+        .and_then(doc_room)
+        .unwrap_or_else(draw_room);
+    doc["room"] = json!(room);
+    let _ = write_doc(&file, &doc);
+    if let (Some(rf), Some(rd)) = (rf, root_doc.as_mut())
+        && doc_room(rd).is_none()
+    {
+        rd["room"] = json!(room);
+        let _ = write_doc(&rf, rd);
+    }
+    Some(room)
+}
+
+/// The place a named `session`'s tab is titled after (giverny#435):
+/// `Rotem's Workshop`, its first name and its [`room`]. None while the
+/// switch is off ([`is_on`]) or the session has no name recorded under its
+/// id: its tab keeps Claude's own title.
+pub fn place(feeds: &Path, session: &str) -> Option<String> {
+    if !is_on(feeds) {
+        return None;
+    }
+    place_of(&read(feeds, session)?, &room(feeds, session)?)
 }
 
 /// One word of a name: a letter, then letters, digits, hyphens and
@@ -957,7 +1057,11 @@ fn record_held(
 ) -> Result<(String, Option<String>), String> {
     let file =
         session_file(feeds, session).ok_or_else(|| format!("not a session id: {session:?}"))?;
-    let previous = name_in(&file).or_else(|| name_in(&root_file(feeds, root?)?));
+    let docs = [
+        read_doc(&file),
+        root.and_then(|r| read_doc(&root_file(feeds, r)?)),
+    ];
+    let previous = docs.iter().flatten().find_map(doc_name);
     let name = full_name(given, previous.as_deref(), surname)?;
     if let Some(h) = held_by(held, &name) {
         let first = name.split_whitespace().next().unwrap_or(&name);
@@ -966,7 +1070,15 @@ fn record_held(
              give another, or run `giverny-manage name` alone to be drawn one"
         ));
     }
-    let mut doc = json!({"session": session, "name": name});
+    // The room is drawn at birth and kept through any renaming
+    // (giverny#435): the tab's title is the session's place, not its name
+    // of the moment.
+    let room = docs
+        .iter()
+        .flatten()
+        .find_map(doc_room)
+        .unwrap_or_else(draw_room);
+    let mut doc = json!({"session": session, "name": name, "room": room});
     if let Some(r) = root {
         doc["root"] = json!(r);
     }
@@ -1587,6 +1699,94 @@ mod tests {
         assert_eq!(shown(&feeds, "s3", Some(&u)), Some(s3.clone()));
         assert_eq!(name_in(&root_file(&feeds, "root-3").unwrap()), Some(s3));
         let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_room_is_drawn_at_birth_and_kept() {
+        // giverny#435: drawn once, recorded beside the name, and the same
+        // across reads, a renaming and a resume.
+        let feeds = scratch("room");
+        record(&feeds, "s1", "Tamsin", Some("root-1"), drawn("Giverny")).unwrap();
+        let doc = read_doc(&session_file(&feeds, "s1").unwrap()).unwrap();
+        let born = doc_room(&doc).expect("a room at birth");
+        assert!(ROOMS.contains(&born.as_str()), "{born}");
+        for _ in 0..5 {
+            assert_eq!(room(&feeds, "s1").as_deref(), Some(born.as_str()));
+        }
+        assert_eq!(place(&feeds, "s1"), None, "the switch is off");
+        set_on(&feeds, true).unwrap();
+        assert_eq!(place(&feeds, "s1"), Some(format!("Tamsin's {born}")));
+        // Renamed: another first name, the same room.
+        record(&feeds, "s1", "Xanthe", Some("root-1"), drawn("Giverny")).unwrap();
+        assert_eq!(place(&feeds, "s1"), Some(format!("Xanthe's {born}")));
+        // Resumed under a new id: the conversation's room comes with its name.
+        let t = feeds.join("new.jsonl");
+        std::fs::write(
+            &t,
+            "{\"type\":\"user\",\"uuid\":\"root-1\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shown(&feeds, "new", Some(&t)).as_deref(),
+            Some("Xanthe Giverny")
+        );
+        assert_eq!(place(&feeds, "new"), Some(format!("Xanthe's {born}")));
+        // Nobody named, no place.
+        assert_eq!(place(&feeds, "nobody"), None);
+        assert_eq!(room(&feeds, "nobody"), None);
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_name_from_before_rooms_is_given_one_once() {
+        // giverny#435: a document written before rooms draws one on first
+        // need and records it under its id and its conversation's root, so
+        // another id of the conversation takes the same.
+        let feeds = scratch("old-room");
+        let old = json!({"session": "s1", "name": "Rotem Ashby", "root": "root-1"});
+        write_doc(&session_file(&feeds, "s1").unwrap(), &old).unwrap();
+        write_doc(&root_file(&feeds, "root-1").unwrap(), &old).unwrap();
+        let other = json!({"session": "s2", "name": "Rotem Ashby", "root": "root-1"});
+        write_doc(&session_file(&feeds, "s2").unwrap(), &other).unwrap();
+        let drawn_now = room(&feeds, "s1").expect("drawn");
+        assert!(ROOMS.contains(&drawn_now.as_str()));
+        let on_disk = |f: PathBuf| doc_room(&read_doc(&f).unwrap());
+        assert_eq!(
+            on_disk(session_file(&feeds, "s1").unwrap()),
+            Some(drawn_now.clone())
+        );
+        assert_eq!(
+            on_disk(root_file(&feeds, "root-1").unwrap()),
+            Some(drawn_now.clone())
+        );
+        assert_eq!(room(&feeds, "s1"), Some(drawn_now.clone()), "drawn once");
+        assert_eq!(
+            room(&feeds, "s2"),
+            Some(drawn_now.clone()),
+            "its conversation's"
+        );
+        // Naming again keeps it too.
+        record(&feeds, "s1", "Rotem", Some("root-1"), || panic!()).unwrap();
+        assert_eq!(room(&feeds, "s1"), Some(drawn_now));
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_place_is_the_first_name_and_the_room() {
+        assert_eq!(
+            place_of("Rotem Giverny", "Workshop").as_deref(),
+            Some("Rotem's Workshop")
+        );
+        assert_eq!(
+            place_of("Silas ToLaD", "Loft").as_deref(),
+            Some("Silas's Loft")
+        );
+        assert_eq!(place_of("", "Loft"), None);
+        assert_eq!(place_of("Rotem Giverny", " "), None);
+        assert!(
+            ROOMS.iter().all(|r| is_word(r) && r.len() <= 12),
+            "short words"
+        );
     }
 
     /// A live map: each session with where it runs.

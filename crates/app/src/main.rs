@@ -2256,7 +2256,7 @@ impl App {
                         .ws
                         .tab(*id)
                         // What they see, not the raw title behind it.
-                        .map(|t| t.display_title(&self.cfg.titles))
+                        .map(|t| self.shown_title(t))
                         .unwrap_or_default(),
                     RenameTarget::Category(id) => self
                         .ws
@@ -3172,6 +3172,30 @@ impl App {
     /// `None` for every tab that is not.
     pub fn limited_until(&self, id: TabId) -> Option<jiff::Timestamp> {
         self.limited.get(&id).and_then(|w| w.reopens)
+    }
+
+    /// The place this Claude tab is titled after (giverny#435), if it is:
+    /// see [`rail::place_title`].
+    pub fn tab_place(&self, t: &giverny_core::tabs::Tab) -> Option<&str> {
+        rail::place_title(
+            self.cfg.rail.place_titles,
+            t.custom_title.as_deref(),
+            self.claude
+                .tabs
+                .get(&t.id)
+                .and_then(|c| c.session_id.as_deref()),
+            t.claude_session.as_deref(),
+            &self.claude.places,
+        )
+    }
+
+    /// A tab's title as the rail shows it: its place (giverny#435), else
+    /// its title tidied per `[titles]`.
+    pub fn shown_title(&self, t: &giverny_core::tabs::Tab) -> String {
+        match self.tab_place(t) {
+            Some(place) => place.to_string(),
+            None => t.display_title(&self.cfg.titles),
+        }
     }
 
     /// Is this tab stopped by a usage limit at all, reset time known or not?
@@ -5464,8 +5488,17 @@ impl eframe::App for App {
             .ws
             .tabs
             .iter()
-            .map(|t| (t.id, t.display_title(&self.cfg.titles)))
+            .map(|t| (t.id, self.shown_title(t)))
             .collect();
+        // The sessions whose place the rail titles their tab after
+        // (giverny#435), looked up by the next scan; none while that is off.
+        self.claude.place_sessions = self.cfg.rail.place_titles.then(|| {
+            self.ws
+                .tabs
+                .iter()
+                .filter_map(|t| t.claude_session.clone())
+                .collect()
+        });
         // Typing in a tab counts as attending to it: declining a permission
         // prompt (Escape) emits no hook, so nothing else would clear the flag.
         for (&id, rt) in &self.rt {
@@ -5649,7 +5682,7 @@ impl eframe::App for App {
                 let into = self
                     .ws
                     .tab(target)
-                    .map(|t| t.display_title(&self.cfg.titles))
+                    .map(|t| self.shown_title(t))
                     .unwrap_or_default();
                 let what = match hovering {
                     0 => "drop into".to_string(),

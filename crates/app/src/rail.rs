@@ -279,6 +279,9 @@ fn braille(turns: f64) -> String {
 struct RowData {
     id: TabId,
     title: String,
+    /// What the pointer on the row says: Claude's own title, when the row
+    /// is titled after its session's place instead (giverny#435).
+    hover: Option<String>,
     sub: String,
     active: bool,
     exited: bool,
@@ -341,6 +344,25 @@ struct GroupData {
     rows: Vec<RowData>,
 }
 
+/// The place a tab is titled after (giverny#435), when it is one: with
+/// `rail.place_titles` `on`, no title typed on the tab (`custom`, which
+/// always wins), and a place found for the session it holds (`live`, the
+/// claude running there now, else `recorded`, the one it resumes) among
+/// `places` ([`giverny_claude::names::place`]: none while names are off or
+/// the session is unnamed). Else none, and the tab keeps Claude's title.
+pub(crate) fn place_title<'a>(
+    on: bool,
+    custom: Option<&str>,
+    live: Option<&str>,
+    recorded: Option<&str>,
+    places: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    if !on || custom.is_some_and(|c| !c.is_empty()) {
+        return None;
+    }
+    places.get(live.or(recorded)?).map(String::as_str)
+}
+
 /// One tab's row.
 ///
 /// `under` is the repository the row is being shown inside, whose name is
@@ -399,9 +421,15 @@ fn row_data(
             format!("{sub} · @{account}")
         };
     }
+    let own = t.display_title(&app.cfg.titles);
+    let (title, hover) = match app.tab_place(t) {
+        Some(place) => (place.to_string(), Some(own)),
+        None => (own, None),
+    };
     RowData {
         id: t.id,
-        title: t.display_title(&app.cfg.titles),
+        title,
+        hover,
         sub,
         active: app.ws.active == Some(t.id),
         exited: t.exited,
@@ -1612,6 +1640,12 @@ fn tab_row(
     let c = app.chrome;
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click_and_drag());
+    // A row titled after its session's place keeps Claude's own title, what
+    // the session is about, under the pointer (giverny#435).
+    let resp = match &row.hover {
+        Some(own) => resp.on_hover_text(egui_line(own, None)),
+        None => resp,
+    };
     let p = ui.painter_at(rect);
     // Geometry-based hover: `resp.hovered()` flickers when the close button
     // overlays the row in the hit-test stack.
@@ -2537,6 +2571,31 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_claude_tab_is_titled_after_its_sessions_place() {
+        // giverny#435.
+        use super::place_title;
+        let places: std::collections::HashMap<String, String> =
+            [("s1".to_string(), "Rotem's Workshop".to_string())].into();
+        let on = |custom, live, recorded| place_title(true, custom, live, recorded, &places);
+        assert_eq!(on(None, Some("s1"), None), Some("Rotem's Workshop"));
+        assert_eq!(
+            on(None, None, Some("s1")),
+            Some("Rotem's Workshop"),
+            "resumes it"
+        );
+        // Off: Claude's title, as upstream.
+        assert_eq!(place_title(false, None, Some("s1"), None, &places), None);
+        // A title typed on the tab wins; an empty one is none.
+        assert_eq!(on(Some("api"), Some("s1"), None), None);
+        assert_eq!(on(Some(""), Some("s1"), None), Some("Rotem's Workshop"));
+        // Unnamed (or names off: no places at all), or no session.
+        assert_eq!(on(None, Some("s2"), None), None);
+        assert_eq!(on(None, None, None), None);
+        // The claude running now is the tab's session, not the one recorded.
+        assert_eq!(on(None, Some("s2"), Some("s1")), None);
+    }
+
     use super::*;
 
     /// The delay the rail asks for in one frame that draws a spinner and a
@@ -2975,6 +3034,7 @@ mod tests {
         RowData {
             id: TabId(1),
             title: String::new(),
+            hover: None,
             sub: String::new(),
             active: false,
             exited: false,
