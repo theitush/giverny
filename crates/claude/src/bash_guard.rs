@@ -58,7 +58,7 @@ pub fn refusal_on(what: &str, macos: bool) -> String {
 }
 
 /// How deep `sh -c '…'` inside `sh -c '…'` is followed.
-const MAX_DEPTH: usize = 8;
+pub(crate) const MAX_DEPTH: usize = 8;
 
 fn check_text(cmd: &str, depth: usize) -> Option<String> {
     if depth > MAX_DEPTH {
@@ -85,22 +85,22 @@ const CGROUP_FS: &str = "/sys/fs/cgroup";
 
 /// One simple command: its words, and where its output is redirected.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Segment {
-    words: Vec<String>,
-    redirects: Vec<String>,
+pub(crate) struct Segment {
+    pub(crate) words: Vec<String>,
+    pub(crate) redirects: Vec<String>,
 }
 
 #[derive(Debug, Default)]
-struct Parsed {
-    segments: Vec<Segment>,
+pub(crate) struct Parsed {
+    pub(crate) segments: Vec<Segment>,
     /// The text of each `$(…)` or backtick substitution met inside double
     /// quotes, checked as commands of their own.
-    nested: Vec<String>,
+    pub(crate) nested: Vec<String>,
 }
 
 /// The command's simple commands, split the way a shell would at `;`,
 /// `&`, `|`, newlines, parentheses and backticks, with quotes removed.
-fn split(cmd: &str) -> Parsed {
+pub(crate) fn split(cmd: &str) -> Parsed {
     let mut out = Parsed::default();
     let mut seg = Segment::default();
     let mut word = String::new();
@@ -283,16 +283,16 @@ const READERS: &[&str] = &[
 ];
 
 /// Words that only lead into the command after them.
-const LEADERS: &[&str] = &[
+pub(crate) const LEADERS: &[&str] = &[
     "exec", "command", "builtin", "time", "nohup", "setsid", "then", "do", "else", "elif", "if",
     "while", "until", "!", "{", "}", "unbuffer", "chronic",
 ];
 
-fn base(word: &str) -> &str {
+pub(crate) fn base(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-fn is_assignment(word: &str) -> bool {
+pub(crate) fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(k, _)| {
         !k.is_empty()
             && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -331,7 +331,7 @@ fn negative_nice(args: &[String]) -> bool {
 }
 
 /// Where the command after `nice`'s options starts.
-fn after_nice(args: &[String]) -> usize {
+pub(crate) fn after_nice(args: &[String]) -> usize {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -389,7 +389,7 @@ fn realtime_ionice(args: &[String]) -> bool {
 
 /// Skip `prog`'s options (those in `with_value` take the next word) and
 /// return where its command starts.
-fn after_options(args: &[String], with_value: &[&str]) -> usize {
+pub(crate) fn after_options(args: &[String], with_value: &[&str]) -> usize {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();

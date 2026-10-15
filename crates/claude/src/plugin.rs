@@ -32,7 +32,10 @@
 //!   call costs a few `stat`s. The same launcher runs as a `PreToolUse` hook
 //!   on Bash: a command that would leave its tab's resource cap
 //!   (`systemd-run`, `systemctl --user set-property`, a write into
-//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]). And with the
+//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]), as is one
+//!   that reaches into another session's processes, run scopes or
+//!   worktrees, and on Edit/Write an edit in such a worktree
+//!   ([`crate::reach_guard`], giverny#415). And with the
 //!   skill in, it runs as a `UserPromptSubmit` hook: a prompt that asks to
 //!   manage ("manage that task") gets context telling Claude to invoke
 //!   `giverny:manage` first, since a skill picked only by its description
@@ -139,7 +142,9 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// the session's `ask`/`reply` messages and renews its resource leases;
 /// quiet and exit 0 whatever happens. The same launcher is a `PreToolUse`
 /// hook on Bash, which refuses a command that would leave its tab's
-/// resource cap ([`crate::bash_guard`]), and, with the manage skill in
+/// resource cap ([`crate::bash_guard`]) — and on Bash and the editing tools
+/// one that would reach into another session's processes, scopes or
+/// worktrees ([`crate::reach_guard`], giverny#415) — and, with the manage skill in
 /// (`skill`), a `UserPromptSubmit` hook that sends a prompt asking to manage
 /// to that skill ([`crate::manage_trigger`]) and a `PreToolUse` hook on the
 /// `Agent` tool (`Task` in older Claude Code) that nudges a session toward
@@ -160,6 +165,12 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// running, and its parent told if it does ([`crate::leftovers`],
 /// giverny#370). Like any hook here it reaches only sessions started after
 /// the `hooks.json` that names it was written.
+/// The tools the `PreToolUse` guard sees: Bash, for the cap
+/// ([`crate::bash_guard`]) and for reaching into another session's work,
+/// and the editing tools, for its worktrees ([`crate::reach_guard`],
+/// giverny#415).
+pub const PRE_MATCHER: &str = "Bash|Edit|Write|MultiEdit|NotebookEdit";
+
 fn session_hooks(skill: bool) -> Value {
     let hook = || {
         json!([{
@@ -168,7 +179,7 @@ fn session_hooks(skill: bool) -> Value {
         }])
     };
     let mut hooks = json!({
-        "PreToolUse": [{ "matcher": "Bash", "hooks": hook() }],
+        "PreToolUse": [{ "matcher": PRE_MATCHER, "hooks": hook() }],
         "PostToolUse": [{ "matcher": "*", "hooks": hook() }],
         "SessionStart": [{ "hooks": hook() }],
         "SubagentStop": [{ "hooks": hook() }]
@@ -176,13 +187,14 @@ fn session_hooks(skill: bool) -> Value {
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
         hooks["PreToolUse"] = json!([
-            { "matcher": "Bash", "hooks": hook() },
+            { "matcher": PRE_MATCHER, "hooks": hook() },
             { "matcher": "Agent|Task", "hooks": hook() }
         ]);
     }
     json!({
         "description": "Giverny: ETAs for subagents, manager sessions' upkeep, \
-                        Bash commands kept inside their tab's resource cap, \
+                        Bash commands kept inside their tab's resource cap \
+                        and out of other sessions' work, \
                         \"manage this\" sent to the manage skill, \
                         task work pointed at it, \
                         and subagents asked about commands they leave running",
@@ -650,7 +662,7 @@ mod tests {
         // stays (giverny#358).
         let pre = &hooks(&d)["hooks"]["PreToolUse"];
         assert_eq!(pre.as_array().map(Vec::len), Some(1), "{pre}");
-        assert_eq!(pre[0]["matcher"], "Bash");
+        assert_eq!(pre[0]["matcher"], PRE_MATCHER);
         for kept in [
             "plugins/giverny/hooks/hooks.json",
             "plugins/giverny/bin/giverny-manage",
@@ -750,7 +762,7 @@ mod tests {
         assert!(cmd.contains("bin/giverny-hook\""), "{cmd}");
         // The Bash guard is the same launcher, before Bash calls only.
         let pre = &h["hooks"]["PreToolUse"][0];
-        assert_eq!(pre["matcher"], "Bash");
+        assert_eq!(pre["matcher"], PRE_MATCHER);
         assert_eq!(pre["hooks"][0]["command"].as_str(), Some(cmd));
         // And the nudge toward the manage skill, before Agent calls
         // (giverny#358).

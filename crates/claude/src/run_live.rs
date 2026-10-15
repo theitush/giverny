@@ -2,7 +2,9 @@
 //!
 //! While a command runs, `run` keeps a small JSON file beside its stats
 //! file, `<ledger dir>/runs/<pid>-<n>.live` (`task`, `session`, `pid`,
-//! `stats`, `started_ms`), and removes it when the command ends. The shim
+//! `stats`, `started_ms`, and `cwd`: the worktree it works in, which the
+//! reach guard keeps other sessions out of, [`crate::reach_guard`]), and
+//! removes it when the command ends. The shim
 //! inside the command's systemd scope adds `cgroup <dir>` to the stats file
 //! as it starts, so a reader finds the scope's cgroup without asking
 //! systemd. The app's one sampler ([`crate::use_reading`]) lists them
@@ -94,6 +96,7 @@ pub fn register(stats: &Path, task: &str, session: &str, now_ms: u64) -> Option<
         "pid": std::process::id(),
         "stats": stats.display().to_string(),
         "started_ms": now_ms,
+        "cwd": std::env::current_dir().ok().map(|d| d.display().to_string()),
     });
     let tmp = path.with_extension("live.tmp");
     std::fs::write(&tmp, body.to_string()).ok()?;
@@ -117,6 +120,7 @@ struct LiveFile {
     pid: u32,
     stats: PathBuf,
     started_ms: Option<u64>,
+    cwd: Option<PathBuf>,
 }
 
 fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
@@ -128,6 +132,7 @@ fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
         pid: v.get("pid").and_then(Value::as_u64)? as u32,
         stats: PathBuf::from(s("stats")?),
         started_ms: v.get("started_ms").and_then(Value::as_u64),
+        cwd: s("cwd").map(PathBuf::from),
     })
 }
 
@@ -147,7 +152,7 @@ fn read_dir(dir: &Path) -> Vec<(PathBuf, LiveFile)> {
 
 /// The process is there (Linux: `/proc/<pid>`; other Unix: `kill(pid,
 /// 0)`, which only asks; elsewhere assumed).
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     if cfg!(target_os = "linux") {
         return Path::new(&format!("/proc/{pid}")).exists();
     }
@@ -173,6 +178,32 @@ pub fn running_leases(runs_dir: &Path) -> HashSet<String> {
         .into_iter()
         .filter(|(_, l)| alive(l.pid))
         .map(|(_, l)| crate::resources::lease_id(&l.session, &l.task))
+        .collect()
+}
+
+/// One `giverny manage run` command's record, whose `run` may be gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRecord {
+    /// The `run` process, whose scope is `giverny-run-<task>-<pid>`.
+    pub pid: u32,
+    pub session: String,
+    pub task: String,
+    /// Where it was started, when it said.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Every `.live` file under `runs_dir`, its `run` alive or not (one that is
+/// gone stays until the next `run` sweeps it): who a `giverny-run-…` scope
+/// belongs to ([`crate::reach_guard`], giverny#415).
+pub fn records(runs_dir: &Path) -> Vec<RunRecord> {
+    read_dir(runs_dir)
+        .into_iter()
+        .map(|(_, l)| RunRecord {
+            pid: l.pid,
+            session: l.session,
+            task: l.task,
+            cwd: l.cwd,
+        })
         .collect()
 }
 

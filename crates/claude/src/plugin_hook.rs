@@ -350,15 +350,44 @@ pub fn reply(text: &str) -> String {
 /// (read whole only when it names that event: the others carry a tool's
 /// whole response).
 pub fn pre_bash(input: &str) -> Option<String> {
+    let p = pre_tool(input)?;
+    if p.tool != "Bash" {
+        return Some(String::new());
+    }
+    Some(p.command.unwrap_or_default())
+}
+
+/// What a `PreToolUse` payload says: the tool, its Bash command or the file
+/// it edits, who calls and where.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PreTool {
+    pub tool: String,
+    pub command: Option<String>,
+    /// Edit/Write/MultiEdit's `file_path`, NotebookEdit's `notebook_path`.
+    pub file: Option<String>,
+    pub session: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// The tools that write a file, refused in another session's worktree
+/// ([`crate::reach_guard`]).
+pub const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// A `PreToolUse` payload, or `None` for any other.
+pub fn pre_tool(input: &str) -> Option<PreTool> {
     #[derive(serde::Deserialize)]
     struct Input {
         command: Option<String>,
+        file_path: Option<String>,
+        notebook_path: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct Pre {
         hook_event_name: Option<String>,
         tool_name: Option<String>,
         tool_input: Option<Input>,
+        session_id: Option<String>,
+        cwd: Option<String>,
     }
     if !input.contains("\"PreToolUse\"") {
         return None;
@@ -367,10 +396,68 @@ pub fn pre_bash(input: &str) -> Option<String> {
     if p.hook_event_name.as_deref() != Some("PreToolUse") {
         return None;
     }
-    if p.tool_name.as_deref() != Some("Bash") {
-        return Some(String::new());
-    }
-    Some(p.tool_input?.command.unwrap_or_default())
+    let (command, file) = match p.tool_input {
+        Some(i) => (i.command, i.file_path.or(i.notebook_path)),
+        None => (None, None),
+    };
+    Some(PreTool {
+        tool: p.tool_name.unwrap_or_default(),
+        command,
+        file,
+        session: p.session_id.filter(|s| !s.trim().is_empty()),
+        cwd: p.cwd,
+    })
+}
+
+/// The `PreToolUse` reply refusing a tool call another session's work
+/// would suffer ([`crate::reach_guard`], giverny#415): a Bash command
+/// killing its processes, stopping its scopes, mutating git in its
+/// worktree or speaking as it, or an edit in its worktree. Anywhere the
+/// plugin runs, in a tab or not; with no session known, nothing. The
+/// caller (`me`) is looked up only for a call that reaches for something.
+pub fn reach(
+    pre: &PreTool,
+    w: &dyn crate::reach_guard::World,
+    me: impl FnOnce() -> crate::reach_guard::Me,
+) -> Option<String> {
+    use crate::reach_guard::{edit_verdict, judge, linked_root, reaches};
+    let why = if pre.tool == "Bash" {
+        let cmd = pre.command.as_deref()?;
+        let cwd = pre
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())?;
+        let found = reaches(cmd, &cwd);
+        if found.is_empty() {
+            return None;
+        }
+        let me = me();
+        found.iter().find_map(|r| judge(r, &me, w))?
+    } else if EDIT_TOOLS.contains(&pre.tool.as_str()) {
+        let file = PathBuf::from(pre.file.as_deref()?);
+        let file = match (file.is_absolute(), pre.cwd.as_deref()) {
+            (false, Some(cwd)) => Path::new(cwd).join(file),
+            _ => file,
+        };
+        linked_root(file.parent().unwrap_or(&file))?;
+        edit_verdict(&file, &me(), w)?
+    } else {
+        return None;
+    };
+    Some(deny(&why))
+}
+
+/// The `PreToolUse` reply denying the call, `why` shown to Claude.
+fn deny(why: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": why
+        }
+    })
+    .to_string()
 }
 
 /// The `PreToolUse` reply refusing a Bash `command` that would leave its
@@ -382,16 +469,7 @@ pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
     if !in_tab() {
         return None;
     }
-    Some(
-        json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": why
-            }
-        })
-        .to_string(),
-    )
+    Some(deny(&why))
 }
 
 /// A prompt payload's `session_id`, read alone.
@@ -497,8 +575,16 @@ pub fn main() -> i32 {
         }
         return 0;
     }
-    if let Some(command) = pre_bash(&input) {
-        if let Some(out) = guard(&command, in_giverny_tab) {
+    if let Some(pre) = pre_tool(&input) {
+        let capped = (pre.tool == "Bash")
+            .then(|| guard(pre.command.as_deref().unwrap_or_default(), in_giverny_tab))
+            .flatten();
+        let out = capped.or_else(|| {
+            let session = pre.session.as_deref()?;
+            let w = crate::reach_guard::System::new(crate::feed::feed_dir());
+            reach(&pre, &w, || w.me(session))
+        });
+        if let Some(out) = out {
             println!("{out}");
         }
         return 0;
@@ -625,6 +711,46 @@ mod tests {
             pre_bash(&spawn_input("s1", "a1", "systemd-run PreToolUse", true)),
             None
         );
+    }
+
+    /// giverny#415: the pre-tool hook refuses a reach into another
+    /// session's processes, and asks who the caller is only when there is
+    /// one.
+    #[test]
+    fn a_reach_into_another_sessions_work_is_denied_and_the_rest_passes() {
+        use crate::reach_guard::tests::{me, world};
+        let w = world();
+        let pre = |tool: &str, input: Value| {
+            pre_tool(
+                &json!({"session_id": "my-session", "hook_event_name": "PreToolUse",
+                        "tool_name": tool, "tool_input": input, "cwd": "/tmp"})
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let kill = pre("Bash", json!({"command": "kill -9 400"}));
+        assert_eq!(kill.session.as_deref(), Some("my-session"));
+        assert_eq!(kill.cwd.as_deref(), Some("/tmp"));
+        let out = reach(&kill, &w, me).expect("denied");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(why.contains("giverny-manage ask scale343"), "{why}");
+        assert_eq!(
+            reach(&pre("Bash", json!({"command": "kill 600"})), &w, me),
+            None
+        );
+        let plain = pre("Bash", json!({"command": "cargo build"}));
+        assert_eq!(reach(&plain, &w, || panic!("not asked")), None);
+        let edit = pre("Edit", json!({"file_path": "/tmp/x.rs", "old_string": "a"}));
+        assert_eq!(edit.file.as_deref(), Some("/tmp/x.rs"));
+        assert_eq!(reach(&edit, &w, || panic!("not in a worktree")), None);
+        let nb = pre("NotebookEdit", json!({"notebook_path": "/tmp/n.ipynb"}));
+        assert_eq!(nb.file.as_deref(), Some("/tmp/n.ipynb"));
+        let read = pre("Read", json!({"file_path": "/x"}));
+        assert_eq!(reach(&read, &w, || panic!("not asked")), None);
     }
 
     #[test]
