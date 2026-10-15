@@ -443,6 +443,13 @@ pub struct ClaudeWatch {
     /// The feed directory, where `names/on` is the session-names switch
     /// ([`giverny_claude::names`]).
     feeds: PathBuf,
+    /// The sessions whose place the rail wants (giverny#435): `None` while
+    /// `rail.place_titles` is off, else the ones the tabs hold, set by
+    /// the app. Each scan looks their places up, with every tab's live
+    /// session's, off the UI thread.
+    pub place_sessions: Option<Vec<String>>,
+    /// What the last scan found for them: `Rotem's Workshop`, by session id.
+    pub places: HashMap<String, String>,
     /// When the link was last checked for a target that is gone.
     #[cfg(unix)]
     last_link_check: Instant,
@@ -633,6 +640,18 @@ fn merge_registry(
     }
 }
 
+/// The place each of `sessions` is titled after (giverny#435), for those
+/// with one: none at all while names are off.
+fn session_places(feeds: &Path, sessions: &[String]) -> HashMap<String, String> {
+    if sessions.is_empty() || !giverny_claude::names::is_on(feeds) {
+        return HashMap::new();
+    }
+    sessions
+        .iter()
+        .filter_map(|s| Some((s.clone(), giverny_claude::names::place(feeds, s)?)))
+        .collect()
+}
+
 /// One pass over the session registries, done on a worker.
 #[derive(Default)]
 struct ScanResult {
@@ -640,6 +659,10 @@ struct ScanResult {
     /// What each tab's `claude attach` names, for a tab running one
     /// ([`attach::under`]).
     attached: HashMap<TabId, String>,
+    /// The place each session asked for is titled after, by session id
+    /// ([`giverny_claude::names::place`], giverny#435): none asked, or names
+    /// off, none.
+    places: HashMap<String, String>,
 }
 
 /// When one rate-limit window resets, out of a statusline push.
@@ -794,6 +817,8 @@ impl ClaudeWatch {
             ),
             leave_accounts,
             feeds: giverny_claude::feed::feed_dir(),
+            place_sessions: None,
+            places: HashMap::new(),
             #[cfg(unix)]
             last_link_check: Instant::now(),
             predate_hooks: HashSet::new(),
@@ -1190,8 +1215,9 @@ impl ClaudeWatch {
         // Registry scan: baseline busy/idle + identity, ~1 Hz, off-thread.
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok(mut result) => {
                     self.scan_rx = None;
+                    self.places = std::mem::take(&mut result.places);
                     self.scanned = result;
                     let live = &self.scanned.live;
                     self.predate_hooks.retain(|(dir, pid)| {
@@ -1208,6 +1234,16 @@ impl ClaudeWatch {
             self.last_scan = Instant::now();
             let dirs: Vec<PathBuf> = self.profiles.iter().map(|p| p.config_dir.clone()).collect();
             let shells = shell_pids.clone();
+            // The places asked for, with each tab's live session (a tab's
+            // recorded one can lag a `/clear` by a hook): a few small reads,
+            // here rather than on every frame the rail is drawn.
+            let mut place_ids = self.place_sessions.clone().unwrap_or_default();
+            if self.place_sessions.is_some() {
+                place_ids.extend(self.tabs.values().filter_map(|t| t.session_id.clone()));
+                place_ids.sort();
+                place_ids.dedup();
+            }
+            let feeds = self.feeds.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             if std::thread::Builder::new()
                 .name("giverny session scan".into())
@@ -1217,7 +1253,12 @@ impl ClaudeWatch {
                         .into_iter()
                         .filter_map(|(tab, shell)| Some((tab, attach::under(shell)?)))
                         .collect();
-                    let _ = tx.send(ScanResult { live, attached });
+                    let places = session_places(&feeds, &place_ids);
+                    let _ = tx.send(ScanResult {
+                        live,
+                        attached,
+                        places,
+                    });
                 })
                 .is_ok()
             {
@@ -2312,6 +2353,8 @@ impl ClaudeWatch {
                 std::process::id(),
                 jiff::Timestamp::now().as_nanosecond()
             )),
+            place_sessions: None,
+            places: HashMap::new(),
         }
     }
 

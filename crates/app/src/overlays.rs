@@ -96,7 +96,7 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 .as_deref()
                 .map(|p| giverny_core::short_path(p, 28))
                 .unwrap_or_default();
-            let title = t.display_title(&app.cfg.titles);
+            let title = app.shown_title(t);
             let label = format!("{cat} › {title}   {cwd}");
             fuzzy_score(&st.query, &label).map(|s| {
                 // Matched as written, drawn as read.

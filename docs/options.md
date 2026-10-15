@@ -17,6 +17,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `rail.animate` | `true` | Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse. |
 | `rail.calm_busy` | `false` | A working tab breathes a slow dot in its colour instead of spinning. |
 | `rail.tab_figures` | `true` | Each tab's CPU and memory in the rail, and a collapsed group's sum. |
+| `rail.place_titles` | `false` | Title a Claude tab after its session's name, as a place: Rotem's Workshop. |
 | `rail.total_line` | `true` | The summed CPU and memory line under the account bars. |
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
 | `behavior.history_per_tab` | `false` | Each tab's shell keeps its own history, back when the tab is restored. |
