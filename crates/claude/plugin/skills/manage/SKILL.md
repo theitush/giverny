@@ -160,7 +160,11 @@ not keep others waiting. The answer is one line and an exit code:
   holds the worker to it.
 - `queued` (4): something it needs is held, or the CPU is busy; its row says
   so. Start another planned task from a free lane instead, and re-run the same
-  `claim` now and then until it is granted (nothing calls back). When it says the wait is longer than the task
+  `claim` now and then until it is granted. The queue also moves on other
+  sessions' calls: when your turn comes while you are not polling, your next
+  tool call says `the ledger granted your queued claim for <task>` — start it
+  then (`claim` answers `granted`), within 10 minutes, or the grant lapses and
+  waits for your next `claim`. When it says the wait is longer than the task
   itself and suggests `ask`, send `giverny-manage ask <holder's task> "<why, the
   priority, how long you need it>"` and keep polling; the holder may release.
 - `refused` (5): larger than this machine's limits (Settings → Management panel →

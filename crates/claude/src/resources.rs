@@ -66,7 +66,10 @@
 //! it, and none takes what the head will need when it can start. A
 //! request that fits is never jumped, so nothing starves. A queued manager
 //! polls by running the same `claim` again, which also keeps its place
-//! alive.
+//! alive — but the queue does not wait for it (giverny#429): every ledger
+//! write, whoever makes it, grants each waiter that fits for its own
+//! manager to take up, and a grant left untaken lapses
+//! ([`Ledger::advance`]).
 //!
 //! **Leases are protections.** Since giverny#262 the kernel holds the one
 //! ceiling (the slice's `MemoryMax`) and a lease's RAM is its commands'
@@ -115,6 +118,10 @@ pub const MIN_BUILDERS: usize = 2;
 /// started yet, so no measure can see it, and a burst of claims the
 /// moment the CPU frees must not all be granted at once.
 pub const FRESH_MS: u64 = 2 * 60 * 1000;
+/// A session no claude runs (by Claude Code's registry) is gone once it has
+/// not beaten for this long (giverny#429): its waiters leave the queue and
+/// a grant it never took up is dropped, not put back in line.
+pub const GONE_MS: u64 = 5 * 60 * 1000;
 
 /// Exit codes of `giverny manage claim`.
 pub mod exit {
@@ -220,6 +227,33 @@ pub struct Lease {
     pub granted_at: u64,
     #[serde(with = "ts")]
     pub heartbeat_at: u64,
+    /// Granted on another session's ledger call (giverny#429) and not yet
+    /// taken up by its own manager: what to put back in line should it lapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncollected: Option<Uncollected>,
+}
+
+/// A grant its manager has not taken up yet ([`Ledger::advance`]): the
+/// request it was granted from and its place in the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Uncollected {
+    #[serde(with = "ts")]
+    pub queued_at: u64,
+    pub request: Request,
+    /// Its manager's hook has said so ([`news`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub told: bool,
+}
+
+/// A grant that lapsed untaken ([`Ledger::advance`]): the waiter keeps its
+/// place, but nothing is set aside for it and it is not granted again until
+/// its manager claims again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lapsed {
+    #[serde(with = "ts")]
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub told: bool,
 }
 
 /// A request that did not fit yet, in line.
@@ -236,6 +270,9 @@ pub struct Waiter {
     pub queued_at: u64,
     #[serde(with = "ts")]
     pub heartbeat_at: u64,
+    /// Its grant lapsed untaken: dormant until its manager claims again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lapsed: Option<Lapsed>,
 }
 
 /// The ledger file.
@@ -274,6 +311,10 @@ pub struct Capacity {
     pub cpu_use: CpuUse,
     /// How busy the CPU has been lately, and who is building.
     pub cpu: CpuBusy,
+    /// The Claude sessions running now, by Claude Code's registry; `None`
+    /// when that is not known (no registry read, none found): then only a
+    /// heartbeat's [`TTL_MS`] says a session is gone.
+    pub live_sessions: Option<HashSet<String>>,
 }
 
 impl Capacity {
@@ -295,7 +336,23 @@ impl Capacity {
             default_lease: giverny_core::config::DefaultLease::load(),
             mem_use: MemUse::sample(&runs),
             cpu_use: CpuUse::sample(&runs, now),
+            live_sessions: live_sessions(),
         })
+    }
+
+    /// Is `session` gone: no claude runs it, and it last beat at
+    /// `last_beat`, [`GONE_MS`] or more before `now`? Never when the
+    /// registry says nothing.
+    pub fn gone(&self, session: &str, last_beat: u64, now: u64) -> bool {
+        self.live_sessions
+            .as_ref()
+            .is_some_and(|live| !live.contains(session))
+            && now.saturating_sub(last_beat) >= GONE_MS
+    }
+
+    /// How long a grant waits for its manager ([`Ledger::advance`]), ms.
+    pub fn uncollected_ms(&self) -> u64 {
+        self.default_lease.uncollected_min.max(1) * 60 * 1000
     }
 
     /// What admission counts `l` at: its expected peak (else its RAM, else
@@ -401,6 +458,17 @@ impl CpuBusy {
         }
         s
     }
+}
+
+/// The sessions Claude Code's registry has running, in every config dir
+/// this user's claudes use; `None` when it lists none (nothing to go by).
+fn live_sessions() -> Option<HashSet<String>> {
+    let w = crate::reach_guard::System::new(PathBuf::new());
+    let live: HashSet<String> = crate::reach_guard::World::sessions(&w)
+        .into_iter()
+        .map(|(_, s, _)| s)
+        .collect();
+    (!live.is_empty()).then_some(live)
 }
 
 /// `<ledger dir>/cpu-samples`: the slice's CPU counter as seen by recent
@@ -746,6 +814,23 @@ pub struct Fit {
     pub counted_mb: u64,
 }
 
+/// What [`Ledger::advance`] did.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Advanced {
+    /// Granted for managers not in this call, uncollected.
+    pub granted: Vec<Lease>,
+    /// Tasks whose grant lapsed untaken, back in line.
+    pub lapsed: Vec<String>,
+    /// Lease and queue ids dropped with their gone sessions.
+    pub dropped: Vec<String>,
+}
+
+impl Advanced {
+    pub fn moved(&self) -> bool {
+        !(self.granted.is_empty() && self.lapsed.is_empty() && self.dropped.is_empty())
+    }
+}
+
 /// The answer to a claim.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -1070,6 +1155,7 @@ impl Ledger {
                 // About to start: it counts as building, as a fresh grant.
                 granted_at: cap.cpu.at_ms,
                 heartbeat_at: w.heartbeat_at,
+                uncollected: None,
             });
         }
         v
@@ -1133,21 +1219,39 @@ impl Ledger {
     ) -> Outcome {
         self.expire(now);
         self.heartbeat(session, now);
+        // A grant made for it on another session's call: taken up now, as
+        // if granted this moment (giverny#429).
+        if self.collect(session, task, now)
+            && let Some(l) = self.lease(session, task)
+        {
+            let lease = l.clone();
+            return if lease.ram_mb < req.ram_mb && req.peak_mb.is_none() {
+                Outcome::GrantedSmaller {
+                    lease,
+                    wanted_mb: req.ram_mb,
+                }
+            } else {
+                Outcome::Granted(lease)
+            };
+        }
         if let Some(l) = self.lease(session, task) {
             return Outcome::Held(l.clone());
         }
         if let Some(why) = Ledger::never_fits(cap, req) {
             self.queue
                 .retain(|w| !(w.session == session && w.task == task));
+            self.advance(cap, now, left, None);
             return Outcome::Refused(why);
         }
         let id = lease_id(session, task);
         // Join the line (or update the place already held) before looking
-        // at who is ahead, so a Priority given now counts.
+        // at who is ahead, so a Priority given now counts. A place whose
+        // grant lapsed is live again: its manager is back.
         match self.queue.iter_mut().find(|w| w.id == id) {
             Some(w) => {
                 w.request = req.clone();
                 w.repo = repo.map(String::from).or(w.repo.take());
+                w.lapsed = None;
             }
             None => self.queue.push(Waiter {
                 id: id.clone(),
@@ -1157,28 +1261,24 @@ impl Ledger {
                 request: req.clone(),
                 queued_at: now,
                 heartbeat_at: now,
+                lapsed: None,
             }),
         }
+        // Everyone else in line that fits goes first, whether or not its
+        // manager is polling: the queue moves on anyone's call.
+        self.advance(cap, now, left, Some(&id));
         let order = self.ordered_queue();
         let position = order.iter().position(|w| w.id == id).unwrap_or(0);
-        let ahead: Vec<Waiter> = order[..position].iter().map(|w| (*w).clone()).collect();
+        let ahead: Vec<Waiter> = order[..position]
+            .iter()
+            .filter(|w| w.lapsed.is_none())
+            .map(|w| (*w).clone())
+            .collect();
         let (fit, past) = self.fit_behind(cap, &ahead, session, task, req, now, left);
         match fit {
             Ok(fit) => {
                 self.queue.retain(|w| w.id != id);
-                let lease = Lease {
-                    id,
-                    session: session.into(),
-                    task: task.into(),
-                    repo: repo.map(String::from),
-                    ram_mb: fit.ram_mb,
-                    gpus: fit.gpus,
-                    vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
-                    slots: req.slots.clone(),
-                    peak_mb: req.peak_mb.map(|_| fit.counted_mb),
-                    granted_at: now,
-                    heartbeat_at: now,
-                };
+                let lease = Ledger::lease_for(session, task, repo, req, fit, now);
                 self.leases.push(lease.clone());
                 if let Some(past) = past {
                     Outcome::Backfilled {
@@ -1230,6 +1330,155 @@ impl Ledger {
                 }
             }
         }
+    }
+
+    /// The lease `fit` makes of `session`'s `req` for `task`, granted `now`.
+    fn lease_for(
+        session: &str,
+        task: &str,
+        repo: Option<&str>,
+        req: &Request,
+        fit: Fit,
+        now: u64,
+    ) -> Lease {
+        Lease {
+            id: lease_id(session, task),
+            session: session.into(),
+            task: task.into(),
+            repo: repo.map(String::from),
+            ram_mb: fit.ram_mb,
+            gpus: fit.gpus,
+            vram_mb: if req.gpu > 0 { req.vram_mb } else { 0 },
+            slots: req.slots.clone(),
+            peak_mb: req.peak_mb.map(|_| fit.counted_mb),
+            granted_at: now,
+            heartbeat_at: now,
+            uncollected: None,
+        }
+    }
+
+    /// Take up `session`'s grant for `task` that was made on another
+    /// session's call (giverny#429): its manager has claimed, started or
+    /// run it. The grant then dates from `now`, as a fresh one would.
+    /// True when there was such a grant.
+    pub fn collect(&mut self, session: &str, task: &str, now: u64) -> bool {
+        match self
+            .leases
+            .iter_mut()
+            .find(|l| l.session == session && l.task == task && l.uncollected.is_some())
+        {
+            Some(l) => {
+                l.uncollected = None;
+                l.granted_at = now;
+                l.heartbeat_at = l.heartbeat_at.max(now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move the queue on, whoever calls (giverny#429). A grant used to
+    /// happen only inside its own manager's `claim`, so a manager that
+    /// stopped polling — a restart, a crash, a session that moved on —
+    /// froze every waiter behind it. Now, on any ledger write:
+    ///
+    /// 1. a grant made this way that its manager has not taken up within
+    ///    [`Capacity::uncollected_ms`] lapses: its lease is released and
+    ///    its request goes back to its place in line, *lapsed* — set aside
+    ///    for nobody and not granted again until its manager claims again
+    ///    — or out, when its session is gone ([`Capacity::gone`]);
+    /// 2. the waiters of a session that is gone leave the queue;
+    /// 3. every waiter that fits, in queue order (Priority, then first
+    ///    come), by the same rule its own `claim` would meet
+    ///    ([`Ledger::fit_behind`]), is granted now: the lease is its
+    ///    session's, marked [`Uncollected`] until that manager's next
+    ///    `claim` (answered *granted*), `start` or `run`; its hook tells it
+    ///    on its next tool call ([`news`]).
+    ///
+    /// `skip` is a waiter left for its caller to weigh (the claimant's
+    /// own, so its answer can say what it says).
+    pub fn advance(
+        &mut self,
+        cap: &Capacity,
+        now: u64,
+        left: &dyn Fn(&str, &str) -> Option<i64>,
+        skip: Option<&str>,
+    ) -> Advanced {
+        let mut out = Advanced::default();
+        let hold = cap.uncollected_ms();
+        let (lapsing, keep): (Vec<Lease>, Vec<Lease>) = self
+            .leases
+            .drain(..)
+            .partition(|l| l.uncollected.is_some() && now.saturating_sub(l.granted_at) >= hold);
+        self.leases = keep;
+        for l in lapsing {
+            let Some(u) = l.uncollected else { continue };
+            if cap.gone(&l.session, l.heartbeat_at, now) {
+                out.dropped.push(l.id);
+                continue;
+            }
+            let w = Waiter {
+                id: l.id,
+                session: l.session,
+                task: l.task,
+                repo: l.repo,
+                request: u.request,
+                queued_at: u.queued_at,
+                heartbeat_at: l.heartbeat_at,
+                lapsed: Some(Lapsed {
+                    at: now,
+                    told: false,
+                }),
+            };
+            out.lapsed.push(w.task.clone());
+            self.queue.retain(|x| x.id != w.id);
+            self.queue.push(w);
+        }
+        self.queue.retain(|w| {
+            let gone = skip != Some(w.id.as_str()) && cap.gone(&w.session, w.heartbeat_at, now);
+            if gone {
+                out.dropped.push(w.id.clone());
+            }
+            !gone
+        });
+        let order: Vec<String> = self
+            .ordered_queue()
+            .iter()
+            .filter(|w| w.lapsed.is_none() && skip != Some(w.id.as_str()))
+            .map(|w| w.id.clone())
+            .collect();
+        for id in order {
+            let q = self.ordered_queue();
+            let Some(at) = q.iter().position(|w| w.id == id) else {
+                continue;
+            };
+            let w = q[at].clone();
+            let ahead: Vec<Waiter> = q[..at]
+                .iter()
+                .filter(|x| x.lapsed.is_none())
+                .map(|x| (*x).clone())
+                .collect();
+            let (fit, _) = self.fit_behind(cap, &ahead, &w.session, &w.task, &w.request, now, left);
+            let Ok(fit) = fit else { continue };
+            self.queue.retain(|x| x.id != id);
+            let mut lease =
+                Ledger::lease_for(&w.session, &w.task, w.repo.as_deref(), &w.request, fit, now);
+            lease.heartbeat_at = w.heartbeat_at;
+            lease.uncollected = Some(Uncollected {
+                queued_at: w.queued_at,
+                request: w.request.clone(),
+                told: false,
+            });
+            out.granted.push(lease.clone());
+            self.leases.push(lease);
+        }
+        out
+    }
+
+    /// Is there anything [`Ledger::advance`] could move: a waiter, or a
+    /// grant not yet taken up?
+    pub fn may_advance(&self) -> bool {
+        !self.queue.is_empty() || self.leases.iter().any(|l| l.uncollected.is_some())
     }
 
     /// Does `req` fit behind the requests queued `ahead` of it? It fits when
@@ -1573,13 +1822,23 @@ fn counted(l: &Lease) -> String {
     }
 }
 
+/// `; granted, waiting for its manager` for a grant its manager has not
+/// taken up ([`Ledger::advance`]): what the queued and held lines say of it.
+pub fn waiting(l: &Lease) -> &'static str {
+    if l.uncollected.is_some() {
+        "; granted, waiting for its manager"
+    } else {
+        ""
+    }
+}
+
 /// The line `claim` prints.
 pub fn outcome_line(task: &str, o: &Outcome, eta: &dyn Fn(&str, &str) -> Option<i64>) -> String {
     let holder = |l: &Lease| {
         let left = eta(&l.session, &l.task)
             .map(|s| format!("; ~{}", feed::fmt_span(s.max(0))))
             .unwrap_or_default();
-        format!("{} ({}{left})", l.task, l.describe())
+        format!("{} ({}{left}{})", l.task, l.describe(), waiting(l))
     };
     match o {
         Outcome::Granted(l) => format!("granted {task}: {}{}", l.describe(), counted(l)),
@@ -1816,15 +2075,47 @@ fn landed_tasks(feed_dir: &Path, session: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every `giverny manage` command's heartbeat for `session`. Touches nothing
-/// when there is no ledger yet, and writes only every [`BEAT_EVERY_MS`].
-/// With the feed dir, a lease or queued request of a task whose feed row
-/// has landed is dropped rather than renewed.
+/// [`Ledger::advance`] on `l` when it has anything to move, under `cap`
+/// (else this machine, detected — only then), with the tasks' times from
+/// the feeds in `feed_dir`. Nothing when the machine cannot be read.
+fn advance_in(
+    l: &mut Ledger,
+    path: &Path,
+    feed_dir: Option<&Path>,
+    cap: Option<&Capacity>,
+    now: u64,
+) -> Advanced {
+    if !l.may_advance() {
+        return Advanced::default();
+    }
+    let detected;
+    let cap = match cap {
+        Some(c) => c,
+        None => match Capacity::detect(path) {
+            Ok(c) => {
+                detected = c;
+                &detected
+            }
+            Err(_) => return Advanced::default(),
+        },
+    };
+    let left = |s: &str, t: &str| feed_dir.and_then(|d| eta_or_estimate_s(d, s, t, now));
+    l.advance(cap, now, &left, None)
+}
+
+/// Every `giverny manage` command's heartbeat for `session`, and the hook's.
+/// Touches nothing when there is no ledger yet, and writes only every
+/// [`BEAT_EVERY_MS`] — or when the queue moved: every beat also moves it
+/// on ([`Ledger::advance`], giverny#429), under `cap` (else this machine),
+/// so a queue whose managers stopped polling still advances. With the feed
+/// dir, a lease or queued request of a task whose feed row has landed is
+/// dropped rather than renewed.
 pub fn heartbeat(
     path: &Path,
     feed_dir: Option<&Path>,
     session: &str,
     now: u64,
+    cap: Option<&Capacity>,
 ) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -1845,9 +2136,9 @@ pub fn heartbeat(
     {
         l.drop_landed(session, &landed_tasks(dir, session));
     }
-    if l.heartbeat(session, now)
-        || l.leases.len() != before.leases.len()
-        || l.queue.len() != before.queue.len()
+    let beat = l.heartbeat(session, now);
+    let moved = advance_in(&mut l, path, feed_dir, cap, now).moved();
+    if beat || moved || l.leases.len() != before.leases.len() || l.queue.len() != before.queue.len()
     {
         let v = serde_json::to_value(&l).map_err(|e| e.to_string())?;
         manage::write(path, &v).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1856,17 +2147,88 @@ pub fn heartbeat(
 }
 
 /// Release `session`'s `task` in the ledger at `path` (nothing when there
-/// is no ledger). The lease released, if any.
+/// is no ledger), and move the queue on into what it freed
+/// ([`Ledger::advance`], under `cap`, else this machine). The lease
+/// released, if any.
 pub fn release_at(
     path: &Path,
+    feed_dir: Option<&Path>,
     session: &str,
     task: &str,
     now: u64,
+    cap: Option<&Capacity>,
 ) -> Result<Option<Lease>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    with_ledger(path, now, |l| l.release(session, task, now))
+    with_ledger(path, now, |l| {
+        let gone = l.release(session, task, now);
+        advance_in(l, path, feed_dir, cap, now);
+        gone
+    })
+}
+
+/// `session`'s manager takes up its grant for `task` (`start`, `run`):
+/// [`Ledger::collect`] in the ledger at `path`, when there is one.
+pub fn collect_at(path: &Path, session: &str, task: &str, now: u64) -> Result<bool, String> {
+    let has = crate::manage_inbox::read_ledger(path, now).is_some_and(|l| {
+        l.leases
+            .iter()
+            .any(|x| x.session == session && x.task == task && x.uncollected.is_some())
+    });
+    if !has {
+        return Ok(false);
+    }
+    with_ledger(path, now, |l| l.collect(session, task, now))
+}
+
+/// What the ledger did for `session` while its manager was not looking
+/// (giverny#429), told once on its hook: a queued claim granted on another
+/// session's call, or such a grant that lapsed untaken.
+pub fn news(path: &Path, session: &str, now: u64) -> Option<String> {
+    let l = crate::manage_inbox::read_ledger(path, now)?;
+    let untold = l
+        .leases
+        .iter()
+        .any(|x| x.session == session && x.uncollected.as_ref().is_some_and(|u| !u.told))
+        || l.queue
+            .iter()
+            .any(|w| w.session == session && w.lapsed.as_ref().is_some_and(|x| !x.told));
+    if !untold {
+        return None;
+    }
+    let hold_min = giverny_core::config::DefaultLease::load()
+        .uncollected_min
+        .max(1);
+    let lines = with_ledger(path, now, |l| {
+        let mut lines = Vec::new();
+        for x in l.leases.iter_mut().filter(|x| x.session == session) {
+            if let Some(u) = x.uncollected.as_mut().filter(|u| !u.told) {
+                u.told = true;
+                let ago = feed::fmt_span((now.saturating_sub(x.granted_at) / 1000) as i64);
+                lines.push(format!(
+                    "Giverny: the ledger granted your queued claim for {} ({}) {ago} ago, on                      another session's call. Start its worker now; `giverny-manage claim {}`                      takes it up (exit 0), as do `start` and `run`. Untaken for {hold_min}m,                      it lapses and the queue moves past it.",
+                    x.task,
+                    x.describe(),
+                    x.task,
+                ));
+            }
+        }
+        for w in l.queue.iter_mut().filter(|w| w.session == session) {
+            if let Some(x) = w.lapsed.as_mut().filter(|x| !x.told) {
+                x.told = true;
+                lines.push(format!(
+                    "Giverny: your grant for {} ({}) lapsed untaken after {hold_min}m and was                      given back; it keeps its place in the queue but waits for you: re-run                      `giverny-manage claim {}` when you can start it.",
+                    w.task,
+                    w.request.describe(),
+                    w.task,
+                ));
+            }
+        }
+        lines
+    })
+    .ok()?;
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// Put `lease` on `session`'s feed row for `task` (or take it off, with
@@ -2039,8 +2401,18 @@ pub fn report(
                     .join(", ")
                 ),
             };
+            let uncollected = match &x.uncollected {
+                Some(_) => format!(
+                    ", granted {} ago, waiting for its manager (lapses in {})",
+                    ago(x.granted_at),
+                    feed::fmt_span(
+                        ((x.granted_at + cap.uncollected_ms()).saturating_sub(now) / 1000) as i64
+                    )
+                ),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  {:<16} {}{mem}  session {}  beat {} ago{left}\n",
+                "  {:<16} {}{mem}  session {}  beat {} ago{left}{uncollected}\n",
                 x.task,
                 x.describe(),
                 short_session(&x.session),
@@ -2053,7 +2425,7 @@ pub fn report(
         out.push_str("queue\n");
         for (i, w) in q.iter().enumerate() {
             out.push_str(&format!(
-                "  #{} {:<14} {}  session {}  queued {} ago{}\n",
+                "  #{} {:<14} {}  session {}  queued {} ago{}{}\n",
                 i + 1,
                 w.task,
                 w.request.describe(),
@@ -2063,6 +2435,13 @@ pub fn report(
                     .priority
                     .as_deref()
                     .map(|p| format!(", {p}"))
+                    .unwrap_or_default(),
+                w.lapsed
+                    .as_ref()
+                    .map(|x| format!(
+                        ", its grant lapsed {} ago untaken: waits for its manager to claim again",
+                        ago(x.at)
+                    ))
                     .unwrap_or_default()
             ));
         }
@@ -2109,6 +2488,7 @@ mod tests {
                 at_ms: T0,
                 ..Default::default()
             },
+            live_sessions: None,
         }
     }
 
@@ -2142,14 +2522,15 @@ mod tests {
         // A fourth from session a lines up behind it.
         let q2 = l.claim(&c, "a", "t4", None, &req(1), T0 + 2 * MIN);
         assert!(matches!(q2, Outcome::Queued { position: 2, .. }), "{q2:?}");
-        // Once t1 is released, t4 may go first only with what is left after
-        // t3's share is set aside (7.85 G free; t3 wants 2 G).
+        // Once t1 is released, t4's call grants t3 first, at its place
+        // (giverny#429): 7.85 G free, t3's 2 G taken, 6 G no longer fits.
         assert!(l.release("a", "t1", T0 + 3 * MIN).is_some());
         let big = l.claim(&c, "a", "t4", None, &req(6), T0 + 3 * MIN);
         assert!(
-            matches!(big, Outcome::Queued { position: 2, .. }),
+            matches!(big, Outcome::Queued { position: 1, .. }),
             "{big:?}"
         );
+        assert!(l.lease("b", "t3").is_some_and(|x| x.uncollected.is_some()));
         let g = l.claim(&c, "a", "t4", None, &req(1), T0 + 3 * MIN);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
         let g = l.claim(&c, "b", "t3", None, &req(2), T0 + 3 * MIN);
@@ -2989,7 +3370,8 @@ mod tests {
         l.claim(&c, "o", "a", None, &req(9), T0);
         l.claim_timed(&c, "h", "spx", None, &req(6), T0, &t);
         assert!(l.release("o", "a", T0 + MIN).is_some());
-        // 14.85G free, 6G of it the head's: 10G more would take its share.
+        // 14.85G free: the head fits, so wide's call grants it first
+        // (giverny#429), and 10G more does not fit beside its 6G.
         let q = l.claim_timed(&c, "s", "wide", None, &req(10), T0 + MIN, &t);
         let Outcome::Queued {
             behind, only_queue, ..
@@ -2997,9 +3379,15 @@ mod tests {
         else {
             panic!("{q:?}")
         };
-        assert_eq!((behind.as_deref(), *only_queue), (Some("spx"), true));
+        assert_eq!((behind.as_deref(), *only_queue), (Some("spx"), false));
+        let line = outcome_line("wide", &q, &|_, _| None);
+        assert!(
+            line.contains("behind spx (6G; granted, waiting for its manager)"),
+            "{line}"
+        );
         let g = l.claim_timed(&c, "h", "spx", None, &req(6), T0 + MIN, &t);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        assert!(l.lease("h", "spx").is_some_and(|x| x.uncollected.is_none()));
     }
 
     /// Priority still beats first come with backfill on: a later ASAP
@@ -3026,6 +3414,166 @@ mod tests {
         assert_eq!(behind.as_deref(), Some("urgent"));
         let g = l.claim_timed(&c, "u", "urgent", None, &urgent, T0 + 2 * MIN, &t);
         assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+    }
+
+    /// giverny#429, as seen live: one 2G lease, 12.85G free, and three
+    /// waiters ahead that all fit — spx-backtest 3G, sim2 2G, clean 1G —
+    /// whose managers stopped polling. g422's claim behind them used to
+    /// answer "behind spx-backtest's 3G, the only thing in the way" for
+    /// hours. Now its call grants all three at their places, then g422.
+    #[test]
+    fn fitting_waiters_with_silent_owners_are_granted_on_anyones_call() {
+        let c = cap();
+        let mut l = Ledger::default();
+        l.claim(&c, "me", "g429", None, &req(2), T0);
+        l.claim(&c, "o", "big", None, &req(12), T0);
+        for (s, t, gb) in [
+            ("inbar", "spx-backtest", 3),
+            ("inbar", "sim2", 2),
+            ("tolad", "clean", 1),
+        ] {
+            let q = l.claim(&c, s, t, None, &req(gb), T0 + MIN);
+            assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        }
+        assert!(l.release("o", "big", T0 + 2 * MIN).is_some());
+        // Hours later, their owners have not polled since (their hooks still
+        // beat): g422 asks.
+        let at = T0 + 3 * 60 * MIN;
+        for s in ["inbar", "tolad"] {
+            l.heartbeat(s, at - MIN);
+        }
+        let g = l.claim(&c, "me", "g422", None, &req(3), at);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        assert!(l.queue.is_empty(), "{:?}", l.queue);
+        for t in ["spx-backtest", "sim2", "clean"] {
+            let x = l.leases.iter().find(|x| x.task == t).unwrap();
+            assert!(x.uncollected.is_some(), "{t} granted for its manager");
+            assert_eq!(x.granted_at, at);
+        }
+        // The panel and the report say so.
+        let text = report(&l, &c, at, &|_, _| None);
+        assert!(
+            text.contains("granted 0m ago, waiting for its manager (lapses in 10m)"),
+            "{text}"
+        );
+        // Its owner's next claim finds it granted, as if just now: exit 0.
+        let g = l.claim(&c, "inbar", "spx-backtest", None, &req(3), at + 4 * MIN);
+        let Outcome::Granted(x) = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!(g.exit_code(), exit::GRANTED);
+        assert_eq!(
+            (x.granted_at, x.uncollected.is_none()),
+            (at + 4 * MIN, true)
+        );
+        assert_eq!(
+            outcome_line("spx-backtest", &g, &|_, _| None),
+            "granted spx-backtest: 3G"
+        );
+        // A second claim is the held lease, as ever.
+        let h = l.claim(&c, "inbar", "spx-backtest", None, &req(3), at + 5 * MIN);
+        assert!(matches!(h, Outcome::Held(_)), "{h:?}");
+    }
+
+    /// giverny#429: a grant nobody takes up lapses after the setting's
+    /// minutes; the next waiter gets what it held, at once, on one call.
+    /// The lapsed one keeps its place, dormant, until its manager claims.
+    #[test]
+    fn an_uncollected_grant_lapses_and_the_next_waiter_gets_it() {
+        let c = cap();
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "big", None, &req(9), T0);
+        l.claim(&c, "h", "spx", None, &req(8), T0);
+        l.claim(&c, "d", "g422", None, &req(8), T0 + MIN);
+        assert!(l.release("o", "big", T0 + 2 * MIN).is_some());
+        // Anyone's call (a third session's beat) grants the head.
+        let n = l.advance(&c, T0 + 2 * MIN, &|_, _| None, None);
+        assert_eq!(n.granted.len(), 1);
+        assert!(l.lease("h", "spx").is_some_and(|x| x.uncollected.is_some()));
+        // Its manager is alive (its hook beats) but never claims.
+        l.heartbeat("h", T0 + 8 * MIN);
+        let q = l.claim(&c, "d", "g422", None, &req(8), T0 + 9 * MIN);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        // Ten minutes after the grant, g422's one call takes it.
+        let g = l.claim(&c, "d", "g422", None, &req(8), T0 + 12 * MIN);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        assert!(l.lease("h", "spx").is_none());
+        let w = l.queue.iter().find(|w| w.task == "spx").unwrap();
+        assert_eq!(w.queued_at, T0, "back at its place");
+        assert!(w.lapsed.is_some());
+        // Dormant: nothing set aside for it, never granted again unasked.
+        assert!(l.release("d", "g422", T0 + 13 * MIN).is_some());
+        assert!(!l.advance(&c, T0 + 13 * MIN, &|_, _| None, None).moved());
+        let g = l.claim(&c, "x", "small", None, &req(10), T0 + 13 * MIN);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        let text = report(&l, &c, T0 + 13 * MIN, &|_, _| None);
+        assert!(text.contains("its grant lapsed 1m ago untaken"), "{text}");
+        // Its manager comes back: live again, at its old place.
+        let q = l.claim(&c, "h", "spx", None, &req(8), T0 + 14 * MIN);
+        assert!(matches!(q, Outcome::Queued { position: 1, .. }), "{q:?}");
+        assert!(l.queue[0].lapsed.is_none());
+    }
+
+    /// giverny#429: a session no claude runs, that has not beaten for
+    /// [`GONE_MS`], leaves the queue; its untaken grant is dropped, not put
+    /// back. Without the registry's word, only the TTL says so.
+    #[test]
+    fn a_dead_sessions_waiters_drop_out() {
+        let mut c = cap();
+        let mut l = Ledger::default();
+        l.claim(&c, "o", "big", None, &req(14), T0);
+        l.claim(&c, "dead", "w", None, &req(2), T0);
+        l.claim(&c, "live", "v", None, &req(2), T0);
+        let later = T0 + GONE_MS;
+        l.heartbeat("o", later);
+        assert!(
+            !l.advance(&c, later, &|_, _| None, None).moved(),
+            "no registry"
+        );
+        c.live_sessions = Some(["o", "live"].into_iter().map(String::from).collect());
+        let n = l.advance(&c, later, &|_, _| None, None);
+        assert_eq!(n.dropped, vec!["dead:w".to_string()]);
+        assert_eq!(l.queue.len(), 1);
+        // A grant its gone session never took up is dropped when it lapses.
+        assert!(l.release("o", "big", later).is_some());
+        l.advance(&c, later, &|_, _| None, None);
+        assert!(
+            l.lease("live", "v")
+                .is_some_and(|x| x.uncollected.is_some())
+        );
+        c.live_sessions = Some(["o"].into_iter().map(String::from).collect());
+        let n = l.advance(&c, later + c.uncollected_ms(), &|_, _| None, None);
+        assert_eq!(n.dropped, vec!["live:v".to_string()]);
+        assert!(l.leases.is_empty() && l.queue.is_empty());
+    }
+
+    /// giverny#429: the hook tells a manager once what the queue did for
+    /// it; `start` (or `run`) takes a grant up as a claim does.
+    #[test]
+    fn news_is_told_once_and_start_collects() {
+        let dir = std::env::temp_dir().join(format!("giverny-news-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ledger.json");
+        let c = cap();
+        with_ledger(&path, T0, |l| {
+            l.claim(&c, "o", "big", None, &req(14), T0);
+            l.claim(&c, "h", "spx", None, &req(3), T0);
+        })
+        .unwrap();
+        assert!(news(&path, "h", T0).is_none());
+        release_at(&path, None, "o", "big", T0 + MIN, Some(&c)).unwrap();
+        let said = news(&path, "h", T0 + 2 * MIN).unwrap();
+        assert!(
+            said.contains("granted your queued claim for spx (3G) 1m ago"),
+            "{said}"
+        );
+        assert!(news(&path, "h", T0 + 2 * MIN).is_none(), "told once");
+        assert!(news(&path, "o", T0 + 2 * MIN).is_none());
+        assert!(collect_at(&path, "h", "spx", T0 + 3 * MIN).unwrap());
+        assert!(!collect_at(&path, "h", "spx", T0 + 3 * MIN).unwrap());
+        let l = Ledger::parse(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(l.leases[0].granted_at, T0 + 3 * MIN);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3059,12 +3607,16 @@ mod tests {
         assert_eq!(l.leases[0].ram_mb, 3072);
         assert_eq!(l.leases[0].repo.as_deref(), Some("demo"));
         // Heartbeats beat; a silent ledger expires on the next read.
-        heartbeat(&path, None, "a", T0 + 10 * MIN).unwrap();
+        heartbeat(&path, None, "a", T0 + 10 * MIN, Some(&c)).unwrap();
         let l = Ledger::parse(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(l.leases[0].heartbeat_at, T0 + 10 * MIN);
         let n = with_ledger(&path, T0 + 10 * MIN + TTL_MS, |l| l.leases.len()).unwrap();
         assert_eq!(n, 0);
-        assert!(release_at(&path, "a", "t", T0).unwrap().is_none());
+        assert!(
+            release_at(&path, None, "a", "t", T0, Some(&c))
+                .unwrap()
+                .is_none()
+        );
         // Many writers at once lose nothing.
         let handles: Vec<_> = (0..8)
             .map(|i| {

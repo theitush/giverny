@@ -270,6 +270,7 @@ pub fn run_with(
     let asks: Vec<String> = [
         away,
         manage_inbox::deliver(dir, &ledger, session, now),
+        resources::news(&ledger, session, now),
         manage_chores::deliver(dir, session, now),
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),

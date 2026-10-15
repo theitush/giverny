@@ -19,7 +19,10 @@
 //! ([`WindowsClipboard`], giverny#410): a fresh `powershell.exe` took 1.4 to
 //! 2.7 s to start, which was nearly all of a paste's time; the resident one
 //! answers in about 10 ms. It is started a moment after the app, and it
-//! exits with it.
+//! exits with it. An answer that does not come in time (a clipboard held
+//! open, a copier that never renders what it offered) costs that paste
+//! a few seconds and that reader its life (giverny#420): the next paste
+//! starts a fresh one rather than queueing behind a hung read.
 //!
 //! The PNGs live in a directory of this run's (`giverny-paste-<pid>` under
 //! `$XDG_RUNTIME_DIR`, or the temp dir), removed when the app exits; files
@@ -27,11 +30,11 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use giverny_core::tabs::TabId;
 
 /// The prefix of every run's paste directory, which the start-up sweep
@@ -67,6 +70,14 @@ catch { $m.SetLength(0) }; \
 /// How long after the app starts the resident PowerShell is started: out of
 /// the way of the first frames, and long before anyone pastes.
 const WARM_UP_AFTER: Duration = Duration::from_secs(2);
+
+/// How long a running reader has to answer a paste: a read takes 10 to
+/// 25 ms, so one this late is stuck, and is ended rather than waited on.
+const ANSWER_WITHIN: Duration = Duration::from_secs(3);
+
+/// How long a reader just started has for its first answer, which waits on
+/// PowerShell's own start: 1.4 to 2.7 s, 4.5 s seen with Windows busy.
+const FIRST_ANSWER_WITHIN: Duration = Duration::from_secs(15);
 
 /// A pasted image's file, ready to be typed into the tab it was pasted in.
 pub struct Pasted {
@@ -226,24 +237,43 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, png::
 ///
 /// Pastes take turns at it. One that finds it gone (its stdin's end is its
 /// end, so a crash of ours ends it too) starts another and asks once more.
+/// One that gets no answer in time ends it and has no image; the next
+/// paste starts another.
 struct WindowsClipboard {
     /// How to start the reader: [`powershell_command`], or a stand-in in
     /// tests.
     command: fn() -> Command,
+    /// [`ANSWER_WITHIN`] and [`FIRST_ANSWER_WITHIN`], or shorter in tests.
+    answer_within: Duration,
+    first_answer_within: Duration,
     reader: Mutex<Option<Reader>>,
 }
 
-/// A running reader and its pipes.
+/// A running reader, its stdin, and its stdout's lines as a thread of its
+/// own reads them, so that waiting on one can have a deadline.
 struct Reader {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    lines: Receiver<std::io::Result<String>>,
+    /// Whether it has answered yet: its first answer waits on its start.
+    answered: bool,
+}
+
+/// Why a reader gave no answer.
+#[derive(Debug)]
+enum AskError {
+    /// It is gone: its pipe broke or closed.
+    Gone(std::io::Error),
+    /// It is there but did not answer in time.
+    Late,
 }
 
 impl WindowsClipboard {
     fn new(command: fn() -> Command) -> Self {
         Self {
             command,
+            answer_within: ANSWER_WITHIN,
+            first_answer_within: FIRST_ANSWER_WITHIN,
             reader: Mutex::new(None),
         }
     }
@@ -275,13 +305,30 @@ impl WindowsClipboard {
                 *reader = self.start();
             }
             let current = reader.as_mut()?;
-            match current.ask() {
+            let within = if current.answered {
+                self.answer_within
+            } else {
+                self.first_answer_within
+            };
+            match current.ask(within) {
                 Ok(line) => return decode_base64_png(&line),
-                Err(e) => {
+                Err(AskError::Gone(e)) => {
                     tracing::info!("paste: the clipboard reader is gone ({e}); attempt {attempt}");
                     if let Some(mut gone) = reader.take() {
                         gone.stop();
                     }
+                }
+                Err(AskError::Late) => {
+                    // Asking again would wait as long once more; the next
+                    // paste starts a fresh reader instead.
+                    tracing::warn!(
+                        "paste: the clipboard reader did not answer in {} ms; ended",
+                        within.as_millis()
+                    );
+                    if let Some(mut stuck) = reader.take() {
+                        stuck.stop();
+                    }
+                    return None;
                 }
             }
         }
@@ -315,10 +362,36 @@ impl WindowsClipboard {
             let _ = child.wait();
             return None;
         };
+        // The thread ends with the reader: a killed reader's stdout closes.
+        let (tx, lines) = crossbeam_channel::unbounded();
+        let spawned = std::thread::Builder::new()
+            .name("paste reader".into())
+            .spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    let read = match stdout.read_line(&mut line) {
+                        Ok(0) => return,
+                        Ok(_) => Ok(line.trim_end().to_string()),
+                        Err(e) => Err(e),
+                    };
+                    let failed = read.is_err();
+                    if tx.send(read).is_err() || failed {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("paste: no thread to read the clipboard reader: {e}");
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         Some(Reader {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines,
+            answered: false,
         })
     }
 }
@@ -330,15 +403,24 @@ impl Drop for WindowsClipboard {
 }
 
 impl Reader {
-    /// One request, one line back (without its line end).
-    fn ask(&mut self) -> std::io::Result<String> {
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
+    /// One request, one line back (without its line end), if it comes
+    /// `within` that long.
+    fn ask(&mut self, within: Duration) -> Result<String, AskError> {
+        self.stdin
+            .write_all(b"\n")
+            .and_then(|()| self.stdin.flush())
+            .map_err(AskError::Gone)?;
+        match self.lines.recv_timeout(within) {
+            Ok(Ok(line)) => {
+                self.answered = true;
+                Ok(line)
+            }
+            Ok(Err(e)) => Err(AskError::Gone(e)),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(AskError::Gone(std::io::ErrorKind::UnexpectedEof.into()))
+            }
+            Err(RecvTimeoutError::Timeout) => Err(AskError::Late),
         }
-        Ok(line.trim_end().to_string())
     }
 
     fn stop(&mut self) {
@@ -556,15 +638,19 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// A one-pixel PNG as base64, as a reader answers.
+    #[cfg(unix)]
+    fn one_pixel_base64() -> String {
+        use base64::Engine;
+        let png = encode_png(1, 1, &[1, 2, 3, 255]).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
     /// A stand-in reader: answers every line with a one-pixel PNG.
     #[cfg(unix)]
     fn fake_reader() -> Command {
         let mut command = Command::new("sh");
-        let png = encode_png(1, 1, &[1, 2, 3, 255]).unwrap();
-        let b64 = {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(png)
-        };
+        let b64 = one_pixel_base64();
         command.args(["-c", &format!("while read l; do echo {b64}; done")]);
         command
     }
@@ -597,6 +683,62 @@ mod tests {
         assert_ne!(windows.lock().as_ref().unwrap().child.id(), pid);
         windows.shut_down();
         assert!(windows.lock().is_none());
+    }
+
+    /// A stand-in reader that answers its first paste and hangs on the
+    /// second, the way a clipboard held open would hang a read.
+    #[cfg(unix)]
+    fn hangs_on_the_second_paste() -> Command {
+        let mut command = Command::new("sh");
+        let b64 = one_pixel_base64();
+        // exec: the kill lands on the sleep itself, leaving no orphan.
+        command.args(["-c", &format!("read l; echo {b64}; read l; exec sleep 999")]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_read_costs_one_paste_its_deadline_and_the_next_paste_works() {
+        let windows = WindowsClipboard::new(hangs_on_the_second_paste);
+        let first = windows.png().expect("the first paste is answered");
+        let pid = windows.lock().as_ref().unwrap().child.id();
+
+        let asked = std::time::Instant::now();
+        assert_eq!(windows.png(), None, "a hung read is no image");
+        let took = asked.elapsed();
+        assert!(
+            took >= ANSWER_WITHIN && took < ANSWER_WITHIN + Duration::from_secs(2),
+            "one paste costs about the deadline: {took:?}"
+        );
+        assert!(windows.lock().is_none(), "the stuck reader is ended");
+        let gone = Path::new("/proc").join(pid.to_string());
+        assert!(!gone.exists(), "and its process with it");
+
+        let asked = std::time::Instant::now();
+        assert_eq!(windows.png(), Some(first), "the next paste works");
+        assert!(asked.elapsed() < ANSWER_WITHIN, "{:?}", asked.elapsed());
+        assert_ne!(windows.lock().as_ref().unwrap().child.id(), pid);
+        windows.shut_down();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_that_never_answers_is_ended_at_its_first_deadline() {
+        fn never_answers() -> Command {
+            let mut command = Command::new("sh");
+            command.args(["-c", "read l; exec sleep 999"]);
+            command
+        }
+        let mut windows = WindowsClipboard::new(never_answers);
+        windows.first_answer_within = Duration::from_millis(300);
+        let asked = std::time::Instant::now();
+        assert_eq!(windows.png(), None);
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(windows.lock().is_none(), "ended, not asked twice");
     }
 
     #[cfg(unix)]
