@@ -14,14 +14,21 @@
 //!   WSLg's clipboard bridge carries text only: a Win+Shift+S snip shows up
 //!   in X as an empty `UTF8_STRING` and no image target at all.
 //!
-//! The read runs on a thread of its own: PowerShell takes the better part of
-//! a second to start, and a frame must never wait on it.
+//! The read runs on a thread of its own, and a frame never waits on it.
+//! On WSL it goes to a PowerShell kept running for the purpose
+//! ([`WindowsClipboard`], giverny#410): a fresh `powershell.exe` took 1.4 to
+//! 2.7 s to start, which was nearly all of a paste's time; the resident one
+//! answers in about 10 ms. It is started a moment after the app, and it
+//! exits with it.
 //!
 //! The PNGs live in a directory of this run's (`giverny-paste-<pid>` under
 //! `$XDG_RUNTIME_DIR`, or the temp dir), removed when the app exits; files
 //! a crashed run left behind go at the next start once they are a day old.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -37,17 +44,29 @@ const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// The eight bytes every PNG starts with.
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-/// The Windows clipboard's image, as base64 PNG on stdout: the `PNG` format
-/// itself when the copier offered one (a Win+Shift+S snip does, alpha and
-/// all), else the bitmap re-encoded. Nothing printed when there is no image.
+/// The resident PowerShell's script: for each line read on stdin, one line
+/// on stdout with the Windows clipboard's image as base64 PNG — the `PNG`
+/// format itself when the copier offered one (a Win+Shift+S snip does, alpha
+/// and all), so it passes through untouched, else the bitmap encoded — and
+/// an empty line when there is no image (or the clipboard would not open).
+/// stdin's end is its end. The format query before the loop only warms it
+/// up: the first paste's read took 80 ms without it, 25 ms with.
 const WINDOWS_CLIPBOARD_PS: &str = "\
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-$d = [Windows.Forms.Clipboard]::GetDataObject(); \
+$null = [Windows.Forms.Clipboard]::ContainsImage(); \
+while ($null -ne [Console]::In.ReadLine()) { \
 $m = New-Object IO.MemoryStream; \
+try { $d = [Windows.Forms.Clipboard]::GetDataObject(); \
 if ($d -and $d.GetDataPresent('PNG')) { $d.GetData('PNG').CopyTo($m) } \
 elseif ([Windows.Forms.Clipboard]::ContainsImage()) { \
-[Windows.Forms.Clipboard]::GetImage().Save($m, [Drawing.Imaging.ImageFormat]::Png) }; \
-if ($m.Length -gt 0) { [Convert]::ToBase64String($m.ToArray()) }";
+[Windows.Forms.Clipboard]::GetImage().Save($m, [Drawing.Imaging.ImageFormat]::Png) } } \
+catch { $m.SetLength(0) }; \
+[Console]::Out.WriteLine([Convert]::ToBase64String($m.ToArray())); \
+[Console]::Out.Flush() }";
+
+/// How long after the app starts the resident PowerShell is started: out of
+/// the way of the first frames, and long before anyone pastes.
+const WARM_UP_AFTER: Duration = Duration::from_secs(2);
 
 /// A pasted image's file, ready to be typed into the tab it was pasted in.
 pub struct Pasted {
@@ -62,6 +81,8 @@ pub struct ImagePaste {
     dir: PathBuf,
     tx: Sender<Pasted>,
     rx: Receiver<Pasted>,
+    /// WSL only: the Windows clipboard's reader, kept running.
+    windows: Option<Arc<WindowsClipboard>>,
     /// Debug builds: the next paste reads this PNG instead of the clipboard
     /// (`GIVERNY_DEBUG_CMD` `paste-image <file>`), so the whole path can be
     /// driven in a test window without touching anyone's clipboard.
@@ -79,10 +100,16 @@ impl ImagePaste {
             .unwrap_or_else(std::env::temp_dir);
         sweep(&base, SystemTime::now(), STALE_AFTER);
         let (tx, rx) = crossbeam_channel::unbounded();
+        let windows = giverny_claude::away::is_wsl().then(|| {
+            let windows = Arc::new(WindowsClipboard::new(powershell_command));
+            windows.warm_up_after(WARM_UP_AFTER);
+            windows
+        });
         Self {
             dir: base.join(format!("{DIR_PREFIX}{}", std::process::id())),
             tx,
             rx,
+            windows,
             #[cfg(debug_assertions)]
             debug_source: None,
         }
@@ -95,7 +122,9 @@ impl ImagePaste {
         let debug_source = self.debug_source.take();
         let dir = self.dir.clone();
         let tx = self.tx.clone();
+        let windows = self.windows.clone();
         let ctx = ctx.clone();
+        let asked = std::time::Instant::now();
         let spawned = std::thread::Builder::new()
             .name("paste image".into())
             .spawn(move || {
@@ -104,17 +133,21 @@ impl ImagePaste {
                     Some(file) => std::fs::read(&file)
                         .inspect_err(|e| tracing::warn!("paste-image {}: {e}", file.display()))
                         .ok(),
-                    None => clipboard_png(),
+                    None => clipboard_png(windows.as_deref()),
                 };
                 #[cfg(not(debug_assertions))]
-                let png = clipboard_png();
+                let png = clipboard_png(windows.as_deref());
                 let Some(png) = png.filter(|b| b.starts_with(PNG_MAGIC)) else {
                     tracing::info!("paste: no text and no image in the clipboard");
                     return;
                 };
                 match save(&dir, &png, SystemTime::now()) {
                     Ok(path) => {
-                        tracing::info!("paste: image saved to {}", path.display());
+                        tracing::info!(
+                            "paste: image saved to {} in {} ms",
+                            path.display(),
+                            asked.elapsed().as_millis()
+                        );
                         let _ = tx.send(Pasted { tab, path });
                         ctx.request_repaint();
                     }
@@ -131,9 +164,13 @@ impl ImagePaste {
         self.rx.try_iter().collect()
     }
 
-    /// Remove this run's pasted images. Run at exit: by then Claude Code
-    /// has long read every one it was given.
+    /// Remove this run's pasted images, and stop the Windows clipboard's
+    /// reader. Run at exit: by then Claude Code has long read every image
+    /// it was given.
     pub fn clean_up(&self) {
+        if let Some(windows) = &self.windows {
+            windows.shut_down();
+        }
         if self.dir.exists()
             && let Err(e) = std::fs::remove_dir_all(&self.dir)
         {
@@ -148,15 +185,14 @@ impl Drop for ImagePaste {
     }
 }
 
-/// The clipboard's image as PNG bytes, from wherever this platform keeps it.
-fn clipboard_png() -> Option<Vec<u8>> {
+/// The clipboard's image as PNG bytes, from wherever this platform keeps it:
+/// through arboard first (a few milliseconds when it has none), then on WSL
+/// the Windows clipboard.
+fn clipboard_png(windows: Option<&WindowsClipboard>) -> Option<Vec<u8>> {
     if let Some(png) = arboard_png() {
         return Some(png);
     }
-    if giverny_claude::away::is_wsl() {
-        return windows_clipboard_png();
-    }
-    None
+    windows?.png()
 }
 
 /// The clipboard's image through `arboard` (raw RGBA), encoded as PNG.
@@ -182,31 +218,164 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, png::
     Ok(out)
 }
 
-/// WSL: the Windows clipboard's image, through PowerShell over interop.
-/// Base64 on stdout rather than a file Windows writes: no path to translate,
-/// and nothing of Windows' to clean up.
-fn windows_clipboard_png() -> Option<Vec<u8>> {
-    use base64::Engine;
+/// WSL: the Windows clipboard, read by a PowerShell over interop that is
+/// kept running between pastes, so that a paste costs a round trip (about
+/// 10 ms) rather than PowerShell's start (1.4 to 2.7 s). Base64 on a pipe
+/// rather than a file Windows writes: no path to translate, and nothing of
+/// Windows' to clean up.
+///
+/// Pastes take turns at it. One that finds it gone (its stdin's end is its
+/// end, so a crash of ours ends it too) starts another and asks once more.
+struct WindowsClipboard {
+    /// How to start the reader: [`powershell_command`], or a stand-in in
+    /// tests.
+    command: fn() -> Command,
+    reader: Mutex<Option<Reader>>,
+}
+
+/// A running reader and its pipes.
+struct Reader {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl WindowsClipboard {
+    fn new(command: fn() -> Command) -> Self {
+        Self {
+            command,
+            reader: Mutex::new(None),
+        }
+    }
+
+    /// Start the reader after `delay`, on a thread of its own, unless a
+    /// paste has started it first.
+    fn warm_up_after(self: &Arc<Self>, delay: Duration) {
+        let this = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("paste warm-up".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                let mut reader = this.lock();
+                if reader.is_none() {
+                    *reader = this.start();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::debug!("paste: no thread to start the clipboard reader: {e}");
+        }
+    }
+
+    /// The clipboard's image as PNG bytes, if it holds one. Waits for the
+    /// reader's start when it has not finished starting.
+    fn png(&self) -> Option<Vec<u8>> {
+        let mut reader = self.lock();
+        for attempt in 0..2 {
+            if reader.is_none() {
+                *reader = self.start();
+            }
+            let current = reader.as_mut()?;
+            match current.ask() {
+                Ok(line) => return decode_base64_png(&line),
+                Err(e) => {
+                    tracing::info!("paste: the clipboard reader is gone ({e}); attempt {attempt}");
+                    if let Some(mut gone) = reader.take() {
+                        gone.stop();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Stop the reader, if it is running. A paste after this starts another.
+    fn shut_down(&self) {
+        if let Some(mut reader) = self.lock().take() {
+            reader.stop();
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Reader>> {
+        // A paste thread that panicked left nothing half-done that matters:
+        // at worst a reader whose next answer is out of step, which the
+        // next ask replaces when it fails.
+        self.reader.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn start(&self) -> Option<Reader> {
+        let mut child = (self.command)()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .inspect_err(|e| tracing::warn!("paste: the clipboard reader did not start: {e}"))
+            .ok()?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        Some(Reader {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+}
+
+impl Drop for WindowsClipboard {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+impl Reader {
+    /// One request, one line back (without its line end).
+    fn ask(&mut self) -> std::io::Result<String> {
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        let mut line = String::new();
+        if self.stdout.read_line(&mut line)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(line.trim_end().to_string())
+    }
+
+    fn stop(&mut self) {
+        // Its stdin closes with the drop; the kill makes sure, and ending
+        // the Linux side of an interop process ends the Windows side.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The resident PowerShell: Windows' own, by its full path when the C:
+/// drive is mounted where WSL mounts it, else whatever `PATH` finds. Started
+/// in C:\ so it does not hold a UNC path into this distro.
+fn powershell_command() -> Command {
     let ps = ["/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"]
         .into_iter()
         .find(|p| Path::new(p).exists())
         .unwrap_or("powershell.exe");
-    let out = std::process::Command::new(ps)
-        // The clipboard is an OLE service: single-threaded apartment only.
+    let mut command = Command::new(ps);
+    // The clipboard is an OLE service: single-threaded apartment only.
+    command
         .args(["-NoProfile", "-NonInteractive", "-Sta", "-Command"])
-        .arg(WINDOWS_CLIPBOARD_PS)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .inspect_err(|e| tracing::warn!("paste: {ps} did not run: {e}"))
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    if text.is_empty() {
+        .arg(WINDOWS_CLIPBOARD_PS);
+    if Path::new("/mnt/c").is_dir() {
+        command.current_dir("/mnt/c");
+    }
+    command
+}
+
+/// A reader's answer as PNG bytes: `None` for the empty line of "no image".
+fn decode_base64_png(line: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    if line.is_empty() {
         return None;
     }
     base64::engine::general_purpose::STANDARD
-        .decode(text)
+        .decode(line)
         .inspect_err(|e| tracing::warn!("paste: Windows clipboard image unreadable: {e}"))
         .ok()
 }
@@ -375,6 +544,7 @@ mod tests {
             dir: base.join(format!("{DIR_PREFIX}33")),
             tx,
             rx,
+            windows: None,
             #[cfg(debug_assertions)]
             debug_source: None,
         };
@@ -384,6 +554,65 @@ mod tests {
         drop(paste);
         assert!(!dir.exists(), "the drop at exit takes the run's pastes");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A stand-in reader: answers every line with a one-pixel PNG.
+    #[cfg(unix)]
+    fn fake_reader() -> Command {
+        let mut command = Command::new("sh");
+        let png = encode_png(1, 1, &[1, 2, 3, 255]).unwrap();
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(png)
+        };
+        command.args(["-c", &format!("while read l; do echo {b64}; done")]);
+        command
+    }
+
+    /// A stand-in reader that has no image to give.
+    #[cfg(unix)]
+    fn empty_reader() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "while read l; do echo; done"]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_reader_stays_up_between_pastes_and_comes_back_when_gone() {
+        let windows = WindowsClipboard::new(fake_reader);
+        let first = windows.png().expect("an image");
+        assert!(first.starts_with(PNG_MAGIC));
+        let pid = windows.lock().as_ref().unwrap().child.id();
+        assert_eq!(windows.png(), Some(first.clone()));
+        assert_eq!(
+            windows.lock().as_ref().unwrap().child.id(),
+            pid,
+            "the same reader answers the next paste"
+        );
+        // Gone under us: the next paste starts another and still gets its
+        // image.
+        windows.lock().as_mut().unwrap().child.kill().unwrap();
+        assert_eq!(windows.png(), Some(first));
+        assert_ne!(windows.lock().as_ref().unwrap().child.id(), pid);
+        windows.shut_down();
+        assert!(windows.lock().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_answer_is_no_image() {
+        let windows = WindowsClipboard::new(empty_reader);
+        assert_eq!(windows.png(), None);
+        assert!(windows.lock().is_some(), "kept for the next paste");
+    }
+
+    #[test]
+    fn a_reader_that_will_not_start_is_no_image() {
+        fn missing() -> Command {
+            Command::new("/nonexistent/giverny-test-reader")
+        }
+        assert_eq!(WindowsClipboard::new(missing).png(), None);
     }
 
     #[test]
