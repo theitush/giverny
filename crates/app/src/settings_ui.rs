@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].key, "behavior.restore_apps");
         // Searching by TOML key works too — that is half the point of showing it.
-        state.search = "titles.strip".into();
+        state.search = "titles.strip_host".into();
         assert_eq!(visible(&state).len(), 1);
     }
 }
