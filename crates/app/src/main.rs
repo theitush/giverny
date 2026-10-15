@@ -2678,13 +2678,13 @@ impl App {
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
-        let profile_dir = self
-            .ws
-            .tab(id)
-            .and_then(|t| self.ws.category(t.category))
-            .and_then(|c| c.profile_dir.clone());
+        let category = self.ws.tab(id).and_then(|t| self.ws.category(t.category));
+        let profile_dir = category.and_then(|c| c.profile_dir.clone());
+        // The category's name, the surname a session born in this tab takes
+        // (giverny#434).
+        let category = category.map(|c| c.name.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, category, was_in.as_deref());
         let in_wsl = shape.in_wsl;
         // A WSL shell is a world of its own — its paths, its home — and is
         // left with the history it has.
@@ -3936,7 +3936,12 @@ impl App {
     /// environment does not reach a process in a distribution at all unless
     /// `%WSLENV%` lists it, which is how the tab identity the hooks report
     /// gets there.
-    fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
+    fn tab_shape(
+        &self,
+        profile_dir: Option<PathBuf>,
+        category: Option<String>,
+        was_in: Option<&Path>,
+    ) -> TabShape {
         let mut env = self.claude_env();
         // Where a manager in this tab writes its management-panel feed
         // (`docs/management-panel.md`) — the directory this app reads.
@@ -3944,6 +3949,12 @@ impl App {
             giverny_claude::feed::DIR_ENV.into(),
             giverny_claude::feed::feed_dir().display().to_string(),
         ));
+        // The rail category the tab sits in as its shell starts: a session
+        // born there is named after it (giverny#434). Not a path, so it
+        // crosses into a distribution as it is.
+        if let Some(name) = category.filter(|n| !n.trim().is_empty()) {
+            env.push((giverny_claude::names::CATEGORY_ENV.into(), name));
+        }
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
