@@ -521,9 +521,10 @@ pub fn fmt_cores(m: u64) -> String {
     format!("{:.1}", m as f64 / 1000.0)
 }
 
-/// Memory the slice's processes cannot give back (no swap): a cgroup's
-/// `memory.current` less its page cache (`file` in `memory.stat`), MiB.
-/// The page cache is left out because the kernel reclaims it first.
+/// Memory the slice's processes cannot give back (no swap): what a
+/// cgroup's `memory.stat` says will not come back on demand ([`MemSplit`]),
+/// MiB. The page cache and reclaimable slab are left out because the
+/// kernel reclaims them first (giverny#424).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemUse {
     /// Each lease's running `giverny manage run` commands, summed, by
@@ -532,6 +533,12 @@ pub struct MemUse {
     /// The rest of the slice: the claudes themselves (and their plain
     /// commands), which no lease counts.
     pub other_mb: u64,
+    /// What the whole slice is made of, for `resources` to show.
+    pub slice: Option<MemSplit>,
+    /// `run` scopes whose `run` is gone but whose command lives on, with
+    /// what each holds, MiB: in `other_mb`, no lease counts them, and
+    /// nothing will stop them (giverny#424).
+    pub orphans: Vec<(String, u64)>,
 }
 
 impl MemUse {
@@ -543,6 +550,10 @@ impl MemUse {
     /// [`crate::run_live::running`]) and [`crate::tab_cap::SLICE`] now.
     /// Nothing where there is no such cgroup (no user systemd, not Linux).
     pub fn sample(runs_dir: &Path) -> MemUse {
+        Self::sample_in(runs_dir, slice_dir().as_deref())
+    }
+
+    fn sample_in(runs_dir: &Path, slice: Option<&Path>) -> MemUse {
         let mut by_lease: HashMap<String, u64> = HashMap::new();
         let mut in_runs = 0;
         for (session, task, cg) in crate::run_live::running(runs_dir) {
@@ -551,25 +562,139 @@ impl MemUse {
                 in_runs += mb;
             }
         }
-        let other_mb = slice_dir()
-            .and_then(|d| held_mb(&d))
-            .map_or(0, |mb| mb.saturating_sub(in_runs));
-        MemUse { by_lease, other_mb }
+        let orphans = slice.map(orphan_scopes).unwrap_or_default();
+        let slice = slice.and_then(MemSplit::read);
+        let other_mb = slice.map_or(0, |s| s.held_mb().saturating_sub(in_runs));
+        MemUse {
+            by_lease,
+            other_mb,
+            slice,
+            orphans,
+        }
+    }
+
+    /// What the orphaned `run` scopes hold, MiB.
+    pub fn orphans_mb(&self) -> u64 {
+        self.orphans.iter().map(|(_, mb)| mb).sum()
     }
 }
 
-/// `memory.current` − `file` of the cgroup at `dir`, MiB.
+/// The `giverny-run-<task>-<pid>.scope` cgroups under `slice` whose `run`
+/// process (`<pid>`) is gone, biggest first, with what each holds, MiB.
+fn orphan_scopes(slice: &Path) -> Vec<(String, u64)> {
+    let Ok(rd) = std::fs::read_dir(slice) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let unit = name.strip_suffix(".scope")?;
+            let pid: u32 = unit
+                .strip_prefix("giverny-run-")?
+                .rsplit_once('-')?
+                .1
+                .parse()
+                .ok()?;
+            if crate::run_live::alive(pid) {
+                return None;
+            }
+            Some((unit.to_string(), held_mb(&e.path())?))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// What a cgroup's memory is made of, bytes: `memory.current` and the
+/// `memory.stat` fields that say what comes back on demand (giverny#424).
+/// The slice sits at its `MemoryMax` full of dentry/inode slab and page
+/// cache nobody holds; counting that as the claudes' turned ~2G of
+/// processes into 10G and granted nothing on an idle box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemSplit {
+    pub current: u64,
+    pub anon: u64,
+    /// Page cache, tmpfs and shared memory included.
+    pub file: u64,
+    /// tmpfs and shared memory: in `file`, but it goes only when its
+    /// files do.
+    pub shmem: u64,
+    /// All kernel memory, both slabs included (`kernel`; on kernels before
+    /// 5.18 the sum of its parts).
+    pub kernel: u64,
+    pub slab_reclaimable: u64,
+    pub slab_unreclaimable: u64,
+    pub sock: u64,
+}
+
+impl MemSplit {
+    /// The cgroup at `dir`, `None` without its `memory.current`.
+    pub fn read(dir: &Path) -> Option<MemSplit> {
+        let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+        let f = |name| stat_field(&stat, name).unwrap_or(0);
+        let kernel = stat_field(&stat, "kernel").unwrap_or_else(|| {
+            [
+                "kernel_stack",
+                "pagetables",
+                "percpu",
+                "slab_reclaimable",
+                "slab_unreclaimable",
+            ]
+            .into_iter()
+            .map(f)
+            .sum()
+        });
+        Some(MemSplit {
+            current,
+            anon: f("anon"),
+            file: f("file"),
+            shmem: f("shmem"),
+            kernel,
+            slab_reclaimable: f("slab_reclaimable"),
+            slab_unreclaimable: f("slab_unreclaimable"),
+            sock: f("sock"),
+        })
+    }
+
+    /// What will not come back on demand, bytes: anon, shmem, kernel
+    /// memory but its reclaimable slab, and socket buffers — never more
+    /// than `memory.current`.
+    pub fn held(&self) -> u64 {
+        (self.anon + self.shmem + self.kernel.saturating_sub(self.slab_reclaimable) + self.sock)
+            .min(self.current)
+    }
+
+    pub fn held_mb(&self) -> u64 {
+        self.held() / (1024 * 1024)
+    }
+
+    /// One line for `resources`: what is held, of what, and what comes back.
+    pub fn describe(&self) -> String {
+        let m = |b: u64| Mem(b / (1024 * 1024));
+        format!(
+            "{} held (anon {}, shmem {}, kernel {}, sock {}) of {} in the slice; \
+             comes back: cache {}, reclaimable slab {}",
+            m(self.held()),
+            m(self.anon),
+            m(self.shmem),
+            m(self.kernel.saturating_sub(self.slab_reclaimable)),
+            m(self.sock),
+            m(self.current),
+            m(self.file.saturating_sub(self.shmem)),
+            m(self.slab_reclaimable),
+        )
+    }
+}
+
+/// What the cgroup at `dir` holds ([`MemSplit::held`]), MiB.
 fn held_mb(dir: &Path) -> Option<u64> {
-    let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let file = std::fs::read_to_string(dir.join("memory.stat"))
-        .ok()
-        .and_then(|t| stat_field(&t, "file"))
-        .unwrap_or(0);
-    Some(current.saturating_sub(file) / (1024 * 1024))
+    MemSplit::read(dir).map(|s| s.held_mb())
 }
 
 /// One `memory.stat` field, bytes.
@@ -1850,12 +1975,35 @@ pub fn report(
     ));
     out.push_str(&format!(
         "memory    {} counted of {}: the leases at their expected peaks (or use, \
-         or lease), {} for the claudes, {} headroom\n",
+         or lease), {} for the claudes{}, {} headroom\n",
         Mem(free.counted_mb),
         lim.ram,
-        Mem(cap.mem_use.other_mb),
+        Mem(cap
+            .mem_use
+            .other_mb
+            .saturating_sub(cap.mem_use.orphans_mb())),
+        if cap.mem_use.orphans.is_empty() {
+            String::new()
+        } else {
+            format!(", {} in orphaned runs", Mem(cap.mem_use.orphans_mb()))
+        },
         ram_headroom(m),
     ));
+    if let Some(split) = &cap.mem_use.slice {
+        out.push_str(&format!("slice     {}\n", split.describe()));
+    }
+    if !cap.mem_use.orphans.is_empty() {
+        out.push_str(&format!(
+            "orphans   {} — their `run` is gone and no lease counts them; \
+             `systemctl --user stop <unit>.scope` frees it\n",
+            cap.mem_use
+                .orphans
+                .iter()
+                .map(|(u, mb)| format!("{u} {}", Mem(*mb)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     out.push_str(&format!(
         "free now  {} RAM{}\n",
         Mem(free.ram_mb),
@@ -2525,6 +2673,100 @@ mod tests {
         let mut ids: Vec<String> = crate::run_live::running_leases(&runs).into_iter().collect();
         ids.sort();
         assert_eq!(ids, ["s1:demo#7", "s2:acme#5"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#424: a slice at its cap, full of page cache and reclaimable
+    /// slab (dentries, inodes) around ~1.5G of processes, counts the
+    /// claudes at what will not come back, so a claim that fits is granted.
+    #[test]
+    fn a_slice_full_of_cache_and_reclaimable_slab_still_grants() {
+        let dir = std::env::temp_dir().join(format!("giverny-memsplit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runs = dir.join("runs");
+        let slice = dir.join("slice");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::create_dir_all(&slice).unwrap();
+        let mb = |n: u64| n << 20;
+        // 16G in all: 1.5G anon, 4G cache (200M of it tmpfs), 10.4G kernel
+        // of which 9.8G reclaimable slab, 20M of sockets.
+        std::fs::write(slice.join("memory.current"), format!("{}\n", mb(16 * 1024))).unwrap();
+        std::fs::write(
+            slice.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nkernel {}\nkernel_stack {}\npagetables {}\nsock {}\n\
+                 shmem {}\nslab_reclaimable {}\nslab_unreclaimable {}\nslab {}\n",
+                mb(1536),
+                mb(4096),
+                mb(10650),
+                mb(40),
+                mb(60),
+                mb(20),
+                mb(200),
+                mb(10035),
+                mb(515),
+                mb(10550),
+            ),
+        )
+        .unwrap();
+        // A run scope whose `run` is gone, and one whose `run` lives.
+        for (unit, anon) in [
+            ("giverny-run-scale343-999999999".to_string(), 1024u64),
+            (format!("giverny-run-mine-{}", std::process::id()), 512),
+        ] {
+            let d = slice.join(format!("{unit}.scope"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("memory.current"), format!("{}\n", mb(anon + 100))).unwrap();
+            std::fs::write(
+                d.join("memory.stat"),
+                format!("anon {}\nfile {}\n", mb(anon), mb(100)),
+            )
+            .unwrap();
+        }
+        let u = MemUse::sample_in(&runs, Some(&slice));
+        // anon + shmem + kernel less reclaimable slab + sock.
+        assert_eq!(u.other_mb, 1536 + 200 + 615 + 20);
+        assert_eq!(
+            u.orphans,
+            [("giverny-run-scale343-999999999".to_string(), 1024)]
+        );
+        let split = u.slice.unwrap();
+        assert_eq!(
+            split.describe(),
+            "2.3G held (anon 1.5G, shmem 200M, kernel 615M, sock 20M) of 16G in the slice; \
+             comes back: cache 3.8G, reclaimable slab 9.8G"
+        );
+        let mut c = cap();
+        c.mem_use = u;
+        let g = Ledger::default().claim(&c, "s", "spx", Some("inbar"), &req(4), T0);
+        assert!(matches!(g, Outcome::Granted(_)), "{g:?}");
+        let shown = report(&Ledger::default(), &c, T0, &|_, _| None);
+        assert!(
+            shown.contains("1.3G for the claudes, 1G in orphaned runs,"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("orphans   giverny-run-scale343-999999999 1G — their `run` is gone"),
+            "{shown}"
+        );
+        // Counted the old way (all but the page cache), it queued.
+        c.mem_use.other_mb = (mb(16 * 1024) - mb(4096)) >> 20;
+        let q = Ledger::default().claim(&c, "s", "spx", Some("inbar"), &req(4), T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+        // An old kernel without `kernel` sums its parts.
+        std::fs::write(
+            slice.join("memory.stat"),
+            format!(
+                "anon {}\nkernel_stack {}\npagetables {}\nslab_reclaimable {}\nslab_unreclaimable {}\n",
+                mb(1024),
+                mb(40),
+                mb(60),
+                mb(8192),
+                mb(500),
+            ),
+        )
+        .unwrap();
+        assert_eq!(held_mb(&slice), Some(1024 + 600));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
