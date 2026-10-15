@@ -769,11 +769,12 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
+        // The section's colour, as its rows' marks are.
         if needs > 0 {
             ui.label(
                 egui::RichText::new(format!("{needs}⚑"))
                     .font(FontId::monospace(9.5))
-                    .color(c.amber),
+                    .color(c.accent),
             );
         }
     });
@@ -795,7 +796,9 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
             }
             JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
-            JobState::Blocked => ("⚑".into(), c.amber),
+            // The section's colour, as its working and finished marks are:
+            // the tab rows' flags no longer wear amber either.
+            JobState::Blocked => ("⚑".into(), c.accent),
             JobState::Done => ("✓".into(), c.accent),
             JobState::Unknown => ("·".into(), dim),
         };
@@ -981,63 +984,34 @@ fn category_header(
         }
     });
 
+    // The fold triangle wears the group's colour, as its name and badges
+    // do: a repository group's is its own hashed colour.
     let tri = if cat.collapsed { "▸" } else { "▾" };
     p.text(
         Pos2::new(rect.min.x + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
         tri,
         FontId::monospace(10.0),
-        dim,
-    );
-    // Right after the fold triangle: no dot between them, the name's own
-    // colour is the category's.
-    p.text(
-        Pos2::new(rect.min.x + 20.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        cat.name.to_uppercase(),
-        FontId::monospace(11.5),
         cat.color,
     );
-    // Right-aligned summary: attention flags, working count, tab count.
-    let mut badge_x = rect.max.x - 26.0;
+    let name_end = header_badges(&p, rect.center().y, rect.max.x - 26.0, cat, dim);
+    // The name, cut to what fits before them (the rail is monospace), right
+    // after the fold triangle: no dot between them, the name's own colour is
+    // the category's.
+    let name_font = FontId::monospace(11.5);
+    let char_w = ui
+        .ctx()
+        .fonts_mut(|f| f.glyph_width(&name_font, 'M'))
+        .max(1.0);
+    let name_x = rect.min.x + 20.0;
+    let char_budget = ((name_end - 6.0 - name_x) / char_w).max(4.0) as usize;
     p.text(
-        Pos2::new(badge_x, rect.center().y),
-        Align2::RIGHT_CENTER,
-        format!("{}", cat.count),
-        FontId::monospace(10.0),
-        dim,
+        Pos2::new(name_x, rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate_chars(&cat.name.to_uppercase(), char_budget),
+        name_font,
+        cat.color,
     );
-    badge_x -= 20.0;
-    if cat.busy > 0 {
-        // Off, the spinner's place stays blank and the count keeps its spot;
-        // a calm ring holds still.
-        busy(
-            ui,
-            &p,
-            rect,
-            Pos2::new(badge_x, rect.center().y),
-            cat.color,
-            BusyMark::of(&app.cfg.rail),
-        );
-        p.text(
-            Pos2::new(badge_x - 8.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            format!("{}", cat.busy),
-            FontId::monospace(10.0),
-            cat.color,
-        );
-        badge_x -= 28.0;
-    }
-    if cat.needs > 0 {
-        flag(&p, Pos2::new(badge_x - 3.0, rect.center().y), c.amber);
-        p.text(
-            Pos2::new(badge_x - 9.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            format!("{}", cat.needs),
-            FontId::monospace(10.0),
-            c.amber,
-        );
-    }
 
     // "+" new-tab zone at the right edge.
     let plus_rect = Rect::from_min_size(
@@ -1086,6 +1060,66 @@ fn category_header(
     }
     rect
 }
+
+/// A group header's right-aligned summary, right to left from `badge_x`:
+/// its tab count, then **one** mark: the flag and how many
+/// tabs want you if any do, else the dot and how many work if any do,
+/// else nothing. Wanting you outranks working, and two marks side by side
+/// were more than a header line says at a glance. Returns where the name
+/// has to end, left of the leftmost badge, so it takes the room a missing
+/// mark leaves.
+///
+/// Every mark is the group's colour: the flag
+/// and its count were amber, which matched nothing else in the header. The
+/// working mark is a steady dot, whatever `rail.calm_busy` and
+/// `rail.animate` say: the tab rows under it already show *which* tab
+/// works and how, so the header only has to say *that* something does,
+/// and a still mark there asks for no frame of its own (#43).
+fn header_badges(
+    p: &egui::Painter,
+    y: f32,
+    mut badge_x: f32,
+    cat: &GroupData,
+    dim: Color32,
+) -> f32 {
+    let digits = |n: usize| n.to_string().len() as f32;
+    p.text(
+        Pos2::new(badge_x, y),
+        Align2::RIGHT_CENTER,
+        format!("{}", cat.count),
+        FontId::monospace(10.0),
+        dim,
+    );
+    let name_end = badge_x - 6.0 * digits(cat.count);
+    badge_x -= 20.0;
+    if cat.needs > 0 {
+        flag(p, Pos2::new(badge_x - 3.0, y), cat.color);
+        p.text(
+            Pos2::new(badge_x - 9.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{}", cat.needs),
+            FontId::monospace(10.0),
+            cat.color,
+        );
+        badge_x - 9.0 - 6.0 * digits(cat.needs)
+    } else if cat.busy > 0 {
+        p.circle_filled(Pos2::new(badge_x, y), HEADER_DOT_R, cat.color);
+        p.text(
+            Pos2::new(badge_x - 8.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{}", cat.busy),
+            FontId::monospace(10.0),
+            cat.color,
+        );
+        badge_x - 8.0 - 6.0 * digits(cat.busy)
+    } else {
+        name_end
+    }
+}
+
+/// The header's working dot: filled, a touch inside the calm ring's
+/// [`RING_R`] so the two read as one size beside each other.
+const HEADER_DOT_R: f32 = 3.5;
 
 /// "+ add category": the row under the last category that adds one, drawn
 /// as a ghost of [`category_header`] rather than a framed button that looked
@@ -2305,6 +2339,87 @@ mod tests {
             assert_eq!(d.fill, faded, "dot {i}");
             assert_eq!(d.radius, 1.4);
             assert_eq!(d.center.x, 5.0 + (i as f32 - 1.0) * 4.0);
+        }
+    }
+
+    /// A group header's badges are all its colour, it shows one mark at
+    /// most, the flag outranking the dot, and its working mark is a still,
+    /// filled dot that asks for no frame, animating rail or not (#43). The
+    /// name ends left of whichever mark is there.
+    #[test]
+    fn a_header_marks_in_its_colour_and_holds_still() {
+        let group = |busy, needs| GroupData {
+            key: GroupKey::Repo(None),
+            category: CategoryId(0),
+            cwd: None,
+            name: "work".into(),
+            color: Color32::RED,
+            collapsed: true,
+            count: 3,
+            busy,
+            needs,
+            rows: Vec::new(),
+        };
+        // (busy, needs) -> (dots, flag, where the name ends): the count's
+        // one digit ends 6 left of 200, a mark's slot starts 20 left of it.
+        let cases = [
+            ((2, 1), (0, true, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((0, 1), (0, true, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((2, 0), (1, false, 200.0 - 20.0 - 8.0 - 6.0)),
+            ((0, 0), (0, false, 200.0 - 6.0)),
+        ];
+        let ctx = egui::Context::default();
+        for ((busy, needs), (want_dots, want_flag, want_end)) in cases {
+            let cat = group(busy, needs);
+            for animate in [true, false] {
+                let mut out = None;
+                let mut name_end = 0.0;
+                for _ in 0..3 {
+                    out = Some(ctx.run_ui(egui::RawInput::default(), |ui| {
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+                        name_end = header_badges(ui.painter(), 10.0, 200.0, &cat, Color32::GRAY);
+                    }));
+                }
+                let out = out.unwrap();
+                let case = format!("busy {busy}, needs {needs}, animate {animate}");
+                assert_eq!(
+                    out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    std::time::Duration::MAX,
+                    "a header woke the window ({case})"
+                );
+                assert_eq!(name_end, want_end, "{case}");
+                let shapes: Vec<egui::Shape> = out.shapes.into_iter().map(|c| c.shape).collect();
+                let dots: Vec<_> = shapes
+                    .iter()
+                    .filter_map(|s| match s {
+                        egui::Shape::Circle(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(dots.len(), want_dots, "{case}: {shapes:?}");
+                for d in dots {
+                    assert_eq!(d.radius, HEADER_DOT_R);
+                    assert_eq!(d.fill, Color32::RED, "filled, in the group's colour");
+                }
+                // The flag: its staff and its pennant, neither amber.
+                for s in &shapes {
+                    match s {
+                        egui::Shape::LineSegment { stroke, .. } => {
+                            assert_eq!(stroke.color, Color32::RED, "flag staff")
+                        }
+                        egui::Shape::Path(path) => {
+                            assert_eq!(path.fill, Color32::RED, "pennant")
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    shapes.iter().any(|s| matches!(s, egui::Shape::Path(_))),
+                    want_flag,
+                    "{case}: {shapes:?}"
+                );
+            }
         }
     }
 
