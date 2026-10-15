@@ -322,6 +322,9 @@ struct GroupData {
     count: usize,
     busy: usize,
     needs: usize,
+    /// A tab in it shows the tick, alone or as a badge: something finished
+    /// there while you were elsewhere.
+    unseen: bool,
     rows: Vec<RowData>,
 }
 
@@ -425,6 +428,17 @@ fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     )
 }
 
+/// Whether a group has a finish you have not seen: a row wearing the tick,
+/// alone ([`Mark::Tick`]) or beside what runs after it ([`Mark::badged`]).
+/// Asked of the rows' marks, so the header ticks exactly when a row under
+/// it does — not for a tab not started this run, nor an exited shell.
+fn ticks(rows: &[RowData]) -> bool {
+    rows.iter().any(|r| {
+        let mark = Mark::of(r);
+        mark == Mark::Tick || mark.badged(r)
+    })
+}
+
 /// A repository always gets the same colour, whichever order the groups come
 /// out in and whichever machine it is on.
 fn repo_color(chrome: &crate::chrome::Chrome, path: Option<&Path>) -> Color32 {
@@ -464,6 +478,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                     count,
                     busy,
                     needs,
+                    unseen: ticks(&rows),
                     rows,
                 }
             })
@@ -517,6 +532,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         count,
                         busy,
                         needs,
+                        unseen: ticks(&rows),
                         rows,
                     }
                 })
@@ -1069,6 +1085,13 @@ fn category_header(
 /// has to end, left of the leftmost badge, so it takes the room a missing
 /// mark leaves.
 ///
+/// A finish you have not seen in the group ([`GroupData::unseen`]) adds
+/// the tick a tab row wears as a badge: left of the dot and its count, so
+/// the dot keeps its place, or alone in the dot's place when nothing
+/// works. Not beside the flag, which wins as it does on a row: what you
+/// owe matters more than what you missed. The tick has no count; the rows
+/// say which tabs it is.
+///
 /// Every mark is the group's colour: the flag
 /// and its count were amber, which matched nothing else in the header. The
 /// working mark is a steady dot, whatever `rail.calm_busy` and
@@ -1101,8 +1124,10 @@ fn header_badges(
             FontId::monospace(10.0),
             cat.color,
         );
-        badge_x - 9.0 - 6.0 * digits(cat.needs)
-    } else if cat.busy > 0 {
+        return badge_x - 9.0 - 6.0 * digits(cat.needs);
+    }
+    // Where the tick would sit, and what is left of it before then.
+    let (tick_x, end) = if cat.busy > 0 {
         p.circle_filled(Pos2::new(badge_x, y), HEADER_DOT_R, cat.color);
         p.text(
             Pos2::new(badge_x - 8.0, y),
@@ -1111,11 +1136,22 @@ fn header_badges(
             FontId::monospace(10.0),
             cat.color,
         );
-        badge_x - 8.0 - 6.0 * digits(cat.busy)
+        let end = badge_x - 8.0 - 6.0 * digits(cat.busy);
+        (end - HEADER_TICK_GAP, end)
     } else {
-        name_end
+        (badge_x, name_end)
+    };
+    if !cat.unseen {
+        return end;
     }
+    badge_tick(p, Pos2::new(tick_x, y), cat.color);
+    tick_x - HEADER_TICK_GAP
 }
+
+/// From a header tick's centre to the count beside it, and to where the
+/// name may end: half the badge tick's width and enough air that the tick
+/// does not read as part of the dot's count.
+const HEADER_TICK_GAP: f32 = 8.0;
 
 /// The header's working dot: filled, a touch inside the calm ring's
 /// [`RING_R`] so the two read as one size beside each other.
@@ -2344,11 +2380,13 @@ mod tests {
 
     /// A group header's badges are all its colour, it shows one mark at
     /// most, the flag outranking the dot, and its working mark is a still,
-    /// filled dot that asks for no frame, animating rail or not (#43). The
-    /// name ends left of whichever mark is there.
+    /// filled dot that asks for no frame, animating rail or not (#43). A
+    /// finish unseen in it adds the badge tick, left of the dot or alone in
+    /// its place, never beside the flag. The name ends left of whatever is
+    /// there.
     #[test]
     fn a_header_marks_in_its_colour_and_holds_still() {
-        let group = |busy, needs| GroupData {
+        let group = |busy, needs, unseen| GroupData {
             key: GroupKey::Repo(None),
             category: CategoryId(0),
             cwd: None,
@@ -2358,19 +2396,27 @@ mod tests {
             count: 3,
             busy,
             needs,
+            unseen,
             rows: Vec::new(),
         };
-        // (busy, needs) -> (dots, flag, where the name ends): the count's
-        // one digit ends 6 left of 200, a mark's slot starts 20 left of it.
+        // (busy, needs, unseen) -> (dots, flag, tick, where the name ends):
+        // the count's one digit ends 6 left of 200, a mark's slot starts 20
+        // left of it, and a tick takes 8 either side of its centre.
         let cases = [
-            ((2, 1), (0, true, 200.0 - 20.0 - 9.0 - 6.0)),
-            ((0, 1), (0, true, 200.0 - 20.0 - 9.0 - 6.0)),
-            ((2, 0), (1, false, 200.0 - 20.0 - 8.0 - 6.0)),
-            ((0, 0), (0, false, 200.0 - 6.0)),
+            ((2, 1, false), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((0, 1, false), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((2, 1, true), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((2, 0, false), (1, false, false, 200.0 - 20.0 - 8.0 - 6.0)),
+            (
+                (2, 0, true),
+                (1, false, true, 200.0 - 20.0 - 8.0 - 6.0 - 8.0 - 8.0),
+            ),
+            ((0, 0, false), (0, false, false, 200.0 - 6.0)),
+            ((0, 0, true), (0, false, true, 200.0 - 20.0 - 8.0)),
         ];
         let ctx = egui::Context::default();
-        for ((busy, needs), (want_dots, want_flag, want_end)) in cases {
-            let cat = group(busy, needs);
+        for ((busy, needs, unseen), (want_dots, want_flag, want_tick, want_end)) in cases {
+            let cat = group(busy, needs, unseen);
             for animate in [true, false] {
                 let mut out = None;
                 let mut name_end = 0.0;
@@ -2382,7 +2428,8 @@ mod tests {
                     }));
                 }
                 let out = out.unwrap();
-                let case = format!("busy {busy}, needs {needs}, animate {animate}");
+                let case =
+                    format!("busy {busy}, needs {needs}, unseen {unseen}, animate {animate}");
                 assert_eq!(
                     out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
                     std::time::Duration::MAX,
@@ -2419,8 +2466,44 @@ mod tests {
                     want_flag,
                     "{case}: {shapes:?}"
                 );
+                // The badge tick: two strokes as thin as a row's badge.
+                let tick_strokes = shapes
+                    .iter()
+                    .filter(|s| {
+                        matches!(s, egui::Shape::LineSegment { stroke, .. } if stroke.width == 1.5)
+                    })
+                    .count();
+                assert_eq!(tick_strokes, if want_tick { 2 } else { 0 }, "{case}");
             }
         }
+    }
+
+    /// A header ticks exactly when a row under it does: a finish unseen
+    /// alone or beside what runs after it, but not on a tab not started
+    /// this run, nor on an exited shell, nor for what you have seen.
+    #[test]
+    fn a_header_ticks_when_a_row_does() {
+        let unseen = |mut r: RowData| {
+            r.unseen = true;
+            r
+        };
+        assert!(ticks(&[row(ClaudeState::DoneUnseen)]));
+        assert!(ticks(&[
+            row(ClaudeState::Idle),
+            unseen(row(ClaudeState::Busy))
+        ]));
+        assert!(ticks(&[unseen(row(ClaudeState::None))]));
+        assert!(!ticks(&[row(ClaudeState::Idle), row(ClaudeState::Busy)]));
+        let pending = RowData {
+            started: false,
+            ..row(ClaudeState::DoneUnseen)
+        };
+        assert!(!ticks(&[pending]));
+        let exited = RowData {
+            exited: true,
+            ..unseen(row(ClaudeState::None))
+        };
+        assert!(!ticks(&[exited]));
     }
 
     /// A row in `claude` state, started, live, in no background shell.
