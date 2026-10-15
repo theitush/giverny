@@ -121,6 +121,10 @@ pub struct DefaultLease {
     /// (giverny#387).
     pub cpu_cores: u32,
     pub ram: crate::limits::Mem,
+    /// Minutes a grant made on another session's ledger call waits for its
+    /// own manager to take it up (`claim`, `start` or `run`) before it
+    /// lapses and the queue moves past it (giverny#429).
+    pub uncollected_min: u64,
 }
 
 impl Default for DefaultLease {
@@ -128,6 +132,7 @@ impl Default for DefaultLease {
         DefaultLease {
             cpu_cores: 3,
             ram: crate::limits::Mem::gb(3),
+            uncollected_min: 10,
         }
     }
 }
@@ -146,6 +151,7 @@ impl DefaultLease {
             .map(|l| DefaultLease {
                 cpu_cores: l.cpu_cores.max(1),
                 ram: l.ram,
+                uncollected_min: l.uncollected_min.max(1),
             })
             .unwrap_or_default()
     }
@@ -998,7 +1004,8 @@ mod tests {
             DefaultLease::from_config_str(set),
             DefaultLease {
                 cpu_cores: 2,
-                ram: Mem(1536)
+                ram: Mem(1536),
+                uncollected_min: 10,
             }
         );
         // A bare number is GiB, as everywhere; one key alone keeps the other.

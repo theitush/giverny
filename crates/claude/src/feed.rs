@@ -258,6 +258,11 @@ pub struct RowLease {
     /// What it is short of, as of its last claim (`cpu` — the CPU was
     /// busy — `ram`, `gpu`, `slot <name>`); empty when not known.
     pub short: Vec<String>,
+    /// Granted on another session's call, not yet taken up by its manager
+    /// (giverny#429).
+    pub uncollected: bool,
+    /// Queued again after such a grant lapsed untaken: waits for its manager.
+    pub lapsed: bool,
 }
 
 fn parse_lease(v: &Value) -> Option<RowLease> {
@@ -309,6 +314,8 @@ fn parse_lease(v: &Value) -> Option<RowLease> {
         position: u64_field(l, "position"),
         behind: str_field(l, "behind"),
         short: strings("short"),
+        uncollected: l.get("uncollected").and_then(Value::as_bool) == Some(true),
+        lapsed: l.get("lapsed").and_then(Value::as_bool) == Some(true),
     })
 }
 

@@ -340,7 +340,7 @@ pub fn beat(ledger: &Path, feed_dir: Option<&Path>, session: &str, now: u64) -> 
             }
         }
     }
-    let _ = resources::heartbeat(ledger, feed_dir, session, now);
+    let _ = resources::heartbeat(ledger, feed_dir, session, now, None);
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

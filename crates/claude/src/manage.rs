@@ -1814,7 +1814,14 @@ pub fn run_in_code(
     let ledger = resources::ledger_path(dir);
     // Every command from a session keeps its leases alive.
     if *cmd != Cmd::Path
-        && let Err(e) = resources::heartbeat(&ledger, Some(dir), session, now)
+        && let Err(e) = resources::heartbeat(&ledger, Some(dir), session, now, cap)
+    {
+        eprintln!("giverny manage: {e}");
+    }
+    // Its manager starting or running a task takes up a grant the queue
+    // made for it on another session's call (giverny#429).
+    if let Cmd::Start(task) | Cmd::Run(task) = cmd
+        && let Err(e) = resources::collect_at(&ledger, session, task, now)
     {
         eprintln!("giverny manage: {e}");
     }
@@ -1824,7 +1831,7 @@ pub fn run_in_code(
             return crate::manage_run::run(dir, &ledger, session, task, flags, cap);
         }
         Cmd::Release(task) => {
-            let gone = resources::release_at(&ledger, session, task, now)?;
+            let gone = resources::release_at(&ledger, Some(dir), session, task, now, cap)?;
             resources::annotate_row(dir, session, task, None);
             return Ok((
                 match gone {
@@ -1862,8 +1869,10 @@ pub fn run_in_code(
             };
             let eta = |s: &str, t: &str| resources::eta_left_s(dir, s, t, now);
             let peaks = Peaks::load(dir);
+            let left = |s: &str, t: &str| resources::eta_or_estimate_s(dir, s, t, now);
             let out = resources::with_ledger(&ledger, now, |l| {
                 peaks.fill(l);
+                l.advance(&cap, now, &left, None);
                 resources::report(l, &cap, now, &eta)
             })?;
             return Ok((out, 0));
@@ -1876,7 +1885,7 @@ pub fn run_in_code(
         // not be changed (none in this manager session, another writer's feed).
         Err(e) => {
             if let Cmd::Land(task) | Cmd::Drop(task) = cmd
-                && let Some(l) = resources::release_at(&ledger, session, task, now)?
+                && let Some(l) = resources::release_at(&ledger, Some(dir), session, task, now, cap)?
             {
                 return Err(format!("{e}; released {}", l.describe()));
             }
@@ -1893,7 +1902,7 @@ pub fn run_in_code(
         free.push(task.clone());
     }
     for task in &free {
-        if let Some(l) = resources::release_at(&ledger, session, task, now)? {
+        if let Some(l) = resources::release_at(&ledger, Some(dir), session, task, now, cap)? {
             msg = if free.len() > 1 {
                 format!("{msg}; released {task}: {}", l.describe())
             } else {
@@ -3483,6 +3492,7 @@ mod tests {
                 slice_m: Some(0),
                 ..Default::default()
             },
+            live_sessions: None,
         }
     }
 
