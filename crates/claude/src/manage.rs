@@ -176,6 +176,13 @@ pub enum Cmd {
     Accuracy,
 }
 
+impl Cmd {
+    /// Does it change a feed, the ledger or an inbox (all but the looks)?
+    pub fn changes(&self) -> bool {
+        !matches!(self, Cmd::Show | Cmd::Path | Cmd::Accuracy | Cmd::Resources)
+    }
+}
+
 /// The flags any command may carry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Flags {
@@ -1822,7 +1829,10 @@ pub fn run_in_code(
             return Ok((
                 match gone {
                     Some(l) => format!("released {task}: {}", l.describe()),
-                    None => format!("{task} held no lease"),
+                    None => format!(
+                        "{task} held no lease{}",
+                        held_elsewhere(&ledger, session, task, now)
+                    ),
                 },
                 0,
             ));
@@ -1892,6 +1902,27 @@ pub fn run_in_code(
         }
     }
     Ok((msg, 0))
+}
+
+/// `release` of a task this session holds no lease for, which another
+/// session does: whose it is and how to ask for it (giverny#415). A release
+/// only ever gives back the caller's own.
+fn held_elsewhere(ledger: &Path, session: &str, task: &str, now: u64) -> String {
+    let Some(l) = crate::manage_inbox::read_ledger(ledger, now) else {
+        return String::new();
+    };
+    match l
+        .leases
+        .iter()
+        .find(|x| x.task == task && x.session != session)
+    {
+        Some(x) => format!(
+            " of this session's; another session ({}) holds {task}'s, and only it can \
+             give it back: `giverny-manage ask {task} \"<what you need and why>\"`",
+            x.session.get(..8).unwrap_or(&x.session)
+        ),
+        None => String::new(),
+    }
 }
 
 /// `claim`: ask the ledger, and copy the answer onto the task's feed row.
@@ -2544,6 +2575,20 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         );
         return 2;
     };
+    // Another live session's rows and leases are its own (giverny#415):
+    // `--session` speaks as it only to read.
+    if let Some(mine) = std::env::var(SESSION_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && *s != session)
+        && cmd.changes()
+    {
+        let w = crate::reach_guard::System::new(feed::feed_dir());
+        if let Some(why) = crate::reach_guard::speak_as(&session, &w.me(&mine), &w) {
+            eprintln!("giverny manage: {why}");
+            return 1;
+        }
+    }
     let now = now_ms();
     match run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None) {
         Ok((msg, _)) if cmd == Cmd::ClearDone => {
@@ -3511,6 +3556,74 @@ mod tests {
             "t2 held no lease"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#415: every ledger and row command is the caller's own
+    /// session's: another's same-named task is never touched, and a release
+    /// of it says whose it is and how to ask.
+    #[test]
+    fn a_session_never_releases_or_lands_another_sessions_task() {
+        let dir = scratch("reach");
+        run_as(&dir, "sess-a", "start scale343 --eta 60", T0);
+        let (msg, _) = run_as(&dir, "sess-a", "claim scale343 --ram 6G", T0);
+        assert!(msg.starts_with("granted"), "{msg}");
+        let said = run_as(&dir, "sess-b", "release scale343", T0 + MIN).0;
+        assert!(
+            said.starts_with("scale343 held no lease of this session's"),
+            "{said}"
+        );
+        assert!(said.contains("another session (sess-a) holds"), "{said}");
+        assert!(said.contains("`giverny-manage ask scale343 "), "{said}");
+        for line in [
+            "land scale343",
+            "drop scale343",
+            "pause scale343",
+            "eta scale343 5",
+        ] {
+            let _ = run_line(&dir, "sess-b", line, T0 + MIN);
+        }
+        let l = crate::manage_inbox::read_ledger(&resources::ledger_path(&dir), T0 + MIN).unwrap();
+        assert!(
+            l.leases
+                .iter()
+                .any(|x| x.session == "sess-a" && x.task == "scale343"),
+            "a's lease stands"
+        );
+        let f = feed::read(&feed::feed_path(&dir, "sess-a")).unwrap();
+        assert_eq!(f.rows[0].stage(), feed::Stage::Running, "a's row stands");
+        // Its own release says nothing of anyone else.
+        assert!(
+            run_as(&dir, "sess-a", "release scale343", T0 + MIN)
+                .0
+                .starts_with("released")
+        );
+        assert_eq!(
+            run_as(&dir, "sess-a", "release scale343", T0 + MIN).0,
+            "scale343 held no lease"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_looks_are_free_to_speak_as_another_session() {
+        for (line, changes) in [
+            ("show", false),
+            ("path", false),
+            ("resources", false),
+            ("accuracy", false),
+            ("land t", true),
+            ("release t", true),
+            ("claim t", true),
+            ("eta t 5", true),
+            ("hold t --why x", true),
+            ("ask t hi", true),
+        ] {
+            assert_eq!(
+                parse_args(&args(line)).unwrap().0.changes(),
+                changes,
+                "{line}"
+            );
+        }
     }
 
     /// giverny#281: a claim counts at its kind's measured peak, so 3G
