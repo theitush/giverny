@@ -28,7 +28,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `codex.enabled` | `true` | Show detected Codex accounts and usage automatically. Turn off to disable integration. |
 | `codex.executable` | `"codex"` | Executable name on PATH, or an explicit path. |
 | `codex.home` | `""` | Empty uses CODEX_HOME, then the default .codex directory. |
-| `codex.restore` | `"auto"` | Auto restores when ownership is known; prompt asks first; off skips restore. One of: auto, prompt, off. |
+| `codex.restore` | `"auto"` | Auto reconnects saved conversations on tab focus; prompt asks first; off skips restore. One of: auto, prompt, off. |
 | `codex.usage_refresh_minutes` | `10` | Minutes between Codex usage requests. Zero means manual refresh only. |
 | `claude.auto_mode` | `false` | Every new Claude session starts in auto mode instead of asking for each permission. |
 | `claude.skip_resume_summary` | `false` | Skip Claude Code's offer to resume from a summary, and resume the full session. |

@@ -208,9 +208,10 @@ pub fn is_codex_command(command: &str) -> bool {
     };
     match name(first).as_str() {
         "codex" | "codex.exe" | "codex.cmd" => true,
-        "node" | "node.exe" => words
-            .get(1)
-            .is_some_and(|s| s.replace('\\', "/").ends_with("/codex/bin/codex.js")),
+        "node" | "node.exe" => words.get(1).is_some_and(|s| {
+            matches!(name(s).as_str(), "codex" | "codex.cmd")
+                || s.replace('\\', "/").ends_with("/codex/bin/codex.js")
+        }),
         _ => false,
     }
 }
@@ -266,6 +267,9 @@ mod tests {
         assert!(is_codex_command(
             "node /usr/lib/node_modules/@openai/codex/bin/codex.js"
         ));
+        assert!(is_codex_command("node /portable/node/bin/codex"));
+        assert!(is_codex_command("node.exe C:\\node\\codex.cmd"));
+        assert!(!is_codex_command("node /project/codex-helper.js"));
         assert!(!is_codex_command("echo codex"));
     }
 }

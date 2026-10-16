@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Codex tabs automatically reconnect to saved conversations even when the
+  shared daemon retains a loaded thread or its observer connection is unavailable.
+
 - Ctrl+click opens the complete URL across terminal soft wraps, including
   when part of the link is in scrollback. Real newlines keep targets separate.
 

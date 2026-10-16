@@ -2048,9 +2048,15 @@ fn codex_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
         let title = app.ws.tab(ready.id).map(|t| t.title()).unwrap_or("tab");
         ui.horizontal(|ui| {
             ui.add_space(6.0);
-            if ui.small_button(egui::RichText::new(format!("resume · {}", truncate_chars(title, 20)))
-                .font(FontId::monospace(9.5)).color(c.dim))
-                .on_hover_text("Resume this saved Codex conversation. Automatic restore waits when ownership cannot be verified.").clicked() {
+            if ui
+                .small_button(
+                    egui::RichText::new(format!("resume · {}", truncate_chars(title, 20)))
+                        .font(FontId::monospace(9.5))
+                        .color(c.dim),
+                )
+                .on_hover_text("Resume this saved Codex conversation.")
+                .clicked()
+            {
                 actions.push(Action::ConfirmCodexResume(ready.id));
             }
         });

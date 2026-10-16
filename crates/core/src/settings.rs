@@ -491,7 +491,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "codex.restore",
         label: "restore Codex conversations",
         section: Section::Codex,
-        doc: "Auto restores when ownership is known; prompt asks first; off skips restore.",
+        doc: "Auto reconnects saved conversations on tab focus; prompt asks first; off skips restore.",
         note: &[],
         needs_restart: false,
         kind: Kind::Choice {
