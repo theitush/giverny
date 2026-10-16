@@ -47,7 +47,8 @@ impl SessionEntry {
     /// Claude Code's own session list counts this as "working", which is a
     /// fair answer to "is anything happening in there" and the wrong one for
     /// a spinner: the agent is waiting on *you*, often with a question, while
-    /// something polls in the background. Marked, not animated.
+    /// something polls in the background. Marked, never as busy: a slow
+    /// colour drifting through three dots in the rail.
     pub fn background_shell(&self) -> bool {
         self.status == "shell"
     }

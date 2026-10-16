@@ -621,6 +621,17 @@ mod tests {
             ws.tab(id).unwrap().display_title(&titles),
             "yoz@box:~/Dev/bobo"
         );
+
+        // Nor is a Claude Code glyph you typed into a name.
+        let titles = crate::config::TitlesConfig {
+            strip_claude_glyph: true,
+            ..titles
+        };
+        ws.tab_mut(id).unwrap().auto_title = "✳ Fix the parser".into();
+        ws.tab_mut(id).unwrap().custom_title = None;
+        assert_eq!(ws.tab(id).unwrap().display_title(&titles), "Fix the parser");
+        ws.tab_mut(id).unwrap().custom_title = Some("✳ mine".into());
+        assert_eq!(ws.tab(id).unwrap().display_title(&titles), "✳ mine");
     }
 
     #[test]

@@ -33,11 +33,23 @@ fn anim_time() -> f64 {
     giverny_term::pace::anim_time()
 }
 
+/// Whether the rail draws its moving marks (`rail.animate`). Set once
+/// a frame by [`show`]. Off, no spinner, ring or pulse is drawn at all (their
+/// place stays blank, so nothing beside them moves), and nothing here asks
+/// for a frame.
+fn animating(ui: &Ui) -> bool {
+    ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new(ANIMATE_ID)))
+        .unwrap_or(true)
+}
+
+const ANIMATE_ID: &str = "rail-animate";
+
 /// Keep an animation drawn at `rect` moving: wake for the clock's next tick,
 /// but only while it is on screen. A row scrolled out of the rail, or a
 /// spinner nobody can see, costs nothing.
 fn keep_animating(ui: &Ui, rect: Rect) {
-    if !ui.is_rect_visible(rect) {
+    if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
     let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
@@ -54,9 +66,14 @@ fn keep_animating(ui: &Ui, rect: Rect) {
 /// (#70). On a software renderer every frame is CPU, so they keep to the
 /// shared four-a-second clock at half a turn a second, eight positions to a
 /// turn (#43).
-fn spin(ui: &Ui, rect: Rect) -> f64 {
+///
+/// `None` with `rail.animate` off: then there is no spinner to draw.
+fn spin(ui: &Ui, rect: Rect) -> Option<f64> {
+    if !animating(ui) {
+        return None;
+    }
     keep_spinning(ui, rect);
-    spin_turns(ui)
+    Some(spin_turns(ui))
 }
 
 /// [`spin`]'s angle alone, for a spinner whose rect is not known yet.
@@ -73,7 +90,7 @@ fn keep_spinning(ui: &Ui, rect: Rect) {
     if !giverny_term::pace::cheap_frames() {
         return keep_animating(ui, rect);
     }
-    if !ui.is_rect_visible(rect) {
+    if !animating(ui) || !ui.is_rect_visible(rect) {
         return;
     }
     let (focused, predicted_dt) = ui.input(|i| (i.focused, i.predicted_dt));
@@ -88,6 +105,158 @@ fn keep_spinning(ui: &Ui, rect: Rect) {
 fn breath(time: f64) -> f32 {
     ((time * std::f64::consts::PI).sin() * 0.35 + 0.65).clamp(0.0, 1.0) as f32
 }
+
+/// How a working tab is marked: the spinner, or with `rail.calm_busy` a dot
+/// that breathes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyMark {
+    Spinner,
+    Breath,
+}
+
+impl BusyMark {
+    fn of(cfg: &giverny_core::config::RailConfig) -> Self {
+        if cfg.calm_busy {
+            BusyMark::Breath
+        } else {
+            BusyMark::Spinner
+        }
+    }
+}
+
+/// How far in the calm mark's breath is, 0 out to 1 in: one slow breath
+/// every three seconds, against the amber flag's two (see [`breath`]), so
+/// "working" and "wants you" never fall into step. `None` is a rail that
+/// does not move: the dot holds still, full.
+fn calm_breath(time: Option<f64>) -> f32 {
+    const PERIOD: f64 = 3.0;
+    match time {
+        Some(t) => (0.5 - 0.5 * (t * std::f64::consts::TAU / PERIOD).cos()) as f32,
+        None => 1.0,
+    }
+}
+
+/// A working tab's mark at `at`, kept moving while `rect` is on screen. With
+/// `rail.animate` off the spinner is left out and the calm ring holds still,
+/// full size.
+fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: BusyMark) {
+    match mark {
+        BusyMark::Spinner => {
+            if let Some(turns) = spin(ui, rect) {
+                spinner(p, at, turns, color);
+            }
+        }
+        BusyMark::Breath => {
+            let time = animating(ui).then(anim_time);
+            if time.is_some() {
+                keep_animating(ui, rect);
+            }
+            calm_ring(p, at, calm_breath(time), color);
+        }
+    }
+}
+
+/// The idle ring's radius: Claude at its prompt, and the size the calm busy
+/// ring breathes up to.
+const RING_R: f32 = 4.0;
+
+/// A plain shell's hollow square, across: at its prompt, exited, and the
+/// size a running command's square breathes up to.
+const SQUARE_SIDE: f32 = 7.0;
+
+/// A hollow ring of `radius` at `at`: Claude at its prompt.
+fn ring(p: &egui::Painter, at: Pos2, radius: f32, color: Color32) {
+    p.circle_stroke(at, radius, Stroke::new(1.4, color));
+}
+
+/// How big a breathing mark is, as a share of its resting size: from about
+/// a device pixel (`floor`) at `breath` 0 up to the whole mark at 1.
+fn breathed(floor: f32, breath: f32) -> f32 {
+    floor + (1.0 - floor) * breath
+}
+
+/// Claude's calm busy mark (`rail.calm_busy`): its idle ring breathing in
+/// size, from a pixel out to the ring and back. Hollow, so it
+/// reads as the ring at work, not a second kind of mark; full size when
+/// `breath` holds at 1, as with `rail.animate` off.
+fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
+    let px = 1.0 / p.pixels_per_point();
+    let radius = RING_R * breathed(px / RING_R, breath);
+    if radius <= px {
+        // Too small for a hollow middle: a pixel.
+        p.circle_filled(at, px, color);
+    } else {
+        ring(p, at, radius, color);
+    }
+}
+
+/// A shell running a command: its hollow square breathing in size, a pixel
+/// up to the square at its prompt and back, on the calm mark's slow breath.
+/// Kept moving on the animation clock while `rect` is on
+/// screen; with `rail.animate` off it holds still, full size.
+fn breathing_square(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) {
+    let time = animating(ui).then(anim_time);
+    if time.is_some() {
+        keep_animating(ui, rect);
+    }
+    let px = 1.0 / p.pixels_per_point();
+    let side = SQUARE_SIDE * breathed(px / SQUARE_SIDE, calm_breath(time));
+    // Two pixels across or less has no hollow middle, and an inside stroke
+    // that fills it all draws nothing: filled, it is the pixel it should be.
+    square(p, at, side, side <= 2.0 * px, color);
+}
+
+/// How lit each of a background shell's three dots is, 0 (dim) to 1 (the
+/// tab's colour), as a colour travels through them left to right: one lap
+/// every 3.75 s, slower than the calm mark's 3 s breath and the amber flag's
+/// 2 s, so "something hums along" never falls into step with "working" or
+/// "wants you". Fifteen animation steps a lap, five from one dot's peak to
+/// the next, so each peak lands on the clock's grid. Each dot's glow spans
+/// two thirds of a lap: it fades up as the one before it fades down, and at
+/// any moment at most two are lit. `None` is a rail that does not move: all
+/// three dim and still, as they were before they moved.
+fn shell_wave(time: Option<f64>) -> [f32; 3] {
+    const LAP: f64 = 3.75;
+    const HALF_WIDTH: f64 = 1.0 / 3.0;
+    let Some(t) = time else {
+        return [0.0; 3];
+    };
+    std::array::from_fn(|i| {
+        let phase = (t / LAP - i as f64 / 3.0).rem_euclid(1.0);
+        let off = phase.min(1.0 - phase);
+        if off >= HALF_WIDTH {
+            0.0
+        } else {
+            (0.5 + 0.5 * (std::f64::consts::PI * off / HALF_WIDTH).cos()) as f32
+        }
+    })
+}
+
+/// A Claude tab's background shell at `at`: three small dots, a colour
+/// moving through them from a faded `color` up to the full one, kept moving
+/// while `rect` is on screen. All in the tab's category colour, like every
+/// other mark: the wave's motion says "humming", the colour
+/// says whose. With `rail.animate` off they hold still and faded, and
+/// nothing asks for a frame.
+fn shell_dots(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) {
+    let time = animating(ui).then(anim_time);
+    if time.is_some() {
+        keep_animating(ui, rect);
+    }
+    let faded = color.gamma_multiply(WAVE_REST);
+    for (i, lit) in shell_wave(time).into_iter().enumerate() {
+        p.circle_filled(
+            at + Vec2::new((i as f32 - 1.0) * 4.0, 0.0),
+            1.4,
+            faded.lerp_to_gamma(color, lit),
+        );
+    }
+}
+
+/// How lit a wave dot is between peaks, as a share of the category colour:
+/// faint enough that the moving peak stands out, enough that the three
+/// still read as the tab's colour and not as gray.
+const WAVE_REST: f32 = 0.35;
 
 fn braille(turns: f64) -> String {
     let step = if giverny_term::pace::cheap_frames() {
@@ -110,12 +279,24 @@ struct RowData {
     /// Its shell has been spawned. A tab restored from a previous run has
     /// none until it is first focused.
     started: bool,
+    /// Started, it comes back as Claude: it recorded a conversation to
+    /// resume, or a `claude --resume` it was last running (what
+    /// `queue_resume` acts on). What tells a not-started Claude tab from a
+    /// not-started shell.
+    resumes_claude: bool,
     color: Color32,
     claude: ClaudeState,
     /// Something Claude started still works — a background shell, or
     /// subagents it handed work to — while Claude itself waits at its
     /// prompt, free to talk.
     background: bool,
+    /// A plain shell with a command in front: seen by the foreground poll,
+    /// or between the shell's OSC 133 `C` and `D`.
+    running: bool,
+    /// Something finished here while you were on another tab and you have
+    /// not looked since: a Claude turn, or a shell's command.
+    /// Outlives Claude's `DoneUnseen`, which a new turn replaces.
+    unseen: bool,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -141,6 +322,9 @@ struct GroupData {
     count: usize,
     busy: usize,
     needs: usize,
+    /// A tab in it shows the tick, alone or as a badge: something finished
+    /// there while you were elsewhere.
+    unseen: bool,
     rows: Vec<RowData>,
 }
 
@@ -209,23 +393,50 @@ fn row_data(
         active: app.ws.active == Some(t.id),
         exited: t.exited,
         started: app.rt.contains_key(&t.id),
+        resumes_claude: t.claude_session.is_some()
+            || t.foreground
+                .as_deref()
+                .and_then(giverny_core::procs::resume_session_of)
+                .is_some(),
         color,
         claude: ct.map(|c| c.state).unwrap_or_default(),
         background: ct.is_some_and(|c| c.working_in_background()),
+        running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
+        unseen: app.unseen_done.contains(&t.id)
+            || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
     }
 }
 
 /// Counts a header carries: how many, how many working, how many want you.
+///
+/// Working is every tab whose mark says something runs — the agent itself
+/// ([`Mark::Busy`]) or what it left humming at its prompt ([`Mark::Wave`]:
+/// subagents, a background shell, seen or unseen). Counting only the busy
+/// state let the header's breathing dot go still while a tab still showed
+/// the wave; it should stop only once nothing in the group
+/// runs, collapsed or not. A tab not started this run has nothing running,
+/// whatever state lingers for it, so it is not counted.
 fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     (
         rows.len(),
         rows.iter()
-            .filter(|r| r.claude == ClaudeState::Busy)
+            .filter(|r| matches!(Mark::of(r), Mark::Busy | Mark::Wave))
             .count(),
         rows.iter()
             .filter(|r| r.claude == ClaudeState::NeedsYou)
             .count(),
     )
+}
+
+/// Whether a group has a finish you have not seen: a row wearing the tick,
+/// alone ([`Mark::Tick`]) or beside what runs after it ([`Mark::badged`]).
+/// Asked of the rows' marks, so the header ticks exactly when a row under
+/// it does — not for a tab not started this run, nor an exited shell.
+fn ticks(rows: &[RowData]) -> bool {
+    rows.iter().any(|r| {
+        let mark = Mark::of(r);
+        mark == Mark::Tick || mark.badged(r)
+    })
 }
 
 /// A repository always gets the same colour, whichever order the groups come
@@ -267,6 +478,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                     count,
                     busy,
                     needs,
+                    unseen: ticks(&rows),
                     rows,
                 }
             })
@@ -320,6 +532,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         count,
                         busy,
                         needs,
+                        unseen: ticks(&rows),
                         rows,
                     }
                 })
@@ -338,6 +551,9 @@ fn repo_name(path: &Path) -> Option<String> {
 pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
     let mut actions = Vec::new();
     app.row_rects.clear();
+    let animate = app.cfg.rail.animate;
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
 
     // Precollect display data so rendering never borrows the workspace.
     let cats = groups(app);
@@ -418,18 +634,11 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                 }
                 ui.add_space(6.0);
             }
-            ui.add_space(4.0);
+            // One more header's height, in the categories' own rhythm: the
+            // next category, not yet named. A repository group is not made
+            // by hand, so the repos view has none.
             if arrangeable {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    if ui
-                        .small_button("+ category")
-                        .on_hover_text("add a category")
-                        .clicked()
-                    {
-                        actions.push(Action::NewCategory);
-                    }
-                });
+                new_category_row(app, ui, &mut actions);
             }
             ui.add_space(8.0);
         });
@@ -576,34 +785,54 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
+        // The section's colour, as its rows' marks are.
         if needs > 0 {
             ui.label(
                 egui::RichText::new(format!("{needs}⚑"))
                     .font(FontId::monospace(9.5))
-                    .color(c.amber),
+                    .color(c.accent),
             );
         }
     });
 
     let turns = spin_turns(ui);
+    let animate = animating(ui);
+    let mark = BusyMark::of(&app.cfg.rail);
     for job in &app.claude.jobs {
+        let working = job.live && job.state == JobState::Working;
         let (glyph, color) = match job.state {
             // Only a *live* worker gets a spinner. A state file that still
             // says "working" after its process died would otherwise spin
             // forever, which is worse than saying nothing.
+            // Off, or calm, its place stays blank: the glyph is drawn
+            // see-through, so the name beside it does not move when either
+            // switch flips. A calm one is drawn over that place.
+            JobState::Working if job.live && (!animate || mark == BusyMark::Breath) => {
+                (braille(turns), Color32::TRANSPARENT)
+            }
             JobState::Working if job.live => (braille(turns), c.accent),
             JobState::Working => ("·".into(), dim),
-            JobState::Blocked => ("⚑".into(), c.amber),
+            // The section's colour, as its working and finished marks are:
+            // the tab rows' flags no longer wear amber either.
+            JobState::Blocked => ("⚑".into(), c.accent),
             JobState::Done => ("✓".into(), c.accent),
             JobState::Unknown => ("·".into(), dim),
         };
         let resp = ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(
+            let glyph = ui.label(
                 egui::RichText::new(glyph)
                     .font(FontId::monospace(11.0))
                     .color(color),
             );
+            if working && mark == BusyMark::Breath {
+                calm_ring(
+                    ui.painter(),
+                    glyph.rect.center(),
+                    calm_breath(animate.then(anim_time)),
+                    c.accent,
+                );
+            }
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new(egui_line(&truncate_chars(&job.name, 22), None))
@@ -639,8 +868,11 @@ fn jobs_section(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut
                 }
             });
         });
-        if job.live && job.state == JobState::Working {
-            keep_spinning(ui, resp.response.rect);
+        if working {
+            match mark {
+                BusyMark::Spinner => keep_spinning(ui, resp.response.rect),
+                BusyMark::Breath => keep_animating(ui, resp.response.rect),
+            }
         }
         let resp = resp.response.interact(Sense::click());
         if resp.hovered() {
@@ -694,9 +926,10 @@ fn category_header(
         && as_category == Some(*id)
     {
         let id = *id;
+        // Its text (4px in from the field's edge) where the name was.
         let edit_rect = Rect::from_min_size(
-            Pos2::new(rect.min.x + 22.0, rect.min.y + 2.0),
-            Vec2::new(width - 30.0, HEADER_H - 4.0),
+            Pos2::new(rect.min.x + 16.0, rect.min.y + 2.0),
+            Vec2::new(width - 24.0, HEADER_H - 4.0),
         );
         let te = ui.put(
             edit_rect,
@@ -767,62 +1000,34 @@ fn category_header(
         }
     });
 
+    // The fold triangle wears the group's colour, as its name and badges
+    // do: a repository group's is its own hashed colour.
     let tri = if cat.collapsed { "▸" } else { "▾" };
     p.text(
         Pos2::new(rect.min.x + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
         tri,
         FontId::monospace(10.0),
-        dim,
-    );
-    p.circle_filled(
-        Pos2::new(rect.min.x + 24.0, rect.center().y),
-        4.0,
         cat.color,
     );
+    let name_end = header_badges(&p, rect.center().y, rect.max.x - 26.0, cat, dim);
+    // The name, cut to what fits before them (the rail is monospace), right
+    // after the fold triangle: no dot between them, the name's own colour is
+    // the category's.
+    let name_font = FontId::monospace(11.5);
+    let char_w = ui
+        .ctx()
+        .fonts_mut(|f| f.glyph_width(&name_font, 'M'))
+        .max(1.0);
+    let name_x = rect.min.x + 20.0;
+    let char_budget = ((name_end - 6.0 - name_x) / char_w).max(4.0) as usize;
     p.text(
-        Pos2::new(rect.min.x + 34.0, rect.center().y),
+        Pos2::new(name_x, rect.center().y),
         Align2::LEFT_CENTER,
-        cat.name.to_uppercase(),
-        FontId::monospace(11.5),
+        truncate_chars(&cat.name.to_uppercase(), char_budget),
+        name_font,
         cat.color,
     );
-    // Right-aligned summary: attention flags, working count, tab count.
-    let mut badge_x = rect.max.x - 26.0;
-    p.text(
-        Pos2::new(badge_x, rect.center().y),
-        Align2::RIGHT_CENTER,
-        format!("{}", cat.count),
-        FontId::monospace(10.0),
-        dim,
-    );
-    badge_x -= 20.0;
-    if cat.busy > 0 {
-        spinner(
-            &p,
-            Pos2::new(badge_x, rect.center().y),
-            spin(ui, rect),
-            cat.color,
-        );
-        p.text(
-            Pos2::new(badge_x - 8.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            format!("{}", cat.busy),
-            FontId::monospace(10.0),
-            cat.color,
-        );
-        badge_x -= 28.0;
-    }
-    if cat.needs > 0 {
-        flag(&p, Pos2::new(badge_x - 3.0, rect.center().y), c.amber);
-        p.text(
-            Pos2::new(badge_x - 9.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            format!("{}", cat.needs),
-            FontId::monospace(10.0),
-            c.amber,
-        );
-    }
 
     // "+" new-tab zone at the right edge.
     let plus_rect = Rect::from_min_size(
@@ -872,6 +1077,137 @@ fn category_header(
     rect
 }
 
+/// A group header's right-aligned summary, right to left from `badge_x`:
+/// its tab count, then **one** mark: the flag and how many
+/// tabs want you if any do, else the dot and how many work if any do,
+/// else nothing. Wanting you outranks working, and two marks side by side
+/// were more than a header line says at a glance. Returns where the name
+/// has to end, left of the leftmost badge, so it takes the room a missing
+/// mark leaves.
+///
+/// A finish you have not seen in the group ([`GroupData::unseen`]) adds
+/// the tick a tab row wears as a badge: left of the dot and its count, so
+/// the dot keeps its place, or alone in the dot's place when nothing
+/// works. Not beside the flag, which wins as it does on a row: what you
+/// owe matters more than what you missed. The tick has no count; the rows
+/// say which tabs it is.
+///
+/// Every mark is the group's colour: the flag
+/// and its count were amber, which matched nothing else in the header. The
+/// working mark is a steady dot, whatever `rail.calm_busy` and
+/// `rail.animate` say: the tab rows under it already show *which* tab
+/// works and how, so the header only has to say *that* something does,
+/// and a still mark there asks for no frame of its own (#43).
+fn header_badges(
+    p: &egui::Painter,
+    y: f32,
+    mut badge_x: f32,
+    cat: &GroupData,
+    dim: Color32,
+) -> f32 {
+    let digits = |n: usize| n.to_string().len() as f32;
+    p.text(
+        Pos2::new(badge_x, y),
+        Align2::RIGHT_CENTER,
+        format!("{}", cat.count),
+        FontId::monospace(10.0),
+        dim,
+    );
+    let name_end = badge_x - 6.0 * digits(cat.count);
+    badge_x -= 20.0;
+    if cat.needs > 0 {
+        flag(p, Pos2::new(badge_x - 3.0, y), cat.color);
+        p.text(
+            Pos2::new(badge_x - 9.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{}", cat.needs),
+            FontId::monospace(10.0),
+            cat.color,
+        );
+        return badge_x - 9.0 - 6.0 * digits(cat.needs);
+    }
+    // Where the tick would sit, and what is left of it before then.
+    let (tick_x, end) = if cat.busy > 0 {
+        p.circle_filled(Pos2::new(badge_x, y), HEADER_DOT_R, cat.color);
+        p.text(
+            Pos2::new(badge_x - 8.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{}", cat.busy),
+            FontId::monospace(10.0),
+            cat.color,
+        );
+        let end = badge_x - 8.0 - 6.0 * digits(cat.busy);
+        (end - HEADER_TICK_GAP, end)
+    } else {
+        (badge_x, name_end)
+    };
+    if !cat.unseen {
+        return end;
+    }
+    badge_tick(p, Pos2::new(tick_x, y), cat.color);
+    tick_x - HEADER_TICK_GAP
+}
+
+/// From a header tick's centre to the count beside it, and to where the
+/// name may end: half the badge tick's width and enough air that the tick
+/// does not read as part of the dot's count.
+const HEADER_TICK_GAP: f32 = 8.0;
+
+/// The header's working dot: filled, a touch inside the calm ring's
+/// [`RING_R`] so the two read as one size beside each other.
+const HEADER_DOT_R: f32 = 3.5;
+
+/// "+ add category": the row under the last category that adds one, drawn
+/// as a ghost of [`category_header`] rather than a framed button that looked
+/// dropped in. The same height, font and places: a `+` where
+/// the fold triangle sits, its words where a name starts. Dim and frameless
+/// at rest; hovered, it takes a tab row's faint highlight and the colour the
+/// new category will wear (the palette's next, as `add_category` picks it),
+/// so the row previews what a click makes. Lower case, unlike the names
+/// above it: it is an offer, not a category.
+fn new_category_row(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let c = app.chrome;
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), HEADER_H), Sense::click());
+    let p = ui.painter_at(rect);
+    // `hovered` and not the pointer's position: a tab or category being
+    // dragged over it is not aimed at it.
+    let hovered = resp.hovered();
+    if hovered {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+        );
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+    }
+    let color = if hovered {
+        c.category(app.ws.categories.len())
+    } else {
+        c.dim
+    };
+    // Centred on the header's fold triangle, which starts 8 in.
+    let tri_font = FontId::monospace(10.0);
+    let tri_w = ui.ctx().fonts_mut(|f| f.glyph_width(&tri_font, '▾'));
+    p.text(
+        Pos2::new(rect.min.x + 8.0 + tri_w / 2.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        "+",
+        FontId::monospace(11.5),
+        color,
+    );
+    p.text(
+        Pos2::new(rect.min.x + 20.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "add category",
+        FontId::monospace(11.5),
+        color,
+    );
+    if resp.clicked() {
+        actions.push(Action::NewCategory);
+    }
+}
+
 /// A ring with a gap, turned `turns` of the way round (see [`spin`]). What
 /// the braille spinner was for, minus the assumption that the font has
 /// braille in it.
@@ -913,15 +1249,159 @@ fn flag(p: &egui::Painter, at: Pos2, color: Color32) {
 
 /// A tick: finished while you were elsewhere.
 fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.8, color);
-    p.line_segment(
-        [at + Vec2::new(-4.5, 0.0), at + Vec2::new(-1.5, 3.5)],
-        stroke,
+    tick_scaled(p, at, 1.0, 1.8, color);
+}
+
+/// How far left of a tab's mark the badge tick sits: clear of the widest
+/// mark beside it (the spinner, the three dots), inside the gutter before
+/// the active-tab bar.
+const BADGE_OFFSET: f32 = 13.0;
+
+/// The tick as a badge beside a mark that is still running:
+/// three quarters the size and a touch thinner, so it reads as a note on
+/// the mark and not a second mark.
+fn badge_tick(p: &egui::Painter, at: Pos2, color: Color32) {
+    tick_scaled(p, at, 0.75, 1.5, color);
+}
+
+/// A tick at `at`, `scale` times the full one, stroked `width` wide.
+fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, color: Color32) {
+    let stroke = Stroke::new(width, color);
+    let at_ = |x: f32, y: f32| at + Vec2::new(x, y) * scale;
+    p.line_segment([at_(-4.5, 0.0), at_(-1.5, 3.5)], stroke);
+    p.line_segment([at_(-1.5, 3.5), at_(4.5, -4.0)], stroke);
+}
+
+/// A plain shell's mark at `at`: a square `side` points
+/// across, filled or hollow. Every Claude mark is round or drawn — spinner,
+/// calm ring, flag, tick, ring, three dots — so a square says "just a
+/// shell" by shape alone, now that colour says the category for both.
+/// Snapped to whole device pixels, edges and all: a square straddling a
+/// pixel boundary smears into a blurred blob at this size, where a circle
+/// only softens.
+fn square(p: &egui::Painter, at: Pos2, side: f32, filled: bool, color: Color32) {
+    let ppp = p.pixels_per_point();
+    let px = (side * ppp).round().max(1.0);
+    let min = Pos2::new(
+        (at.x * ppp - px / 2.0).round() / ppp,
+        (at.y * ppp - px / 2.0).round() / ppp,
     );
-    p.line_segment(
-        [at + Vec2::new(-1.5, 3.5), at + Vec2::new(4.5, -4.0)],
-        stroke,
-    );
+    let rect = Rect::from_min_size(min, Vec2::splat(px / ppp));
+    if filled {
+        p.rect_filled(rect, 0.0, color);
+    } else {
+        // A whole number of pixels, at least one, drawn inside the edge so
+        // the hollow square is exactly as wide as the filled one would be.
+        let width = (1.2 * ppp).round().max(1.0) / ppp;
+        p.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(width, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// A tab's status mark: its shape says what the tab is
+/// doing, its colour which category it is in. Claude's marks are round or
+/// drawn; a plain shell's are square, so the two no longer pass for each
+/// other (an exited shell's ring was an idle Claude's, a live shell's dot
+/// the calm busy one's).
+///
+/// The tick says "finished while you were elsewhere", for both. Alone it is
+/// the whole mark: nothing runs after the finish you have not seen. When
+/// something does — the agent working again, its subagents or background
+/// shell humming on, a shell's next command — that is the mark, and the
+/// tick rides beside it as a badge ([`Mark::badged`]) until you look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// Claude working: the spinner, or with `rail.calm_busy` the idle ring
+    /// breathing in size.
+    Busy,
+    /// Claude wants you: the pulsing flag. It wins over everything, the
+    /// badge too: what you owe it matters more than what you missed.
+    Flag,
+    /// Something finished while you were elsewhere, and nothing runs after
+    /// it: the tick. A Claude turn that ended with its subagents or a
+    /// background shell still running is not done yet, seen or unseen, so
+    /// it wears [`Mark::Wave`] until they end, with the tick beside it
+    /// while unseen. A shell whose command ended
+    /// on another tab ticks the same.
+    Tick,
+    /// Claude idle at its prompt, seen: a hollow ring.
+    Ring,
+    /// Claude at its prompt, free to talk, while something it started
+    /// hums on — a background shell or its subagents: the three-dot wave,
+    /// whether or not you have seen the turn that left them running. The
+    /// agent itself working, which it cannot talk through, is
+    /// [`Mark::Busy`], and wins; it asking for you is [`Mark::Flag`], and
+    /// wins too.
+    Wave,
+    /// A plain shell running a command: the hollow square breathing in
+    /// size, a pixel up to [`Mark::Prompt`]'s and back.
+    Running,
+    /// A plain shell at its prompt, its last command seen: a hollow square,
+    /// as Claude at its prompt is a hollow ring.
+    Prompt,
+    /// A plain shell that has exited: the hollow square in gray, like a
+    /// tab not started — nothing runs there.
+    Exited,
+    /// A tab restored from a previous run whose process has not spawned:
+    /// tiny and gray, a circle when it will come back as Claude, a square
+    /// when it will come back as a shell.
+    NotStarted { claude: bool },
+}
+
+impl Mark {
+    /// The mark `row` wears. A tab that has not started has nothing
+    /// running, so whatever Claude state lingers for it is not shown: the
+    /// gray mark is the whole truth until it is focused.
+    fn of(row: &RowData) -> Mark {
+        if !row.started && !row.exited {
+            return Mark::NotStarted {
+                claude: row.resumes_claude,
+            };
+        }
+        let mark = match row.claude {
+            ClaudeState::Busy => Mark::Busy,
+            ClaudeState::NeedsYou => Mark::Flag,
+            // Unseen or not, a turn whose work still runs is not done: the
+            // wave says so, the state staying `DoneUnseen` until you look (a
+            // manager's tab ticked while its worker built), and the tick
+            // waits beside it ([`Mark::badged`]).
+            ClaudeState::DoneUnseen | ClaudeState::Idle if row.background => Mark::Wave,
+            ClaudeState::DoneUnseen => Mark::Tick,
+            ClaudeState::Idle => Mark::Ring,
+            ClaudeState::None if row.exited => Mark::Exited,
+            ClaudeState::None if row.running => Mark::Running,
+            ClaudeState::None => Mark::Prompt,
+        };
+        // Back at rest with a finish still unseen — a shell's command, or a
+        // turn the agent has since followed with another — the tick alone,
+        // as for a turn that ended once.
+        match mark {
+            Mark::Ring | Mark::Prompt if row.unseen => Mark::Tick,
+            mark => mark,
+        }
+    }
+
+    /// Whether the tick rides beside this mark: something
+    /// finished unseen, and something runs on after it — the agent working
+    /// again, what it left humming, a shell's next command. Not beside the
+    /// flag, which wins, nor an exited shell, which runs nothing.
+    fn badged(self, row: &RowData) -> bool {
+        row.unseen && matches!(self, Mark::Busy | Mark::Wave | Mark::Running)
+    }
+
+    /// What it is drawn in: the tab's category `color`, Claude or shell,
+    /// except a tab that has not started or a shell that has exited, which
+    /// is `dim` — gray says "nothing runs here" in any category.
+    fn color(self, color: Color32, dim: Color32) -> Color32 {
+        match self {
+            Mark::NotStarted { .. } | Mark::Exited => dim,
+            _ => color,
+        }
+    }
 }
 
 fn tab_row(
@@ -978,56 +1458,65 @@ fn tab_row(
         );
     }
 
-    // Status mark: Claude state wins over the plain shell dot.
+    // Status mark (see [`Mark`]): Claude state wins over the plain shell square.
     //
     // Drawn, not typed. These were characters — a braille spinner, a braille
     // ⠿ for a background shell — and a font without the braille block turns
     // them into empty boxes, which is what every Windows machine did. A shape
     // is a shape everywhere.
-    // Indented past the header above it: a category's name starts at 34, so
+    // Indented past the header above it: a category's name starts at 20, so
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
     let time = anim_time();
-    match row.claude {
-        ClaudeState::Busy => {
-            spinner(&p, dot, spin(ui, rect), row.color);
-        }
-        ClaudeState::NeedsYou => {
-            flag(&p, dot, c.amber.gamma_multiply(breath(time)));
-            keep_animating(ui, rect);
-        }
-        // Green and still: finished, nothing owed. The amber flag above is
-        // the one that wants something, and the two differ in colour, shape
-        // and movement.
-        ClaudeState::DoneUnseen => tick(&p, dot, c.green),
-        ClaudeState::Idle => {
-            // A background shell or its subagents keep running while Claude
-            // waits at its prompt. Worth showing — it is why a directory is
-            // still churning — but it is not the agent working: it can take a
-            // message, and animating it would say "come back later" about a
-            // tab that is waiting on you.
-            if row.background {
-                for i in -1..=1 {
-                    p.circle_filled(dot + Vec2::new(i as f32 * 4.0, 0.0), 1.4, dim);
-                }
+    let mark = Mark::of(row);
+    let color = mark.color(row.color, dim);
+    match mark {
+        // Off, a working tab's spinner is not drawn, the only state left
+        // blank (a calm ring holds still, full size). The title stays
+        // where it is.
+        Mark::Busy => busy(ui, &p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
+        Mark::Flag => {
+            // One breath every two seconds, sampled at the animation step.
+            // Off, no pulse: the flag held at full colour.
+            let pulse = if animating(ui) {
+                keep_animating(ui, rect);
+                breath(time)
             } else {
-                p.circle_stroke(dot, 4.0, Stroke::new(1.4, dim));
-            }
+                1.0
+            };
+            flag(&p, dot, color.gamma_multiply(pulse));
         }
-        ClaudeState::None => {
-            // A plain shell, which most tabs are most of the time: a small
-            // green dot for a live shell, an outline once it has exited, and
-            // a small dim dot for a restored tab whose shell has not started
-            // yet: green there would claim a shell that is not running.
-            if row.exited {
-                p.circle_stroke(dot, 3.5, Stroke::new(1.2, dim));
-            } else if !row.started {
-                p.circle_filled(dot, 2.5, dim);
-            } else {
-                p.circle_filled(dot, 3.5, c.green);
-            }
+        // Still: finished, nothing owed. The flag above is the one that
+        // wants something; the two differ in shape and movement.
+        Mark::Tick => tick(&p, dot, color),
+        // A background shell or its subagents keep running while Claude
+        // waits at its prompt. Worth showing — it is why a directory is
+        // still churning — but it is not the agent working: it can take a
+        // message. So no spinner and no flag: a slow colour drifting
+        // through three small dots, the hum of something left running.
+        // Off, they hold still and faded.
+        Mark::Wave => shell_dots(ui, &p, rect, dot, color),
+        Mark::Ring => ring(&p, dot, RING_R, color),
+        // A plain shell, which most tabs are most of the time: a hollow
+        // square at its prompt, breathing in size while a command runs, and
+        // gray once the shell has exited. Squares read larger
+        // than circles of the same width, so it is a touch narrower than
+        // the ring.
+        Mark::Running => breathing_square(ui, &p, rect, dot, color),
+        Mark::Prompt | Mark::Exited => square(&p, dot, SQUARE_SIDE, false, color),
+        // A restored tab whose process has not started yet: small and
+        // gray, since any colour would claim something running.
+        Mark::NotStarted { claude: true } => {
+            p.circle_filled(dot, 2.5, color);
         }
+        Mark::NotStarted { claude: false } => square(&p, dot, 4.0, true, color),
+    }
+    // The unseen finish beside what runs after it: the tick,
+    // smaller, in the gutter left of the mark, so the mark keeps its place
+    // and the title never moves as the badge comes and goes.
+    if mark.badged(row) {
+        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
     }
 
     // Inline rename?
@@ -1295,7 +1784,9 @@ fn update_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
             Action::Select(job.tab),
         );
         let at = Pos2::new(rect.min.x + 13.0, rect.center().y);
-        spinner(ui.painter(), at, spin(ui, rect), c.fg);
+        if let Some(turns) = spin(ui, rect) {
+            spinner(ui.painter(), at, turns, c.fg);
+        }
         return;
     }
     let Some(available) = &app.update else { return };
@@ -1452,7 +1943,8 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                 .color(dim),
         );
         let spinning = app.claude.refresh_in_flight();
-        let label = if spinning {
+        // Off, no spinner: the refresh mark stays, lit while it runs.
+        let label = if spinning && animating(ui) {
             braille(spin_turns(ui))
         } else {
             "⟳".to_string()
@@ -1664,6 +2156,43 @@ fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The delay the rail asks for in one frame that draws a spinner and a
+    /// pulse on screen, with `rail.animate` at `animate`, and the spinner's
+    /// angle (`None`: no spinner drawn).
+    fn rail_wake(ctx: &egui::Context, animate: bool) -> (std::time::Duration, Option<f64>) {
+        let mut turns = None;
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+            turns = spin(ui, rect);
+            keep_spinning(ui, rect);
+            keep_animating(ui, rect);
+        });
+        let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        (delay, turns)
+    }
+
+    /// Off, there is no spinner and the rail wakes nothing; on, it spins
+    /// and asks for the clock's next tick (#43).
+    #[test]
+    fn a_rail_without_animation_draws_no_spinner_and_schedules_no_frames() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            rail_wake(&ctx, false);
+        }
+        let (delay, turns) = rail_wake(&ctx, false);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "a still rail woke the window"
+        );
+        assert_eq!(turns, None, "a spinner drawn with the switch off");
+        let (delay, turns) = rail_wake(&ctx, true);
+        assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
+        assert!(turns.is_some(), "no spinner with the switch on");
+    }
+
     #[test]
     fn a_repository_is_named_by_its_directory() {
         assert_eq!(
@@ -1685,5 +2214,592 @@ mod tests {
         assert_ne!(repo_color(&chrome, Some(a)), repo_color(&chrome, Some(b)));
         // Tabs in no repository are grouped, not coloured.
         assert_eq!(repo_color(&chrome, None), Color32::GRAY);
+    }
+
+    #[test]
+    fn the_busy_mark_breathes_unless_asked_to_spin() {
+        let mut cfg = giverny_core::config::RailConfig::default();
+        assert_eq!(
+            BusyMark::of(&cfg),
+            BusyMark::Breath,
+            "the breath by default"
+        );
+        cfg.calm_busy = false;
+        assert_eq!(BusyMark::of(&cfg), BusyMark::Spinner);
+    }
+
+    /// One breath every three seconds, out of step with the amber flag's two,
+    /// and still when the rail does not move.
+    #[test]
+    fn the_calm_mark_breathes_slower_than_the_flag() {
+        let at = |t: f64| calm_breath(Some(t));
+        assert!(at(0.0) < 0.01, "starts breathed out");
+        assert!((at(1.5) - 1.0).abs() < 0.01, "in at half a breath");
+        for t in [0.25, 0.7, 1.1, 2.4] {
+            assert!((at(t) - at(t + 3.0)).abs() < 1e-5, "a breath is 3s");
+            assert!((0.0..=1.0).contains(&at(t)));
+        }
+        // The flag's pulse is back where it was after 2s; the calm mark is not.
+        assert!((breath(0.25) - breath(2.25)).abs() < 1e-5);
+        assert!((at(0.25) - at(2.25)).abs() > 0.2);
+        assert_eq!(calm_breath(None), 1.0, "a still rail holds the dot full");
+    }
+
+    /// The calm mark wakes the window on the shared animation clock, as the
+    /// pulse does, and draws in a frame without a spinner (#43).
+    #[test]
+    fn the_calm_mark_keeps_to_the_animation_clock() {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run_ui(egui::RawInput::default(), |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                busy(
+                    ui,
+                    ui.painter(),
+                    rect,
+                    rect.center(),
+                    Color32::WHITE,
+                    BusyMark::Breath,
+                );
+            }));
+        }
+        let delay = out.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay <= giverny_term::pace::STEP_BACKGROUND, "{delay:?}");
+    }
+
+    /// With `rail.animate` off a calm rail still marks a working tab: the
+    /// ring, full size and still, and no frame asked for. The spinner it
+    /// replaces draws nothing at all.
+    #[test]
+    fn a_still_rail_holds_the_calm_ring_full() {
+        let ctx = egui::Context::default();
+        let frame = |mark: BusyMark| {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), false));
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                busy(ui, ui.painter(), rect, rect.center(), Color32::WHITE, mark);
+            });
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            let shapes: Vec<egui::Shape> = out.shapes.into_iter().map(|c| c.shape).collect();
+            (delay, shapes)
+        };
+        for _ in 0..3 {
+            frame(BusyMark::Breath);
+        }
+        let (delay, shapes) = frame(BusyMark::Breath);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "a still ring woke the window"
+        );
+        let rings: Vec<_> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Circle(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rings.len(), 1, "{shapes:?}");
+        assert_eq!(rings[0].radius, RING_R, "breathed in, all the way");
+        assert_eq!(rings[0].fill, Color32::TRANSPARENT, "hollow, as at rest");
+        assert_eq!(rings[0].stroke.color, Color32::WHITE);
+        let (_, shapes) = frame(BusyMark::Spinner);
+        assert!(shapes.is_empty(), "a spinner drawn with the switch off");
+    }
+
+    /// A colour travels through the shell's dots: each in [0,1], the peak
+    /// moving 0 → 1 → 2 and back to 0 after a lap, and all dim and still
+    /// when the rail does not move.
+    #[test]
+    fn the_shell_dots_carry_a_colour_left_to_right() {
+        const LAP: f64 = 3.75;
+        let at = |t: f64| shell_wave(Some(t));
+        let peak = |w: [f32; 3]| (0..3).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap();
+        for k in 0..60 {
+            let t = k as f64 * 0.25;
+            let w = at(t);
+            assert!(w.iter().all(|v| (0.0..=1.0).contains(v)), "{t}: {w:?}");
+            assert!(w.iter().filter(|&&v| v > 1e-4).count() <= 2, "{t}: {w:?}");
+            let later = at(t + LAP);
+            for i in 0..3 {
+                assert!((w[i] - later[i]).abs() < 1e-5, "a lap is {LAP}s at {t}");
+            }
+        }
+        for (i, t) in [0.0, LAP / 3.0, 2.0 * LAP / 3.0, LAP]
+            .into_iter()
+            .enumerate()
+        {
+            let w = at(t);
+            assert_eq!(peak(w), i % 3, "{t}: {w:?}");
+            assert!((w[i % 3] - 1.0).abs() < 1e-5, "full at its peak: {w:?}");
+        }
+        // Halfway from one dot to the next, the two share the light.
+        let w = at(LAP / 6.0);
+        assert!(
+            (w[0] - w[1]).abs() < 1e-5 && w[0] > 0.3 && w[2] == 0.0,
+            "{w:?}"
+        );
+        // Not in step with the calm mark (3s) or the amber flag (2s).
+        assert!((at(0.25)[0] - at(3.25)[0]).abs() > 0.2);
+        assert!((at(0.25)[0] - at(2.25)[0]).abs() > 0.2);
+        assert_eq!(shell_wave(None), [0.0; 3], "a still rail holds them dim");
+    }
+
+    /// The shell's dots: moving, they wake the window on the shared clock;
+    /// with `rail.animate` off they are drawn still and faded, in the tab's
+    /// colour rather than gray, and ask for no frame.
+    #[test]
+    fn the_shell_dots_hold_still_and_faded_when_the_rail_does_not_move() {
+        let ctx = egui::Context::default();
+        let faded = Color32::RED.gamma_multiply(WAVE_REST);
+        let frame = |animate: bool| {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
+                shell_dots(ui, ui.painter(), rect, rect.center(), Color32::RED);
+            });
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            let dots: Vec<egui::epaint::CircleShape> = out
+                .shapes
+                .into_iter()
+                .filter_map(|c| match c.shape {
+                    egui::Shape::Circle(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            (delay, dots)
+        };
+        for _ in 0..3 {
+            frame(true);
+        }
+        let (delay, dots) = frame(true);
+        assert_eq!(dots.len(), 3);
+        assert!(delay <= giverny_term::pace::STEP_BACKGROUND, "{delay:?}");
+        for _ in 0..3 {
+            frame(false);
+        }
+        let (delay, dots) = frame(false);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "still dots woke the window"
+        );
+        assert_eq!(dots.len(), 3);
+        for (i, d) in dots.iter().enumerate() {
+            assert_eq!(d.fill, faded, "dot {i}");
+            assert_eq!(d.radius, 1.4);
+            assert_eq!(d.center.x, 5.0 + (i as f32 - 1.0) * 4.0);
+        }
+    }
+
+    /// A group header's badges are all its colour, it shows one mark at
+    /// most, the flag outranking the dot, and its working mark is a still,
+    /// filled dot that asks for no frame, animating rail or not (#43). A
+    /// finish unseen in it adds the badge tick, left of the dot or alone in
+    /// its place, never beside the flag. The name ends left of whatever is
+    /// there.
+    #[test]
+    fn a_header_marks_in_its_colour_and_holds_still() {
+        let group = |busy, needs, unseen| GroupData {
+            key: GroupKey::Repo(None),
+            category: CategoryId(0),
+            cwd: None,
+            name: "work".into(),
+            color: Color32::RED,
+            collapsed: true,
+            count: 3,
+            busy,
+            needs,
+            unseen,
+            rows: Vec::new(),
+        };
+        // (busy, needs, unseen) -> (dots, flag, tick, where the name ends):
+        // the count's one digit ends 6 left of 200, a mark's slot starts 20
+        // left of it, and a tick takes 8 either side of its centre.
+        let cases = [
+            ((2, 1, false), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((0, 1, false), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((2, 1, true), (0, true, false, 200.0 - 20.0 - 9.0 - 6.0)),
+            ((2, 0, false), (1, false, false, 200.0 - 20.0 - 8.0 - 6.0)),
+            (
+                (2, 0, true),
+                (1, false, true, 200.0 - 20.0 - 8.0 - 6.0 - 8.0 - 8.0),
+            ),
+            ((0, 0, false), (0, false, false, 200.0 - 6.0)),
+            ((0, 0, true), (0, false, true, 200.0 - 20.0 - 8.0)),
+        ];
+        let ctx = egui::Context::default();
+        for ((busy, needs, unseen), (want_dots, want_flag, want_tick, want_end)) in cases {
+            let cat = group(busy, needs, unseen);
+            for animate in [true, false] {
+                let mut out = None;
+                let mut name_end = 0.0;
+                for _ in 0..3 {
+                    out = Some(ctx.run_ui(egui::RawInput::default(), |ui| {
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(egui::Id::new(ANIMATE_ID), animate));
+                        name_end = header_badges(ui.painter(), 10.0, 200.0, &cat, Color32::GRAY);
+                    }));
+                }
+                let out = out.unwrap();
+                let case =
+                    format!("busy {busy}, needs {needs}, unseen {unseen}, animate {animate}");
+                assert_eq!(
+                    out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    std::time::Duration::MAX,
+                    "a header woke the window ({case})"
+                );
+                assert_eq!(name_end, want_end, "{case}");
+                let shapes: Vec<egui::Shape> = out.shapes.into_iter().map(|c| c.shape).collect();
+                let dots: Vec<_> = shapes
+                    .iter()
+                    .filter_map(|s| match s {
+                        egui::Shape::Circle(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(dots.len(), want_dots, "{case}: {shapes:?}");
+                for d in dots {
+                    assert_eq!(d.radius, HEADER_DOT_R);
+                    assert_eq!(d.fill, Color32::RED, "filled, in the group's colour");
+                }
+                // The flag: its staff and its pennant, neither amber.
+                for s in &shapes {
+                    match s {
+                        egui::Shape::LineSegment { stroke, .. } => {
+                            assert_eq!(stroke.color, Color32::RED, "flag staff")
+                        }
+                        egui::Shape::Path(path) => {
+                            assert_eq!(path.fill, Color32::RED, "pennant")
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    shapes.iter().any(|s| matches!(s, egui::Shape::Path(_))),
+                    want_flag,
+                    "{case}: {shapes:?}"
+                );
+                // The badge tick: two strokes as thin as a row's badge.
+                let tick_strokes = shapes
+                    .iter()
+                    .filter(|s| {
+                        matches!(s, egui::Shape::LineSegment { stroke, .. } if stroke.width == 1.5)
+                    })
+                    .count();
+                assert_eq!(tick_strokes, if want_tick { 2 } else { 0 }, "{case}");
+            }
+        }
+    }
+
+    /// A header ticks exactly when a row under it does: a finish unseen
+    /// alone or beside what runs after it, but not on a tab not started
+    /// this run, nor on an exited shell, nor for what you have seen.
+    #[test]
+    fn a_header_ticks_when_a_row_does() {
+        let unseen = |mut r: RowData| {
+            r.unseen = true;
+            r
+        };
+        assert!(ticks(&[row(ClaudeState::DoneUnseen)]));
+        assert!(ticks(&[
+            row(ClaudeState::Idle),
+            unseen(row(ClaudeState::Busy))
+        ]));
+        assert!(ticks(&[unseen(row(ClaudeState::None))]));
+        assert!(!ticks(&[row(ClaudeState::Idle), row(ClaudeState::Busy)]));
+        let pending = RowData {
+            started: false,
+            ..row(ClaudeState::DoneUnseen)
+        };
+        assert!(!ticks(&[pending]));
+        let exited = RowData {
+            exited: true,
+            ..unseen(row(ClaudeState::None))
+        };
+        assert!(!ticks(&[exited]));
+    }
+
+    /// A row in `claude` state, started, live, in no background shell.
+    fn row(claude: ClaudeState) -> RowData {
+        RowData {
+            id: TabId(1),
+            title: String::new(),
+            sub: String::new(),
+            active: false,
+            exited: false,
+            started: true,
+            resumes_claude: false,
+            color: Color32::RED,
+            claude,
+            background: false,
+            running: false,
+            unseen: claude == ClaudeState::DoneUnseen,
+        }
+    }
+
+    /// Every state gets its own mark, and a plain shell's are squares no
+    /// Claude state shares.
+    #[test]
+    fn each_state_has_its_mark_and_shells_are_square() {
+        assert_eq!(Mark::of(&row(ClaudeState::Busy)), Mark::Busy);
+        assert_eq!(Mark::of(&row(ClaudeState::NeedsYou)), Mark::Flag);
+        assert_eq!(Mark::of(&row(ClaudeState::DoneUnseen)), Mark::Tick);
+        assert_eq!(Mark::of(&row(ClaudeState::Idle)), Mark::Ring);
+        let humming = RowData {
+            background: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(Mark::of(&humming), Mark::Wave);
+        assert_eq!(Mark::of(&row(ClaudeState::None)), Mark::Prompt);
+        let exited = RowData {
+            exited: true,
+            ..row(ClaudeState::None)
+        };
+        assert_eq!(Mark::of(&exited), Mark::Exited);
+        // An exited tab never spawned this run is still exited, not pending.
+        let exited_unstarted = RowData {
+            started: false,
+            ..exited
+        };
+        assert_eq!(Mark::of(&exited_unstarted), Mark::Exited);
+    }
+
+    /// The mark says whether the agent can take a message: busy, it
+    /// cannot; at its prompt with subagents still working, the wave; with
+    /// nothing left running, the ring. A turn you have not seen waves too
+    /// while its work runs, and ticks only once it is all done.
+    #[test]
+    fn subagents_running_after_the_turn_wave_and_a_working_agent_spins() {
+        use crate::claude_watch::ClaudeTab;
+        let mark = |state, agents| {
+            let mut tab = ClaudeTab::default();
+            tab.state = state;
+            tab.agents = agents;
+            Mark::of(&RowData {
+                background: tab.working_in_background(),
+                ..row(state)
+            })
+        };
+        assert_eq!(mark(ClaudeState::Idle, true), Mark::Wave);
+        assert_eq!(mark(ClaudeState::Busy, true), Mark::Busy, "busy wins");
+        assert_eq!(mark(ClaudeState::Idle, false), Mark::Ring, "agents gone");
+        // The flag is unchanged by what runs behind it.
+        assert_eq!(mark(ClaudeState::NeedsYou, true), Mark::Flag);
+        // Unseen, the turn's workers still running: not done, the wave;
+        // they end, the tick.
+        assert_eq!(mark(ClaudeState::DoneUnseen, true), Mark::Wave);
+        assert_eq!(mark(ClaudeState::DoneUnseen, false), Mark::Tick);
+        // A background shell holds the tick back the same.
+        let shell = |state| {
+            Mark::of(&RowData {
+                background: true,
+                ..row(state)
+            })
+        };
+        assert_eq!(shell(ClaudeState::DoneUnseen), Mark::Wave);
+        assert_eq!(shell(ClaudeState::Idle), Mark::Wave);
+    }
+
+    /// A turn that ended unseen keeps its tick as a badge beside what runs
+    /// after it — the wave of its workers, the agent working again — until
+    /// you look; alone, with nothing running, it is the tick itself. The
+    /// flag wins over all of it.
+    #[test]
+    fn an_unseen_turn_ticks_beside_what_runs_after_it() {
+        let marked = |row: RowData| {
+            let mark = Mark::of(&row);
+            (mark, mark.badged(&row))
+        };
+        // Its workers still running: the wave, the tick beside it.
+        let humming = RowData {
+            background: true,
+            ..row(ClaudeState::DoneUnseen)
+        };
+        assert_eq!(marked(humming), (Mark::Wave, true));
+        // Seen, the wave alone.
+        let seen = RowData {
+            background: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(marked(seen), (Mark::Wave, false));
+        // Unseen, then the agent works again: the spinner (or the calm
+        // ring), the tick beside it; that turn ends too, the tick alone.
+        let again = RowData {
+            unseen: true,
+            ..row(ClaudeState::Busy)
+        };
+        assert_eq!(marked(again), (Mark::Busy, true));
+        assert_eq!(marked(row(ClaudeState::DoneUnseen)), (Mark::Tick, false));
+        // Back at its prompt without a `Stop` while still unseen: the tick.
+        let idle = RowData {
+            unseen: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!(marked(idle), (Mark::Tick, false));
+        // Nothing unseen: no badge on the spinner.
+        assert_eq!(marked(row(ClaudeState::Busy)), (Mark::Busy, false));
+        // The flag wins, badge and all.
+        let asks = RowData {
+            unseen: true,
+            ..row(ClaudeState::NeedsYou)
+        };
+        assert_eq!(marked(asks), (Mark::Flag, false));
+    }
+
+    /// A plain shell: a command running breathes its square;
+    /// one that finished on another tab ticks until you look; at its prompt,
+    /// seen, the hollow square; exited, the hollow square in gray. Its next
+    /// command, the first still unseen, breathes with the tick beside it.
+    #[test]
+    fn a_shell_breathes_ticks_then_rests_hollow() {
+        let shell = |running, unseen, exited| {
+            let row = RowData {
+                running,
+                unseen,
+                exited,
+                ..row(ClaudeState::None)
+            };
+            let mark = Mark::of(&row);
+            (mark, mark.badged(&row))
+        };
+        assert_eq!(shell(true, false, false), (Mark::Running, false));
+        assert_eq!(shell(false, true, false), (Mark::Tick, false));
+        assert_eq!(shell(false, false, false), (Mark::Prompt, false));
+        assert_eq!(shell(true, true, false), (Mark::Running, true));
+        // Exited is exited, whatever it last ran or left unseen.
+        assert_eq!(shell(false, true, true), (Mark::Exited, false));
+        assert_eq!(shell(true, false, true), (Mark::Exited, false));
+    }
+
+    /// The breathing marks start at a device pixel and breathe up to the
+    /// resting mark's size exactly, so at full breath (and with
+    /// `rail.animate` off) a working mark is the size of the idle one.
+    #[test]
+    fn breathing_marks_go_from_a_pixel_to_the_resting_size() {
+        let floor = 1.0 / SQUARE_SIDE;
+        assert_eq!(SQUARE_SIDE * breathed(floor, 0.0), 1.0);
+        assert_eq!(SQUARE_SIDE * breathed(floor, 1.0), SQUARE_SIDE);
+        assert_eq!(RING_R * breathed(0.5 / RING_R, 1.0), RING_R);
+        assert!(breathed(floor, 0.5) > floor && breathed(floor, 0.5) < 1.0);
+    }
+
+    /// A header counts a tab showing the wave as working, so its breathing
+    /// dot and count stay while only the tab's subagents or background shell
+    /// run; the tick and the ring are not working.
+    #[test]
+    fn a_header_counts_a_waving_tab_as_working() {
+        let humming = |state| RowData {
+            background: true,
+            ..row(state)
+        };
+        assert_eq!(tallies(&[humming(ClaudeState::Idle)]), (1, 1, 0));
+        // Unseen with its work still running is the wave too.
+        assert_eq!(tallies(&[humming(ClaudeState::DoneUnseen)]), (1, 1, 0));
+        assert_eq!(
+            tallies(&[
+                row(ClaudeState::Busy),
+                humming(ClaudeState::Idle),
+                row(ClaudeState::DoneUnseen),
+                row(ClaudeState::Idle),
+                humming(ClaudeState::NeedsYou),
+            ]),
+            (5, 2, 1),
+            "busy and wave count; tick, ring and flag do not"
+        );
+        // A tab not started has nothing running, whatever state lingers.
+        let pending = RowData {
+            started: false,
+            ..humming(ClaudeState::Busy)
+        };
+        assert_eq!(tallies(&[pending]), (1, 0, 0));
+    }
+
+    /// A restored tab that has not spawned is told by what it comes back
+    /// as, whatever Claude state lingers for it.
+    #[test]
+    fn a_tab_not_started_is_a_circle_if_it_resumes_claude_else_a_square() {
+        let pending = |resumes_claude, claude| RowData {
+            started: false,
+            resumes_claude,
+            ..row(claude)
+        };
+        assert_eq!(
+            Mark::of(&pending(false, ClaudeState::None)),
+            Mark::NotStarted { claude: false }
+        );
+        assert_eq!(
+            Mark::of(&pending(true, ClaudeState::None)),
+            Mark::NotStarted { claude: true }
+        );
+        assert_eq!(
+            Mark::of(&pending(true, ClaudeState::Busy)),
+            Mark::NotStarted { claude: true },
+            "nothing is running, so nothing is busy"
+        );
+    }
+
+    /// Every mark is in the category's colour, Claude and shell alike; only
+    /// a tab not started yet, or a shell that has exited, is gray.
+    #[test]
+    fn every_mark_wears_the_category_colour_but_not_started_is_gray() {
+        let (cat, dim) = (Color32::from_rgb(200, 120, 40), Color32::from_gray(90));
+        for mark in [
+            Mark::Busy,
+            Mark::Flag,
+            Mark::Tick,
+            Mark::Ring,
+            Mark::Wave,
+            Mark::Running,
+            Mark::Prompt,
+        ] {
+            assert_eq!(mark.color(cat, dim), cat, "{mark:?}");
+        }
+        for claude in [false, true] {
+            assert_eq!(Mark::NotStarted { claude }.color(cat, dim), dim);
+        }
+        assert_eq!(Mark::Exited.color(cat, dim), dim, "an exited shell is gray");
+    }
+
+    /// A shell's square lands on whole device pixels at any scale and any
+    /// fractional position, and is as many pixels across as asked: a square
+    /// straddling a pixel edge blurs at this size.
+    #[test]
+    fn a_shell_square_sits_on_whole_pixels() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            for filled in [true, false] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+                let mut out = None;
+                for _ in 0..2 {
+                    let shapes = ctx
+                        .run_ui(egui::RawInput::default(), |ui| {
+                            square(
+                                ui.painter(),
+                                Pos2::new(32.3, 13.7),
+                                6.0,
+                                filled,
+                                Color32::RED,
+                            );
+                        })
+                        .shapes;
+                    out = shapes.into_iter().find_map(|c| match c.shape {
+                        egui::Shape::Rect(r) => Some(r.rect),
+                        _ => None,
+                    });
+                }
+                let r = out.expect("a square was drawn");
+                let whole = |v: f32| ((v * ppp) - (v * ppp).round()).abs() < 1e-3;
+                assert!(
+                    whole(r.min.x) && whole(r.min.y) && whole(r.max.x) && whole(r.max.y),
+                    "{ppp}: {r:?}"
+                );
+                assert!(((r.width() * ppp) - (6.0 * ppp).round()).abs() < 1e-3);
+                assert!((r.width() - r.height()).abs() < 1e-3, "{r:?}");
+            }
+        }
     }
 }
