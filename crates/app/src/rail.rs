@@ -202,6 +202,13 @@ fn row_data(
             format!("{sub} · @{account}")
         };
     }
+    if app.codex.state_of(t.id) != ClaudeState::None {
+        sub = if sub.is_empty() {
+            "Codex".into()
+        } else {
+            format!("{sub} · Codex")
+        };
+    }
     RowData {
         id: t.id,
         title: t.display_title(&app.cfg.titles),
@@ -210,7 +217,7 @@ fn row_data(
         exited: t.exited,
         started: app.rt.contains_key(&t.id),
         color,
-        claude: ct.map(|c| c.state).unwrap_or_default(),
+        claude: app.agent_state(t.id),
         background: ct.is_some_and(|c| c.working_in_background()),
     }
 }
@@ -353,7 +360,7 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             wslg_banner(app, ui, &mut actions);
             update_banner(app, ui, &mut actions);
             hooks_banner(app, ui, &mut actions);
-            usage_panel(app, ui, dim, fg, &mut actions);
+            usage_panel(app, ui, dim, &mut actions);
         });
 
     view_switch(app, ui, &mut actions);
@@ -1351,6 +1358,9 @@ fn banner_button(
 }
 
 fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    if app.claude.profiles.is_empty() {
+        return;
+    }
     let c = app.chrome;
     if app.claude.hooks_installed && !app.claude.relay_listening() {
         // Another live Giverny is the usual reason, and the one worth naming:
@@ -1424,7 +1434,121 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     });
 }
 
-fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut Vec<Action>) {
+/// Codex uses the same account row and meter geometry as Claude.
+fn codex_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    if !app.cfg.codex.enabled {
+        return;
+    }
+    let c = app.chrome;
+    let now = jiff::Timestamp::now();
+    for account in &app.codex.accounts {
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            let name = account.name.as_deref().unwrap_or("default");
+            ui.label(
+                egui::RichText::new(format!("@{name}"))
+                    .font(FontId::monospace(10.5))
+                    .color(c.fg),
+            )
+            .on_hover_text(match &account.target.wsl_distro {
+                Some(d) => format!("{} · {d}", account.target.home.display()),
+                None => account.target.home.display().to_string(),
+            });
+            if account.refreshing {
+                let response = ui.label(
+                    egui::RichText::new(braille(spin_turns(ui)))
+                        .font(FontId::monospace(9.0))
+                        .color(c.accent),
+                );
+                keep_spinning(ui, response.rect);
+            } else if let Some(updated) = account.updated {
+                let minutes = updated.elapsed().as_secs() / 60;
+                let age = if minutes < 1 {
+                    "· just now".into()
+                } else if minutes < 120 {
+                    format!("· {minutes}m old")
+                } else if minutes < 1440 {
+                    format!("· {}h old", minutes / 60)
+                } else {
+                    format!("· {}d old", minutes / 1440)
+                };
+                ui.label(egui::RichText::new(age).font(FontId::monospace(9.0)).color(
+                    if account.error.is_some() || minutes > 30 {
+                        c.amber
+                    } else {
+                        c.dim
+                    },
+                ))
+                .on_hover_text("last successful reading from Codex");
+            }
+            if let Some(error) = &account.error {
+                ui.label(
+                    egui::RichText::new("⚠")
+                        .font(FontId::monospace(9.0))
+                        .color(c.amber),
+                )
+                .on_hover_text(error);
+            }
+        });
+        for window in &account.windows {
+            let expired = window.resets_at.is_some_and(|at| at <= now.as_second());
+            let read = crate::claude_watch::Reading {
+                percent: window.used_percent,
+                live: false,
+                critical: window.used_percent >= 100.0,
+                resets: window
+                    .resets_at
+                    .and_then(|s| jiff::Timestamp::from_second(s).ok()),
+            };
+            let label = window.label.strip_prefix("codex ").unwrap_or(&window.label);
+            ui.scope(|ui| usage_bar(ui, label, !expired, read, now, c.dim, c.fg, c))
+                .response
+                .on_hover_text(format!(
+                    "{}{}",
+                    window.label,
+                    if expired || account.error.is_some() {
+                        " · last reading is stale"
+                    } else {
+                        ""
+                    }
+                ));
+        }
+        if account.windows.is_empty() && !account.refreshing {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(if account.error.is_some() {
+                        "usage unavailable"
+                    } else {
+                        "no usage data yet"
+                    })
+                    .font(FontId::monospace(9.5))
+                    .color(c.dim),
+                )
+                .on_hover_text(
+                    account
+                        .error
+                        .as_deref()
+                        .unwrap_or("Refresh usage to request a reading from Codex."),
+                );
+            });
+        }
+    }
+    for ready in app.codex.pending_restore.values() {
+        let title = app.ws.tab(ready.id).map(|t| t.title()).unwrap_or("tab");
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            if ui.small_button(egui::RichText::new(format!("resume · {}", truncate_chars(title, 20)))
+                .font(FontId::monospace(9.5)).color(c.dim))
+                .on_hover_text("Resume this saved Codex conversation. Automatic restore waits when ownership cannot be verified.").clicked() {
+                actions.push(Action::ConfirmCodexResume(ready.id));
+            }
+        });
+    }
+}
+
+fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, actions: &mut Vec<Action>) {
     let c = app.chrome;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -1434,7 +1558,8 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
                 .font(FontId::monospace(9.5))
                 .color(dim),
         );
-        let spinning = app.claude.refresh_in_flight();
+        let spinning = app.claude.refresh_in_flight()
+            || (app.cfg.codex.enabled && app.codex.accounts.iter().any(|a| a.refreshing));
         let label = if spinning {
             braille(spin_turns(ui))
         } else {
@@ -1450,11 +1575,12 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
         }
         if refresh
             .on_hover_text(
-                "refresh usage now\n(asks Claude Code to update its own cache;\nGiverny makes no API call)",
+                "refresh account usage\n(Claude Code updates its cache; Codex fetches its allowance windows)",
             )
             .clicked()
         {
             actions.push(Action::RefreshUsage);
+            if app.cfg.codex.enabled { actions.push(Action::RefreshCodexUsage); }
         }
         // The way in that does not require knowing a chord.
         if ui
@@ -1469,10 +1595,77 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             actions.push(Action::ToggleSettings);
         }
     });
-    // No "states live" line: working is the normal case and says nothing.
-    // What is wrong says so above it (`hooks_banner`): no hooks, or no relay.
-    // Only surfaced when off — it is on by default wherever hooks are.
-    if !app.claude.statusline_on() {
+    if app.cfg.codex.enabled && !app.codex.accounts.is_empty() {
+        provider_accounts(ui, "CODEX", c, |ui| codex_accounts(app, ui, actions));
+    }
+    if !app.claude.accounts.is_empty() {
+        provider_accounts(ui, "CLAUDE", c, |ui| claude_accounts(app, ui, actions));
+    } else if !app.cfg.codex.enabled {
+        ui.label(
+            egui::RichText::new("no accounts found")
+                .font(FontId::monospace(10.0))
+                .color(dim),
+        );
+    }
+    ui.add_space(6.0);
+}
+
+/// A rotated label interrupts the left category line; its height comes from
+/// the accounts, so provider headings add no rows to the rail.
+fn provider_accounts(
+    ui: &mut Ui,
+    label: &str,
+    c: crate::chrome::Chrome,
+    draw: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal_top(|ui| {
+        let (gutter, _) = ui.allocate_exact_size(Vec2::new(12.0, 0.0), Sense::hover());
+        let content = ui
+            .vertical(|ui| {
+                ui.set_width(ui.available_width());
+                draw(ui);
+            })
+            .response
+            .rect;
+        let x = gutter.center().x;
+        let center = content.center().y;
+        let font_size = (content.height() / label.len() as f32 / 0.65).clamp(6.5, 9.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.into(), FontId::monospace(font_size), c.dim);
+        let half = galley.size().x / 2.0;
+        let stroke = Stroke::new(1.0, c.dim.gamma_multiply(0.35));
+        if center - half - 2.0 > content.top() + 1.0 {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(x, content.top() + 1.0),
+                    Pos2::new(x, center - half - 2.0),
+                ],
+                stroke,
+            );
+        }
+        if center + half + 2.0 < content.bottom() - 1.0 {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(x, center + half + 2.0),
+                    Pos2::new(x, content.bottom() - 1.0),
+                ],
+                stroke,
+            );
+        }
+        let position = Pos2::new(x - galley.size().y / 2.0, center + half);
+        ui.painter().add(
+            egui::epaint::TextShape::new(position, galley, c.dim)
+                .with_angle(-std::f32::consts::FRAC_PI_2),
+        );
+    });
+}
+
+fn claude_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let c = app.chrome;
+    let dim = c.dim;
+    let fg = c.fg;
+    if !app.claude.accounts.is_empty() && !app.claude.statusline_on() {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             if ui
@@ -1487,7 +1680,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             }
         });
     }
-    if app.claude.accounts.is_empty() {
+    if app.claude.accounts.is_empty() && !app.cfg.codex.enabled {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.label(
@@ -1555,7 +1748,7 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
             Some(u) if !u.limits.is_empty() => {
                 for limit in &u.limits {
                     let read = ClaudeWatch::reading(acc, limit, now);
-                    usage_bar(ui, limit, read, now, dim, fg, c);
+                    usage_bar(ui, &limit.label(), limit.is_active, read, now, dim, fg, c);
                 }
             }
             _ => {
@@ -1576,7 +1769,8 @@ fn usage_panel(app: &App, ui: &mut Ui, dim: Color32, fg: Color32, actions: &mut 
 #[allow(clippy::too_many_arguments)]
 fn usage_bar(
     ui: &mut Ui,
-    limit: &giverny_claude::usage::LimitEntry,
+    label: &str,
+    active: bool,
     read: crate::claude_watch::Reading,
     now: jiff::Timestamp,
     dim: Color32,
@@ -1599,9 +1793,9 @@ fn usage_bar(
     p.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
-        truncate_chars(&limit.label(), 6),
+        truncate_chars(label, 6),
         FontId::monospace(9.5),
-        if limit.is_active { fg } else { dim },
+        if active { fg } else { dim },
     );
     // Track + fill.
     let track = Rect::from_min_max(

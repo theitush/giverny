@@ -2,7 +2,7 @@
 
 # Giverny
 
-A GPU-rendered terminal for running many Claude Code sessions at once. Tabs sit in categories on a left rail, each tab shows what its Claude is doing, and every account's rate limits are visible in the corner.
+A GPU-rendered terminal for running Claude Code and Codex sessions side by side. Tabs sit in categories on a left rail, each tab shows what its agent is doing, and every account's rate limits are visible in the corner.
 
 ![Giverny: categorized tabs with live Claude state and multi-account usage meters](assets/demo.gif)
 
@@ -11,7 +11,8 @@ Written in Rust on `alacritty_terminal`, with no web engine.
 ## Features
 
 - **Claude state per tab.** A spinner while Claude works, a flag and desktop notification when it needs input, a ✓ when a background tab finishes. Driven by Claude Code hooks, with a zero-config fallback that reads Claude's local session registry.
-- **Multiple accounts.** Each `CLAUDE_CONFIG_DIR` is an account, discovered automatically. Assign one per category; the rail shows 5-hour, weekly and per-model limits with reset times.
+- **Codex support.** Type `codex` normally in a tab. Codex is detected automatically, with allowance meters and automatic or manual refresh. Install the observer hooks from Settings → codex and trust them with `/hooks` for live state, notifications and conversation restore. Disable automatic detection in Settings if unwanted. See [Codex setup](docs/codex-integration.md).
+- **Multiple Claude accounts.** Each `CLAUDE_CONFIG_DIR` is an account, discovered automatically. Assign one per category; the rail shows 5-hour, weekly and per-model limits with reset times.
 - **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
 - **Background agents.** Forked and `run_in_background` sessions appear in the rail. Click one to attach a tab.
 - **Rail views.** Group tabs by your own categories or by git repository.
@@ -54,7 +55,7 @@ On Windows, Claude accounts inside WSL are discovered and their tabs open in the
 
 ## Privacy
 
-Giverny never contacts Anthropic and never reads credential files. Usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. The only network request is the update check, which sends nothing but a User-Agent.
+Giverny never contacts Anthropic and never reads credential files. Usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. Giverny’s direct network request is the update check, which sends nothing but a User-Agent. When Codex is detected (unless disabled in Settings), Giverny also asks an official local Codex helper to fetch allowance data; that helper contacts OpenAI using Codex’s existing sign-in. Giverny does not read Codex credentials or manage authentication.
 
 Hook installation shows what it adds, keeps your existing hooks and writes a `.giverny-bak` backup. Pasted text is stripped of escape bytes, and the in-band control channel is nonce-authenticated so terminal output can't fake Claude states. Details in [Claude Code integration](docs/claude-integration.md).
 
@@ -63,7 +64,7 @@ Hook installation shows what it adds, keeps your existing hooks and writes a `.g
 | Chord | Action |
 |---|---|
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab / close tab |
-| `Ctrl+Shift+A` | Next tab where Claude needs you |
+| `Ctrl+Shift+A` | Next tab where an agent needs you |
 | `Ctrl+Shift+P` | Tab palette |
 | `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+E` | Label paths and URLs on screen for quick open |
@@ -74,7 +75,7 @@ Hook installation shows what it adds, keeps your existing hooks and writes a `.g
 
 ## Docs
 
-[Architecture](docs/architecture.md) · [Options](docs/options.md) · [Claude Code integration](docs/claude-integration.md) · [Changelog](CHANGELOG.md)
+[Architecture](docs/architecture.md) · [Options](docs/options.md) · [Claude Code integration](docs/claude-integration.md) · [Codex integration](docs/codex-integration.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

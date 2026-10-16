@@ -180,7 +180,7 @@ elif [ -n "$new" ]; then
   say "  ${dim}installed${reset} ${gold}${bold}${new}${reset}"
 fi
 if [ "${TERM_PROGRAM:-}" = giverny ]; then
-  say "  ${dim}restart from the rail to finish${reset}"
+  say "  ${dim}giverny restarts itself to finish${reset}"
 else
   say "  ${dim}run:${reset} giverny ${dim}(and 'giverny doctor' if Claude states look wrong)${reset}"
 fi

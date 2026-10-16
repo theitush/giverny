@@ -141,7 +141,7 @@ try {
         }
         Write-Host '  run: ' -ForegroundColor DarkGray -NoNewline
         Write-Host 'giverny ' -NoNewline
-        Write-Host '(if it is open, restart it from the rail to finish)' -ForegroundColor DarkGray
+        Write-Host '(if it is open, it restarts itself to finish)' -ForegroundColor DarkGray
         Write-Host ''
     }
 } finally {
