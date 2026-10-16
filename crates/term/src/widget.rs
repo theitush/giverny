@@ -154,6 +154,12 @@ pub struct TabView {
     hints: Option<Hints>,
     /// Uploaded image textures, keyed by graphics id.
     textures: std::collections::HashMap<u32, egui::TextureHandle>,
+    /// Watches for a paste chord that found no text.
+    paste_chord: input::PasteChord,
+    /// Set by [`TabView::show`] for a frame in which a paste chord found no
+    /// text in the clipboard while the terminal had the keyboard: the app
+    /// looks for files or an image there and pastes them.
+    pub paste_image: bool,
 }
 
 /// Labelled targets on the visible screen.
@@ -232,6 +238,8 @@ impl Default for TabView {
             hover_target: None,
             hints: None,
             textures: std::collections::HashMap::new(),
+            paste_chord: input::PasteChord::default(),
+            paste_image: false,
         }
     }
 }
@@ -578,6 +586,19 @@ impl TabView {
                 },
             )
         });
+        // Watched whether focused or not, so a V pressed while a text field
+        // had the keyboard is still known to be pressed when it comes up.
+        let paste_chord = &mut self.paste_chord;
+        // Every event is fed, not just up to the first hit: the tracker has
+        // to see them all.
+        let empty_paste = ui.input(|i| {
+            i.events
+                .iter()
+                .filter(|ev| paste_chord.on_event(ev))
+                .count()
+                > 0
+        });
+        self.paste_image = empty_paste && response.has_focus();
         if !response.has_focus() {
             return;
         }
