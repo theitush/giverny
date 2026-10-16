@@ -37,6 +37,7 @@ pollster = "0.4"
 # written as, and the Windows clipboard's PNG arriving base64 from WSL. All
 # versions already in the tree, so no new one.
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+tempfile = "3"
 png = "0.18"
 base64 = "0.22"
 

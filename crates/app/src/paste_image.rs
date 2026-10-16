@@ -94,8 +94,8 @@ pub struct Pasted {
 /// The app's side of image pastes: the run's directory, and the threads'
 /// answers.
 pub struct ImagePaste {
-    /// This run's directory; created on the first paste.
-    dir: PathBuf,
+    /// Random private directory, retained until every paste worker exits.
+    dir: Option<Arc<tempfile::TempDir>>,
     tx: Sender<Pasted>,
     rx: Receiver<Pasted>,
     /// WSL only: the Windows clipboard's reader, kept running.
@@ -103,8 +103,8 @@ pub struct ImagePaste {
 }
 
 impl ImagePaste {
-    /// Sets up this run's directory name and sweeps what earlier runs left
-    /// behind. Nothing is created until something is pasted.
+    /// Allocates a private directory with an unpredictable name and sweeps
+    /// what earlier runs left behind.
     pub fn new() -> Self {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -118,7 +118,12 @@ impl ImagePaste {
             windows
         });
         Self {
-            dir: base.join(format!("{DIR_PREFIX}{}", std::process::id())),
+            dir: tempfile::Builder::new()
+                .prefix(DIR_PREFIX)
+                .tempdir_in(&base)
+                .inspect_err(|e| tracing::warn!("paste: cannot create private directory: {e}"))
+                .ok()
+                .map(Arc::new),
             tx,
             rx,
             windows,
@@ -129,7 +134,7 @@ impl ImagePaste {
     /// background, and when there is either have it pasted into `tab` (see
     /// [`Self::poll`]).
     pub fn request(&mut self, ctx: &egui::Context, tab: TabId) {
-        let dir = self.dir.clone();
+        let Some(dir) = self.dir.clone() else { return };
         let tx = self.tx.clone();
         let windows = self.windows.clone();
         let ctx = ctx.clone();
@@ -151,7 +156,7 @@ impl ImagePaste {
                     tracing::info!("paste: no text, files or image in the clipboard");
                     return;
                 };
-                match save(&dir, &png, SystemTime::now()) {
+                match save(dir.path(), &png, SystemTime::now()) {
                     Ok(path) => {
                         tracing::info!(
                             "paste: image saved to {} in {} ms",
@@ -162,7 +167,9 @@ impl ImagePaste {
                             .display()
                             .to_string()]));
                     }
-                    Err(e) => tracing::warn!("paste: image not saved in {}: {e}", dir.display()),
+                    Err(e) => {
+                        tracing::warn!("paste: image not saved in {}: {e}", dir.path().display())
+                    }
                 }
             });
         if let Err(e) = spawned {
@@ -182,11 +189,8 @@ impl ImagePaste {
         if let Some(windows) = &self.windows {
             windows.shut_down();
         }
-        if self.dir.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.dir)
-        {
-            tracing::debug!("paste: {} not removed: {e}", self.dir.display());
-        }
+        // The private directory is removed by TempDir after the last paste
+        // worker releases it, so shutdown cannot race an in-flight write.
     }
 }
 
@@ -629,14 +633,19 @@ mod tests {
         let base = scratch("cleanup");
         let (tx, rx) = crossbeam_channel::unbounded();
         let paste = ImagePaste {
-            dir: base.join(format!("{DIR_PREFIX}33")),
+            dir: Some(Arc::new(
+                tempfile::Builder::new()
+                    .prefix(DIR_PREFIX)
+                    .tempdir_in(&base)
+                    .unwrap(),
+            )),
             tx,
             rx,
             windows: None,
         };
-        save(&paste.dir, b"png", SystemTime::now()).unwrap();
-        assert!(paste.dir.exists());
-        let dir = paste.dir.clone();
+        let dir = paste.dir.as_ref().unwrap().path().to_path_buf();
+        save(&dir, b"png", SystemTime::now()).unwrap();
+        assert!(dir.exists());
         drop(paste);
         assert!(!dir.exists(), "the drop at exit takes the run's pastes");
         std::fs::remove_dir_all(&base).unwrap();
