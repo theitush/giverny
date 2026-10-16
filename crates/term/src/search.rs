@@ -159,9 +159,8 @@ const URL_SCHEMES: [&str; 4] = ["http://", "https://", "file://", "ftp://"];
 /// Characters that terminate a path/URL token in terminal output.
 const TOKEN_STOPS: [char; 12] = [' ', '\t', '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<'];
 
-/// Extract the click target inside `text` at byte-ish char index `col`.
-/// `cwd` resolves relative paths (Claude prints `src/main.rs:42`).
-pub fn target_at(text: &str, col: usize, cwd: &std::path::Path) -> Option<ClickTarget> {
+/// Character bounds shared by detection and the terminal-cell underline.
+pub(crate) fn token_range(text: &str, col: usize) -> Option<std::ops::Range<usize>> {
     let chars: Vec<char> = text.chars().collect();
     if col >= chars.len() || chars[col].is_whitespace() {
         return None;
@@ -171,7 +170,14 @@ pub fn target_at(text: &str, col: usize, cwd: &std::path::Path) -> Option<ClickT
     let end = (col..chars.len())
         .take_while(|&i| !is_stop(chars[i]))
         .last()?;
-    let token: String = chars[start..=end].iter().collect();
+    Some(start..end + 1)
+}
+
+/// Extract the click target inside `text` at byte-ish char index `col`.
+/// `cwd` resolves relative paths (Claude prints `src/main.rs:42`).
+pub fn target_at(text: &str, col: usize, cwd: &std::path::Path) -> Option<ClickTarget> {
+    let range = token_range(text, col)?;
+    let token: String = text.chars().skip(range.start).take(range.len()).collect();
     // Trailing punctuation is prose, not part of the target.
     let token = token.trim_end_matches([',', '.', ';', ':', '!', '?']);
     if token.is_empty() {

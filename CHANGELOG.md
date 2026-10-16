@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Ctrl+click opens the complete URL across terminal soft wraps, including
+  when part of the link is in scrollback. Real newlines keep targets separate.
+
 - Optional Codex CLI integration alongside Claude: tab state, attention and
   completion notifications, conversation restore, and allowance meters with
   automatic/manual refresh. Setup preserves existing hooks and leaves hook
