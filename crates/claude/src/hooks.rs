@@ -19,6 +19,9 @@ pub const RELAY_EVENTS: &[&str] = &[
     // keeps whatever the last turn's `Stop` left on it, and shows a tick
     // while it works.
     "PostToolUse",
+    // A compaction starting. `/compact` sends no `UserPromptSubmit`, so
+    // without it the tab reads idle through the minute it compacts.
+    "PreCompact",
     "Stop",
     "Notification",
     "SessionEnd",

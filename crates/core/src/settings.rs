@@ -290,6 +290,46 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "titles.strip_claude_glyph",
+        label: "drop Claude's title glyph",
+        section: Section::Titles,
+        doc: "Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner).",
+        note: &[
+            "The rail's own mark beside the title already shows whether",
+            "Claude is working, and keeps showing it while background",
+            "agents run. A title you typed yourself is never touched.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.animate",
+        label: "animate the rail",
+        section: Section::Titles,
+        doc: "Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse.",
+        note: &[
+            "Off, no spinner, ring or pulse is drawn: a working tab's mark is",
+            "left blank and a waiting one shows its amber flag, still. The",
+            "rail stops waking the window to animate them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.calm_busy",
+        label: "calm busy mark",
+        section: Section::Titles,
+        doc: "A working tab breathes a slow dot in its colour instead of spinning.",
+        note: &[
+            "One breath every three seconds, everywhere the spinner would be:",
+            "tab rows, category headers, background agents. Still a different",
+            "thing from the amber flag of a tab that wants you, in shape,",
+            "colour and pace.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "behavior.scrollback_lines",
         label: "scrollback lines",
         section: Section::Terminal,
@@ -839,6 +879,33 @@ mod tests {
                 tables.push(def.table());
             }
         }
+    }
+
+    /// The rail's calm look is the default: both are on until someone
+    /// turns them off, and a file without them reads as on.
+    #[test]
+    fn calm_marks_are_on_by_default() {
+        let absent: Config = toml::from_str("[rail]\n[titles]\n").unwrap();
+        for key in ["rail.calm_busy", "titles.strip_claude_glyph"] {
+            let def = by_key(key).expect("declared");
+            assert!(matches!(def.kind, Kind::Bool { default: true }), "{key}");
+            assert_eq!(current(&absent, def), Some(Value::Bool(true)), "{key}");
+        }
+    }
+
+    /// The rail's two motion options sit with the title glyph toggle in tabs
+    /// & titles, right after it, though their keys stay in `[rail]`.
+    #[test]
+    fn rail_motion_options_follow_the_title_glyph() {
+        let titles: Vec<&str> = in_section(Section::Titles).map(|d| d.key).collect();
+        let glyph = titles
+            .iter()
+            .position(|k| *k == "titles.strip_claude_glyph")
+            .expect("glyph toggle is in tabs & titles");
+        assert_eq!(
+            titles[glyph + 1..glyph + 3],
+            ["rail.animate", "rail.calm_busy"]
+        );
     }
 
     #[test]
