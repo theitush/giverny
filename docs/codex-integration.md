@@ -92,15 +92,14 @@ Restoration uses the normal `codex resume <id> --cd <directory>` command;
 session IDs are validated and paths are quoted for the tab's shell.
 
 Before restoring, a background helper reads session metadata with `thread/read`.
-It never resumes a conversation merely to inspect it. Where available, an
-observer connection to the existing shared daemon checks all pages of
-`thread/loaded/list`. Conversations already loaded are skipped. If ownership
-cannot be verified, the rail offers an explicit resume button rather than
-starting a second writer automatically. Thus `restore = "auto"` can still ask
-when Codex cannot establish ownership. `"prompt"` always asks, and `"off"`
-skips restoration. Missing sessions are reported and skipped.
+It never resumes a conversation merely to inspect it. `restore = "auto"`
+reconnects the saved conversation using the normal CLI, including when the
+shared daemon still holds it in memory. Loaded threads are not proof that
+another terminal is open. `"prompt"` offers an explicit resume button and
+`"off"` skips restoration. Missing sessions are reported and skipped.
 
-Tabs still start lazily, and typing cancels pending automatic restoration.
+Tabs still start lazily. Resume waits for shell startup, and typing cancels
+pending automatic restoration.
 On Windows, native PowerShell and WSL resume commands use the corresponding
 shell syntax; cmd.exe filenames requiring unsafe expansion are refused.
 

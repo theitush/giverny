@@ -92,9 +92,9 @@ account limits without starting turns. It owns authentication, including any
 network access. Giverny persists only returned allowance windows in its own
 cache. Cancellation kills and reaps owned helpers; no user daemon is stopped.
 
-Restoration reads metadata without resuming it. A connection to an existing
-shared daemon checks loaded-thread inventory; uncertain ownership falls back
-to an explicit resume action. Persistence adds an optional provider-tagged
+Restoration reads metadata without resuming it, then reconnects the normal CLI
+to the saved conversation. Loaded daemon threads do not block restoration;
+the prompt mode offers an explicit resume action. Persistence adds an optional provider-tagged
 session reference while retaining legacy Claude fields and state version.
 
 ## Threading

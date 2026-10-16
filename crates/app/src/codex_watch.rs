@@ -40,11 +40,7 @@ pub struct CodexTab {
 pub enum Answer {
     Usage(Target, Result<AccountUsage, String>),
     Target(Target),
-    Resume(
-        TabId,
-        String,
-        Result<(serde_json::Value, Option<bool>), String>,
-    ),
+    Resume(TabId, String, Result<serde_json::Value, String>),
 }
 
 pub struct ReadyResume {

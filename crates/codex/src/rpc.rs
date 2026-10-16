@@ -25,11 +25,6 @@ impl Client {
         Self::spawn(target, &["app-server", "--listen", "stdio://"], cancel)
     }
 
-    /// Connect only to an existing shared daemon; never start or stop it.
-    pub fn observer(target: &Target, cancel: Arc<AtomicBool>) -> anyhow::Result<Self> {
-        Self::spawn(target, &["app-server", "proxy"], cancel)
-    }
-
     fn spawn(target: &Target, args: &[&str], cancel: Arc<AtomicBool>) -> anyhow::Result<Self> {
         let mut cmd = target.command(args);
         cmd.stdin(Stdio::piped())
@@ -178,36 +173,15 @@ pub fn inspect_session(
     target: &Target,
     id: &str,
     cancel: Arc<AtomicBool>,
-) -> anyhow::Result<(Value, Option<bool>)> {
+) -> anyhow::Result<Value> {
     if !crate::valid_session_id(id) {
         bail!("Invalid Codex session id")
     }
-    let mut client = Client::connect(target, cancel.clone())?;
-    let result = client.request("thread/read", json!({"threadId":id}))?;
-    drop(client);
-    // A standalone server cannot vouch for another process's runtime state.
-    // Failure to contact the shared daemon therefore remains unknown.
-    let live = Client::observer(target, cancel)
-        .and_then(|mut c| {
-            let mut cursor = Value::Null;
-            for _ in 0..100 {
-                let page = c.request("thread/loaded/list", json!({"cursor":cursor}))?;
-                let items = page
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .context("invalid loaded-thread list")?;
-                if items.iter().any(|v| v.as_str() == Some(id)) {
-                    return Ok(true);
-                }
-                cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
-                if cursor.is_null() {
-                    return Ok(false);
-                }
-            }
-            bail!("loaded-thread inventory exceeded page limit")
-        })
-        .ok();
-    Ok((result, live))
+    let mut client = Client::connect(target, cancel)?;
+    // Loaded threads may simply be retained by the shared daemon after a
+    // terminal disconnects. The regular CLI resume reconnects to them; a
+    // loaded-thread inventory is not evidence of another live frontend.
+    client.request("thread/read", json!({"threadId":id, "includeTurns":false}))
 }
 
 #[cfg(all(test, unix))]
@@ -315,18 +289,13 @@ done
         );
     }
     #[test]
-    fn restore_reads_metadata_and_all_inventory_pages_without_resuming() {
+    fn restore_reads_metadata_without_requiring_a_shared_daemon() {
         let fixture = Fixture::new(":");
         let sid = "01a144ed-3193-79d3-9569-4b9e28f3d9e4";
         let executable = PathBuf::from(&fixture.target.executable);
         let script = std::fs::read_to_string(&executable).unwrap();
         let handlers = format!(
-            r#"*'"method":"thread/read"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{sid}","cwd":"/work"}}}}}}' ;;
-    *'"method":"thread/loaded/list"'*)
-      case "$line" in
-        *'"cursor":"next"'*) printf '%s\n' '{{"id":3,"result":{{"data":["{sid}"]}}}}' ;;
-        *) printf '%s\n' '{{"id":2,"result":{{"data":["other"],"nextCursor":"next"}}}}' ;;
-      esac ;;
+            r#"*'"method":"thread/read"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{sid}","cwd":"/work","status":{{"type":"idle"}}}}}}}}' ;;
     "#
         );
         std::fs::write(
@@ -337,11 +306,12 @@ done
             ),
         )
         .unwrap();
-        let (metadata, live) = inspect_session(&fixture.target, sid, token()).unwrap();
+        let metadata = inspect_session(&fixture.target, sid, token()).unwrap();
         assert_eq!(metadata["thread"]["cwd"], "/work");
-        assert_eq!(live, Some(true));
+        assert_eq!(metadata["thread"]["status"]["type"], "idle");
         let requests = std::fs::read_to_string(fixture.path.join("requests")).unwrap();
-        assert!(requests.contains("next"));
+        assert!(requests.contains("\"includeTurns\":false"));
+        assert!(!requests.contains("thread/loaded/list"));
         assert!(!requests.contains("thread/resume"));
     }
 }

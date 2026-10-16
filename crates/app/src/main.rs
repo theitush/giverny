@@ -3180,18 +3180,14 @@ impl App {
             {
                 continue;
             }
-            let (metadata, live) = match result {
+            let metadata = match result {
                 Ok(v) => v,
                 Err(e) => {
+                    tracing::warn!("tab {id:?}: Codex restore failed: {e}");
                     self.codex.status = Some(format!("Codex restore: {e}"));
                     continue;
                 }
             };
-            if live == Some(true) {
-                self.codex.status =
-                    Some("Codex conversation is already loaded elsewhere; restore skipped.".into());
-                continue;
-            }
             let target = giverny_codex::Target {
                 executable: self.cfg.codex.executable.clone(),
                 home: saved.home.clone(),
@@ -3213,11 +3209,11 @@ impl App {
             let Some(command) = codex_watch::resume_command(&target, &sid, &cwd, shell) else {
                 continue;
             };
-            let automatic =
-                live == Some(false) && self.cfg.codex.restore == config::RestoreClaude::Auto;
+            let automatic = self.cfg.codex.restore == config::RestoreClaude::Auto;
             if automatic {
+                tracing::info!("tab {id:?}: resuming codex session {sid}");
                 self.pending_inject.push((
-                    Instant::now() + Duration::from_millis(100),
+                    Instant::now() + Duration::from_millis(1300),
                     id,
                     Inject::Raw(command),
                 ));
@@ -3537,6 +3533,7 @@ impl App {
             && session.provider == giverny_core::agent::AgentKind::Codex
         {
             if self.cfg.codex.enabled && self.cfg.codex.restore != config::RestoreClaude::Off {
+                tracing::debug!("tab {id:?}: inspecting saved Codex conversation for restore");
                 self.codex.inspect_restore(id, &session, ctx);
             }
             return;
@@ -4574,7 +4571,7 @@ fn codex_doctor() {
         cfg.usage_refresh_minutes
     );
     println!(
-        "  restore    {:?}; ambiguous ownership asks before resuming\n",
+        "  restore    {:?}; auto reconnects saved conversations on tab focus\n",
         cfg.restore
     );
     for sample in giverny_codex::usage::load_cache(
