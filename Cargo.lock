@@ -1426,6 +1426,7 @@ dependencies = [
  "signal-hook",
  "smithay-clipboard",
  "sysinfo",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "ureq",
