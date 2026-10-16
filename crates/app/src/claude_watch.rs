@@ -66,6 +66,10 @@ pub struct ClaudeTab {
     /// sure not to. See [`ClaudeWatch::apply_found_prompts`].
     heard: Vec<Heard>,
     last_hook: Option<Instant>,
+    /// When `last_hook` was heard, by the wall clock (ms since the epoch):
+    /// what a registry entry's `statusUpdatedAt` is told apart by, older
+    /// than what the hooks said or newer (giverny#443).
+    heard_at_ms: u64,
     seen_in_scan: bool,
 }
 
@@ -603,29 +607,54 @@ fn finished_kind(notification_type: &str) -> bool {
 /// the registry says what the session is doing right now, including the one
 /// state no hook marks the start of: blocked on the user (`waiting`).
 ///
+/// `heard`: when the last hook from this session was heard, by the wall
+/// clock — `None` for a session that has sent none, whose state the registry
+/// drives. With hooks, the registry speaks only where it is news: a status it
+/// wrote (`statusUpdatedAt`) after that hook. One written before is what the
+/// hooks have since told better — the `busy` a turn's start left in the file,
+/// read by a scan a moment before the `Stop` and applied just after it,
+/// re-opened the turn the `Stop` had closed, and nothing but the next hook
+/// ever closed it again: an idle tab spinning for hours (giverny#443).
+///
 /// `agents`: the turn that ended left delegated work running
 /// ([`ClaudeTab::agents`]). Claude Code's `busy` counts that work as the
 /// session working, so while it runs `busy` is no evidence of a new turn.
 fn merge_registry(
     current: ClaudeState,
-    hooks_own: bool,
+    heard: Option<u64>,
     agents: bool,
     live: &giverny_claude::registry::SessionEntry,
 ) -> ClaudeState {
+    let written = live.status_updated_at;
+    // Written after the last hook. A file that does not date its status
+    // (older Claude Code) is taken at its word, as it always was.
+    let news = heard.is_none_or(|heard| written == 0 || written > heard);
     // Working is evidence Claude is running again, so it clears a stale
     // flag — even under hook authority. A declined permission prompt emits
     // no hook to clear the one it raised, and a turn that ended before this
     // one left a tick behind that "finished" no longer describes. Not while
     // its subagents run on: that `busy` is theirs, and the tick for the turn
-    // they outlived stays (giverny#363).
-    if live.busy() && !agents && matches!(current, ClaudeState::NeedsYou | ClaudeState::DoneUnseen)
+    // they outlived stays (giverny#363). Not a `busy` older than the hook
+    // that raised the flag, either: that is the turn the flag ended.
+    if live.busy()
+        && news
+        && !agents
+        && matches!(current, ClaudeState::NeedsYou | ClaudeState::DoneUnseen)
     {
         return ClaudeState::Busy;
     }
-    if hooks_own {
+    if let Some(heard) = heard {
         // Hooks are authoritative for a session that emits them: they mark
         // the end of a turn exactly, and the registry must not re-open one it
-        // closed.
+        // closed. The one thing they can miss is that end: a `Stop` lost (the
+        // machine slept as it fired), or a turn interrupted, which sends
+        // none. The session back at its prompt since the last hook ends the
+        // turn the hooks still think runs. The timestamp must say so: an
+        // undated `idle` may be the one before the turn began.
+        let at_prompt = live.status == "idle" || live.background_shell();
+        if current == ClaudeState::Busy && at_prompt && written > heard {
+            return ClaudeState::DoneUnseen;
+        }
         return current;
     }
     match current {
@@ -638,6 +667,12 @@ fn merge_registry(
         _ if live.waiting() => ClaudeState::NeedsYou,
         _ => ClaudeState::Idle,
     }
+}
+
+/// Now, by the wall clock, in milliseconds since the epoch: what Claude Code
+/// dates a registry status by.
+fn now_ms() -> u64 {
+    u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0)
 }
 
 /// The place each of `sessions` is titled after (giverny#435), for those
@@ -1023,6 +1058,7 @@ impl ClaudeWatch {
         let account = self.account_of(config_dir.as_deref());
         let entry = self.tabs.entry(tab_id).or_default();
         entry.last_hook = Some(Instant::now());
+        entry.heard_at_ms = now_ms();
         if account.is_some() {
             entry.account = account;
         }
@@ -1224,7 +1260,7 @@ impl ClaudeWatch {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
                     });
-                    self.merge_scan(shell_pids, &mut effects);
+                    self.merge_scan(shell_pids, active, &mut effects);
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => self.scan_rx = None,
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -1397,7 +1433,12 @@ impl ClaudeWatch {
     }
 
     /// Fold the last scan into per-tab state.
-    fn merge_scan(&mut self, shell_pids: &HashMap<TabId, u32>, effects: &mut WatchEffects) {
+    fn merge_scan(
+        &mut self,
+        shell_pids: &HashMap<TabId, u32>,
+        active: Option<TabId>,
+        effects: &mut WatchEffects,
+    ) {
         for tab in self.tabs.values_mut() {
             tab.seen_in_scan = false;
         }
@@ -1499,9 +1540,18 @@ impl ClaudeWatch {
                 // started before install never fires them, and a global
                 // hooks-installed check would freeze such tabs; per-tab
                 // evidence keeps the registry driving exactly those.
-                let hooks_own = entry.last_hook.is_some();
+                let heard = entry.last_hook.map(|_| entry.heard_at_ms);
+                let hooks_own = heard.is_some();
                 let was = entry.state;
-                entry.state = merge_registry(entry.state, hooks_own, entry.agents, &live.entry);
+                entry.state = merge_registry(entry.state, heard, entry.agents, &live.entry);
+                // A turn the registry ended in the tab you are looking at is
+                // seen already, as a `Stop` there would have it.
+                if entry.state == ClaudeState::DoneUnseen
+                    && was != ClaudeState::DoneUnseen
+                    && active == Some(tab_id)
+                {
+                    entry.state = ClaudeState::Idle;
+                }
                 // Delegated work the last `Stop` reported runs for as long as
                 // the registry says `busy`; the first scan that says
                 // otherwise is its end, and the wave goes with it
@@ -2785,7 +2835,7 @@ mod tests {
 
         for target in ["6e7e56e0", "6e7e", "s-6e", "rust lines"] {
             w.scanned.attached = [(TAB, target.to_string())].into();
-            w.merge_scan(&HashMap::new(), &mut fx);
+            w.merge_scan(&HashMap::new(), None, &mut fx);
             w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
             assert_eq!(background(&w), ["34c55b2c"], "attached by {target:?}");
             assert_eq!(w.tab_of(&hook), Some(TAB), "attached by {target:?}");
@@ -2801,13 +2851,13 @@ mod tests {
         );
         feed(&mut w, &hook, None);
         assert_eq!(w.state_of(TAB), ClaudeState::Busy, "its hook is the tab's");
-        w.merge_scan(&HashMap::new(), &mut fx);
+        w.merge_scan(&HashMap::new(), None, &mut fx);
         assert_eq!(w.state_of(TAB), ClaudeState::Busy, "an attach is a claude");
 
         // Detached: the next scan finds no attach, and the hooks are old.
         w.scanned.attached.clear();
         w.tabs.get_mut(&TAB).unwrap().last_hook = Some(Instant::now() - Duration::from_secs(10));
-        w.merge_scan(&HashMap::new(), &mut fx);
+        w.merge_scan(&HashMap::new(), None, &mut fx);
         w.apply_jobs(jobs.clone(), &titles, &none, &mut fx);
         assert_eq!(
             background(&w),
@@ -2836,7 +2886,7 @@ mod tests {
 
         // Its claude switched jobs in the agents view and re-attached.
         w.scanned.attached = [(TAB, "34c55b2c".to_string())].into();
-        w.merge_scan(&HashMap::new(), &mut fx);
+        w.merge_scan(&HashMap::new(), None, &mut fx);
         w.apply_jobs(jobs, &titles, &opened, &mut fx);
         assert_eq!(w.viewing.get("34c55b2c"), Some(&TAB));
         assert_eq!(w.viewing.get("6e7e56e0"), None);
@@ -2905,6 +2955,18 @@ mod tests {
             r#"{{"pid":1,"sessionId":"s-1","status":"{status}"}}"#
         ))
         .expect("session fixture")
+    }
+
+    /// When the fixtures' last hook was heard, by the wall clock.
+    const HEARD: Option<u64> = Some(1_000_000);
+    /// A session no hook has been heard from.
+    const NO_HOOKS: Option<u64> = Option::None;
+
+    /// A registry entry whose status was written at `at` (ms).
+    fn dated(status: &str, at: u64) -> giverny_claude::registry::SessionEntry {
+        let mut entry = session(status);
+        entry.status_updated_at = at;
+        entry
     }
 
     #[test]
@@ -3226,7 +3288,7 @@ mod tests {
         };
         let shells = HashMap::from([(TAB, me)]);
         let read_back = |w: &mut ClaudeWatch| {
-            w.merge_scan(&shells, &mut WatchEffects::default());
+            w.merge_scan(&shells, None, &mut WatchEffects::default());
             let deadline = Instant::now() + Duration::from_secs(5);
             while w.prompt_of(TAB).is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -3292,7 +3354,11 @@ mod tests {
                 &hook("UserPromptSubmit", r#","prompt":"go on""#),
                 Some(TAB),
             );
-            w.merge_scan(&HashMap::from([(TAB, me)]), &mut WatchEffects::default());
+            w.merge_scan(
+                &HashMap::from([(TAB, me)]),
+                None,
+                &mut WatchEffects::default(),
+            );
             assert!(w.prompts_asked.contains_key("s-1"), "a read is asked");
             let deadline = Instant::now() + Duration::from_secs(5);
             while w.prompts_of(TAB).is_some_and(|p| p.len() < 3) && Instant::now() < deadline {
@@ -3330,12 +3396,12 @@ mod tests {
             ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
-        w.merge_scan(&shells, &mut WatchEffects::default());
+        w.merge_scan(&shells, None, &mut WatchEffects::default());
         let read = w.prompts_asked.get("s-2").copied();
         assert!(read.is_some());
         for _ in 0..3 {
             let mut fx = WatchEffects::default();
-            w.merge_scan(&shells, &mut fx);
+            w.merge_scan(&shells, None, &mut fx);
             assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-2"));
             assert_eq!(w.prompts_asked.get("s-2").copied(), read, "not read again");
             assert!(!w.prompts_asked.contains_key("s-1"));
@@ -3344,13 +3410,13 @@ mod tests {
 
         // The newer one ends: the tab goes back to the older.
         w.scanned.live.retain(|s| s.entry.session_id == "s-1");
-        w.merge_scan(&shells, &mut WatchEffects::default());
+        w.merge_scan(&shells, None, &mut WatchEffects::default());
         assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-1"));
 
         // With no start times to go by, the tab keeps the one it holds.
         w.scanned.live = vec![live("s-2", 0), live("s-1", 0)];
         for _ in 0..3 {
-            w.merge_scan(&shells, &mut WatchEffects::default());
+            w.merge_scan(&shells, None, &mut WatchEffects::default());
             assert_eq!(w.tabs[&TAB].session_id.as_deref(), Some("s-1"));
         }
     }
@@ -3402,7 +3468,7 @@ mod tests {
             ..ScanResult::default()
         };
         let shells = HashMap::from([(TAB, me)]);
-        w.merge_scan(&shells, &mut WatchEffects::default());
+        w.merge_scan(&shells, None, &mut WatchEffects::default());
         let deadline = Instant::now() + Duration::from_secs(5);
         while w.prompt_of(TAB).is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -3411,7 +3477,7 @@ mod tests {
         assert_eq!(w.prompt_of(TAB), Some("what changed\nsince friday"));
 
         // Read once per session, not on every scan.
-        w.merge_scan(&shells, &mut WatchEffects::default());
+        w.merge_scan(&shells, None, &mut WatchEffects::default());
         assert!(w.prompts_asked.contains_key("s-1"));
 
         // A hook's prompt is newer than the transcript's and is not replaced.
@@ -3457,49 +3523,176 @@ mod tests {
         // Hooks mark the end of a turn exactly. The registry may not re-open
         // one they closed — a session left with a background shell reads as
         // "shell" for as long as that shell lives, which is hours.
-        assert_eq!(merge_registry(Idle, true, false, &session("shell")), Idle);
-        assert_eq!(merge_registry(Idle, true, false, &session("busy")), Idle);
-        assert_eq!(merge_registry(Busy, true, false, &session("idle")), Busy);
+        assert_eq!(merge_registry(Idle, HEARD, false, &session("shell")), Idle);
+        assert_eq!(merge_registry(Idle, HEARD, false, &session("busy")), Idle);
+        assert_eq!(merge_registry(Busy, HEARD, false, &session("idle")), Busy);
         assert_eq!(
-            merge_registry(DoneUnseen, true, false, &session("idle")),
+            merge_registry(DoneUnseen, HEARD, false, &session("idle")),
             DoneUnseen
         );
         // The one exception: a working session clears a stale attention flag,
         // because declining a prompt emits no hook to clear it.
         assert_eq!(
-            merge_registry(NeedsYou, true, false, &session("busy")),
+            merge_registry(NeedsYou, HEARD, false, &session("busy")),
             Busy
         );
         assert_eq!(
-            merge_registry(NeedsYou, true, false, &session("idle")),
+            merge_registry(NeedsYou, HEARD, false, &session("idle")),
             NeedsYou
         );
         // ...unless the turn's subagents are what keeps it `busy`: the tick
         // for the turn they outlived stays (giverny#363).
         assert_eq!(
-            merge_registry(DoneUnseen, true, true, &session("busy")),
+            merge_registry(DoneUnseen, HEARD, true, &session("busy")),
             DoneUnseen
         );
-        assert_eq!(merge_registry(Idle, true, true, &session("busy")), Idle);
+        assert_eq!(merge_registry(Idle, HEARD, true, &session("busy")), Idle);
+    }
+
+    /// A dated registry status speaks under hook authority only where it is
+    /// newer than the last hook: the `busy` a turn's start wrote does not
+    /// re-open the turn its `Stop` closed, and an `idle` written after the
+    /// last hook ends a turn whose `Stop` never came (giverny#443).
+    #[test]
+    fn a_registry_status_older_than_the_hooks_is_old_news() {
+        use ClaudeState::*;
+        let heard = HEARD.unwrap();
+        let before = heard - 5_000;
+        let after = heard + 100;
+        // The stale `busy` a scan read just before the `Stop`.
+        assert_eq!(
+            merge_registry(DoneUnseen, HEARD, false, &dated("busy", before)),
+            DoneUnseen
+        );
+        assert_eq!(
+            merge_registry(NeedsYou, HEARD, false, &dated("busy", before)),
+            NeedsYou
+        );
+        // A `busy` written since: Claude Code working again (a declined
+        // prompt, a turn no hook announced).
+        assert_eq!(
+            merge_registry(NeedsYou, HEARD, false, &dated("busy", after)),
+            Busy
+        );
+        assert_eq!(
+            merge_registry(DoneUnseen, HEARD, false, &dated("busy", after)),
+            Busy
+        );
+        // Back at its prompt after the last hook: the turn is over.
+        assert_eq!(
+            merge_registry(Busy, HEARD, false, &dated("idle", after)),
+            DoneUnseen
+        );
+        assert_eq!(
+            merge_registry(Busy, HEARD, false, &dated("shell", after)),
+            DoneUnseen
+        );
+        // ...but not on the `idle` the turn began from, nor while it waits on
+        // you or still works.
+        assert_eq!(
+            merge_registry(Busy, HEARD, false, &dated("idle", before)),
+            Busy
+        );
+        assert_eq!(
+            merge_registry(Busy, HEARD, false, &dated("waiting", after)),
+            Busy
+        );
+        assert_eq!(
+            merge_registry(Busy, HEARD, false, &dated("busy", after)),
+            Busy
+        );
+        // A turn's end the hooks marked stays theirs.
+        assert_eq!(
+            merge_registry(Idle, HEARD, false, &dated("busy", after)),
+            Idle
+        );
+    }
+
+    /// The race behind giverny#443: a scan reads `busy` an instant before a
+    /// background tab's `Stop`, and is merged an instant after it. The tab
+    /// keeps its tick, and the `idle` Claude Code then writes changes
+    /// nothing. Without that `Stop` the same `idle` ends the turn, and in
+    /// the tab you look at it ends it seen.
+    #[test]
+    fn a_stale_busy_does_not_reopen_a_finished_turn() {
+        let mut w = ClaudeWatch::for_tests();
+        let me = std::process::id();
+        let shells = HashMap::from([(TAB, me)]);
+        let scan = |w: &mut ClaudeWatch, status: &str, at: u64, active: Option<TabId>| {
+            let mut live = dated(status, at);
+            live.pid = me;
+            w.scanned = ScanResult {
+                live: vec![registry::LiveSession {
+                    entry: live,
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-443"),
+                }],
+                ..ScanResult::default()
+            };
+            w.merge_scan(&shells, active, &mut WatchEffects::default());
+        };
+
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        let turn_began = now_ms();
+        scan(&mut w, "busy", turn_began, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+
+        std::thread::sleep(Duration::from_millis(5));
+        feed(&mut w, &hook("Stop", ""), None);
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        scan(&mut w, "busy", turn_began, None);
+        assert_eq!(
+            w.state_of(TAB),
+            ClaudeState::DoneUnseen,
+            "the busy the turn began with is not a new turn"
+        );
+        scan(&mut w, "idle", now_ms() + 1, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+
+        // A new turn whose `Stop` is lost: the `idle` written after its last
+        // hook ends it, unseen in the background...
+        feed(&mut w, &hook("UserPromptSubmit", ""), None);
+        let turn_began = now_ms();
+        scan(&mut w, "busy", turn_began, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        let heard = w.tabs[&TAB].heard_at_ms;
+        scan(&mut w, "idle", heard - 1, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy, "the idle before it");
+        scan(&mut w, "idle", now_ms() + 1, None);
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+
+        // ...and seen in the tab you are looking at.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        scan(&mut w, "idle", now_ms() + 1, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
     }
 
     #[test]
     fn without_hooks_the_registry_drives_every_state() {
         use ClaudeState::*;
-        assert_eq!(merge_registry(Idle, false, false, &session("busy")), Busy);
-        assert_eq!(merge_registry(Busy, false, false, &session("idle")), Idle);
+        assert_eq!(
+            merge_registry(Idle, NO_HOOKS, false, &session("busy")),
+            Busy
+        );
+        assert_eq!(
+            merge_registry(Busy, NO_HOOKS, false, &session("idle")),
+            Idle
+        );
         // A background shell leaves the agent idle: marked in the rail, not
         // spun.
-        assert_eq!(merge_registry(Busy, false, false, &session("shell")), Idle);
+        assert_eq!(
+            merge_registry(Busy, NO_HOOKS, false, &session("shell")),
+            Idle
+        );
         // A session blocked on a permission prompt with no hook to report it
         // used to read as idle: the flag now comes from the registry.
         assert_eq!(
-            merge_registry(Idle, false, false, &session("waiting")),
+            merge_registry(Idle, NO_HOOKS, false, &session("waiting")),
             NeedsYou
         );
         // Attention states are the user's to clear, not the registry's.
         assert_eq!(
-            merge_registry(DoneUnseen, false, false, &session("idle")),
+            merge_registry(DoneUnseen, NO_HOOKS, false, &session("idle")),
             DoneUnseen
         );
     }
@@ -3524,7 +3717,7 @@ mod tests {
                 }],
                 ..ScanResult::default()
             };
-            w.merge_scan(&shells, &mut WatchEffects::default());
+            w.merge_scan(&shells, None, &mut WatchEffects::default());
         };
         let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
         let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
@@ -3659,7 +3852,7 @@ mod tests {
                 }],
                 ..ScanResult::default()
             };
-            w.merge_scan(&shells, &mut WatchEffects::default());
+            w.merge_scan(&shells, None, &mut WatchEffects::default());
         };
         let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
         let worker_call = hook(
