@@ -2,16 +2,37 @@
 
 ## Unreleased
 
-- Codex tabs automatically reconnect to saved conversations even when the
-  shared daemon retains a loaded thread or its observer connection is unavailable.
+## v1.7.0 — 2026-10-17
 
-- Ctrl+click opens the complete URL across terminal soft wraps, including
-  when part of the link is in scrollback. Real newlines keep targets separate.
+- Codex CLI support alongside Claude Code: automatic installation/profile
+  detection, tab state and attention notifications, saved conversation restore,
+  and account usage meters. Compact meters show account names and the allowance
+  windows each provider reports, with vertical provider labels shown only for
+  detected accounts. Authentication stays in Codex; hook installation preserves
+  existing configuration and requires review in Codex. See [setup](docs/codex-integration.md).
+- Saved Codex tabs reconnect automatically when opened, including conversations
+  retained by the shared daemon. Restore waits for shell startup and stops when
+  you type; prompt and off modes remain available. (#18, #20)
+- A calmer rail: category-coloured marks, squares for shells, slow breathing
+  for working agents, clearer background activity and persistent unseen-finish
+  ticks. Rail animation can be disabled, and Claude's title spinner glyphs are
+  stripped by default. Compaction and stale registry updates no longer leave
+  misleading activity indicators. (#16)
+- Paste screenshots with Ctrl+V / Cmd+V. Images are saved as PNGs in private
+  temporary directories and their paths are pasted into the terminal; copied
+  text and files retain precedence. WSL can read images from the Windows
+  clipboard, and stalled clipboard reads time out. (#17, #18)
+- Ctrl+click opens the complete URL across terminal soft wraps, including when
+  part of the link is in scrollback. Unicode and terminal resize preserve link
+  hit positions; real newlines keep separate links apart. (#19)
+- The WSLg slow-mode notice offers `wsl --shutdown` without administrator
+  privileges first, followed by the service restart if needed, with separate
+  copy buttons. (#15)
+- Updates restart Giverny after installation finishes, and the welcome screen
+  shows the complete wrapped changelog. (#18)
 
-- Optional Codex CLI integration alongside Claude: tab state, attention and
-  completion notifications, conversation restore, and allowance meters with
-  automatic/manual refresh. Setup preserves existing hooks and leaves hook
-  trust and authentication with Codex. See [setup](docs/codex-integration.md).
+The rail, screenshot-paste and WSLg notice improvements were contributed by
+[@theitush](https://github.com/theitush) in #15, #16 and #17.
 
 ## v1.6.0 — 2026-10-14
 
