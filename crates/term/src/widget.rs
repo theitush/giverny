@@ -1280,24 +1280,11 @@ impl TabView {
             return;
         }
 
-        let text = session.row_text(line);
         let cwd = session.proc_cwd().unwrap_or_else(|| PathBuf::from("/"));
-        let Some(target) = crate::search::target_at(&text, col as usize, &cwd) else {
+        let Some((target, start, len)) = session.click_target_at(line, col, &cwd) else {
             return;
         };
-
-        // Underline the whole token: walk out from the cursor over non-space.
-        let chars: Vec<char> = text.chars().collect();
-        let start = (0..=col as usize)
-            .rev()
-            .take_while(|&i| !chars[i].is_whitespace())
-            .last()
-            .unwrap_or(col as usize);
-        let end = (col as usize..chars.len())
-            .take_while(|&i| !chars[i].is_whitespace())
-            .last()
-            .unwrap_or(col as usize);
-        self.hover_target = Some((target.clone(), line, start as u16, (end - start + 1) as u16));
+        self.hover_target = Some((target.clone(), line, start, len));
 
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
         if response.clicked() {

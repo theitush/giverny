@@ -281,8 +281,19 @@ impl TermSession {
             return String::new();
         }
         (0..grid.columns())
-            .map(|c| grid[Point::new(Line(row as i32), Column(c))].c)
+            .map(|c| grid[Point::new(Line(row as i32 - grid.display_offset() as i32), Column(c))].c)
             .collect()
+    }
+
+    /// Resolve printed URLs and paths across soft-wrapped terminal rows.
+    /// The span is the part on the hovered viewport row.
+    pub fn click_target_at(
+        &self,
+        row: u16,
+        col: u16,
+        cwd: &std::path::Path,
+    ) -> Option<(crate::search::ClickTarget, u16, u16)> {
+        printed_target_at(self.term.lock().grid(), row, col, cwd)
     }
 
     /// The OSC 8 hyperlink at a screen cell, and the run of cells sharing it.
@@ -292,29 +303,7 @@ impl TermSession {
     /// looking at the visible text finds it, so the cell metadata is the only
     /// place the link exists.
     pub fn hyperlink_at(&self, row: u16, col: u16) -> Option<(String, u16, u16)> {
-        use alacritty_terminal::grid::Dimensions;
-        use alacritty_terminal::index::{Column, Line, Point};
-        let term = self.term.lock();
-        let grid = term.grid();
-        if row as usize >= grid.screen_lines() || col as usize >= grid.columns() {
-            return None;
-        }
-        let at = |c: usize| grid[Point::new(Line(row as i32), Column(c))].hyperlink();
-        let here = at(col as usize)?;
-        let uri = here.uri().to_string();
-        // Underline the whole link, not the character under the pointer. Cells
-        // are one link when they carry the same id — two adjacent links with
-        // the same target stay separate, which is what the id is for.
-        let same = |c: usize| at(c).is_some_and(|h| h.id() == here.id());
-        let mut start = col as usize;
-        while start > 0 && same(start - 1) {
-            start -= 1;
-        }
-        let mut end = col as usize;
-        while end + 1 < grid.columns() && same(end + 1) {
-            end += 1;
-        }
-        Some((uri, start as u16, (end - start + 1) as u16))
+        hyperlink_at(self.term.lock().grid(), row, col)
     }
 
     /// Visible screen contents as text (row-major, newline-separated).
@@ -447,6 +436,121 @@ fn row_text(grid: &Grid, line: alacritty_terminal::index::Line, out: &mut String
     use alacritty_terminal::grid::Dimensions;
     out.clear();
     out.extend((0..grid.columns()).filter_map(|c| char_at(grid, line, c)));
+}
+
+/// OSC 8 metadata at viewport coordinates, including scrolled history.
+fn hyperlink_at(grid: &Grid, row: u16, col: u16) -> Option<(String, u16, u16)> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line, Point};
+    if row as usize >= grid.screen_lines() || col as usize >= grid.columns() {
+        return None;
+    }
+    let at = |c: usize| {
+        grid[Point::new(Line(row as i32 - grid.display_offset() as i32), Column(c))].hyperlink()
+    };
+    let here = at(col as usize)?;
+    let uri = here.uri().to_string();
+    // Underline the whole link, not the character under the pointer. Cells
+    // are one link when they carry the same id — two adjacent links with
+    // the same target stay separate, which is what the id is for.
+    let same = |c: usize| at(c).is_some_and(|h| h.id() == here.id());
+    let mut start = col as usize;
+    while start > 0 && same(start - 1) {
+        start -= 1;
+    }
+    let mut end = col as usize;
+    while end + 1 < grid.columns() && same(end + 1) {
+        end += 1;
+    }
+    Some((uri, start as u16, (end - start + 1) as u16))
+}
+
+/// Read one logical line, preserving the relationship between characters and
+/// terminal cells. Only WRAPLINE joins rows; explicit newlines stay separate.
+fn printed_target_at(
+    grid: &Grid,
+    row: u16,
+    col: u16,
+    cwd: &std::path::Path,
+) -> Option<(crate::search::ClickTarget, u16, u16)> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::cell::Flags;
+    let cols = grid.columns();
+    if row as usize >= grid.screen_lines() || col as usize >= cols {
+        return None;
+    }
+    let line = row as i32 - grid.display_offset() as i32;
+    let oldest = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let wraps = |line| {
+        grid[Point::new(Line(line), Column(cols - 1))]
+            .flags
+            .contains(Flags::WRAPLINE)
+    };
+    // Refuse pathological lines rather than opening a truncated URL or
+    // scanning the entire scrollback on every pointer movement.
+    const MAX_CELLS: usize = 65_536;
+    let mut first = line;
+    let mut last = line;
+    while first > oldest && wraps(first - 1) {
+        first -= 1;
+        if (last - first + 1) as usize * cols > MAX_CELLS {
+            return None;
+        }
+    }
+    while last < bottom && wraps(last) {
+        last += 1;
+        if (last - first + 1) as usize * cols > MAX_CELLS {
+            return None;
+        }
+    }
+    let mut text = String::new();
+    let mut cells = Vec::new();
+    let mut hovered = None;
+    for l in first..=last {
+        for c in 0..cols {
+            let cell = &grid[Point::new(Line(l), Column(c))];
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if l == line && c == col as usize {
+                    hovered = cells.len().checked_sub(1);
+                }
+                continue;
+            }
+            if l == line && c == col as usize {
+                hovered = Some(cells.len());
+            }
+            text.push(cell.c);
+            cells.push((l, c));
+            if let Some(extra) = cell.zerowidth() {
+                for ch in extra {
+                    text.push(*ch);
+                    cells.push((l, c));
+                }
+            }
+        }
+    }
+    let hovered = hovered?;
+    let target = crate::search::target_at(&text, hovered, cwd)?;
+    let range = crate::search::token_range(&text, hovered)?;
+    let mut span = cells[range]
+        .iter()
+        .filter(|(l, _)| *l == line)
+        .map(|(_, c)| *c);
+    let start = span.next()?;
+    let end = span.next_back().unwrap_or(start);
+    let width = if grid[Point::new(Line(line), Column(end))]
+        .flags
+        .contains(Flags::WIDE_CHAR)
+    {
+        2
+    } else {
+        1
+    };
+    Some((target, start as u16, (end + width - start) as u16))
 }
 
 /// Does a row's first cell have a background of its own?
@@ -650,6 +754,157 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text.trim_end().to_string())
             .collect()
+    }
+
+    fn printed(
+        t: &Term<VoidListener>,
+        row: u16,
+        col: u16,
+    ) -> Option<(crate::search::ClickTarget, u16, u16)> {
+        printed_target_at(t.grid(), row, col, std::path::Path::new("/"))
+    }
+
+    #[test]
+    fn every_part_of_a_wrapped_url_opens_the_whole_url() {
+        let url = "https://example.test/a/very/long/path?first=one&second=two#fragment";
+        let prefix = "visit ";
+        let text = format!("{prefix}{url} done");
+        let t = term(13, 10, text.as_bytes());
+        for i in prefix.len()..prefix.len() + url.len() {
+            let row = (i / 13) as u16;
+            let col = (i % 13) as u16;
+            let (target, start, len) = printed(&t, row, col).unwrap();
+            assert_eq!(
+                target,
+                crate::search::ClickTarget::Url(url.into()),
+                "cell {row}:{col}"
+            );
+            assert!(start <= col && col < start + len && start + len <= 13);
+        }
+    }
+
+    #[test]
+    fn wrapped_urls_reach_into_history_and_follow_the_scrolled_viewport() {
+        use alacritty_terminal::grid::Scroll;
+        let url = "https://example.test/very/long/path/with/many/segments/and/a/query?key=value";
+        let mut t = term(12, 3, url.as_bytes());
+        // The beginning is outside the viewport, but still in scrollback.
+        assert_eq!(
+            printed(&t, 0, 0).unwrap().0,
+            crate::search::ClickTarget::Url(url.into())
+        );
+        t.scroll_display(Scroll::Delta(2));
+        assert_eq!(
+            printed(&t, 0, 0).unwrap().0,
+            crate::search::ClickTarget::Url(url.into())
+        );
+    }
+
+    #[test]
+    fn wrapped_urls_survive_terminal_resize() {
+        let url = "https://example.test/a/long/path?first=one&second=two";
+        let mut t = term(20, 12, url.as_bytes());
+        t.resize(TermSize::new(11, 12));
+        // Reflow can push the start into history while keeping the cursor
+        // in place. Test the actual viewport cells, before and after scrolling.
+        for _ in 0..2 {
+            let rows = texts(&t);
+            for (row, text) in rows.iter().enumerate() {
+                for col in 0..text.chars().count() {
+                    assert_eq!(
+                        printed(&t, row as u16, col as u16).unwrap().0,
+                        crate::search::ClickTarget::Url(url.into())
+                    );
+                }
+            }
+            t.scroll_display(alacritty_terminal::grid::Scroll::Top);
+        }
+    }
+
+    #[test]
+    fn oversized_logical_lines_are_not_opened_as_partial_urls() {
+        let url = format!("https://example.test/{}", "a".repeat(70_000));
+        let t = term(16, 4, url.as_bytes());
+        assert!(printed(&t, 0, 0).is_none());
+    }
+
+    #[test]
+    fn osc8_links_keep_the_full_target_when_wrapped_and_scrolled() {
+        use alacritty_terminal::grid::Scroll;
+        let url = "https://example.test/the/complete/target";
+        let label = "a label spread across several terminal rows";
+        let mut t = term(
+            10,
+            3,
+            format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\").as_bytes(),
+        );
+        assert_eq!(hyperlink_at(t.grid(), 0, 0).unwrap().0, url);
+        t.scroll_display(Scroll::Top);
+        assert_eq!(hyperlink_at(t.grid(), 0, 0).unwrap().0, url);
+        assert!(hyperlink_at(t.grid(), u16::MAX, 0).is_none());
+    }
+
+    #[test]
+    fn actual_newlines_do_not_join_adjacent_urls() {
+        let a = "https://one.test/";
+        let b = "https://two.test/";
+        let t = term(a.len(), 4, format!("{a}\r\n{b}").as_bytes());
+        assert_eq!(
+            printed(&t, 0, 9).unwrap().0,
+            crate::search::ClickTarget::Url(a.into())
+        );
+        assert_eq!(
+            printed(&t, 1, 9).unwrap().0,
+            crate::search::ClickTarget::Url(b.into())
+        );
+    }
+
+    #[test]
+    fn wide_and_combining_characters_keep_url_cell_positions() {
+        let url = "https://example.test/a/long/path";
+        let t = term(14, 8, format!("日e\u{301} {url}").as_bytes());
+        // 日 takes two cells, the combining accent none: URL starts at 4.
+        for i in 4..4 + url.len() {
+            assert_eq!(
+                printed(&t, (i / 14) as u16, (i % 14) as u16).unwrap().0,
+                crate::search::ClickTarget::Url(url.into())
+            );
+        }
+        assert!(printed(&t, 0, 0).is_none());
+    }
+
+    #[test]
+    fn a_wide_character_wrapping_early_does_not_split_a_url() {
+        let url = "https://a.test/日本語/path";
+        let t = term(16, 8, url.as_bytes());
+        // 日 begins on the second row: the last cell of the first is a
+        // leading wide-character spacer, not a space in the URL.
+        assert_eq!(
+            printed(&t, 1, 0).unwrap().0,
+            crate::search::ClickTarget::Url(url.into())
+        );
+        assert_eq!(
+            printed(&t, 1, 1).unwrap().0,
+            crate::search::ClickTarget::Url(url.into())
+        );
+    }
+
+    #[test]
+    fn multiple_links_on_a_wrapped_line_stay_separate() {
+        let a = "https://one.test/long/path";
+        let b = "https://two.test/another/path";
+        let t = term(17, 6, format!("({a}), [{b}]").as_bytes());
+        assert_eq!(
+            printed(&t, 1, 0).unwrap().0,
+            crate::search::ClickTarget::Url(a.into())
+        );
+        let i = a.len() + 5 + 8;
+        assert_eq!(
+            printed(&t, (i / 17) as u16, (i % 17) as u16).unwrap().0,
+            crate::search::ClickTarget::Url(b.into())
+        );
+        assert!(printed(&t, 0, 0).is_none());
+        assert!(printed(&t, u16::MAX, u16::MAX).is_none());
     }
 
     #[test]
