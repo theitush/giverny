@@ -829,6 +829,19 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_uses_the_visible_link_instead_of_the_live_screen() {
+        let a = "https://history.test/link";
+        let b = "https://current.test/link";
+        let mut t = term(40, 3, format!("{a}\r\nplain\r\nmore\r\n{b}").as_bytes());
+        assert!(printed(&t, 0, 0).is_none());
+        t.scroll_display(alacritty_terminal::grid::Scroll::Top);
+        assert_eq!(
+            printed(&t, 0, 0).unwrap().0,
+            crate::search::ClickTarget::Url(a.into())
+        );
+    }
+
+    #[test]
     fn osc8_links_keep_the_full_target_when_wrapped_and_scrolled() {
         use alacritty_terminal::grid::Scroll;
         let url = "https://example.test/the/complete/target";
@@ -839,6 +852,9 @@ mod tests {
             format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\").as_bytes(),
         );
         assert_eq!(hyperlink_at(t.grid(), 0, 0).unwrap().0, url);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut t, b"\r\nplain\r\nmore\r\nlast");
+        assert!(hyperlink_at(t.grid(), 0, 0).is_none());
         t.scroll_display(Scroll::Top);
         assert_eq!(hyperlink_at(t.grid(), 0, 0).unwrap().0, url);
         assert!(hyperlink_at(t.grid(), u16::MAX, 0).is_none());
