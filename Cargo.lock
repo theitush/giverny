@@ -1402,6 +1402,8 @@ name = "giverny"
 version = "1.6.0"
 dependencies = [
  "anyhow",
+ "arboard",
+ "base64 0.22.1",
  "crossbeam-channel",
  "dirs",
  "eframe",
@@ -1416,6 +1418,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "png",
  "pollster",
  "raw-window-handle",
  "serde",
