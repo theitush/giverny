@@ -16,7 +16,32 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
     pub claude: ClaudeConfig,
+    pub codex: CodexConfig,
     pub update: UpdateConfig,
+}
+
+/// Automatically discovered Codex integration. Authentication stays in Codex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    pub enabled: bool,
+    pub executable: String,
+    /// Empty means CODEX_HOME, then the user's .codex directory.
+    pub home: String,
+    pub restore: RestoreClaude,
+    pub usage_refresh_minutes: u64,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            executable: "codex".into(),
+            home: String::new(),
+            restore: RestoreClaude::Auto,
+            usage_refresh_minutes: 10,
+        }
+    }
 }
 
 /// How Claude Code itself is launched in a tab.
@@ -190,7 +215,8 @@ impl Default for UsageConfig {
 #[serde(default)]
 pub struct UpdateConfig {
     /// Ask GitHub once a day whether a newer release exists. This is the
-    /// only network request Giverny makes; set false to make it zero.
+    /// only direct network request Giverny makes. Codex usage refreshes
+    /// optionally ask the Codex helper to contact OpenAI.
     pub check: bool,
 }
 
@@ -277,7 +303,7 @@ impl Default for RailConfig {
 pub struct BehaviorConfig {
     /// Re-run `claude --resume` for restored tabs: `auto`, `prompt`, `off`.
     pub restore_claude: RestoreClaude,
-    /// Desktop notifications when Claude needs you.
+    /// Desktop notifications when an agent needs attention.
     pub notifications: bool,
     /// Scrollback lines kept per tab.
     pub scrollback_lines: usize,

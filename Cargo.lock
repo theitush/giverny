@@ -1409,6 +1409,7 @@ dependencies = [
  "eframe",
  "egui",
  "giverny-claude",
+ "giverny-codex",
  "giverny-core",
  "giverny-term",
  "jiff",
@@ -1450,6 +1451,16 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.19",
  "tracing",
+]
+
+[[package]]
+name = "giverny-codex"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

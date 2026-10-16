@@ -19,12 +19,17 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `behavior.scrollback_lines` | `10000` | Lines kept above the screen, per tab. |
 | `behavior.history_per_tab` | `false` | Each tab's shell keeps its own history, back when the tab is restored. |
 | `behavior.history_also_shared` | `false` | With history per terminal, also append each command to the usual history (bash). |
-| `behavior.notifications` | `true` | Notify when Claude needs you in a background tab. |
+| `behavior.notifications` | `true` | Notify when an agent needs you, or Codex finishes in a background tab. |
 | `behavior.prefer_x11` | `false` | Run under X11/XWayland instead of Wayland. Takes effect on restart. |
 | `behavior.restore_claude` | `"auto"` | Re-run `claude --resume` in restored tabs. One of: auto, prompt, off. |
 | `behavior.windows_shell` | `"auto"` | Which shell a new tab opens on Windows. One of: auto, wsl, powershell, cmd. |
 | `behavior.restore_apps` | 26 programs | Full-screen programs a restored tab may start again by itself. |
 | `behavior.extra_profile_dirs` | `[]` | Account directories kept somewhere Giverny would not find on its own. Takes effect on restart. |
+| `codex.enabled` | `true` | Show detected Codex accounts and usage automatically. Turn off to disable integration. |
+| `codex.executable` | `"codex"` | Executable name on PATH, or an explicit path. |
+| `codex.home` | `""` | Empty uses CODEX_HOME, then the default .codex directory. |
+| `codex.restore` | `"auto"` | Auto restores when ownership is known; prompt asks first; off skips restore. One of: auto, prompt, off. |
+| `codex.usage_refresh_minutes` | `10` | Minutes between Codex usage requests. Zero means manual refresh only. |
 | `claude.auto_mode` | `false` | Every new Claude session starts in auto mode instead of asking for each permission. |
 | `claude.skip_resume_summary` | `false` | Skip Claude Code's offer to resume from a summary, and resume the full session. |
 | `claude.resume_after_limit` | `false` | Pick a session back up when the usage window that stopped it reopens. |

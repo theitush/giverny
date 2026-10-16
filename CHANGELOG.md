@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Optional Codex CLI integration alongside Claude: tab state, attention and
+  completion notifications, conversation restore, and allowance meters with
+  automatic/manual refresh. Setup preserves existing hooks and leaves hook
+  trust and authentication with Codex. See [setup](docs/codex-integration.md).
+
 ## v1.6.0 — 2026-10-14
 
 The second-launch raise, the tab walk and every fix below but the last are

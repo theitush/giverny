@@ -3,6 +3,7 @@
 mod capture;
 mod chrome;
 mod claude_watch;
+mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
@@ -441,6 +442,9 @@ fn release_own_console() {}
 
 fn scrub_inherited_claude_markers() {
     const MARKERS: &[&str] = &[
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_TOOL_CALL_ID",
         "CLAUDECODE",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_ENTRYPOINT",
@@ -470,7 +474,7 @@ fn scrub_inherited_claude_markers() {
         unsafe { std::env::remove_var(key) };
     }
     eprintln!(
-        "giverny: cleared {} inherited Claude session marker(s) so tabs start clean",
+        "giverny: cleared {} inherited agent session marker(s) so tabs start clean",
         inherited.len()
     );
 }
@@ -478,14 +482,15 @@ fn scrub_inherited_claude_markers() {
 /// `giverny --help`, and what an unknown command prints to stderr.
 const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      USAGE:\n  giverny            launch the terminal\n  \
-     giverny doctor     diagnose Claude integration\n  \
+     giverny doctor     diagnose Claude and Codex integration\n  \
      giverny welcome [from-version]\n                     \
      print the welcome screen\n  \
      giverny update     check for a newer release\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
-     giverny relay      (internal) Claude Code hook entrypoint\n  \
+     giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
+     giverny relay      (internal) agent hook entrypoint\n  \
      giverny statusline (internal) Claude Code statusline entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
@@ -507,6 +512,13 @@ fn main() -> eframe::Result {
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
             giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            return Ok(());
+        }
+        Some("codex-hooks") => {
+            if let Err(err) = codex_hooks_cli() {
+                eprintln!("giverny: {err:#}");
+                std::process::exit(1);
+            }
             return Ok(());
         }
         Some("statusline") => {
@@ -889,6 +901,9 @@ pub enum Action {
     SetCategoryColor(CategoryId, usize),
     MoveTab(TabId, CategoryId),
     InstallHooks,
+    CodexHooks(giverny_codex::Target, bool),
+    RefreshCodexUsage,
+    ConfirmCodexResume(TabId),
     DismissHooksBanner,
     DismissWslgSlow,
     SetCategoryProfile(CategoryId, Option<PathBuf>),
@@ -954,7 +969,13 @@ pub struct UpdateJob {
     /// Something has run in the tab's shell. Until then an empty foreground
     /// is the command not having been typed yet, not the install having ended.
     seen_running: bool,
+    /// When the new binary appeared on disk.
+    landed: Option<Instant>,
 }
+
+/// How long the installer gets to finish after the binary lands (the desktop
+/// entry, the PATH note) before Giverny restarts into the new version anyway.
+const UPDATE_FINISH_GRACE: Duration = Duration::from_secs(30);
 
 /// How long an install that was never seen running gets before it counts as
 /// over: one that fails at once (no network) finishes between two looks.
@@ -1068,6 +1089,7 @@ pub struct App {
     state_dirty: bool,
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
+    pub codex: codex_watch::CodexWatch,
     pub hooks_banner_dismissed: bool,
     /// WSLg lost its shared memory with Windows and the window lags:
     /// the commands that fix it, the no-administrator one first, said in the
@@ -1576,6 +1598,29 @@ impl App {
         );
         // Events spooled while the app was closed: keep session captures.
         for msg in &spooled {
+            if msg.provider == "codex" {
+                if cfg.codex.enabled
+                    && msg.hook_event() == Some("SessionStart")
+                    && let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg)
+                    && let Some(tab) = ws.tab_mut(id)
+                    && let (Some(sid), Some(home), Some(cwd)) = (
+                        msg.session_id(),
+                        msg.config_dir.as_ref(),
+                        msg.event.get("cwd").and_then(|v| v.as_str()),
+                    )
+                    && giverny_codex::valid_session_id(sid)
+                {
+                    tab.agent_session = Some(giverny_core::agent::AgentSession {
+                        provider: giverny_core::agent::AgentKind::Codex,
+                        id: sid.into(),
+                        home: home.into(),
+                        cwd: cwd.into(),
+                        wsl_distro: msg.wsl_distro.clone().or_else(|| tab.wsl_distro.clone()),
+                    });
+                    tab.claude_session = None;
+                }
+                continue;
+            }
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else {
                 continue;
             };
@@ -1611,6 +1656,10 @@ impl App {
             })
         })
         .flatten();
+        let codex = codex_watch::CodexWatch::new(
+            &cfg.codex,
+            Some(paths.base().join("state/codex-usage.json")),
+        );
         let mut app = App {
             shared,
             ws,
@@ -1623,6 +1672,7 @@ impl App {
             state_dirty: false,
             last_save: Instant::now(),
             claude,
+            codex,
             hooks_banner_dismissed: false,
             wslg_slow: wslg_slow_mode(),
             pending_inject: Vec::new(),
@@ -1924,13 +1974,27 @@ impl App {
             }
             Action::Respawn(id) => {
                 self.spawn_session(ctx, id, None);
-                self.queue_resume(id);
+                self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
             Action::InstallHooks => match self.claude.install_hooks() {
                 Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
                 Err(e) => tracing::error!("hook install: {e}"),
             },
+            Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
+            Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
+            Action::ConfirmCodexResume(id) => {
+                if let Some(ready) = self.codex.pending_restore.remove(&id)
+                    && self
+                        .ws
+                        .tab(id)
+                        .and_then(|t| t.agent_session.as_ref())
+                        .is_some_and(|s| s.id == ready.session_id)
+                    && let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref())
+                {
+                    session.write(ready.command);
+                }
+            }
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
             Action::DismissWslgSlow => self.wslg_slow = None,
             Action::SetCategoryProfile(id, dir) => {
@@ -1953,11 +2017,11 @@ impl App {
                 let ring = |k: usize| order[(start + k) % order.len()];
                 let pick = (0..order.len())
                     .map(ring)
-                    .find(|&t| self.claude.state_of(t) == ClaudeState::NeedsYou)
+                    .find(|&t| self.agent_state(t) == ClaudeState::NeedsYou)
                     .or_else(|| {
                         (0..order.len())
                             .map(ring)
-                            .find(|&t| self.claude.state_of(t) == ClaudeState::DoneUnseen)
+                            .find(|&t| self.agent_state(t) == ClaudeState::DoneUnseen)
                     });
                 if let Some(id) = pick {
                     self.apply(ctx, Action::Select(id));
@@ -2155,6 +2219,7 @@ impl App {
                             tab: id,
                             started: Instant::now(),
                             seen_running: false,
+                            landed: None,
                         });
                         self.update_stalled = false;
                     }
@@ -2263,6 +2328,24 @@ impl App {
             .and_then(|c| c.profile_dir.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
         let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
+        if let Some(saved) = self.ws.tab(id).and_then(|t| t.agent_session.as_ref())
+            && let Some(distro) = &saved.wsl_distro
+        {
+            shape.shell = Some(wsl_shell(
+                distro,
+                wsl::default_distro().as_deref(),
+                saved.cwd.to_str(),
+            ));
+            shape.in_wsl = true;
+            shape.config_dir = None;
+            shape.env.push((
+                "WSLENV".into(),
+                wslenv(
+                    std::env::var("WSLENV").ok(),
+                    &["GIVERNY_TAB_ID", "GIVERNY_NONCE"],
+                ),
+            ));
+        }
         let in_wsl = shape.in_wsl;
         // A WSL shell is a world of its own — its paths, its home — and is
         // left with the history it has.
@@ -2654,10 +2737,10 @@ impl App {
     fn show_attention(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         use claude_watch::ClaudeState;
         let waiting = self
-            .claude
+            .ws
             .tabs
-            .values()
-            .filter(|t| t.state == ClaudeState::NeedsYou)
+            .iter()
+            .filter(|t| self.agent_state(t.id) == ClaudeState::NeedsYou)
             .count();
         if waiting == self.attention {
             return;
@@ -2952,6 +3035,9 @@ impl App {
         {
             tracing::info!("window.opacity: restart Giverny to make the window see-through");
         }
+        if self.cfg.codex != cfg.codex {
+            self.codex.configure(&cfg.codex);
+        }
         self.cfg = cfg;
         tracing::info!("config reloaded");
     }
@@ -3054,6 +3140,101 @@ impl App {
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     fn handle_wayland_drag(&mut self, _ctx: &egui::Context) {}
 
+    pub fn agent_state(&self, id: TabId) -> giverny_core::agent::AgentState {
+        let codex = self.codex.state_of(id);
+        if codex != giverny_core::agent::AgentState::None {
+            codex
+        } else {
+            self.claude.state_of(id)
+        }
+    }
+
+    fn tick_codex(&mut self, ctx: &egui::Context) {
+        self.codex
+            .tabs
+            .retain(|id, _| self.ws.tab(*id).is_some_and(|t| !t.exited));
+        self.codex
+            .pending_restore
+            .retain(|id, _| self.ws.tab(*id).is_some());
+        for answer in self.codex.answers() {
+            let codex_watch::Answer::Resume(id, sid, result) = answer else {
+                continue;
+            };
+            if self.codex.restoring.remove(&id).as_deref() != Some(&sid) || !self.cfg.codex.enabled
+            {
+                continue;
+            }
+            let Some(saved) = self
+                .ws
+                .tab(id)
+                .and_then(|t| t.agent_session.as_ref())
+                .filter(|s| s.id == sid)
+            else {
+                continue;
+            };
+            if self
+                .rt
+                .get(&id)
+                .and_then(|rt| rt.session.as_ref())
+                .is_none_or(|s| s.had_user_input())
+            {
+                continue;
+            }
+            let (metadata, live) = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    self.codex.status = Some(format!("Codex restore: {e}"));
+                    continue;
+                }
+            };
+            if live == Some(true) {
+                self.codex.status =
+                    Some("Codex conversation is already loaded elsewhere; restore skipped.".into());
+                continue;
+            }
+            let target = giverny_codex::Target {
+                executable: self.cfg.codex.executable.clone(),
+                home: saved.home.clone(),
+                wsl_distro: saved.wsl_distro.clone(),
+            };
+            let cwd = metadata["thread"]["cwd"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| saved.cwd.clone());
+            let shell = if cfg!(windows) && saved.wsl_distro.is_none() {
+                if self.cfg.behavior.windows_shell == config::WindowsShell::Cmd {
+                    codex_watch::ResumeShell::Cmd
+                } else {
+                    codex_watch::ResumeShell::PowerShell
+                }
+            } else {
+                codex_watch::ResumeShell::Posix
+            };
+            let Some(command) = codex_watch::resume_command(&target, &sid, &cwd, shell) else {
+                continue;
+            };
+            let automatic =
+                live == Some(false) && self.cfg.codex.restore == config::RestoreClaude::Auto;
+            if automatic {
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(100),
+                    id,
+                    Inject::Raw(command),
+                ));
+            } else {
+                self.codex.pending_restore.insert(
+                    id,
+                    codex_watch::ReadyResume {
+                        id,
+                        session_id: sid,
+                        command,
+                    },
+                );
+            }
+        }
+        self.codex.refresh(false, ctx);
+    }
+
     fn claude_env(&self) -> Vec<(String, String)> {
         claude_env(&self.cfg.claude)
     }
@@ -3153,6 +3334,21 @@ impl App {
             })
             .collect();
         for (id, cmd) in seen {
+            if self.cfg.codex.enabled && self.ws.tab(id).is_some_and(|t| t.wsl_distro.is_none()) {
+                let running = cmd.as_deref().is_some_and(giverny_codex::is_codex_command);
+                if running {
+                    let entry = self.codex.tabs.entry(id).or_default();
+                    if entry.state == giverny_core::agent::AgentState::None {
+                        entry.state = giverny_core::agent::AgentState::Idle;
+                    }
+                } else if cmd.is_none()
+                    && self.codex.tabs.remove(&id).is_some()
+                    && let Some(tab) = self.ws.tab_mut(id)
+                {
+                    tab.agent_session = None;
+                    self.state_dirty = true;
+                }
+            }
             // A command seen in front last time and gone now has finished.
             // Only one seen this run: see `fg_running`.
             let running = cmd.is_some();
@@ -3196,6 +3392,7 @@ impl App {
     /// the unseen-finish badge alike.
     fn mark_seen(&mut self, id: TabId) {
         self.claude.mark_viewed(id);
+        self.codex.attended(id);
         self.unseen_done.remove(&id);
     }
 
@@ -3204,7 +3401,9 @@ impl App {
     /// rail then wears the tick beside its spinner.
     fn note_unseen_turns(&mut self) {
         for t in &self.ws.tabs {
-            if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen {
+            if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
+                || self.codex.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
+            {
                 self.unseen_done.insert(t.id);
             }
         }
@@ -3213,6 +3412,7 @@ impl App {
 
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
         self.reload_config_if_changed(ctx);
+        self.tick_codex(ctx);
         if let Some(welcome) = self.welcome.take() {
             self.open_welcome(ctx, &welcome);
         }
@@ -3249,6 +3449,13 @@ impl App {
             self.update_installed =
                 update::binary_mtime().is_some_and(|at| Some(at) != self.exe_mtime);
         }
+        if self.update_finished() {
+            // Taken first, so a restart that fails to spawn is not retried
+            // every refresh; the rail's restart button stays for that case.
+            self.update_job = None;
+            self.apply(ctx, Action::RestartNow);
+            return;
+        }
         self.persist_font_size();
         self.track_foreground();
         self.follow_update_job();
@@ -3260,6 +3467,21 @@ impl App {
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
         }
+    }
+
+    /// The installer replaced the binary and is done with its tab: its shell
+    /// is back at the prompt, the tab was closed, or it has had long enough.
+    /// Restarting is then the only thing left, so it happens without asking.
+    fn update_finished(&mut self) -> bool {
+        if !self.update_installed || self.closing {
+            return false;
+        }
+        let Some(job) = &mut self.update_job else {
+            return false;
+        };
+        let landed = *job.landed.get_or_insert_with(Instant::now);
+        let idle = self.ws.tab(job.tab).is_none_or(|t| t.foreground.is_none());
+        idle || landed.elapsed() > UPDATE_FINISH_GRACE
     }
 
     /// Notice an install that ended without the binary changing: its tab was
@@ -3290,7 +3512,7 @@ impl App {
     fn queue_app_restore(&mut self, id: TabId) {
         let Some(tab) = self.ws.tab(id) else { return };
         // A tab with a Claude session resumes that instead.
-        if tab.claude_session.is_some() {
+        if tab.claude_session.is_some() || tab.agent_session.is_some() {
             return;
         }
         let Some(cmd) = tab.foreground.clone() else {
@@ -3310,7 +3532,15 @@ impl App {
     }
 
     /// Queue the auto-resume command for a freshly restored tab.
-    fn queue_resume(&mut self, id: TabId) {
+    fn queue_resume(&mut self, id: TabId, ctx: &egui::Context) {
+        if let Some(session) = self.ws.tab(id).and_then(|t| t.agent_session.clone())
+            && session.provider == giverny_core::agent::AgentKind::Codex
+        {
+            if self.cfg.codex.enabled && self.cfg.codex.restore != config::RestoreClaude::Off {
+                self.codex.inspect_restore(id, &session, ctx);
+            }
+            return;
+        }
         let Some(sid) = self.session_to_resume(id) else {
             return;
         };
@@ -3486,6 +3716,15 @@ impl App {
             };
             if let Some(dir) = &profile_dir {
                 env.push(("GIVERNY_PROFILE_DIR".into(), dir.display().to_string()));
+            }
+            if self.cfg.codex.enabled && !self.cfg.codex.home.is_empty() {
+                env.push((
+                    "CODEX_HOME".into(),
+                    giverny_codex::Target::native(&self.cfg.codex.executable, &self.cfg.codex.home)
+                        .home
+                        .display()
+                        .to_string(),
+                ));
             }
             return TabShape {
                 shell,
@@ -3740,11 +3979,54 @@ impl eframe::App for App {
                 .is_some_and(|prev| prev != seq)
             {
                 self.claude.mark_attended(id);
+                self.codex.attended(id);
+                self.codex.pending_restore.remove(&id);
+                self.codex.restoring.remove(&id);
                 self.unseen_done.remove(&id);
             }
         }
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        for msg in effects.codex {
+            let Some(id) = claude_watch::ClaudeWatch::tab_id_of(&msg) else {
+                continue;
+            };
+            let Some(tab) = self.ws.tab(id) else { continue };
+            let distro = msg.wsl_distro.clone().or_else(|| tab.wsl_distro.clone());
+            let before = self.codex.state_of(id);
+            if let Some(captured) = self
+                .codex
+                .handle(&msg, id, distro, self.ws.active == Some(id))
+                && let Some(tab) = self.ws.tab_mut(id)
+            {
+                tab.agent_session = captured;
+                tab.claude_session = None;
+                self.claude.tabs.remove(&id);
+                self.state_dirty = true;
+            }
+            let after = self.codex.state_of(id);
+            if self.cfg.behavior.notifications
+                && self.ws.active != Some(id)
+                && after != before
+                && matches!(
+                    after,
+                    giverny_core::agent::AgentState::NeedsYou
+                        | giverny_core::agent::AgentState::DoneUnseen
+                )
+            {
+                let summary = if after == giverny_core::agent::AgentState::NeedsYou {
+                    "Codex needs you"
+                } else {
+                    "Codex finished"
+                };
+                desktop_notify(summary.into(), titles.get(&id).cloned().unwrap_or_default());
+            }
+        }
+        if let Some(active) = self.ws.active
+            && self.codex.state_of(active) == giverny_core::agent::AgentState::DoneUnseen
+        {
+            self.codex.attended(active);
+        }
         self.show_attention(&ctx, frame);
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
         // Not while coming forward, which maps the window again anyway: the
@@ -3763,6 +4045,10 @@ impl eframe::App for App {
         self.note_unseen_turns();
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
+                if session.is_some() {
+                    tab.agent_session = None;
+                    self.codex.tabs.remove(&id);
+                }
                 tab.claude_session = session;
                 if config_dir.is_some() {
                     tab.claude_config_dir = config_dir;
@@ -3936,7 +4222,7 @@ impl eframe::App for App {
                 self.spawn_session(&ctx, active, preseed);
                 // The tab had a live Claude conversation — resume it; or a
                 // full-screen app worth starting again.
-                self.queue_resume(active);
+                self.queue_resume(active, &ctx);
                 self.queue_app_restore(active);
             }
 
@@ -4205,11 +4491,132 @@ fn restore_report(profs: &[giverny_claude::profiles::Profile]) {
     }
 }
 
+fn codex_hooks_cli() -> anyhow::Result<()> {
+    let enabled = match std::env::args().nth(2).as_deref() {
+        Some("install") => true,
+        Some("remove") => false,
+        _ => anyhow::bail!("usage: giverny codex-hooks install|remove"),
+    };
+    let args: Vec<_> = std::env::args().skip(3).collect();
+    let enable_integration = enabled && args.as_slice() == ["--enable"];
+    if !args.is_empty() && !enable_integration {
+        anyhow::bail!("usage: giverny codex-hooks install [--enable] | remove");
+    }
+    let paths = Paths::default_dirs();
+    let cfg = config::load_checked(paths.base(), &config::Config::default())
+        .map_err(anyhow::Error::msg)?
+        .config
+        .codex;
+    let mut target = giverny_codex::Target::native(&cfg.executable, &cfg.home);
+    if let Some((distro, home)) = wsl::split_unc(&target.home) {
+        target.wsl_distro = Some(distro);
+        target.home = home.into();
+    }
+    #[cfg(unix)]
+    if enabled {
+        giverny_claude::hooks::point_link()?;
+    }
+    let path = codex_watch::CodexWatch::hook_path(&target);
+    let command = codex_watch::CodexWatch::hook_command(&target);
+    giverny_codex::hooks::set_installed(&path, &command, enabled)?;
+    if enable_integration {
+        giverny_core::settings::write(
+            paths.base(),
+            giverny_core::settings::by_key("codex.enabled").unwrap(),
+            &giverny_core::settings::Value::Bool(true),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    println!(
+        "{} Giverny hooks in {}",
+        if enabled { "Installed" } else { "Removed" },
+        path.display()
+    );
+    if enabled {
+        println!(
+            "Review and trust these hooks using /hooks in Codex, then restart Codex. Enable integration in Giverny Settings if it is not already enabled."
+        );
+    }
+    Ok(())
+}
+
+fn codex_doctor() {
+    let cfg = config::load_checked(Paths::default_dirs().base(), &config::Config::default())
+        .map(|p| p.config.codex)
+        .unwrap_or_default();
+    println!(
+        "codex        {}",
+        if cfg.enabled {
+            "enabled"
+        } else {
+            "disabled (enable in Settings > codex)"
+        }
+    );
+    let target = giverny_codex::Target::native(&cfg.executable, &cfg.home);
+    println!("  executable {}", target.executable);
+    println!(
+        "  version    {}",
+        giverny_codex::version(&target).unwrap_or_else(|e| format!("unavailable: {e}"))
+    );
+    println!("  home       {}", target.home.display());
+    let hooks = codex_watch::CodexWatch::hook_path(&target);
+    println!(
+        "  hooks      {} (trust is reviewed inside Codex with /hooks)",
+        if giverny_codex::hooks::installed(&hooks, &codex_watch::CodexWatch::hook_command(&target))
+        {
+            "installed"
+        } else {
+            "not installed or command changed"
+        }
+    );
+    println!(
+        "  usage      refresh every {} min; authentication owned by Codex",
+        cfg.usage_refresh_minutes
+    );
+    println!(
+        "  restore    {:?}; ambiguous ownership asks before resuming\n",
+        cfg.restore
+    );
+    for sample in giverny_codex::usage::load_cache(
+        &Paths::default_dirs().base().join("state/codex-usage.json"),
+    ) {
+        let age = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(sample.sampled_at);
+        println!(
+            "  usage cache {}: {} window(s), {}m old",
+            sample.target.home.display(),
+            sample.windows.len(),
+            age / 60
+        );
+    }
+    if let Some(state) = state::load(&Paths::default_dirs()) {
+        for tab in state
+            .workspace
+            .tabs
+            .iter()
+            .filter(|t| t.agent_session.is_some())
+        {
+            let session = tab.agent_session.as_ref().unwrap();
+            println!(
+                "  saved tab {}: {:?} {} in {}",
+                tab.id.0,
+                session.provider,
+                session.id,
+                session.cwd.display()
+            );
+        }
+    }
+}
+
 /// `giverny doctor` — print exactly what the app sees of your Claude setup.
 fn doctor() {
     use giverny_claude::{hooks, profiles, registry, usage};
 
     println!("giverny doctor {}\n", update::CURRENT);
+    codex_doctor();
     let running = app_is_running();
     println!(
         "app          {}\n",

@@ -51,12 +51,22 @@ pub fn partly_installed_in(settings_path: &Path) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayMsg {
+    #[serde(default = "claude_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub wsl_distro: Option<String>,
+    #[serde(default)]
+    pub emitted_at: Option<u64>,
     /// `$GIVERNY_TAB_ID` as inherited by the hook (absent outside Giverny).
     pub tab_id: Option<String>,
     /// `$CLAUDE_CONFIG_DIR` — which account profile the session runs under.
     pub config_dir: Option<String>,
     /// The raw hook payload.
     pub event: serde_json::Value,
+}
+
+fn claude_provider() -> String {
+    "claude".into()
 }
 
 impl RelayMsg {
@@ -146,8 +156,39 @@ pub fn run_relay(spool: &Path) {
     };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let msg = RelayMsg {
+        provider: if std::env::args()
+            .skip_while(|s| s != "--provider")
+            .nth(1)
+            .as_deref()
+            == Some("codex")
+        {
+            "codex"
+        } else {
+            "claude"
+        }
+        .into(),
+        emitted_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        ),
+        wsl_distro: std::env::args().skip_while(|s| s != "--wsl-distro").nth(1),
         tab_id: Some(tab_id),
-        config_dir: account_dir(),
+        config_dir: if std::env::args()
+            .skip_while(|s| s != "--provider")
+            .nth(1)
+            .as_deref()
+            == Some("codex")
+        {
+            std::env::args()
+                .skip_while(|s| s != "--home")
+                .nth(1)
+                .or_else(|| std::env::var("CODEX_HOME").ok())
+        } else {
+            account_dir()
+        },
         event,
     };
     deliver(&msg, spool);
@@ -637,6 +678,9 @@ pub fn run_statusline(spool: &Path) {
         event.insert("session_id".into(), sid.clone());
     }
     let msg = RelayMsg {
+        provider: claude_provider(),
+        wsl_distro: None,
+        emitted_at: None,
         tab_id: std::env::var("GIVERNY_TAB_ID").ok(),
         config_dir: account_dir(),
         event: serde_json::Value::Object(event),

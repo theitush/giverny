@@ -17,20 +17,7 @@ use giverny_claude::usage::{self, AccountUsage};
 use giverny_claude::wsl;
 use giverny_core::tabs::TabId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ClaudeState {
-    /// No Claude running in this tab.
-    #[default]
-    None,
-    /// Claude open, waiting at its prompt.
-    Idle,
-    /// Claude is working.
-    Busy,
-    /// Claude needs the user (permission / question / agent input).
-    NeedsYou,
-    /// Claude finished while the tab was in the background.
-    DoneUnseen,
-}
+pub use giverny_core::agent::AgentState as ClaudeState;
 
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeTab {
@@ -356,6 +343,7 @@ impl LiveUsage {
 /// Side effects for the app to apply after a tick.
 #[derive(Default)]
 pub struct WatchEffects {
+    pub codex: Vec<RelayMsg>,
     /// `(tab, session_id, config_dir)` — `None` session means it ended.
     pub captured: Vec<(TabId, Option<String>, Option<PathBuf>)>,
     /// Desktop notifications to fire: `(summary, body)`.
@@ -861,6 +849,10 @@ impl ClaudeWatch {
         tab_title: &str,
         effects: &mut WatchEffects,
     ) {
+        if msg.provider == "codex" {
+            effects.codex.push(msg.clone());
+            return;
+        }
         // Statusline pushes carry usage, not tab state.
         if msg.hook_event() == Some(hooks::STATUSLINE_EVENT) {
             self.apply_statusline(msg);
