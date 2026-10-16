@@ -187,7 +187,6 @@ pub fn inspect_session(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -203,7 +202,10 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).unwrap();
-            let executable = path.join("codex-fixture");
+            // Read the generated script through a stable interpreter. Executing
+            // the script directly can race another test's fork while its
+            // writable descriptor is inherited briefly (Linux ETXTBSY).
+            let executable = path.join("app-server");
             std::fs::write(&executable,format!(r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_HOME/requests"
@@ -214,10 +216,9 @@ while IFS= read -r line; do
   esac
 done
 "#)).unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self {
                 target: Target {
-                    executable: executable.to_string_lossy().into_owned(),
+                    executable: "/bin/sh".into(),
                     home: path.clone(),
                     wsl_distro: None,
                 },
@@ -292,7 +293,7 @@ done
     fn restore_reads_metadata_without_requiring_a_shared_daemon() {
         let fixture = Fixture::new(":");
         let sid = "01a144ed-3193-79d3-9569-4b9e28f3d9e4";
-        let executable = PathBuf::from(&fixture.target.executable);
+        let executable = fixture.path.join("app-server");
         let script = std::fs::read_to_string(&executable).unwrap();
         let handlers = format!(
             r#"*'"method":"thread/read"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{sid}","cwd":"/work","status":{{"type":"idle"}}}}}}}}' ;;
