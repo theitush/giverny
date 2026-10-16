@@ -1311,13 +1311,18 @@ pub fn build_with(
         // What a Next up row waits for is read off every row, drawn or not:
         // the task it was planned after may have no worker yet.
         let waits: Vec<Option<Wait>> = rows.iter().map(|r| planned_wait(r, &rows)).collect();
+        let order = start_order(&rows, &waits);
         let mut kept: Vec<_> = rows
             .into_iter()
             .zip(waits)
-            .filter(|(r, _)| drawn.keeps(r))
+            .zip(order)
+            .filter(|((r, _), _)| drawn.keeps(r))
             .collect();
-        keep_done(&mut kept, done, |(r, _)| r.stage);
-        let (mut rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().unzip();
+        // Next up in the order its rows will start, the next on top
+        // (giverny#442); Running and Done as they were.
+        kept.sort_by_key(|(_, o)| *o);
+        keep_done(&mut kept, done, |((r, _), _)| r.stage);
+        let (mut rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().map(|(rw, _)| rw).unzip();
         reditto(&mut rows);
         let written = feed.and_then(|f| f.written_ms);
         let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
@@ -1377,8 +1382,9 @@ fn benched(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> bool {
     }
 }
 
-/// Move the [`benched`] rows to the head of Next up, keeping every other
-/// row where it was, and ditto again ([`PaneRow::ditto`]) where rows moved.
+/// Move the [`benched`] rows to Next up, keeping every other row where it
+/// was, and ditto again ([`PaneRow::ditto`]) where rows moved. Where in Next
+/// up a benched row is drawn is its own wait's call ([`start_order`]).
 fn bench(rows: &mut [PaneRow<'_, SubagentRow>], now_ms: u64) {
     let mut moved = false;
     for row in rows.iter_mut() {
@@ -1390,7 +1396,7 @@ fn bench(rows: &mut [PaneRow<'_, SubagentRow>], now_ms: u64) {
     if !moved {
         return;
     }
-    // Stable: a benched row was above every Next up row, and stays so.
+    // Stable: every other row keeps its place.
     rows.sort_by_key(|r| r.stage);
     reditto(rows);
 }
@@ -1982,6 +1988,30 @@ pub struct Wait {
     pub held: Option<String>,
     /// The row's hover line (giverny#423): the note, and why it is there.
     pub why: String,
+    /// Where it stands in line to start ([`start_order`]).
+    pub start: Start,
+    /// The task it waits for (`after <key>`), if any.
+    pub after: Option<String>,
+}
+
+/// Where a Next up row stands in line to start (giverny#442), first to
+/// last: the pane draws Next up in this order, the one that starts next on
+/// top ([`start_order`]); rows of one place keep their plan order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Start {
+    /// Its lease is granted, or it was started: it waits only for its
+    /// worker.
+    Ready,
+    /// Queued in the machine ledger, at this place (1-based; one with no
+    /// place known goes after the rest).
+    Queued(u64),
+    /// Nothing recorded to wait for: its manager's to start.
+    Idle,
+    /// After another task ([`Wait::after`]), and after that task's row when
+    /// it is in Next up too.
+    After,
+    /// Held or paused: it starts only on a person's or its manager's call.
+    SetAside,
 }
 
 /// What a Next up row waits for (giverny#282). A planned task may wait only
@@ -1998,12 +2028,14 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
         return None;
     }
     let f = row.feed;
-    let waits = |note: String, why: String| {
+    let waits = |note: String, why: String, start: Start| {
         Some(Wait {
             note,
             idle_since: None,
             held: None,
             why,
+            start,
+            after: None,
         })
     };
     if let Some(why) = f.and_then(|f| f.held.clone()) {
@@ -2012,24 +2044,33 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
             idle_since: None,
             why: format!("held — not started; waiting for: {why}"),
             held: Some(why),
+            start: Start::SetAside,
+            after: None,
         });
     }
     // A Running row benched for want of a worker ([`benched`]): a paused
-    // one says since when ([`format_row`]).
-    if f.is_some_and(|f| f.stage() == Stage::Running) {
+    // one says since when ([`format_row`]), and is set aside.
+    if let Some(f) = f.filter(|f| f.stage() == Stage::Running) {
         return waits(
             NO_WORKER_YET.to_string(),
             format!("{NO_WORKER_YET} — started, but no worker has picked it up"),
+            if f.paused_since_ms.is_some() {
+                Start::SetAside
+            } else {
+                Start::Ready
+            },
         );
     }
     let lease = f.and_then(|f| f.lease.as_ref());
     if let Some(l) = lease.filter(|l| l.state == LeaseState::Queued) {
-        return waits(queued_note(l), queued_why(l));
+        let place = l.position.unwrap_or(u64::MAX);
+        return waits(queued_note(l), queued_why(l), Start::Queued(place));
     }
     if lease.is_some_and(|l| l.uncollected) {
         return waits(
             GRANTED_WAITING.to_string(),
             format!("{GRANTED_WAITING} — its lease is granted; its manager is to start it"),
+            Start::Ready,
         );
     }
     // The task it was planned after: waited for until it is drawn Done; one
@@ -2037,15 +2078,23 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
     let before = f
         .and_then(|f| f.after.as_deref())
         .and_then(|a| rows.iter().find(|r| r.feed.is_some_and(|f| f.key == a)));
+    let after = |k: &str, note: String, why: String| {
+        Some(Wait {
+            after: Some(k.to_string()),
+            ..waits(note, why, Start::After)?
+        })
+    };
     if let Some(r) = before.filter(|r| r.stage != Stage::Done) {
         let k = r.feed.map_or("", |f| f.key.as_str());
-        return waits(
+        return after(
+            k,
             format!("after {k}"),
             format!("after {k} — starts when that lands"),
         );
     }
     if let Some(k) = &row.after_key {
-        return waits(
+        return after(
+            k,
             format!("after {k}"),
             format!("after {k} — starts when its worker is done with that"),
         );
@@ -2060,12 +2109,60 @@ fn planned_wait(row: &PaneRow<'_, SubagentRow>, rows: &[PaneRow<'_, SubagentRow>
     .into_iter()
     .flatten()
     .max();
+    // A lease already granted: it waits only for its worker.
+    let granted = lease.is_some_and(|l| l.state != LeaseState::Queued);
     Some(Wait {
         note: String::new(),
         idle_since: since,
         held: None,
         why: IDLE_WHY.to_string(),
+        start: if granted { Start::Ready } else { Start::Idle },
+        after: None,
     })
+}
+
+/// Each row's place in the pane's drawing order (giverny#442): its section,
+/// then, in Next up, where it stands in line to start ([`Wait::start`]) and
+/// how deep in a chain of `after`s it sits. A row after another Next up row
+/// goes after that row: no sooner than its place, one deeper, so it is set
+/// aside too behind a held one. Sorted on stably, rows of one place keep
+/// their plan order; across managers the ledger's places decide.
+fn start_order(
+    rows: &[PaneRow<'_, SubagentRow>],
+    waits: &[Option<Wait>],
+) -> Vec<(Stage, Start, usize)> {
+    fn place(
+        i: usize,
+        rows: &[PaneRow<'_, SubagentRow>],
+        waits: &[Option<Wait>],
+        seen: &mut Vec<usize>,
+    ) -> (Start, usize) {
+        let Some(w) = &waits[i] else {
+            return (Start::Idle, 0);
+        };
+        let before = w.after.as_deref().and_then(|k| {
+            rows.iter()
+                .position(|r| r.stage == Stage::Planned && r.feed.is_some_and(|f| f.key == k))
+        });
+        match before {
+            // A loop of `after`s is no chain: its rows keep their own place.
+            Some(j) if !seen.contains(&j) && j != i => {
+                seen.push(i);
+                let (start, depth) = place(j, rows, waits, seen);
+                (start.max(w.start), depth + 1)
+            }
+            _ => (w.start, usize::from(w.after.is_some())),
+        }
+    }
+    (0..rows.len())
+        .map(|i| match rows[i].stage {
+            Stage::Planned => {
+                let (start, depth) = place(i, rows, waits, &mut Vec::new());
+                (Stage::Planned, start, depth)
+            }
+            s => (s, Start::Ready, 0),
+        })
+        .collect()
 }
 
 /// The hover of a Next up row that waits on nothing recorded
@@ -3612,6 +3709,115 @@ mod tests {
         assert_eq!(why("284-idle"), [IDLE_WHY]);
     }
 
+    /// The Next up keys, top to bottom.
+    fn next_up(t: &Table) -> Vec<&str> {
+        t.lines
+            .iter()
+            .filter(|l| l.stage == Stage::Planned)
+            .map(|l| l.id.as_str())
+            .collect()
+    }
+
+    /// giverny#442: Next up reads in the order its rows will start, the
+    /// next on top, whatever order they were planned in.
+    #[test]
+    fn next_up_reads_in_the_order_its_rows_start() {
+        let at = |m: u64| ts(T0 + m * 60_000);
+        let json = format!(
+            r#"{{"version":1,"rows":[
+              {{"key":"501-held","stage":"planned","planned":"{p}","held":"your answer"}},
+              {{"key":"502-after2","stage":"planned","planned":"{p}","after":"503-after1"}},
+              {{"key":"503-after1","stage":"planned","planned":"{p}","after":"100-run"}},
+              {{"key":"504-idle-a","stage":"planned","planned":"{p}"}},
+              {{"key":"505-q2","stage":"planned","planned":"{p}",
+                "lease":{{"state":"queued","position":2,"ram_mb":3072}}}},
+              {{"key":"506-paused","stage":"running","started":"{p}","paused_since":"{paused}"}},
+              {{"key":"507-q1","stage":"planned","planned":"{p}",
+                "lease":{{"state":"queued","position":1,"ram_mb":3072}}}},
+              {{"key":"508-granted","stage":"planned","planned":"{p}",
+                "lease":{{"state":"granted","ram_mb":3072,"uncollected":true}}}},
+              {{"key":"509-no-worker","stage":"running","started":"{p}"}},
+              {{"key":"510-idle-b","stage":"planned","planned":"{p}"}},
+              {{"key":"511-after-held","stage":"planned","planned":"{p}","after":"501-held"}},
+              {{"key":"512-leased","stage":"planned","planned":"{p}",
+                "lease":{{"state":"granted","ram_mb":3072,"granted_at":"{p}"}}}},
+              {{"key":"513-after-done","stage":"planned","planned":"{p}","after":"099-done"}},
+              {{"key":"100-run","stage":"running","started":"{fresh}"}},
+              {{"key":"099-done","stage":"done","started":"{p}","ended":"{p}"}}]}}"#,
+            p = at(0),
+            paused = at(5),
+            fresh = at(29),
+        );
+        let t = build(Some(&feed(&json)), &[], T0 + 30 * 60_000);
+        assert_eq!(
+            next_up(&t),
+            [
+                // Started, or granted: each waits only for its worker, in
+                // plan order (a benched row, started, by its own wait).
+                "509-no-worker",
+                "508-granted",
+                "512-leased",
+                // The machine ledger's queue, #1 first.
+                "507-q1",
+                "505-q2",
+                // Nothing to wait for, in plan order (a task whose
+                // prerequisite landed waits on nothing).
+                "504-idle-a",
+                "510-idle-b",
+                "513-after-done",
+                // After another task, chained.
+                "503-after1",
+                "502-after2",
+                // Held and paused last, and what waits on a held row after it.
+                "506-paused",
+                "501-held",
+                "511-after-held",
+            ]
+        );
+        let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&"100-run"), "Running stays on top");
+        assert_eq!(ids.last(), Some(&"099-done"), "Done stays below");
+    }
+
+    /// A row `--after` another Next up row goes after it, even when it was
+    /// planned first; a loop of `after`s keeps its rows' own places.
+    #[test]
+    fn a_row_after_another_next_up_row_goes_below_it() {
+        let at = |m: u64| ts(T0 + m * 60_000);
+        let json = format!(
+            r#"{{"version":1,"rows":[
+              {{"key":"c","stage":"planned","planned":"{p}","after":"b"}},
+              {{"key":"b","stage":"planned","planned":"{p}","after":"a"}},
+              {{"key":"a","stage":"planned","planned":"{p}",
+                "lease":{{"state":"queued","position":1,"ram_mb":1024}}}},
+              {{"key":"x","stage":"planned","planned":"{p}","after":"y"}},
+              {{"key":"y","stage":"planned","planned":"{p}","after":"x"}}]}}"#,
+            p = at(0),
+        );
+        let t = build(Some(&feed(&json)), &[], T0 + 30 * 60_000);
+        assert_eq!(next_up(&t), ["a", "b", "c", "x", "y"]);
+    }
+
+    /// Dittos follow the rows to their new places: a worker's two Next up
+    /// rows brought together by the order read as one worker's.
+    #[test]
+    fn next_up_rows_are_dittoed_where_they_land() {
+        let f = feed(
+            r#"{"rows":[
+              {"key":"g#1","stage":"planned","agent_id":"a1","eta_s":600},
+              {"key":"g#2","stage":"planned","agent_id":"a1","eta_s":600,
+                "lease":{"state":"queued","position":1,"ram_mb":1024}},
+              {"key":"g#3","stage":"planned","eta_s":600,
+                "lease":{"state":"queued","position":2,"ram_mb":1024}},
+              {"key":"g#4","stage":"planned","agent_id":"a1","eta_s":600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &[], T0);
+        assert_eq!(next_up(&t), ["g#2", "g#3", "g#1", "g#4"]);
+        let ditto: Vec<bool> = t.lines.iter().map(|l| l.eta == "\"").collect();
+        assert_eq!(ditto, [false, false, false, true]);
+    }
+
     #[test]
     fn a_done_rows_hover_says_how_it_went_against_its_estimate() {
         use feed::Against;
@@ -4542,8 +4748,9 @@ mod tests {
 
     /// giverny#334: a task nobody works on is Next up, not Running. A
     /// Running row with no worker that its manager paused or held, or never
-    /// gave a worker, is drawn under Next up — above the rows planned there
-    /// already — with why, never in amber; only the one not set aside is a
+    /// gave a worker, is drawn under Next up — in its place in line to
+    /// start (giverny#442): one set aside below the rest — with why, never
+    /// in amber; only the one not set aside is a
     /// chore. A worker that handed its row back and a row paused rather
     /// than landed waits there too. A worker that failed, or stopped on an
     /// API error, keeps its row Running for the person to see.
@@ -4566,10 +4773,10 @@ mod tests {
         assert_eq!(
             order,
             [
-                ("acme#700", Stage::Planned),
-                ("acme#701", Stage::Planned),
                 ("acme#702", Stage::Planned),
                 ("acme#703", Stage::Planned),
+                ("acme#700", Stage::Planned),
+                ("acme#701", Stage::Planned),
             ]
         );
         assert!(!t.any_running());
