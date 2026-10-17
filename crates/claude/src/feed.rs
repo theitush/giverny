@@ -195,8 +195,13 @@ pub struct RowUsage {
     pub cpu_s: u64,
     /// Wall time over every run, seconds.
     pub wall_s: u64,
-    /// Runs the memory cap killed.
+    /// Runs the memory cap killed, ever: the history counts them.
     pub oom_kills: u64,
+    /// The OOM is still news: the latest run was killed by the memory cap
+    /// and no fresh, bigger grant came since (`oom_open`, giverny#452). A
+    /// row from before reads open only when its last run exited as the
+    /// kill does (137, with a kill counted).
+    pub oom_open: bool,
     pub last_cmd: Option<String>,
     pub last_exit: Option<i64>,
     pub last_peak_mb: Option<u64>,
@@ -205,6 +210,21 @@ pub struct RowUsage {
     pub cap_ram_mb: Option<u64>,
     /// The last run was capped by a systemd scope (else ran plain).
     pub capped: bool,
+}
+
+/// The exit `giverny manage run` records for a command the OOM killer took:
+/// 128 + SIGKILL.
+pub const OOM_EXIT: i64 = 137;
+
+/// Whether a row's `usage` holds an OOM still open ([`RowUsage::oom_open`]).
+pub fn oom_open(u: &Value) -> bool {
+    match u.get("oom_open").and_then(Value::as_bool) {
+        Some(open) => open,
+        None => {
+            u64_field(u, "oom_kills").unwrap_or(0) > 0
+                && i64_field(u, "last_exit") == Some(OOM_EXIT)
+        }
+    }
 }
 
 fn parse_usage(v: &Value) -> Option<RowUsage> {
@@ -218,6 +238,7 @@ fn parse_usage(v: &Value) -> Option<RowUsage> {
         cpu_s: u64_field(u, "cpu_s").unwrap_or(0),
         wall_s: u64_field(u, "wall_s").unwrap_or(0),
         oom_kills: u64_field(u, "oom_kills").unwrap_or(0),
+        oom_open: oom_open(u),
         last_cmd: str_field(u, "last_cmd"),
         last_exit: i64_field(u, "last_exit"),
         last_peak_mb: u64_field(u, "last_peak_mb"),
@@ -2619,6 +2640,29 @@ mod tests {
         .unwrap();
         assert_eq!(cache.poll_any(&dir, &ids).unwrap().rows[0].key, "n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#452: `oom_open` says whether the latest run's OOM is still
+    /// news; a row from before reads open only when its last run exited as
+    /// the kill does.
+    #[test]
+    fn an_oom_is_open_by_its_flag_else_by_the_last_exit() {
+        let open = |u: &str| oom_open(&serde_json::from_str::<Value>(u).unwrap());
+        assert!(
+            !open(r#"{"oom_kills":1,"last_exit":0,"runs":16}"#),
+            "poly's 138"
+        );
+        assert!(open(r#"{"oom_kills":1,"last_exit":137}"#));
+        assert!(
+            !open(r#"{"oom_kills":0,"last_exit":137}"#),
+            "a plain kill -9"
+        );
+        assert!(!open(r#"{"oom_kills":1}"#));
+        assert!(!open(r#"{"oom_kills":2,"last_exit":137,"oom_open":false}"#));
+        assert!(open(r#"{"oom_kills":1,"last_exit":0,"oom_open":true}"#));
+        let v = serde_json::json!({"usage":{"oom_kills":3,"last_exit":137}});
+        let u = parse_usage(&v).unwrap();
+        assert_eq!((u.oom_kills, u.oom_open), (3, true));
     }
 
     #[test]

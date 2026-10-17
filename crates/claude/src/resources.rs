@@ -2262,7 +2262,10 @@ pub fn annotate_row(feed_dir: &Path, session: &str, task: &str, lease: Option<Va
         return;
     };
     match lease {
-        Some(v) => row.insert("lease".into(), v),
+        Some(v) => {
+            crate::manage_run::close_oom_on_grant(row, &v);
+            row.insert("lease".into(), v)
+        }
         None => row.remove("lease"),
     };
     let _ = manage::write(&file, &doc);

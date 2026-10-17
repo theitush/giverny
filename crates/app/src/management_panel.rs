@@ -1052,6 +1052,10 @@ fn usage_fact(u: &RowUsage) -> String {
             s.push_str(", ");
         }
         s.push_str(&format!("OOM-killed x{}", u.oom_kills));
+        // A later clean run or a bigger grant closed it (giverny#452).
+        if !u.oom_open {
+            s.push_str(" earlier");
+        }
     }
     s
 }
@@ -1721,7 +1725,7 @@ fn format_row(
     // The cell is the row's use: a Running row's commands now,
     // a Done row's memory peak alone.
     let measured = f.and_then(|f| f.usage.as_ref());
-    let oom = measured.is_some_and(|u| u.oom_kills > 0) && row.stage != Stage::Planned;
+    let oom = measured.is_some_and(|u| u.oom_open) && row.stage != Stage::Planned;
     // Running and Done rows always have a cell, zero when nothing is going
     // or was measured; Next up rows say what they wait for in NOW instead.
     let peak = measured.and_then(|u| u.peak_mb);
@@ -5403,6 +5407,37 @@ mod tests {
         assert_eq!(mem4(1_572_864), "1.5T");
     }
 
+    /// giverny#452: the OOM mark is the latest run's, not the row's past. A
+    /// row whose OOM was followed by a clean run (here an old-format row,
+    /// poly's 138: `oom_kills` 1, `last_exit` 0) draws none and says the
+    /// kill was earlier; one whose last run was killed draws it.
+    #[test]
+    fn an_oom_followed_by_a_clean_run_draws_no_mark() {
+        let json = r#"{"session":"s","rows":[
+            {"key":"poly#138","stage":"running","eta_s":1800,"started":1790000000000,
+             "usage":{"runs":16,"peak_mb":9000,"oom_kills":1,"last_exit":0,"last_peak_mb":239}},
+            {"key":"poly#139","stage":"running","eta_s":1800,"started":1790000000000,
+             "usage":{"runs":2,"peak_mb":3000,"oom_kills":1,"last_exit":137}},
+            {"key":"poly#140","stage":"running","eta_s":1800,"started":1790000000000,
+             "usage":{"runs":3,"peak_mb":3000,"oom_kills":2,"last_exit":137,"oom_open":false}}]}"#;
+        let t = build(Some(&feed(json)), &[], T0 + 60_000);
+        let line = |k: &str| t.lines.iter().find(|l| l.click.key == k).unwrap();
+        assert!(!line("poly#138").oom);
+        assert!(!line("poly#138").usage.contains("OOM"));
+        assert!(
+            line("poly#138")
+                .click
+                .facts
+                .iter()
+                .any(|f| f.ends_with("OOM-killed x1 earlier")),
+            "{:?}",
+            line("poly#138").click.facts
+        );
+        assert!(line("poly#139").oom, "an old row whose last run was killed");
+        assert!(line("poly#139").usage.starts_with("OOM"));
+        assert!(!line("poly#140").oom, "closed by a bigger grant");
+    }
+
     /// A Running row's cell is what its commands use now, not
     /// its lease; a Done row's is its memory peak alone.
     #[test]
@@ -5415,7 +5450,7 @@ mod tests {
             {"key":"demo#13","stage":"running","started":1790000000000,
              "lease":{"state":"granted","id":"s:demo#13","cpu":1,"ram_mb":128,
                       "granted_at":1790000000000},
-             "usage":{"runs":1,"peak_mb":128,"oom_kills":1}},
+             "usage":{"runs":1,"peak_mb":128,"oom_kills":1,"oom_open":true}},
             {"key":"demo#14","stage":"done","started":1790000000000,"ended":1790000600000,
              "usage":{"runs":2,"peak_mb":512}},
             {"key":"demo#15","stage":"done","started":1790000000000,"ended":1790000600000}]}"#;
