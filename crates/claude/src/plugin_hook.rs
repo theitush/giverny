@@ -16,7 +16,9 @@
 //! giverny#448). And it is the `SubagentStop` hook, which
 //! holds a subagent's finish once to ask whether a background command of its
 //! own should keep running after it reports ([`crate::leftovers`],
-//! giverny#370).
+//! giverny#370), and the `Stop` hook, which holds a session's turn's end
+//! once per background command of its own that its timeout moved there or
+//! that went quiet ([`crate::strays`], giverny#450).
 //!
 //! - **Estimates.** Whoever spawns a worker gives its ETA. Right after a
 //!   dispatcher's `Agent` call that started a worker in the background, if no
@@ -43,6 +45,12 @@
 //!   if it does, its parent session hears of it once, on its next tool call
 //!   or prompt ([`crate::leftovers::deliver`]). Every subagent in a Giverny
 //!   tab, managed or not (giverny#370).
+//! - **What a session leaves running itself.** A shell of its own still
+//!   running at its turn's end, moved to the background by its timeout or
+//!   quiet for ten minutes, holds the stop once with a question
+//!   ([`crate::strays::stop`]); one that goes quiet later is told once on
+//!   its next tool call or prompt ([`crate::strays::between`],
+//!   giverny#450).
 //! - **The manager mark.** The session's own `Skill` call running the
 //!   manage skill marks it a manager ([`crate::managers`], giverny#357), as
 //!   does the person typing `/giverny:manage` (the prompt hook): what lets
@@ -267,8 +275,8 @@ pub fn run_with(
         return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
     }
     // The dispatcher's own call: its messages, its rows' chores, the
-    // worker it just started, and the commands a finished subagent left
-    // running (giverny#370).
+    // worker it just started, the commands a finished subagent left
+    // running (giverny#370), and its own that went quiet (giverny#450).
     let asks: Vec<String> = [
         away,
         manage_inbox::deliver(dir, &ledger, session, now),
@@ -276,6 +284,7 @@ pub fn run_with(
         manage_chores::deliver(dir, session, now),
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),
+        crate::strays::between(dir, session, now, &crate::strays::System),
     ]
     .into_iter()
     .flatten()
@@ -513,6 +522,18 @@ fn context_reply(event: &str, contexts: &[Option<&str>]) -> Option<String> {
 pub fn main() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    // The session's turn's end: held once per background command of its
+    // own that its timeout moved there or that went quiet (giverny#450).
+    if let Some(stop) = crate::strays::stop_payload(&input) {
+        let feeds = crate::feed::feed_dir();
+        let probe = crate::strays::System;
+        if let Some(out) =
+            crate::strays::stop(&stop, &feeds, manage::now_ms(), &probe, in_giverny_tab)
+        {
+            println!("{out}");
+        }
+        return 0;
+    }
     // A subagent's finish: held once when a background command of its own
     // still runs (giverny#370).
     if let Some(stop) = crate::leftovers::stop_payload(&input) {
@@ -546,11 +567,22 @@ pub fn main() -> i32 {
         let left = session
             .as_deref()
             .and_then(|s| crate::leftovers::deliver(&feeds, s));
+        // Its own background commands that went quiet since its last turn
+        // (giverny#450).
+        let strays = session.as_deref().and_then(|s| {
+            crate::strays::between(&feeds, s, manage::now_ms(), &crate::strays::System)
+        });
         // What happened since its last turn, first (giverny#373).
         let away = session
             .as_deref()
             .and_then(|s| away::on_call(&feeds, s, manage::now_ms(), away::Call::Prompt));
-        let contexts = [away.as_deref(), manage, name.as_deref(), left.as_deref()];
+        let contexts = [
+            away.as_deref(),
+            manage,
+            name.as_deref(),
+            left.as_deref(),
+            strays.as_deref(),
+        ];
         if let Some(out) = prompt_reply(&contexts) {
             println!("{out}");
         }
