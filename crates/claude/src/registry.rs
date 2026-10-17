@@ -217,6 +217,19 @@ pub fn scan(config_dirs: impl IntoIterator<Item = PathBuf>) -> Vec<LiveSession> 
     out
 }
 
+/// The session the live claude `pid`, started at `start` (clock ticks after
+/// boot), runs: its own `sessions/<pid>.json` in the first of `config_dirs`
+/// that has one. An entry whose `procStart` is another start is another
+/// process's leftover, and no answer (giverny#447).
+pub fn session_of_pid(config_dirs: &[PathBuf], pid: u32, start: u64) -> Option<String> {
+    config_dirs.iter().find_map(|dir| {
+        let bytes = std::fs::read(dir.join("sessions").join(format!("{pid}.json"))).ok()?;
+        let entry = serde_json::from_slice::<SessionEntry>(&bytes).ok()?;
+        (entry.pid == pid && entry.proc_start_ticks().is_none_or(|s| s == start))
+            .then_some(entry.session_id)
+    })
+}
+
 /// Is this claude session currently live in ANY of the given config dirs?
 /// (Resuming it twice would interleave two writers into one transcript.)
 pub fn session_is_live(config_dirs: impl IntoIterator<Item = PathBuf>, session_id: &str) -> bool {
@@ -749,6 +762,29 @@ mod tests {
         assert_eq!(live[0].entry.session_id, "alive");
         assert!(session_is_live([dir.clone()], "alive"));
         assert!(!session_is_live([dir.clone()], "dead"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A claude's own file names its session; one left by another process
+    /// with that pid (another start) names none.
+    #[test]
+    fn a_claudes_session_is_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("giverny-reg-of-{}", std::process::id()));
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let write = |pid: u32, body: String| {
+            std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap()
+        };
+        write(
+            10,
+            r#"{"pid":10,"sessionId":"s10","procStart":"700"}"#.into(),
+        );
+        write(11, r#"{"pid":11,"sessionId":"s11"}"#.into());
+        let dirs = [dir.join("nowhere"), dir.clone()];
+        assert_eq!(session_of_pid(&dirs, 10, 700).as_deref(), Some("s10"));
+        assert_eq!(session_of_pid(&dirs, 10, 701), None, "another start");
+        assert_eq!(session_of_pid(&dirs, 11, 5).as_deref(), Some("s11"));
+        assert_eq!(session_of_pid(&dirs, 12, 5), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
