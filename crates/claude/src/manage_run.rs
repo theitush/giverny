@@ -1408,6 +1408,8 @@ pub fn record_usage(
         "oom_kills".into(),
         json!(get(&u, "oom_kills") + m.oom_kills),
     );
+    // The mark follows the latest run alone: a clean run closes it.
+    u.insert("oom_open".into(), json!(m.oom_kills > 0));
     let mut line = cmd.join(" ");
     if line.chars().count() > 200 {
         line = line.chars().take(199).collect::<String>() + "…";
@@ -1424,6 +1426,46 @@ pub fn record_usage(
     }
     u.insert("last_at".into(), json!(manage::stamp(now)));
     row.insert("usage".into(), Value::Object(u));
+}
+
+/// A fresh grant for the row's task (giverny#452): an open OOM closes once
+/// the task is granted, after that run, more RAM than the run was held to,
+/// which is the release-and-claim-bigger the OOM line asks for. A lease
+/// held from before the run, or one no bigger, leaves it open. `oom_kills`
+/// stays: the history counts every kill.
+pub fn close_oom_on_grant(row: &mut Map<String, Value>, lease: &Value) {
+    let Some(lease) = lease.as_object() else {
+        return;
+    };
+    if !matches!(
+        lease.get("state").and_then(Value::as_str),
+        Some("granted" | "smaller")
+    ) {
+        return;
+    }
+    let Some(usage) = row.get_mut("usage") else {
+        return;
+    };
+    if !crate::feed::oom_open(usage) {
+        return;
+    }
+    let Some(u) = usage.as_object_mut() else {
+        return;
+    };
+    let after = match (
+        manage::ms_of(lease, "granted_at"),
+        manage::ms_of(u, "last_at"),
+    ) {
+        (Some(granted), Some(ran)) => granted >= ran,
+        // Nothing says when the run was: a grant now is after it.
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let ram = manage::u64_of(lease, "ram_mb").unwrap_or(0);
+    let bigger = manage::u64_of(u, "cap_ram_mb").is_none_or(|cap| ram > cap);
+    if after && bigger {
+        u.insert("oom_open".into(), json!(false));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1807,6 +1849,102 @@ mod tests {
         assert_eq!(run(&dir, "t", &[], hog, held), 137);
         let u = row(&dir, "t").usage.unwrap();
         assert_eq!(u.oom_kills, 1, "{u:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#452: the OOM mark follows the latest run. A clean run after
+    /// it closes it, and so does a grant made after it that is bigger than
+    /// the run was held to; a lease from before, one no bigger or a queued
+    /// claim leave it open. The kills still add up for the history.
+    #[test]
+    fn an_oom_closes_on_a_clean_run_or_a_bigger_grant() {
+        const T: u64 = 1_790_000_000_000;
+        let oom = Measured {
+            exit: 137,
+            signal: Some(9),
+            oom_kills: 1,
+            capped: true,
+            ..Default::default()
+        };
+        let clean = Measured {
+            capped: true,
+            ..Default::default()
+        };
+        let cap = Cap {
+            ram_mb: 1024,
+            jobs: 1,
+        };
+        let cmd = ["cargo".to_string(), "test".to_string()];
+        let mut row = Map::new();
+        let usage = |row: &Map<String, Value>| row["usage"].clone();
+        let kills = |row: &Map<String, Value>| row["usage"]["oom_kills"].as_u64();
+        record_usage(&mut row, &oom, &cap, &cmd, T);
+        assert!(feed::oom_open(&usage(&row)), "the latest run OOM'd");
+        record_usage(&mut row, &clean, &cap, &cmd, T + MIN);
+        assert!(!feed::oom_open(&usage(&row)), "a clean run closes it");
+        assert_eq!(kills(&row), Some(1), "the kill is still counted");
+        record_usage(&mut row, &oom, &cap, &cmd, T + 2 * MIN);
+        assert!(feed::oom_open(&usage(&row)));
+        let lease = |state: &str, at: u64, ram_mb: u64| json!({"state": state, "ram_mb": ram_mb, "granted_at": manage::stamp(at)});
+        for (l, why) in [
+            (lease("granted", T + MIN, 4096), "held from before the run"),
+            (lease("granted", T + 3 * MIN, 1024), "no bigger"),
+            (lease("queued", T + 3 * MIN, 4096), "only queued"),
+        ] {
+            close_oom_on_grant(&mut row, &l);
+            assert!(feed::oom_open(&usage(&row)), "{why}");
+        }
+        close_oom_on_grant(&mut row, &lease("granted", T + 2 * MIN, 4096));
+        assert!(
+            !feed::oom_open(&usage(&row)),
+            "a bigger grant since closes it"
+        );
+        assert_eq!(kills(&row), Some(2));
+        // An old row's open OOM (no flag, its last run killed) closes too.
+        let mut old = Map::new();
+        old.insert(
+            "usage".into(),
+            json!({"oom_kills": 1, "last_exit": 137, "cap_ram_mb": 1024,
+                   "last_at": manage::stamp(T)}),
+        );
+        close_oom_on_grant(&mut old, &lease("smaller", T + MIN, 2048));
+        assert!(!feed::oom_open(&usage(&old)));
+    }
+
+    /// The same through the commands: `run` OOM'd, a clean `run`, `run`
+    /// OOM'd again, then `release` and a bigger `claim`; the row ends with
+    /// no open OOM and the history counts both kills.
+    #[test]
+    fn an_oom_row_clears_through_run_release_and_claim() {
+        let dir = scratch("oom-clears");
+        cmd(&dir, "start t --eta 30");
+        assert_eq!(cmd(&dir, "claim t --ram 64M").1, 0);
+        let held = Opts {
+            hold: true,
+            ..plain(60_000)
+        };
+        let hog = "exec python3 -c \"import time\na=[]\nwhile True:\n a.append(bytearray(b'x')*(16<<20)); time.sleep(0.05)\"";
+        assert_eq!(run(&dir, "t", &[], hog, held), 137);
+        let u = row(&dir, "t").usage.unwrap();
+        assert!(u.oom_open, "{u:?}");
+        assert_eq!(run(&dir, "t", &[], "exit 0", held), 0);
+        let u = row(&dir, "t").usage.unwrap();
+        assert!(!u.oom_open, "a clean run closed it: {u:?}");
+        assert_eq!(u.oom_kills, 1);
+        assert_eq!(run(&dir, "t", &[], hog, held), 137);
+        assert!(row(&dir, "t").usage.unwrap().oom_open);
+        // The same lease again (a claim answered with what it holds) is no
+        // fresh grant.
+        assert_eq!(cmd(&dir, "claim t").1, 0);
+        assert!(row(&dir, "t").usage.unwrap().oom_open);
+        assert_eq!(cmd(&dir, "release t").1, 0);
+        assert_eq!(cmd(&dir, "claim t --ram 256M").1, 0);
+        let u = row(&dir, "t").usage.unwrap();
+        assert!(!u.oom_open, "a bigger grant closed it: {u:?}");
+        assert_eq!(u.oom_kills, 2);
+        cmd(&dir, "land t");
+        let h = manage_history::load(&dir.join(manage_history::FILE));
+        assert_eq!(h[0].oom_kills, Some(2), "the history keeps every kill");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
