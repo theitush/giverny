@@ -34,6 +34,7 @@ pub mod resources;
 pub mod run_live;
 pub mod session_use;
 pub mod sleeps;
+pub mod strays;
 pub mod subagents;
 pub mod tab_cap;
 pub mod tokens;

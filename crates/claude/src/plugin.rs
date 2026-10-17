@@ -61,6 +61,9 @@
 //!   should keep running after it reports, and its parent session told of
 //!   what it kept ([`crate::leftovers`], giverny#370). By the same rule it
 //!   reaches only sessions started after the update that wrote it.
+//! - And as a `Stop` hook: a session's turn ending with a background shell
+//!   of its own that its timeout moved there, or that has gone quiet, is
+//!   asked about once per command ([`crate::strays`], giverny#450).
 //!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/` and without its
@@ -163,8 +166,11 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// And it is a `SubagentStop` hook: a subagent finishing with a background
 /// command of its own still running is asked, once, whether it should keep
 /// running, and its parent told if it does ([`crate::leftovers`],
-/// giverny#370). Like any hook here it reaches only sessions started after
-/// the `hooks.json` that names it was written.
+/// giverny#370). And a `Stop` hook: a session's turn ending with a
+/// background shell of its own that its timeout moved there, or that has
+/// gone quiet, is held once per command with a question
+/// ([`crate::strays`], giverny#450). Like any hook here it reaches only
+/// sessions started after the `hooks.json` that names it was written.
 /// The tools the `PreToolUse` guard sees: Bash, for the cap
 /// ([`crate::bash_guard`]) and for reaching into another session's work,
 /// and the editing tools, for its worktrees ([`crate::reach_guard`],
@@ -182,7 +188,8 @@ fn session_hooks(skill: bool) -> Value {
         "PreToolUse": [{ "matcher": PRE_MATCHER, "hooks": hook() }],
         "PostToolUse": [{ "matcher": "*", "hooks": hook() }],
         "SessionStart": [{ "hooks": hook() }],
-        "SubagentStop": [{ "hooks": hook() }]
+        "SubagentStop": [{ "hooks": hook() }],
+        "Stop": [{ "hooks": hook() }]
     });
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
@@ -197,7 +204,7 @@ fn session_hooks(skill: bool) -> Value {
                         and out of other sessions' work, \
                         \"manage this\" sent to the manage skill, \
                         task work pointed at it, \
-                        and subagents asked about commands they leave running",
+                        and sessions and subagents asked about commands they leave running",
         "hooks": hooks
     })
 }
@@ -711,6 +718,10 @@ mod tests {
             let stop = &h["hooks"]["SubagentStop"][0];
             assert!(stop.get("matcher").is_none(), "every agent type");
             assert_eq!(stop["hooks"][0]["command"], start["hooks"][0]["command"]);
+            // giverny#450: every session's turn's end.
+            let own = &h["hooks"]["Stop"][0];
+            assert!(own.get("matcher").is_none());
+            assert_eq!(own["hooks"][0]["command"], start["hooks"][0]["command"]);
         }
         assert!(remove_dir(&d).unwrap());
     }
