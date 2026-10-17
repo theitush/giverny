@@ -10,17 +10,23 @@
 //! * each **session**: a claude process and everything under it, keyed by
 //!   the claude's pid;
 //! * each **run**: the processes in a `giverny manage run` scope's cgroup
-//!   (the management panel's rows). A scope's command is a descendant of the
-//!   claude that ran it (`systemd-run --scope` execs it in place), so a run
-//!   is part of its session, and a session part of the total.
+//!   (the management panel's rows). A scope's command is usually a
+//!   descendant of the claude that ran it (`systemd-run --scope` execs it in
+//!   place), but not always: one started detached (`setsid`, `nohup`, a
+//!   shell whose parent died) is reparented outside the app. So each run's
+//!   processes are added, once, to its session (the claude whose
+//!   `sessions/<pid>.json` names the run's session id), that claude's tab
+//!   and the total; a run with no claude here, to the total alone
+//!   (giverny#453). A run is part of its session, a session part of its
+//!   tab, a tab part of the total, by construction.
 //!
 //! Every group is a set of processes, and every figure is a sum over its
 //! processes of the same per-process figures from the same pass: CPU
 //! clock ticks spent since the last pass ([`pid_ticks`]), as a share of
 //! the machine; memory as the proportional set (shared pages split
 //! between their sharers); GPU memory and compute per process from
-//! `nvidia-smi`. So a run never reads more than its session, nor a session
-//! more than the total.
+//! `nvidia-smi`. So a run never reads more than its session, a session more
+//! than its tab, nor a tab more than the total.
 //!
 //! Claude Code's status line shows none of it (giverny#384): the app draws
 //! every figure from its newest pass.
@@ -134,6 +140,15 @@ impl Table {
     /// The reading: `app`'s tree, each claude in it (`is_claude`), each
     /// run's processes (`runs`: session, task, its scope's pids; several
     /// scopes of one task are summed), and each worker's (`agents`).
+    ///
+    /// `claude_of` names each session's claude (session id → pid). A run's
+    /// processes count in its session's claude, every claude around that
+    /// one, the claude's tab and the total, whether they descend from the
+    /// claude or not: a run started detached (`setsid`, `nohup`, a shell
+    /// whose parent died) has left the tree, and still is its session's
+    /// (giverny#453). A run whose session has no claude here counts in the
+    /// total alone. Each set is a set, so a run that is under its claude is
+    /// counted once.
     pub fn reading(
         &self,
         at_ms: u64,
@@ -141,19 +156,32 @@ impl Table {
         is_claude: impl Fn(u32) -> bool,
         runs: &[(String, String, HashSet<u32>)],
         agents: &HashMap<String, HashSet<u32>>,
+        claude_of: &HashMap<String, u32>,
     ) -> Reading {
         let tree = subtree(&self.procs, app);
-        let claudes: BTreeMap<u32, HashSet<u32>> = tree
+        let mut claudes: BTreeMap<u32, HashSet<u32>> = tree
             .iter()
             .copied()
             .filter(|&p| is_claude(p))
             .map(|p| (p, subtree(&self.procs, p)))
             .collect();
-        let sessions = claudes
-            .iter()
-            .map(|(&p, pids)| (p, self.use_of(pids)))
-            .collect();
-        let tabs = self.tabs(app, &tree);
+        let (mut tabs, tab_of) = self.tabs(app, &tree);
+        let mut total = tree;
+        for (session, _, pids) in runs {
+            total.extend(pids);
+            let Some(&claude) = claude_of.get(session) else {
+                continue;
+            };
+            if !claudes.contains_key(&claude) {
+                continue;
+            }
+            for set in claudes.values_mut().filter(|s| s.contains(&claude)) {
+                set.extend(pids);
+            }
+            if let Some(tab) = tab_of.get(&claude) {
+                tabs.entry(*tab).or_default().extend(pids);
+            }
+        }
         let mut by_task: BTreeMap<(String, String), HashSet<u32>> = BTreeMap::new();
         for (session, task, pids) in runs {
             by_task
@@ -176,9 +204,15 @@ impl Table {
         Reading {
             at_ms,
             app,
-            total: self.use_of(&tree),
-            sessions,
-            tabs,
+            total: self.use_of(&total),
+            sessions: claudes
+                .iter()
+                .map(|(&p, pids)| (p, self.use_of(pids)))
+                .collect(),
+            tabs: tabs
+                .iter()
+                .map(|(&tab, pids)| (tab, self.use_of(pids)))
+                .collect(),
             runs,
             agents: agents
                 .iter()
@@ -189,9 +223,14 @@ impl Table {
 }
 
 impl Table {
-    /// [`Reading::tabs`]: each child of `app` (a tab's shell) with every
-    /// process under it, from `tree` (`app`'s subtree), in one sweep.
-    fn tabs(&self, app: u32, tree: &HashSet<u32>) -> BTreeMap<u32, Use> {
+    /// [`Reading::tabs`]' processes: each child of `app` (a tab's shell)
+    /// with every process under it, from `tree` (`app`'s subtree), in one
+    /// sweep; and each process's tab.
+    fn tabs(
+        &self,
+        app: u32,
+        tree: &HashSet<u32>,
+    ) -> (BTreeMap<u32, HashSet<u32>>, HashMap<u32, u32>) {
         let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
         // Each process's tab, as found: a walk up stops at the first
         // process whose tab is known.
@@ -221,10 +260,7 @@ impl Table {
             }
             by_tab.entry(tab).or_default().insert(pid);
         }
-        by_tab
-            .into_iter()
-            .map(|(tab, pids)| (tab, self.use_of(&pids)))
-            .collect()
+        (by_tab, tab_of)
     }
 }
 
@@ -361,6 +397,9 @@ pub struct Sampler {
     /// Which processes are claudes, asked once each (macOS).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     claudes: crate::user_cap::Claudes,
+    /// Where the claudes' registry files are, found once (Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    config_dirs: Option<Vec<std::path::PathBuf>>,
 }
 
 impl Sampler {
@@ -439,7 +478,44 @@ impl Sampler {
         let agents = self
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
-        Some(table.reading(su::now_ms(), app, |p| claudes.contains(&p), &runs, &agents))
+        let claude_of = self.claude_of(&table.procs, &claudes, &runs);
+        Some(table.reading(
+            su::now_ms(),
+            app,
+            |p| claudes.contains(&p),
+            &runs,
+            &agents,
+            &claude_of,
+        ))
+    }
+
+    /// Each running run's session's claude, among `claudes`: the claude
+    /// whose registry file names it ([`crate::registry::session_of_pid`]).
+    /// Read only while something runs.
+    #[cfg(target_os = "linux")]
+    fn claude_of(
+        &mut self,
+        procs: &[Proc],
+        claudes: &HashSet<u32>,
+        runs: &[(String, String, HashSet<u32>)],
+    ) -> HashMap<String, u32> {
+        if runs.is_empty() {
+            return HashMap::new();
+        }
+        let dirs = self
+            .config_dirs
+            .get_or_insert_with(|| crate::registry::ambient_config_dirs(None));
+        let wanted: HashSet<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        procs
+            .iter()
+            .filter(|p| claudes.contains(&p.pid))
+            .filter_map(|p| {
+                let session = crate::registry::session_of_pid(dirs, p.pid, p.start)?;
+                wanted
+                    .contains(session.as_str())
+                    .then_some((session, p.pid))
+            })
+            .collect()
     }
 
     /// macOS: no figures are shown (the reading is Linux's), but the app's
@@ -595,7 +671,14 @@ mod tests {
         let gpu = HashMap::from([(141, 2048), (220, 512), (900, 4096)]);
         let t = table(after, Some(&seen(&before)), Some(gpu));
         let runs = vec![("s1".into(), "demo#1".into(), HashSet::from([140, 141]))];
-        let r = t.reading(42, 100, |p| p == 120 || p == 220, &runs, &HashMap::new());
+        let r = t.reading(
+            42,
+            100,
+            |p| p == 120 || p == 220,
+            &runs,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let a = r.sessions[&120];
         let b = r.sessions[&220];
         let run = r.runs[0].used;
@@ -629,6 +712,73 @@ mod tests {
         }
     }
 
+    /// A run started detached (giverny#453): its shell 300 was reparented
+    /// out of the app (to 1), its scope holds python 310. It still counts in
+    /// its session's claude A, A's tab and the total; a run under A counts
+    /// once; a run of a session with no claude here, in the total alone.
+    #[test]
+    fn a_detached_run_is_its_sessions_its_tabs_and_the_totals() {
+        let mut before = machine();
+        before.extend([p(300, 1, 0, 1_000), p(310, 300, 0, 7_000_000)]);
+        let mut after = before.clone();
+        for q in &mut after {
+            q.ticks += match q.pid {
+                310 => 200, // two cores
+                900 => 100,
+                _ => 5,
+            };
+        }
+        let t = table(after, Some(&seen(&before)), None);
+        let claude_of = HashMap::from([("sA".to_string(), 120), ("sB".to_string(), 220)]);
+        let is_claude = |p| p == 120 || p == 220;
+        let plain = t.reading(42, 100, is_claude, &[], &HashMap::new(), &HashMap::new());
+        let detached = vec![("sA".into(), "poly#138".into(), HashSet::from([310]))];
+        let r = t.reading(42, 100, is_claude, &detached, &HashMap::new(), &claude_of);
+        let run = r.runs[0].used;
+        assert_eq!(run.cpu_pct, 50);
+        let with = |base: HashSet<u32>| t.use_of(&base.into_iter().chain([310]).collect());
+        assert_eq!(r.sessions[&120], with(subtree(&t.procs, 120)));
+        assert_eq!(r.tabs[&110], with(subtree(&t.procs, 110)));
+        assert_eq!(r.total, with(subtree(&t.procs, 100)));
+        assert!(r.sessions[&120].mem_mb > 7_000_000 / 1024);
+        // B and its tab are as they were.
+        assert_eq!(r.sessions[&220], plain.sessions[&220]);
+        assert_eq!(r.tabs[&210], plain.tabs[&210]);
+        for (part, whole) in [
+            (run, r.sessions[&120]),
+            (r.sessions[&120], r.tabs[&110]),
+            (r.tabs[&110], r.total),
+        ] {
+            assert!(part.cpu_pct <= whole.cpu_pct, "{part:?} {whole:?}");
+            assert!(part.mem_mb <= whole.mem_mb, "{part:?} {whole:?}");
+        }
+        // Under its claude: counted once, everything as without it.
+        let under = vec![("sA".into(), "demo#1".into(), HashSet::from([140, 141]))];
+        let r = t.reading(42, 100, is_claude, &under, &HashMap::new(), &claude_of);
+        assert_eq!(
+            (r.total, &r.sessions, &r.tabs),
+            (plain.total, &plain.sessions, &plain.tabs)
+        );
+        // No claude here for its session: the total only.
+        let stray = vec![("sX".into(), "other#1".into(), HashSet::from([900]))];
+        let r = t.reading(42, 100, is_claude, &stray, &HashMap::new(), &claude_of);
+        assert_eq!((&r.sessions, &r.tabs), (&plain.sessions, &plain.tabs));
+        assert_eq!(
+            r.total,
+            t.use_of(&subtree(&t.procs, 100).into_iter().chain([900]).collect())
+        );
+        // A claude that names a session but is not under the app: the same.
+        let away = HashMap::from([("sX".to_string(), 900)]);
+        let r = t.reading(42, 100, is_claude, &stray, &HashMap::new(), &away);
+        assert_eq!((&r.sessions, &r.tabs), (&plain.sessions, &plain.tabs));
+        // A claude inside a claude: the run counts in both.
+        let nested = |p| p == 120 || p == 130;
+        let inner = HashMap::from([("sA".to_string(), 130)]);
+        let r = t.reading(42, 100, nested, &detached, &HashMap::new(), &inner);
+        assert_eq!(r.sessions[&130], with(subtree(&t.procs, 130)));
+        assert_eq!(r.sessions[&120], with(subtree(&t.procs, 120)));
+    }
+
     /// Every tab reads, Claude Code in it or not: its shell and every
     /// process under it, each counted once, whichever claudes are where.
     #[test]
@@ -639,7 +789,7 @@ mod tests {
             q.ticks += 10;
         }
         let t = table(after, Some(&seen(&before)), None);
-        let none = t.reading(42, 100, |_| false, &[], &HashMap::new());
+        let none = t.reading(42, 100, |_| false, &[], &HashMap::new(), &HashMap::new());
         assert!(none.sessions.is_empty());
         assert_eq!(
             none.tabs.keys().copied().collect::<Vec<_>>(),
@@ -650,7 +800,14 @@ mod tests {
         }
         // A claude inside a claude, or two side by side: the same tabs.
         for claudes in [&[120, 141][..], &[130, 220], &[220]] {
-            let r = t.reading(42, 100, |p| claudes.contains(&p), &[], &HashMap::new());
+            let r = t.reading(
+                42,
+                100,
+                |p| claudes.contains(&p),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
             assert_eq!(r.tabs, none.tabs, "{claudes:?}");
         }
         // The app itself and processes outside it are in no tab.
@@ -670,7 +827,7 @@ mod tests {
         // The worker started bash 130 (cargo 140 → rustc 141 under it).
         let agents = HashMap::from([("a1".to_string(), HashSet::from([130, 140, 141]))]);
         let runs = vec![("s1".into(), "demo#1".into(), HashSet::from([140, 141]))];
-        let r = t.reading(42, 100, |p| p == 120, &runs, &agents);
+        let r = t.reading(42, 100, |p| p == 120, &runs, &agents, &HashMap::new());
         let (run, worker, session) = (r.runs[0].used, r.agents["a1"], r.sessions[&120]);
         assert_eq!(r.runs[0].agent.as_deref(), Some("a1"));
         assert_eq!((run.cpu_pct, worker.cpu_pct, session.cpu_pct), (39, 40, 41));
@@ -683,7 +840,7 @@ mod tests {
     #[test]
     fn the_first_pass_has_no_cpu() {
         let t = table(machine(), None, None);
-        let r = t.reading(1, 100, |p| p == 120, &[], &HashMap::new());
+        let r = t.reading(1, 100, |p| p == 120, &[], &HashMap::new(), &HashMap::new());
         assert_eq!(r.total.cpu_pct, 0);
         assert!(r.total.mem_mb > 0);
         assert_eq!(r.total.gpu_mb, None);
@@ -754,6 +911,61 @@ mod tests {
 /// read-only, and print what each costs and what it credits.
 #[cfg(all(test, target_os = "linux"))]
 mod dump {
+    /// `GIVERNY_USE_DUMP=<app pid> cargo test -p giverny-claude -- --ignored
+    /// dump_runs_in_their_tabs --nocapture`: one real pass, read-only, and
+    /// each run's figure beside its session's claude's and that tab's.
+    #[test]
+    #[ignore]
+    fn dump_runs_in_their_tabs() {
+        let Some(app) = std::env::var("GIVERNY_USE_DUMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let runs =
+            crate::run_live::runs_dir(&crate::resources::ledger_path(&crate::feed::feed_dir()));
+        let mut s = super::Sampler::default();
+        s.sample(app, &runs).expect("a /proc");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let r = s.sample(app, &runs).expect("a /proc");
+        let procs = crate::session_use::proc_table(4);
+        let dirs = crate::registry::ambient_config_dirs(None);
+        let parent: std::collections::HashMap<u32, u32> =
+            procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        println!("total {:?}", r.total);
+        for run in &r.runs {
+            let claude = procs.iter().find(|p| {
+                r.sessions.contains_key(&p.pid)
+                    && crate::registry::session_of_pid(&dirs, p.pid, p.start).as_deref()
+                        == Some(run.session.as_str())
+            });
+            let tab = claude.and_then(|c| {
+                let mut at = c.pid;
+                while let Some(&up) = parent.get(&at) {
+                    if up == app {
+                        return Some(at);
+                    }
+                    if up == at || up == 0 {
+                        break;
+                    }
+                    at = up;
+                }
+                None
+            });
+            println!(
+                "run {} (session {}): {:?}\n  claude {:?}: {:?}\n  tab {:?}: {:?}",
+                run.task,
+                run.session,
+                run.used,
+                claude.map(|c| c.pid),
+                claude.and_then(|c| r.sessions.get(&c.pid)),
+                tab,
+                tab.and_then(|t| r.tabs.get(&t)),
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn dump_a_live_tree() {
@@ -789,6 +1001,7 @@ mod dump {
                     app,
                     |p| r.sessions.contains_key(&p),
                     &[],
+                    &Default::default(),
                     &Default::default(),
                 );
             }
