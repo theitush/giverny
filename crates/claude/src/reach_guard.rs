@@ -1107,7 +1107,9 @@ impl World for System {
         self.config_dirs().iter().find_map(|d| {
             let bytes = std::fs::read(d.join("sessions").join(format!("{claude}.json"))).ok()?;
             let e: crate::registry::SessionEntry = serde_json::from_slice(&bytes).ok()?;
-            (e.pid == claude).then_some(e.session_id)
+            // Its start time too: a file left by a claude that died in a
+            // reboot names a pid that may be this one again (giverny#447).
+            (e.pid == claude && crate::registry::entry_is_live(d, &e)).then_some(e.session_id)
         })
     }
     fn runs(&self) -> Vec<RunRecord> {
