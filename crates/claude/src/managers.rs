@@ -28,6 +28,13 @@
 //! or compacted session has a new id but the same root, so it is found
 //! there and the mark copied under the new id. `/clear` starts a new root:
 //! a cleared session is no manager until the skill runs again.
+//!
+//! **Told after a compaction.** A compaction's summary may drop that the
+//! session runs the manage skill, and the skill's text is gone with it. So
+//! the `SessionStart` hook of a manager's own compacted session carries
+//! [`START_CONTEXT`] ([`start_context`], giverny#448). A resume hears
+//! nothing: its transcript already holds that line from its last
+//! compaction.
 
 use std::path::{Path, PathBuf};
 
@@ -127,6 +134,38 @@ pub fn is_manager(feeds: &Path, session: &str, transcript: Option<&Path>) -> boo
     is_marked(feeds, session, &[], || {
         crate::subagents::conversation_root(transcript?)
     })
+}
+
+/// What a manager session hears when it starts again from a compaction
+/// ([`start_context`]).
+pub const START_CONTEXT: &str = "Giverny: this is a manager session (giverny:manage), \
+continued from a compaction, and the manage skill's rules are no longer in \
+context. Before acting, call the Skill tool with `giverny:manage` to reload them; then \
+check `giverny-manage` rows and the workers really running against what the summary says.";
+
+/// The context a `SessionStart` payload's session hears for being a
+/// manager: [`START_CONTEXT`] when its `source` is `compact`, it is the
+/// session's own start (no `agent_id`), and the session is a manager
+/// ([`is_manager`], which finds a new id by its conversation's root and
+/// copies the mark under it). Never for `startup`, `clear` or `resume` (a
+/// resumed transcript already holds the line from its last compaction).
+pub fn start_context(feeds: &Path, payload: &Value) -> Option<&'static str> {
+    let source = payload.get("source").and_then(Value::as_str)?;
+    if source != "compact" || payload.get("agent_id").is_some() {
+        return None;
+    }
+    let session = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let transcript = payload
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Path::new);
+    is_manager(feeds, session, transcript).then_some(START_CONTEXT)
 }
 
 /// The skill a `Skill` tool call ran, from its `tool_input`.
@@ -278,5 +317,48 @@ mod tests {
             !typed_skill("/manage this"),
             "sent to the skill, whose call marks it"
         );
+    }
+
+    #[test]
+    fn a_compacted_manager_is_told_to_reload_the_skill() {
+        let feeds = scratch("start");
+        let t1 = transcript(&feeds.join("proj"), "s1", "root-a");
+        mark_from(
+            &feeds,
+            &json!({"session_id": "s1", "transcript_path": t1.display().to_string()}),
+        );
+        let start = |session: &str, t: &Path, source: &str| {
+            json!({"hook_event_name": "SessionStart", "session_id": session,
+                   "transcript_path": t.display().to_string(), "source": source})
+        };
+        // Compacted: the same session.
+        assert_eq!(
+            start_context(&feeds, &start("s1", &t1, "compact")),
+            Some(START_CONTEXT)
+        );
+        // Compacted under a new id, the same conversation: found by its
+        // root, and the mark copied under the new id.
+        let t2 = transcript(&feeds.join("proj"), "s2", "root-a");
+        assert_eq!(
+            start_context(&feeds, &start("s2", &t2, "compact")),
+            Some(START_CONTEXT)
+        );
+        assert!(session_file(&feeds, "s2").unwrap().is_file());
+        // A resume already holds the line from its last compaction.
+        assert_eq!(start_context(&feeds, &start("s1", &t1, "resume")), None);
+        assert_eq!(start_context(&feeds, &start("s2", &t2, "resume")), None);
+        // Never for a fresh start or a `/clear`, manager or not.
+        assert_eq!(start_context(&feeds, &start("s1", &t1, "startup")), None);
+        assert_eq!(start_context(&feeds, &start("s1", &t1, "clear")), None);
+        let t3 = transcript(&feeds.join("proj"), "s3", "root-b");
+        assert_eq!(start_context(&feeds, &start("s3", &t3, "clear")), None);
+        // A session that is no manager: nothing.
+        assert_eq!(start_context(&feeds, &start("s3", &t3, "compact")), None);
+        assert_eq!(start_context(&feeds, &start("s3", &t3, "resume")), None);
+        // A subagent's start in a manager's session: nothing.
+        let mut sub = start("s1", &t1, "compact");
+        sub["agent_id"] = json!("a1");
+        assert_eq!(start_context(&feeds, &sub), None);
+        let _ = std::fs::remove_dir_all(&feeds);
     }
 }

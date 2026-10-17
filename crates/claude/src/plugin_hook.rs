@@ -11,7 +11,9 @@
 //! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
 //! hook that, with names on, asks a tab's session to name itself
 //! ([`crate::names`]) — or, for a session whose start ran no such hook, its
-//! next prompt does (giverny#356). And it is the `SubagentStop` hook, which
+//! next prompt does (giverny#356) — and tells a manager's compacted
+//! session it is one ([`crate::managers::start_context`],
+//! giverny#448). And it is the `SubagentStop` hook, which
 //! holds a subagent's finish once to ask whether a background command of its
 //! own should keep running after it reports ([`crate::leftovers`],
 //! giverny#370).
@@ -562,7 +564,12 @@ pub fn main() -> i32 {
         let away = text(&start, "session_id")
             .filter(|_| start.get("agent_id").is_none())
             .and_then(|s| away::on_call(&feeds, &s, manage::now_ms(), away::Call::Start));
-        if let Some(out) = context_reply("SessionStart", &[away.as_deref(), name.as_deref()]) {
+        // A manager's compacted session is told it is one
+        // (giverny#448).
+        let manager = crate::managers::start_context(&feeds, &start);
+        if let Some(out) =
+            context_reply("SessionStart", &[away.as_deref(), manager, name.as_deref()])
+        {
             println!("{out}");
         }
         return 0;
