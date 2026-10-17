@@ -315,7 +315,7 @@ pub fn scope_args(
 
 /// Where a run's memory is throttled: twice its grant.
 pub fn high_mb(cap: &Cap) -> u64 {
-    cap.ram_mb * 2
+    resources::lease_bound_mb(cap.ram_mb)
 }
 
 /// What the shim read of the scope.
