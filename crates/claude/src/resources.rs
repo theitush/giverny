@@ -44,9 +44,11 @@
 //! - its memory fits by **expected peaks**, not by the sum of leases
 //!   (giverny#281): every task, running or about to, counts at its expected
 //!   peak — the high end of its kind's measured history (p90, as `claim`
-//!   summarises it, [`crate::manage_history::expected_peak_mb`]), else its
-//!   lease, else the default lease — or at what it really uses now when
-//!   that is more ([`MemUse`]). The new task's expected peak must fit under
+//!   summarises it, [`crate::manage_history::expected_peak_mb`]) but never
+//!   above what its lease lets a `run` use, twice its RAM (the scope's
+//!   `MemoryHigh`, [`lease_bound_mb`], giverny#455) — else its lease, else
+//!   the default lease — or at what it really uses now when that is more
+//!   ([`MemUse`]). So a kind's history only lowers what a lease counts at. The new task's expected peak must fit under
 //!   the limit (the slice's `MemoryMax`) less a headroom
 //!   ([`ram_headroom`]), the claudes' own memory in the slice, and every
 //!   other task so counted; and under `MemAvailable` less the headroom and
@@ -147,6 +149,27 @@ pub fn ledger_path(feed_dir: &Path) -> PathBuf {
 /// machine, at least 1 GiB.
 pub fn ram_headroom(machine: &Machine) -> Mem {
     Mem((machine.ram.0 / 20).max(1024))
+}
+
+/// The most a `run` under a lease of `ram_mb` can use (giverny#455): its
+/// scope's `MemoryHigh`, twice the lease, above which the kernel reclaims
+/// and throttles it ([`crate::manage_run`]; on macOS Giverny kills it there,
+/// [`crate::user_cap::Ceiling::for_run`]). A lease of no RAM has no bound.
+pub fn lease_bound_mb(ram_mb: u64) -> u64 {
+    ram_mb * 2
+}
+
+/// What a task holding `ram_mb` is expected to reach: its kind's `peak`,
+/// held to [`lease_bound_mb`] — the history only ever lowers what a lease
+/// counts at, never past what it can use — else that RAM, else
+/// `default_mb`.
+fn expected_within(peak: Option<u64>, ram_mb: u64, default_mb: u64) -> u64 {
+    match (peak, ram_mb) {
+        (Some(p), 0) => p,
+        (Some(p), r) => p.min(lease_bound_mb(r)),
+        (None, 0) => default_mb,
+        (None, r) => r,
+    }
 }
 
 /// Epoch milliseconds, written as RFC 3339 like the feed's stamps.
@@ -355,15 +378,12 @@ impl Capacity {
         self.default_lease.uncollected_min.max(1) * 60 * 1000
     }
 
-    /// What admission counts `l` at: its expected peak (else its RAM, else
-    /// the default lease), or what it uses now when that is more.
+    /// What admission counts `l` at: its expected peak, never above what
+    /// its lease lets a `run` reach ([`lease_bound_mb`], giverny#455) — else
+    /// its RAM, else the default lease — or what it uses now when that is
+    /// more.
     pub fn counted_mb(&self, l: &Lease) -> u64 {
-        let expected = l.peak_mb.unwrap_or(if l.ram_mb > 0 {
-            l.ram_mb
-        } else {
-            self.default_lease.ram.0
-        });
-        expected.max(self.mem_use.of(&l.id))
+        expected_within(l.peak_mb, l.ram_mb, self.default_lease.ram.0).max(self.mem_use.of(&l.id))
     }
 }
 
@@ -1046,17 +1066,13 @@ impl Ledger {
         }
     }
 
-    /// What `req` counts at when it holds `ram_mb`: its expected peak, else
-    /// that RAM, else the default lease — never more than an empty slice
-    /// has room for, so a task whose kind once peaked near the limit still
-    /// starts on an idle box.
+    /// What `req` counts at when it holds `ram_mb`: its expected peak, held
+    /// to what that lease lets it use ([`lease_bound_mb`]), else that RAM,
+    /// else the default lease — never more than an empty slice has room
+    /// for, so a task whose kind once peaked near the limit still starts on
+    /// an idle box.
     fn counted_for(cap: &Capacity, req: &Request, ram_mb: u64) -> u64 {
-        let expected = req.peak_mb.unwrap_or(if ram_mb > 0 {
-            ram_mb
-        } else {
-            cap.default_lease.ram.0
-        });
-        expected.min(
+        expected_within(req.peak_mb, ram_mb, cap.default_lease.ram.0).min(
             cap.limits
                 .ram
                 .0
@@ -1814,9 +1830,15 @@ pub fn ask_hint(
 }
 
 /// `, counted at its kind's peak 1.2G` when admission counts a lease at an
-/// expected peak other than its RAM.
+/// expected peak other than its RAM; `, counted at 6G, the most its lease
+/// lets it use` when it is held to that ([`lease_bound_mb`], giverny#455):
+/// its kind peaked at that or more.
 fn counted(l: &Lease) -> String {
     match l.peak_mb {
+        Some(p) if l.ram_mb > 0 && p >= lease_bound_mb(l.ram_mb) => format!(
+            ", counted at {}, the most its lease lets it use",
+            Mem(lease_bound_mb(l.ram_mb))
+        ),
         Some(p) if p != l.ram_mb => format!(", counted at its kind's peak {}", Mem(p)),
         _ => String::new(),
     }
@@ -2964,6 +2986,83 @@ mod tests {
         let mut l = Ledger::default();
         l.claim(&c, "s", "slot", None, &req(0), T0);
         assert_eq!(l.free(&c).counted_mb, 3 * 1024);
+    }
+
+    /// giverny#455: a kind's history only lowers what a lease counts at. A
+    /// `run` under a lease is throttled at twice it (`MemoryHigh`), so a
+    /// peak past that is memory the lease cannot use.
+    #[test]
+    fn a_lease_counts_at_most_what_it_can_use() {
+        let mut c = cap();
+        let lease = |ram_gb: u64, peak_mb: Option<u64>| Lease {
+            id: lease_id("s", "t"),
+            session: "s".into(),
+            task: "t".into(),
+            repo: None,
+            ram_mb: ram_gb * 1024,
+            gpus: vec![],
+            vram_mb: 0,
+            slots: vec![],
+            peak_mb,
+            granted_at: T0,
+            heartbeat_at: T0,
+            uncollected: None,
+        };
+        // A 3G lease whose kind peaked at 16G: at most 6G.
+        assert_eq!(c.counted_mb(&lease(3, Some(16 * 1024))), 6 * 1024);
+        // Between its RAM and twice it, its kind's peak stands.
+        assert_eq!(c.counted_mb(&lease(3, Some(4222))), 4222);
+        // A 16G lease whose kind peaks at 2G: 2G.
+        assert_eq!(c.counted_mb(&lease(16, Some(2048))), 2048);
+        // No RAM, no bound; no history, its RAM.
+        assert_eq!(c.counted_mb(&lease(0, Some(9 * 1024))), 9 * 1024);
+        assert_eq!(c.counted_mb(&lease(3, None)), 3 * 1024);
+        // What it uses now, above both, still counts.
+        c.mem_use.by_lease.insert(lease_id("s", "t"), 7 * 1024);
+        assert_eq!(c.counted_mb(&lease(3, Some(16 * 1024))), 7 * 1024);
+        assert_eq!(c.counted_mb(&lease(1, Some(2048))), 7 * 1024);
+        // Admission holds a request to the same bound, at the RAM granted.
+        let c = cap();
+        let r = Request {
+            peak_mb: Some(16 * 1024),
+            ..req(3)
+        };
+        assert_eq!(Ledger::counted_for(&c, &r, 3 * 1024), 6 * 1024);
+        assert_eq!(Ledger::counted_for(&c, &r, 2 * 1024), 4 * 1024);
+        let r = Request {
+            peak_mb: Some(2048),
+            ..req(16)
+        };
+        assert_eq!(Ledger::counted_for(&c, &r, 16 * 1024), 2048);
+    }
+
+    /// giverny#455, end to end: on a 20G limit two 3G leases whose kind
+    /// once peaked at 16G counted at 16G each, so memory was full on paper;
+    /// held to what they can use (6G each), a third such claim fits.
+    #[test]
+    fn leases_whose_kind_peaked_high_leave_room_for_another() {
+        let mut c = cap();
+        c.limits.ram = Mem::gb(20);
+        let mut l = Ledger::default();
+        idle(&mut l, &c, "a", Some(16 * 1024));
+        idle(&mut l, &c, "b", Some(16 * 1024));
+        assert_eq!(l.free(&c).counted_mb, 12 * 1024);
+        let new = Request {
+            peak_mb: Some(16 * 1024),
+            ..req(3)
+        };
+        let g = l.claim(&c, "s", "new", Some("demo"), &new, T0);
+        let Outcome::Granted(lease) = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!((lease.ram_mb, lease.peak_mb), (3 * 1024, Some(6 * 1024)));
+        assert_eq!(
+            outcome_line("new", &g, &|_, _| None),
+            "granted new: 3G, counted at 6G, the most its lease lets it use"
+        );
+        // That is all there is: a fourth waits.
+        let q = l.claim(&c, "s", "fourth", Some("demo"), &new, T0);
+        assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
     }
 
     /// giverny#281: what is really committed still queues a task — peaks
