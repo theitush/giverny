@@ -198,6 +198,29 @@ pub fn detect_mode() -> Mode {
     Mode::Plain
 }
 
+/// Does `run` hold a command to its lease's bound here
+/// ([`resources::lease_bound_mb`])? Under a systemd scope, or held by
+/// Giverny itself ([`user_cap::active`]) — the probe `run` makes; else the
+/// lease is advisory (giverny#456).
+pub fn caps_here() -> bool {
+    matches!(detect_mode(), Mode::Systemd { .. }) || user_cap::active()
+}
+
+/// Say beside the ledger whether this `run` held its command
+/// ([`resources::run_caps_path`]), so the ledger counts leases by it. Only
+/// when that changed; a failure costs only that.
+fn record_caps(ledger: &Path, capped: bool) {
+    let path = resources::run_caps_path(ledger);
+    let word = if capped { "capped" } else { "advisory" };
+    if std::fs::read_to_string(&path).is_ok_and(|t| t.trim() == word) {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{word}\n")).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// What the command is held to: the lease's RAM (0 = no memory cap), and
 /// the build jobs that RAM pays for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,8 +867,10 @@ fn execute(
                 crate::tab_cap::SLICE
             ),
         );
-        // Seen by the management panel while it runs.
-        let live = run_live::register(&stats, task, session, manage::now_ms());
+        // Seen by the management panel while it runs; the ledger counts its
+        // lease at least at its `MemoryHigh` until it ends (giverny#456).
+        let bound = (cap.ram_mb > 0).then(|| high_mb(cap));
+        let live = run_live::register_bound(&stats, task, session, manage::now_ms(), bound);
         // giverny#426: a signal to `run` stops its scope, as Ctrl-C would
         // stop the command, and `run` still releases and records. Taken
         // before the spawn: a caught signal is the default again after exec.
@@ -882,6 +907,9 @@ fn execute(
             .unwrap_or_default();
         let _ = std::fs::remove_file(&stats);
         let w = w?;
+        if st.started {
+            record_caps(ledger, true);
+        }
         // Stopped, it never falls back to a plain run.
         if st.started || stopped_by.is_some() {
             let cg_mb = st.peak_bytes.map(|b| b.div_ceil(1024 * 1024));
@@ -949,9 +977,16 @@ fn execute(
     jobs_env(&mut c, cap);
     // Seen by the app (which holds it with the tabs where there are no
     // cgroups) and by the ledger's CPU-busy check, as a scope is.
-    let live = stats_path(ledger)
-        .ok()
-        .and_then(|stats| run_live::register(&stats, task, session, manage::now_ms()));
+    record_caps(ledger, held.is_some());
+    let live = stats_path(ledger).ok().and_then(|stats| {
+        run_live::register_bound(
+            &stats,
+            task,
+            session,
+            manage::now_ms(),
+            held.map(|c| c.ram_mb),
+        )
+    });
     let t = task.to_string();
     let (w, guard) = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, None, |pid| {
         held.map(|ceiling| user_cap::RunGuard::start(pid, ceiling, hold_cpu, move |s| say(&t, s)))
@@ -1509,6 +1544,7 @@ mod tests {
                 ..Default::default()
             },
             live_sessions: None,
+            run_bounds: Default::default(),
         }
     }
 

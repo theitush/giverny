@@ -46,9 +46,12 @@
 //!   peak — the high end of its kind's measured history (p90, as `claim`
 //!   summarises it, [`crate::manage_history::expected_peak_mb`]) but never
 //!   above what its lease lets a `run` use, twice its RAM (the scope's
-//!   `MemoryHigh`, [`lease_bound_mb`], giverny#455) — else its lease, else
+//!   `MemoryHigh`, [`lease_bound_mb`], giverny#455) where `run` holds it
+//!   there, and above what a command still running from before a shrink
+//!   was started under ([`RunBounds`], giverny#456) — else its lease, else
 //!   the default lease — or at what it really uses now when that is more
-//!   ([`MemUse`]). So a kind's history only lowers what a lease counts at. The new task's expected peak must fit under
+//!   ([`MemUse`]). So a kind's history only lowers what a lease counts at.
+//!   The new task's expected peak must fit under
 //!   the limit (the slice's `MemoryMax`) less a headroom
 //!   ([`ram_headroom`]), the claudes' own memory in the slice, and every
 //!   other task so counted; and under `MemAvailable` less the headroom and
@@ -155,20 +158,80 @@ pub fn ram_headroom(machine: &Machine) -> Mem {
 /// scope's `MemoryHigh`, twice the lease, above which the kernel reclaims
 /// and throttles it ([`crate::manage_run`]; on macOS Giverny kills it there,
 /// [`crate::user_cap::Ceiling::for_run`]). A lease of no RAM has no bound.
+/// Only where `run` holds a command there ([`RunBounds`], giverny#456).
 pub fn lease_bound_mb(ram_mb: u64) -> u64 {
     ram_mb * 2
 }
 
 /// What a task holding `ram_mb` is expected to reach: its kind's `peak`,
-/// held to [`lease_bound_mb`] — the history only ever lowers what a lease
+/// held to `bound` (what its commands can reach, [`RunBounds::bound`]; `None`
+/// when nothing holds them) — the history only ever lowers what a lease
 /// counts at, never past what it can use — else that RAM, else
 /// `default_mb`.
-fn expected_within(peak: Option<u64>, ram_mb: u64, default_mb: u64) -> u64 {
+fn expected_within(peak: Option<u64>, bound: Option<u64>, ram_mb: u64, default_mb: u64) -> u64 {
     match (peak, ram_mb) {
-        (Some(p), 0) => p,
-        (Some(p), r) => p.min(lease_bound_mb(r)),
+        (Some(p), _) => bound.map_or(p, |b| p.min(b)),
         (None, 0) => default_mb,
         (None, r) => r,
+    }
+}
+
+/// `<ledger dir>/run-caps`: what the last `run` here did with its lease —
+/// `capped` (a scope's `MemoryHigh`, or Giverny's own kill, at
+/// [`lease_bound_mb`]) or `advisory` (nothing held it) — so the ledger
+/// knows without asking systemd on every call (giverny#456).
+pub fn run_caps_path(ledger: &Path) -> PathBuf {
+    ledger.with_file_name("run-caps")
+}
+
+/// What the leases' commands can reach (giverny#456): where `run` holds a
+/// command to [`lease_bound_mb`], and what each command running now was
+/// started held to. A lease counts at no less than what its commands can
+/// really use: nothing bounds it where `run` is advisory (Linux without a
+/// user systemd, Windows), and a command started before its lease shrank
+/// (`claim --ram <less>`) keeps the old scope's `MemoryHigh`, so the lease
+/// counts at that until the command ends. Lowering the live scopes'
+/// `MemoryHigh` instead would throttle a build mid-way, needs systemd (on
+/// macOS the bound lives inside the `run` process), and can fail; counting
+/// the old bound only costs the room the shrink would have freed, for as
+/// long as the old command runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunBounds {
+    /// `run` holds a command to [`lease_bound_mb`] here: under a systemd
+    /// scope, or by Giverny itself (macOS, [`crate::user_cap`]). Read from
+    /// [`run_caps_path`], else probed as `run` probes.
+    pub caps: bool,
+    /// Each lease with a `run` going, by id: the most any of its running
+    /// commands was started held to — `None` when one is held to nothing.
+    pub live: HashMap<String, Option<u64>>,
+}
+
+impl RunBounds {
+    /// This machine's, beside the ledger at `ledger`.
+    pub fn detect(ledger: &Path) -> RunBounds {
+        let caps = match std::fs::read_to_string(run_caps_path(ledger)) {
+            Ok(t) => t.trim() == "capped",
+            Err(_) => crate::manage_run::caps_here(),
+        };
+        RunBounds {
+            caps,
+            live: crate::run_live::running_bounds(&crate::run_live::runs_dir(ledger)),
+        }
+    }
+
+    /// The most a lease of `ram_mb` (with id `id`, when it is one) lets its
+    /// commands use: twice it where `run` caps, and at least what a running
+    /// command was started under. `None`: unbounded (no RAM, `run`
+    /// advisory, or a running command held to nothing).
+    pub fn bound(&self, id: Option<&str>, ram_mb: u64) -> Option<u64> {
+        if ram_mb == 0 || !self.caps {
+            return None;
+        }
+        let new = lease_bound_mb(ram_mb);
+        match id.and_then(|id| self.live.get(id)) {
+            None => Some(new),
+            Some(live) => live.map(|b| b.max(new)),
+        }
     }
 }
 
@@ -338,6 +401,8 @@ pub struct Capacity {
     /// when that is not known (no registry read, none found): then only a
     /// heartbeat's [`TTL_MS`] says a session is gone.
     pub live_sessions: Option<HashSet<String>>,
+    /// What the leases' commands can reach (giverny#456).
+    pub run_bounds: RunBounds,
 }
 
 impl Capacity {
@@ -360,6 +425,7 @@ impl Capacity {
             mem_use: MemUse::sample(&runs),
             cpu_use: CpuUse::sample(&runs, now),
             live_sessions: live_sessions(),
+            run_bounds: RunBounds::detect(ledger),
         })
     }
 
@@ -379,11 +445,13 @@ impl Capacity {
     }
 
     /// What admission counts `l` at: its expected peak, never above what
-    /// its lease lets a `run` reach ([`lease_bound_mb`], giverny#455) — else
-    /// its RAM, else the default lease — or what it uses now when that is
-    /// more.
+    /// its commands can reach ([`RunBounds::bound`], giverny#455/#456) —
+    /// else its RAM, else the default lease — or what it uses now when that
+    /// is more.
     pub fn counted_mb(&self, l: &Lease) -> u64 {
-        expected_within(l.peak_mb, l.ram_mb, self.default_lease.ram.0).max(self.mem_use.of(&l.id))
+        let bound = self.run_bounds.bound(Some(&l.id), l.ram_mb);
+        expected_within(l.peak_mb, bound, l.ram_mb, self.default_lease.ram.0)
+            .max(self.mem_use.of(&l.id))
     }
 }
 
@@ -1067,12 +1135,13 @@ impl Ledger {
     }
 
     /// What `req` counts at when it holds `ram_mb`: its expected peak, held
-    /// to what that lease lets it use ([`lease_bound_mb`]), else that RAM,
+    /// to what that lease lets it use ([`RunBounds::bound`]), else that RAM,
     /// else the default lease — never more than an empty slice has room
     /// for, so a task whose kind once peaked near the limit still starts on
     /// an idle box.
     fn counted_for(cap: &Capacity, req: &Request, ram_mb: u64) -> u64 {
-        expected_within(req.peak_mb, ram_mb, cap.default_lease.ram.0).min(
+        let bound = cap.run_bounds.bound(None, ram_mb);
+        expected_within(req.peak_mb, bound, ram_mb, cap.default_lease.ram.0).min(
             cap.limits
                 .ram
                 .0
@@ -1835,7 +1904,7 @@ pub fn ask_hint(
 /// its kind peaked at that or more.
 fn counted(l: &Lease) -> String {
     match l.peak_mb {
-        Some(p) if l.ram_mb > 0 && p >= lease_bound_mb(l.ram_mb) => format!(
+        Some(p) if l.ram_mb > 0 && p == lease_bound_mb(l.ram_mb) => format!(
             ", counted at {}, the most its lease lets it use",
             Mem(lease_bound_mb(l.ram_mb))
         ),
@@ -2514,6 +2583,10 @@ mod tests {
                 ..Default::default()
             },
             live_sessions: None,
+            run_bounds: RunBounds {
+                caps: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -3063,6 +3136,110 @@ mod tests {
         // That is all there is: a fourth waits.
         let q = l.claim(&c, "s", "fourth", Some("demo"), &new, T0);
         assert!(matches!(q, Outcome::Queued { .. }), "{q:?}");
+    }
+
+    /// giverny#456: the bound holds only where `run` holds a command to it,
+    /// and a command started before its lease shrank keeps the old one: a
+    /// lease counts at no less than what its commands can really reach.
+    #[test]
+    fn a_lease_counts_at_what_its_commands_can_really_reach() {
+        let lease = |ram_gb: u64, peak_mb: Option<u64>| Lease {
+            id: lease_id("s", "t"),
+            session: "s".into(),
+            task: "t".into(),
+            repo: None,
+            ram_mb: ram_gb * 1024,
+            gpus: vec![],
+            vram_mb: 0,
+            slots: vec![],
+            peak_mb,
+            granted_at: T0,
+            heartbeat_at: T0,
+            uncollected: None,
+        };
+        let id = lease_id("s", "t");
+        // Where `run` is advisory, nothing holds a 3G lease to 6G: it counts
+        // at its kind's peak, as before giverny#455, and so is admitted.
+        let mut c = cap();
+        c.run_bounds.caps = false;
+        assert_eq!(c.counted_mb(&lease(3, Some(10 * 1024))), 10 * 1024);
+        let r = Request {
+            peak_mb: Some(10 * 1024),
+            ..req(3)
+        };
+        assert_eq!(Ledger::counted_for(&c, &r, 3 * 1024), 10 * 1024);
+        let mut l = Ledger::default();
+        let g = l.claim(&c, "s", "t", Some("demo"), &r, T0);
+        let Outcome::Granted(granted) = &g else {
+            panic!("{g:?}")
+        };
+        assert_eq!(granted.peak_mb, Some(10 * 1024));
+        assert_eq!(
+            outcome_line("t", &g, &|_, _| None),
+            "granted t: 3G, counted at its kind's peak 10G"
+        );
+        assert_eq!(l.free(&c).counted_mb, 10 * 1024);
+        // Where it caps, 6G; but a command of it running held to nothing (a
+        // scope systemd would not make) is unbounded again.
+        c.run_bounds.caps = true;
+        assert_eq!(c.counted_mb(&lease(3, Some(10 * 1024))), 6 * 1024);
+        c.run_bounds.live.insert(id.clone(), None);
+        assert_eq!(c.counted_mb(&lease(3, Some(10 * 1024))), 10 * 1024);
+        // Shrunk from 3G to 1G while a command started under 3G (held at
+        // 6G) runs: 6G until it ends, then twice the new lease.
+        let mut l = Ledger::default();
+        let c = cap();
+        let r = Request {
+            peak_mb: Some(10 * 1024),
+            ..req(3)
+        };
+        assert!(matches!(
+            l.claim(&c, "s", "t", Some("demo"), &r, T0),
+            Outcome::Granted(_)
+        ));
+        let (_, shrunk) = l.shrink("s", "t", Some(1024), None, T0).unwrap();
+        let mut c = cap();
+        c.run_bounds.live.insert(id.clone(), Some(6 * 1024));
+        assert_eq!(c.counted_mb(&shrunk), 6 * 1024);
+        assert_eq!(l.free(&c).counted_mb, 6 * 1024);
+        c.run_bounds.live.clear();
+        assert_eq!(c.counted_mb(&shrunk), 2 * 1024);
+        // A command held below the lease's bound (started under a smaller
+        // lease) never lowers it.
+        c.run_bounds.live.insert(id, Some(1024));
+        assert_eq!(c.counted_mb(&lease(3, Some(10 * 1024))), 6 * 1024);
+    }
+
+    /// giverny#456: what `run` did is read beside the ledger — whether it
+    /// caps here, and what each running command is held to.
+    #[test]
+    fn run_bounds_are_read_beside_the_ledger() {
+        let dir = std::env::temp_dir().join(format!("giverny-runbounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runs = crate::run_live::runs_dir(&dir.join("ledger.json"));
+        std::fs::create_dir_all(&runs).unwrap();
+        let ledger = dir.join("ledger.json");
+        std::fs::write(run_caps_path(&ledger), "capped\n").unwrap();
+        let _a = crate::run_live::register_bound(&runs.join("1-0.stats"), "a", "s", T0, Some(6144))
+            .unwrap();
+        let _b = crate::run_live::register_bound(&runs.join("1-1.stats"), "a", "s", T0, Some(2048))
+            .unwrap();
+        let _c = crate::run_live::register(&runs.join("1-2.stats"), "b", "s", T0).unwrap();
+        let b = RunBounds::detect(&ledger);
+        assert!(b.caps);
+        assert_eq!(
+            b.live,
+            HashMap::from([(lease_id("s", "a"), Some(6144)), (lease_id("s", "b"), None)])
+        );
+        assert_eq!(b.bound(Some(&lease_id("s", "a")), 1024), Some(6144));
+        assert_eq!(b.bound(Some(&lease_id("s", "b")), 1024), None);
+        assert_eq!(b.bound(Some(&lease_id("s", "c")), 1024), Some(2048));
+        assert_eq!(b.bound(None, 0), None);
+        std::fs::write(run_caps_path(&ledger), "advisory\n").unwrap();
+        let b = RunBounds::detect(&ledger);
+        assert!(!b.caps);
+        assert_eq!(b.bound(Some(&lease_id("s", "c")), 1024), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// giverny#281: what is really committed still queues a task — peaks

@@ -2,9 +2,10 @@
 //!
 //! While a command runs, `run` keeps a small JSON file beside its stats
 //! file, `<ledger dir>/runs/<pid>-<n>.live` (`task`, `session`, `pid`,
-//! `stats`, `started_ms`, and `cwd`: the worktree it works in, which the
-//! reach guard keeps other sessions out of, [`crate::reach_guard`]), and
-//! removes it when the command ends. The shim
+//! `stats`, `started_ms`, `cwd`: the worktree it works in, which the
+//! reach guard keeps other sessions out of, [`crate::reach_guard`], and
+//! `bound_mb`: the memory the command is held to, null when nothing holds
+//! it, giverny#456), and removes it when the command ends. The shim
 //! inside the command's systemd scope adds `cgroup <dir>` to the stats file
 //! as it starts, so a reader finds the scope's cgroup without asking
 //! systemd. The app's one sampler ([`crate::use_reading`]) lists them
@@ -19,7 +20,7 @@
 //! as building. A `.live` file whose `run` is gone (killed) is skipped by
 //! readers and swept by the next `run`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -82,10 +83,23 @@ impl Drop for Registered {
     }
 }
 
-/// Say that `task`'s command, measured through `stats`, is running. Sweeps
-/// `.live` files whose `run` is gone first. A failure only costs the pane
-/// its live figure, so it is `None`, not an error.
+/// Say that `task`'s command, measured through `stats`, is running, held
+/// to nothing. Sweeps `.live` files whose `run` is gone first. A failure
+/// only costs the pane its live figure, so it is `None`, not an error.
 pub fn register(stats: &Path, task: &str, session: &str, now_ms: u64) -> Option<Registered> {
+    register_bound(stats, task, session, now_ms, None)
+}
+
+/// [`register`], for a command held to `bound_mb` of memory (a scope's
+/// `MemoryHigh`, Giverny's own kill), which the ledger counts its lease at
+/// until it ends ([`crate::resources::RunBounds`], giverny#456).
+pub fn register_bound(
+    stats: &Path,
+    task: &str,
+    session: &str,
+    now_ms: u64,
+    bound_mb: Option<u64>,
+) -> Option<Registered> {
     if let Some(dir) = stats.parent() {
         sweep(dir);
     }
@@ -97,6 +111,7 @@ pub fn register(stats: &Path, task: &str, session: &str, now_ms: u64) -> Option<
         "stats": stats.display().to_string(),
         "started_ms": now_ms,
         "cwd": std::env::current_dir().ok().map(|d| d.display().to_string()),
+        "bound_mb": bound_mb,
     });
     let tmp = path.with_extension("live.tmp");
     std::fs::write(&tmp, body.to_string()).ok()?;
@@ -121,6 +136,9 @@ struct LiveFile {
     stats: PathBuf,
     started_ms: Option<u64>,
     cwd: Option<PathBuf>,
+    /// Held to that much memory; `None` when nothing holds it (or the file
+    /// is older than giverny#456 and does not say).
+    bound_mb: Option<u64>,
 }
 
 fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
@@ -133,6 +151,7 @@ fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
         stats: PathBuf::from(s("stats")?),
         started_ms: v.get("started_ms").and_then(Value::as_u64),
         cwd: s("cwd").map(PathBuf::from),
+        bound_mb: v.get("bound_mb").and_then(Value::as_u64),
     })
 }
 
@@ -179,6 +198,22 @@ pub fn running_leases(runs_dir: &Path) -> HashSet<String> {
         .filter(|(_, l)| alive(l.pid))
         .map(|(_, l)| crate::resources::lease_id(&l.session, &l.task))
         .collect()
+}
+
+/// Each lease (`<session>:<task>`) with a `run` command going under
+/// `runs_dir`: the most any of them is held to, `None` when one is held to
+/// nothing (giverny#456).
+pub fn running_bounds(runs_dir: &Path) -> HashMap<String, Option<u64>> {
+    let mut out: HashMap<String, Option<u64>> = HashMap::new();
+    for (_, l) in read_dir(runs_dir).into_iter().filter(|(_, l)| alive(l.pid)) {
+        let id = crate::resources::lease_id(&l.session, &l.task);
+        let b = out.entry(id).or_insert(Some(0));
+        *b = match (*b, l.bound_mb) {
+            (Some(a), Some(n)) => Some(a.max(n)),
+            _ => None,
+        };
+    }
+    out
 }
 
 /// One `giverny manage run` command's record, whose `run` may be gone.
