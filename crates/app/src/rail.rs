@@ -162,6 +162,8 @@ fn busy(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32, mark: 
 
 /// The open ring's radius: what Claude's calm busy mark breathes out to
 /// from the idle dot ([`DOT_R`]), and holds at with `rail.animate` off.
+/// The ring's inner edge: its stroke ([`RING_STROKE`]) lies outside it, as
+/// egui paints a circle's stroke.
 const RING_R: f32 = 4.0;
 
 /// The small filled dot's radius: Claude idle at its prompt in the
@@ -170,12 +172,15 @@ const RING_R: f32 = 4.0;
 /// beside the small square at a glance, still well inside the ring.
 const DOT_R: f32 = 3.0;
 
-/// The open ring's stroke, centred on [`RING_R`].
+/// The open ring's stroke, from [`RING_R`] outwards.
 const RING_STROKE: f32 = 1.4;
 
-/// A plain shell's hollow square, across: exited, and the size a running
-/// command's square breathes out to.
-const SQUARE_SIDE: f32 = 7.0;
+/// The hollow square a running command's square breathes out to, across,
+/// and holds at with `rail.animate` off: about as big to the eye as
+/// Claude's ring at the top of its breath (giverny#462; was 7.0, which
+/// looked small beside it). A square reads larger than a circle as wide,
+/// so it stays narrower than the ring's outer edge.
+const SQUARE_SIDE: f32 = 9.5;
 
 /// The small filled square, across: a shell at its prompt in the
 /// category's colour, as idle Claude is the small dot; a restored shell tab
@@ -184,47 +189,99 @@ const SQUARE_SIDE: f32 = 7.0;
 /// square beside the dot ([`DOT_R`]), still well inside [`SQUARE_SIDE`].
 const SMALL_SQUARE: f32 = 5.0;
 
-/// The smallest hole [`annulus`] cuts, in device pixels: a smaller one
-/// would be lost in the edge's anti-aliasing, so it is cut this size and
-/// faded in instead.
-const HOLE_PX: f32 = 1.5;
+/// How many sides [`annulus`] gives its circles: rounder than the 16 egui
+/// gives a circle this small.
+const ANNULUS_SIDES: u32 = 32;
 
 /// A disc at `at` with a hole in its middle: everything between `inner` and
-/// `outer` from the centre is `color`. Drawn as a ring whose stroke is the
-/// band between the two, so as the hole closes the stroke simply widens
-/// until it fills the disc. A hole too small to draw (under [`HOLE_PX`])
-/// is cut at that size and filled back in, the fill fading out as the hole
-/// grows, so the hole opens and closes by degrees, never a whole pixel or
-/// two at once, which showed as a jump on the busy breath's slow clock
-/// (giverny#462).
+/// `outer` from the centre is `color`, drawn as one mesh, so as the hole
+/// closes the band simply thickens inwards until it fills the disc. Both
+/// edges are anti-aliased across one device pixel, as egui's own; a hole
+/// narrower than that does not vanish in a step but fades out in the
+/// centre (see [`annulus_ink`]). One shape at every size: never a second
+/// one filling the hole in, which showed as a dot inside the ring just
+/// before it closed (giverny#462).
 fn annulus(p: &egui::Painter, at: Pos2, outer: f32, inner: f32, color: Color32) {
     let px = 1.0 / p.pixels_per_point();
+    let outer = outer.max(0.0);
     let inner = inner.clamp(0.0, outer);
-    let least = (HOLE_PX * px).min(outer / 2.0);
-    if inner <= 0.0 {
-        p.circle_filled(at, outer, color);
+    if outer <= 0.0 {
         return;
     }
-    let hole = inner.max(least);
-    p.circle_stroke(at, (outer + hole) / 2.0, Stroke::new(outer - hole, color));
-    if inner < least {
-        // Over the ring's inner anti-aliased edge too, so no seam shows.
-        let fill = 1.0 - inner / least;
-        p.circle_filled(at, (hole + px).min(outer), color.gamma_multiply(fill));
+    // The radii where the ink's slope changes, innermost first: between
+    // two of them it is a straight ramp, which the mesh's colours draw
+    // exactly.
+    let mut radii = [
+        inner - px / 2.0,
+        inner + px / 2.0,
+        outer - px / 2.0,
+        outer + px / 2.0,
+    ]
+    .map(|r| r.max(0.0))
+    .to_vec();
+    radii.sort_by(f32::total_cmp);
+    radii.dedup();
+    let ink = |r: f32| color.gamma_multiply(annulus_ink(r, outer, inner, px));
+    let mut mesh = egui::Mesh::default();
+    // A ring of vertices round the centre at each radius; at radius 0 the
+    // centre alone. With the hole open the innermost ring has no ink and
+    // nothing is drawn inside it.
+    let mut rings = Vec::new();
+    for &r in &radii {
+        let first = mesh.vertices.len() as u32;
+        if r <= 0.0 {
+            mesh.colored_vertex(at, ink(0.0));
+        } else {
+            for i in 0..ANNULUS_SIDES {
+                let turn = std::f32::consts::TAU * i as f32 / ANNULUS_SIDES as f32;
+                mesh.colored_vertex(at + r * Vec2::angled(turn), ink(r));
+            }
+        }
+        rings.push((first, r <= 0.0));
     }
+    for pair in rings.windows(2) {
+        let [(a, centre), (b, _)] = [pair[0], pair[1]];
+        for i in 0..ANNULUS_SIDES {
+            let j = (i + 1) % ANNULUS_SIDES;
+            if centre {
+                mesh.add_triangle(a, b + i, b + j);
+            } else {
+                mesh.add_triangle(a + i, b + i, b + j);
+                mesh.add_triangle(a + i, b + j, a + j);
+            }
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// How much ink [`annulus`] lays `r` from its centre, 0 to 1: a ramp one
+/// pixel (`px`) wide over each edge, as egui feathers its own. A hole
+/// under a pixel across cannot be ramped so, and its centre would stay
+/// half filled; its ramp instead starts in the very centre, at
+/// `1 - 2 * inner / px`, so the centre clears by degrees as the hole opens
+/// and fills by degrees as it closes, meeting the full ramp at half a pixel.
+fn annulus_ink(r: f32, outer: f32, inner: f32, px: f32) -> f32 {
+    let edge = (outer - r) / px + 0.5;
+    let hole = if inner >= px / 2.0 {
+        (r - inner) / px + 0.5
+    } else {
+        let centre = 1.0 - 2.0 * inner / px;
+        centre + (1.0 - centre) * r / (inner + px / 2.0)
+    };
+    edge.min(hole).clamp(0.0, 1.0)
 }
 
 /// Claude's calm busy mark (`rail.calm_busy`): its idle dot breathing out
 /// to the open ring and back (giverny#388, giverny#462). At `breath` 0 it
 /// is the idle dot ([`DOT_R`], filled); as it breathes out its edge grows
 /// to the ring's and a hole opens in its middle, until at 1 it is the
-/// hollow ring of [`RING_R`], as with `rail.animate` off. Both edges move
-/// together, so it morphs and never jumps between filled and stroked.
+/// hollow ring of [`RING_R`], as with `rail.animate` off. It is one shape
+/// throughout, its edge and its hole moving together, so it morphs and
+/// never jumps between filled and stroked.
 fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     let breath = breath.clamp(0.0, 1.0);
-    let half = RING_STROKE / 2.0;
-    let outer = DOT_R + (RING_R + half - DOT_R) * breath;
-    let inner = (RING_R - half) * breath;
+    let outer = DOT_R + (RING_R + RING_STROKE - DOT_R) * breath;
+    let inner = RING_R * breath;
     annulus(p, at, outer, inner, color);
 }
 
@@ -1654,8 +1711,10 @@ enum Mark {
     /// square, as Claude at its prompt is a small dot (giverny#388,
     /// giverny#462).
     Prompt,
-    /// A plain shell that has exited: the hollow square in gray, like a
-    /// tab not started — nothing runs there (giverny#388).
+    /// A plain shell that has exited: a small hollow square in gray, the
+    /// size of a shell at its prompt, not the running breath's top; hollow,
+    /// so it differs from the filled gray square of a tab not started —
+    /// nothing runs there (giverny#388, giverny#462).
     Exited,
     /// A tab restored from a previous run whose process has not spawned:
     /// tiny and gray, a circle when it will come back as Claude, a square
@@ -1665,11 +1724,12 @@ enum Mark {
 
 impl Mark {
     /// A still shell mark's square, (side, filled): at its prompt and not
-    /// started, the small filled one; exited, the hollow one (giverny#462).
+    /// started, the small filled one; exited, the small hollow one
+    /// (giverny#462).
     fn still_square(self) -> Option<(f32, bool)> {
         match self {
             Mark::Prompt | Mark::NotStarted { claude: false } => Some((SMALL_SQUARE, true)),
-            Mark::Exited => Some((SQUARE_SIDE, false)),
+            Mark::Exited => Some((SMALL_SQUARE, false)),
             _ => None,
         }
     }
@@ -1830,8 +1890,8 @@ fn tab_row(
         }
         // A plain shell, which most tabs are most of the time: a small
         // filled square at its prompt, breathing out to the hollow square
-        // and back while a command runs, and the hollow square in gray once
-        // the shell has exited (giverny#388, giverny#462). Squares read
+        // and back while a command runs, and the small square hollow and in
+        // gray once the shell has exited (giverny#388, giverny#462). Squares read
         // larger than circles of the same width, so each is a touch
         // narrower than its round twin.
         Mark::Running => breathing_square(ui, &p, rect, dot, color),
@@ -3096,21 +3156,17 @@ mod tests {
             std::time::Duration::MAX,
             "a still ring woke the window"
         );
-        let rings: Vec<_> = shapes
-            .iter()
-            .filter_map(|s| match s {
-                egui::Shape::Circle(c) => Some(c),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(rings.len(), 1, "{shapes:?}");
-        assert!(
-            (rings[0].radius - RING_R).abs() < 1e-4,
-            "breathed out to the open ring, all the way"
+        // Breathed out to the open ring, all the way, and hollow.
+        let (outer, inner) = band(&shapes);
+        assert!((outer - (RING_R + RING_STROKE)).abs() < 0.05, "{outer}");
+        assert!((inner - RING_R).abs() < 0.05, "{inner}");
+        let mesh = the_mesh(&shapes);
+        assert_eq!(
+            ink_at(mesh, Pos2::new(5.0, 5.0), Color32::WHITE),
+            0.0,
+            "hollow"
         );
-        assert!((rings[0].stroke.width - RING_STROKE).abs() < 1e-4);
-        assert_eq!(rings[0].fill, Color32::TRANSPARENT, "hollow");
-        assert_eq!(rings[0].stroke.color, Color32::WHITE);
+        assert!(mesh.vertices.iter().any(|v| v.color == Color32::WHITE));
         let (_, shapes) = frame(BusyMark::Spinner);
         assert!(shapes.is_empty(), "a spinner drawn with the switch off");
     }
@@ -3541,8 +3597,9 @@ mod tests {
 
     /// A shell at its prompt is the small filled square, as idle Claude is
     /// the small dot, the same square a not-started shell wears in gray and
-    /// a running command's breath starts from; an exited shell is the
-    /// hollow square, the running breath's other end (giverny#462).
+    /// a running command's breath starts from; an exited shell is that
+    /// small square hollow, smaller than the running breath's other end
+    /// (giverny#462).
     #[test]
     fn a_shell_at_its_prompt_is_the_small_filled_square() {
         assert_eq!(Mark::Prompt.still_square(), Some((SMALL_SQUARE, true)));
@@ -3550,7 +3607,7 @@ mod tests {
             Mark::NotStarted { claude: false }.still_square(),
             Mark::Prompt.still_square()
         );
-        assert_eq!(Mark::Exited.still_square(), Some((SQUARE_SIDE, false)));
+        assert_eq!(Mark::Exited.still_square(), Some((SMALL_SQUARE, false)));
         for mark in [Mark::Running, Mark::Idle, Mark::NotStarted { claude: true }] {
             assert_eq!(mark.still_square(), None, "{mark:?}");
         }
@@ -3568,7 +3625,15 @@ mod tests {
                 )
             };
             assert_eq!(draw(Mark::Prompt.still_square().unwrap()), breath(0.0));
-            assert_eq!(draw(Mark::Exited.still_square().unwrap()), breath(1.0));
+            // Exited: the prompt's square across, but hollow, and smaller
+            // than the running breath's top.
+            let (exited, prompt) = (
+                draw(Mark::Exited.still_square().unwrap()),
+                draw(Mark::Prompt.still_square().unwrap()),
+            );
+            assert_eq!(exited.0, prompt.0, "{ppp}: the prompt's size");
+            assert!(exited.1 > 0.0 && prompt.1 == 0.0, "{ppp}: hollow");
+            assert!(exited.0 < breath(1.0).0, "{ppp}: not the breath's top");
         }
     }
 
@@ -3648,39 +3713,87 @@ mod tests {
         }
     }
 
-    /// The disc between `outer` and `inner` the shapes at `breath` draw,
-    /// at one point per pixel: a filled circle has no hole, and a hole
-    /// filled back in part way by a faded disc counts as that much smaller
-    /// (the hole fading in, [`annulus`]).
-    fn band(shapes: &[egui::Shape]) -> (f32, f32) {
-        let circle = |s: &egui::Shape| match s {
-            egui::Shape::Circle(c) => *c,
-            _ => panic!("circles, not {shapes:?}"),
-        };
+    /// The one mesh [`annulus`] draws, which must be all that was drawn.
+    fn the_mesh(shapes: &[egui::Shape]) -> &egui::Mesh {
         match shapes {
-            [c] => {
-                let c = circle(c);
-                if c.fill != Color32::TRANSPARENT {
-                    assert_eq!(c.stroke.width, 0.0, "filled or stroked, not both");
-                    (c.radius, 0.0)
-                } else {
-                    let half = c.stroke.width / 2.0;
-                    (c.radius + half, c.radius - half)
-                }
-            }
-            [ring, fill] => {
-                let (ring, fill) = (circle(ring), circle(fill));
-                let half = ring.stroke.width / 2.0;
-                let (outer, hole) = (ring.radius + half, ring.radius - half);
-                assert!(
-                    fill.radius >= hole && fill.radius <= outer,
-                    "fills the hole"
-                );
-                let shown = fill.fill.a() as f32 / ring.stroke.color.a() as f32;
-                (outer, hole * (1.0 - shown))
-            }
-            _ => panic!("a ring and at most its fill, not {shapes:?}"),
+            [egui::Shape::Mesh(m)] => m,
+            _ => panic!("one mesh, not {shapes:?}"),
         }
+    }
+
+    /// The ink a mesh lays at `at`, 0 to 1 of `full`'s alpha: what its
+    /// triangles' colours blend to there, as the GPU draws them.
+    fn ink_at(mesh: &egui::Mesh, at: Pos2, full: Color32) -> f32 {
+        let mut ink = 0.0f32;
+        for t in mesh.indices.chunks(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| &mesh.vertices[t[k] as usize]);
+            let (v0, v1, v2) = (b.pos - a.pos, c.pos - a.pos, at - a.pos);
+            let det = v0.x * v1.y - v1.x * v0.y;
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let u = (v2.x * v1.y - v1.x * v2.y) / det;
+            let v = (v0.x * v2.y - v2.x * v0.y) / det;
+            if u < -1e-6 || v < -1e-6 || u + v > 1.0 + 1e-6 {
+                continue;
+            }
+            let alpha = |x: &egui::epaint::Vertex| x.color.a() as f32;
+            let here = alpha(a) * (1.0 - u - v) + alpha(b) * u + alpha(c) * v;
+            ink = ink.max(here / full.a() as f32);
+        }
+        ink
+    }
+
+    /// The ink of a calm mark's one mesh along the ray through each ring's
+    /// first vertex, (radius, 0 to 1 of `full`'s alpha) from the centre
+    /// out: between two points it ramps straight, as the mesh draws it.
+    fn ray(shapes: &[egui::Shape], full: Color32) -> Vec<(f32, f32)> {
+        let mesh = the_mesh(shapes);
+        // The rings are round the centre, so it is all their vertices' mean.
+        let sum = mesh
+            .vertices
+            .iter()
+            .fold(Vec2::ZERO, |s, v| s + v.pos.to_vec2());
+        let centre = (sum / mesh.vertices.len() as f32).to_pos2();
+        let mut ray: Vec<(f32, f32)> = mesh
+            .vertices
+            .iter()
+            .map(|v| (v.pos - centre, v.color.a() as f32 / full.a() as f32))
+            .filter(|(d, _)| d.y.abs() < 1e-4 && d.x >= -1e-4)
+            .map(|(d, a)| (d.x.max(0.0), a))
+            .collect();
+        ray.sort_by(|a, b| a.0.total_cmp(&b.0));
+        ray
+    }
+
+    /// The disc between `outer` and `inner` a calm mark's one mesh draws,
+    /// in points: how big a disc its ink makes all told, and how big a hole
+    /// it leaves in the middle, both by area, so a hole under a pixel that
+    /// only thins the centre counts as that much hole.
+    fn band(shapes: &[egui::Shape]) -> (f32, f32) {
+        let ray = ray(shapes, Color32::RED);
+        // ∫ 2r·a(r) dr over one straight piece, or of the ink missing,
+        // 1 - a(r); Simpson's rule is exact for it.
+        let piece = |(r0, a0): (f32, f32), (r1, a1): (f32, f32), ink: bool| {
+            let f = |r: f32, a: f32| 2.0 * r * if ink { a } else { 1.0 - a };
+            let (rm, am) = ((r0 + r1) / 2.0, (a0 + a1) / 2.0);
+            (r1 - r0) / 6.0 * (f(r0, a0) + 4.0 * f(rm, am) + f(r1, a1))
+        };
+        let peak = ray
+            .iter()
+            .position(|&(_, a)| a >= 1.0 - 1e-3)
+            .expect("full ink somewhere");
+        // The hole: all that is missing inside the full band; the disc: the
+        // band's ink and all inside it.
+        let mut hole = ray[0].0 * ray[0].0;
+        let mut disc = ray[peak].0 * ray[peak].0;
+        for w in ray.windows(2).take(peak) {
+            hole += piece(w[0], w[1], false);
+        }
+        for w in ray.windows(2).skip(peak) {
+            disc += piece(w[0], w[1], true);
+        }
+        (disc.sqrt(), hole.max(0.0).sqrt())
     }
 
     fn painted(paint: impl Fn(&egui::Painter)) -> Vec<egui::Shape> {
@@ -3690,11 +3803,11 @@ mod tests {
     }
 
     /// Claude's calm busy mark morphs from the idle dot to the open ring
-    /// and back (giverny#462): breathed in it is the idle dot exactly,
-    /// breathed out the ring, and all the way round the breath, at any
-    /// scale, both edges move a little at a time, the hole fading in from
-    /// nothing, so there is no jump where a filled disc turns into a
-    /// stroked ring (the step Ita saw at the end of the clench).
+    /// and back (giverny#462): breathed in it is the idle dot, breathed out
+    /// the ring, and all the way round the breath, at any scale, both edges
+    /// move a little at a time, the hole fading in from nothing, so there
+    /// is no jump where a filled disc turns into a stroked ring (the step
+    /// Ita saw at the end of the clench).
     #[test]
     fn the_calm_mark_morphs_from_the_idle_dot_to_the_open_ring() {
         for ppp in [1.0, 1.25, 1.5, 2.0] {
@@ -3703,10 +3816,18 @@ mod tests {
                     calm_ring(p, Pos2::ZERO, breath, Color32::RED)
                 }))
             };
-            assert_eq!(at(0.0), (DOT_R, 0.0), "breathed in: the idle dot");
+            // An edge anti-aliased across a pixel reads a hair bigger by
+            // area: (r² + px²/12)^½.
+            let near = |got: f32, r: f32| (got - r).abs() < 0.05;
+            let (outer, inner) = at(0.0);
+            assert!(
+                near(outer, DOT_R),
+                "{ppp}: breathed in, the idle dot: {outer}"
+            );
+            assert_eq!(inner, 0.0, "{ppp}: breathed in, no hole at all");
             let (outer, inner) = at(1.0);
-            assert!((outer - (RING_R + RING_STROKE / 2.0)).abs() < 1e-4);
-            assert!((inner - (RING_R - RING_STROKE / 2.0)).abs() < 1e-4);
+            assert!(near(outer, RING_R + RING_STROKE), "{ppp}: {outer}");
+            assert!(near(inner, RING_R), "{ppp}: {inner}");
             // One whole breath, out and back in, in fine steps of time.
             let steps = 600;
             let breath = |k: usize| calm_breath(Some(CALM_PERIOD * k as f64 / steps as f64));
@@ -3734,7 +3855,54 @@ mod tests {
                 );
                 last = now;
             }
-            assert_eq!(last, (DOT_R, 0.0), "{ppp}: back to the idle dot");
+            assert_eq!(last, at(0.0), "{ppp}: back to the idle dot");
+        }
+    }
+
+    /// Nothing is ever drawn inside the calm mark's hole (giverny#462,
+    /// round 4: a disc filling a hole too small to draw showed as a dot
+    /// inside the ring just before it closed). At every frame of a breath,
+    /// at the animation clock's pace and in fine steps between, at 1x,
+    /// 1.25x and 1.5x: the mark is one shape; where the hole is wider than
+    /// its anti-aliased edge no ink falls inside it; and from the centre
+    /// out the ink only rises to the full band and then only falls, so even
+    /// a hole under a pixel is a thinning centre, never a dot in a ring.
+    #[test]
+    fn the_calm_mark_draws_nothing_inside_its_hole() {
+        let paced = (0..=12).map(|k| k as f64 * 0.25);
+        let fine = (0..=240).map(|k| CALM_PERIOD * k as f64 / 240.0);
+        for ppp in [1.0, 1.25, 1.5] {
+            let px = 1.0 / ppp;
+            for t in paced.clone().chain(fine.clone()) {
+                let breath = calm_breath(Some(t));
+                let shapes = painted_at(ppp, |p| calm_ring(p, Pos2::ZERO, breath, Color32::RED));
+                let mesh = the_mesh(&shapes);
+                // Clear of the hole's anti-aliased edge.
+                let hole = RING_R * breath - px / 2.0;
+                if hole > 0.0 {
+                    for part in [0.0, 0.3, 0.6, 0.9, 0.99] {
+                        for k in 0..7 {
+                            let turn = std::f32::consts::TAU * (k as f32 + 0.5) / 7.0;
+                            let at = Pos2::ZERO + hole * part * Vec2::angled(turn);
+                            let ink = ink_at(mesh, at, Color32::RED);
+                            assert_eq!(ink, 0.0, "{ppp} at {t}s: ink {ink} at {at:?}, hole {hole}");
+                        }
+                    }
+                }
+                let ray = ray(&shapes, Color32::RED);
+                let peak = ray.iter().position(|&(_, a)| a >= 1.0 - 1e-3).unwrap();
+                for w in ray.windows(2) {
+                    let rising = w[1].0 <= ray[peak].0;
+                    assert!(
+                        if rising {
+                            w[1].1 >= w[0].1
+                        } else {
+                            w[1].1 <= w[0].1
+                        },
+                        "{ppp} at {t}s: a bump in the ink {ray:?}"
+                    );
+                }
+            }
         }
     }
 
