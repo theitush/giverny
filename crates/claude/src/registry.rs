@@ -25,9 +25,21 @@ pub struct SessionEntry {
     /// mtime to tell whether this session loaded Giverny's hooks.
     #[serde(rename = "startedAt", default)]
     pub started_at_ms: u64,
+    /// When the process started (`procStart`): clock ticks after boot, a
+    /// decimal string, field 22 of `/proc/<pid>/stat`. A pid only names a
+    /// process together with this: after a reboot pids start low again, and
+    /// a file Claude Code never removed names whatever new process got its
+    /// pid. Older Claude Codes leave it out.
+    #[serde(rename = "procStart", default)]
+    pub proc_start: Option<String>,
 }
 
 impl SessionEntry {
+    /// [`Self::proc_start`] as a number; `None` when absent or not one.
+    pub fn proc_start_ticks(&self) -> Option<u64> {
+        self.proc_start.as_deref()?.trim().parse().ok()
+    }
+
     /// The agent is working: thinking, or running a tool call. Measured, not
     /// assumed — a session stays `busy` through minutes of back-to-back Bash
     /// calls.
@@ -74,31 +86,57 @@ pub struct LiveSession {
 /// the Windows process table is not a weaker answer, it is an unrelated one.
 /// The distribution is asked instead, by the sweep that already walks its
 /// `/proc`, and this reads what that sweep left behind.
+///
+/// And a pid only means the same process while its start time does: an
+/// entry with `procStart` is live only if that pid started then, so a stale
+/// file whose pid came back after a reboot is not.
 fn entry_is_live(config_dir: &Path, entry: &SessionEntry) -> bool {
+    let start = entry.proc_start_ticks();
     if crate::wsl::is_wsl_path(config_dir) {
         // The pids in there are the distribution's, and the last sweep asked
         // it which ones exist. Not knowing means no: an unanswered question
         // used to read as "still running", which is the answer that refuses
         // to bring a conversation back — and it was wrong for the two minutes
         // after a restart, which is precisely when the app restarts.
-        return crate::wsl::pid_alive_in(config_dir, entry.pid).unwrap_or(false);
+        return crate::wsl::pid_alive_in(config_dir, entry.pid, start).unwrap_or(false);
     }
-    pid_alive(entry.pid)
+    pid_alive(entry.pid, start)
 }
 
-fn pid_alive(pid: u32) -> bool {
+/// `starttime` (field 22) of a `/proc/<pid>/stat` line, counted after the
+/// last `)`: the name before it may hold spaces and parentheses itself.
+pub fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `state` is field 3, so field 22 is the 20th after the name.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Is `pid` running, and (where the platform can say, and `start` is
+/// given) is it the process that started at `start`?
+fn pid_alive(pid: u32, start: Option<u64>) -> bool {
     #[cfg(target_os = "linux")]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        match start {
+            None => Path::new(&format!("/proc/{pid}")).exists(),
+            Some(start) => {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| stat_start_ticks(&stat))
+                    == Some(start)
+            }
+        }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
+        // `procStart` is Linux's clock; elsewhere only the pid is checked.
+        let _ = start;
         // macOS/BSD: signal 0 probes existence without delivering anything.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
     #[cfg(windows)]
     {
         use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let _ = start;
         let mut sys = System::new();
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
@@ -636,6 +674,7 @@ mod tests {
         let e: SessionEntry = serde_json::from_str(json).unwrap();
         assert_eq!(e.pid, 1234);
         assert_eq!(e.started_at_ms, 1785250651905);
+        assert_eq!(e.proc_start_ticks(), Some(50262977));
         assert!(e.busy());
         assert_eq!(e.name.as_deref(), Some("dev-13"));
         assert_eq!(e.cwd, PathBuf::from("/home/u/dev"));
@@ -664,6 +703,49 @@ mod tests {
         assert!(session_is_live([dir.clone()], "alive"));
         assert!(!session_is_live([dir.clone()], "dead"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This process's start time, as Claude Code writes `procStart`.
+    #[cfg(target_os = "linux")]
+    fn my_start() -> u64 {
+        stat_start_ticks(&std::fs::read_to_string("/proc/self/stat").unwrap()).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn entry(pid: u32, proc_start: Option<&str>) -> SessionEntry {
+        let start = proc_start
+            .map(|s| format!(r#","procStart":"{s}""#))
+            .unwrap_or_default();
+        serde_json::from_str(&format!(r#"{{"pid":{pid},"sessionId":"s"{start}}}"#)).unwrap()
+    }
+
+    /// A pid is a process only together with its start time: a stale file
+    /// whose pid came back after a reboot is dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_pid_is_not_a_live_session() {
+        let dir = Path::new("/nonexistent-config");
+        let me = std::process::id();
+        let start = my_start().to_string();
+        assert!(entry_is_live(dir, &entry(me, Some(&start))), "right start");
+        let wrong = (my_start() + 1).to_string();
+        assert!(!entry_is_live(dir, &entry(me, Some(&wrong))), "reused pid");
+        assert!(entry_is_live(dir, &entry(me, None)), "old Claude Code");
+        assert!(!entry_is_live(dir, &entry(4194301, None)), "dead pid");
+        assert!(
+            !entry_is_live(dir, &entry(4194301, Some(&start))),
+            "dead pid"
+        );
+    }
+
+    /// The name before the fields may hold `) (` itself.
+    #[test]
+    fn start_time_is_read_after_the_last_paren() {
+        let stat = "3204 (a) (b c) S 803 3204 3204 0 -1 4194304 147 0 2 0 0 0 0 0 \
+                    20 0 1 0 48254 3217408 512 18446744073709551615";
+        assert_eq!(stat_start_ticks(stat), Some(48254));
+        assert_eq!(stat_start_ticks("3204 (sleep) S 1"), None);
+        assert_eq!(stat_start_ticks("garbage"), None);
     }
 
     #[test]
