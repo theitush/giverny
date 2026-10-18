@@ -37,7 +37,7 @@ gh api repos/theitush/giverny/issues -X POST -f title="..." -F body=@file -q .nu
 1. Read it. `Worker: ita` is his — don't do it, don't close it.
 2. Sign and set In Progress, before any work: pick a one-word first name and run `/home/ita/coo/tools/sign giverny $n Pike` (a surname is drawn: Pike Vance; revived, pass both words). No `tools/sign` (cloud run): write `**Agent:** <name> · <hostname> · in \`<pwd>\` · no resumable session` at the top of the body by hand.
 3. Do the work; commit and push (below).
-4. Finish — file the leftovers, write the result signed with your full name, close, set Done:
+4. Finish — write the result signed with your full name, close, set Done:
    ```bash
    { gh api repos/theitush/giverny/issues/$n -q .body; printf '\n---\n**Result**\n\n%s\n' "<what, how verified> — Pike Vance"; } > /tmp/task-$n.md
    gh api -X PATCH repos/theitush/giverny/issues/$n -F body=@/tmp/task-$n.md -f state=closed
@@ -47,11 +47,11 @@ gh api repos/theitush/giverny/issues -X POST -f title="..." -F body=@file -q .nu
 
 **Review, not Done,** when finished work needs a person's eye — anything visual, a judgement call, an outward-facing or irreversible change. Status `Review`, issue stays open, and only the reviewer closes it. The body's first line is **one line** — `**Review:** ita — <what exactly> <where: URL, branch + command, file:line>`. Commits say `Refs #n`, never `Closes`/`Fixes`, which would close it. Mere doubt is not Review: it is Done with the doubt in the result, or Blocked.
 
-**What you could not do becomes a task.** Each skipped step, unrun check, estimate, uncovered case → its own `backlog` issue before this one closes, and the result names them: `Left over: #40 (…), #41 (…)`.
+**Leftovers go in your report, not on the board.** A skipped step, an unrun check, an uncovered case, something you noticed on the way — write it in the result and say it in your final report to whoever sent you (your manager, or Ita); they decide what happens to it. An issue is only for what must outlive the session: a real bug nobody is fixing now, a call only Ita can make (`DECIDE:`), work too big for this session. The result names those: `Left over: #40 (…)`. Filing every leftover took the board from 946 items to 2,504 in four weeks, and Ita now works from the managers, not the board (coo#241).
 
-**Another repo's work is handed off, not taken:** file it in that repo over REST, `tools/board add` it at `backlog`, tell Ita in one line, and get back to your task. Never write into another repo's tree; read it there or in `coo/mirror/<name>/`.
+**Another repo's work is handed off, not taken:** say it in one line in your report; if it must outlive the session, file it in that repo over REST and `tools/board add` it at `backlog`. Then get back to your task. Never write into another repo's tree; read it there or in `coo/mirror/<name>/`.
 
-**Stay focused.** Unrelated findings are pins: a `backlog` issue of three to five lines (where, symptom, hunch, done-when), then straight back. Related is not a detour — if the task can't be finished correctly without it, it is the task. Write only inside this repo's directory (or your session scratchpad).
+**Stay focused.** An unrelated finding is a line in your report, then straight back; only one that must outlive the session becomes a `backlog` issue of three to five lines (where, symptom, hunch, done-when). Related is not a detour — if the task can't be finished correctly without it, it is the task. Write only inside this repo's directory (or your session scratchpad).
 
 **Git.** Never end with unpushed work: complete and verified → trunk; incomplete or risky → branch `task-<n>-<slug>`, pushed, with `In flight on branch …` written into the issue. The tree is shared, so **you hold what you dirty and touch nothing dirty that is not yours**: check `git status --short -- <path>` when you reach for a file; if it is held, use a new file or ask — never guess. Commit by path (`git add <files>`, never `-A`/`-a`); never `stash`, `reset`, `restore`, `clean`, `pull --rebase`/`--autostash`, or a branch switch over others' files. Plain `git pull` is safe.
 
