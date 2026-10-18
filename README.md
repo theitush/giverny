@@ -48,7 +48,7 @@ Giverny checks GitHub daily for a new release and offers a one-click update; `gi
 
 ### Platform support
 
-Linux (Wayland and X11) is the primary platform. macOS and Windows build in CI but haven't been tested on real hardware; reports are welcome.
+Giverny runs on Linux (Wayland and X11), macOS and Windows.
 
 On Windows, Claude accounts and Codex homes inside WSL are discovered and their tabs open in the matching distribution. Under WSLg, an outdated Windows GPU driver makes Giverny fall back to CPU rendering; `GIVERNY_GPU=software` forces that mode.
 
