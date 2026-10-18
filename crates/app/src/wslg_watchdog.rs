@@ -1,4 +1,4 @@
-//! WSLg watchdog: after a sleep, bring the window back by itself (#337).
+//! WSLg watchdog: after a sleep, bring the window back by itself.
 //!
 //! A Linux window on WSLg is drawn on Windows by `msrdc.exe`, an RDP client
 //! that WSLGd starts and starts again whenever it exits. Weston, WSLg's
@@ -13,7 +13,7 @@
 //! (handshake 15:55:31) and this window was not created on Windows' side. The
 //! window was gone, though the app ran on, until a second launch made it come
 //! forward (`come_forward`), whose unmap and map is a new window to Windows:
-//! that announcement came at 15:55:51, when Ita clicked. The other gaps in
+//! that announcement came at 15:55:51, at a click on the Start menu. The other gaps in
 //! that log (15:22 to 15:39, 15:48 to 15:55) are the VM itself frozen while
 //! the laptop slept: the journal has nothing in them either.
 //!
@@ -21,9 +21,13 @@
 //! - connected, armed (this window was shown on Windows before), and not shown
 //!   [`ANNOUNCE_WITHIN`] after the handshake: unmap and map the window again,
 //!   the cure the 15:55 click applied by hand;
-//! - still not shown [`AFTER_REMAP`] later, or the link down for
-//!   [`DOWN_FOR`] with the VM awake: end WSLg's msrdc, so WSLGd starts a new
-//!   one (the 16:15 path; measured: the window is back 1.1 s after the kill).
+//! - still not shown [`AFTER_REMAP`] later: end WSLg's msrdc, so WSLGd
+//!   starts a new one (the 16:15 path; measured: the window is back 1.1 s
+//!   after the kill);
+//! - with `GIVERNY_WSLG_WATCHDOG_LINK_DOWN=1` only, also the link down for
+//!   [`DOWN_FOR`] with the VM awake. Off by default: no link says nothing
+//!   about this window, and a VM that runs on while Windows sleeps or its
+//!   display is off looks the same.
 //!
 //! Killing msrdc blinks every WSLg window, so it never happens on a healthy
 //! link: only after the remap failed or with no link at all, at most once per
@@ -153,6 +157,9 @@ pub struct Watchdog {
     unanswered: u32,
     /// A held-back kill was reported since the link last changed.
     held_said: bool,
+    /// Also end msrdc after [`DOWN_FOR`] with no link: opt-in, see the
+    /// module docs.
+    kills_on_link_down: bool,
 }
 
 impl Watchdog {
@@ -165,6 +172,15 @@ impl Watchdog {
             last_kill: None,
             unanswered: 0,
             held_said: false,
+            kills_on_link_down: false,
+        }
+    }
+
+    /// Also end msrdc when the link has been down for [`DOWN_FOR`].
+    pub fn killing_on_link_down(self) -> Self {
+        Watchdog {
+            kills_on_link_down: true,
+            ..self
         }
     }
 
@@ -228,6 +244,7 @@ impl Watchdog {
         if !self.armed {
             return None;
         }
+        let kills_on_link_down = self.kills_on_link_down;
         match &mut self.link {
             Link::Up {
                 since,
@@ -257,7 +274,7 @@ impl Watchdog {
                 );
                 self.kill(now, why)
             }
-            Link::Down { since } if now - *since >= DOWN_FOR => {
+            Link::Down { since } if kills_on_link_down && now - *since >= DOWN_FOR => {
                 let why = format!(
                     "WSLg's link to Windows has been down for {:.0} s",
                     now - *since
@@ -379,6 +396,11 @@ fn dry_run() -> bool {
     std::env::var("GIVERNY_WSLG_WATCHDOG").as_deref() == Ok("dry-run")
 }
 
+/// The no-link kill is asked for with `GIVERNY_WSLG_WATCHDOG_LINK_DOWN=1`.
+fn kills_on_link_down() -> bool {
+    std::env::var("GIVERNY_WSLG_WATCHDOG_LINK_DOWN").as_deref() == Ok("1")
+}
+
 /// Start watching, on WSLg; `wake` brings the UI round to take a remap.
 pub fn start(record: PathBuf, wake: impl Fn() + Send + 'static) -> Option<Handle> {
     if !applies() {
@@ -408,6 +430,9 @@ fn wall_now() -> f64 {
 
 fn watch(path: &Path, record: &Path, dry: bool, remap: &AtomicBool, wake: &dyn Fn()) {
     let mut dog = Watchdog::new(std::process::id());
+    if kills_on_link_down() {
+        dog = dog.killing_on_link_down();
+    }
     let mut tail = Tail::new(path.to_path_buf());
     let mut vm_id = None;
     loop {
@@ -592,6 +617,14 @@ mod tests {
     /// five seconds, each taking the lines stamped up to then, and no polls
     /// at all while the VM was frozen.
     fn replay(log: &str, pid: u32, asleep: &[(&str, &str)]) -> Vec<(String, Decision)> {
+        replay_with(Watchdog::new(pid), log, asleep)
+    }
+
+    fn replay_with(
+        mut dog: Watchdog,
+        log: &str,
+        asleep: &[(&str, &str)],
+    ) -> Vec<(String, Decision)> {
         let asleep: Vec<(f64, f64)> = asleep.iter().map(|(a, b)| (secs(a), secs(b))).collect();
         let mut lines = Vec::new();
         let mut at = 0.0;
@@ -601,7 +634,6 @@ mod tests {
         }
         let start = lines.iter().find(|(t, _)| *t > 0.0).map_or(0.0, |l| l.0);
         let end = lines.last().map_or(0.0, |l| l.0) + 60.0;
-        let mut dog = Watchdog::new(pid);
         let mut next = 0;
         let mut out = Vec::new();
         let mut now = start;
@@ -671,7 +703,7 @@ mod tests {
 
     #[test]
     fn the_day_it_happened_remaps_once_when_the_window_stayed_missing() {
-        // 15:55:31 reconnect, window not shown until Ita's click at 15:55:51:
+        // 15:55:31 reconnect, window not shown until a click at 15:55:51:
         // remapped on the first poll ten seconds after the handshake was seen.
         // The 15:39 and 16:15 reconnects, the kill measured at 16:47, the idle
         // and wake churn all day, and the three sleeps decide nothing.
@@ -706,9 +738,21 @@ mod tests {
 
     #[test]
     fn the_sleeps_are_not_counted_as_the_link_being_down() {
-        // Had the VM stayed awake from 15:48:41 to 15:55:31 with no link, that
-        // is an msrdc that is not reconnecting, and it is ended once.
+        // Had the VM stayed awake from 15:48:41 to 15:55:31 with no link: by
+        // default nothing comes of it, since no link says nothing about this
+        // window.
         let decisions = replay(REAL, PID, &ASLEEP[..1]);
+        assert!(
+            decisions.iter().all(|(_, d)| d.step != Step::Kill),
+            "{decisions:#?}"
+        );
+        // Asked for, that is an msrdc that is not reconnecting, and it is
+        // ended once.
+        let decisions = replay_with(
+            Watchdog::new(PID).killing_on_link_down(),
+            REAL,
+            &ASLEEP[..1],
+        );
         let steps = steps(&decisions);
         assert_eq!(steps[0].1, Step::Kill, "{decisions:#?}");
         assert!(decisions[0].1.why.contains("down for"), "{decisions:#?}");

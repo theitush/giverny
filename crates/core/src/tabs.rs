@@ -41,6 +41,9 @@ pub struct Tab {
     /// resume target after a restart.
     #[serde(default)]
     pub claude_session: Option<String>,
+    /// Provider-tagged sessions; legacy Claude fields remain readable.
+    #[serde(default)]
+    pub agent_session: Option<crate::agent::AgentSession>,
     /// The `CLAUDE_CONFIG_DIR` that session ran under (multi-account).
     #[serde(default)]
     pub claude_config_dir: Option<PathBuf>,
@@ -187,6 +190,7 @@ impl Workspace {
                 cwd: None,
                 foreground: None,
                 claude_session: None,
+                agent_session: None,
                 claude_config_dir: None,
                 git_branch: None,
                 git_repo: None,

@@ -25,6 +25,7 @@ pub enum Section {
     Restore,
     Claude,
     ManagementPanel,
+    Codex,
     Keys,
     Updates,
     About,
@@ -39,6 +40,7 @@ impl Section {
         Section::Restore,
         Section::Claude,
         Section::ManagementPanel,
+        Section::Codex,
         Section::Keys,
         Section::Updates,
         Section::About,
@@ -52,6 +54,7 @@ impl Section {
             Section::Restore => "restore",
             Section::Claude => "claude",
             Section::ManagementPanel => "management panel",
+            Section::Codex => "codex",
             Section::Keys => "keys",
             Section::Updates => "updates",
             Section::About => "about",
@@ -329,7 +332,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "agents run. A title you typed yourself is never touched.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "rail.animate",
@@ -357,7 +360,7 @@ pub const SETTINGS: &[SettingDef] = &[
             "still, full.",
         ],
         needs_restart: false,
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "rail.tab_figures",
@@ -445,7 +448,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "behavior.notifications",
         label: "desktop notifications",
         section: Section::Terminal,
-        doc: "Notify when Claude needs you in a background tab.",
+        doc: "Notify when an agent needs you, or Codex finishes in a background tab.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -523,6 +526,64 @@ pub const SETTINGS: &[SettingDef] = &[
         ],
         needs_restart: true,
         kind: Kind::StringList { default: None },
+    },
+    SettingDef {
+        key: "codex.enabled",
+        label: "detect Codex automatically",
+        section: Section::Codex,
+        doc: "Show detected Codex accounts and usage automatically. Turn off to disable integration.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "codex.executable",
+        label: "Codex executable",
+        section: Section::Codex,
+        doc: "Executable name on PATH, or an explicit path.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Text {
+            default: "codex",
+            placeholder: "codex",
+        },
+    },
+    SettingDef {
+        key: "codex.home",
+        label: "Codex home",
+        section: Section::Codex,
+        doc: "Empty uses CODEX_HOME, then the default .codex directory.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Text {
+            default: "",
+            placeholder: "automatic",
+        },
+    },
+    SettingDef {
+        key: "codex.restore",
+        label: "restore Codex conversations",
+        section: Section::Codex,
+        doc: "Auto reconnects saved conversations on tab focus; prompt asks first; off skips restore.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Choice {
+            default: "auto",
+            options: &["auto", "prompt", "off"],
+        },
+    },
+    SettingDef {
+        key: "codex.usage_refresh_minutes",
+        label: "usage refresh interval",
+        section: Section::Codex,
+        doc: "Minutes between Codex usage requests. Zero means manual refresh only.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Int {
+            default: 10,
+            min: 0,
+            max: 1440,
+        },
     },
     SettingDef {
         key: "claude.auto_mode",
@@ -740,7 +801,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "manager.limits.cpu_cores",
         label: "CPU cores",
         section: Section::ManagementPanel,
-        doc: "The hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). Cores are shared, never leased: a claim waits only while they are measured busy. auto = all but 2.",
+        doc: "The hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, a duty cycle on the busy commands). Cores are shared, never leased: a claim waits only while they are measured busy. auto = all but 2.",
         note: &[
             "The resource ledger (`giverny manage claim`) grants workers RAM",
             "and GPUs out of these limits, across every manager on this",
@@ -756,7 +817,7 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "manager.limits.ram",
         label: "RAM",
         section: Section::ManagementPanel,
-        doc: "Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`). auto = 70 %.",
+        doc: "Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, which kills the biggest command over it). auto = 70 %.",
         note: &["A size like \"16G\" or \"512M\" (a bare number is GiB), or \"auto\"."],
         needs_restart: false,
         kind: Kind::Limit {
@@ -1183,15 +1244,15 @@ mod tests {
         }
     }
 
-    /// Both change how y0av's rail looks, so neither is on until someone
-    /// turns it on, and a file without them reads as off.
+    /// The rail's calm look is the default: both are on until someone
+    /// turns them off, and a file without them reads as on.
     #[test]
-    fn calm_marks_are_opt_in() {
+    fn calm_marks_are_on_by_default() {
         let absent: Config = toml::from_str("[rail]\n[titles]\n").unwrap();
         for key in ["rail.calm_busy", "titles.strip_claude_glyph"] {
             let def = by_key(key).expect("declared");
-            assert!(matches!(def.kind, Kind::Bool { default: false }), "{key}");
-            assert_eq!(current(&absent, def), Some(Value::Bool(false)), "{key}");
+            assert!(matches!(def.kind, Kind::Bool { default: true }), "{key}");
+            assert_eq!(current(&absent, def), Some(Value::Bool(true)), "{key}");
         }
     }
 

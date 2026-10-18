@@ -53,7 +53,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         chord: "Ctrl+Shift+A",
-        action: "jump to the next tab where Claude needs you",
+        action: "jump to the next tab where an agent needs you",
         scope: Scope::Global,
     },
     Binding {

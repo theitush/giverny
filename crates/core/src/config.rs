@@ -16,6 +16,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub usage: UsageConfig,
     pub claude: ClaudeConfig,
+    pub codex: CodexConfig,
     pub update: UpdateConfig,
     pub manager: ManagerConfig,
     pub management_panel: ManagementPanelConfig,
@@ -175,6 +176,30 @@ pub struct ManagerConfig {
     pub limits: crate::limits::Limits,
 }
 
+/// Automatically discovered Codex integration. Authentication stays in Codex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    pub enabled: bool,
+    pub executable: String,
+    /// Empty means CODEX_HOME, then the user's .codex directory.
+    pub home: String,
+    pub restore: RestoreClaude,
+    pub usage_refresh_minutes: u64,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            executable: "codex".into(),
+            home: String::new(),
+            restore: RestoreClaude::Auto,
+            usage_refresh_minutes: 10,
+        }
+    }
+}
+
 /// How Claude Code itself is launched in a tab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -220,7 +245,7 @@ impl Default for TitlesConfig {
         TitlesConfig {
             strip_host_prefix: true,
             shorten_paths: false,
-            strip_claude_glyph: false,
+            strip_claude_glyph: true,
         }
     }
 }
@@ -360,7 +385,8 @@ impl Default for UsageConfig {
 #[serde(default)]
 pub struct UpdateConfig {
     /// Ask GitHub once a day whether a newer release exists. This is the
-    /// only network request Giverny makes; set false to make it zero.
+    /// only direct network request Giverny makes. Codex usage refreshes
+    /// optionally ask the Codex helper to contact OpenAI.
     pub check: bool,
 }
 
@@ -451,7 +477,7 @@ impl Default for RailConfig {
             animate: true,
             tab_figures: true,
             total_line: true,
-            calm_busy: false,
+            calm_busy: true,
             place_titles: false,
         }
     }
@@ -462,7 +488,7 @@ impl Default for RailConfig {
 pub struct BehaviorConfig {
     /// Re-run `claude --resume` for restored tabs: `auto`, `prompt`, `off`.
     pub restore_claude: RestoreClaude,
-    /// Desktop notifications when Claude needs you.
+    /// Desktop notifications when an agent needs attention.
     pub notifications: bool,
     /// Scrollback lines kept per tab.
     pub scrollback_lines: usize,
@@ -855,7 +881,7 @@ mod tests {
     /// defaults, and is left exactly as the user wrote it.
     #[test]
     fn unparseable_config_is_an_error_not_defaults() {
-        let dir = scratch("broken");
+        let dir = scratch("unparseable");
         let broken = "[font\nsize = 16.0\n";
         std::fs::write(config_path(&dir), broken).unwrap();
         assert!(load_checked(&dir, &Config::default()).is_err());
@@ -872,7 +898,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(config_path(&dir)).unwrap(), broken);
 
         // A missing file is a first run, not an error.
-        let fresh = scratch("broken-fresh");
+        let fresh = scratch("unparseable-fresh");
         assert!(load_checked(&fresh, &Config::default()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fresh);
@@ -1028,7 +1054,11 @@ mod tests {
 
     #[test]
     fn host_prefix_is_stripped_only_when_it_really_is_one() {
-        let cfg = TitlesConfig::default();
+        // Claude's glyph left on, so its title shows the host rule alone.
+        let cfg = TitlesConfig {
+            strip_claude_glyph: false,
+            ..TitlesConfig::default()
+        };
         // The actual shape oh-my-zsh sets, and the reason for the option.
         assert_eq!(
             display_title("yoz@yoz-framework:~/Dev/bobo", &cfg),
@@ -1054,14 +1084,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_glyph_is_stripped_only_when_asked() {
-        let off = TitlesConfig::default();
-        assert!(!off.strip_claude_glyph, "off unless asked for");
-        assert_eq!(display_title("✳ Fix the parser", &off), "✳ Fix the parser");
-        let on = TitlesConfig {
-            strip_claude_glyph: true,
+    fn claude_glyph_is_stripped_unless_turned_off() {
+        let on = TitlesConfig::default();
+        assert!(on.strip_claude_glyph, "on unless turned off");
+        let off = TitlesConfig {
+            strip_claude_glyph: false,
             ..TitlesConfig::default()
         };
+        assert_eq!(display_title("✳ Fix the parser", &off), "✳ Fix the parser");
         assert_eq!(display_title("✳ Fix the parser", &on), "Fix the parser");
         assert_eq!(display_title("⠐ Fix the parser", &on), "Fix the parser");
         assert_eq!(display_title("◐ Fix the parser", &on), "Fix the parser");

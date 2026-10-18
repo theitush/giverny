@@ -52,6 +52,12 @@ pub fn partly_installed_in(settings_path: &Path) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayMsg {
+    #[serde(default = "claude_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub wsl_distro: Option<String>,
+    #[serde(default)]
+    pub emitted_at: Option<u64>,
     /// `$GIVERNY_TAB_ID` as inherited by the hook (absent outside Giverny).
     pub tab_id: Option<String>,
     /// The background job whose session ran the hook, by short id, in place
@@ -63,6 +69,10 @@ pub struct RelayMsg {
     pub config_dir: Option<String>,
     /// The raw hook payload.
     pub event: serde_json::Value,
+}
+
+fn claude_provider() -> String {
+    "claude".into()
 }
 
 impl RelayMsg {
@@ -88,10 +98,15 @@ impl RelayMsg {
     /// session's own calls carry none (measured on a `PostToolUse`,
     /// giverny#374).
     pub fn from_subagent(&self) -> bool {
-        self.event
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .is_some_and(|a| !a.trim().is_empty())
+        self.agent_id().is_some_and(|a| !a.trim().is_empty())
+    }
+
+    /// The subagent a tool hook fired in. Claude Code (2.1.296) builds the
+    /// tool hooks from the tool call's context, so a subagent's tool calls
+    /// arrive under the parent's `session_id` with this set.
+    /// `UserPromptSubmit` never carries it.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.event.get("agent_id").and_then(|v| v.as_str())
     }
 
     /// On `Stop`: is work this session delegated still running as the turn
@@ -220,6 +235,9 @@ impl Target {
             Target::Job(job) => (None, Some(job)),
         };
         RelayMsg {
+            provider: claude_provider(),
+            wsl_distro: None,
+            emitted_at: None,
             tab_id,
             job,
             config_dir,
@@ -240,8 +258,26 @@ pub fn run_relay(spool: &Path) {
         return;
     };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let account = target.account();
-    deliver(&target.msg(account, event), spool);
+    let arg = |name: &str| std::env::args().skip_while(|s| s != name).nth(1);
+    let codex = arg("--provider").as_deref() == Some("codex");
+    let config_dir = if codex {
+        arg("--home").or_else(|| std::env::var("CODEX_HOME").ok())
+    } else {
+        target.account()
+    };
+    let mut msg = target.msg(config_dir, event);
+    if codex {
+        msg.provider = "codex".into();
+    }
+    msg.wsl_distro = arg("--wsl-distro");
+    msg.emitted_at = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+    );
+    deliver(&msg, spool);
 }
 
 /// Which account this session runs under.
@@ -427,6 +463,7 @@ pub fn spawn_listener(
 /// to the front, because the user just started Giverny again.
 pub const RAISE_REQUEST: &str = r#"{"giverny":"raise"}"#;
 
+#[cfg(unix)]
 fn is_raise_request(line: &str) -> bool {
     #[derive(Deserialize)]
     struct Control {
@@ -774,6 +811,9 @@ pub fn run_statusline(spool: &Path) {
             target.msg(account, serde_json::Value::Object(event))
         }
         None => RelayMsg {
+            provider: claude_provider(),
+            wsl_distro: None,
+            emitted_at: None,
             tab_id: crate::lineage::giverny_var("GIVERNY_TAB_ID"),
             job: None,
             config_dir: account_dir(),
@@ -1226,8 +1266,31 @@ pub fn statusline_installed_in(settings_path: &Path) -> bool {
         .is_some_and(is_our_statusline)
 }
 
+/// Does our statusline entry lack a `refreshInterval`? True only for an
+/// entry of ours (installs from before it was written), never for a foreign
+/// statusline or none at all; `set_statusline(.., true)` then adds it.
+pub fn statusline_lacks_refresh(settings_path: &Path) -> bool {
+    if !statusline_installed_in(settings_path) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(settings_path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    root.get("statusLine")
+        .and_then(|s| s.get("refreshInterval"))
+        .is_none_or(serde_json::Value::is_null)
+}
+
 /// Install/remove the Giverny statusline. Refuses to replace a statusline
 /// the user configured themselves.
+///
+/// Enabling over an entry of ours (a path refresh) rewrites its `type`,
+/// `command` and `refreshInterval` ([`STATUSLINE_REFRESH_S`]: the session's
+/// use is pushed with each run, so the interval is the app's to set); a
+/// `padding` or any other key the user set on it is kept.
 pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> {
     let mut root: serde_json::Value = match std::fs::read(settings_path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -1245,18 +1308,18 @@ pub fn set_statusline(settings_path: &Path, enable: bool) -> anyhow::Result<()> 
         anyhow::bail!("a custom statusLine is already configured — leaving it alone");
     }
     if enable {
-        obj.insert(
-            "statusLine".into(),
-            serde_json::json!({
-                "type": "command",
-                "command": statusline_command_for(settings_path),
-                "padding": 0,
-                // Rerun every second as well as on Claude Code's own
-                // events, so the session's use keeps step with the app's
-                // sampler (one reading a second) while the session idles.
-                "refreshInterval": STATUSLINE_REFRESH_S,
-            }),
+        let mut entry = match obj.remove("statusLine") {
+            Some(serde_json::Value::Object(ours)) => ours,
+            _ => serde_json::Map::new(),
+        };
+        entry.insert("type".into(), "command".into());
+        entry.insert(
+            "command".into(),
+            statusline_command_for(settings_path).into(),
         );
+        entry.entry("padding").or_insert(0.into());
+        entry.insert("refreshInterval".into(), STATUSLINE_REFRESH_S.into());
+        obj.insert("statusLine".into(), entry.into());
     } else {
         obj.remove("statusLine");
     }
@@ -1555,6 +1618,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_raise_request_reads_as_one() {
         assert!(is_raise_request(RAISE_REQUEST));
@@ -2251,6 +2315,88 @@ mod tests {
         );
         assert!(set_subagent_line(&path, true).unwrap(), "rewritten");
         assert!(!needs_path_refresh(&path));
+    }
+
+    fn statusline_entry(path: &Path) -> serde_json::Value {
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        root["statusLine"].clone()
+    }
+
+    #[test]
+    fn a_fresh_statusline_refreshes_every_second() {
+        let path = scratch("statusline-refresh-fresh");
+        set_statusline(&path, true).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["refreshInterval"], STATUSLINE_REFRESH_S);
+        assert_eq!(entry["refreshInterval"], 1);
+        assert_eq!(entry["padding"], 0);
+        assert!(!statusline_lacks_refresh(&path));
+    }
+
+    #[test]
+    fn a_path_refresh_keeps_the_users_keys_but_sets_the_interval() {
+        let path = scratch("statusline-refresh-user");
+        std::fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"/old/path/giverny statusline",
+                "padding":2,"refreshInterval":5,"note":"mine"}}"#,
+        )
+        .unwrap();
+        assert!(needs_path_refresh(&path));
+        assert!(!statusline_lacks_refresh(&path), "it has one");
+
+        set_statusline(&path, true).unwrap();
+        let entry = statusline_entry(&path);
+        assert_eq!(entry["command"], statusline_command_for(&path));
+        // The use pushed with each run keeps step with the app's sampler
+        // only at the app's interval.
+        assert_eq!(entry["refreshInterval"], STATUSLINE_REFRESH_S);
+        assert_eq!(entry["padding"], 2);
+        assert_eq!(entry["note"], "mine", "other keys of the user's are kept");
+        assert!(!needs_path_refresh(&path));
+    }
+
+    #[test]
+    fn an_older_entry_of_ours_gains_the_refresh_interval() {
+        let path = scratch("statusline-refresh-old");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": statusline_command_for(&path),
+                    "padding": 0,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(statusline_installed_in(&path));
+        // The path is current, but without the app's interval the entry is
+        // stale all the same.
+        assert!(needs_path_refresh(&path));
+        assert!(statusline_lacks_refresh(&path));
+
+        set_statusline(&path, true).unwrap();
+        assert_eq!(
+            statusline_entry(&path)["refreshInterval"],
+            STATUSLINE_REFRESH_S
+        );
+        assert!(!statusline_lacks_refresh(&path));
+    }
+
+    #[test]
+    fn a_foreign_statusline_never_lacks_a_refresh_interval() {
+        let path = scratch("statusline-refresh-foreign");
+        let mine = r#"{"statusLine":{"type":"command","command":"my-own-script.sh"}}"#;
+        std::fs::write(&path, mine).unwrap();
+        assert!(!statusline_lacks_refresh(&path), "not ours to change");
+        assert!(set_statusline(&path, true).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+
+        let none = scratch("statusline-refresh-none");
+        assert!(!statusline_lacks_refresh(&none), "no file, nothing to add");
     }
 
     #[test]

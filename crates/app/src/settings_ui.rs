@@ -274,6 +274,40 @@ fn body(
         return management_panel_page(ui, state, cfg, machine, rows, suggestions, actions, c);
     }
 
+    if state.search.is_empty() && state.section == Section::Codex {
+        ui.label(
+            "Codex is detected automatically. Type codex normally in any tab; usage uses its existing sign-in.",
+        );
+        ui.label("Setup preserves existing hooks and writes a .giverny-bak backup. Codex requires you to review the hooks with /hooks.");
+        for account in &app.codex.accounts {
+            let target = &account.target;
+            let path = crate::codex_watch::CodexWatch::hook_path(target);
+            let command = crate::codex_watch::CodexWatch::hook_command(target);
+            ui.label(path.display().to_string());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Events: {}\nCommand: {command}",
+                        giverny_codex::hooks::EVENTS.join(", ")
+                    ))
+                    .monospace(),
+                )
+                .wrap(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("install / repair hooks").clicked() {
+                    actions.push(Action::CodexHooks(target.clone(), true));
+                }
+                if ui.button("remove Giverny hooks").clicked() {
+                    actions.push(Action::CodexHooks(target.clone(), false));
+                }
+            });
+        }
+        if let Some(status) = &app.codex.status {
+            ui.label(status);
+        }
+        ui.add_space(10.0);
+    }
     for def in rows {
         if skip_gpus(cfg, machine, def) {
             continue;

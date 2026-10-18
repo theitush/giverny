@@ -20,20 +20,7 @@ use giverny_core::tabs::TabId;
 
 use crate::management_live::ManagementLive;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ClaudeState {
-    /// No Claude running in this tab.
-    #[default]
-    None,
-    /// Claude open, waiting at its prompt.
-    Idle,
-    /// Claude is working.
-    Busy,
-    /// Claude needs the user (permission / question / agent input).
-    NeedsYou,
-    /// Claude finished while the tab was in the background.
-    DoneUnseen,
-}
+pub use giverny_core::agent::AgentState as ClaudeState;
 
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeTab {
@@ -368,6 +355,7 @@ impl LiveUsage {
 /// Side effects for the app to apply after a tick.
 #[derive(Default)]
 pub struct WatchEffects {
+    pub codex: Vec<RelayMsg>,
     /// `(tab, session_id, config_dir)` — `None` session means it ended.
     pub captured: Vec<(TabId, Option<String>, Option<PathBuf>)>,
     /// Desktop notifications to fire: `(summary, body)`.
@@ -949,7 +937,12 @@ impl ClaudeWatch {
                     Err(e) => tracing::warn!("hook refresh failed for {}: {e}", p.name),
                 }
             }
-            if !hooks::statusline_installed_in(&settings) || hooks::needs_path_refresh(&settings) {
+            // An entry of ours from before `refreshInterval` was written gains
+            // it here, so existing installs see the cold-cache warning too.
+            if !hooks::statusline_installed_in(&settings)
+                || hooks::needs_path_refresh(&settings)
+                || hooks::statusline_lacks_refresh(&settings)
+            {
                 match hooks::set_statusline(&settings, true) {
                     Ok(()) => tracing::info!("live-usage statusline enabled for {}", p.name),
                     Err(e) => tracing::info!("statusline skipped for {}: {e}", p.name),
@@ -1030,6 +1023,10 @@ impl ClaudeWatch {
         tab_title: &str,
         effects: &mut WatchEffects,
     ) {
+        if msg.provider == "codex" {
+            effects.codex.push(msg.clone());
+            return;
+        }
         // Statusline pushes carry usage, not tab state.
         if msg.hook_event() == Some(hooks::STATUSLINE_EVENT) {
             self.apply_statusline(msg);
@@ -1544,6 +1541,15 @@ impl ClaudeWatch {
                 let hooks_own = heard.is_some();
                 let was = entry.state;
                 entry.state = merge_registry(entry.state, heard, entry.agents, &live.entry);
+                // What the registry ended was a compaction, not a turn: the
+                // tab goes back to what it was, as the compaction's own
+                // `SessionStart` would have it — no tick for a `/compact`.
+                if entry.state == ClaudeState::DoneUnseen
+                    && was == ClaudeState::Busy
+                    && let Some(before) = entry.before_compact.take()
+                {
+                    entry.state = before;
+                }
                 // A turn the registry ended in the tab you are looking at is
                 // seen already, as a `Stop` there would have it.
                 if entry.state == ClaudeState::DoneUnseen
@@ -1554,8 +1560,8 @@ impl ClaudeWatch {
                 }
                 // Delegated work the last `Stop` reported runs for as long as
                 // the registry says `busy`; the first scan that says
-                // otherwise is its end, and the wave goes with it
-                // (giverny#363). A session without hooks never sets it: its
+                // otherwise is its end, and the dots go with it.
+                // A session without hooks never sets it: its
                 // `busy` is a spinner, as it cannot tell the two apart.
                 entry.agents &= hooks_own && live.entry.busy();
                 // A session new to the tab has its earlier turns read back
@@ -3664,6 +3670,22 @@ mod tests {
         // ...and seen in the tab you are looking at.
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
         scan(&mut w, "idle", now_ms() + 1, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        // A `/compact` in the background whose `idle` comes before its
+        // `SessionStart`: the tab is given back as it was, not ticked.
+        feed(&mut w, &hook("PreCompact", r#","trigger":"manual""#), None);
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        scan(&mut w, "idle", now_ms() + 1, None);
+        assert_eq!(
+            w.state_of(TAB),
+            ClaudeState::Idle,
+            "no tick for a compaction"
+        );
+        feed(
+            &mut w,
+            &hook("SessionStart", r#","source":"compact""#),
+            None,
+        );
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
     }
 

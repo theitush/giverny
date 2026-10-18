@@ -1,4 +1,4 @@
-//! Pasting a screenshot (giverny#395).
+//! Pasting a screenshot.
 //!
 //! Ctrl+V (Cmd+V) with an image and no text in the clipboard used to do
 //! nothing: egui only ever pastes text, and Claude Code's own clipboard read
@@ -6,6 +6,11 @@
 //! the image itself, writes it to a PNG of its own, and pastes the file's
 //! path the way a file drop types one: Claude Code attaches an image path
 //! pasted into its prompt (`[Image #1]`), and a shell gets the path.
+//!
+//! What a paste types, in order: the clipboard's text when it has some (and
+//! files copied in Finder over the display names that come with them, see
+//! `giverny_term::input::copied_files_text`); with no text, copied files'
+//! paths; with neither, an image.
 //!
 //! Where the image comes from:
 //! * the clipboard through `arboard` — X11 (or XWayland) on Linux,
@@ -16,13 +21,13 @@
 //!
 //! The read runs on a thread of its own, and a frame never waits on it.
 //! On WSL it goes to a PowerShell kept running for the purpose
-//! ([`WindowsClipboard`], giverny#410): a fresh `powershell.exe` took 1.4 to
+//! ([`WindowsClipboard`]): a fresh `powershell.exe` took 1.4 to
 //! 2.7 s to start, which was nearly all of a paste's time; the resident one
 //! answers in about 10 ms. It is started a moment after the app, and it
 //! exits with it. An answer that does not come in time (a clipboard held
 //! open, a copier that never renders what it offered) costs that paste
-//! a few seconds and that reader its life (giverny#420): the next paste
-//! starts a fresh one rather than queueing behind a hung read.
+//! a few seconds and that reader its life: the next paste starts a
+//! fresh one rather than queueing behind a hung read.
 //!
 //! The PNGs live in a directory of this run's (`giverny-paste-<pid>` under
 //! `$XDG_RUNTIME_DIR`, or the temp dir), removed when the app exits; files
@@ -79,17 +84,18 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(3);
 /// PowerShell's own start: 1.4 to 2.7 s, 4.5 s seen with Windows busy.
 const FIRST_ANSWER_WITHIN: Duration = Duration::from_secs(15);
 
-/// A pasted image's file, ready to be typed into the tab it was pasted in.
+/// What a paste with no text found to type, and the tab it was pasted in:
+/// an image's saved file, or copied files, as a drop of them would type.
 pub struct Pasted {
     pub tab: TabId,
-    pub path: PathBuf,
+    pub text: String,
 }
 
 /// The app's side of image pastes: the run's directory, and the threads'
 /// answers.
 pub struct ImagePaste {
-    /// This run's directory; created on the first paste.
-    dir: PathBuf,
+    /// Random private directory, retained until every paste worker exits.
+    dir: Option<Arc<tempfile::TempDir>>,
     tx: Sender<Pasted>,
     rx: Receiver<Pasted>,
     /// WSL only: the Windows clipboard's reader, kept running.
@@ -102,8 +108,8 @@ pub struct ImagePaste {
 }
 
 impl ImagePaste {
-    /// Sets up this run's directory name and sweeps what earlier runs left
-    /// behind. Nothing is created until something is pasted.
+    /// Allocates a private directory with an unpredictable name and sweeps
+    /// what earlier runs left behind.
     pub fn new() -> Self {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -111,13 +117,18 @@ impl ImagePaste {
             .unwrap_or_else(std::env::temp_dir);
         sweep(&base, SystemTime::now(), STALE_AFTER);
         let (tx, rx) = crossbeam_channel::unbounded();
-        let windows = giverny_claude::away::is_wsl().then(|| {
+        let windows = is_wsl().then(|| {
             let windows = Arc::new(WindowsClipboard::new(powershell_command));
             windows.warm_up_after(WARM_UP_AFTER);
             windows
         });
         Self {
-            dir: base.join(format!("{DIR_PREFIX}{}", std::process::id())),
+            dir: tempfile::Builder::new()
+                .prefix(DIR_PREFIX)
+                .tempdir_in(&base)
+                .inspect_err(|e| tracing::warn!("paste: cannot create private directory: {e}"))
+                .ok()
+                .map(Arc::new),
             tx,
             rx,
             windows,
@@ -126,12 +137,13 @@ impl ImagePaste {
         }
     }
 
-    /// Look for an image in the clipboard, in the background, and when there
-    /// is one have it pasted into `tab` (see [`Self::poll`]).
+    /// Look for copied files, else an image, in the clipboard, in the
+    /// background, and when there is either have it pasted into `tab` (see
+    /// [`Self::poll`]).
     pub fn request(&mut self, ctx: &egui::Context, tab: TabId) {
         #[cfg(debug_assertions)]
         let debug_source = self.debug_source.take();
-        let dir = self.dir.clone();
+        let Some(dir) = self.dir.clone() else { return };
         let tx = self.tx.clone();
         let windows = self.windows.clone();
         let ctx = ctx.clone();
@@ -139,30 +151,48 @@ impl ImagePaste {
         let spawned = std::thread::Builder::new()
             .name("paste image".into())
             .spawn(move || {
+                let send = |text: String| {
+                    let _ = tx.send(Pasted { tab, text });
+                    ctx.request_repaint();
+                };
                 #[cfg(debug_assertions)]
                 let png = match debug_source {
                     Some(file) => std::fs::read(&file)
                         .inspect_err(|e| tracing::warn!("paste-image {}: {e}", file.display()))
                         .ok(),
-                    None => clipboard_png(windows.as_deref()),
+                    None => {
+                        if let Some(text) = giverny_term::input::copied_files_text() {
+                            return send(text);
+                        }
+                        clipboard_png(windows.as_deref())
+                    }
                 };
+                // Files copied with no text beside them (Finder's always
+                // come with their names, and are pasted as text is).
+                #[cfg(not(debug_assertions))]
+                if let Some(text) = giverny_term::input::copied_files_text() {
+                    return send(text);
+                }
                 #[cfg(not(debug_assertions))]
                 let png = clipboard_png(windows.as_deref());
                 let Some(png) = png.filter(|b| b.starts_with(PNG_MAGIC)) else {
-                    tracing::info!("paste: no text and no image in the clipboard");
+                    tracing::info!("paste: no text, files or image in the clipboard");
                     return;
                 };
-                match save(&dir, &png, SystemTime::now()) {
+                match save(dir.path(), &png, SystemTime::now()) {
                     Ok(path) => {
                         tracing::info!(
                             "paste: image saved to {} in {} ms",
                             path.display(),
                             asked.elapsed().as_millis()
                         );
-                        let _ = tx.send(Pasted { tab, path });
-                        ctx.request_repaint();
+                        send(giverny_term::input::dropped_paths_text(&[path
+                            .display()
+                            .to_string()]));
                     }
-                    Err(e) => tracing::warn!("paste: image not saved in {}: {e}", dir.display()),
+                    Err(e) => {
+                        tracing::warn!("paste: image not saved in {}: {e}", dir.path().display())
+                    }
                 }
             });
         if let Err(e) = spawned {
@@ -170,7 +200,7 @@ impl ImagePaste {
         }
     }
 
-    /// Images read and saved since the last call, oldest first.
+    /// What the threads found since the last call, oldest first.
     pub fn poll(&self) -> Vec<Pasted> {
         self.rx.try_iter().collect()
     }
@@ -182,11 +212,8 @@ impl ImagePaste {
         if let Some(windows) = &self.windows {
             windows.shut_down();
         }
-        if self.dir.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.dir)
-        {
-            tracing::debug!("paste: {} not removed: {e}", self.dir.display());
-        }
+        // The private directory is removed by TempDir after the last paste
+        // worker releases it, so shutdown cannot race an in-flight write.
     }
 }
 
@@ -204,6 +231,12 @@ fn clipboard_png(windows: Option<&WindowsClipboard>) -> Option<Vec<u8>> {
         return Some(png);
     }
     windows?.png()
+}
+
+/// Running in WSL, where the Windows clipboard is a process away.
+fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
 }
 
 /// The clipboard's image through `arboard` (raw RGBA), encoded as PNG.
@@ -623,16 +656,21 @@ mod tests {
         let base = scratch("cleanup");
         let (tx, rx) = crossbeam_channel::unbounded();
         let paste = ImagePaste {
-            dir: base.join(format!("{DIR_PREFIX}33")),
+            dir: Some(Arc::new(
+                tempfile::Builder::new()
+                    .prefix(DIR_PREFIX)
+                    .tempdir_in(&base)
+                    .unwrap(),
+            )),
             tx,
             rx,
             windows: None,
             #[cfg(debug_assertions)]
             debug_source: None,
         };
-        save(&paste.dir, b"png", SystemTime::now()).unwrap();
-        assert!(paste.dir.exists());
-        let dir = paste.dir.clone();
+        let dir = paste.dir.as_ref().unwrap().path().to_path_buf();
+        save(&dir, b"png", SystemTime::now()).unwrap();
+        assert!(dir.exists());
         drop(paste);
         assert!(!dir.exists(), "the drop at exit takes the run's pastes");
         std::fs::remove_dir_all(&base).unwrap();

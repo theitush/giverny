@@ -1,6 +1,6 @@
 # Architecture
 
-Cargo workspace, four crates:
+Cargo workspace, five crates:
 
 ```
 crates/
@@ -8,8 +8,9 @@ crates/
 ├─ term/     terminal engine: PTY + forked event loop + byte tee +
 │            alacritty_terminal Term + glyph-atlas renderer + input encoders
 ├─ core/     tabs/categories model, persistent state, git info, paths
-└─ claude/   Claude Code integration: profiles, session registry, hook
+├─ claude/   Claude Code integration: profiles, session registry, hook
              relay/installer, usage cache parser
+└─ codex/    Codex hook installer, bounded app-server RPC, usage windows/cache
 ```
 
 ## The terminal engine (`crates/term`)
@@ -72,6 +73,29 @@ Hook-set attention states are stickier than registry state; done-markers clear w
 **Resume**: tabs persist `(claude_session, claude_config_dir)`. Restore injects `CLAUDE_CONFIG_DIR=… command claude --resume <uuid>` after a settle delay (`command` bypasses shell wrapper functions), guarded by a registry check so a session live in another terminal is never double-resumed (double-resume interleaves one transcript — documented Claude Code behavior).
 
 **Usage**: parsed from `.claude.json → cachedUsageUtilization.limits[]` only (kind `session`/`weekly_all`/`weekly_scoped`, scoped model names like *Fable*, server-side `severity`). Windows whose `resets_at` has passed render 0% (verified server quirk: lapsed windows keep stale percentages). No network, no tokens — and deliberately no `/api/oauth/usage` polling (unsupported endpoint, ToS-exposed) and **never** an OAuth refresh (refresh tokens are single-use; a third-party refresh force-logs-out Claude Code). Refreshing means asking Claude Code to do it: `claude -p /usage`, run wherever that account's Claude Code lives — inside the distribution, for an account in WSL.
+
+## Codex integration
+
+`crates/codex` isolates the documented Codex interfaces. App-side
+`codex_watch` tracks per-tab state and runs usage and restore metadata requests
+on background workers. The existing relay transport carries an explicit provider;
+legacy messages still default to Claude. Shared presentation states live in core,
+while Claude registry merging and account logic remain provider-specific.
+
+Codex hooks carry session ID, tab ID, home, timestamp and WSL distribution.
+They only observe; they return no model context or permission decision. User hook
+trust remains Codex's responsibility. The runtime rejects stale session events,
+ignores subagent events and never associates conversations by cwd alone.
+
+A bounded stdio JSON-RPC helper initializes with Giverny's identity and reads
+account limits without starting turns. It owns authentication, including any
+network access. Giverny persists only returned allowance windows in its own
+cache. Cancellation kills and reaps owned helpers; no user daemon is stopped.
+
+Restoration reads metadata without resuming it, then reconnects the normal CLI
+to the saved conversation. Loaded daemon threads do not block restoration;
+the prompt mode offers an explicit resume action. Persistence adds an optional provider-tagged
+session reference while retaining legacy Claude fields and state version.
 
 ## Threading
 

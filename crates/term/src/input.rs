@@ -311,7 +311,7 @@ pub fn clipboard_chord(cut: bool, shift: bool, macos: bool) -> ClipboardChord {
 }
 
 /// Spots a paste chord that found no text in the clipboard: the cue to look
-/// for an image there instead (giverny#395).
+/// for copied files or an image there instead.
 ///
 /// egui-winit swallows the paste chord (Ctrl+V, Cmd+V on macOS, the Paste
 /// key): it reads the clipboard's *text*, pushes a `Paste` event when there
@@ -320,7 +320,8 @@ pub fn clipboard_chord(cut: bool, shift: bool, macos: bool) -> ClipboardChord {
 /// is the key's *release*, which egui-winit does pass on: a V released that
 /// was never seen pressed was a paste chord, and one with no `Paste` since
 /// was a paste of nothing textual. Text always wins: a clipboard with both
-/// pastes its text, as before.
+/// pastes its text, as before (and Finder's files over their names, as
+/// [`copied_files_text`] has it).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PasteChord {
     /// A V (or Paste key) press reached us and has not been released: its
@@ -373,7 +374,7 @@ pub fn quote_path(path: &str) -> String {
     // accept that a literal `"` in a filename is not worth chasing.
     #[cfg(windows)]
     {
-        return format!("\"{}\"", path.replace('"', ""));
+        format!("\"{}\"", path.replace('"', ""))
     }
     #[cfg(not(windows))]
     {
@@ -394,6 +395,23 @@ pub fn dropped_paths_text(paths: &[String]) -> String {
         .join(" ");
     out.push(' ');
     out
+}
+
+/// Files copied in Finder, as the text a paste should type: their paths,
+/// exactly as dropping them would. Finder also puts each file's display name
+/// on the clipboard as plain text, and that is all egui hands over, so
+/// pasting a copied screenshot typed `Screenshot … at 9.53.01` (no folder, no
+/// extension) where Claude needed a path to attach the image.
+#[cfg(target_os = "macos")]
+pub fn copied_files_text() -> Option<String> {
+    let paths = arboard::Clipboard::new().ok()?.get().file_list().ok()?;
+    let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    Some(dropped_paths_text(&paths)).filter(|t| !t.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copied_files_text() -> Option<String> {
+    None
 }
 
 /// Wrap pasted text for the terminal: bracketed when the mode is on

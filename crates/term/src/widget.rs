@@ -217,7 +217,7 @@ pub struct TabView {
     paste_chord: input::PasteChord,
     /// Set by [`TabView::show`] for a frame in which a paste chord found no
     /// text in the clipboard while the terminal had the keyboard: the app
-    /// looks for an image there and pastes its file (giverny#395).
+    /// looks for files or an image there and pastes them (giverny#395).
     pub paste_image: bool,
 }
 
@@ -887,7 +887,10 @@ impl TabView {
                             input::ClipboardChord::Signal(b) => bytes.push(b),
                         }
                     }
-                    EguiEvent::Paste(s) => bytes.extend(input::encode_paste(s, mode)),
+                    EguiEvent::Paste(s) => {
+                        let text = input::copied_files_text();
+                        bytes.extend(input::encode_paste(text.as_deref().unwrap_or(s), mode));
+                    }
                     // Composed input — Hebrew, Arabic, CJK, anything going
                     // through the platform input method — arrives as an IME
                     // commit and never as `Text`, so it used to vanish
@@ -1503,24 +1506,11 @@ impl TabView {
             return;
         }
 
-        let text = session.row_text(line);
         let cwd = session.proc_cwd().unwrap_or_else(|| PathBuf::from("/"));
-        let Some(target) = crate::search::target_at(&text, col as usize, &cwd) else {
+        let Some((target, start, len)) = session.click_target_at(line, col, &cwd) else {
             return;
         };
-
-        // Underline the whole token: walk out from the cursor over non-space.
-        let chars: Vec<char> = text.chars().collect();
-        let start = (0..=col as usize)
-            .rev()
-            .take_while(|&i| !chars[i].is_whitespace())
-            .last()
-            .unwrap_or(col as usize);
-        let end = (col as usize..chars.len())
-            .take_while(|&i| !chars[i].is_whitespace())
-            .last()
-            .unwrap_or(col as usize);
-        self.hover_target = Some((target.clone(), line, start as u16, (end - start + 1) as u16));
+        self.hover_target = Some((target.clone(), line, start, len));
 
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
         if response.clicked() {
