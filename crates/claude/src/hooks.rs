@@ -891,6 +891,12 @@ pub fn run_statusline(spool: &Path) {
     // Usage is no tab's, so a session the relay would not speak for still
     // delivers it; a background job's says which job it is.
     let target = Target::of_this_process();
+    // The worker whose view the tab shows, as the app tells it (giverny#460):
+    // only the tab's own claude's line names it, not one that inherited it.
+    let viewing = match &target {
+        Some(Target::Tab(tab)) => viewing_name(spool, tab),
+        _ => None,
+    };
     let msg = match target {
         Some(target) => {
             let account = target.account();
@@ -909,7 +915,7 @@ pub fn run_statusline(spool: &Path) {
     deliver(&msg, spool);
 
     let now_ms = jiff::Timestamp::now().as_millisecond();
-    println!("{}", statusline_text(&payload, now_ms));
+    println!("{}", statusline_text(&payload, viewing.as_deref(), now_ms));
 }
 
 /// What Claude Code displays for the status line payload `payload` at
@@ -917,7 +923,12 @@ pub fn run_statusline(spool: &Path) {
 /// its tokens, and a cache gone cold. No 5h or week usage, and no CPU,
 /// memory or GPU (giverny#384): the sidebar shows the usage, and its tab
 /// rows and category headers and the management panel's rows the use.
-fn statusline_text(payload: &serde_json::Value, now_ms: i64) -> String {
+///
+/// `viewing` is the worker whose view the tab shows ([`viewing_name`],
+/// giverny#460): it takes the session's name's place while it is on screen.
+/// Claude Code builds the payload from the main session whatever view is
+/// shown, so nothing in `payload` says which one is.
+fn statusline_text(payload: &serde_json::Value, viewing: Option<&str>, now_ms: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
     let transcript = transcript_of(payload);
@@ -926,8 +937,11 @@ fn statusline_text(payload: &serde_json::Value, now_ms: i64) -> String {
         .and_then(|m| m.get("display_name"))
         .and_then(|d| d.as_str())
     {
-        let name = session_id
-            .and_then(|s| crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref()));
+        let name = viewing.map(str::to_string).or_else(|| {
+            session_id.and_then(|s| {
+                crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref())
+            })
+        });
         parts.push(model_segment(model, name.as_deref(), || {
             accent_sgr(&statusline_accent_path())
         }));
@@ -985,6 +999,54 @@ fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> Strin
         Some(name) => format!("{model} {}({name}){RESET}", accent()),
         None => model.to_string(),
     }
+}
+
+/// The file the app leaves for tab `tab_id`'s status line while that tab's
+/// Claude Code shows a worker's view (giverny#460): the worker's name, as its
+/// management-panel row names it. Beside the spool, one per tab, like
+/// [`strip_flag`]; none while the tab is on the manager's own view.
+pub fn viewing_flag(spool: &Path, tab_id: &str) -> PathBuf {
+    viewing_dir(spool).join(tab_id)
+}
+
+fn viewing_dir(spool: &Path) -> PathBuf {
+    spool.with_file_name("viewing")
+}
+
+/// Tell tab `tab_id`'s status line which worker's view is on screen
+/// (`Some(name)`), or that the manager's own is again (`None`). Claude Code
+/// reruns the status line every [`STATUSLINE_REFRESH_S`] seconds, so the
+/// line follows within one.
+pub fn set_viewing(spool: &Path, tab_id: &str, name: Option<&str>) -> std::io::Result<()> {
+    let flag = viewing_flag(spool, tab_id);
+    match name {
+        Some(name) => {
+            if let Some(dir) = flag.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = flag.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&tmp, name)?;
+            std::fs::rename(&tmp, &flag)
+        }
+        None => match std::fs::remove_file(&flag) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Forget every tab's worker view: the app does at start, when no tab is on
+/// one yet, so a run that ended on a worker's view leaves no line naming it.
+pub fn clear_viewing(spool: &Path) {
+    let _ = std::fs::remove_dir_all(viewing_dir(spool));
+}
+
+/// The worker whose view tab `tab_id` shows, as the app last told it
+/// ([`set_viewing`]); `None` on the manager's own view.
+pub fn viewing_name(spool: &Path, tab_id: &str) -> Option<String> {
+    let name = std::fs::read_to_string(viewing_flag(spool, tab_id)).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Where the app leaves its chrome's accent colour for the status line: beside
@@ -2596,7 +2658,7 @@ mod tests {
         });
         let tokens = statusline_tokens(&payload, None);
         assert!(!tokens.is_empty(), "{tokens:?}");
-        let line = statusline_text(&payload, 0);
+        let line = statusline_text(&payload, None, 0);
         let sep = crate::session_use::SEP;
         assert_eq!(line, format!("Opus 5.5{sep}{}", tokens.join(sep)));
         assert!(!line.contains("CPU") && !line.contains('%'), "{line}");
@@ -2645,5 +2707,44 @@ mod tests {
         assert_eq!(accent_sgr(&dir.join("none.accent")), "\x1b[96m");
         std::fs::write(&accent, "#12345\n").unwrap();
         assert_eq!(accent_sgr(&accent), "\x1b[96m");
+    }
+
+    /// While a tab's Claude Code shows a worker's view, the app tells that
+    /// tab's status line the worker's name, and the line gives it in the
+    /// session's name's place; back on main, the manager's again
+    /// (giverny#460). Another tab's line is not told.
+    #[test]
+    fn the_status_line_names_the_worker_whose_view_is_on_screen() {
+        let spool = scratch("viewing").with_file_name("hooks.spool");
+        assert_eq!(viewing_name(&spool, "giverny-3"), None);
+        set_viewing(&spool, "giverny-3", Some("giverny#460 · g460-r1")).unwrap();
+        assert_eq!(
+            viewing_name(&spool, "giverny-3").as_deref(),
+            Some("giverny#460 · g460-r1")
+        );
+        assert_eq!(viewing_name(&spool, "giverny-4"), None);
+        // A second worker's view replaces the first's.
+        set_viewing(&spool, "giverny-3", Some("giverny#461 · other")).unwrap();
+        assert_eq!(
+            viewing_name(&spool, "giverny-3").as_deref(),
+            Some("giverny#461 · other")
+        );
+        let payload = serde_json::json!({
+            "model": {"display_name": "Opus 5.5"},
+            "transcript_path": "",
+        });
+        let line = statusline_text(&payload, Some("giverny#461 · other"), 0);
+        assert!(
+            line.starts_with("Opus 5.5 \x1b[") && line.contains("(giverny#461 · other)\x1b[0m"),
+            "{line:?}"
+        );
+        // Back on main: the file goes, and so does the worker's name.
+        set_viewing(&spool, "giverny-3", None).unwrap();
+        set_viewing(&spool, "giverny-3", None).unwrap();
+        assert_eq!(viewing_name(&spool, "giverny-3"), None);
+        // An app starting over forgets every tab's.
+        set_viewing(&spool, "giverny-5", Some("w")).unwrap();
+        clear_viewing(&spool);
+        assert_eq!(viewing_name(&spool, "giverny-5"), None);
     }
 }
