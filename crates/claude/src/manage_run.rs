@@ -70,8 +70,11 @@
 //! ([`ScopeStop`]: SIGTERM to its processes, [`STOP_GRACE`] later
 //! `cgroup.kill`), records and releases as usual, and exits 128 + the
 //! signal. One that dies before it can (SIGKILL) is covered by the shim's
-//! watcher, which stops the scope once `run`'s pid is gone. A command that
-//! ends on its own is unchanged: what it left running on purpose stays.
+//! watcher, which stops the scope once `run`'s pid is gone. Run plain, it
+//! stops its command's process tree the same way ([`TreeStop`],
+//! giverny#436): every process below the command, and any that detached
+//! from it while `run` watched. A command that ends on its own is
+//! unchanged: what it left running on purpose stays.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +199,29 @@ pub fn detect_mode() -> Mode {
         }
     }
     Mode::Plain
+}
+
+/// Does `run` hold a command to its lease's bound here
+/// ([`resources::lease_bound_mb`])? Under a systemd scope, or held by
+/// Giverny itself ([`user_cap::active`]) — the probe `run` makes; else the
+/// lease is advisory (giverny#456).
+pub fn caps_here() -> bool {
+    matches!(detect_mode(), Mode::Systemd { .. }) || user_cap::active()
+}
+
+/// Say beside the ledger whether this `run` held its command
+/// ([`resources::run_caps_path`]), so the ledger counts leases by it. Only
+/// when that changed; a failure costs only that.
+fn record_caps(ledger: &Path, capped: bool) {
+    let path = resources::run_caps_path(ledger);
+    let word = if capped { "capped" } else { "advisory" };
+    if std::fs::read_to_string(&path).is_ok_and(|t| t.trim() == word) {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{word}\n")).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// What the command is held to: the lease's RAM (0 = no memory cap), and
@@ -375,8 +401,8 @@ pub struct Opts {
     /// said outright by a test, so the suite means the same whatever its
     /// environment (giverny#389).
     pub hold: bool,
-    /// Under a scope: where a signal `run` caught is set (giverny#426), and
-    /// the scope is stopped once it is. The CLI's is [`CAUGHT`], set by the
+    /// Where a signal `run` caught is set (giverny#426), and the scope —
+    /// run plain, the command's tree (giverny#436) — is stopped once it is. The CLI's is [`CAUGHT`], set by the
     /// SIGTERM/SIGHUP/SIGINT handlers it takes while the command runs; a
     /// test sets its own.
     pub stop: Option<&'static AtomicI32>,
@@ -844,8 +870,10 @@ fn execute(
                 crate::tab_cap::SLICE
             ),
         );
-        // Seen by the management panel while it runs.
-        let live = run_live::register(&stats, task, session, manage::now_ms());
+        // Seen by the management panel while it runs; the ledger counts its
+        // lease at least at its `MemoryHigh` until it ends (giverny#456).
+        let bound = (cap.ram_mb > 0).then(|| high_mb(cap));
+        let live = run_live::register_bound(&stats, task, session, manage::now_ms(), bound);
         // giverny#426: a signal to `run` stops its scope, as Ctrl-C would
         // stop the command, and `run` still releases and records. Taken
         // before the spawn: a caught signal is the default again after exec.
@@ -882,6 +910,9 @@ fn execute(
             .unwrap_or_default();
         let _ = std::fs::remove_file(&stats);
         let w = w?;
+        if st.started {
+            record_caps(ledger, true);
+        }
         // Stopped, it never falls back to a plain run.
         if st.started || stopped_by.is_some() {
             let cg_mb = st.peak_bytes.map(|b| b.div_ceil(1024 * 1024));
@@ -949,17 +980,46 @@ fn execute(
     jobs_env(&mut c, cap);
     // Seen by the app (which holds it with the tabs where there are no
     // cgroups) and by the ledger's CPU-busy check, as a scope is.
-    let live = stats_path(ledger)
-        .ok()
-        .and_then(|stats| run_live::register(&stats, task, session, manage::now_ms()));
+    record_caps(ledger, held.is_some());
+    let live = stats_path(ledger).ok().and_then(|stats| {
+        run_live::register_bound(
+            &stats,
+            task,
+            session,
+            manage::now_ms(),
+            held.map(|c| c.ram_mb),
+        )
+    });
+    // giverny#436: a signal to `run` stops the command's whole tree, as
+    // under a scope; taken before the spawn, as there.
+    let mut stop = opts.stop.map(|caught| {
+        caught.store(0, Ordering::Relaxed);
+        TreeStop::new(caught, opts.stop_grace)
+    });
+    #[cfg(unix)]
+    let catching = (opts.ignore_signals && stop.is_some()).then(CatchSignals::new);
     let t = task.to_string();
-    let (w, guard) = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, None, |pid| {
+    let waited = spawn_wait(&mut c, &cmd[0], opts.ignore_signals, stop.as_mut(), |pid| {
         held.map(|ceiling| user_cap::RunGuard::start(pid, ceiling, hold_cpu, move |s| say(&t, s)))
-    })?;
+    });
+    #[cfg(unix)]
+    drop(catching);
+    let (w, guard) = waited?;
     drop(live);
     let seen = guard.map(user_cap::RunGuard::finish).unwrap_or_default();
+    let stopped_by = stop.as_ref().and_then(TreeStop::signal);
+    if let Some(sig) = stopped_by {
+        say(
+            task,
+            &format!(
+                "got {}: stopped its command and everything under it (SIGTERM, SIGKILL after {}s)",
+                signal_name(sig),
+                opts.stop_grace.as_secs()
+            ),
+        );
+    }
     Ok(Measured {
-        exit: w.exit,
+        exit: stopped_by.map_or(w.exit, |s| 128 + s),
         signal: w.signal,
         // The whole tree's, where the guard watched it.
         peak_mb: match (seen.peak_mb, w.maxrss_mb) {
@@ -971,7 +1031,7 @@ fn execute(
         oom_kills: seen.kills,
         capped: held.is_some(),
         held_mb: held.map(|c| c.ram_mb),
-        stopped_by: None,
+        stopped_by,
     })
 }
 
@@ -994,13 +1054,13 @@ struct Waited {
 /// Spawn and reap `c`, with its rusage on Unix; `watch` is handed the
 /// child's pid as it starts, and what it returns is held until the child
 /// is reaped.
-/// With `stop`, the wait polls it, and once it has stopped the scope it
-/// sees the scope empty (or killed) before returning.
-fn spawn_wait<G>(
+/// With `stop`, the wait polls it, and once it has stopped the scope (or
+/// the command's tree) it sees that empty (or killed) before returning.
+fn spawn_wait<G, S: Stop>(
     c: &mut Command,
     what: &str,
     ignore_signals: bool,
-    mut stop: Option<&mut ScopeStop>,
+    mut stop: Option<&mut S>,
     watch: impl FnOnce(u32) -> G,
 ) -> Result<(Waited, G), String> {
     let t0 = Instant::now();
@@ -1318,6 +1378,152 @@ impl ScopeStop {
     }
 }
 
+/// What a `run` told to go stops, polled by [`spawn_wait`]: its scope
+/// ([`ScopeStop`], giverny#426) or, run plain, its command's process tree
+/// ([`TreeStop`], giverny#436).
+pub trait Stop {
+    /// While the child (not yet reaped) runs.
+    fn tick(&mut self, child: u32);
+    /// After the child is reaped.
+    fn finish(&mut self);
+}
+
+impl Stop for ScopeStop {
+    fn tick(&mut self, child: u32) {
+        ScopeStop::tick(self, child)
+    }
+    fn finish(&mut self) {
+        ScopeStop::finish(self)
+    }
+}
+
+/// How often a [`TreeStop`] looks at the command's tree before it is told
+/// to go.
+const TREE_EVERY: Duration = Duration::from_secs(1);
+
+/// Stops a plain run's command once `run` has caught a signal
+/// (giverny#436), as [`ScopeStop`] stops a scope: SIGTERM to every process
+/// of the command's tree, and after the grace SIGKILL to each still there.
+/// With no cgroup to list them, the tree is the child and everything below
+/// it, looked at every [`TREE_EVERY`] and remembered by pid and start time
+/// ([`user_cap::Members`]), so a process that detached from it (`nohup …
+/// &`, a double fork) is still stopped, and a pid reused by another
+/// program is never signalled.
+pub struct TreeStop {
+    caught: &'static AtomicI32,
+    grace: Duration,
+    members: user_cap::Members,
+    /// The tree at the last look.
+    tree: std::collections::HashSet<u32>,
+    looked: Option<Instant>,
+    stopping: Option<Stopping>,
+}
+
+impl TreeStop {
+    pub fn new(caught: &'static AtomicI32, grace: Duration) -> TreeStop {
+        TreeStop {
+            caught,
+            grace,
+            members: user_cap::Members::default(),
+            tree: Default::default(),
+            looked: None,
+            stopping: None,
+        }
+    }
+
+    /// The signal it stopped the command for.
+    pub fn signal(&self) -> Option<i32> {
+        self.stopping.as_ref().map(|s| s.signal)
+    }
+
+    /// The tree now: below `child` while it is ours, and every earlier
+    /// member still alive with all below it.
+    fn look(&mut self, child: Option<u32>) {
+        self.looked = Some(Instant::now());
+        let Some(snap) = user_cap::Snapshot::take() else {
+            return;
+        };
+        let now = child
+            .map(|c| crate::session_use::subtree(&snap.procs, c))
+            .unwrap_or_default();
+        self.tree = self.members.hold(&snap.procs, now);
+        self.tree.remove(&std::process::id());
+    }
+
+    fn signal_tree(&self, sig: i32) {
+        for &pid in &self.tree {
+            send(pid, sig);
+        }
+    }
+
+    /// A caught signal starts the stop: SIGTERM to the whole tree.
+    fn begin(&mut self, child: Option<u32>) {
+        if self.stopping.is_some() {
+            return;
+        }
+        let sig = self.caught.load(Ordering::Relaxed);
+        if sig == 0 {
+            return;
+        }
+        self.look(child);
+        self.signal_tree(SIGTERM);
+        self.stopping = Some(Stopping {
+            signal: sig,
+            at: Instant::now(),
+            child,
+            killed: false,
+        });
+    }
+
+    /// Past the grace: SIGKILL to what is left, once.
+    fn escalate(&mut self) {
+        let Some(s) = self.stopping.as_ref() else {
+            return;
+        };
+        if s.killed || s.at.elapsed() < self.grace {
+            return;
+        }
+        let child = s.child;
+        self.look(child);
+        self.signal_tree(SIGKILL);
+        if let Some(s) = self.stopping.as_mut() {
+            s.killed = true;
+        }
+    }
+}
+
+impl Stop for TreeStop {
+    fn tick(&mut self, child: u32) {
+        if self.stopping.is_none() && self.looked.is_none_or(|t| t.elapsed() >= TREE_EVERY) {
+            self.look(Some(child));
+        }
+        self.begin(Some(child));
+        self.escalate();
+    }
+
+    /// After the child is reaped: a signal caught meanwhile still stops
+    /// the tree, which is watched until it is gone, killed past the grace,
+    /// and let go a little after that. A command that ended on its own
+    /// leaves what it meant to running.
+    fn finish(&mut self) {
+        if let Some(s) = self.stopping.as_mut() {
+            s.child = None;
+        }
+        self.begin(None);
+        while let Some(s) = self.stopping.as_ref() {
+            if s.at.elapsed() >= self.grace + STOP_AFTER_KILL {
+                return;
+            }
+            self.look(None);
+            if self.tree.is_empty() {
+                return;
+            }
+            self.escalate();
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+}
+
 /// The cgroup v2 tree.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
@@ -1509,6 +1715,7 @@ mod tests {
                 ..Default::default()
             },
             live_sessions: None,
+            run_bounds: Default::default(),
         }
     }
 
@@ -2219,6 +2426,126 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("{} never written", path.display());
+    }
+
+    /// Waits up to `secs` for `pid` to be gone (or a zombie, dead).
+    fn gone(pid: u32, secs: u64) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|t| {
+                    t.rsplit_once(')')
+                        .map(|(_, r)| r.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false);
+            if !alive(pid) || zombie {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// giverny#436: a plain `run` signalled mid-command stops its
+    /// command's whole tree — a child, one that ignores SIGTERM (killed
+    /// past the grace), one in a session of its own, and one that detached
+    /// from the tree before the signal — and nothing outside it.
+    #[test]
+    fn a_signalled_plain_run_stops_its_whole_tree_and_nothing_else() {
+        static CAUGHT_P: AtomicI32 = AtomicI32::new(0);
+        let dir = scratch("stop-tree");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut outside = Proc::sh("exec sleep 30");
+        let f = |n: &str| dir.join(n).display().to_string();
+        let script = format!(
+            "sleep 30 & echo $! > {a}; \
+             sh -c 'trap \"\" TERM; : > {b}.ready; exec sleep 30' & echo $! > {b}; \
+             setsid sleep 30 & echo $! > {s}; \
+             (sleep 30 & echo $! > {d}; sleep 2.5; : > {d}.ready) & \
+             exec sleep 30",
+            a = f("child"),
+            b = f("stubborn"),
+            s = f("own-session"),
+            d = f("detached"),
+        );
+        let mut c = Command::new("sh");
+        c.args(["-c", &script]);
+        let mut stop = TreeStop::new(&CAUGHT_P, Duration::from_millis(400));
+        let d = dir.clone();
+        let signaller = std::thread::spawn(move || {
+            ready(&d.join("stubborn.ready"));
+            ready(&d.join("detached.ready"));
+            CAUGHT_P.store(libc::SIGTERM, Ordering::Relaxed);
+        });
+        let t0 = Instant::now();
+        let (w, ()) = spawn_wait(&mut c, "stand-in", false, Some(&mut stop), |_| ()).unwrap();
+        signaller.join().unwrap();
+        assert_eq!(stop.signal(), Some(libc::SIGTERM));
+        assert_eq!((w.exit, w.signal), (143, Some(libc::SIGTERM)));
+        for name in ["child", "stubborn", "own-session", "detached"] {
+            let pid: u32 = wait_for(&dir.join(name), 5).trim().parse().unwrap();
+            assert!(gone(pid, 5), "{name} ({pid}) still running");
+        }
+        assert!(outside.running(), "not in the tree: untouched");
+        assert!(t0.elapsed() < Duration::from_secs(15));
+        // Not signalled: the command's own exit, and what it left running
+        // on purpose lives on.
+        static CAUGHT_Q: AtomicI32 = AtomicI32::new(0);
+        let mut quiet = TreeStop::new(&CAUGHT_Q, Duration::from_millis(100));
+        let bg = dir.join("bg");
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            &format!(
+                "sleep 30 >/dev/null 2>&1 & echo $! > {}; exit 3",
+                bg.display()
+            ),
+        ]);
+        let (w, ()) = spawn_wait(&mut c, "stand-in", false, Some(&mut quiet), |_| ()).unwrap();
+        assert_eq!((w.exit, w.signal, quiet.signal()), (3, None, None));
+        let bg: u32 = wait_for(&bg, 5).trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(alive(bg), "a normal end stops nothing");
+        send(bg, libc::SIGKILL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#436, end to end: `run` with no scope (no user systemd,
+    /// macOS), SIGTERMed mid-command, exits 143, leaves no descendant, and
+    /// still records the run.
+    #[test]
+    fn a_plain_run_sigtermed_mid_command_leaves_no_descendant() {
+        static CAUGHT_E: AtomicI32 = AtomicI32::new(0);
+        let dir = scratch("stop-plain");
+        cmd(&dir, "start t436 --eta 30");
+        assert_eq!(cmd(&dir, "claim t436 --ram 64M").1, 0);
+        let opts = Opts {
+            stop: Some(&CAUGHT_E),
+            stop_grace: Duration::from_millis(500),
+            ..plain(60_000)
+        };
+        let pids = dir.join("pids");
+        let script = format!(
+            "trap '' TERM; setsid sleep 600 & a=$!; sleep 600 & echo $a $! $$ > {}; wait",
+            pids.display()
+        );
+        let d = dir.clone();
+        let worker = std::thread::spawn(move || run(&d, "t436", &[], &script, opts));
+        let pids: Vec<u32> = wait_for(&pids, 20)
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 3);
+        std::thread::sleep(Duration::from_millis(300));
+        CAUGHT_E.store(libc::SIGTERM, Ordering::Relaxed);
+        assert_eq!(worker.join().unwrap(), 143);
+        for &p in &pids {
+            assert!(gone(p, 5), "{p} still running");
+        }
+        let u = row(&dir, "t436").usage.unwrap();
+        assert_eq!(u.last_exit, Some(143), "recorded: {u:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real thing, where this machine has a user systemd (giverny#426):

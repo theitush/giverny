@@ -3546,6 +3546,7 @@ mod tests {
                 ..Default::default()
             },
             live_sessions: None,
+            run_bounds: Default::default(),
         }
     }
 
