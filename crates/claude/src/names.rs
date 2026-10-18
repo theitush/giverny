@@ -910,7 +910,28 @@ pub fn place(feeds: &Path, session: &str) -> Option<String> {
     if !is_on(feeds) {
         return None;
     }
-    place_of(&read(feeds, session)?, &room(feeds, session)?)
+    let name = read(feeds, session).or_else(|| adopt(feeds, session))?;
+    place_of(&name, &room(feeds, session)?)
+}
+
+/// Give `session`, named only on its manager feed (from before names had a
+/// home, giverny#330), a names document of that name, so it has a room to
+/// be titled after (giverny#440). Nothing writes a feed's name any more, so
+/// the copy never goes stale; the status line stamps its root in
+/// ([`keep_root`]).
+fn adopt(feeds: &Path, session: &str) -> Option<String> {
+    let name = on_feed(feeds, session)?;
+    let file = session_file(feeds, session)?;
+    let _lock = lock(feeds);
+    if let Some(name) = name_in(&file) {
+        return Some(name);
+    }
+    write_doc(
+        &file,
+        &json!({"session": session, "name": name, "room": draw_room()}),
+    )
+    .ok()?;
+    Some(name)
 }
 
 /// One word of a name: a letter, then letters, digits, hyphens and
@@ -2152,6 +2173,34 @@ mod tests {
             assert_eq!(doc.get("root").and_then(Value::as_str), Some("root-1"));
             assert_eq!(room(&feeds, &id), Some(kept));
         }
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_session_named_only_on_an_old_feed_gets_a_place() {
+        // giverny#440: named before names had a home; its tab is titled
+        // after it the first time a place is asked for, and the same after.
+        let feeds = scratch("feed-place");
+        set_on(&feeds, true).unwrap();
+        let feed = crate::feed::feed_path(&feeds, "old");
+        std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+        std::fs::write(
+            &feed,
+            json!({"version": 1, "session": "old", "name": "Juniper Belfry", "rows": []})
+                .to_string(),
+        )
+        .unwrap();
+        let first = place(&feeds, "old").expect("a place");
+        assert!(first.starts_with("Juniper's "), "{first}");
+        assert_eq!(read(&feeds, "old").as_deref(), Some("Juniper Belfry"));
+        for _ in 0..3 {
+            assert_eq!(place(&feeds, "old"), Some(first.clone()));
+        }
+        assert_eq!(
+            shown(&feeds, "old", None).as_deref(),
+            Some("Juniper Belfry")
+        );
+        assert_eq!(place(&feeds, "nobody"), None, "no feed, no place");
         let _ = std::fs::remove_dir_all(&feeds);
     }
 }
