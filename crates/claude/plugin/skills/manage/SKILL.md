@@ -94,7 +94,8 @@ first `eta` on a running task (the one Giverny asks for five minutes in,
 after it has read the code) goes on the pane as given, and its gut figure
 (`--gut`) is later checked against the working time that was still to come.
 How far off the worker's gut on its kind's re-estimates runs reaches it only
-in Giverny's asks, never as a note between them.
+in Giverny's asks, never as a note between them; an `eta` reply to a figure
+given before any ask, or without `--gut`, is one.
 
 `giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess and the worker's
@@ -204,14 +205,14 @@ When you spawn one:
   conversation. Include these lines, with the task name filled in:
 
   > You are the worker for task `<task>`. Work only on this task and only in the
-  > files it needs. Once you have read the code (Giverny will ask you about
-  > five minutes in), re-estimate once with how many minutes are left, even
-  > if the figure stands. Each ask tells you how far off your gut figures on
-  > such tasks usually run: give your gut figure and the one you settle on
-  > after allowing for that, as you judge: `giverny-manage eta <task>
-  > <settled> --gut <gut> --note "<why>"`. Do the same whenever the estimate
-  > turns out wrong, allowing for what the last ask said; before any ask,
-  > give your gut figure. When you are waiting on
+  > files it needs. Your first re-estimate is Giverny's ask, about five
+  > minutes in, once you have read the code; do not give one before it. The
+  > ask tells you how far off your gut figures on such tasks usually run:
+  > answer it, even if the figure stands, with your gut figure and the one
+  > you settle on after allowing for that, as you judge: `giverny-manage eta
+  > <task> <settled> --gut <gut> --note "<why>"`. After it, re-estimate the
+  > same way whenever the figure turns out wrong, allowing for the last line
+  > you were shown. When you are waiting on
   > something that is not the work (a build slot, a lock, a person), say so
   > with `--why wait`; your next `eta` without it ends the wait. Do not run
   > `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy
@@ -232,6 +233,10 @@ When you spawn one:
   have usually run about 2.5× too high (last 20, median)`; nothing with too
   little history) and asks for both figures; none changes its figure. Its
   answer is the `eta` command. Nothing is put in its context between asks.
+  An `eta` given before any ask, or without `--gut`, is answered as an ask
+  itself: the reply keeps the figure as the gut figure, tells the line and
+  asks for the figure the worker settles on, which takes the first one's
+  place when it comes with `--gut` soon after.
 
 ## 3. While it runs
 
