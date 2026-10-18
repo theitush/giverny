@@ -715,6 +715,10 @@ pub trait LiveAgent {
     fn ended_ms(&self) -> Option<u64> {
         None
     }
+    /// The agent that spawned it, when another agent did (giverny#464).
+    fn parent_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Does `text` name `key` as a whole word? `demo#82` is named by
@@ -1117,7 +1121,15 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
 ) -> Vec<PaneRow<'a, L>> {
     let feed_rows: &[FeedRow] = feed.map(|f| f.rows.as_slice()).unwrap_or(&[]);
     let find_live = |id: &str| live.iter().find(|l| l.agent_id() == id);
-    let names = |l: &L, key: &str| l.description().is_some_and(|d| names_key(d, key));
+    // An agent another listed agent spawned is never a feed row's worker by
+    // its description: it works for its parent, whose task it may well
+    // name, and is drawn under its parent's row (giverny#464). Only an
+    // `agent_id` makes it a row's worker.
+    let nested = |l: &L| {
+        l.parent_id()
+            .is_some_and(|p| live.iter().any(|o| o.agent_id() == p))
+    };
+    let names = |l: &L, key: &str| !nested(l) && l.description().is_some_and(|d| names_key(d, key));
     // A Running row wants the worker still running; any other the one that
     // finished. Either takes the other when that is all there is.
     let by_description = |f: &FeedRow| -> Option<&'a L> {
