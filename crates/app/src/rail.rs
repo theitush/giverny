@@ -166,36 +166,52 @@ const RING_R: f32 = 4.0;
 
 /// The small filled dot's radius: Claude idle at its prompt in the
 /// category's colour, and a restored Claude tab not started yet in gray
-/// (giverny#462).
-const DOT_R: f32 = 2.5;
+/// (giverny#462). A touch bigger than it was (2.5) so it reads as round
+/// beside the small square at a glance, still well inside the ring.
+const DOT_R: f32 = 3.0;
 
 /// The open ring's stroke, centred on [`RING_R`].
 const RING_STROKE: f32 = 1.4;
 
-/// A plain shell's hollow square, across: at its prompt, exited, and the
-/// size a running command's square breathes up to.
+/// A plain shell's hollow square, across: exited, and the size a running
+/// command's square breathes out to.
 const SQUARE_SIDE: f32 = 7.0;
+
+/// The small filled square, across: a shell at its prompt in the
+/// category's colour, as idle Claude is the small dot; a restored shell tab
+/// not started yet, in gray; and the size a running command's square
+/// breathes in to (giverny#462). Was 4.0; a little bigger so it reads as
+/// square beside the dot ([`DOT_R`]), still well inside [`SQUARE_SIDE`].
+const SMALL_SQUARE: f32 = 5.0;
+
+/// The smallest hole [`annulus`] cuts, in device pixels: a smaller one
+/// would be lost in the edge's anti-aliasing, so it is cut this size and
+/// faded in instead.
+const HOLE_PX: f32 = 1.5;
 
 /// A disc at `at` with a hole in its middle: everything between `inner` and
 /// `outer` from the centre is `color`. Drawn as a ring whose stroke is the
 /// band between the two, so as the hole closes the stroke simply widens
-/// until it fills the disc, and there is no jump from hollow to filled: a
-/// hole under a device pixel is drawn filled, which it already looks
+/// until it fills the disc. A hole too small to draw (under [`HOLE_PX`])
+/// is cut at that size and filled back in, the fill fading out as the hole
+/// grows, so the hole opens and closes by degrees, never a whole pixel or
+/// two at once, which showed as a jump on the busy breath's slow clock
 /// (giverny#462).
 fn annulus(p: &egui::Painter, at: Pos2, outer: f32, inner: f32, color: Color32) {
     let px = 1.0 / p.pixels_per_point();
     let inner = inner.clamp(0.0, outer);
-    if inner < px {
+    let least = (HOLE_PX * px).min(outer / 2.0);
+    if inner <= 0.0 {
         p.circle_filled(at, outer, color);
-    } else {
-        p.circle_stroke(at, (outer + inner) / 2.0, Stroke::new(outer - inner, color));
+        return;
     }
-}
-
-/// How big a breathing mark is, as a share of its resting size: from about
-/// a device pixel (`floor`) at `breath` 0 up to the whole mark at 1.
-fn breathed(floor: f32, breath: f32) -> f32 {
-    floor + (1.0 - floor) * breath
+    let hole = inner.max(least);
+    p.circle_stroke(at, (outer + hole) / 2.0, Stroke::new(outer - hole, color));
+    if inner < least {
+        // Over the ring's inner anti-aliased edge too, so no seam shows.
+        let fill = 1.0 - inner / least;
+        p.circle_filled(at, (hole + px).min(outer), color.gamma_multiply(fill));
+    }
 }
 
 /// Claude's calm busy mark (`rail.calm_busy`): its idle dot breathing out
@@ -212,20 +228,29 @@ fn calm_ring(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     annulus(p, at, outer, inner, color);
 }
 
-/// A shell running a command: its hollow square breathing in size, a pixel
-/// up to the square at its prompt and back, on the calm mark's slow breath
-/// (giverny#388). Kept moving on the animation clock while `rect` is on
-/// screen; with `rail.animate` off it holds still, full size.
+/// A shell running a command (giverny#388, giverny#462): its prompt's
+/// small filled square ([`SMALL_SQUARE`]) breathing out to the hollow
+/// square ([`SQUARE_SIDE`]) and back, on the calm
+/// mark's slow breath, as Claude's busy dot breathes to its ring
+/// ([`calm_ring`]). Its edge grows and a hole opens in its middle together,
+/// so it morphs and never jumps between filled and hollow. Kept moving on
+/// the animation clock while `rect` is on screen; with `rail.animate` off
+/// it holds still as the hollow square.
 fn breathing_square(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, color: Color32) {
     let time = animating(ui).then(anim_time);
     if time.is_some() {
         keep_animating(ui, rect);
     }
-    let px = 1.0 / p.pixels_per_point();
-    let side = SQUARE_SIDE * breathed(px / SQUARE_SIDE, calm_breath(time));
-    // Two pixels across or less has no hollow middle, and an inside stroke
-    // that fills it all draws nothing: filled, it is the pixel it should be.
-    square(p, at, side, side <= 2.0 * px, color);
+    square_breath(p, at, calm_breath(time), color);
+}
+
+/// [`breathing_square`]'s shape at `breath`: 0 is the small filled square
+/// of the prompt, 1 the hollow one exactly as [`square`] draws it.
+fn square_breath(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
+    let breath = breath.clamp(0.0, 1.0);
+    let outer = SMALL_SQUARE + (SQUARE_SIDE - SMALL_SQUARE) * breath;
+    let hole = (SQUARE_SIDE - 2.0 * square_stroke(p.pixels_per_point())) * breath;
+    square_band(p, at, outer, hole, color);
 }
 
 /// How lit each of a background shell's three dots is, 0 (dim) to 1 (the
@@ -1542,23 +1567,42 @@ fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, color: Color
 /// pixel boundary smears into a blurred blob at this size, where a circle
 /// only softens.
 fn square(p: &egui::Painter, at: Pos2, side: f32, filled: bool, color: Color32) {
+    let hole = if filled {
+        0.0
+    } else {
+        side - 2.0 * square_stroke(p.pixels_per_point())
+    };
+    square_band(p, at, side, hole, color);
+}
+
+/// A hollow square's edge, in points: a whole number of pixels, at least
+/// one, at `ppp` pixels per point.
+fn square_stroke(ppp: f32) -> f32 {
+    (1.2 * ppp).round().max(1.0) / ppp
+}
+
+/// A square `outer` points across with a square hole `hole` across in its
+/// middle, snapped to whole device pixels: the band between is drawn as a
+/// stroke inside the edge, so as the hole closes the stroke widens until it
+/// fills the square. A hole under a pixel is drawn filled, which it
+/// already looks (giverny#462).
+fn square_band(p: &egui::Painter, at: Pos2, outer: f32, hole: f32, color: Color32) {
     let ppp = p.pixels_per_point();
-    let px = (side * ppp).round().max(1.0);
+    let px = (outer * ppp).round().max(1.0);
     let min = Pos2::new(
         (at.x * ppp - px / 2.0).round() / ppp,
         (at.y * ppp - px / 2.0).round() / ppp,
     );
     let rect = Rect::from_min_size(min, Vec2::splat(px / ppp));
-    if filled {
+    // Each side of the hole loses the same whole number of pixels.
+    let width = ((px - (hole * ppp).max(0.0)) / 2.0).round().max(1.0);
+    if px - 2.0 * width < 1.0 {
         p.rect_filled(rect, 0.0, color);
     } else {
-        // A whole number of pixels, at least one, drawn inside the edge so
-        // the hollow square is exactly as wide as the filled one would be.
-        let width = (1.2 * ppp).round().max(1.0) / ppp;
         p.rect_stroke(
             rect,
             0.0,
-            Stroke::new(width, color),
+            Stroke::new(width / ppp, color),
             egui::StrokeKind::Inside,
         );
     }
@@ -1602,11 +1646,13 @@ enum Mark {
     /// which it cannot talk through, is [`Mark::Busy`], and wins; it asking
     /// for you is [`Mark::Flag`], and wins too.
     Wave,
-    /// A plain shell running a command: the hollow square breathing in
-    /// size, a pixel up to [`Mark::Prompt`]'s and back (giverny#388).
+    /// A plain shell running a command: [`Mark::Prompt`]'s small filled
+    /// square breathing out to the hollow square and back (giverny#388,
+    /// giverny#462).
     Running,
-    /// A plain shell at its prompt, its last command seen: a hollow square,
-    /// as Claude at its prompt is a small dot (giverny#388, giverny#462).
+    /// A plain shell at its prompt, its last command seen: a small filled
+    /// square, as Claude at its prompt is a small dot (giverny#388,
+    /// giverny#462).
     Prompt,
     /// A plain shell that has exited: the hollow square in gray, like a
     /// tab not started — nothing runs there (giverny#388).
@@ -1618,6 +1664,16 @@ enum Mark {
 }
 
 impl Mark {
+    /// A still shell mark's square, (side, filled): at its prompt and not
+    /// started, the small filled one; exited, the hollow one (giverny#462).
+    fn still_square(self) -> Option<(f32, bool)> {
+        match self {
+            Mark::Prompt | Mark::NotStarted { claude: false } => Some((SMALL_SQUARE, true)),
+            Mark::Exited => Some((SQUARE_SIDE, false)),
+            _ => None,
+        }
+    }
+
     /// The mark `row` wears. A tab that has not started has nothing
     /// running, so whatever Claude state lingers for it is not shown: the
     /// gray mark is the whole truth until it is focused.
@@ -1772,19 +1828,23 @@ fn tab_row(
         Mark::Idle => {
             p.circle_filled(dot, DOT_R, color);
         }
-        // A plain shell, which most tabs are most of the time: a hollow
-        // square at its prompt, breathing in size while a command runs, and
-        // gray once the shell has exited (giverny#388). Squares read larger
-        // than circles of the same width, so it is a touch narrower than
-        // the open ring.
+        // A plain shell, which most tabs are most of the time: a small
+        // filled square at its prompt, breathing out to the hollow square
+        // and back while a command runs, and the hollow square in gray once
+        // the shell has exited (giverny#388, giverny#462). Squares read
+        // larger than circles of the same width, so each is a touch
+        // narrower than its round twin.
         Mark::Running => breathing_square(ui, &p, rect, dot, color),
-        Mark::Prompt | Mark::Exited => square(&p, dot, SQUARE_SIDE, false, color),
+        Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
+            if let Some((side, filled)) = mark.still_square() {
+                square(&p, dot, side, filled, color);
+            }
+        }
         // A restored tab whose process has not started yet: small and
         // gray, since any colour would claim something running.
         Mark::NotStarted { claude: true } => {
             p.circle_filled(dot, DOT_R, color);
         }
-        Mark::NotStarted { claude: false } => square(&p, dot, 4.0, true, color),
     }
     // The unseen finish beside what runs after it (giverny#388): the tick,
     // smaller, in the gutter left of the mark, so the mark keeps its place
@@ -3456,7 +3516,7 @@ mod tests {
 
     /// A plain shell (giverny#388): a command running breathes its square;
     /// one that finished on another tab ticks until you look; at its prompt,
-    /// seen, the hollow square; exited, the hollow square in gray. Its next
+    /// seen, the small filled square; exited, the hollow square in gray. Its next
     /// command, the first still unseen, breathes with the tick beside it.
     #[test]
     fn a_shell_breathes_ticks_then_rests_hollow() {
@@ -3479,30 +3539,147 @@ mod tests {
         assert_eq!(shell(true, false, true), (Mark::Exited, false));
     }
 
-    /// A shell's breathing square starts at a device pixel and breathes up
-    /// to the resting square's size exactly, so at full breath (and with
-    /// `rail.animate` off) a running shell's square is its prompt's
-    /// (giverny#388).
+    /// A shell at its prompt is the small filled square, as idle Claude is
+    /// the small dot, the same square a not-started shell wears in gray and
+    /// a running command's breath starts from; an exited shell is the
+    /// hollow square, the running breath's other end (giverny#462).
     #[test]
-    fn breathing_marks_go_from_a_pixel_to_the_resting_size() {
-        let floor = 1.0 / SQUARE_SIDE;
-        assert_eq!(SQUARE_SIDE * breathed(floor, 0.0), 1.0);
-        assert_eq!(SQUARE_SIDE * breathed(floor, 1.0), SQUARE_SIDE);
-        assert!(breathed(floor, 0.5) > floor && breathed(floor, 0.5) < 1.0);
+    fn a_shell_at_its_prompt_is_the_small_filled_square() {
+        assert_eq!(Mark::Prompt.still_square(), Some((SMALL_SQUARE, true)));
+        assert_eq!(
+            Mark::NotStarted { claude: false }.still_square(),
+            Mark::Prompt.still_square()
+        );
+        assert_eq!(Mark::Exited.still_square(), Some((SQUARE_SIDE, false)));
+        for mark in [Mark::Running, Mark::Idle, Mark::NotStarted { claude: true }] {
+            assert_eq!(mark.still_square(), None, "{mark:?}");
+        }
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let draw = |(side, filled): (f32, bool)| {
+                square_of(
+                    &painted_at(ppp, |p| square(p, Pos2::ZERO, side, filled, Color32::RED)),
+                    ppp,
+                )
+            };
+            let breath = |b: f32| {
+                square_of(
+                    &painted_at(ppp, |p| square_breath(p, Pos2::ZERO, b, Color32::RED)),
+                    ppp,
+                )
+            };
+            assert_eq!(draw(Mark::Prompt.still_square().unwrap()), breath(0.0));
+            assert_eq!(draw(Mark::Exited.still_square().unwrap()), breath(1.0));
+        }
+    }
+
+    /// The (outer side, hole side) of the one square `shapes` draws, in
+    /// pixels: a filled square has no hole.
+    fn square_of(shapes: &[egui::Shape], ppp: f32) -> (f32, f32) {
+        match shapes {
+            [egui::Shape::Rect(r)] => {
+                let side = r.rect.width() * ppp;
+                assert!((side - r.rect.height() * ppp).abs() < 1e-3, "square");
+                if r.fill != Color32::TRANSPARENT {
+                    assert_eq!(r.stroke.width, 0.0, "filled or stroked, not both");
+                    (side, 0.0)
+                } else {
+                    (side, side - 2.0 * r.stroke.width * ppp)
+                }
+            }
+            _ => panic!("one square, not {shapes:?}"),
+        }
+    }
+
+    fn painted_at(ppp: f32, paint: impl Fn(&egui::Painter)) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| paint(ui.painter()));
+        out.shapes.into_iter().map(|c| c.shape).collect()
+    }
+
+    /// A shell's running square morphs from its prompt's small filled
+    /// square (the not-started marker's size) to the hollow square and back
+    /// (giverny#462), never down to a pixel: breathed in it is the small
+    /// square exactly, breathed out (and with `rail.animate` off) the
+    /// hollow one, and in between its edge and its hole each move a pixel
+    /// at a time, so it never jumps from filled to hollow.
+    #[test]
+    fn the_running_square_morphs_from_the_small_square_to_the_hollow_one() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let at = |breath: f32| {
+                square_of(
+                    &painted_at(ppp, |p| square_breath(p, Pos2::ZERO, breath, Color32::RED)),
+                    ppp,
+                )
+            };
+            let small = square_of(
+                &painted_at(ppp, |p| {
+                    square(p, Pos2::ZERO, SMALL_SQUARE, true, Color32::RED)
+                }),
+                ppp,
+            );
+            let hollow = square_of(
+                &painted_at(ppp, |p| {
+                    square(p, Pos2::ZERO, SQUARE_SIDE, false, Color32::RED)
+                }),
+                ppp,
+            );
+            assert_eq!(at(0.0), small, "breathed in: the prompt's square");
+            assert!(small.0 >= (SMALL_SQUARE * ppp).round() && small.1 == 0.0);
+            assert_eq!(at(1.0), hollow, "breathed out: the hollow square");
+            assert!(hollow.1 > 0.0, "hollow");
+            let steps = 400;
+            let mut last = at(0.0);
+            for k in 1..=steps {
+                let now = at(k as f32 / steps as f32);
+                assert!(now.0 >= last.0, "{ppp}: {last:?} -> {now:?}");
+                assert!(
+                    now.0 - last.0 <= 1.0 + 1e-3,
+                    "{ppp}: edge jumped {last:?} -> {now:?}"
+                );
+                // The hole opens from nothing: it never goes from none to
+                // more than a couple of pixels, nor back.
+                assert!(
+                    (now.1 - last.1).abs() <= 2.0 + 1e-3,
+                    "{ppp}: hole jumped {last:?} -> {now:?}"
+                );
+                last = now;
+            }
+        }
     }
 
     /// The disc between `outer` and `inner` the shapes at `breath` draw,
-    /// at one point per pixel: a filled circle has no hole.
+    /// at one point per pixel: a filled circle has no hole, and a hole
+    /// filled back in part way by a faded disc counts as that much smaller
+    /// (the hole fading in, [`annulus`]).
     fn band(shapes: &[egui::Shape]) -> (f32, f32) {
-        let [egui::Shape::Circle(c)] = shapes else {
-            panic!("one circle, not {shapes:?}");
+        let circle = |s: &egui::Shape| match s {
+            egui::Shape::Circle(c) => *c,
+            _ => panic!("circles, not {shapes:?}"),
         };
-        if c.fill != Color32::TRANSPARENT {
-            assert_eq!(c.stroke.width, 0.0, "filled or stroked, not both");
-            (c.radius, 0.0)
-        } else {
-            let half = c.stroke.width / 2.0;
-            (c.radius + half, c.radius - half)
+        match shapes {
+            [c] => {
+                let c = circle(c);
+                if c.fill != Color32::TRANSPARENT {
+                    assert_eq!(c.stroke.width, 0.0, "filled or stroked, not both");
+                    (c.radius, 0.0)
+                } else {
+                    let half = c.stroke.width / 2.0;
+                    (c.radius + half, c.radius - half)
+                }
+            }
+            [ring, fill] => {
+                let (ring, fill) = (circle(ring), circle(fill));
+                let half = ring.stroke.width / 2.0;
+                let (outer, hole) = (ring.radius + half, ring.radius - half);
+                assert!(
+                    fill.radius >= hole && fill.radius <= outer,
+                    "fills the hole"
+                );
+                let shown = fill.fill.a() as f32 / ring.stroke.color.a() as f32;
+                (outer, hole * (1.0 - shown))
+            }
+            _ => panic!("a ring and at most its fill, not {shapes:?}"),
         }
     }
 
@@ -3514,28 +3691,50 @@ mod tests {
 
     /// Claude's calm busy mark morphs from the idle dot to the open ring
     /// and back (giverny#462): breathed in it is the idle dot exactly,
-    /// breathed out the ring, and in between both edges move a little at a
-    /// time, the hole opening from nothing, so there is no jump where a
-    /// filled disc turns into a stroked ring.
+    /// breathed out the ring, and all the way round the breath, at any
+    /// scale, both edges move a little at a time, the hole fading in from
+    /// nothing, so there is no jump where a filled disc turns into a
+    /// stroked ring (the step Ita saw at the end of the clench).
     #[test]
     fn the_calm_mark_morphs_from_the_idle_dot_to_the_open_ring() {
-        let at = |breath: f32| band(&painted(|p| calm_ring(p, Pos2::ZERO, breath, Color32::RED)));
-        assert_eq!(at(0.0), (DOT_R, 0.0), "breathed in: the idle dot");
-        let (outer, inner) = at(1.0);
-        assert!((outer - (RING_R + RING_STROKE / 2.0)).abs() < 1e-4);
-        assert!((inner - (RING_R - RING_STROKE / 2.0)).abs() < 1e-4);
-        let steps = 200;
-        let mut last = at(0.0);
-        for k in 1..=steps {
-            let now = at(k as f32 / steps as f32);
-            assert!(now.0 >= last.0 && now.1 >= last.1, "{last:?} -> {now:?}");
-            assert!(
-                now.0 - last.0 < 0.05,
-                "outer edge jumped {last:?} -> {now:?}"
-            );
-            // The hole opens from under a pixel, never all at once.
-            assert!(now.1 - last.1 < 1.05, "hole jumped {last:?} -> {now:?}");
-            last = now;
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let at = |breath: f32| {
+                band(&painted_at(ppp, |p| {
+                    calm_ring(p, Pos2::ZERO, breath, Color32::RED)
+                }))
+            };
+            assert_eq!(at(0.0), (DOT_R, 0.0), "breathed in: the idle dot");
+            let (outer, inner) = at(1.0);
+            assert!((outer - (RING_R + RING_STROKE / 2.0)).abs() < 1e-4);
+            assert!((inner - (RING_R - RING_STROKE / 2.0)).abs() < 1e-4);
+            // One whole breath, out and back in, in fine steps of time.
+            let steps = 600;
+            let breath = |k: usize| calm_breath(Some(CALM_PERIOD * k as f64 / steps as f64));
+            let mut last = at(breath(0));
+            for k in 1..=steps {
+                let now = at(breath(k));
+                let out = k <= steps / 2;
+                assert!(
+                    // The fill's alpha is a byte: allow its rounding.
+                    if out {
+                        now.0 >= last.0 - 1e-3 && now.1 >= last.1 - 1e-3
+                    } else {
+                        now.0 <= last.0 + 1e-3 && now.1 <= last.1 + 1e-3
+                    },
+                    "{ppp}: {last:?} -> {now:?}"
+                );
+                assert!(
+                    (now.0 - last.0).abs() < 0.05,
+                    "{ppp}: outer edge jumped {last:?} -> {now:?}"
+                );
+                // The hole opens and closes by degrees, never a pixel at once.
+                assert!(
+                    (now.1 - last.1).abs() < 0.05,
+                    "{ppp}: hole jumped {last:?} -> {now:?}"
+                );
+                last = now;
+            }
+            assert_eq!(last, (DOT_R, 0.0), "{ppp}: back to the idle dot");
         }
     }
 

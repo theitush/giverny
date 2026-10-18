@@ -168,6 +168,8 @@ mod tests {
             flag: false,
             landed_ms: None,
             why: Vec::new(),
+            depth: 0,
+            fold: None,
             click: RowClick {
                 stage: Stage::Running,
                 key: String::new(),
