@@ -1,9 +1,10 @@
 //! `giverny hook`: the plugin's `PostToolUse` hook, which runs on every tool
 //! call of every session the plugin is loaded in — the dispatcher's and its
 //! workers' alike — and hands each part of its work to the side that owns it.
-//! The same command is the plugin's `PreToolUse` Bash hook, which refuses a
-//! command that would leave its tab's resource cap ([`guard`],
-//! [`crate::bash_guard`]), and, with the manage skill in, its `PreToolUse`
+//! The same command is the plugin's `PreToolUse` Bash hook, which lets a
+//! command that would leave its tab's resource cap run and reminds the
+//! session, once per kind, to keep heavy work in the cap ([`guard`],
+//! [`crate::bash_guard`], giverny#271), and, with the manage skill in, its `PreToolUse`
 //! Agent hook, which nudges a session that is no manager toward the skill
 //! when a subagent it starts looks like task work ([`crate::manage_hint`],
 //! giverny#358), and the plugin's
@@ -53,6 +54,12 @@
 //!   ([`crate::strays::stop`]); one that goes quiet later is told once on
 //!   its next tool call or prompt ([`crate::strays::between`],
 //!   giverny#450).
+//! - **What left the cap afterwards.** A process of the session's that the
+//!   app's sampler found outside its tab's slice is told once, on its next
+//!   tool call or prompt ([`crate::escapes::deliver`], giverny#271). And
+//!   every hook call of a tab's session leaves its hook mark
+//!   ([`crate::escapes::mark_hooked`]), whose absence the management panel
+//!   marks.
 //! - **The manager mark.** The session's own `Skill` call running the
 //!   manage skill marks it a manager ([`crate::managers`], giverny#357), as
 //!   does the person typing `/giverny:manage` (the prompt hook): what lets
@@ -274,7 +281,16 @@ pub fn run_with(
         crate::managers::mark_from(dir, payload);
     }
     if let Some(caller) = Caller::of(payload) {
-        return worker(&caller, dir, now, in_tab).map(|t| reply(&t));
+        // A subagent's call hears of its session's escapes too: it may be
+        // the one that ran it (giverny#271).
+        let asks: Vec<String> = [
+            worker(&caller, dir, now, in_tab),
+            crate::escapes::deliver(dir, session),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        return (!asks.is_empty()).then(|| reply(&asks.join("\n\n")));
     }
     // The dispatcher's own call: its messages, its rows' chores, the
     // worker it just started, the commands a finished subagent left
@@ -287,6 +303,7 @@ pub fn run_with(
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),
         crate::strays::between(dir, session, now, &crate::strays::System),
+        crate::escapes::deliver(dir, session),
     ]
     .into_iter()
     .flatten()
@@ -474,16 +491,46 @@ fn deny(why: &str) -> String {
     .to_string()
 }
 
-/// The `PreToolUse` reply refusing a Bash `command` that would leave its
-/// tab's resource cap ([`crate::bash_guard`]), or nothing. Only in a
-/// Giverny tab (`in_tab`, asked only for a command it would refuse), whose
+/// The `PreToolUse` reply reminding the session (`session`) that a Bash
+/// `command` would leave its tab's resource cap ([`crate::bash_guard`]),
+/// once per kind of escape ([`crate::escapes::remind`], giverny#271), or
+/// nothing. The command runs either way: it is never refused. Only in a
+/// Giverny tab (`in_tab`, asked only for a command that escapes), whose
 /// claude runs capped: a claude elsewhere has no cap to leave.
-pub fn guard(command: &str, in_tab: impl FnOnce() -> bool) -> Option<String> {
-    let why = crate::bash_guard::verdict(command)?;
-    if !in_tab() {
+pub fn guard(
+    command: &str,
+    session: Option<&str>,
+    feeds: &Path,
+    in_tab: impl FnOnce() -> bool,
+) -> Option<String> {
+    let found = crate::bash_guard::escapes(command);
+    if found.is_empty() || !in_tab() {
         return None;
     }
-    Some(deny(&why))
+    let said = crate::escapes::remind(feeds, session, &found)?;
+    Some(pre_context(&said))
+}
+
+/// The `PreToolUse` reply letting the call run with `text` added to the
+/// session's context.
+fn pre_context(text: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": text
+        }
+    })
+    .to_string()
+}
+
+/// Leave the session's hook mark ([`crate::escapes::mark_hooked`]) when it
+/// runs in a Giverny tab: the pane marks a session with none.
+fn mark_hooked(feeds: &Path, session: Option<&str>) {
+    if let Some(s) = session
+        && crate::lineage::giverny_var("GIVERNY_TAB_ID").is_some()
+    {
+        crate::escapes::mark_hooked(feeds, s);
+    }
 }
 
 /// A prompt payload's `session_id`, read alone.
@@ -574,6 +621,11 @@ pub fn main() -> i32 {
         let strays = session.as_deref().and_then(|s| {
             crate::strays::between(&feeds, s, manage::now_ms(), &crate::strays::System)
         });
+        // What the sampler found outside its cap (giverny#271).
+        mark_hooked(&feeds, session.as_deref());
+        let escaped = session
+            .as_deref()
+            .and_then(|s| crate::escapes::deliver(&feeds, s));
         // What happened since its last turn, first (giverny#373).
         let away = session
             .as_deref()
@@ -584,6 +636,7 @@ pub fn main() -> i32 {
             name.as_deref(),
             left.as_deref(),
             strays.as_deref(),
+            escaped.as_deref(),
         ];
         if let Some(out) = prompt_reply(&contexts) {
             println!("{out}");
@@ -598,6 +651,10 @@ pub fn main() -> i32 {
             crate::tab_cap::on_session_start(env_file.as_deref());
         }
         let feeds = crate::feed::feed_dir();
+        if start.get("agent_id").is_none() {
+            crate::escapes::prune_hooked(&feeds);
+            mark_hooked(&feeds, text(&start, "session_id").as_deref());
+        }
         let on = crate::names::is_on(&feeds);
         let name = crate::names::start_context(&start, &feeds, on, on && tabs_own());
         // A resume after a reboot or a relaunch hears of it here (giverny#373).
@@ -624,13 +681,25 @@ pub fn main() -> i32 {
         return 0;
     }
     if let Some(pre) = pre_tool(&input) {
-        let capped = (pre.tool == "Bash")
-            .then(|| guard(pre.command.as_deref().unwrap_or_default(), in_giverny_tab))
-            .flatten();
-        let out = capped.or_else(|| {
-            let session = pre.session.as_deref()?;
-            let w = crate::reach_guard::System::new(crate::feed::feed_dir());
+        let feeds = crate::feed::feed_dir();
+        mark_hooked(&feeds, pre.session.as_deref());
+        // Another session's work is refused (giverny#415); leaving the cap
+        // only reminded of (giverny#271), and only for a call that runs.
+        let refused = pre.session.as_deref().and_then(|session| {
+            let w = crate::reach_guard::System::new(feeds.clone());
             reach(&pre, &w, || w.me(session))
+        });
+        let out = refused.or_else(|| {
+            (pre.tool == "Bash")
+                .then(|| {
+                    guard(
+                        pre.command.as_deref().unwrap_or_default(),
+                        pre.session.as_deref(),
+                        &feeds,
+                        in_giverny_tab,
+                    )
+                })
+                .flatten()
         });
         if let Some(out) = out {
             println!("{out}");
@@ -648,6 +717,7 @@ pub fn main() -> i32 {
             away::Call::Tool
         };
         let away = text(&payload, "session_id").and_then(|s| away::on_call(&feeds, &s, now, call));
+        mark_hooked(&feeds, text(&payload, "session_id").as_deref());
         if let Some(out) = run_with(&payload, &feeds, now, in_giverny_tab(), away) {
             println!("{out}");
         }
@@ -726,39 +796,97 @@ mod tests {
     }
 
     #[test]
-    fn a_bash_command_that_leaves_its_cap_is_refused_in_a_tab() {
+    fn a_bash_command_that_leaves_its_cap_runs_with_one_reminder_in_a_tab() {
+        let dir = temp("guard");
         let pre = |cmd: &str| {
             json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash",
                    "tool_input": {"command": cmd, "description": "x"}})
             .to_string()
         };
+        // Refused until giverny#271: now it runs, and the session hears once.
         let cmd = pre_bash(&pre("systemd-run --user --scope make")).unwrap();
         assert_eq!(cmd, "systemd-run --user --scope make");
-        let out = guard(&cmd, || true).unwrap();
+        let out = guard(&cmd, Some("s1"), &dir, || true).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(
-            v["hookSpecificOutput"]["permissionDecisionReason"]
-                .as_str()
-                .unwrap()
-                .contains("giverny-manage run")
+            v["hookSpecificOutput"].get("permissionDecision").is_none(),
+            "{v}"
         );
+        let said = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            said.contains("giverny-manage run") && said.contains("`systemd-run`"),
+            "{said}"
+        );
+        // The second of a kind: nothing.
+        assert_eq!(
+            guard(
+                "systemd-run --user --scope cargo test",
+                Some("s1"),
+                &dir,
+                || true
+            ),
+            None
+        );
+        // A new kind: its own line.
+        let wsl = guard("wsl.exe -e make", Some("s1"), &dir, || true).unwrap();
+        assert!(context_of(&wsl).contains("`wsl.exe`"), "{wsl}");
+        // Mentioning the tool in a file or a heredoc says nothing (giverny#427).
+        for mention in [
+            "gh api repos/o/r/issues -X POST -F body=@/tmp/b.md -f title='systemd-run escapes'",
+            "gh api repos/o/r/issues/1 -X PATCH -F body=@- <<'EOF'\nsystemd-run --user --scope x\nEOF",
+        ] {
+            assert_eq!(
+                guard(mention, Some("s9"), &dir, || panic!("not asked")),
+                None
+            );
+        }
         // Outside a tab there is no cap to leave.
-        assert_eq!(guard(&cmd, || false), None);
+        assert_eq!(guard(&cmd, Some("s2"), &dir, || false), None);
         // A capped run passes, and the tab is not even asked.
         let ok = pre_bash(&pre("giverny-manage run t -- cargo build")).unwrap();
-        assert_eq!(guard(&ok, || panic!("not asked")), None);
+        assert_eq!(guard(&ok, Some("s1"), &dir, || panic!("not asked")), None);
         // Another tool's PreToolUse: nothing to check; a PostToolUse: not ours.
         let read = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
                           "tool_input": {"file_path": "/x"}})
         .to_string();
         assert_eq!(pre_bash(&read).as_deref(), Some(""));
-        assert_eq!(guard("", || true), None);
+        assert_eq!(guard("", Some("s1"), &dir, || true), None);
         assert_eq!(
             pre_bash(&spawn_input("s1", "a1", "systemd-run PreToolUse", true)),
             None
         );
+    }
+
+    fn context_of(out: &str) -> String {
+        let v: Value = serde_json::from_str(out).unwrap();
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn an_escape_the_sampler_found_reaches_the_session_once_on_its_next_call() {
+        let dir = temp("escaped");
+        let f = crate::escapes::Found {
+            pid: 4242,
+            start: 7,
+            cmd: "cargo build --release".into(),
+            cgroup: "run-u7.scope".into(),
+            seen_ms: 1,
+        };
+        crate::escapes::record(&dir, &[("s1".to_string(), f)]);
+        let call = json!({"session_id": "s1", "hook_event_name": "PostToolUse",
+                          "tool_name": "Bash", "tool_input": {"command": "ls"}});
+        let out = run(&call, &dir, 10, true).unwrap();
+        assert!(
+            context_of(&out).contains("pid 4242 `cargo build --release`"),
+            "{out}"
+        );
+        assert_eq!(run(&call, &dir, 20, true), None);
     }
 
     /// giverny#415: the pre-tool hook refuses a reach into another

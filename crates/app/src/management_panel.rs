@@ -180,6 +180,33 @@ struct View {
     /// The rows whose agents' own agents are folded away under them
     /// (giverny#464), by [`fold_ident`]: kept for as long as the tab is.
     folded: HashSet<String>,
+    /// The session this view first saw, and when: a session's hook mark
+    /// is looked for only after [`HOOKLESS_GRACE`].
+    since: Option<(String, Instant)>,
+    /// No Giverny plugin hook ever ran in the session (giverny#271): the
+    /// pane says so ([`HOOKLESS`]). Looked up with the feed.
+    hookless: bool,
+}
+
+/// How long a session may run before its missing hook mark is shown: its
+/// `SessionStart` hook writes it, but the pane may see the session first.
+const HOOKLESS_GRACE: Duration = Duration::from_secs(20);
+
+/// The pane's mark for a session no Giverny plugin hook ran in
+/// ([`giverny_claude::escapes::hooked`], giverny#271).
+pub const HOOKLESS: &str = "no guard: no Giverny plugin hook ran in this session (plugin off, \
+     or the claude started before it), so it hears no cap reminders; the memory cap still holds";
+
+/// The table's footer with the hookless mark, when the session has it,
+/// put first.
+fn with_hookless(footer: Option<String>, hookless: bool) -> Option<String> {
+    if !hookless {
+        return footer;
+    }
+    Some(match footer {
+        Some(f) => format!("{HOOKLESS} · {f}"),
+        None => HOOKLESS.to_string(),
+    })
 }
 
 /// The newly done rows' frames breathing together (giverny#394): which rows
@@ -286,6 +313,14 @@ impl View {
             })
         });
         self.feed_now = session.and_then(|_| self.feed.poll_any(&dir, &ids).cloned());
+        if self.since.as_ref().map(|s| s.0.as_str()) != session {
+            self.since = session.map(|s| (s.to_string(), Instant::now()));
+        }
+        self.hookless = self
+            .since
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= HOOKLESS_GRACE)
+            && !giverny_claude::escapes::hooked(&dir, &ids);
         self.etas_now = session
             .map(|_| self.etas.poll_any(&dir, &ids).clone())
             .unwrap_or_default();
@@ -2783,7 +2818,7 @@ pub fn show(
     if std::mem::take(&mut view.logs_due) {
         poll_logs(&mut view.logs, tracker.rows());
     }
-    let table = build_with(
+    let mut table = build_with(
         feed,
         tracker.rows(),
         now,
@@ -2793,6 +2828,7 @@ pub fn show(
         drawn,
         &view.folded,
     );
+    table.footer = with_hookless(table.footer.take(), view.hookless);
     if table.is_empty() {
         return (None, None);
     }
@@ -6654,6 +6690,21 @@ mod tests {
         assert_eq!(
             only(r#"["cpu","ram"]"#),
             "queued for CPU, 3G behind fold146"
+        );
+    }
+
+    #[test]
+    fn a_session_no_plugin_hook_ran_in_is_marked_first_in_the_footer() {
+        assert_eq!(with_hookless(None, false), None);
+        assert_eq!(
+            with_hookless(Some("s 3".into()), false).as_deref(),
+            Some("s 3")
+        );
+        assert_eq!(with_hookless(None, true).as_deref(), Some(HOOKLESS));
+        let both = with_hookless(Some("s 3".into()), true).unwrap();
+        assert!(
+            both.starts_with("no guard: ") && both.ends_with(" · s 3"),
+            "{both}"
         );
     }
 

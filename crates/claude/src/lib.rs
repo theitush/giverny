@@ -10,6 +10,7 @@ pub mod attach;
 pub mod away;
 pub mod bash_guard;
 pub mod continuation;
+pub mod escapes;
 pub mod feed;
 pub mod hooks;
 pub mod jobs;

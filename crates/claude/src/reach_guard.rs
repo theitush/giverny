@@ -117,6 +117,11 @@ fn text(cmd: &str, depth: usize, st: &mut State, out: &mut Vec<Reach>) {
     }
     for seg in &parsed.segments {
         words(&seg.words, depth, st, out);
+        // A heredoc's lines are read as commands, as before the split kept
+        // them apart (giverny#427 is the cap guard's, not this one's).
+        if let Some(body) = &seg.heredoc {
+            text(body, depth + 1, st, out);
+        }
     }
 }
 
@@ -1612,6 +1617,11 @@ pub(crate) mod tests {
         assert_eq!(reaches("kill -9 12 34", cwd), [Reach::Pids(vec![12, 34])]);
         assert_eq!(reaches("kill -- -12", cwd), [Reach::Pids(vec![-12])]);
         assert_eq!(reaches("kill -l", cwd), []);
+        // A heredoc's lines are read as before giverny#427 split them off.
+        assert_eq!(
+            reaches("bash <<'EOF'\nkill 42\nEOF", cwd),
+            [Reach::Pids(vec![42])]
+        );
         assert_eq!(
             reaches("pkill -9 -fx 'node a'", cwd),
             [Reach::Match(Pattern {
