@@ -1,6 +1,6 @@
 # Architecture
 
-Cargo workspace, four crates:
+Cargo workspace, five crates:
 
 ```
 crates/
@@ -8,8 +8,9 @@ crates/
 ├─ term/     terminal engine: PTY + forked event loop + byte tee +
 │            alacritty_terminal Term + glyph-atlas renderer + input encoders
 ├─ core/     tabs/categories model, persistent state, git info, paths
-└─ claude/   Claude Code integration: profiles, session registry, hook
+├─ claude/   Claude Code integration: profiles, session registry, hook
              relay/installer, usage cache parser
+└─ codex/    Codex hook installer, bounded app-server RPC, usage windows/cache
 ```
 
 ## The terminal engine (`crates/term`)
@@ -44,9 +45,15 @@ sanitized bracketed paste as `Ctrl+V` — a filename is untrusted input.
 
 ### Bidirectional text
 
-The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` reorders each row that contains RTL script, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.
+The grid stores logical order, always: it is what the program wrote and what it expects to read back, and selection, search and the resume machinery all index it. Display is where direction is applied — `render/bidi.rs` orders the rows of a screen that has RTL script on it, and the mesh draws cells at their visual columns. This is VTE's approach, and the reason Hebrew looks right in GNOME Terminal.
 
-Rows with no RTL character skip the algorithm entirely, so the cost for ordinary output is one range test per cell. Mouse hit-testing and selection still work in logical columns, so a click inside an RTL run currently lands on the wrong cell — the mapping exists (`logical_to_visual`) and inverting it is the next step.
+A row runs in the direction of its first letter (Unicode's rule P2, a browser's `dir="auto"`), and a right-to-left row is mirrored across the whole width, so a Hebrew answer sits against the right edge with Claude's `⏺` and indent on the right, and its words, English terms and full stops in reading order. Left to right for every row would put the runs of a mixed sentence in the wrong order. The exception is a row that carries on the paragraph above it, which takes that paragraph's direction: Claude Code wraps its own text, so the terminal sees no soft wrap, and the second row of a Hebrew sentence can start with an English word. A row carries on the one above when it starts at that row's text column, opens no bullet or message of its own, and its first word would not have fitted at the end of the row above. Lines that merely follow each other, like code, fail the last test. Box drawing is a wall: the text between each pair is ordered on its own and the walls stay put, so a table whose rows run in different directions keeps its columns.
+
+Screens with no RTL character skip all of it, so the cost for ordinary output is one range test per cell. Each snapshot carries the orders of the rows it moved, and the widget inverts them for the pointer: clicks, selection, mouse reporting and link hover all work in logical cells.
+
+egui, which draws the rail and the prompt bar, has no bidi pass, but it shapes each run of one font with HarfBuzz's guess at its direction, so it turns a Hebrew word round by itself and leaves a sentence's words in the wrong order. `bidi::egui_line` orders the line and then puts each RTL run back in writing order for egui to finish; a test pins egui's half of that.
+
+Hebrew glyphs come from Cascadia Mono, bundled in `crates/term/fonts`: monospace Hebrew designed for a coding font, where most systems have only proportional faces or Miriam Mono. They serve the Hebrew block and nothing else, so no other character changes face.
 
 ## Persistence (`crates/core`)
 
@@ -66,6 +73,29 @@ Hook-set attention states are stickier than registry state; done-markers clear w
 **Resume**: tabs persist `(claude_session, claude_config_dir)`. Restore injects `CLAUDE_CONFIG_DIR=… command claude --resume <uuid>` after a settle delay (`command` bypasses shell wrapper functions), guarded by a registry check so a session live in another terminal is never double-resumed (double-resume interleaves one transcript — documented Claude Code behavior).
 
 **Usage**: parsed from `.claude.json → cachedUsageUtilization.limits[]` only (kind `session`/`weekly_all`/`weekly_scoped`, scoped model names like *Fable*, server-side `severity`). Windows whose `resets_at` has passed render 0% (verified server quirk: lapsed windows keep stale percentages). No network, no tokens — and deliberately no `/api/oauth/usage` polling (unsupported endpoint, ToS-exposed) and **never** an OAuth refresh (refresh tokens are single-use; a third-party refresh force-logs-out Claude Code). Refreshing means asking Claude Code to do it: `claude -p /usage`, run wherever that account's Claude Code lives — inside the distribution, for an account in WSL.
+
+## Codex integration
+
+`crates/codex` isolates the documented Codex interfaces. App-side
+`codex_watch` tracks per-tab state and runs usage and restore metadata requests
+on background workers. The existing relay transport carries an explicit provider;
+legacy messages still default to Claude. Shared presentation states live in core,
+while Claude registry merging and account logic remain provider-specific.
+
+Codex hooks carry session ID, tab ID, home, timestamp and WSL distribution.
+They only observe; they return no model context or permission decision. User hook
+trust remains Codex's responsibility. The runtime rejects stale session events,
+ignores subagent events and never associates conversations by cwd alone.
+
+A bounded stdio JSON-RPC helper initializes with Giverny's identity and reads
+account limits without starting turns. It owns authentication, including any
+network access. Giverny persists only returned allowance windows in its own
+cache. Cancellation kills and reaps owned helpers; no user daemon is stopped.
+
+Restoration reads metadata without resuming it, then reconnects the normal CLI
+to the saved conversation. Loaded daemon threads do not block restoration;
+the prompt mode offers an explicit resume action. Persistence adds an optional provider-tagged
+session reference while retaining legacy Claude fields and state version.
 
 ## Threading
 

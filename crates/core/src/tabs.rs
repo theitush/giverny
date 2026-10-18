@@ -41,6 +41,9 @@ pub struct Tab {
     /// resume target after a restart.
     #[serde(default)]
     pub claude_session: Option<String>,
+    /// Provider-tagged sessions; legacy Claude fields remain readable.
+    #[serde(default)]
+    pub agent_session: Option<crate::agent::AgentSession>,
     /// The `CLAUDE_CONFIG_DIR` that session ran under (multi-account).
     #[serde(default)]
     pub claude_config_dir: Option<PathBuf>,
@@ -182,6 +185,7 @@ impl Workspace {
                 cwd: None,
                 foreground: None,
                 claude_session: None,
+                agent_session: None,
                 claude_config_dir: None,
                 git_branch: None,
                 git_repo: None,
@@ -199,8 +203,9 @@ impl Workspace {
         id
     }
 
-    /// Close a tab; picks a sensible new active tab (next in rail order,
-    /// else previous, else none).
+    /// Close a tab. Closing the active one goes back to the tab used before
+    /// it — the one Ctrl+Tab would switch to — and only when there is none
+    /// to the next in rail order, else the previous, else none.
     pub fn close_tab(&mut self, id: TabId) {
         let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
             return;
@@ -208,10 +213,16 @@ impl Workspace {
         self.tabs.remove(pos);
         if self.active == Some(id) {
             self.active = self
-                .tabs
-                .get(pos)
-                .or_else(|| self.tabs.get(pos.wrapping_sub(1)))
-                .map(|t| t.id);
+                .recent
+                .iter()
+                .copied()
+                .find(|&x| self.tab(x).is_some())
+                .or_else(|| {
+                    self.tabs
+                        .get(pos)
+                        .or_else(|| self.tabs.get(pos.wrapping_sub(1)))
+                        .map(|t| t.id)
+                });
         }
         // A closed tab is nobody's "previous", and the tab that replaced it
         // is the current one rather than a step back from it.
@@ -405,13 +416,78 @@ mod tests {
 
         ws.set_active(b);
         ws.close_tab(b);
-        assert_eq!(ws.active, Some(c), "next in rail order");
+        assert_eq!(ws.active, Some(c), "back to the tab used before it");
 
         ws.close_tab(c);
-        assert_eq!(ws.active, Some(a), "previous when no next");
+        assert_eq!(ws.active, Some(a), "back to the tab used before it");
 
         ws.close_tab(a);
         assert_eq!(ws.active, None);
+    }
+
+    /// Closing the current tab goes back to where you were before it, not
+    /// to its neighbour in the rail (giverny#247).
+    #[test]
+    fn closing_the_active_tab_goes_back_to_the_last_one_used() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let c = ws.add_tab(cat);
+        ws.set_active(a);
+        ws.set_active(c);
+        ws.close_tab(c);
+        assert_eq!(ws.active, Some(a), "a was used last, not b next to it");
+        assert_eq!(ws.recent_order(), vec![a, b], "a left the stack");
+
+        // Again from the middle of the rail: the neighbours lose to recency.
+        let d = ws.add_tab(cat);
+        ws.set_active(b);
+        ws.set_active(d);
+        ws.set_active(a);
+        // Rail: a b d; used: a, d, b.
+        ws.close_tab(a);
+        assert_eq!(ws.active, Some(d));
+        ws.close_tab(d);
+        assert_eq!(ws.active, Some(b));
+        assert_eq!(ws.recent_order(), vec![b]);
+    }
+
+    /// Tabs nobody has used since a restore have no recency; rail order is
+    /// the fallback, next first and then previous.
+    #[test]
+    fn closing_with_no_recency_falls_back_to_rail_order() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let c = ws.add_tab(cat);
+        ws.recent.clear();
+        ws.active = Some(b);
+        ws.close_tab(b);
+        assert_eq!(ws.active, Some(c), "next in rail order");
+
+        ws.recent.clear();
+        ws.close_tab(c);
+        assert_eq!(ws.active, Some(a), "previous when no next");
+    }
+
+    /// Closing a tab that is not the active one leaves the selection alone
+    /// and only drops it from the stack.
+    #[test]
+    fn closing_another_tab_keeps_the_active_one() {
+        let mut ws = Workspace::default();
+        let cat = ws.categories[0].id;
+        let a = ws.add_tab(cat);
+        let b = ws.add_tab(cat);
+        let c = ws.add_tab(cat);
+        ws.close_tab(b);
+        assert_eq!(ws.active, Some(c));
+        assert!(!ws.recent.contains(&b), "b left the stack");
+        assert_eq!(ws.recent_order(), vec![c, a]);
+        ws.close_tab(c);
+        assert_eq!(ws.active, Some(a));
+        assert_eq!(ws.recent_order(), vec![a]);
     }
 
     /// The Ctrl+Tab order: where you were, not where the tab sits in the rail.
@@ -549,6 +625,17 @@ mod tests {
             ws.tab(id).unwrap().display_title(&titles),
             "yoz@box:~/Dev/bobo"
         );
+
+        // Nor is a Claude Code glyph you typed into a name.
+        let titles = crate::config::TitlesConfig {
+            strip_claude_glyph: true,
+            ..titles
+        };
+        ws.tab_mut(id).unwrap().auto_title = "✳ Fix the parser".into();
+        ws.tab_mut(id).unwrap().custom_title = None;
+        assert_eq!(ws.tab(id).unwrap().display_title(&titles), "Fix the parser");
+        ws.tab_mut(id).unwrap().custom_title = Some("✳ mine".into());
+        assert_eq!(ws.tab(id).unwrap().display_title(&titles), "✳ mine");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, RichText};
 use giverny_claude::registry::PastSession;
 use giverny_core::tabs::TabId;
+use giverny_term::render::bidi::egui_line;
 
 use crate::{Action, App};
 
@@ -89,8 +90,13 @@ pub fn palette_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                 .as_deref()
                 .map(|p| giverny_core::short_path(p, 28))
                 .unwrap_or_default();
-            let label = format!("{cat} › {}   {cwd}", t.display_title(&app.cfg.titles));
-            fuzzy_score(&st.query, &label).map(|s| (t.id, label, s))
+            let title = t.display_title(&app.cfg.titles);
+            let label = format!("{cat} › {title}   {cwd}");
+            fuzzy_score(&st.query, &label).map(|s| {
+                // Matched as written, drawn as read.
+                let shown = format!("{cat} › {}   {cwd}", egui_line(&title, None));
+                (t.id, shown, s)
+            })
         })
         .collect();
     if !st.query.is_empty() {
@@ -203,7 +209,8 @@ pub fn sessions_ui(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
                     .map(|p| format!("@{}", p.name))
                     .unwrap_or_default();
                 let suffix = if s.live { "  · live" } else { "" };
-                let label = format!("{:<44} {age:>4} {account}{suffix}", truncate(&s.title, 44));
+                let title = egui_line(&truncate(&s.title, 44), None).into_owned();
+                let label = format!("{title:<44} {age:>4} {account}{suffix}");
                 let text = RichText::new(label)
                     .font(FontId::monospace(11.5))
                     .color(if s.live {

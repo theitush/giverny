@@ -310,6 +310,54 @@ pub fn clipboard_chord(cut: bool, shift: bool, macos: bool) -> ClipboardChord {
     }
 }
 
+/// Spots a paste chord that found no text in the clipboard: the cue to look
+/// for copied files or an image there instead.
+///
+/// egui-winit swallows the paste chord (Ctrl+V, Cmd+V on macOS, the Paste
+/// key): it reads the clipboard's *text*, pushes a `Paste` event when there
+/// is some, and returns without emitting the key either way. A screenshot in
+/// the clipboard has no text, so the keystroke vanished. What is left of it
+/// is the key's *release*, which egui-winit does pass on: a V released that
+/// was never seen pressed was a paste chord, and one with no `Paste` since
+/// was a paste of nothing textual. Text always wins: a clipboard with both
+/// pastes its text, as before (and Finder's files over their names, as
+/// [`copied_files_text`] has it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasteChord {
+    /// A V (or Paste key) press reached us and has not been released: its
+    /// release is ordinary typing, not the tail of a chord.
+    down: bool,
+    /// A text paste arrived since the last release: the chord found text.
+    pasted_text: bool,
+}
+
+impl PasteChord {
+    /// Feed one input event; true when it ends a paste chord that found no
+    /// text, so the clipboard's image (if any) is what to paste.
+    pub fn on_event(&mut self, event: &egui::Event) -> bool {
+        match event {
+            egui::Event::Paste(_) => self.pasted_text = true,
+            egui::Event::Key {
+                key: Key::V | Key::Paste,
+                pressed,
+                ..
+            } => {
+                if *pressed {
+                    self.down = true;
+                } else {
+                    let chord = !self.down;
+                    let found_text = self.pasted_text;
+                    self.down = false;
+                    self.pasted_text = false;
+                    return chord && !found_text;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 /// One dropped path as a shell word: quoted only when it has to be.
 ///
 /// Dropping a file types its path, the way every other terminal behaves, so
@@ -326,7 +374,7 @@ pub fn quote_path(path: &str) -> String {
     // accept that a literal `"` in a filename is not worth chasing.
     #[cfg(windows)]
     {
-        return format!("\"{}\"", path.replace('"', ""));
+        format!("\"{}\"", path.replace('"', ""))
     }
     #[cfg(not(windows))]
     {
@@ -347,6 +395,23 @@ pub fn dropped_paths_text(paths: &[String]) -> String {
         .join(" ");
     out.push(' ');
     out
+}
+
+/// Files copied in Finder, as the text a paste should type: their paths,
+/// exactly as dropping them would. Finder also puts each file's display name
+/// on the clipboard as plain text, and that is all egui hands over, so
+/// pasting a copied screenshot typed `Screenshot … at 9.53.01` (no folder, no
+/// extension) where Claude needed a path to attach the image.
+#[cfg(target_os = "macos")]
+pub fn copied_files_text() -> Option<String> {
+    let paths = arboard::Clipboard::new().ok()?.get().file_list().ok()?;
+    let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    Some(dropped_paths_text(&paths)).filter(|t| !t.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copied_files_text() -> Option<String> {
+    None
 }
 
 /// Wrap pasted text for the terminal: bracketed when the mode is on
@@ -482,6 +547,73 @@ mod tests {
         assert_eq!(out, b"\x1b[200~a[31mb\rc\x1b[201~");
         let plain = encode_paste("x\ny", TermMode::empty());
         assert_eq!(plain, b"x\ry");
+    }
+
+    fn v(pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }
+    }
+
+    #[test]
+    fn paste_chord_without_text_asks_for_an_image() {
+        // Ctrl+V on an image-only clipboard: the press was swallowed and
+        // no text came, so only the release is seen.
+        let mut chord = PasteChord::default();
+        assert!(
+            chord.on_event(&v(false)),
+            "a release never pressed: a chord"
+        );
+
+        // Ctrl+V with text: the text wins, and nothing more is asked.
+        let mut chord = PasteChord::default();
+        assert!(!chord.on_event(&egui::Event::Paste("hi".into())));
+        assert!(!chord.on_event(&v(false)), "text came: no image paste");
+        // ...and that release resets it, so the next empty chord asks again.
+        assert!(chord.on_event(&v(false)));
+
+        // A V typed as a letter is pressed and released: not a chord.
+        let mut chord = PasteChord::default();
+        assert!(!chord.on_event(&v(true)));
+        assert!(!chord.on_event(&egui::Event::Text("v".into())));
+        assert!(!chord.on_event(&v(false)));
+
+        // The Paste key works the same way; other keys are no part of it.
+        let mut chord = PasteChord::default();
+        let paste_key = egui::Event::Key {
+            key: Key::Paste,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        assert!(chord.on_event(&paste_key));
+        let c = egui::Event::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        assert!(!chord.on_event(&c), "a copy's release is no paste");
+    }
+
+    #[test]
+    fn a_pasted_image_path_is_a_bracketed_paste() {
+        // The image's file goes in as a drop's would: a shell word, then a
+        // space, inside the brackets Claude Code reads a paste by.
+        let text = dropped_paths_text(&["/run/user/1000/giverny-paste-7/paste-1.png".into()]);
+        let out = encode_paste(&text, TermMode::BRACKETED_PASTE);
+        assert_eq!(
+            out,
+            b"\x1b[200~/run/user/1000/giverny-paste-7/paste-1.png \x1b[201~"
+        );
+        // A plain shell without bracketed paste gets the bare path.
+        assert_eq!(encode_paste(&text, TermMode::empty()), text.as_bytes());
     }
 
     #[test]

@@ -14,6 +14,7 @@ path = "src/main.rs"
 giverny-term.workspace = true
 giverny-core.workspace = true
 giverny-claude.workspace = true
+giverny-codex.workspace = true
 sysinfo.workspace = true
 eframe.workspace = true
 egui.workspace = true
@@ -32,6 +33,14 @@ raw-window-handle = "0.6"
 # Blocks on wgpu's adapter request before the window exists (`pick_renderer`).
 # The version eframe already uses, so no new tree.
 pollster = "0.4"
+# Pasting a screenshot (src/paste_image.rs): the clipboard's image through
+# the crate and feature eframe's clipboard already uses, the PNG it is
+# written as, and the Windows clipboard's PNG arriving base64 from WSL. All
+# versions already in the tree, so no new one.
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+tempfile = "3"
+png = "0.18"
+base64 = "0.22"
 
 # Wayland drag-and-drop, which winit 0.30 does not implement. It arrives
 # through the clipboard crate eframe already uses — patched in the workspace

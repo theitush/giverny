@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/term", "crates/core", "crates/claude"]
+members = ["crates/app", "crates/term", "crates/core", "crates/claude", "crates/codex"]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.7.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -12,6 +12,7 @@ rust-version = "1.90"
 giverny-term = { path = "crates/term" }
 giverny-core = { path = "crates/core" }
 giverny-claude = { path = "crates/claude" }
+giverny-codex = { path = "crates/codex" }
 
 # terminal engine
 alacritty_terminal = "0.26"

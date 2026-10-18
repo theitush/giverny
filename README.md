@@ -2,101 +2,83 @@
 
 # Giverny
 
-**A native GPU terminal built around Claude Code.** Categorized, persistent tabs on a left rail; live Claude activity on every tab; usage meters for all your Claude accounts. *Where your Claudes live.*
+A GPU-rendered terminal for running Claude Code and Codex sessions side by side. Tabs sit in categories on a left rail, each tab shows what its agent is doing, and every account's rate limits are visible in the corner.
 
-![Giverny: categorised tabs with live Claude state and multi-account usage meters](assets/demo.gif)
+![Giverny: categorized tabs with live Claude state and multi-account usage meters](assets/demo.gif)
 
-*One tab is working (spinner), one finished while you were away (✓), one is waiting on you (⚑) — and every account's limits are in the corner.*
-
-## Why
-
-Running many concurrent Claude Code sessions across projects — and across multiple subscription accounts — in ordinary terminals means losing track of which session is working, which is waiting on *you*, and how close each account is to its rate limits. Giverny is a real terminal emulator (Rust, GPU-rendered, `alacritty_terminal` core, no web engine) whose entire chrome is built for that workflow.
+Written in Rust on `alacritty_terminal`, with no web engine.
 
 ## Features
 
-- **A real terminal first.** Kitty keyboard protocol (Shift+Enter newline in Claude works out of the box — no `/terminal-setup`), synchronized output (flicker-free Claude redraws), bracketed paste with escape-sequence sanitizing, SGR mouse reporting, selection with auto-copy (double-click word, triple-click line), OSC 52 (store capped, clipboard *reads* denied), truecolor + glyph atlas rendering with integer-pixel cell metrics.
-- **Vertical, categorized tabs.** Categories with Monet-palette colors (right-click to rename, recolor, assign an account, delete); drag tabs to reorder or move them between categories; tabs show live cwd (OSC 7 + process fallback), git branch (worktree-aware), and the Claude account they run under. A category-colored strip above the pane always tells you where you are.
-- **Everything persists.** Tabs, order, categories, titles, working directories, scrollback (colors intact), window size and rail width survive app restarts and reboots. Shells respawn lazily on first focus, with restored scrollback above a `── restored ──` divider. A tab that was running a full-screen monitor (btop, k9s, lazygit…) starts it again; anything not on the `restore_apps` list is remembered but never re-run, since replaying a last command could deploy or delete something.
-- **Live Claude states.** Braille spinner while Claude works, a pulsing amber flag when it *needs you* (permission prompts, questions, agent input) with a desktop notification, a quiet ✓ when it finished in a background tab. Driven by Claude Code hooks (one-click install, non-destructive, reversible) with a zero-config fallback that reads Claude's own live session registry.
-- **Background agents are visible.** Agents running without a tab — `/fork`ed sessions, `run_in_background` work — appear in the rail with their state and what they are doing; click one to open a tab attached to its conversation, directory and account.
-- **Conversations resume.** Each tab remembers its Claude session; on restore, Giverny re-runs `claude --resume <id>` in the right directory *and* the right account, guarded against double-resuming a session that's already live elsewhere.
-- **Multi-account, at a glance.** Profiles are `CLAUDE_CONFIG_DIR`s (auto-discovered, including the `CCTOP_CONFIG_DIRS` convention). Assign an account per category; every tab shows its account. The rail's bottom panel shows each account's limit bars — 5-hour window, weekly, and per-model buckets (e.g. *Fable*) — with reset countdowns and severity colors. Installing hooks also adds a compact Claude statusline that pushes live usage back to Giverny (official `rate_limits` data, no API calls); values it refreshes are marked with a dot, since Claude's own on-disk cache can be days stale for idle accounts.
-- **Right-to-left text.** Hebrew and Arabic display correctly: rows containing RTL script are reordered with the Unicode Bidi Algorithm, while the grid keeps logical order so programs read back what they wrote. Selecting inside an RTL run is not mapped yet.
-- **Images.** The kitty graphics protocol, so `timg`, file managers, plot output and anything else that draws pixels works — PNG and raw RGB/RGBA, placed on the grid and scrolling with the text.
-- **Drop files in.** Dragging files onto a tab types their quoted paths — how you hand Claude an image. On Wayland the drop lands in the tab under the pointer, which highlights as you pass over it; on X11 it lands in the active tab, because winit reports no drag position there.
-- **Settings that are still a config file.** `Ctrl+,` opens a settings screen over the terminal, with the rail still visible; every row shows its TOML key, so you can make the next change by hand or over SSH. Edits are written back to `~/.config/giverny/config.toml` with your comments intact, and the file stays the source of truth — see [all options](docs/options.md).
-- **`giverny doctor`** prints exactly what the app sees: profiles, per-profile hook and statusline status, usage freshness, and every live Claude session — the first thing to run if states look wrong.
-
-### Privacy & security
-
-Giverny **never contacts Anthropic and never reads credential files**. Usage meters come from `.claude.json` — a cache Claude Code itself writes; session states come from hook events and Claude Code's local session registry. The only network request Giverny can make is the daily update check against GitHub's releases API, which sends nothing but a User-Agent and can be switched off; with `[update] check = false` it makes no requests at all. Hook installation edits `settings.json` only after showing what it adds, keeps your existing hooks, and writes a `.giverny-bak` backup. Pasted text is stripped of raw escape bytes before it reaches the PTY, and Giverny's in-band control channel is nonce-authenticated so terminal output can't forge Claude states.
+- **Claude state per tab.** A spinner while Claude works, a flag and desktop notification when it needs input, a ✓ when a background tab finishes. Driven by Claude Code hooks, with a zero-config fallback that reads Claude's local session registry.
+- **Codex support.** Type `codex` normally in a tab. Codex is detected automatically, with allowance meters and automatic or manual refresh. Install the observer hooks from Settings → codex and trust them with `/hooks` for live state, notifications and conversation restore. Disable automatic detection in Settings if unwanted. See [Codex setup](docs/codex-integration.md).
+- **Multiple Claude accounts.** Each `CLAUDE_CONFIG_DIR` is an account, discovered automatically. Assign one per category; the rail shows 5-hour, weekly and per-model limits with reset times.
+- **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
+- **Background agents.** Forked and `run_in_background` sessions appear in the rail. Click one to attach a tab.
+- **Rail views.** Group tabs by your own categories or by git repository.
+- **Terminal support.** Kitty keyboard protocol (Shift+Enter works in Claude without `/terminal-setup`), kitty graphics, synchronized output, OSC 7 and 52, sanitized bracketed paste, SGR mouse, file drag-and-drop.
+- **Right-to-left text.** Hebrew and Arabic render in reading order. Cascadia Mono Hebrew is bundled.
+- **Plain config.** `~/.config/giverny/config.toml` hot-reloads. The `Ctrl+,` settings screen writes back to it with comments preserved. See [all options](docs/options.md).
+- **`giverny doctor`** prints accounts, hook status, usage freshness and live sessions.
 
 ## Install
 
-**Linux / macOS**
+Linux / macOS:
 
 ```sh
 curl -fsSL https://github.com/y0av/giverny/releases/latest/download/install.sh | sh
 ```
 
-**Windows**
+Windows:
 
 ```powershell
 irm https://github.com/y0av/giverny/releases/latest/download/install.ps1 | iex
 ```
 
-**From source** (Rust 1.90+):
+From source (Rust 1.90+):
 
 ```sh
 git clone https://github.com/y0av/giverny && cd giverny
 cargo install --path crates/app
-giverny install-desktop     # launcher entry + icons; on Wayland this is what puts the icon in the dock
+giverny install-desktop
 ```
 
-On Linux `install-desktop` also writes a systemd drop-in that sets `OOMPolicy=continue` on Giverny's scope. Without it a scope stops the moment the kernel OOM-kills anything inside it, so one tab's dev server eating the machine takes every tab with it. The one-line installer above runs the command for you; `giverny doctor` prints the policy in force.
+`install-desktop` adds the launcher entry and icons. On Linux it also sets `OOMPolicy=continue` on Giverny's systemd scope, so an out-of-memory kill in one tab doesn't close the rest. The install scripts run it for you.
 
-Giverny checks GitHub once a day for a newer release and offers a one-click update in the rail; clicking it opens a tab and runs the install command above, so you watch exactly what happens. `giverny update` does the same from a shell, and `[update] check = false` in `~/.config/giverny/config.toml` (or `GIVERNY_NO_UPDATE=1`) turns it off entirely. The config file is written with comments on first run and hot-reloads on save.
+Giverny checks GitHub daily for a new release and offers a one-click update; `giverny update` does the same from a shell. Disable the check with `[update] check = false` or `GIVERNY_NO_UPDATE=1`.
 
-Linux (Wayland/X11) is tier 1 and daily-driven. macOS and Windows compile in CI and their platform-specific paths are implemented (ConPTY, WSL/PowerShell shell resolution, a spool-file hook relay where unix sockets don't exist) but neither has had a real pass on hardware — reports welcome.
+### Platform support
 
-On Windows, an account that lives inside WSL is treated as an account: it is discovered there, its usage is refreshed by running `claude` inside the distribution, and its hooks call back out to Giverny. Tabs for it open in the distribution it belongs to. `behavior.windows_shell` decides what everything else opens, and `giverny doctor` prints what was found in each distribution.
+Linux (Wayland and X11) is the primary platform. macOS and Windows build in CI but haven't been tested on real hardware; reports are welcome.
 
-Inside WSL itself (WSLg), Giverny draws on the GPU through Mesa's d3d12 driver, which needs a recent Windows GPU driver: an older one opens every window black. Giverny checks first and falls back to drawing on the CPU, which works but costs most of a core. If the log says to update the Windows GPU driver, do that from the GPU vendor's site or Windows Update. `GIVERNY_GPU=software` skips the GPU.
+On Windows, Claude accounts inside WSL are discovered and their tabs open in the matching distribution. Under WSLg, an outdated Windows GPU driver makes Giverny fall back to CPU rendering; `GIVERNY_GPU=software` forces that mode.
 
-## The rail
+## Privacy
 
-Two ways to read it, switched at the top and remembered between launches:
+Giverny never contacts Anthropic and never reads credential files. Usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. Giverny’s direct network request is the update check, which sends nothing but a User-Agent. When Codex is detected (unless disabled in Settings), Giverny also asks an official local Codex helper to fetch allowance data; that helper contacts OpenAI using Codex’s existing sign-in. Giverny does not read Codex credentials or manage authentication.
 
-- **categories** — the ones you made, in the order you put them in. Drag to
-  rearrange, right-click to rename, recolour, or pin an account to one.
-- **repos** — wherever the tabs actually are, grouped by git repository and
-  named after it. A repository keeps the same colour every launch; tabs in no
-  repository are gathered at the end. The path under each tab shows where in
-  the repository it is, since the repository is already on the header.
+Hook installation shows what it adds, keeps your existing hooks and writes a `.giverny-bak` backup. Pasted text is stripped of escape bytes, and the in-band control channel is nonce-authenticated so terminal output can't fake Claude states. Details in [Claude Code integration](docs/claude-integration.md).
 
 ## Keys
 
 | Chord | Action |
 |---|---|
-| `Ctrl+Shift+T` / `Ctrl+Shift+W` | new tab (active category) / close tab |
-| `Ctrl+Shift+A` | jump to the next tab where Claude needs you |
-| `Ctrl+Shift+P` | fuzzy tab palette |
-| `Ctrl+,` / `F1` | settings / this list of keys |
-| `Ctrl+Shift+F` | search scrollback (Enter / Shift+Enter to step) |
-| `Ctrl+Shift+E` | label every path/URL on screen — letter opens, Shift+letter types it |
-| `Ctrl`+hover / click | underline and open a path or URL |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | back / forward through recently used tabs (hold `Ctrl` to keep going) |
-| `Ctrl+PageUp` / `Ctrl+PageDown` | previous / next tab |
-| `F2` or double-click | rename tab |
-| `Ctrl` `+` / `−` / `0` | font size (persists) |
-| `Ctrl+Shift+C` | copy selection |
-| middle-click on a tab | close it |
-| right-click tab / category | full menu (move, color, account, …) |
+| `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab / close tab |
+| `Ctrl+Shift+A` | Next tab where an agent needs you |
+| `Ctrl+Shift+P` | Tab palette |
+| `Ctrl+Shift+F` | Search scrollback |
+| `Ctrl+Shift+E` | Label paths and URLs on screen for quick open |
+| `Ctrl+Tab` | Recently used tabs |
+| `F2` | Rename tab |
+| `Ctrl+,` | Settings |
+| `F1` | Full key list |
 
 ## Docs
 
-[Architecture](docs/architecture.md) · [All options](docs/options.md) · [What it touches in Claude Code](docs/claude-integration.md) · [Changelog](CHANGELOG.md)
+[Architecture](docs/architecture.md) · [Options](docs/options.md) · [Claude Code integration](docs/claude-integration.md) · [Codex integration](docs/codex-integration.md) · [Changelog](CHANGELOG.md)
 
 ## License
 
 MIT OR Apache-2.0, at your option.
+
+The bundled Cascadia Mono fonts in `crates/term/fonts` are © Microsoft, licensed under the SIL Open Font License 1.1 (`CascadiaMono-OFL.txt`).

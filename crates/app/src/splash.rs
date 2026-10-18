@@ -305,11 +305,13 @@ pub fn render(welcome: &Welcome) -> String {
 
 /// The changelog's bullets for every version after `from`, up to this one.
 ///
-/// One line each: the first sentence is what a bullet leads with, and the
-/// rest is for whoever opens the file.
+/// Each bullet in full, wrapped to the width. Cutting them to their first
+/// sentence left most of them unreadable: a bullet's first line is often
+/// only the setup for what changed.
 fn changes_since(from: Option<&str>) -> Vec<String> {
-    const MAX: usize = 9;
+    const MAX: usize = 20;
     let mut out = Vec::new();
+    let mut shown = 0usize;
     let mut counted = 0usize;
     for (version, bullets) in sections() {
         let wanted = match from {
@@ -325,15 +327,27 @@ fn changes_since(from: Option<&str>) -> Vec<String> {
         }
         for bullet in bullets {
             counted += 1;
-            if out.len() < MAX {
-                out.push(format!("  {DIM}·{RESET} {}", one_line(&bullet)));
+            if shown < MAX {
+                shown += 1;
+                if shown > 1 {
+                    out.push(String::new());
+                }
+                for (i, line) in wrap(&plain(&bullet), WIDTH - 4).into_iter().enumerate() {
+                    let lead = if i == 0 {
+                        format!("{DIM}·{RESET}")
+                    } else {
+                        " ".into()
+                    };
+                    out.push(format!("  {lead} {line}"));
+                }
             }
         }
     }
-    if counted > out.len() {
+    if counted > shown {
+        out.push(String::new());
         out.push(format!(
             "  {DIM}and {} more in the changelog{RESET}",
-            counted - out.len()
+            counted - shown
         ));
     }
     out
@@ -368,20 +382,52 @@ fn sections() -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// A bullet's first sentence, trimmed of markdown and cut to the width.
-fn one_line(bullet: &str) -> String {
-    let plain = bullet.replace(['*', '`'], "");
-    let mut text = plain.trim();
-    if let Some(end) = text.find(". ") {
-        text = &text[..end + 1];
+/// A bullet as plain text: no emphasis or code marks, links reduced to their
+/// words.
+fn plain(bullet: &str) -> String {
+    let mut out = String::new();
+    let mut rest = bullet;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let link = after.find("](").and_then(|mid| {
+            after[mid + 2..]
+                .find(')')
+                .map(|close| (mid, mid + 2 + close))
+        });
+        match link {
+            Some((mid, close)) => {
+                out.push_str(&rest[..open]);
+                out.push_str(&after[..mid]);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
     }
-    let room = WIDTH - 4;
-    if text.chars().count() <= room {
-        return text.to_string();
+    out.push_str(rest);
+    out.replace(['*', '`'], "").trim().to_string()
+}
+
+/// Word-wrap to `room` columns. A word longer than a line gets one to itself.
+fn wrap(text: &str, room: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let len = line.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
     }
-    let cut: String = text.chars().take(room - 1).collect();
-    let cut = cut.rsplit_once(' ').map(|(head, _)| head).unwrap_or(&cut);
-    format!("{cut}…")
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -446,6 +492,24 @@ mod tests {
         );
     }
 
+    /// Bullets arrive whole, not cut to their first sentence.
+    #[test]
+    fn a_bullet_is_shown_in_full_and_wrapped() {
+        let bullet = "Before, it opened a second window. **Now** it does `not`, see [the PR](https://x.example/1) for why and how it changed over time.";
+        let text = plain(bullet);
+        assert_eq!(
+            text,
+            "Before, it opened a second window. Now it does not, see the PR for why and how it changed over time."
+        );
+        let lines = wrap(&text, 40);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:?}");
+        assert_eq!(lines.join(" "), text, "nothing dropped");
+        for line in changes_since(Some("0.0.1")) {
+            assert!(visible_width(&line) <= WIDTH, "{line:?}");
+        }
+    }
+
     #[test]
     fn the_changelog_parses_into_versions_and_bullets() {
         let all = sections();
@@ -453,6 +517,45 @@ mod tests {
         let (version, bullets) = &all[0];
         assert_eq!(version, CURRENT, "the newest section is this build");
         assert!(!bullets.is_empty(), "this release has notes");
+    }
+
+    /// The installers draw this wordmark too, from their own copy of it: the
+    /// shell script in blocks, the PowerShell one in `#` (see its comment).
+    #[test]
+    fn the_installer_draws_the_same_wordmark() {
+        let sh = include_str!("../../../scripts/install.sh");
+        let ps1 = include_str!("../../../scripts/install.ps1");
+        for (y, wash) in WASH.iter().enumerate() {
+            let colored = word_row(y);
+            let mut row = String::new();
+            let mut chars = colored.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    chars.by_ref().find(|c| c.is_ascii_alphabetic());
+                } else {
+                    row.push(c);
+                }
+            }
+            let row = row.trim_end();
+            assert!(
+                sh.contains(&format!("|{row}'")),
+                "install.sh lacks row {y}: {row:?}"
+            );
+            let hashed = row.replace('█', "#");
+            assert!(
+                ps1.contains(&format!("'{hashed}'")),
+                "install.ps1 lacks row {y}: {hashed:?}"
+            );
+            // Same wash, row for row.
+            assert!(
+                sh.contains(&format!("'{wash}|")),
+                "install.sh row {y} colour"
+            );
+            assert!(
+                ps1.contains(&format!("@('{wash}'")),
+                "install.ps1 row {y} colour"
+            );
+        }
     }
 
     /// A first run has never seen a version; an upgrade has seen an older one.

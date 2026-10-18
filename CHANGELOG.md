@@ -1,5 +1,212 @@
 # Changelog
 
+## Unreleased
+
+## v1.7.0 — 2026-10-17
+
+- Codex CLI support alongside Claude Code: automatic installation/profile
+  detection, tab state and attention notifications, saved conversation restore,
+  and account usage meters. Compact meters show account names and the allowance
+  windows each provider reports, with vertical provider labels shown only for
+  detected accounts. Authentication stays in Codex; hook installation preserves
+  existing configuration and requires review in Codex. See [setup](docs/codex-integration.md).
+- Saved Codex tabs reconnect automatically when opened, including conversations
+  retained by the shared daemon. Restore waits for shell startup and stops when
+  you type; prompt and off modes remain available. (#18, #20)
+- A calmer rail: category-coloured marks, squares for shells, slow breathing
+  for working agents, clearer background activity and persistent unseen-finish
+  ticks. Rail animation can be disabled, and Claude's title spinner glyphs are
+  stripped by default. Compaction and stale registry updates no longer leave
+  misleading activity indicators. (#16)
+- Paste screenshots with Ctrl+V / Cmd+V. Images are saved as PNGs in private
+  temporary directories and their paths are pasted into the terminal; copied
+  text and files retain precedence. WSL can read images from the Windows
+  clipboard, and stalled clipboard reads time out. (#17, #18)
+- Ctrl+click opens the complete URL across terminal soft wraps, including when
+  part of the link is in scrollback. Unicode and terminal resize preserve link
+  hit positions; real newlines keep separate links apart. (#19)
+- The WSLg slow-mode notice offers `wsl --shutdown` without administrator
+  privileges first, followed by the service restart if needed, with separate
+  copy buttons. (#15)
+- Updates restart Giverny after installation finishes, and the welcome screen
+  shows the complete wrapped changelog. (#18)
+
+The rail, screenshot-paste and WSLg notice improvements were contributed by
+[@theitush](https://github.com/theitush) in #15, #16 and #17.
+
+## v1.6.0 — 2026-10-14
+
+The second-launch raise, the tab walk and every fix below but the last are
+[@theitush](https://github.com/theitush)'s, merged from #13 and #14.
+
+- Launching Giverny while it is already running brings the open window to the
+  front. Before, it opened a second window that never got hook events, so it
+  showed no live Claude states. `GIVERNY_SECOND_WINDOW=1` still opens one, and
+  a build started with `GIVERNY_NO_ACCOUNT_SETUP=1` opens alongside. Linux and
+  macOS; Windows is unchanged.
+
+- Ctrl+Tab and Ctrl+PageUp/PageDown start only the tab you stop on. A restored
+  tab you pass over shows its saved output, dimmed, instead of starting a
+  shell and a `claude --resume` just for being looked at.
+
+- A Claude tab whose subagents are still running after its turn ends shows the
+  background dots, not the idle ring, until they finish.
+
+- After an early usage reset the meter stays at the new number. Sessions that
+  had not asked since used to push it back to the old one.
+
+- Right after `/compact` the status line estimates the new context. `session:`
+  shows it as `~<n>` until the next reply, where it used to keep the figure
+  from before the compaction, and the cold-cache warning counts what the
+  compacted context will cache again.
+
+- WSLg: when a resume from sleep leaves the window missing, Giverny maps it
+  again, and if Windows still does not show it, restarts WSLg's own display
+  client. It does this at most twice before waiting for the window to come
+  back, logs each step to `giverny doctor`, and `GIVERNY_WSLG_WATCHDOG=0`
+  turns it off. When WSLg starts without its shared memory, which makes typing
+  lag, the rail says so and gives the fix. A Giverny started from inside
+  Giverny stays on OpenGL, where it used to crash on an inherited d3d12
+  driver.
+
+- Run from inside a Claude session, `giverny --version` and the commands
+  Claude Code runs for hooks and the status line no longer print "cleared N
+  inherited Claude session marker(s)".
+
+## v1.5.0 — 2026-10-12
+
+Tab closing, the status line refresh and the prompt bar fixes are
+[@theitush](https://github.com/theitush)'s, merged from #6 to #9. The two
+macOS fixes are [@nirshabi10](https://github.com/nirshabi10)'s, merged from
+#10 and #11.
+
+- Hebrew reads right to left. A row runs in the direction of its first
+  letter, so a Hebrew answer sits against the right edge with its English
+  terms, paths and numbers in reading order, and a sentence Claude wrapped
+  keeps its direction on the next row. Clicks, selection and links land on
+  the letter under the pointer. Hebrew is drawn in Cascadia Mono's Hebrew,
+  which ships with Giverny, unless your font has its own.
+
+- The prompt bar shows only what you typed. A message from another Claude
+  session, a coordinator or a channel no longer shows as your prompt, and
+  something you pasted that opens the way those do stays in the history read
+  back from the transcript. `claude -c "go on"` now reads the earlier turns
+  back, a tab with two sessions under its shell holds the newer one instead
+  of switching every second, and a prompt that arrives while the transcript
+  is being read is neither lost nor counted twice.
+
+- Closing the active tab goes back to the tab you were on before, the one
+  Ctrl+Tab would switch to, rather than its neighbour in the rail. The tab it
+  lands on counts as seen, and closing the tab a Ctrl+Tab switch is
+  previewing goes back to where the switch started.
+
+- The status line's cold-cache warning now shows on an idle session. Giverny's
+  status line asks Claude Code to re-run it every 30 s. A `refreshInterval`
+  you set on it yourself is kept, and existing installs get it on first
+  launch.
+
+- On a Mac without the Linux fonts Giverny looks for, Claude's select prompts
+  draw their pointer, checkboxes and ticks. They drew as blank cells. Windows
+  falls back to Segoe UI Symbol for the same glyphs.
+
+- On macOS, pasting files copied in Finder types their paths, as dropping
+  them does, so Claude can attach a copied screenshot. Before, it typed the
+  file's name with no folder or extension.
+
+- A status line of yours whose command mentions giverny, like a script under
+  `~/giverny-tools/`, is no longer replaced with Giverny's at startup.
+
+## v1.4.0 — 2026-10-10
+
+The prompt bar is [@theitush](https://github.com/theitush)'s, merged from #5.
+
+- A Claude tab keeps the prompt of the turn you are reading in view. Once a
+  long answer scrolls it off the top, a one-line bar over the top row shows
+  it, and goes when the prompt is back on screen. Click the bar to read the
+  whole prompt. It follows Claude Code's fullscreen view and the terminal's
+  own scrollback, and a session resumed or adopted after a restart has its
+  prompts read back from the transcript. Only what you typed shows:
+  interrupted turns, background-task notifications and subagent hand-backs
+  do not.
+
+- A click on something drawn over the terminal no longer reaches the program
+  under it. With mouse reporting on, as in Claude Code's fullscreen view, a
+  click on an overlay also moved Claude's view.
+
+- Updating from the rail shows the install while it runs, and leads to its
+  tab. If the install ends without replacing the binary, the update button
+  comes back, and the restart button pulses once there is a new version to
+  restart into. Before, the rail went blank between the click and the new
+  binary landing. Run in a terminal, the installers draw Giverny's wordmark
+  and one line per step. Piped, logged or under `NO_COLOR`, they print the
+  same plain lines as before.
+
+## v1.3.0 — 2026-10-09
+
+All of this is [@theitush](https://github.com/theitush)'s, merged from #3.
+
+- Claude's hooks and status line no longer go stale when Giverny moves. Each
+  account's `settings.json` used to name the running Giverny's own path, so a
+  rebuild, a second build or a reinstall rewrote it, and sessions already
+  running kept calling the old binary. They now name one link,
+  `<giverny config dir>/bin/giverny`, that each Giverny points at itself when
+  it starts. Existing installs move to the link once, on first launch. The
+  "restart claude for live states" line now appears only after hooks are
+  installed for the first time, and goes once the sessions that predate them
+  have ended. A test build started with `GIVERNY_NO_ACCOUNT_SETUP=1` leaves the
+  link and every account alone, and a link left pointing at a deleted build is
+  taken back within seconds.
+
+- On Windows, hook and status-line commands are written with forward slashes.
+  Claude Code runs them through Git Bash, which read `C:\Users\…` as
+  `C:Users…`, so they never ran.
+
+- Each tab can keep its own shell history, restored with the tab:
+  `behavior.history_per_tab`, off by default, under Settings → Terminal. Works
+  with bash, zsh and fish, without touching your rc files, and nothing leaks
+  into shells started from the tab. `behavior.history_also_shared` also
+  appends each command to `~/.bash_history` (bash only).
+
+- One bad line in `config.toml` costs that line, not the file. An unknown key
+  (a typo, or a setting from a newer version) is logged and skipped, and a
+  wrong-typed value keeps its previous value. Before, either one put every
+  setting back to its default. A hot reload of a file that doesn't parse keeps
+  the running settings, and a file that exists but can't be read is no longer
+  overwritten with the template.
+
+- `giverny <word>` with a word it doesn't know prints usage and exits, instead
+  of opening a window. Flags and paths still open one.
+
+- The status line's `session:` count keeps what was spent before each
+  `/compact`, as `session: 41.2k (+310.5k)`, and `total:` includes it.
+
+- The status line can also warn in red when the prompt cache has gone cold,
+  with how many tokens the next message will cache again. It only shows if
+  Claude Code redraws the status line while the session is idle, which
+  Giverny does not set up yet.
+
+- Smaller fixes. Ctrl+click opens links and files under WSL. The terminal
+  takes the keyboard back after a click on the rail, the taskbar or a header
+  button. Settings reopens on the section you last viewed. A restored tab's
+  dot stays dim until its shell has started.
+
+## v1.2.1 — 2026-10-07
+
+Both fixes are [@theitush](https://github.com/theitush)'s, from running the
+native Windows build.
+
+- On Windows, Giverny draws through DirectX 12 rather than Vulkan. wgpu offers
+  Vulkan first, and Intel's Vulkan driver made the window flicker as the mouse
+  moved over it. Where DirectX 12 has no GPU adapter, the old choice stands,
+  and `WGPU_BACKEND` still decides when it is set.
+
+- A Claude config directory that was opened but never logged in is no longer
+  an account. A Windows Claude Code closed at the login prompt leaves
+  `C:\Users\<you>\.claude` behind, and the rail showed it as `@.claude` with no
+  usage, above the real accounts in WSL. A directory now counts when it has a
+  login or a transcript. Directories you name yourself (`CLAUDE_CONFIG_DIR`,
+  `behavior.extra_profile_dirs`) are still shown either way.
+
 ## v1.2.0 — 2026-10-02
 
 - A new theme, `catppuccin-mauve`: Catppuccin Mocha as the Colloid GTK theme

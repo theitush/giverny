@@ -124,6 +124,12 @@ pub fn settings_ui(app: &mut App, ui: &mut egui::Ui) -> Vec<Action> {
             footer(ui, &mut actions, &mut close, c);
         });
 
+    // Remembered for the next Ctrl+, — this process and, through the state
+    // file, the next one.
+    if app.layout.settings_section.as_deref() != Some(state.section.title()) {
+        app.layout.settings_section = Some(state.section.title().to_string());
+        app.state_dirty = true;
+    }
     if !close {
         app.settings = Some(state);
     }
@@ -231,8 +237,47 @@ fn body(
         ui.add_space(8.0);
     }
 
+    if state.search.is_empty() && state.section == Section::Codex {
+        ui.label(
+            "Codex is detected automatically. Type codex normally in any tab; usage uses its existing sign-in.",
+        );
+        ui.label("Setup preserves existing hooks and writes a .giverny-bak backup. Codex requires you to review the hooks with /hooks.");
+        for account in &app.codex.accounts {
+            let target = &account.target;
+            let path = crate::codex_watch::CodexWatch::hook_path(target);
+            let command = crate::codex_watch::CodexWatch::hook_command(target);
+            ui.label(path.display().to_string());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Events: {}\nCommand: {command}",
+                        giverny_codex::hooks::EVENTS.join(", ")
+                    ))
+                    .monospace(),
+                )
+                .wrap(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("install / repair hooks").clicked() {
+                    actions.push(Action::CodexHooks(target.clone(), true));
+                }
+                if ui.button("remove Giverny hooks").clicked() {
+                    actions.push(Action::CodexHooks(target.clone(), false));
+                }
+            });
+        }
+        if let Some(status) = &app.codex.status {
+            ui.label(status);
+        }
+        ui.add_space(10.0);
+    }
     for def in rows {
-        row(ui, state, cfg, def, suggestions, actions, c);
+        // Sharing is a refinement of history per terminal: greyed out while
+        // there is no per-terminal history to share from.
+        let enabled = def.key != "behavior.history_also_shared" || cfg.behavior.history_per_tab;
+        ui.add_enabled_ui(enabled, |ui| {
+            row(ui, state, cfg, def, suggestions, actions, c);
+        });
         ui.add_space(10.0);
     }
 }
@@ -734,7 +779,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].key, "behavior.restore_apps");
         // Searching by TOML key works too — that is half the point of showing it.
-        state.search = "titles.strip".into();
+        state.search = "titles.strip_host".into();
         assert_eq!(visible(&state).len(), 1);
     }
 }

@@ -159,7 +159,9 @@ pub fn remove() {
     }
 }
 
-/// Whether the desktop entry is in place, for `doctor`.
+/// Whether the desktop entry is in place, for `doctor`, which only asks on
+/// Linux.
+#[cfg(target_os = "linux")]
 pub fn status() -> Option<(PathBuf, bool)> {
     let data = data_home()?;
     let entry = desktop_path(&data);

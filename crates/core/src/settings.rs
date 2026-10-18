@@ -23,6 +23,7 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
+    Codex,
     Keys,
     Updates,
     About,
@@ -36,6 +37,7 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
+        Section::Codex,
         Section::Keys,
         Section::Updates,
         Section::About,
@@ -48,6 +50,7 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
+            Section::Codex => "codex",
             Section::Keys => "keys",
             Section::Updates => "updates",
             Section::About => "about",
@@ -195,7 +198,8 @@ pub const SETTINGS: &[SettingDef] = &[
         key: "font.family",
         label: "font family",
         section: Section::Appearance,
-        doc: "Preferred monospace family; empty auto-detects.",
+        doc: "Preferred monospace family; empty auto-detects. Hebrew comes from the bundled \
+              Cascadia Mono unless this family has Hebrew of its own.",
         note: &["Applied at startup: the glyph atlas is built once."],
         needs_restart: true,
         kind: Kind::Text {
@@ -286,6 +290,46 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "titles.strip_claude_glyph",
+        label: "drop Claude's title glyph",
+        section: Section::Titles,
+        doc: "Drop the glyph Claude Code puts in front of its title (✳, ◐, a spinner).",
+        note: &[
+            "The rail's own mark beside the title already shows whether",
+            "Claude is working, and keeps showing it while background",
+            "agents run. A title you typed yourself is never touched.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.animate",
+        label: "animate the rail",
+        section: Section::Titles,
+        doc: "Spin a working tab's mark and pulse a tab that wants you; off removes the spinners and the pulse.",
+        note: &[
+            "Off, no spinner, ring or pulse is drawn: a working tab's mark is",
+            "left blank and a waiting one shows its amber flag, still. The",
+            "rail stops waking the window to animate them.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "rail.calm_busy",
+        label: "calm busy mark",
+        section: Section::Titles,
+        doc: "A working tab breathes a slow dot in its colour instead of spinning.",
+        note: &[
+            "One breath every three seconds, everywhere the spinner would be:",
+            "tab rows, category headers, background agents. Still a different",
+            "thing from the amber flag of a tab that wants you, in shape,",
+            "colour and pace.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
         key: "behavior.scrollback_lines",
         label: "scrollback lines",
         section: Section::Terminal,
@@ -299,10 +343,39 @@ pub const SETTINGS: &[SettingDef] = &[
         },
     },
     SettingDef {
+        key: "behavior.history_per_tab",
+        label: "history per terminal",
+        section: Section::Terminal,
+        doc: "Each tab's shell keeps its own history, back when the tab is restored.",
+        note: &[
+            "Set inside the shells Giverny starts (bash, zsh, fish) by a",
+            "start-up file of its own that runs your usual rc; no rc file of",
+            "yours is touched, and a shell started from the tab keeps its own",
+            "history. An rc that sets HISTFILE itself wins. Off leaves the",
+            "shell's history as the shell has it. Applies to shells started",
+            "from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
+        key: "behavior.history_also_shared",
+        label: "also add to shell history",
+        section: Section::Terminal,
+        doc: "With history per terminal, also append each command to the usual history (bash).",
+        note: &[
+            "Appends to ~/.bash_history as each command runs; never rewrites it.",
+            "zsh and fish keep only the tab's own history.",
+            "Applies to shells started from here on.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "behavior.notifications",
         label: "desktop notifications",
         section: Section::Terminal,
-        doc: "Notify when Claude needs you in a background tab.",
+        doc: "Notify when an agent needs you, or Codex finishes in a background tab.",
         note: &[],
         needs_restart: false,
         kind: Kind::Bool { default: true },
@@ -380,6 +453,64 @@ pub const SETTINGS: &[SettingDef] = &[
         ],
         needs_restart: true,
         kind: Kind::StringList { default: None },
+    },
+    SettingDef {
+        key: "codex.enabled",
+        label: "detect Codex automatically",
+        section: Section::Codex,
+        doc: "Show detected Codex accounts and usage automatically. Turn off to disable integration.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
+    SettingDef {
+        key: "codex.executable",
+        label: "Codex executable",
+        section: Section::Codex,
+        doc: "Executable name on PATH, or an explicit path.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Text {
+            default: "codex",
+            placeholder: "codex",
+        },
+    },
+    SettingDef {
+        key: "codex.home",
+        label: "Codex home",
+        section: Section::Codex,
+        doc: "Empty uses CODEX_HOME, then the default .codex directory.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Text {
+            default: "",
+            placeholder: "automatic",
+        },
+    },
+    SettingDef {
+        key: "codex.restore",
+        label: "restore Codex conversations",
+        section: Section::Codex,
+        doc: "Auto reconnects saved conversations on tab focus; prompt asks first; off skips restore.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Choice {
+            default: "auto",
+            options: &["auto", "prompt", "off"],
+        },
+    },
+    SettingDef {
+        key: "codex.usage_refresh_minutes",
+        label: "usage refresh interval",
+        section: Section::Codex,
+        doc: "Minutes between Codex usage requests. Zero means manual refresh only.",
+        note: &[],
+        needs_restart: false,
+        kind: Kind::Int {
+            default: 10,
+            min: 0,
+            max: 1440,
+        },
     },
     SettingDef {
         key: "claude.auto_mode",
@@ -698,8 +829,8 @@ mod tests {
 
     #[test]
     fn every_option_resolves_against_a_live_config() {
-        // `deny_unknown_fields` catches keys the struct lacks; this catches
-        // keys the struct has under a different path.
+        // Unknown keys are tolerated, so this checks
+        // every option resolves under the path the settings table names.
         let cfg = Config::default();
         for def in SETTINGS {
             let value = current(&cfg, def);
@@ -748,6 +879,33 @@ mod tests {
                 tables.push(def.table());
             }
         }
+    }
+
+    /// The rail's calm look is the default: both are on until someone
+    /// turns them off, and a file without them reads as on.
+    #[test]
+    fn calm_marks_are_on_by_default() {
+        let absent: Config = toml::from_str("[rail]\n[titles]\n").unwrap();
+        for key in ["rail.calm_busy", "titles.strip_claude_glyph"] {
+            let def = by_key(key).expect("declared");
+            assert!(matches!(def.kind, Kind::Bool { default: true }), "{key}");
+            assert_eq!(current(&absent, def), Some(Value::Bool(true)), "{key}");
+        }
+    }
+
+    /// The rail's two motion options sit with the title glyph toggle in tabs
+    /// & titles, right after it, though their keys stay in `[rail]`.
+    #[test]
+    fn rail_motion_options_follow_the_title_glyph() {
+        let titles: Vec<&str> = in_section(Section::Titles).map(|d| d.key).collect();
+        let glyph = titles
+            .iter()
+            .position(|k| *k == "titles.strip_claude_glyph")
+            .expect("glyph toggle is in tabs & titles");
+        assert_eq!(
+            titles[glyph + 1..glyph + 3],
+            ["rail.animate", "rail.calm_busy"]
+        );
     }
 
     #[test]

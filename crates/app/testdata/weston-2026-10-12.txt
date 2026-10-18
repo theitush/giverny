@@ -1,0 +1,633 @@
+Date: 2026-10-12 IDT
+[11:05:04.165] weston 9.0.0
+               https://wayland.freedesktop.org
+               Bug reports to: https://gitlab.freedesktop.org/wayland/weston/issues/
+               Build: 9.0.0-210-gf227edd6
+[11:05:04.167] Command line: /usr/bin/weston --backend=rdp-backend.so --modules=wslgd-notify.so --xwayland --socket=wayland-0 --shell=rdprail-shell.so --log=/mnt/wslg/weston.log --logger-scopes=log,rdp-backend,rdprail-shell
+[11:05:04.167] OS: Linux, 6.6.87.2-microsoft-standard-WSL2, #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025, x86_64
+[11:05:04.167] warning: XDG_RUNTIME_DIR "/mnt/wslg/runtime-dir" is not configured
+correctly.  Unix access mode must be 0700 (current mode is 777),
+and must be owned by the user (current owner is UID 1000).
+Refer to your distribution on how to get it, or
+http://www.freedesktop.org/wiki/Specifications/basedir-spec
+on how to implement it.
+[11:05:04.169] Using config file '/home/wslg/.config/weston.ini'
+[11:05:04.171] Output repaint window is 7 ms maximum.
+[11:05:04.172] Loading module '/usr/lib/libweston-9/rdp-backend.so'
+[11:05:04.191] using FreeRDP version 2.4.0
+Date: 2026-10-12 IDT
+[11:05:04.191] RDP backend: WESTON_RDP_DEBUG_LEVEL: 3
+[11:05:04.191] RDP backend: rdp_monitor_refresh_rate: 60000
+[11:05:04.191] RDP backend: timer resolution tv_sec:0 tv_nsec:1
+[11:05:04.191] RDP backend: Environment dump - start
+[11:05:04.191] RDP backend: Environment dump - end
+[11:05:04.191] RDP backend: FreeRDP version: 2.4.0
+[11:05:04.191] Using external fd for incoming connections: 3
+[11:05:04.191] Default head is being added
+[11:05:04.191] Registered plugin API 'weston_rdprail_api_v1' of size 72
+[11:05:04.191] RDPAPPLIST_MODULEDIR is set to /usr/lib/rdpapplist
+[11:05:04.193] RDP backend: use_rdpapplist = 1
+[11:05:04.205] RDP backend: use_gfxredir = 1
+[11:05:04.205] RDP backend: enable_hi_dpi_support = 1
+[11:05:04.205] RDP backend: enable_fractional_hi_dpi_support = 0
+[11:05:04.205] RDP backend: enable_fractional_hi_dpi_roundup = 0
+[11:05:04.205] RDP backend: debug_desktop_scaling_factor = 0
+[11:05:04.205] RDP backend: enable_window_zorder_sync = 1
+[11:05:04.205] RDP backend: enable_window_snap_arrange = 1
+[11:05:04.205] RDP backend: enable_window_shadow_remoting = 1
+[11:05:04.205] RDP backend: enable_display_power_by_screenupdate = 0
+[11:05:04.205] RDP backend: enable_distro_name_title = 1
+[11:05:04.205] RDP backend: enable_copy_warning_title = 1
+[11:05:04.206] Using VSOCK for incoming connections: 3
+[11:05:04.209] Registered plugin API 'weston_rdp_output_api_v1' of size 24
+[11:05:04.209] Head attaching: rdp-0, index:0, is_primary: 1
+[11:05:04.209] Client desktop upper left coordinate (0,0)
+[11:05:04.209] disp_monitor_validate_and_compute_layout:---OUTPUT---
+[11:05:04.209] 	rdpMonitor[0]: x:0, y:0, width:0, height:0, is_primary:1
+[11:05:04.209] 	rdpMonitor[0]: weston x:0, y:0, width:0, height:0
+[11:05:04.209] 	rdpMonitor[0]: physicalWidth:0, physicalHeight:0, orientation:0
+[11:05:04.209] 	rdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:0
+[11:05:04.209] 	rdpMonitor[0]: scale:1, clientScale:1.00
+[11:05:04.209] Head mode change:rdp-0 NEW width:0, height:0, scale:1, clientScale:1.000000
+[11:05:04.209] move head/output rdp-0 (0,0) -> (0,0)
+[11:05:04.209] client origin (0,0) is (0,0) in Weston space
+[11:05:04.209] Output 'rdp-0' enabled with head(s) rdp-0
+[11:05:04.209] Compositor capabilities:
+               arbitrary surface rotation: yes
+               screen capture uses y-flip: no
+               presentation clock: CLOCK_MONOTONIC_RAW, id 4
+               presentation clock resolution: 0.000000001 s
+[11:05:04.210] Loading module '/usr/lib/weston/rdprail-shell.so'
+[11:05:04.226] RDPRAIL-shell: WESTON_RDPRAIL_SHELL_DEBUG_LEVEL: 3.
+Date: 2026-10-12 IDT
+[11:05:04.226] RDPRAIL-shell: allow-zap:0
+[11:05:04.226] RDPRAIL-shell: allow-alt-f4-to-close-app:1
+[11:05:04.226] RDPRAIL-shell: binding-modifier:none
+[11:05:04.226] RDPRAIL-shell: local-move:0
+[11:05:04.226] RDPRAIL-shell: distro name:Ubuntu (len:6)
+[11:05:04.229] RDPRAIL-shell: WSL2_DEFAULT_APP_ICON:/usr/share/icons/wsl/linux.png (loaded:yes)
+[11:05:04.230] RDPRAIL-shell: WSL2_DEFAULT_APP_OVERLAY_ICON:/usr/share/icons/wsl/linux.png (loaded:yes)
+[11:05:04.230] RDPRAIL-shell: WESTON_RDPRAIL_SHELL_APPEND_DISTRONAME_STARTMEN:1
+[11:05:04.230] RDPRAIL-shell: WESTON_RDPRAIL_SHELL_BLEND_OVERLAY_ICON_APPLIST:1
+[11:05:04.230] RDPRAIL-shell: WESTON_RDPRAIL_SHELL_BLEND_OVERLAY_ICON_TASKBAR:1
+[11:05:04.230] RDPRAIL-shell: WESTON_RDPRAIL_SHELL_USE_WSLPATH:0
+[11:05:04.231] rdp_rail_shell_initialize_notify: shell: distro name: Ubuntu
+[11:05:04.232] app_list_monitor_thread: running in system-distro with user-distro: Ubuntu
+[11:05:04.232] app_list_monitor_thread: open(/proc/self/ns/mnt)
+[11:05:04.232] app_list_monitor_thread: open(/proc/2/ns/mnt)
+[11:05:04.233] Loading module '/usr/lib/libweston-9/xwayland.so'
+[11:05:04.233] app_list_monitor_thread: inotify_add_watch(/usr/share/applications)
+[11:05:04.235] Registered plugin API 'weston_xwayland_v1' of size 32
+[11:05:04.236] app_list_monitor_thread: monitor /usr/share/applications
+[11:05:04.236] Registered plugin API 'weston_xwayland_surface_v1' of size 48
+[11:05:04.236] Not using abstract fd for Xwayland
+[11:05:04.236] xserver listening on display :0
+[11:05:04.236] app_list_monitor_thread: /usr/local/share/applications doesn't exist, skipping.
+[11:05:04.236] Loading module '/usr/lib/weston/wslgd-notify.so'
+[11:05:04.237] ../compositor/wslgd-notify.c: socket connected
+[11:05:04.238] app_list_monitor_thread: inotify_add_watch(/var/lib/snapd/desktop/applications)
+[11:05:04.238] app_list_monitor_thread: monitor /var/lib/snapd/desktop/applications
+[11:05:04.238] app_list_monitor_thread: /var/lib/flatpak/exports/share/applications doesn't exist, skipping.
+[11:05:04.238] app list folder[0]: /usr/share/applications
+[11:05:04.248] app list folder[1]: /usr/local/share/applications
+[11:05:04.248] app list folder[2]: /var/lib/snapd/desktop/applications
+[11:05:04.249] app list folder[3]: /var/lib/flatpak/exports/share/applications
+[11:05:04.359] Spawned Xwayland server, pid 31
+[11:05:04.586] xfixes version: 5.0
+[11:05:04.602] created wm, root 912
+[11:05:05.099] Client HandShake buildNumber:26200
+[11:05:05.099] Client: ClientStatus:0x3f5
+[11:05:05.111] Server AppList caps version:4
+[11:05:05.111]     appListProviderName:Ubuntu
+[11:05:05.112]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[11:05:05.132] Client: gfxredir selected caps: version:0x2000
+[11:05:05.153] xf_peer_adjust_monitor_layout:
+[11:05:05.153]   DesktopWidth:2880, DesktopHeight:1800
+[11:05:05.153]   UseMultimon:0
+[11:05:05.153]   ForceMultimon:0
+[11:05:05.153]   MonitorCount:0
+[11:05:05.153]   HasMonitorAttributes:0
+[11:05:05.153]   HiDefRemoteApp:1
+[11:05:05.153] disp_monitor_sanity_check_layout:---INPUT---
+[11:05:05.153] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[11:05:05.153] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[11:05:05.153] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[11:05:05.153] 	rdpMonitor[0]: scale:1, client scale :1.00
+[11:05:05.153] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[11:05:05.153] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[11:05:05.159] Client desktop upper left coordinate (0,0)
+[11:05:05.159] disp_monitor_validate_and_compute_layout:---OUTPUT---
+[11:05:05.159] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[11:05:05.159] 	rdpMonitor[0]: weston x:0, y:0, width:2880, height:1800
+[11:05:05.159] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[11:05:05.159] 	rdpMonitor[0]: desktopScaleFactor:0, deviceScaleFactor:180
+[11:05:05.159] 	rdpMonitor[0]: scale:1, clientScale:1.00
+[11:05:05.159] Head mode change:rdp-0 NEW width:2880, height:1800, scale:1, clientScale:1.000000
+[11:05:05.159] move head/output rdp-0 (0,0) -> (0,0)
+[11:05:05.159] client origin (0,0) is (0,0) in Weston space
+[11:05:05.160] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[11:05:05.160] Client ExecOrder launching dummy-entry
+[11:05:05.160] launching 'dummy-entry'
+[11:05:05.162] compositor: executing 'dummy-entry' failed: No such file or directory
+[11:05:05.162] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[11:05:05.162] Client AppList caps version:4
+[11:05:05.162] Client AppList client language id: en_GB
+[11:05:05.163] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[11:05:05.163] app_list_start_rdp_notify(): client language is changed from en_US to en_GB
+[11:05:05.163] app list folder[0]: /usr/share/applications
+[11:05:05.163] Client ExecOrder program terminated
+[11:05:05.163] dummy-entry exited with status 255
+[11:05:05.164] app list folder[1]: /usr/local/share/applications
+[11:05:05.164] app list folder[2]: /var/lib/snapd/desktop/applications
+[11:05:05.164] app list folder[3]: /var/lib/flatpak/exports/share/applications
+[11:05:06.503] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[11:05:06.506] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[11:05:12.514] RDP Sink version (1 - 1)
+[11:05:18.709] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[11:05:18.710] launching '/usr/libexec/weston-rdprail-shell'
+[11:05:18.920] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[11:05:18.920]     inSync: 0
+[11:05:18.920]     syncStart: 0
+[11:05:18.920]     syncEnd: 0
+[11:05:18.920]     newAppId: 0
+[11:05:18.920]     deleteAppId: 0
+[11:05:18.920]     deleteAppProvider: 0
+[11:05:18.920]     associateWindowId: 1
+[11:05:18.920]     appId: giverny
+[11:05:18.920]     appGroup: (null)
+[11:05:18.920]     appExecPath: (null)
+[11:05:18.920]     appWorkingDir: (null)
+[11:05:18.920]     appDesc: giverny
+[11:05:18.920]     appIcon: (nil)
+[11:05:18.920]     appProvider: (null)
+[11:05:18.920]     appWindowId: 0x2
+[11:05:18.920] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x2
+[11:05:18.934] !!!cursor role is added after creation - WindowId:0x1
+[11:13:19.943] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[11:13:41.089] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[11:28:15.628] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[11:28:15.628]     inSync: 0
+[11:28:15.628]     syncStart: 0
+[11:28:15.628]     syncEnd: 0
+[11:28:15.628]     newAppId: 0
+[11:28:15.628]     deleteAppId: 0
+[11:28:15.628]     deleteAppProvider: 0
+[11:28:15.628]     associateWindowId: 1
+[11:28:15.628]     appId: giverny
+[11:28:15.628]     appGroup: (null)
+[11:28:15.628]     appExecPath: (null)
+[11:28:15.628]     appWorkingDir: (null)
+[11:28:15.628]     appDesc: giverny
+[11:28:15.628]     appIcon: (nil)
+[11:28:15.628]     appProvider: (null)
+[11:28:15.628]     appWindowId: 0x8
+[11:28:15.628] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x8
+[11:34:05.116] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=il variant=basic options=(null)
+[11:35:53.809] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[11:56:25.631] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=il variant=basic options=(null)
+[11:57:12.653] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[12:12:38.651] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[12:13:03.368] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[12:16:01.677] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:16:01.677]     inSync: 0
+[12:16:01.677]     syncStart: 0
+[12:16:01.677]     syncEnd: 0
+[12:16:01.677]     newAppId: 0
+[12:16:01.677]     deleteAppId: 0
+[12:16:01.677]     deleteAppProvider: 0
+[12:16:01.677]     associateWindowId: 1
+[12:16:01.677]     appId: giverny
+[12:16:01.677]     appGroup: (null)
+[12:16:01.677]     appExecPath: (null)
+[12:16:01.677]     appWorkingDir: (null)
+[12:16:01.677]     appDesc: giverny
+[12:16:01.677]     appIcon: (nil)
+[12:16:01.677]     appProvider: (null)
+[12:16:01.677]     appWindowId: 0x9
+[12:16:01.678] Client: ClientGetAppidReq: pid:100385 appId:giverny WindowId:0x9
+[12:17:04.734] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:17:04.734]     inSync: 0
+[12:17:04.734]     syncStart: 0
+[12:17:04.734]     syncEnd: 0
+[12:17:04.734]     newAppId: 0
+[12:17:04.734]     deleteAppId: 0
+[12:17:04.734]     deleteAppProvider: 0
+[12:17:04.734]     associateWindowId: 1
+[12:17:04.734]     appId: giverny
+[12:17:04.734]     appGroup: (null)
+[12:17:04.734]     appExecPath: (null)
+[12:17:04.734]     appWorkingDir: (null)
+[12:17:04.734]     appDesc: giverny
+[12:17:04.734]     appIcon: (nil)
+[12:17:04.734]     appProvider: (null)
+[12:17:04.734]     appWindowId: 0xa
+[12:17:04.734] Client: ClientGetAppidReq: pid:107259 appId:giverny WindowId:0xa
+[12:20:49.363] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:20:49.363]     inSync: 0
+[12:20:49.363]     syncStart: 0
+[12:20:49.363]     syncEnd: 0
+[12:20:49.363]     newAppId: 0
+[12:20:49.363]     deleteAppId: 0
+[12:20:49.363]     deleteAppProvider: 0
+[12:20:49.363]     associateWindowId: 1
+[12:20:49.363]     appId: giverny
+[12:20:49.363]     appGroup: (null)
+[12:20:49.363]     appExecPath: (null)
+[12:20:49.363]     appWorkingDir: (null)
+[12:20:49.363]     appDesc: giverny
+[12:20:49.363]     appIcon: (nil)
+[12:20:49.363]     appProvider: (null)
+[12:20:49.363]     appWindowId: 0xb
+[12:20:49.363] Client: ClientGetAppidReq: pid:116460 appId:giverny WindowId:0xb
+[12:25:08.749] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:25:08.749]     inSync: 0
+[12:25:08.749]     syncStart: 0
+[12:25:08.749]     syncEnd: 0
+[12:25:08.749]     newAppId: 0
+[12:25:08.749]     deleteAppId: 0
+[12:25:08.749]     deleteAppProvider: 0
+[12:25:08.749]     associateWindowId: 1
+[12:25:08.749]     appId: giverny
+[12:25:08.749]     appGroup: (null)
+[12:25:08.749]     appExecPath: (null)
+[12:25:08.749]     appWorkingDir: (null)
+[12:25:08.749]     appDesc: giverny
+[12:25:08.749]     appIcon: (nil)
+[12:25:08.749]     appProvider: (null)
+[12:25:08.749]     appWindowId: 0xc
+[12:25:08.749] Client: ClientGetAppidReq: pid:126865 appId:giverny WindowId:0xc
+[12:30:35.259] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[12:36:24.757] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[12:37:39.956] 
+
+
+RDP clipboard_data_source_send new (0x7e27b4000ac0:published:fd 101) vs prev (0x7e27b4000c40:cancel pending:fd 100): outstanding RDP data request (client to server)
+
+
+[12:46:51.275] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[12:48:42.539] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[12:52:06.593] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:52:06.593]     inSync: 0
+[12:52:06.593]     syncStart: 0
+[12:52:06.593]     syncEnd: 0
+[12:52:06.593]     newAppId: 0
+[12:52:06.593]     deleteAppId: 0
+[12:52:06.593]     deleteAppProvider: 0
+[12:52:06.593]     associateWindowId: 1
+[12:52:06.593]     appId: giverny
+[12:52:06.593]     appGroup: (null)
+[12:52:06.593]     appExecPath: (null)
+[12:52:06.593]     appWorkingDir: (null)
+[12:52:06.593]     appDesc: giverny
+[12:52:06.593]     appIcon: (nil)
+[12:52:06.593]     appProvider: (null)
+[12:52:06.593]     appWindowId: 0xd
+[12:52:06.593] Client: ClientGetAppidReq: pid:169514 appId:giverny WindowId:0xd
+[12:56:53.758] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[12:56:53.759]     inSync: 0
+[12:56:53.759]     syncStart: 0
+[12:56:53.759]     syncEnd: 0
+[12:56:53.759]     newAppId: 0
+[12:56:53.759]     deleteAppId: 0
+[12:56:53.759]     deleteAppProvider: 0
+[12:56:53.759]     associateWindowId: 1
+[12:56:53.759]     appId: giverny
+[12:56:53.759]     appGroup: (null)
+[12:56:53.759]     appExecPath: (null)
+[12:56:53.759]     appWorkingDir: (null)
+[12:56:53.759]     appDesc: giverny
+[12:56:53.759]     appIcon: (nil)
+[12:56:53.759]     appProvider: (null)
+[12:56:53.759]     appWindowId: 0xe
+[12:56:53.759] Client: ClientGetAppidReq: pid:177096 appId:giverny WindowId:0xe
+[13:02:21.759] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[13:03:47.250] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[13:04:44.800] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[13:04:44.800]     inSync: 0
+[13:04:44.801]     syncStart: 0
+[13:04:44.801]     syncEnd: 0
+[13:04:44.801]     newAppId: 0
+[13:04:44.801]     deleteAppId: 0
+[13:04:44.801]     deleteAppProvider: 0
+[13:04:44.801]     associateWindowId: 1
+[13:04:44.801]     appId: giverny
+[13:04:44.801]     appGroup: (null)
+[13:04:44.801]     appExecPath: (null)
+[13:04:44.801]     appWorkingDir: (null)
+[13:04:44.801]     appDesc: giverny
+[13:04:44.801]     appIcon: (nil)
+[13:04:44.801]     appProvider: (null)
+[13:04:44.801]     appWindowId: 0xf
+[13:04:44.801] Client: ClientGetAppidReq: pid:189927 appId:giverny WindowId:0xf
+[13:21:30.537] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[13:21:30.537]     inSync: 0
+[13:21:30.537]     syncStart: 0
+[13:21:30.537]     syncEnd: 0
+[13:21:30.537]     newAppId: 0
+[13:21:30.537]     deleteAppId: 0
+[13:21:30.537]     deleteAppProvider: 0
+[13:21:30.537]     associateWindowId: 1
+[13:21:30.537]     appId: giverny
+[13:21:30.537]     appGroup: (null)
+[13:21:30.537]     appExecPath: (null)
+[13:21:30.538]     appWorkingDir: (null)
+[13:21:30.538]     appDesc: giverny
+[13:21:30.538]     appIcon: (nil)
+[13:21:30.538]     appProvider: (null)
+[13:21:30.538]     appWindowId: 0x10
+[13:21:30.538] Client: ClientGetAppidReq: pid:219133 appId:giverny WindowId:0x10
+[14:01:53.881] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[14:02:40.199] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[14:12:19.109] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[14:37:14.765] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[14:43:32.017] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc71950
+[14:52:57.455] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc71950
+[15:01:16.929] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=il variant=basic options=(null)
+[15:02:17.074] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[15:09:48.208] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=il variant=basic options=(null)
+[15:10:00.061] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[15:22:49.289] unable to checkDescriptor for 0x6264cfc717a0
+[15:39:38.900] rdp_rail_destroy_window: update is still pending in client side (windowId:0x8)
+[15:39:38.952] app_list_monitor_thread: stopRdpNotifyEvent is signalled. 1
+[15:39:38.952] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc71950
+[15:39:38.952]     inSync: 0
+[15:39:38.952]     syncStart: 0
+[15:39:38.952]     syncEnd: 0
+[15:39:38.952]     newAppId: 0
+[15:39:38.952]     deleteAppId: 0
+[15:39:38.952]     deleteAppProvider: 1
+[15:39:38.952]     associateWindowId: 0
+[15:39:38.952]     appId: (null)
+[15:39:38.952]     appGroup: (null)
+[15:39:38.952]     appExecPath: (null)
+[15:39:38.952]     appWorkingDir: (null)
+[15:39:38.952]     appDesc: (null)
+[15:39:38.952]     appIcon: (nil)
+[15:39:38.952]     appProvider: Ubuntu
+[15:39:38.952]     appWindowId: 0x0
+[15:39:39.066] Client HandShake buildNumber:26200
+[15:39:39.066] Client: ClientStatus:0x3f5
+[15:39:39.078] Server AppList caps version:4
+[15:39:39.078]     appListProviderName:Ubuntu
+[15:39:39.078]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[15:39:39.099] Client: gfxredir selected caps: version:0x2000
+[15:39:39.120] xf_peer_adjust_monitor_layout:
+[15:39:39.120]   DesktopWidth:2880, DesktopHeight:1800
+[15:39:39.120]   UseMultimon:0
+[15:39:39.120]   ForceMultimon:0
+[15:39:39.120]   MonitorCount:0
+[15:39:39.120]   HasMonitorAttributes:0
+[15:39:39.120]   HiDefRemoteApp:1
+[15:39:39.120] disp_monitor_sanity_check_layout:---INPUT---
+[15:39:39.120] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[15:39:39.120] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[15:39:39.120] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[15:39:39.120] 	rdpMonitor[0]: scale:1, client scale :1.00
+[15:39:39.120] rdp_rail_wake_handler is called on peer_ctx:0x6264cfc74520
+[15:39:39.120] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[15:39:39.120] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[15:39:39.129] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[15:39:39.130] Client ExecOrder launching dummy-entry
+[15:39:39.130] launching 'dummy-entry'
+[15:39:39.140] compositor: executing 'dummy-entry' failed: No such file or directory
+[15:39:39.507] Client ExecOrder program terminated
+[15:39:39.507] dummy-entry exited with status 255
+[15:39:39.507] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:39:39.507] Client AppList caps version:4
+[15:39:39.507] Client AppList client language id: en_GB
+[15:39:39.508] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[15:39:39.536] !!!cursor role is added after creation - WindowId:0x3
+[15:39:39.762] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[15:39:39.821] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x2
+[15:39:39.822] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:45:34.185] rdp_rail_idle_handler is called on peer_ctx:0x6264cfc74520
+[15:48:37.018] unable to checkDescriptor for 0x6264cfff3600
+[15:48:37.093] app_list_monitor_thread: stopRdpNotifyEvent is signalled. 1
+[15:48:37.093] rdp_rail_notify_app_list(): rdp_peer 0x6264cfc74520
+[15:48:37.093]     inSync: 0
+[15:48:37.093]     syncStart: 0
+[15:48:37.093]     syncEnd: 0
+[15:48:37.093]     newAppId: 0
+[15:48:37.093]     deleteAppId: 0
+[15:48:37.093]     deleteAppProvider: 1
+[15:48:37.093]     associateWindowId: 0
+[15:48:37.093]     appId: (null)
+[15:48:37.093]     appGroup: (null)
+[15:48:37.093]     appExecPath: (null)
+[15:48:37.093]     appWorkingDir: (null)
+[15:48:37.093]     appDesc: (null)
+[15:48:37.093]     appIcon: (nil)
+[15:48:37.093]     appProvider: Ubuntu
+[15:48:37.093]     appWindowId: 0x0
+[15:48:38.193] Client HandShake buildNumber:26200
+[15:48:38.193] Client: ClientStatus:0x3f5
+[15:48:38.204] Server AppList caps version:4
+[15:48:38.204]     appListProviderName:Ubuntu
+[15:48:38.204]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[15:48:38.225] Client: gfxredir selected caps: version:0x2000
+[15:48:38.246] xf_peer_adjust_monitor_layout:
+[15:48:38.246]   DesktopWidth:2880, DesktopHeight:1800
+[15:48:38.246]   UseMultimon:0
+[15:48:38.246]   ForceMultimon:0
+[15:48:38.246]   MonitorCount:0
+[15:48:38.246]   HasMonitorAttributes:0
+[15:48:38.246]   HiDefRemoteApp:1
+[15:48:38.246] disp_monitor_sanity_check_layout:---INPUT---
+[15:48:38.246] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[15:48:38.246] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[15:48:38.246] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[15:48:38.246] 	rdpMonitor[0]: scale:1, client scale :1.00
+[15:48:38.246] rdp_rail_wake_handler is called on peer_ctx:0x6264cfd124e0
+[15:48:38.246] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[15:48:38.246] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[15:48:38.255] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[15:48:38.255] Client ExecOrder launching dummy-entry
+[15:48:38.255] launching 'dummy-entry'
+[15:48:38.259] compositor: executing 'dummy-entry' failed: No such file or directory
+[15:48:38.260] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:48:38.260] Client AppList caps version:4
+[15:48:38.260] Client AppList client language id: en_GB
+[15:48:38.260] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[15:48:38.261] Client ExecOrder program terminated
+[15:48:38.261] dummy-entry exited with status 255
+[15:48:38.992] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[15:48:38.998] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:48:41.618] unable to checkDescriptor for 0x6264cfd235b0
+[15:48:41.618] app_list_monitor_thread: stopRdpNotifyEvent is signalled. 1
+[15:48:41.619] rdp_rail_notify_app_list(): rdp_peer 0x6264cfd124e0
+[15:48:41.619]     inSync: 0
+[15:48:41.619]     syncStart: 0
+[15:48:41.619]     syncEnd: 0
+[15:48:41.619]     newAppId: 0
+[15:48:41.619]     deleteAppId: 0
+[15:48:41.619]     deleteAppProvider: 1
+[15:48:41.619]     associateWindowId: 0
+[15:48:41.619]     appId: (null)
+[15:48:41.619]     appGroup: (null)
+[15:48:41.619]     appExecPath: (null)
+[15:48:41.619]     appWorkingDir: (null)
+[15:48:41.619]     appDesc: (null)
+[15:48:41.619]     appIcon: (nil)
+[15:48:41.619]     appProvider: Ubuntu
+[15:48:41.619]     appWindowId: 0x0
+[15:55:31.024] Client HandShake buildNumber:26200
+[15:55:31.024] Client: ClientStatus:0x3f5
+[15:55:31.035] Server AppList caps version:4
+[15:55:31.035]     appListProviderName:Ubuntu
+[15:55:31.035]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[15:55:31.058] Client: gfxredir selected caps: version:0x2000
+[15:55:31.068] xf_peer_adjust_monitor_layout:
+[15:55:31.069]   DesktopWidth:2880, DesktopHeight:1800
+[15:55:31.069]   UseMultimon:0
+[15:55:31.069]   ForceMultimon:0
+[15:55:31.069]   MonitorCount:0
+[15:55:31.069]   HasMonitorAttributes:0
+[15:55:31.069]   HiDefRemoteApp:1
+[15:55:31.069] disp_monitor_sanity_check_layout:---INPUT---
+[15:55:31.069] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[15:55:31.069] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[15:55:31.069] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[15:55:31.069] 	rdpMonitor[0]: scale:1, client scale :1.00
+[15:55:31.069] rdp_rail_wake_handler is called on peer_ctx:0x6264cfd124e0
+[15:55:31.069] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[15:55:31.069] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[15:55:31.073] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[15:55:31.073] Client ExecOrder launching dummy-entry
+[15:55:31.073] launching 'dummy-entry'
+[15:55:31.074] compositor: executing 'dummy-entry' failed: No such file or directory
+[15:55:31.075] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:55:31.075] Client AppList caps version:4
+[15:55:31.075] Client AppList client language id: en_GB
+[15:55:31.075] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[15:55:31.075] Client ExecOrder program terminated
+[15:55:31.075] dummy-entry exited with status 255
+[15:55:31.631] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[15:55:31.633] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[15:55:51.786] rdp_rail_notify_app_list(): rdp_peer 0x6264cfd124e0
+[15:55:51.786]     inSync: 0
+[15:55:51.786]     syncStart: 0
+[15:55:51.786]     syncEnd: 0
+[15:55:51.786]     newAppId: 0
+[15:55:51.786]     deleteAppId: 0
+[15:55:51.786]     deleteAppProvider: 0
+[15:55:51.786]     associateWindowId: 1
+[15:55:51.786]     appId: giverny
+[15:55:51.786]     appGroup: (null)
+[15:55:51.786]     appExecPath: (null)
+[15:55:51.786]     appWorkingDir: (null)
+[15:55:51.786]     appDesc: giverny
+[15:55:51.786]     appIcon: (nil)
+[15:55:51.786]     appProvider: (null)
+[15:55:51.786]     appWindowId: 0x4
+[15:55:51.786] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x4
+[15:55:51.796] !!!cursor role is added after creation - WindowId:0x2
+[16:03:19.895] rdp_rail_idle_handler is called on peer_ctx:0x6264cfd124e0
+[16:15:35.972] unable to checkDescriptor for 0x6264d001abf0
+[16:15:35.972] AudioIn source thread: Listener connection error (Invalid argument)
+[16:15:36.017] app_list_monitor_thread: stopRdpNotifyEvent is signalled. 1
+[16:15:36.017] rdp_rail_notify_app_list(): rdp_peer 0x6264cfd124e0
+[16:15:36.017]     inSync: 0
+[16:15:36.017]     syncStart: 0
+[16:15:36.017]     syncEnd: 0
+[16:15:36.017]     newAppId: 0
+[16:15:36.017]     deleteAppId: 0
+[16:15:36.017]     deleteAppProvider: 1
+[16:15:36.017]     associateWindowId: 0
+[16:15:36.017]     appId: (null)
+[16:15:36.017]     appGroup: (null)
+[16:15:36.017]     appExecPath: (null)
+[16:15:36.017]     appWorkingDir: (null)
+[16:15:36.017]     appDesc: (null)
+[16:15:36.017]     appIcon: (nil)
+[16:15:36.017]     appProvider: Ubuntu
+[16:15:36.017]     appWindowId: 0x0
+[16:15:37.064] Client HandShake buildNumber:26200
+[16:15:37.064] Client: ClientStatus:0x3f5
+[16:15:37.075] Server AppList caps version:4
+[16:15:37.075]     appListProviderName:Ubuntu
+[16:15:37.075]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[16:15:37.096] Client: gfxredir selected caps: version:0x2000
+[16:15:37.117] xf_peer_adjust_monitor_layout:
+[16:15:37.117]   DesktopWidth:2880, DesktopHeight:1800
+[16:15:37.117]   UseMultimon:0
+[16:15:37.117]   ForceMultimon:0
+[16:15:37.117]   MonitorCount:0
+[16:15:37.117]   HasMonitorAttributes:0
+[16:15:37.117]   HiDefRemoteApp:1
+[16:15:37.117] disp_monitor_sanity_check_layout:---INPUT---
+[16:15:37.117] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[16:15:37.117] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[16:15:37.117] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[16:15:37.117] 	rdpMonitor[0]: scale:1, client scale :1.00
+[16:15:37.117] rdp_rail_wake_handler is called on peer_ctx:0x6264cffc3390
+[16:15:37.117] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[16:15:37.117] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[16:15:37.123] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[16:15:37.123] Client ExecOrder launching dummy-entry
+[16:15:37.123] launching 'dummy-entry'
+[16:15:37.126] compositor: executing 'dummy-entry' failed: No such file or directory
+[16:15:37.127] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[16:15:37.127] Client AppList caps version:4
+[16:15:37.127] Client AppList client language id: en_GB
+[16:15:37.127] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[16:15:37.128] Client ExecOrder program terminated
+[16:15:37.128] dummy-entry exited with status 255
+[16:15:37.704] !!!cursor role is added after creation - WindowId:0x3
+[16:15:37.863] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[16:15:37.912] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x1
+[16:15:37.913] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[16:28:11.249] rdp_rail_idle_handler is called on peer_ctx:0x6264cffc3390
+[16:32:01.989] rdp_rail_wake_handler is called on peer_ctx:0x6264cffc3390
+[16:47:53.946] unable to checkDescriptor for 0x6264cfd26260
+[16:47:53.997] app_list_monitor_thread: stopRdpNotifyEvent is signalled. 1
+[16:47:53.997] rdp_rail_notify_app_list(): rdp_peer 0x6264cffc3390
+[16:47:53.997]     inSync: 0
+[16:47:53.997]     syncStart: 0
+[16:47:53.997]     syncEnd: 0
+[16:47:53.997]     newAppId: 0
+[16:47:53.997]     deleteAppId: 0
+[16:47:53.997]     deleteAppProvider: 1
+[16:47:53.997]     associateWindowId: 0
+[16:47:53.997]     appId: (null)
+[16:47:53.997]     appGroup: (null)
+[16:47:53.997]     appExecPath: (null)
+[16:47:53.997]     appWorkingDir: (null)
+[16:47:53.997]     appDesc: (null)
+[16:47:53.997]     appIcon: (nil)
+[16:47:53.997]     appProvider: Ubuntu
+[16:47:53.997]     appWindowId: 0x0
+[16:47:54.335] Client HandShake buildNumber:26200
+[16:47:54.336] Client: ClientStatus:0x3f5
+[16:47:54.346] Server AppList caps version:4
+[16:47:54.346]     appListProviderName:Ubuntu
+[16:47:54.346]     appListProviderUniqueId:00000001-FACB-11E6-BD58-64006A7986D3
+[16:47:54.367] Client: gfxredir selected caps: version:0x2000
+[16:47:54.378] xf_peer_adjust_monitor_layout:
+[16:47:54.378]   DesktopWidth:2880, DesktopHeight:1800
+[16:47:54.378]   UseMultimon:0
+[16:47:54.378]   ForceMultimon:0
+[16:47:54.378]   MonitorCount:0
+[16:47:54.378]   HasMonitorAttributes:0
+[16:47:54.378]   HiDefRemoteApp:1
+[16:47:54.378] disp_monitor_sanity_check_layout:---INPUT---
+[16:47:54.378] 	rdpMonitor[0]: x:0, y:0, width:2880, height:1800, is_primary:1
+[16:47:54.378] 	rdpMonitor[0]: physicalWidth:289, physicalHeight:186, orientation:0
+[16:47:54.378] 	rdpMonitor[0]: desktopScaleFactor:175, deviceScaleFactor:180
+[16:47:54.378] 	rdpMonitor[0]: scale:1, client scale :1.00
+[16:47:54.378] rdp_rail_wake_handler is called on peer_ctx:0x6264cffc3390
+[16:47:54.378] kbd_layout:0x409 kbd_type:0x4 kbd_subType:0x0 kbd_functionKeys:0xc
+[16:47:54.378] convert_rdp_keyboard_to_xkb_rule_names: matching model=pc105 layout=us variant=(null) options=(null)
+[16:47:54.387] Client ExecOrder:0x00000008, Program:dummy-entry, WorkingDir:(null), RemoteApplicationArguments:(null)
+[16:47:54.387] Client ExecOrder launching dummy-entry
+[16:47:54.387] launching 'dummy-entry'
+[16:47:54.392] compositor: executing 'dummy-entry' failed: No such file or directory
+[16:47:54.392] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[16:47:54.392] Client AppList caps version:4
+[16:47:54.392] Client AppList client language id: en_GB
+[16:47:54.392] app_list_monitor_thread: startRdpNotifyEvent is signalled. 0 - en_GB
+[16:47:54.393] Client ExecOrder program terminated
+[16:47:54.393] dummy-entry exited with status 255
+[16:47:54.976] Pulse Audio Sink listener socket on /mnt/wslg/PulseAudioRDPSink
+[16:47:55.022] Client: ClientGetAppidReq: pid:825 appId:giverny WindowId:0x2
+[16:47:55.022] Translated workarea:(0,0)-(2880,1716) at rdp-0:(0,0)-(2880,1800)
+[16:47:55.120] !!!cursor role is added after creation - WindowId:0x4

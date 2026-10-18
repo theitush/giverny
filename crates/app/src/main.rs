@@ -3,11 +3,14 @@
 mod capture;
 mod chrome;
 mod claude_watch;
+mod codex_watch;
 mod desktop;
 mod icon;
 mod keymap;
 mod oom;
 mod overlays;
+mod paste_image;
+mod prompt_bar;
 mod rail;
 mod settings_ui;
 mod splash;
@@ -15,14 +18,17 @@ mod taskbar;
 mod titlebar;
 mod translucency;
 mod update;
+mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg_cursor;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod wslg_watchdog;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,13 +37,14 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, Modifiers};
 use giverny_claude::wsl;
 use giverny_core::config;
+use giverny_core::history;
 use giverny_core::state::{self, Paths, SaveState};
 use giverny_core::tabs::{CategoryId, TabId, Workspace};
 use giverny_term::proxy::TabEvent;
 use giverny_term::pty::{self, GridSize, SpawnCfg};
 use giverny_term::render::theme::Theme;
 use giverny_term::session::TermSession;
-use giverny_term::tee::TeeEvent;
+use giverny_term::tee::{PromptMark, TeeEvent};
 use giverny_term::widget::{DEFAULT_FONT_SIZE, RenderShared, TabView};
 
 /// Where an attached agent's tab belongs.
@@ -213,18 +220,31 @@ fn remember_env_accounts(paths: &Paths, cfg: &mut config::Config) {
 ///
 /// `GIVERNY_RENDERER=glow|wgpu` decides instead, which is also how the retry
 /// below re-launches itself.
-fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
+///
+/// Also returns the wgpu backends to ask for, where eframe's own choice is the
+/// wrong one (see `preferred_backends`).
+fn pick_renderer(gpu_gl: bool) -> (eframe::Renderer, Option<eframe::wgpu::Backends>) {
     match std::env::var("GIVERNY_RENDERER").as_deref() {
         Ok("glow" | "gl" | "opengl") => {
             tracing::info!("renderer: OpenGL (GIVERNY_RENDERER)");
-            eframe::Renderer::Glow
+            (eframe::Renderer::Glow, None)
         }
-        Ok("wgpu") => eframe::Renderer::Wgpu,
+        Ok("wgpu") => (eframe::Renderer::Wgpu, preferred_backends()),
         // OpenGL is known to reach the GPU; wgpu is not asked, because on
         // WSLg its only Vulkan driver is lavapipe (see `wslg`).
-        _ if gpu_gl => eframe::Renderer::Glow,
+        _ if gpu_gl => (eframe::Renderer::Glow, None),
         _ => {
-            let adapter = wgpu_adapter();
+            // The preferred backends only if they reach a GPU; otherwise
+            // whatever eframe would have picked.
+            let preferred = preferred_backends().and_then(|backends| {
+                wgpu_adapter(Some(backends))
+                    .filter(|info| info.device_type != eframe::wgpu::DeviceType::Cpu)
+                    .map(|info| (backends, info))
+            });
+            let (backends, adapter) = match preferred {
+                Some((backends, info)) => (Some(backends), Some(info)),
+                None => (None, wgpu_adapter(None)),
+            };
             let renderer = renderer_for(adapter.as_ref());
             match (&adapter, renderer) {
                 (None, _) => tracing::info!("renderer: OpenGL, wgpu found no adapter"),
@@ -240,9 +260,29 @@ fn pick_renderer(gpu_gl: bool) -> eframe::Renderer {
                     info.device_type
                 ),
             }
-            renderer
+            (renderer, backends)
         }
     }
+}
+
+/// The fixes to offer if WSLg is in its slow, no-shared-memory mode: the one
+/// any shell can run, then the administrator one if that was not enough.
+/// Logged here; the rail says them to the user.
+fn wslg_slow_mode() -> Option<[&'static str; 2]> {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg::slow_mode() {
+        tracing::warn!(
+            "WSLg started without its shared memory with Windows (weston.log: use_gfxredir = 0): \
+             every frame goes over RDP as a bitmap and typing will lag. \
+             Fix: `{}` in any PowerShell or cmd (no administrator needed); still slow \
+             after that, `{}` in PowerShell as administrator. Either ends all of WSL, \
+             this window and its Claude sessions included; reopen Giverny after",
+            wslg::SLOW_MODE_FIX,
+            wslg::SLOW_MODE_FIX_ADMIN
+        );
+        return Some([wslg::SLOW_MODE_FIX, wslg::SLOW_MODE_FIX_ADMIN]);
+    }
+    None
 }
 
 /// Whether OpenGL has been pointed at a GPU that wgpu cannot reach: WSLg's
@@ -255,6 +295,12 @@ fn gpu_opengl() -> bool {
             tracing::info!("renderer: OpenGL on the GPU through WSLg's d3d12 driver ({renderer})");
             return true;
         }
+        wslg::Gpu::Inherited => {
+            tracing::info!(
+                "renderer: OpenGL on the GPU through WSLg's d3d12 driver (GALLIUM_DRIVER=d3d12 inherited)"
+            );
+            return true;
+        }
         wslg::Gpu::Unavailable(why) => {
             tracing::warn!(
                 "WSLg's d3d12 GL driver is unavailable, drawing may fall back to the CPU: {why}"
@@ -264,10 +310,35 @@ fn gpu_opengl() -> bool {
     false
 }
 
-/// The adapter eframe's default wgpu setup would choose, asked for the same
-/// way (same backends, same power preference) but without a window yet.
-fn wgpu_adapter() -> Option<eframe::wgpu::AdapterInfo> {
-    let setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+/// The wgpu backends to draw with where eframe's default is the wrong one,
+/// `None` where it is right.
+///
+/// On Windows wgpu lists Vulkan before DirectX 12, and eframe takes the first
+/// GPU adapter it finds. Intel's Vulkan driver presents a window badly: it
+/// flickers as the mouse moves over it, after it opens and again after it has
+/// been hidden for a few minutes, then settles. DirectX 12 is Windows'
+/// own path to the screen and does not. `WGPU_BACKEND` still decides.
+fn preferred_backends() -> Option<eframe::wgpu::Backends> {
+    preferred_backends_for(cfg!(windows), std::env::var_os("WGPU_BACKEND").is_some())
+}
+
+fn preferred_backends_for(windows: bool, env_chose: bool) -> Option<eframe::wgpu::Backends> {
+    (windows && !env_chose).then_some(eframe::wgpu::Backends::DX12)
+}
+
+/// eframe's default wgpu setup, on `backends` instead of its own if given.
+fn wgpu_setup(backends: Option<eframe::wgpu::Backends>) -> eframe::egui_wgpu::WgpuSetupCreateNew {
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    if let Some(backends) = backends {
+        setup.instance_descriptor.backends = backends;
+    }
+    setup
+}
+
+/// The adapter that wgpu setup would choose, asked for the same way (same
+/// backends, same power preference) but without a window yet.
+fn wgpu_adapter(backends: Option<eframe::wgpu::Backends>) -> Option<eframe::wgpu::AdapterInfo> {
+    let setup = wgpu_setup(backends);
     let instance = eframe::wgpu::Instance::new(setup.instance_descriptor);
     let options = eframe::wgpu::RequestAdapterOptions {
         power_preference: setup.power_preference,
@@ -371,6 +442,9 @@ fn release_own_console() {}
 
 fn scrub_inherited_claude_markers() {
     const MARKERS: &[&str] = &[
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_TOOL_CALL_ID",
         "CLAUDECODE",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_ENTRYPOINT",
@@ -395,22 +469,56 @@ fn scrub_inherited_claude_markers() {
         return;
     }
     for key in &inherited {
-        // SAFETY: single-threaded here — called first thing in main.
+        // SAFETY: single-threaded here — called before the window, or
+        // anything else, starts a thread.
         unsafe { std::env::remove_var(key) };
     }
     eprintln!(
-        "giverny: cleared {} inherited Claude session marker(s) so tabs start clean",
+        "giverny: cleared {} inherited agent session marker(s) so tabs start clean",
         inherited.len()
     );
 }
 
-fn main() -> eframe::Result {
-    scrub_inherited_claude_markers();
+/// `giverny --help`, and what an unknown command prints to stderr.
+const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
+     USAGE:\n  giverny            launch the terminal\n  \
+     giverny doctor     diagnose Claude and Codex integration\n  \
+     giverny welcome [from-version]\n                     \
+     print the welcome screen\n  \
+     giverny update     check for a newer release\n  \
+     giverny install-desktop [--remove]\n                     \
+     install the desktop entry + icons (needed for the\n                     \
+     taskbar icon on Wayland)\n  \
+     giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
+     giverny relay      (internal) agent hook entrypoint\n  \
+     giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+     FLAGS:\n  -V, --version  print the version\n  \
+     -h, --help     print this help";
 
+/// Is `arg`, the first argument, a command this build does not have?
+///
+/// The window takes no arguments, so anything past the known subcommands
+/// used to be ignored and the window opened anyway. A bare word is refused:
+/// it is a command, likely one newer than this binary. Left to open the
+/// window as before: flags (a launcher may add some, e.g. macOS's `-psn_…`),
+/// and anything that reads as a path — one that `exists`, or is spelled with
+/// a separator, `.` or `~` — in case a launcher or file manager hands one over.
+fn is_unknown_subcommand(arg: &str, exists: bool) -> bool {
+    !arg.is_empty() && !arg.starts_with(['-', '.', '~']) && !arg.contains(['/', '\\']) && !exists
+}
+
+fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
             giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            return Ok(());
+        }
+        Some("codex-hooks") => {
+            if let Err(err) = codex_hooks_cli() {
+                eprintln!("giverny: {err:#}");
+                std::process::exit(1);
+            }
             return Ok(());
         }
         Some("statusline") => {
@@ -454,28 +562,25 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!(
-                "giverny — a native terminal built around Claude Code\n\n\
-                 USAGE:\n  giverny            launch the terminal\n  \
-                 giverny doctor     diagnose Claude integration\n  \
-                 giverny welcome [from-version]\n                     \
-                 print the welcome screen\n  \
-                 giverny update     check for a newer release\n  \
-                 giverny install-desktop [--remove]\n                     \
-                 install the desktop entry + icons (needed for the\n                     \
-                 taskbar icon on Wayland)\n  \
-                 giverny relay      (internal) Claude Code hook entrypoint\n  \
-                 giverny statusline (internal) Claude Code statusline entrypoint\n\n\
-                 FLAGS:\n  -V, --version  print the version\n  \
-                 -h, --help     print this help"
-            );
+            println!("{USAGE}");
             return Ok(());
+        }
+        // A word this build does not know: a typo, or a subcommand added
+        // since it was built. It must not fall through to opening a window,
+        // which would also set up the Claude accounts from this binary.
+        Some(arg) if is_unknown_subcommand(arg, Path::new(arg).exists()) => {
+            eprintln!("giverny: unknown command '{arg}'\n\n{USAGE}");
+            std::process::exit(2);
         }
         _ => {}
     }
 
-    // Past every subcommand: what follows is the window, and a console that
-    // exists only because Windows made one has nothing left to show.
+    // Past every subcommand: what follows is the window. Only its tabs need
+    // the markers gone; `relay` and `statusline` are run by Claude Code with
+    // them set, on every hook and refresh, and have nothing to clean.
+    scrub_inherited_claude_markers();
+    // A console that exists only because Windows made one has nothing left
+    // to show.
     release_own_console();
 
     tracing_subscriber::fmt()
@@ -484,6 +589,11 @@ fn main() -> eframe::Result {
                 .unwrap_or_else(|_| "giverny=info,warn".into()),
         )
         .init();
+
+    #[cfg(unix)]
+    if defer_to_running() {
+        return Ok(());
+    }
 
     if oom::at_risk() {
         tracing::warn!(
@@ -509,9 +619,12 @@ fn main() -> eframe::Result {
         && std::env::var_os("GIVERNY_NO_X11").is_none()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let mut wayland_stashed = None;
+    // Put back for the restart on Wayland below, which only Unix has.
+    #[cfg(unix)]
+    let wayland_stashed = try_x11
+        .then(|| std::env::var_os("WAYLAND_DISPLAY"))
+        .flatten();
     if try_x11 {
-        wayland_stashed = std::env::var_os("WAYLAND_DISPLAY");
         // SAFETY: no threads yet — this runs before the event loop.
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
         if wslg_x11 {
@@ -527,7 +640,7 @@ fn main() -> eframe::Result {
     // Reopen at the size the user left it. Read before the window exists, so
     // it can't be applied as a resize the user sees happen.
     let gpu_gl = gpu_opengl();
-    let renderer = pick_renderer(gpu_gl);
+    let (renderer, wgpu_backends) = pick_renderer(gpu_gl);
     let layout = state::load_layout(&paths);
     // The interface zoom the user last left, or — on a first run only — the
     // display's own scale where the platform hides it from winit (#62). Not
@@ -539,13 +652,14 @@ fn main() -> eframe::Result {
         .flatten();
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     let display_zoom: Option<f32> = None;
-    if let Some(z) = display_zoom {
-        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
-    }
-    let zoom = layout.zoom().or(display_zoom);
     // A first window scaled with its contents, so they have the room the
     // default size was chosen for.
-    let first_size = [1280.0, 820.0].map(|v| v * display_zoom.unwrap_or(1.0));
+    let mut first_size = [1280.0, 820.0];
+    if let Some(z) = display_zoom {
+        tracing::info!("WSLg: display scale {z} is not visible to X11 clients; zooming to match");
+        first_size = first_size.map(|v| v * z);
+    }
+    let zoom = layout.zoom().or(display_zoom);
     // WSLg frames an X11 window with Weston's own caption — a 1x-scale strip
     // with Windows-95 buttons inside a thick black band — and there is no way
     // to have Windows draw one instead, so there Giverny draws its own (#69).
@@ -579,11 +693,14 @@ fn main() -> eframe::Result {
     if frameless {
         titlebar::probe_work_areas();
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         renderer,
         viewport,
         ..Default::default()
     };
+    if let Some(backends) = wgpu_backends {
+        options.wgpu_options.wgpu_setup = wgpu_setup(Some(backends)).into();
+    }
     // A hook rather than `catch_unwind`: wgpu's failure panics, and then
     // panics again on the way out, and a panic while panicking aborts the
     // process on the spot — there is nothing left to catch. A hook runs
@@ -648,6 +765,116 @@ fn main() -> eframe::Result {
     result
 }
 
+/// When, after a second launch asked, this window asks to come forward,
+/// counted from the request: for as long as it is not yet focused, and
+/// covering the seconds WSLg takes to bring its windows back on Windows' side.
+#[cfg(unix)]
+const COME_FORWARD_AT: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_secs(3),
+    Duration::from_secs(6),
+];
+
+/// One second launch's request to come forward, in progress.
+#[cfg(unix)]
+struct ComingForward {
+    since: Instant,
+    next: Instant,
+    /// How many of [`COME_FORWARD_AT`] have been sent.
+    asked: usize,
+    /// Unmapped to be mapped again, and the inner corner to put it back at.
+    unmapped: Option<Option<egui::Pos2>>,
+    /// Mapped again, and still to be put back here.
+    move_to: Option<egui::Pos2>,
+    /// Asked by the WSLg watchdog, not by a launch: mapped again once, so
+    /// that Windows shows the window it lost, without taking the focus.
+    quiet: bool,
+}
+
+#[cfg(unix)]
+impl ComingForward {
+    fn new() -> Self {
+        let now = Instant::now();
+        ComingForward {
+            since: now,
+            next: now,
+            asked: 0,
+            unmapped: None,
+            move_to: None,
+            quiet: false,
+        }
+    }
+
+    /// One remap for the WSLg watchdog.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    fn quiet() -> Self {
+        ComingForward {
+            quiet: true,
+            ..Self::new()
+        }
+    }
+}
+
+/// Set to open a second window although a Giverny is running. That window
+/// gets no hook events (the running one has the relay); a window of its own
+/// wants its own `XDG_RUNTIME_DIR` instead.
+#[cfg(unix)]
+const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
+
+/// One Giverny per relay socket: when one is already running, ask it to
+/// come to the front instead of opening a second window that would get none
+/// of the hooks. Returns whether this launch should end here.
+///
+/// A test instance with its own `XDG_RUNTIME_DIR` has its own socket, and is
+/// never the same Giverny as the one the user runs. One started with
+/// `GIVERNY_NO_ACCOUNT_SETUP` is a side window by definition: a build being
+/// tried out next to the installed one, which it must not hand over to.
+#[cfg(unix)]
+fn defer_to_running() -> bool {
+    use giverny_claude::hooks::{self, Running};
+    if let Some(var) = [SECOND_WINDOW_ENV, claude_watch::NO_ACCOUNT_SETUP_ENV]
+        .into_iter()
+        .find(|var| std::env::var_os(var).is_some())
+    {
+        tracing::info!("{var} is set: opening a window whatever else runs");
+        return false;
+    }
+    match hooks::ask_running_to_raise(Duration::from_secs(4)) {
+        Running::Nobody => false,
+        Running::Raised { pid } => {
+            let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            tracing::info!("Giverny is already running{pid}; it was asked to the front");
+            eprintln!("giverny: already running{pid} — brought its window to the front");
+            true
+        }
+        Running::Silent(holder) => {
+            tracing::warn!(
+                "{holder} holds the relay at {} but did not answer (hung, or older \
+                 than this build); opening a window anyway",
+                hooks::socket_path().display()
+            );
+            false
+        }
+    }
+}
+
+/// Does this window come to the front only by being mapped again? An X11
+/// window on WSLg: its Weston does nothing with `_NET_ACTIVE_WINDOW`. X11 is the
+/// default there, chosen by taking `WAYLAND_DISPLAY` away before it opens.
+#[cfg(unix)]
+fn raises_by_remap() -> bool {
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    {
+        wslg::is_wslg() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(any(target_os = "macos", target_os = "android"))]
+    {
+        false
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameTarget {
     Tab(TabId),
@@ -674,7 +901,11 @@ pub enum Action {
     SetCategoryColor(CategoryId, usize),
     MoveTab(TabId, CategoryId),
     InstallHooks,
+    CodexHooks(giverny_codex::Target, bool),
+    RefreshCodexUsage,
+    ConfirmCodexResume(TabId),
     DismissHooksBanner,
+    DismissWslgSlow,
     SetCategoryProfile(CategoryId, Option<PathBuf>),
     /// Jump to the next tab where Claude needs attention (then done-unseen).
     JumpAttention,
@@ -730,6 +961,26 @@ struct Limited {
     session_gone: bool,
 }
 
+/// An install running in its tab, from the update button until the binary
+/// lands or the installer stops without replacing it.
+pub struct UpdateJob {
+    pub tab: TabId,
+    started: Instant,
+    /// Something has run in the tab's shell. Until then an empty foreground
+    /// is the command not having been typed yet, not the install having ended.
+    seen_running: bool,
+    /// When the new binary appeared on disk.
+    landed: Option<Instant>,
+}
+
+/// How long the installer gets to finish after the binary lands (the desktop
+/// entry, the PATH note) before Giverny restarts into the new version anyway.
+const UPDATE_FINISH_GRACE: Duration = Duration::from_secs(30);
+
+/// How long an install that was never seen running gets before it counts as
+/// over: one that fails at once (no network) finishes between two looks.
+const UPDATE_UNSEEN_GRACE: Duration = Duration::from_secs(10);
+
 /// What one tab needs to open: the shell, the account it is on (named the
 /// way Giverny stores accounts), and the environment that reaches the shell.
 struct TabShape {
@@ -747,6 +998,8 @@ struct TabShape {
 pub struct TabRuntime {
     pub session: Option<TermSession>,
     pub view: TabView,
+    /// Which prompt the bar over the terminal pins, kept between frames.
+    pub prompt_bar: prompt_bar::Owner,
 }
 
 /// Rail width limits: narrow enough to be a strip, wide enough for long
@@ -836,7 +1089,12 @@ pub struct App {
     state_dirty: bool,
     last_save: Instant,
     pub claude: claude_watch::ClaudeWatch,
+    pub codex: codex_watch::CodexWatch,
     pub hooks_banner_dismissed: bool,
+    /// WSLg lost its shared memory with Windows and the window lags:
+    /// the commands that fix it, the no-administrator one first, said in the
+    /// rail until dismissed.
+    pub wslg_slow: Option<[&'static str; 2]>,
     /// Deferred automated actions (cwd fix, auto-resume) with due times.
     pending_inject: Vec<(Instant, TabId, Inject)>,
     pub palette: Option<overlays::PaletteState>,
@@ -851,6 +1109,14 @@ pub struct App {
     /// A Ctrl+Tab walk in progress: where it started, the recency order it
     /// snapshotted, and how far into it the user has stepped.
     switcher: Option<Switcher>,
+    /// A Ctrl+PageUp/PageDown walk in progress: Ctrl has been held since the
+    /// last press. Like `switcher`, it keeps a tab the walk passes over from
+    /// starting until Ctrl comes up; unlike it, it records nothing, since
+    /// rail-order cycling commits each step as it goes.
+    cycling: bool,
+    /// What the not-started tab a walk is on shows meanwhile: its saved
+    /// scrollback, read once when the walk reaches it.
+    walk_preview: Option<walk::Preview>,
     /// Wayland file drops, which winit 0.30 cannot deliver.
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     dnd: Option<wayland_dnd::DragDrop>,
@@ -858,11 +1124,11 @@ pub struct App {
     /// Wayland, where we track the drag ourselves and so know the position;
     /// winit's X11 drops report no coordinates at all.
     pub drag_hover: Option<egui::Pos2>,
+    /// A screenshot pasted with Ctrl+V (Cmd+V): read, saved and typed in as
+    /// a path.
+    paste_image: paste_image::ImagePaste,
     /// Tab rows as painted this frame, so a drag can be aimed at one.
     pub row_rects: Vec<(egui::Rect, TabId)>,
-    /// Every live claude session started before hooks/statusline were
-    /// installed, so none of them report anything (recomputed periodically).
-    pub stale_sessions: bool,
     /// Repository root per directory, so the sweep over every tab is one
     /// filesystem walk per distinct directory rather than per tab.
     repo_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -876,6 +1142,12 @@ pub struct App {
     /// How many tabs wanted you at the last frame, so the taskbar is only
     /// told when that changes.
     attention: usize,
+    /// Coming to the front for a second launch, still (`come_forward`).
+    #[cfg(unix)]
+    coming_forward: Option<ComingForward>,
+    /// An X11 window on WSLg, which comes to the front only as a new window.
+    #[cfg(unix)]
+    raise_by_remap: bool,
     /// The window has no decorations and draws its own caption (#69).
     frameless: bool,
     /// The window was opened see-through and can show it, so
@@ -886,11 +1158,36 @@ pub struct App {
     /// That window's cursors, sized to the display (#100).
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     cursors: Option<wslg_cursor::Cursors>,
+    /// Brings the window back when WSLg loses it after a sleep.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    wslg_watchdog: Option<wslg_watchdog::Handle>,
     /// Tabs whose session stopped because the account ran out of limit.
     limited: HashMap<TabId, Limited>,
     /// Each tab's Claude state as of the last frame: stopping is a transition,
     /// not a state, and only the transition is worth looking at a screen for.
     was: HashMap<TabId, claude_watch::ClaudeState>,
+    /// Tabs where something finished while you were on another tab, until
+    /// you look: a Claude turn (`DoneUnseen`, noted each
+    /// frame) or a plain shell's command. Apart from Claude's state, because
+    /// it outlives it: a turn you have not seen stays unseen when the agent
+    /// starts working again, and the rail wears its tick beside the spinner.
+    unseen_done: HashSet<TabId>,
+    /// Whether each tab's shell had a command in front at the last
+    /// foreground poll (`track_foreground`), as seen this run: the persisted
+    /// `Tab::foreground` is a restored tab's last command, not a live one,
+    /// and reading its going away as a command ending would tick every tab a
+    /// restart brings back.
+    fg_running: HashMap<TabId, bool>,
+    /// Tabs whose shell said OSC 133 `C` (a command's output begins) and not
+    /// yet `D`: a command running, seen the moment it starts and ends where
+    /// the shell marks its prompts, which the two-second foreground poll
+    /// would miss for an `ls`.
+    osc_running: HashSet<TabId>,
+    /// Each tab's input count (`Session::input_seq`) when its last command
+    /// finished. A finish with nothing typed since is none you ran: the rc
+    /// file's own `$(dircolors)` as a shell starts, a prompt hook's helper
+    /// caught by the poll — it would tick a tab nobody touched.
+    finish_input: HashMap<TabId, u64>,
     /// The welcome screen owed to this launch, until the tab for it opens.
     welcome: Option<splash::Welcome>,
     /// A newer release, once the background check finds one.
@@ -900,8 +1197,10 @@ pub struct App {
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
-    update_ran: bool,
+    pub update_job: Option<UpdateJob>,
     pub update_installed: bool,
+    /// The last install ended without replacing the binary; its tab says why.
+    pub update_stalled: bool,
     /// Theme-derived colours for Giverny's own chrome.
     pub chrome: chrome::Chrome,
     pub settings: Option<settings_ui::SettingsState>,
@@ -921,6 +1220,9 @@ pub struct App {
     /// When a clock-driven theme last looked at the clock.
     theme_tick: std::time::Instant,
     last_cfg_check: Instant,
+    /// The config could not be parsed at startup, so the accounts were not
+    /// set up from it; the first reload that parses does that.
+    accounts_unset: bool,
 }
 
 /// Automated per-tab injections. All stand down once the user has typed.
@@ -952,6 +1254,36 @@ fn start_wayland_dnd(cc: &eframe::CreationContext<'_>) -> Option<wayland_dnd::Dr
         surface.surface.as_ptr(),
         move || wake.request_repaint(),
     ))
+}
+
+/// Can account setup follow this config? Not when a value it reads — the
+/// `[claude]` section — is one that did not fit and was stood in for.
+fn accounts_readable(parsed: &config::Parsed) -> bool {
+    !parsed.invalid_under("claude")
+}
+
+/// Bring every account in line with the config at startup: auto mode.
+///
+/// Not when the config could not be parsed, or its `[claude]` values could
+/// not (`config_read` false). The app then runs on defaults there, and
+/// following those would rewrite accounts against what the user configured.
+/// Once the file parses again, the hot reload applies what it says. Hook
+/// paths and the status line read nothing from the config, so
+/// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
+fn set_up_accounts(
+    claude: &mut claude_watch::ClaudeWatch,
+    cfg: &config::Config,
+    config_read: bool,
+) {
+    if !config_read {
+        tracing::warn!(
+            "config.toml could not be parsed: Claude account settings left as they are until it is fixed"
+        );
+        return;
+    }
+    if cfg.claude.auto_mode {
+        claude.ensure_auto_mode();
+    }
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -1165,7 +1497,21 @@ impl App {
         see_through: bool,
     ) -> Self {
         let paths = Paths::default_dirs();
-        let mut cfg = config::load(paths.base());
+        // A config that cannot be parsed runs on defaults, but those are not
+        // what the user chose, so nothing is written into the accounts from
+        // them (see `set_up_accounts`). Nor when only a value account setup
+        // reads is unusable: one bad value is otherwise just left out.
+        let (mut cfg, config_read) =
+            match config::load_checked(paths.base(), &config::Config::default()) {
+                Ok(parsed) => {
+                    let read = accounts_readable(&parsed);
+                    (parsed.config, read)
+                }
+                Err(err) => {
+                    tracing::error!("config.toml ignored ({err}); running on defaults");
+                    (config::Config::default(), false)
+                }
+            };
         remember_env_accounts(&paths, &mut cfg);
         let theme = theme_for(&cfg.theme.name);
         let family = (!cfg.font.family.is_empty()).then_some(cfg.font.family.as_str());
@@ -1252,6 +1598,29 @@ impl App {
         );
         // Events spooled while the app was closed: keep session captures.
         for msg in &spooled {
+            if msg.provider == "codex" {
+                if cfg.codex.enabled
+                    && msg.hook_event() == Some("SessionStart")
+                    && let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg)
+                    && let Some(tab) = ws.tab_mut(id)
+                    && let (Some(sid), Some(home), Some(cwd)) = (
+                        msg.session_id(),
+                        msg.config_dir.as_ref(),
+                        msg.event.get("cwd").and_then(|v| v.as_str()),
+                    )
+                    && giverny_codex::valid_session_id(sid)
+                {
+                    tab.agent_session = Some(giverny_core::agent::AgentSession {
+                        provider: giverny_core::agent::AgentKind::Codex,
+                        id: sid.into(),
+                        home: home.into(),
+                        cwd: cwd.into(),
+                        wsl_distro: msg.wsl_distro.clone().or_else(|| tab.wsl_distro.clone()),
+                    });
+                    tab.claude_session = None;
+                }
+                continue;
+            }
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(msg) else {
                 continue;
             };
@@ -1274,6 +1643,23 @@ impl App {
         // Asked before the workspace moves into the app: a restored tab is how
         // an upgrade is told apart from a first run.
         let welcome = splash::due(paths.base(), !ws.tabs.is_empty());
+        // One watchdog per WSLg: the Giverny holding the relay socket. A
+        // second window, or a side instance trying out a build, must not end
+        // the msrdc the first one's window lives in, nor end it twice.
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        let wslg_watchdog = (claude.relay_listening()
+            && std::env::var_os(claude_watch::NO_ACCOUNT_SETUP_ENV).is_none())
+        .then(|| {
+            let ctx = cc.egui_ctx.clone();
+            wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
+                ctx.request_repaint()
+            })
+        })
+        .flatten();
+        let codex = codex_watch::CodexWatch::new(
+            &cfg.codex,
+            Some(paths.base().join("state/codex-usage.json")),
+        );
         let mut app = App {
             shared,
             ws,
@@ -1286,7 +1672,9 @@ impl App {
             state_dirty: false,
             last_save: Instant::now(),
             claude,
+            codex,
             hooks_banner_dismissed: false,
+            wslg_slow: wslg_slow_mode(),
             pending_inject: Vec::new(),
             palette: None,
             session_picker: None,
@@ -1294,12 +1682,18 @@ impl App {
             dragging: None,
             dragging_category: None,
             switcher: None,
+            cycling: false,
+            walk_preview: None,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
             dnd: start_wayland_dnd(cc),
             drag_hover: None,
+            paste_image: paste_image::ImagePaste::new(),
             row_rects: Vec::new(),
-            stale_sessions: false,
             attention: 0,
+            #[cfg(unix)]
+            coming_forward: None,
+            #[cfg(unix)]
+            raise_by_remap: raises_by_remap(),
             frameless,
             see_through,
             maximize,
@@ -1307,8 +1701,14 @@ impl App {
             cursors: frameless
                 .then(|| wslg_cursor::Cursors::new(cc, wslg::desktop_scale()))
                 .flatten(),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            wslg_watchdog,
             limited: HashMap::new(),
             was: HashMap::new(),
+            unseen_done: HashSet::new(),
+            fg_running: HashMap::new(),
+            osc_running: HashSet::new(),
+            finish_input: HashMap::new(),
             repo_cache: HashMap::new(),
             repo_rx: None,
             wsl_cwd_rx: None,
@@ -1318,8 +1718,9 @@ impl App {
             welcome,
             update_dismissed: false,
             exe_mtime: update::binary_mtime(),
-            update_ran: false,
+            update_job: None,
             update_installed: false,
+            update_stalled: false,
             chrome,
             settings: None,
             keys_overlay: None,
@@ -1332,6 +1733,7 @@ impl App {
             theme_tick: std::time::Instant::now(),
             cfg,
             last_cfg_check: Instant::now(),
+            accounts_unset: !config_read,
         };
         if let Some(z) = zoom {
             cc.egui_ctx.set_zoom_factor(z);
@@ -1339,9 +1741,7 @@ impl App {
         }
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
-        if app.cfg.claude.auto_mode {
-            app.claude.ensure_auto_mode();
-        }
+        set_up_accounts(&mut app.claude, &app.cfg, config_read);
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -1357,6 +1757,15 @@ impl App {
         // otherwise.
         app.save_state();
         app
+    }
+
+    /// A brand-new tab. Tab ids start over when the state file is lost, so
+    /// a history file can outlive its tab (one whose shell outlasted the
+    /// close, say): a new tab with that id starts without it.
+    fn new_tab(&mut self, category: CategoryId) -> TabId {
+        let id = self.ws.add_tab(category);
+        history::remove(&self.paths, id);
+        id
     }
 
     /// Write one tab's scrollback, skipping the write when the screen has not
@@ -1444,7 +1853,7 @@ impl App {
                     .or_else(|| self.ws.active_tab().and_then(|t| t.cwd.clone()))
                     .or_else(dirs::home_dir)
                     .unwrap_or_else(|| PathBuf::from("/"));
-                let id = self.ws.add_tab(category);
+                let id = self.new_tab(category);
                 self.ws.tab_mut(id).unwrap().cwd = Some(cwd);
                 self.spawn_session(ctx, id, None);
                 self.reveal_terminal();
@@ -1456,13 +1865,35 @@ impl App {
                 self.rename_needs_focus = true;
             }
             Action::CloseTab(id) => {
+                // Mid Ctrl+Tab walk, the tab it started from is not on the
+                // recent stack yet. Commit the walk first, so closing the
+                // previewed tab goes back to it.
+                self.end_switch();
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
-                    // Join off the UI thread; the loop exits quickly.
-                    std::thread::spawn(move || session.shutdown());
+                    // Join off the UI thread; the loop exits quickly. The
+                    // history goes once the shell has: zsh writes its file
+                    // on the SIGHUP that shutdown sends, so removing it
+                    // first would only see it written again.
+                    let paths = self.paths.clone();
+                    std::thread::spawn(move || {
+                        // Longer than the 500 ms an app exit allows: this
+                        // thread holds nothing up, and a shell that is slow
+                        // to go would write its file after the removal.
+                        session.shutdown_within(Duration::from_secs(10));
+                        history::remove(&paths, id);
+                    });
+                } else {
+                    history::remove(&self.paths, id);
                 }
                 self.ws.close_tab(id);
+                // The tab it lands on is now in view, as if it was clicked:
+                // a "done" mark on it has been seen.
+                if let Some(active) = self.ws.active {
+                    self.refresh_tab_info(active);
+                    self.mark_seen(active);
+                }
                 state::remove_snapshot(&self.paths, id);
                 self.snapshots.remove(&id);
                 self.focus_terminal = true;
@@ -1471,16 +1902,18 @@ impl App {
                 self.end_switch();
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
-                self.claude.mark_viewed(id);
+                self.mark_seen(id);
                 self.reveal_terminal();
             }
             Action::SwitchRecent(delta) => self.switch_recent(delta),
             Action::Cycle(delta) => {
                 self.end_switch();
+                // Held until Ctrl comes up, which the end of `update` sees.
+                self.cycling = true;
                 self.ws.cycle_active(delta);
                 if let Some(id) = self.ws.active {
                     self.refresh_tab_info(id);
-                    self.claude.mark_viewed(id);
+                    self.mark_seen(id);
                 }
                 self.reveal_terminal();
             }
@@ -1541,14 +1974,29 @@ impl App {
             }
             Action::Respawn(id) => {
                 self.spawn_session(ctx, id, None);
-                self.queue_resume(id);
+                self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
             Action::InstallHooks => match self.claude.install_hooks() {
                 Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
                 Err(e) => tracing::error!("hook install: {e}"),
             },
+            Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
+            Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
+            Action::ConfirmCodexResume(id) => {
+                if let Some(ready) = self.codex.pending_restore.remove(&id)
+                    && self
+                        .ws
+                        .tab(id)
+                        .and_then(|t| t.agent_session.as_ref())
+                        .is_some_and(|s| s.id == ready.session_id)
+                    && let Some(session) = self.rt.get(&id).and_then(|rt| rt.session.as_ref())
+                {
+                    session.write(ready.command);
+                }
+            }
             Action::DismissHooksBanner => self.hooks_banner_dismissed = true,
+            Action::DismissWslgSlow => self.wslg_slow = None,
             Action::SetCategoryProfile(id, dir) => {
                 if let Some(cat) = self.ws.category_mut(id) {
                     cat.profile_dir = dir;
@@ -1569,11 +2017,11 @@ impl App {
                 let ring = |k: usize| order[(start + k) % order.len()];
                 let pick = (0..order.len())
                     .map(ring)
-                    .find(|&t| self.claude.state_of(t) == ClaudeState::NeedsYou)
+                    .find(|&t| self.agent_state(t) == ClaudeState::NeedsYou)
                     .or_else(|| {
                         (0..order.len())
                             .map(ring)
-                            .find(|&t| self.claude.state_of(t) == ClaudeState::DoneUnseen)
+                            .find(|&t| self.agent_state(t) == ClaudeState::DoneUnseen)
                     });
                 if let Some(id) = pick {
                     self.apply(ctx, Action::Select(id));
@@ -1590,7 +2038,15 @@ impl App {
             Action::ToggleSettings => {
                 self.settings = match self.settings.take() {
                     Some(_) => None,
-                    None => Some(settings_ui::SettingsState::default()),
+                    // Back on the section last looked at, not the first.
+                    None => Some(settings_ui::SettingsState {
+                        section: giverny_core::settings::Section::ALL
+                            .iter()
+                            .copied()
+                            .find(|s| self.layout.settings_section.as_deref() == Some(s.title()))
+                            .unwrap_or(giverny_core::settings::Section::Appearance),
+                        ..Default::default()
+                    }),
                 };
                 self.focus_terminal = self.settings.is_none();
             }
@@ -1610,7 +2066,7 @@ impl App {
                         // Apply now rather than waiting for the mtime poll, and
                         // record the mtime we just caused so the watcher does
                         // not reload the same content a second later.
-                        self.apply_config(ctx, config::load(self.paths.base()));
+                        self.reload_config(ctx);
                         self.cfg_mtime = config_mtime(&self.paths);
                     }
                     Err(err) => tracing::error!("could not write {key}: {err:#}"),
@@ -1622,7 +2078,7 @@ impl App {
                     return;
                 };
                 let cat = category_for_agent(&mut self.ws, job.cwd.as_deref());
-                let id = self.ws.add_tab(cat);
+                let id = self.new_tab(cat);
                 if let Some(tab) = self.ws.tab_mut(id) {
                     // The agent's own directory: `claude --resume` only finds a
                     // conversation from where it ran.
@@ -1657,7 +2113,7 @@ impl App {
                     .map(|t| t.category)
                     .or_else(|| self.ws.categories.first().map(|c| c.id));
                 if let Some(cat) = cat {
-                    let id = self.ws.add_tab(cat);
+                    let id = self.new_tab(cat);
                     self.ws.tab_mut(id).unwrap().cwd = dirs::home_dir();
                     self.spawn_session(ctx, id, None);
                     // Same deferred injection the resume path uses: give the
@@ -1759,10 +2215,15 @@ impl App {
                             id,
                             Inject::Raw(cmd),
                         ));
+                        self.update_job = Some(UpdateJob {
+                            tab: id,
+                            started: Instant::now(),
+                            seen_running: false,
+                            landed: None,
+                        });
+                        self.update_stalled = false;
                     }
                 }
-                self.update_ran = true;
-                self.update_dismissed = true;
             }
             Action::DismissUpdate => self.update_dismissed = true,
             Action::RestartNow => {
@@ -1796,12 +2257,60 @@ impl App {
             .or_else(|| self.ws.categories.first().map(|c| c.id));
         let Some(category) = category else { return };
         splash::mark_seen(self.paths.base());
-        let id = self.ws.add_tab(category);
+        let id = self.new_tab(category);
         if let Some(tab) = self.ws.tab_mut(id) {
             tab.cwd = dirs::home_dir();
         }
         self.spawn_session(ctx, id, Some(splash::render(welcome)));
         self.reveal_terminal();
+    }
+
+    /// How this tab's shell is started so it keeps its own history:
+    /// arguments for it and environment for Giverny's init file there. `None` when the setting is off, or the shell is not one that
+    /// can be steered this way or already has arguments of its own. `env` is
+    /// what the tab already adds on top of ours.
+    fn history_steer(
+        &self,
+        id: TabId,
+        shell: Option<&(String, Vec<String>)>,
+        env: &[(String, String)],
+    ) -> Option<(String, history::Steer)> {
+        if !self.cfg.behavior.history_per_tab {
+            return None;
+        }
+        if shell.is_some_and(|(_, args)| !args.is_empty()) {
+            return None;
+        }
+        let program = pty::shell_program(shell)?;
+        let kind = history::ShellKind::of(&program)?;
+        let file = history::history_file(&self.paths, id);
+        let init = history::init_dir(&self.paths);
+        // bash and zsh create the file, not the directory it sits in.
+        let ready = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| history::write_init(&init));
+        if let Err(err) = ready {
+            tracing::warn!("no per-tab history for tab {}: {err}", id.0);
+            return None;
+        }
+        let home = dirs::home_dir();
+        let steer = history::steer(
+            kind,
+            &file,
+            id,
+            self.cfg.behavior.history_also_shared,
+            home.as_deref(),
+            &init,
+            |var| {
+                env.iter()
+                    .rev()
+                    .find(|(k, _)| k == var)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(var).ok())
+            },
+        );
+        Some((program, steer))
     }
 
     fn spawn_session(&mut self, ctx: &egui::Context, id: TabId, preseed: Option<String>) {
@@ -1818,8 +2327,36 @@ impl App {
             .and_then(|t| self.ws.category(t.category))
             .and_then(|c| c.profile_dir.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
+        if let Some(saved) = self.ws.tab(id).and_then(|t| t.agent_session.as_ref())
+            && let Some(distro) = &saved.wsl_distro
+        {
+            shape.shell = Some(wsl_shell(
+                distro,
+                wsl::default_distro().as_deref(),
+                saved.cwd.to_str(),
+            ));
+            shape.in_wsl = true;
+            shape.config_dir = None;
+            shape.env.push((
+                "WSLENV".into(),
+                wslenv(
+                    std::env::var("WSLENV").ok(),
+                    &["GIVERNY_TAB_ID", "GIVERNY_NONCE"],
+                ),
+            ));
+        }
         let in_wsl = shape.in_wsl;
+        // A WSL shell is a world of its own — its paths, its home — and is
+        // left with the history it has.
+        if !in_wsl
+            && let Some((program, steer)) = self.history_steer(id, shape.shell.as_ref(), &shape.env)
+        {
+            if !steer.args.is_empty() {
+                shape.shell = Some((program, steer.args));
+            }
+            shape.env.extend(steer.env);
+        }
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),
@@ -1845,8 +2382,11 @@ impl App {
                 let entry = self.rt.entry(id).or_insert_with(|| TabRuntime {
                     session: None,
                     view: TabView::default(),
+                    prompt_bar: prompt_bar::Owner::default(),
                 });
                 entry.session = Some(session);
+                // A new session counts its changes from nothing again.
+                entry.prompt_bar = prompt_bar::Owner::default();
                 // Startup rc files may `cd` away from the spawn dir; verify
                 // and correct once the shell has settled. Not across the WSL
                 // boundary: what Windows can see of `wsl.exe` is its own
@@ -1873,6 +2413,8 @@ impl App {
 
     fn drain_events(&mut self) {
         let mut cwd_updates: Vec<(TabId, PathBuf)> = Vec::new();
+        let mut prompt_marks: Vec<(TabId, PromptMark)> = Vec::new();
+        let mut ended: Vec<TabId> = Vec::new();
         for (&id, rt) in &self.rt {
             let Some(session) = &rt.session else { continue };
             while let Ok(ev) = session.events.try_recv() {
@@ -1889,6 +2431,7 @@ impl App {
                                 TeeEvent::RemoteCwd(p) => {
                                     tracing::debug!("remote cwd on tab {id:?}: {p:?}");
                                 }
+                                TeeEvent::Prompt(mark) => prompt_marks.push((id, mark)),
                                 other => tracing::debug!("tee {id:?}: {other:?}"),
                             }
                         }
@@ -1898,12 +2441,38 @@ impl App {
                         tracing::info!("tab {id:?} child exited: {status:?}");
                     }
                     TabEvent::LoopDone(_) => {
+                        ended.push(id);
                         if let Some(tab) = self.ws.tab_mut(id) {
                             tab.exited = true;
                         }
                     }
                 }
             }
+        }
+        for (id, mark) in prompt_marks {
+            match mark {
+                // Output begins: a command really runs. `B` alone is the
+                // prompt taking input, and an empty Enter goes from there
+                // straight to `D` — the prompt redrawn, nothing run.
+                PromptMark::OutputStart => {
+                    self.osc_running.insert(id);
+                }
+                // `D` ends it; a shell that skips `D` ends it with the next
+                // prompt's `A`.
+                PromptMark::CommandDone(_) | PromptMark::PromptStart => {
+                    if self.osc_running.remove(&id) {
+                        self.command_finished(id);
+                    }
+                }
+                PromptMark::CommandStart => {}
+            }
+        }
+        // A shell that is gone runs nothing, and its exit is no command
+        // finishing: the exited mark says it.
+        for id in ended {
+            self.osc_running.remove(&id);
+            self.fg_running.remove(&id);
+            self.finish_input.remove(&id);
         }
         for (id, cwd) in cwd_updates {
             if let Some(tab) = self.ws.tab_mut(id) {
@@ -2050,6 +2619,112 @@ impl App {
             .push((Instant::now() + Duration::from_secs(9), id, wake(CONTINUE)));
     }
 
+    /// Come to the front for a second launch of Giverny, which asked over the
+    /// relay socket ([`giverny_claude::hooks::ask_running_to_raise`]) and
+    /// exits once this answers.
+    ///
+    /// The answer is written here, on the UI thread, so that an answer means a
+    /// window that is alive. Then the window asks to come forward, again a
+    /// few times over several seconds while it is not focused: the launch that
+    /// asked is often the thing that brings WSLg's link to Windows back, and
+    /// a window raised before that link is up is raised where nobody sees it.
+    /// What the desktop does with the request is its own call (focus-stealing
+    /// rules); one that will not hand over the focus is asked at the end to
+    /// mark the window instead.
+    #[cfg(unix)]
+    fn come_forward(&mut self, ctx: &egui::Context) {
+        for mut asker in self.claude.raise_requests() {
+            use std::io::Write;
+            // Closing, as on a restart into a new version: the launch asking
+            // is the one taking over, and an answer would send it away just
+            // before this window goes. Left unanswered, it opens its own.
+            if self.closing {
+                continue;
+            }
+            let _ = asker.set_write_timeout(Some(Duration::from_millis(500)));
+            // A launch that waited longer than it would has given up and
+            // opened its own window: this one jumping in front of that, late,
+            // helps nobody.
+            if asker
+                .write_all(giverny_claude::hooks::raise_reply().as_bytes())
+                .is_err()
+            {
+                tracing::info!("a launch asked this window forward, and gave up waiting");
+                continue;
+            }
+            tracing::info!("another launch of Giverny asked this window to come forward");
+            self.coming_forward = Some(ComingForward::new());
+        }
+        let Some(forward) = &mut self.coming_forward else {
+            return;
+        };
+        let now = Instant::now();
+        if now < forward.next {
+            ctx.request_repaint_after(forward.next - now);
+            return;
+        }
+        let soon = |forward: &mut ComingForward, after: Duration| {
+            forward.next = now + after;
+            ctx.request_repaint_after(after);
+        };
+        // The second half of a remap (below): shown again, then back where
+        // it was, once it is shown.
+        if let Some(corner) = forward.unmapped.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            if !forward.quiet {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            forward.move_to = corner;
+            forward.asked += 1;
+            soon(forward, Duration::from_millis(200));
+            return;
+        }
+        if let Some(corner) = forward.move_to.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(corner));
+        }
+        let focused = ctx.input(|i| i.focused);
+        if forward.asked > 0 && (forward.quiet || focused || forward.asked >= COME_FORWARD_AT.len())
+        {
+            if !focused && !forward.quiet {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+            }
+            self.coming_forward = None;
+            return;
+        }
+        if self.raise_by_remap || forward.quiet {
+            // WSLg's Weston ignores `_NET_ACTIVE_WINDOW`, so on WSLg asking is
+            // not enough: the window is unmapped and mapped again, which is a
+            // new window to Windows, and comes to the front as a new window
+            // would. Weston maps it a frame's width up and to the left of
+            // where it was, so it is put back by its inner corner, which is
+            // what WSLg takes a move to mean (see `titlebar::Maximize::place`).
+            // A window the window manager maximised keeps its own place.
+            let (corner, maximized) = ctx.input(|i| {
+                let vp = i.viewport();
+                (vp.inner_rect.map(|r| r.min), vp.maximized.unwrap_or(false))
+            });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            forward.unmapped = Some(corner.filter(|_| !maximized));
+            soon(forward, Duration::from_millis(150));
+            return;
+        }
+        // Shown, out of the taskbar, then on top with the focus. On X11 the
+        // last two are both `_NET_ACTIVE_WINDOW`; on Wayland, an activation
+        // the compositor may refuse.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        forward.asked += 1;
+        let at = forward.since
+            + COME_FORWARD_AT
+                .get(forward.asked)
+                .copied()
+                .unwrap_or_default();
+        soon(forward, at.saturating_duration_since(now));
+    }
+
     /// Say outside the window what the rail says inside it.
     ///
     /// A tab that wants you is invisible from another application, which is
@@ -2062,10 +2737,10 @@ impl App {
     fn show_attention(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         use claude_watch::ClaudeState;
         let waiting = self
-            .claude
+            .ws
             .tabs
-            .values()
-            .filter(|t| t.state == ClaudeState::NeedsYou)
+            .iter()
+            .filter(|t| self.agent_state(t.id) == ClaudeState::NeedsYou)
             .count();
         if waiting == self.attention {
             return;
@@ -2302,8 +2977,23 @@ impl App {
             return;
         }
         self.cfg_mtime = mtime;
-        let cfg = config::load(self.paths.base());
-        self.apply_config(ctx, cfg);
+        self.reload_config(ctx);
+    }
+
+    /// Read `config.toml` again and apply it. A file that does not parse
+    /// changes nothing: the running settings stay.
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        match config::load_checked(self.paths.base(), &self.cfg) {
+            Ok(parsed) => {
+                let read = accounts_readable(&parsed);
+                self.apply_config(ctx, parsed.config);
+                if read && std::mem::take(&mut self.accounts_unset) {
+                    tracing::info!("config.toml parses again: setting up Claude accounts");
+                    set_up_accounts(&mut self.claude, &self.cfg, true);
+                }
+            }
+            Err(err) => tracing::error!("config.toml ignored ({err}); keeping previous settings"),
+        }
     }
 
     /// Put a theme on the grid, on every open session, and on the chrome.
@@ -2344,6 +3034,9 @@ impl App {
             && !self.see_through
         {
             tracing::info!("window.opacity: restart Giverny to make the window see-through");
+        }
+        if self.cfg.codex != cfg.codex {
+            self.codex.configure(&cfg.codex);
         }
         self.cfg = cfg;
         tracing::info!("config reloaded");
@@ -2391,6 +3084,22 @@ impl App {
         }
     }
 
+    /// Type each image pasted since the last frame into the tab it was
+    /// pasted in, as a drop types a file: Claude Code attaches an image path
+    /// pasted into its prompt. A tab closed meanwhile gets nothing, and the
+    /// user's attention may have moved on: no tab switch.
+    fn deliver_pasted_images(&mut self) {
+        for pasted in self.paste_image.poll() {
+            if let Some(session) = self.rt.get(&pasted.tab).and_then(|rt| rt.session.as_ref()) {
+                session.write(giverny_term::input::encode_paste(
+                    &pasted.text,
+                    session.mode(),
+                ));
+                session.note_user_input();
+            }
+        }
+    }
+
     /// The tab whose rail row contains a point, if any.
     pub fn tab_at(&self, pos: egui::Pos2) -> Option<TabId> {
         self.row_rects
@@ -2430,6 +3139,97 @@ impl App {
 
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
     fn handle_wayland_drag(&mut self, _ctx: &egui::Context) {}
+
+    pub fn agent_state(&self, id: TabId) -> giverny_core::agent::AgentState {
+        let codex = self.codex.state_of(id);
+        if codex != giverny_core::agent::AgentState::None {
+            codex
+        } else {
+            self.claude.state_of(id)
+        }
+    }
+
+    fn tick_codex(&mut self, ctx: &egui::Context) {
+        self.codex
+            .tabs
+            .retain(|id, _| self.ws.tab(*id).is_some_and(|t| !t.exited));
+        self.codex
+            .pending_restore
+            .retain(|id, _| self.ws.tab(*id).is_some());
+        for answer in self.codex.answers() {
+            let codex_watch::Answer::Resume(id, sid, result) = answer else {
+                continue;
+            };
+            if self.codex.restoring.remove(&id).as_deref() != Some(&sid) || !self.cfg.codex.enabled
+            {
+                continue;
+            }
+            let Some(saved) = self
+                .ws
+                .tab(id)
+                .and_then(|t| t.agent_session.as_ref())
+                .filter(|s| s.id == sid)
+            else {
+                continue;
+            };
+            if self
+                .rt
+                .get(&id)
+                .and_then(|rt| rt.session.as_ref())
+                .is_none_or(|s| s.had_user_input())
+            {
+                continue;
+            }
+            let metadata = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("tab {id:?}: Codex restore failed: {e}");
+                    self.codex.status = Some(format!("Codex restore: {e}"));
+                    continue;
+                }
+            };
+            let target = giverny_codex::Target {
+                executable: self.cfg.codex.executable.clone(),
+                home: saved.home.clone(),
+                wsl_distro: saved.wsl_distro.clone(),
+            };
+            let cwd = metadata["thread"]["cwd"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| saved.cwd.clone());
+            let shell = if cfg!(windows) && saved.wsl_distro.is_none() {
+                if self.cfg.behavior.windows_shell == config::WindowsShell::Cmd {
+                    codex_watch::ResumeShell::Cmd
+                } else {
+                    codex_watch::ResumeShell::PowerShell
+                }
+            } else {
+                codex_watch::ResumeShell::Posix
+            };
+            let Some(command) = codex_watch::resume_command(&target, &sid, &cwd, shell) else {
+                continue;
+            };
+            let automatic = self.cfg.codex.restore == config::RestoreClaude::Auto;
+            if automatic {
+                tracing::info!("tab {id:?}: resuming codex session {sid}");
+                self.pending_inject.push((
+                    Instant::now() + Duration::from_millis(1300),
+                    id,
+                    Inject::Raw(command),
+                ));
+            } else {
+                self.codex.pending_restore.insert(
+                    id,
+                    codex_watch::ReadyResume {
+                        id,
+                        session_id: sid,
+                        command,
+                    },
+                );
+            }
+        }
+        self.codex.refresh(false, ctx);
+    }
 
     fn claude_env(&self) -> Vec<(String, String)> {
         claude_env(&self.cfg.claude)
@@ -2530,6 +3330,27 @@ impl App {
             })
             .collect();
         for (id, cmd) in seen {
+            if self.cfg.codex.enabled && self.ws.tab(id).is_some_and(|t| t.wsl_distro.is_none()) {
+                let running = cmd.as_deref().is_some_and(giverny_codex::is_codex_command);
+                if running {
+                    let entry = self.codex.tabs.entry(id).or_default();
+                    if entry.state == giverny_core::agent::AgentState::None {
+                        entry.state = giverny_core::agent::AgentState::Idle;
+                    }
+                } else if cmd.is_none()
+                    && self.codex.tabs.remove(&id).is_some()
+                    && let Some(tab) = self.ws.tab_mut(id)
+                {
+                    tab.agent_session = None;
+                    self.state_dirty = true;
+                }
+            }
+            // A command seen in front last time and gone now has finished.
+            // Only one seen this run: see `fg_running`.
+            let running = cmd.is_some();
+            if self.fg_running.insert(id, running) == Some(true) && !running {
+                self.command_finished(id);
+            }
             if let Some(tab) = self.ws.tab_mut(id)
                 && tab.foreground != cmd
             {
@@ -2539,8 +3360,55 @@ impl App {
         }
     }
 
+    /// A command in tab `id`'s shell finished. On the tab you
+    /// are on you saw it end, so nothing is owed; anywhere else it is an
+    /// unseen finish, ticked in the rail until you look.
+    ///
+    /// Only a command typed: one with no input since the last finish (or
+    /// since the shell started) was the shell's own doing — its rc file, its
+    /// prompt — and finishes nothing you asked for (see `finish_input`).
+    fn command_finished(&mut self, id: TabId) {
+        let Some(seq) = self
+            .rt
+            .get(&id)
+            .and_then(|rt| rt.session.as_ref())
+            .map(|s| s.input_seq())
+        else {
+            return;
+        };
+        if self.finish_input.insert(id, seq).unwrap_or(0) == seq {
+            return;
+        }
+        if self.ws.active != Some(id) {
+            self.unseen_done.insert(id);
+        }
+    }
+
+    /// The user looked at tab `id`: its done-markers clear, Claude's tick and
+    /// the unseen-finish badge alike.
+    fn mark_seen(&mut self, id: TabId) {
+        self.claude.mark_viewed(id);
+        self.codex.attended(id);
+        self.unseen_done.remove(&id);
+    }
+
+    /// Note each Claude turn that ended unseen, so its tick outlives the
+    /// state: the agent may start working again before you look, and the
+    /// rail then wears the tick beside its spinner.
+    fn note_unseen_turns(&mut self) {
+        for t in &self.ws.tabs {
+            if self.claude.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
+                || self.codex.state_of(t.id) == claude_watch::ClaudeState::DoneUnseen
+            {
+                self.unseen_done.insert(t.id);
+            }
+        }
+        self.unseen_done.retain(|id| self.ws.tab(*id).is_some());
+    }
+
     fn periodic_refresh(&mut self, ctx: &egui::Context) {
         self.reload_config_if_changed(ctx);
+        self.tick_codex(ctx);
         if let Some(welcome) = self.welcome.take() {
             self.open_welcome(ctx, &welcome);
         }
@@ -2573,13 +3441,20 @@ impl App {
         }
         // While an install is running in its tab, watch for the binary being
         // replaced: that is the moment a restart has something to pick up.
-        if self.update_ran && !self.update_installed {
+        if self.update_job.is_some() && !self.update_installed {
             self.update_installed =
                 update::binary_mtime().is_some_and(|at| Some(at) != self.exe_mtime);
         }
+        if self.update_finished() {
+            // Taken first, so a restart that fails to spawn is not retried
+            // every refresh; the rail's restart button stays for that case.
+            self.update_job = None;
+            self.apply(ctx, Action::RestartNow);
+            return;
+        }
         self.persist_font_size();
         self.track_foreground();
-        self.stale_sessions = self.claude.sessions_predate_settings();
+        self.follow_update_job();
         self.probe_wsl_cwds();
         self.refresh_repos();
         // Ask Claude Code to refresh accounts whose numbers have aged out.
@@ -2590,12 +3465,50 @@ impl App {
         }
     }
 
+    /// The installer replaced the binary and is done with its tab: its shell
+    /// is back at the prompt, the tab was closed, or it has had long enough.
+    /// Restarting is then the only thing left, so it happens without asking.
+    fn update_finished(&mut self) -> bool {
+        if !self.update_installed || self.closing {
+            return false;
+        }
+        let Some(job) = &mut self.update_job else {
+            return false;
+        };
+        let landed = *job.landed.get_or_insert_with(Instant::now);
+        let idle = self.ws.tab(job.tab).is_none_or(|t| t.foreground.is_none());
+        idle || landed.elapsed() > UPDATE_FINISH_GRACE
+    }
+
+    /// Notice an install that ended without the binary changing: its tab was
+    /// closed, or its shell is back at the prompt after running something
+    /// (or never visibly ran it). Either way the update button comes back, so
+    /// it can be tried again.
+    fn follow_update_job(&mut self) {
+        if self.update_installed {
+            return;
+        }
+        let Some(job) = &mut self.update_job else {
+            return;
+        };
+        let Some(tab) = self.ws.tab(job.tab) else {
+            self.update_job = None;
+            return;
+        };
+        if tab.foreground.is_some() {
+            job.seen_running = true;
+        } else if job.seen_running || job.started.elapsed() > UPDATE_UNSEEN_GRACE {
+            self.update_job = None;
+            self.update_stalled = true;
+        }
+    }
+
     /// Restart the full-screen program this tab was running, when it is one
     /// Giverny is allowed to start by itself.
     fn queue_app_restore(&mut self, id: TabId) {
         let Some(tab) = self.ws.tab(id) else { return };
         // A tab with a Claude session resumes that instead.
-        if tab.claude_session.is_some() {
+        if tab.claude_session.is_some() || tab.agent_session.is_some() {
             return;
         }
         let Some(cmd) = tab.foreground.clone() else {
@@ -2615,7 +3528,16 @@ impl App {
     }
 
     /// Queue the auto-resume command for a freshly restored tab.
-    fn queue_resume(&mut self, id: TabId) {
+    fn queue_resume(&mut self, id: TabId, ctx: &egui::Context) {
+        if let Some(session) = self.ws.tab(id).and_then(|t| t.agent_session.clone())
+            && session.provider == giverny_core::agent::AgentKind::Codex
+        {
+            if self.cfg.codex.enabled && self.cfg.codex.restore != config::RestoreClaude::Off {
+                tracing::debug!("tab {id:?}: inspecting saved Codex conversation for restore");
+                self.codex.inspect_restore(id, &session, ctx);
+            }
+            return;
+        }
         let Some(sid) = self.session_to_resume(id) else {
             return;
         };
@@ -2792,6 +3714,15 @@ impl App {
             if let Some(dir) = &profile_dir {
                 env.push(("GIVERNY_PROFILE_DIR".into(), dir.display().to_string()));
             }
+            if self.cfg.codex.enabled && !self.cfg.codex.home.is_empty() {
+                env.push((
+                    "CODEX_HOME".into(),
+                    giverny_codex::Target::native(&self.cfg.codex.executable, &self.cfg.codex.home)
+                        .home
+                        .display()
+                        .to_string(),
+                ));
+            }
             return TabShape {
                 shell,
                 config_dir,
@@ -2862,16 +3793,27 @@ impl App {
         self.focus_terminal = true;
     }
 
+    /// Whether a keyboard walk through the tabs is held: Ctrl+Tab's, or
+    /// Ctrl+PageUp/PageDown's. While it is, a tab it passes over that has
+    /// not started stays that way.
+    fn walking(&self) -> bool {
+        self.switcher.is_some() || self.cycling
+    }
+
     /// Commit a Ctrl+Tab walk: the tab it landed on becomes the current one,
-    /// and only now does it count as seen.
+    /// and only now does it count as seen. Any keyboard walk ends here, so
+    /// the tab it is on may start: Ctrl coming up, and every other way of
+    /// choosing a tab, which starts it at once as ever.
     fn end_switch(&mut self) {
+        self.cycling = false;
+        self.walk_preview = None;
         let Some(sw) = self.switcher.take() else {
             return;
         };
         self.ws.commit_switch(sw.from);
         if let Some(id) = self.ws.active {
             self.refresh_tab_info(id);
-            self.claude.mark_viewed(id);
+            self.mark_seen(id);
         }
     }
 
@@ -2933,6 +3875,13 @@ impl App {
     }
 }
 
+/// The terminal `id` has lost the keyboard to something that is not meant
+/// to hold it, and should take it back: anything but a text field, while no
+/// `overlay` reading keys of its own is open.
+fn terminal_lost_keys(ctx: &egui::Context, id: egui::Id, overlay: bool) -> bool {
+    !overlay && !ctx.text_edit_focused() && !ctx.memory(|m| m.has_focus(id))
+}
+
 /// Frames drawn per second, logged every ten seconds at debug level
 /// (`RUST_LOG=giverny=debug`), with the passes egui ran for them and what
 /// asked for the last one. On a software renderer every frame is CPU, so
@@ -2991,10 +3940,12 @@ impl eframe::App for App {
             // races the compositor going away, and a frame that never
             // finishes writes nothing.
             self.persist_all();
+            self.paste_image.clean_up();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.periodic_refresh(&ctx);
         self.handle_dropped_files(&ctx);
+        self.deliver_pasted_images();
         self.process_pending(&ctx);
 
         // Claude awareness: hooks + registry + usage.
@@ -3025,14 +3976,76 @@ impl eframe::App for App {
                 .is_some_and(|prev| prev != seq)
             {
                 self.claude.mark_attended(id);
+                self.codex.attended(id);
+                self.codex.pending_restore.remove(&id);
+                self.codex.restoring.remove(&id);
+                self.unseen_done.remove(&id);
             }
         }
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        for msg in effects.codex {
+            let Some(id) = claude_watch::ClaudeWatch::tab_id_of(&msg) else {
+                continue;
+            };
+            let Some(tab) = self.ws.tab(id) else { continue };
+            let distro = msg.wsl_distro.clone().or_else(|| tab.wsl_distro.clone());
+            let before = self.codex.state_of(id);
+            if let Some(captured) = self
+                .codex
+                .handle(&msg, id, distro, self.ws.active == Some(id))
+                && let Some(tab) = self.ws.tab_mut(id)
+            {
+                tab.agent_session = captured;
+                tab.claude_session = None;
+                self.claude.tabs.remove(&id);
+                self.state_dirty = true;
+            }
+            let after = self.codex.state_of(id);
+            if self.cfg.behavior.notifications
+                && self.ws.active != Some(id)
+                && after != before
+                && matches!(
+                    after,
+                    giverny_core::agent::AgentState::NeedsYou
+                        | giverny_core::agent::AgentState::DoneUnseen
+                )
+            {
+                let summary = if after == giverny_core::agent::AgentState::NeedsYou {
+                    "Codex needs you"
+                } else {
+                    "Codex finished"
+                };
+                desktop_notify(summary.into(), titles.get(&id).cloned().unwrap_or_default());
+            }
+        }
+        if let Some(active) = self.ws.active
+            && self.codex.state_of(active) == giverny_core::agent::AgentState::DoneUnseen
+        {
+            self.codex.attended(active);
+        }
         self.show_attention(&ctx, frame);
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        // Not while coming forward, which maps the window again anyway: the
+        // request waits for the next frame rather than being taken and lost.
+        if self.coming_forward.is_none()
+            && self
+                .wslg_watchdog
+                .as_ref()
+                .is_some_and(wslg_watchdog::Handle::take_remap)
+        {
+            self.coming_forward = Some(ComingForward::quiet());
+        }
+        #[cfg(unix)]
+        self.come_forward(&ctx);
         self.watch_for_limits();
+        self.note_unseen_turns();
         for (id, session, config_dir) in effects.captured {
             if let Some(tab) = self.ws.tab_mut(id) {
+                if session.is_some() {
+                    tab.agent_session = None;
+                    self.codex.tabs.remove(&id);
+                }
                 tab.claude_session = session;
                 if config_dir.is_some() {
                     tab.claude_config_dir = config_dir;
@@ -3192,29 +4205,99 @@ impl eframe::App for App {
             }
 
             // Lazy restore: a tab from a previous run spawns its shell on
-            // first focus, pre-seeded with its saved scrollback.
-            if !self.rt.contains_key(&active) && !self.ws.tab(active).is_some_and(|t| t.exited) {
+            // first focus, pre-seeded with its saved scrollback. Not while a
+            // keyboard walk is held over it: the walk may only be passing
+            // through, and the tab it stops on starts when Ctrl comes up.
+            let walking = self.walking();
+            if walk::starts_now(
+                self.rt.contains_key(&active),
+                self.ws.tab(active).is_some_and(|t| t.exited),
+                walking,
+            ) {
                 let preseed = state::load_snapshot(&self.paths, active)
                     .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
                 // The tab had a live Claude conversation — resume it; or a
                 // full-screen app worth starting again.
-                self.queue_resume(active);
+                self.queue_resume(active, &ctx);
                 self.queue_app_restore(active);
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(session) = &mut rt.session {
+                    // The wheel over the closed prompt bar scrolls the
+                    // terminal under it.
+                    rt.view.wheel_through([prompt_bar::layer(active)]);
                     let response = rt.view.show(ui, &mut self.shared, session);
                     grid_rect = Some(response.rect);
-                    if self.focus_terminal {
+                    if rt.view.paste_image {
+                        self.paste_image.request(&ctx, active);
+                    }
+                    // Typing goes to the terminal. egui drops a widget's
+                    // focus on any press outside it — the rail, the
+                    // taskbar, a header button — and the keys typed after
+                    // that went nowhere until the terminal was clicked
+                    // again. So it takes the keyboard back whenever nothing
+                    // else is meant to hold it: a text field (the search
+                    // bar, a settings input) or an overlay that reads keys
+                    // of its own. Only when it has lost it, since each
+                    // request interrupts IME input.
+                    let overlay = self.palette.is_some()
+                        || self.session_picker.is_some()
+                        || self.keys_overlay.is_some()
+                        || self.rename.is_some();
+                    if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
                         self.focus_terminal = false;
+                    }
+                    // The prompt whose turn is in view, once its own row
+                    // has scrolled out of sight.
+                    let pinned = self.claude.prompts_of(active).and_then(|history| {
+                        rt.prompt_bar
+                            .get(session.content_seq(), history, || {
+                                let rows = session.viewport_rows();
+                                prompt_bar::owner(history, &rows, |matches| {
+                                    session.find_above(
+                                        prompt_bar::SEARCH_ABOVE,
+                                        &prompt_bar::PROMPT_MARKS,
+                                        |row, shaded| matches(row, shaded),
+                                    )
+                                })
+                            })
+                            .map(|i| history[i].as_str())
+                    });
+                    match pinned {
+                        Some(prompt) => {
+                            let row = session.size().cell_height as f32 / ctx.pixels_per_point();
+                            if prompt_bar::show(
+                                &ctx,
+                                &self.chrome,
+                                response.rect,
+                                row,
+                                self.shared.font_size,
+                                active,
+                                prompt,
+                            ) {
+                                self.focus_terminal = true;
+                            }
+                        }
+                        None => prompt_bar::hide(&ctx, active),
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("no session");
                     });
+                }
+            } else if walking {
+                // A walk passing over a tab that has not started: its saved
+                // scrollback, read-only, until Ctrl comes up.
+                if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
+                    let dump = state::load_snapshot(&self.paths, active);
+                    self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
+                }
+                if let Some(preview) = &self.walk_preview {
+                    let rect = ui.available_rect_before_wrap();
+                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
                 }
             }
         });
@@ -3242,16 +4325,19 @@ impl eframe::App for App {
             self.apply(&ctx, action);
         }
 
-        // A Ctrl+Tab walk ends the way Alt+Tab does: when Ctrl comes up, or
+        // A keyboard walk ends the way Alt+Tab does: when Ctrl comes up, or
         // when the window stops being the one receiving keys at all.
-        if self.switcher.is_some() {
-            let holding = ctx.input(|i| i.modifiers.ctrl && i.focused);
+        if self.walking() {
+            let holding = ctx.input(|i| walk::still_held(i.modifiers.ctrl, i.focused));
             if holding {
                 // Modifier releases arrive as events on every platform we
                 // support, but a missed one would strand the walk open.
                 ctx.request_repaint_after(Duration::from_millis(250));
             } else {
                 self.end_switch();
+                // The tab the walk ended on starts in the next frame, which
+                // nothing else may be about to draw.
+                ctx.request_repaint();
             }
         }
     }
@@ -3290,6 +4376,56 @@ fn app_is_running() -> bool {
                 .to_ascii_lowercase()
                 .starts_with("giverny")
     })
+}
+
+/// Giverny windows, other than this process and `holder`, that would use
+/// the same relay socket as this one: second windows, which get no hooks.
+///
+/// Read from each process's environment, so a test instance with its own
+/// `XDG_RUNTIME_DIR` is not one of them, and neither is a subcommand
+/// (`relay`, `statusline`, this `doctor`).
+#[cfg(unix)]
+fn giverny_windows(holder: Option<u32>) -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let me = std::process::id();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let mut pids: Vec<u32> = sys
+        .processes()
+        .iter()
+        .filter(|(pid, proc)| {
+            let pid = pid.as_u32();
+            pid != me
+                && Some(pid) != holder
+                // A thread shows up as a process of the same name.
+                && proc.thread_kind().is_none()
+                && proc.name().to_string_lossy().starts_with("giverny")
+                // The window takes no command: a bare word is a subcommand.
+                && proc.cmd().get(1).is_none_or(|arg| {
+                    let arg = arg.to_string_lossy();
+                    !is_unknown_subcommand(&arg, false)
+                        && !matches!(&*arg, "-V" | "--version" | "-h" | "--help")
+                })
+                && {
+                    let theirs = proc.environ().iter().find_map(|kv| {
+                        kv.to_str()?
+                            .strip_prefix("XDG_RUNTIME_DIR=")
+                            .map(std::ffi::OsString::from)
+                    });
+                    theirs.filter(|d| !d.is_empty()) == runtime
+                }
+        })
+        .map(|(pid, _)| pid.as_u32())
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// What each saved tab would do when it is next opened.
@@ -3352,11 +4488,132 @@ fn restore_report(profs: &[giverny_claude::profiles::Profile]) {
     }
 }
 
+fn codex_hooks_cli() -> anyhow::Result<()> {
+    let enabled = match std::env::args().nth(2).as_deref() {
+        Some("install") => true,
+        Some("remove") => false,
+        _ => anyhow::bail!("usage: giverny codex-hooks install|remove"),
+    };
+    let args: Vec<_> = std::env::args().skip(3).collect();
+    let enable_integration = enabled && args.as_slice() == ["--enable"];
+    if !args.is_empty() && !enable_integration {
+        anyhow::bail!("usage: giverny codex-hooks install [--enable] | remove");
+    }
+    let paths = Paths::default_dirs();
+    let cfg = config::load_checked(paths.base(), &config::Config::default())
+        .map_err(anyhow::Error::msg)?
+        .config
+        .codex;
+    let mut target = giverny_codex::Target::native(&cfg.executable, &cfg.home);
+    if let Some((distro, home)) = wsl::split_unc(&target.home) {
+        target.wsl_distro = Some(distro);
+        target.home = home.into();
+    }
+    #[cfg(unix)]
+    if enabled {
+        giverny_claude::hooks::point_link()?;
+    }
+    let path = codex_watch::CodexWatch::hook_path(&target);
+    let command = codex_watch::CodexWatch::hook_command(&target);
+    giverny_codex::hooks::set_installed(&path, &command, enabled)?;
+    if enable_integration {
+        giverny_core::settings::write(
+            paths.base(),
+            giverny_core::settings::by_key("codex.enabled").unwrap(),
+            &giverny_core::settings::Value::Bool(true),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    println!(
+        "{} Giverny hooks in {}",
+        if enabled { "Installed" } else { "Removed" },
+        path.display()
+    );
+    if enabled {
+        println!(
+            "Review and trust these hooks using /hooks in Codex, then restart Codex. Enable integration in Giverny Settings if it is not already enabled."
+        );
+    }
+    Ok(())
+}
+
+fn codex_doctor() {
+    let cfg = config::load_checked(Paths::default_dirs().base(), &config::Config::default())
+        .map(|p| p.config.codex)
+        .unwrap_or_default();
+    println!(
+        "codex        {}",
+        if cfg.enabled {
+            "enabled"
+        } else {
+            "disabled (enable in Settings > codex)"
+        }
+    );
+    let target = giverny_codex::Target::native(&cfg.executable, &cfg.home);
+    println!("  executable {}", target.executable);
+    println!(
+        "  version    {}",
+        giverny_codex::version(&target).unwrap_or_else(|e| format!("unavailable: {e}"))
+    );
+    println!("  home       {}", target.home.display());
+    let hooks = codex_watch::CodexWatch::hook_path(&target);
+    println!(
+        "  hooks      {} (trust is reviewed inside Codex with /hooks)",
+        if giverny_codex::hooks::installed(&hooks, &codex_watch::CodexWatch::hook_command(&target))
+        {
+            "installed"
+        } else {
+            "not installed or command changed"
+        }
+    );
+    println!(
+        "  usage      refresh every {} min; authentication owned by Codex",
+        cfg.usage_refresh_minutes
+    );
+    println!(
+        "  restore    {:?}; auto reconnects saved conversations on tab focus\n",
+        cfg.restore
+    );
+    for sample in giverny_codex::usage::load_cache(
+        &Paths::default_dirs().base().join("state/codex-usage.json"),
+    ) {
+        let age = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(sample.sampled_at);
+        println!(
+            "  usage cache {}: {} window(s), {}m old",
+            sample.target.home.display(),
+            sample.windows.len(),
+            age / 60
+        );
+    }
+    if let Some(state) = state::load(&Paths::default_dirs()) {
+        for tab in state
+            .workspace
+            .tabs
+            .iter()
+            .filter(|t| t.agent_session.is_some())
+        {
+            let session = tab.agent_session.as_ref().unwrap();
+            println!(
+                "  saved tab {}: {:?} {} in {}",
+                tab.id.0,
+                session.provider,
+                session.id,
+                session.cwd.display()
+            );
+        }
+    }
+}
+
 /// `giverny doctor` — print exactly what the app sees of your Claude setup.
 fn doctor() {
     use giverny_claude::{hooks, profiles, registry, usage};
 
     println!("giverny doctor {}\n", update::CURRENT);
+    codex_doctor();
     let running = app_is_running();
     println!(
         "app          {}\n",
@@ -3372,14 +4629,35 @@ fn doctor() {
     #[cfg(unix)]
     {
         let socket = hooks::socket_path();
-        let listening = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        let holder = hooks::socket_holder(&socket);
         println!(
-            "relay        unix socket {} — {}\n",
+            "relay        unix socket {} — {}",
             socket.display(),
-            if listening {
-                "listening (hooks deliver live)"
-            } else {
-                "nobody listening (events spool to disk)"
+            match holder.and_then(|h| h.pid) {
+                Some(pid) => format!("listening: Giverny pid {pid} (hooks deliver live)"),
+                None if holder.is_some() => "listening (hooks deliver live)".to_string(),
+                None => "nobody listening (events spool to disk)".to_string(),
+            }
+        );
+        // One Giverny per socket: whoever has it gets every hook.
+        println!(
+            "one window   a second launch brings {} to the front instead of opening;\n             \
+             a side window wants its own XDG_RUNTIME_DIR ({SECOND_WINDOW_ENV}=1\n             \
+             opens one anyway, without hooks){}\n",
+            match holder.and_then(|h| h.pid) {
+                Some(pid) => format!("pid {pid}"),
+                None => "the running one".to_string(),
+            },
+            match giverny_windows(holder.and_then(|h| h.pid)) {
+                others if others.is_empty() => String::new(),
+                others => format!(
+                    "\n             ⚠ more Giverny windows run without the relay: pid {}",
+                    others
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             }
         );
     }
@@ -3405,6 +4683,23 @@ fn doctor() {
                 (false, false) => "not installed (X11 uses the built-in window icon)".to_string(),
             }
         );
+        println!();
+    }
+
+    // What the WSLg watchdog did, if anything.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    if wslg_watchdog::applies() {
+        let recent = wslg_watchdog::recent(Paths::default_dirs().base(), 5);
+        println!(
+            "wslg watch   brings the window back when WSLg loses it after a sleep \
+             (GIVERNY_WSLG_WATCHDOG=0 turns it off)"
+        );
+        if recent.is_empty() {
+            println!("             nothing to do so far");
+        }
+        for line in recent {
+            println!("             {line}");
+        }
         println!();
     }
 
@@ -3596,39 +4891,18 @@ fn doctor() {
     let dirs: Vec<PathBuf> = profs.iter().map(|p| p.config_dir.clone()).collect();
     let live = registry::scan(dirs);
     println!("\nlive claude sessions ({}):", live.len());
-    let mut stale = 0;
     for s in &live {
-        // Sessions that started before settings.json was last written never
-        // loaded our hooks or statusline.
-        let settings_at = std::fs::metadata(s.config_dir.join("settings.json"))
-            .and_then(|m| m.modified())
-            .ok();
-        let started = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_millis(s.entry.started_at_ms));
-        let predates = matches!((settings_at, started), (Some(a), Some(b)) if b < a);
-        if predates {
-            stale += 1;
-        }
         println!(
-            "  pid {:<8} {:<6} {:<26} {:<12} {}",
+            "  pid {:<8} {:<6} {:<26} {}",
             s.entry.pid,
             s.entry.status,
             s.entry.name.as_deref().unwrap_or("-"),
-            if predates { "PRE-HOOKS" } else { "hooked" },
             s.entry.cwd.display()
-        );
-    }
-    if stale > 0 {
-        println!(
-            "\n  ⟳ {stale} session(s) started before hooks/statusline were installed.\n    \
-             Claude Code reads settings.json at session start — exit and re-run\n    \
-             claude in those tabs to get live states and live usage."
         );
     }
 
     println!(
-        "\nnotes\n  · hooks load when a claude session STARTS — restart claude after installing\n  \
-         · notifications fire when claude needs YOU (permission prompts, questions),\n    \
+        "\nnotes\n  · notifications fire when claude needs YOU (permission prompts, questions),\n    \
          not when it merely finishes"
     );
 }
@@ -3680,6 +4954,138 @@ fn fresh_nonce(salt: u64) -> String {
 mod tests {
     use super::*;
 
+    /// A bare word the binary does not know is a command, and is refused;
+    /// flags and anything that reads as a path still open the window.
+    #[test]
+    fn unknown_words_are_commands_but_paths_and_flags_are_not() {
+        for word in ["doctr", "upgrade", "plan", "help", "status-line"] {
+            assert!(is_unknown_subcommand(word, false), "{word}");
+        }
+        for not_a_command in [
+            "",
+            "-psn_0_12345",
+            "--some-flag",
+            "./here",
+            "..",
+            "~/Dev",
+            "/home/me/project",
+            "proj/sub",
+            "C:\\Users\\me",
+        ] {
+            assert!(
+                !is_unknown_subcommand(not_a_command, false),
+                "{not_a_command}"
+            );
+        }
+        // A bare word naming something that exists is a path, not a command.
+        assert!(!is_unknown_subcommand("project", true));
+    }
+
+    /// One bad value elsewhere still lets account setup follow the config; a
+    /// bad value in what it reads does not.
+    #[test]
+    fn account_setup_follows_a_config_unless_its_own_values_are_bad() {
+        let parse = |text| config::parse_over(text, &config::Config::default()).unwrap();
+        assert!(accounts_readable(&parse("[font]\nsize = \"big\"\n")));
+        assert!(accounts_readable(&parse("[claude]\nauto_mode = false\n")));
+        assert!(!accounts_readable(&parse("[claude]\nauto_mode = \"no\"\n")));
+        assert!(!accounts_readable(&parse("claude = 5\n")));
+    }
+
+    /// A config that cannot be parsed leaves every account as it was —
+    /// here one auto mode would otherwise be written into — while a parsed
+    /// one is followed.
+    #[test]
+    fn an_unparseable_config_leaves_the_accounts_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-unread-config-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let account = root.join("claude");
+        std::fs::create_dir_all(&account).unwrap();
+        let settings = account.join("settings.json");
+        let before = r#"{"theme":"dark"}"#;
+        std::fs::write(&settings, before).unwrap();
+
+        let mut watch = claude_watch::ClaudeWatch::for_tests();
+        watch.profiles = vec![giverny_claude::profiles::Profile {
+            name: "test".into(),
+            config_dir: account.clone(),
+            email: None,
+            account_uuid: None,
+        }];
+        let mut auto = config::Config::default();
+        auto.claude.auto_mode = true;
+
+        set_up_accounts(&mut watch, &auto, false);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+
+        // The same settings from a config that was read: the account follows.
+        set_up_accounts(&mut watch, &auto, true);
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(after.contains("defaultMode"), "{after}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A press on anything else — here a button, as the rail
+    /// would be — takes egui's focus off the terminal, and
+    /// the terminal is then told to take it back; a text field keeps it.
+    #[test]
+    fn the_terminal_takes_the_keyboard_back_from_all_but_text_fields() {
+        let ctx = egui::Context::default();
+        let button_at = egui::pos2(20.0, 10.0);
+        let mut text = String::new();
+        let frame = |events: Vec<egui::Event>, with_field: bool, text: &mut String| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut lost = false;
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = ui.button("row");
+                if with_field {
+                    ui.add(egui::TextEdit::singleline(text)).request_focus();
+                }
+                let (_, resp) =
+                    ui.allocate_exact_size(egui::vec2(400.0, 300.0), egui::Sense::click_and_drag());
+                lost = terminal_lost_keys(ui.ctx(), resp.id, false);
+                if lost {
+                    resp.request_focus();
+                }
+            });
+            lost
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: button_at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Unfocused at first: taken.
+        assert!(frame(vec![], false, &mut text));
+        assert!(!frame(vec![], false, &mut text));
+        // A click on the button: lost, and taken back.
+        let lost = frame(
+            vec![egui::Event::PointerMoved(button_at), press(true)],
+            false,
+            &mut text,
+        ) | frame(vec![press(false)], false, &mut text);
+        assert!(lost);
+        assert!(!frame(vec![], false, &mut text));
+        // A text field holding the keyboard keeps it.
+        frame(vec![], true, &mut text);
+        assert!(!frame(vec![], true, &mut text));
+        assert!(ctx.text_edit_focused());
+        // An overlay reading its own keys: left alone.
+        assert!(!terminal_lost_keys(&ctx, egui::Id::new("term"), true));
+    }
+
     #[test]
     fn the_backdrop_tiles_around_the_grid_exactly() {
         let outer = egui::Rect::from_min_max(egui::pos2(240.0, 0.0), egui::pos2(1280.0, 820.0));
@@ -3703,6 +5109,16 @@ mod tests {
         assert!(is_software_gl("GDI Generic"));
         assert!(!is_software_gl("D3D12 (Intel(R) Graphics)"));
         assert!(!is_software_gl("Mesa Intel(R) Graphics (MTL)"));
+    }
+
+    #[test]
+    fn windows_draws_on_dx12_unless_wgpu_backend_says_otherwise() {
+        assert_eq!(
+            preferred_backends_for(true, false),
+            Some(eframe::wgpu::Backends::DX12)
+        );
+        assert_eq!(preferred_backends_for(true, true), None);
+        assert_eq!(preferred_backends_for(false, false), None);
     }
 
     #[test]

@@ -4,8 +4,6 @@
 //! so mesh building — including first-use glyph rasterization — never holds
 //! the terminal lock.
 
-use std::collections::HashMap;
-
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
@@ -15,6 +13,7 @@ use egui::epaint::{Mesh, Rect, TextureId, Vertex, WHITE_UV};
 use egui::{Color32, Pos2, Vec2};
 
 use super::atlas::{Atlas, GlyphKey};
+use super::bidi::{RowOrder, ScreenRow};
 use super::metrics::{CellMetrics, FontSet, SYNTH_BOLD, SYNTH_ITALIC};
 use super::theme::{Theme, dim};
 
@@ -41,6 +40,9 @@ pub struct Snapshot {
     pub display_offset: usize,
     pub total_lines: usize,
     pub mode: TermMode,
+    /// Rows drawn in an order other than the grid's (right-to-left text),
+    /// by viewport line: what a click on one of their columns means.
+    pub orders: Vec<(u16, RowOrder)>,
 }
 
 impl Snapshot {
@@ -55,9 +57,10 @@ impl Snapshot {
 
         let selection = content.selection;
         let mut cells = Vec::with_capacity(cols * rows / 2);
-        // Rows holding right-to-left script, so only those pay for the bidi
-        // pass below. One char test per cell is the cost for everyone else.
-        let mut rtl_rows: Vec<u16> = Vec::new();
+        // Right-to-left script anywhere on screen, so only such screens pay
+        // for the bidi pass below. One char test per cell is the cost for
+        // everyone else.
+        let mut any_rtl = false;
 
         for indexed in content.display_iter {
             let point: Point = indexed.point;
@@ -93,9 +96,7 @@ impl Snapshot {
                 bg_opt = Some(blend(base, s));
             }
 
-            if super::bidi::is_rtl(cell.c) && !rtl_rows.contains(&(vp_line as u16)) {
-                rtl_rows.push(vp_line as u16);
-            }
+            any_rtl |= super::bidi::is_rtl(cell.c);
 
             let blank_char = cell.c == ' ' || cell.flags.contains(Flags::HIDDEN);
             if blank_char
@@ -120,36 +121,11 @@ impl Snapshot {
         // Reorder the RTL rows for display. The grid is untouched: only the
         // column a cell is *drawn* at changes, so what the program reads back
         // and what selection and search work on stay in logical order.
-        let mut visual_maps: Vec<(u16, Vec<usize>)> = Vec::new();
-        if !rtl_rows.is_empty() {
-            // Bucket cell indices by row in one pass. Scanning all cells per
-            // RTL row instead would be quadratic exactly when it hurts most —
-            // a screenful of Hebrew, which is the case this exists for.
-            let mut by_row: HashMap<u16, Vec<usize>> = HashMap::new();
-            for (idx, cell) in cells.iter().enumerate() {
-                if rtl_rows.contains(&cell.line) {
-                    by_row.entry(cell.line).or_default().push(idx);
-                }
-            }
-            for &line in &rtl_rows {
-                let Some(indices) = by_row.get(&line) else {
-                    continue;
-                };
-                let mut row = vec![' '; cols];
-                for &idx in indices {
-                    if let Some(slot) = row.get_mut(cells[idx].col as usize) {
-                        *slot = cells[idx].c;
-                    }
-                }
-                let map = super::bidi::logical_to_visual(&row);
-                for &idx in indices {
-                    if let Some(&visual) = map.get(cells[idx].col as usize) {
-                        cells[idx].col = visual as u16;
-                    }
-                }
-                visual_maps.push((line, map));
-            }
-        }
+        let orders = if any_rtl {
+            reorder(grid, display_offset, &mut cells)
+        } else {
+            Vec::new()
+        };
 
         let cursor = {
             let p = content.cursor.point;
@@ -160,11 +136,11 @@ impl Snapshot {
                 && content.mode.contains(TermMode::SHOW_CURSOR);
             // The cursor follows the text it sits in, or it would sit at the
             // wrong end of a Hebrew word.
-            let col = visual_maps
+            let col = orders
                 .iter()
                 .find(|(line, _)| *line == vp_line as u16)
-                .and_then(|(_, map)| map.get(p.column.0).copied())
-                .unwrap_or(p.column.0) as u16;
+                .and_then(|(_, order)| order.to_visual.get(p.column.0).copied())
+                .unwrap_or(p.column.0 as u16);
             visible.then_some((vp_line as u16, col, content.cursor.shape))
         };
 
@@ -176,8 +152,80 @@ impl Snapshot {
             display_offset,
             total_lines,
             mode: content.mode,
+            orders,
         }
     }
+}
+
+/// Order the screen's rows for display, move `cells` to the columns they
+/// are drawn at, and return the orders of the rows that changed.
+///
+/// Every row is read, not only those with RTL text: whether a row carries
+/// on the paragraph above it decides its direction, and so does the row
+/// above the screen for the top one. Only screens with RTL text get here.
+fn reorder(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    display_offset: usize,
+    cells: &mut [SnapCell],
+) -> Vec<(u16, RowOrder)> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+
+    let (cols, rows) = (grid.columns(), grid.screen_lines());
+    let top = -(display_offset as i32);
+    let first = (top - 1).max(grid.topmost_line().0);
+    let screen: Vec<ScreenRow> = (first..top + rows as i32)
+        .map(|line| {
+            let row = &grid[Line(line)];
+            let mut chars: Vec<char> = (0..cols).map(|c| row[Column(c)].c).collect();
+            for c in 1..cols {
+                // A wide character's second half reads as the character
+                // itself, so the two are never told apart and split.
+                if row[Column(c)].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    chars[c] = chars[c - 1];
+                }
+            }
+            ScreenRow {
+                chars,
+                wraps: row[Column(cols - 1)].flags.contains(Flags::WRAPLINE),
+            }
+        })
+        .collect();
+    let skip = (top - first) as usize;
+    let orders: Vec<(u16, RowOrder)> = super::bidi::order_screen(&screen)
+        .into_iter()
+        .skip(skip)
+        .enumerate()
+        .filter_map(|(line, order)| Some((line as u16, order?)))
+        .collect();
+
+    let mut by_line: Vec<Option<&RowOrder>> = vec![None; rows];
+    for (line, order) in &orders {
+        by_line[*line as usize] = Some(order);
+    }
+    for cell in cells.iter_mut() {
+        let Some(order) = by_line.get(cell.line as usize).copied().flatten() else {
+            continue;
+        };
+        let col = cell.col as usize;
+        let Some(&visual) = order.to_visual.get(col) else {
+            continue;
+        };
+        // Drawn from its left edge, two cells wide: whichever half ended up
+        // further left.
+        cell.col = if cell.flags.contains(Flags::WIDE_CHAR) {
+            order
+                .to_visual
+                .get(col + 1)
+                .map_or(visual, |&v| v.min(visual))
+        } else {
+            visual
+        };
+        if order.rtl.get(col) == Some(&true) {
+            cell.c = super::bidi::mirrored(cell.c);
+        }
+    }
+    orders
 }
 
 /// Built geometry for one frame, in egui points.
@@ -270,7 +318,8 @@ pub fn build(snapshot: &Snapshot, p: &mut BuildParams<'_>) -> TermMeshes {
                 };
                 let sprite = p.atlas.get(p.ctx, p.fonts, key);
                 if !sprite.is_blank() {
-                    let pen_x = rect_px.min.x + sprite.left;
+                    let pen_x =
+                        rect_px.min.x + sprite.left + p.fonts.centring(r.slot, m.ppem, m.cell_w);
                     let pen_y = rect_px.min.y + m.baseline as f32 - sprite.top;
                     let gr = Rect::from_min_size(
                         Pos2::new(pen_x, pen_y),
@@ -488,6 +537,34 @@ mod tests {
             !meshes.bg.vertices.is_empty(),
             "cursor block expected in bg"
         );
+    }
+
+    #[test]
+    fn a_hebrew_row_is_drawn_from_the_right_edge_with_the_cursor_after_it() {
+        // Claude's prompt row with Hebrew typed into it.
+        let term = term_with("❯ שלום".as_bytes());
+        let snap = Snapshot::capture(&term, &Theme::monet_dark());
+        let at = |c: char| {
+            snap.cells
+                .iter()
+                .find(|cell| cell.c == c)
+                .map(|cell| cell.col)
+        };
+        // 20 columns: the mark on the last one, the word read leftwards from
+        // there, and the cursor — where the next letter goes — left of it.
+        assert_eq!(at('❯'), Some(19));
+        assert_eq!(at('ש'), Some(17));
+        assert_eq!(at('ם'), Some(14));
+        assert_eq!(snap.cursor.map(|c| c.1), Some(13));
+        let (line, order) = &snap.orders[0];
+        assert_eq!(*line, 0);
+        assert_eq!(order.to_logical[17], 2, "a click on ש means ש");
+    }
+
+    #[test]
+    fn a_screen_without_rtl_text_keeps_the_grids_order() {
+        let snap = Snapshot::capture(&term_with(b"cargo build"), &Theme::monet_dark());
+        assert!(snap.orders.is_empty());
     }
 
     #[test]
