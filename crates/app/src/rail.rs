@@ -1347,10 +1347,11 @@ fn category_header(
 ///
 /// Every mark is the group's colour (giverny#400, settling #362): the flag
 /// and its count were amber, which matched nothing else in the header. The
-/// working mark is a dot that breathes from empty to full and back on the
-/// calm breath (`breath`, [`calm_breath`]; giverny#462): hollow at 0, a
-/// stroke that widens inward until the dot is filled at 1, where it holds
-/// with `rail.animate` off. Its caller keeps the frames coming.
+/// working mark is a dot that goes from empty to full and back on the calm
+/// breath (`breath`, [`calm_breath`]; giverny#462): a fixed outline of
+/// [`HEADER_DOT_R`], always drawn, whose centre fades in from nothing at 0
+/// to the outline's colour at 1, where it holds with `rail.animate` off.
+/// It never changes size. Its caller keeps the frames coming.
 fn header_badges(
     p: &egui::Painter,
     y: f32,
@@ -1382,9 +1383,14 @@ fn header_badges(
     }
     // Where the tick would sit, and what is left of it before then.
     let (tick_x, end) = if cat.busy > 0 {
-        let empty = HEADER_DOT_R - RING_STROKE;
-        let inner = empty * (1.0 - breath.clamp(0.0, 1.0));
-        annulus(p, Pos2::new(badge_x, y), HEADER_DOT_R, inner, cat.color);
+        // One circle: its outline always there, its centre the colour
+        // faded in by the breath, the stroke drawn over the fill's edge.
+        p.circle(
+            Pos2::new(badge_x, y),
+            HEADER_DOT_R - RING_STROKE / 2.0,
+            cat.color.gamma_multiply(breath.clamp(0.0, 1.0)),
+            Stroke::new(RING_STROKE, cat.color),
+        );
         p.text(
             Pos2::new(badge_x - 8.0, y),
             Align2::RIGHT_CENTER,
@@ -3205,7 +3211,7 @@ mod tests {
                     .collect();
                 assert_eq!(dots.len(), want_dots, "{case}: {shapes:?}");
                 for d in dots {
-                    assert_eq!(d.radius, HEADER_DOT_R);
+                    assert!((d.radius + d.stroke.width / 2.0 - HEADER_DOT_R).abs() < 1e-4);
                     assert_eq!(d.fill, Color32::RED, "full, in the group's colour");
                 }
                 // The flag: its staff and its pennant, neither amber.
@@ -3237,11 +3243,12 @@ mod tests {
         }
     }
 
-    /// The header's working dot breathes from empty to full (giverny#462):
-    /// at breath 0 a hollow dot of the same outer edge, its stroke widening
-    /// inward as it breathes until it is filled, with no jump between.
+    /// The header's working dot goes from empty to full (giverny#462,
+    /// round 2): one circle whose outline holds its size and colour while
+    /// only its centre fades in, nothing at breath 0 and the outline's
+    /// colour at 1, never dropping as the breath climbs.
     #[test]
-    fn the_header_dot_breathes_from_empty_to_full() {
+    fn the_header_dot_fades_its_centre_from_empty_to_full() {
         let cat = GroupData {
             key: GroupKey::Repo(None),
             category: CategoryId(0),
@@ -3260,26 +3267,33 @@ mod tests {
             let shapes = painted(|p| {
                 header_badges(p, 10.0, 200.0, &cat, Color32::GRAY, breath);
             });
-            let circles: Vec<egui::Shape> = shapes
+            let circles: Vec<egui::epaint::CircleShape> = shapes
                 .into_iter()
-                .filter(|s| matches!(s, egui::Shape::Circle(_)))
+                .filter_map(|s| match s {
+                    egui::Shape::Circle(c) => Some(c),
+                    _ => None,
+                })
                 .collect();
-            band(&circles)
+            assert_eq!(circles.len(), 1, "one dot, at {breath}");
+            circles[0]
         };
-        let (outer, inner) = at(0.0);
-        assert!((outer - HEADER_DOT_R).abs() < 1e-4, "{outer}");
-        assert!((inner - (HEADER_DOT_R - RING_STROKE)).abs() < 1e-4, "empty");
-        assert_eq!(at(1.0), (HEADER_DOT_R, 0.0), "full");
-        let mut last = at(0.0);
-        for k in 1..=100 {
-            let now = at(k as f32 / 100.0);
-            assert!((now.0 - HEADER_DOT_R).abs() < 1e-4, "the edge holds");
+        let mut last = 0;
+        for k in 0..=100 {
+            let d = at(k as f32 / 100.0);
             assert!(
-                now.1 <= last.1 && last.1 - now.1 < 1.05,
-                "{last:?} -> {now:?}"
+                (d.radius + d.stroke.width / 2.0 - HEADER_DOT_R).abs() < 1e-4,
+                "the size holds"
             );
-            last = now;
+            assert_eq!(
+                d.stroke,
+                Stroke::new(RING_STROKE, Color32::RED),
+                "the outline holds"
+            );
+            assert!(d.fill.a() >= last, "the centre only fills in");
+            last = d.fill.a();
         }
+        assert_eq!(at(0.0).fill.a(), 0, "empty");
+        assert_eq!(at(1.0).fill, Color32::RED, "full");
     }
 
     /// A header ticks exactly when a row under it does: a finish unseen
