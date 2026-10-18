@@ -428,11 +428,8 @@ fn row_data(
             format!("{sub} · Codex")
         };
     }
-    let own = t.display_title(&app.cfg.titles);
-    let (title, hover) = match app.tab_place(t) {
-        Some(place) => (place.to_string(), Some(own)),
-        None => (own, None),
-    };
+    // The worker on view (giverny#460), the place (giverny#435), the title.
+    let (title, hover) = app.tab_titles(t);
     RowData {
         id: t.id,
         title,

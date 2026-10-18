@@ -1102,6 +1102,10 @@ pub struct TabRuntime {
     /// the picture is held, so the header over the terminal
     /// changes in the same frame as the view under it.
     shown_viewed: Option<String>,
+    /// What the tab is called while [`Self::shown_viewed`] is a worker's
+    /// view: that worker, as its pane row names it (giverny#460). Kept
+    /// while the tab is in the background, where the screen is not read.
+    viewed_title: Option<String>,
     /// The worker view whose header was closed with its `×`; it stays
     /// closed until the tab leaves that view.
     header_closed: Option<String>,
@@ -2335,8 +2339,9 @@ impl App {
                     RenameTarget::Tab(id) => self
                         .ws
                         .tab(*id)
-                        // What they see, not the raw title behind it.
-                        .map(|t| self.shown_title(t))
+                        // What they see, not the raw title behind it — the
+                        // tab's own, not a worker's on view (giverny#460).
+                        .map(|t| self.own_title(t))
                         .unwrap_or_default(),
                     RenameTarget::Category(id) => self
                         .ws
@@ -2837,6 +2842,7 @@ impl App {
                     worker_checked: None,
                     viewed: None,
                     shown_viewed: None,
+                    viewed_title: None,
                     header_closed: None,
                     prompt_bar: prompt_bar::Owner::default(),
                 });
@@ -3308,13 +3314,27 @@ impl App {
         )
     }
 
-    /// A tab's title as the rail shows it: its place (giverny#435), else
-    /// its title tidied per `[titles]`.
+    /// A tab's title as the rail shows it: the worker whose view it shows
+    /// (giverny#460), else its place (giverny#435), else its title tidied
+    /// per `[titles]`.
     pub fn shown_title(&self, t: &giverny_core::tabs::Tab) -> String {
-        match self.tab_place(t) {
-            Some(place) => place.to_string(),
-            None => t.display_title(&self.cfg.titles),
-        }
+        self.tab_titles(t).0
+    }
+
+    /// The rail's title for a tab, and its hover: see
+    /// [`agent_open::tab_titles`].
+    pub fn tab_titles(&self, t: &giverny_core::tabs::Tab) -> (String, Option<String>) {
+        agent_open::tab_titles(
+            self.rt.get(&t.id).and_then(|rt| rt.viewed_title.as_deref()),
+            self.tab_place(t),
+            t.display_title(&self.cfg.titles),
+        )
+    }
+
+    /// A tab's own title, whatever view its Claude Code shows: its place,
+    /// else its title. What a rename starts from and a notification names.
+    pub fn own_title(&self, t: &giverny_core::tabs::Tab) -> String {
+        agent_open::tab_titles(None, self.tab_place(t), t.display_title(&self.cfg.titles)).0
     }
 
     /// Is this tab stopped by a usage limit at all, reset time known or not?
@@ -5762,7 +5782,7 @@ impl eframe::App for App {
             .ws
             .tabs
             .iter()
-            .map(|t| (t.id, self.shown_title(t)))
+            .map(|t| (t.id, self.own_title(t)))
             .collect();
         // The sessions whose place the rail titles their tab after
         // (giverny#435), looked up by the next scan; none while that is off.
@@ -6074,19 +6094,20 @@ impl eframe::App for App {
             }
             // The worker whose view the tab shows, or is on its way to: its
             // pane row is marked, from the click on.
-            // The worker the header over the terminal is about: the view
-            // in the picture, unless its `×` closed it.
-            let header_label = self
-                .rt
-                .get(&active)
-                .filter(|rt| rt.header_closed.is_none() || rt.header_closed != rt.shown_viewed)
-                .and_then(|rt| rt.shown_viewed.clone());
+            // The worker whose view is in the picture: what the header over
+            // the terminal is about, unless its `×` closed it, and what the
+            // tab is titled after (giverny#460).
+            let shown_label = self.rt.get(&active).and_then(|rt| rt.shown_viewed.clone());
+            let header_closed = self.rt.get(&active).is_some_and(|rt| {
+                rt.header_closed.is_some() && rt.header_closed == rt.shown_viewed
+            });
             let viewed = self.viewed_worker(active);
-            let header_id = header_label
+            let shown_id = shown_label
                 .as_deref()
                 .and_then(|l| self.worker_id(active, l));
             // The management panel takes the bottom of the terminal's area.
             let mut header = None;
+            let mut shown_row = None;
             if self.cfg.claude.management_panel {
                 let (click, line) = management_panel::show(
                     &mut self.agent_views,
@@ -6095,7 +6116,7 @@ impl eframe::App for App {
                     // Only once the tab's session is up.
                     self.claude.agents.shown(active),
                     viewed.as_deref(),
-                    header_id.as_deref(),
+                    shown_id.as_deref(),
                     management_panel::limit_for(
                         &self.claude,
                         active,
@@ -6111,7 +6132,20 @@ impl eframe::App for App {
                     actions.push(Action::AgentRowClicked(active, Box::new(click)));
                 }
                 self.hover = self.agent_views.take_hover(active).map(|row| (active, row));
-                header = line;
+                shown_row = line.clone();
+                header = line.filter(|_| !header_closed);
+            }
+            let title = agent_open::viewed_title(
+                shown_label.as_deref(),
+                shown_row.as_ref().map(|l| &l.click),
+            );
+            if let Some(rt) = self.rt.get_mut(&active)
+                && rt.viewed_title != title
+            {
+                tracing::debug!("tab {active:?}: titled {title:?} (worker view)");
+                rt.viewed_title = title;
+                // The rail is drawn before this: draw it again.
+                ctx.request_repaint();
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {

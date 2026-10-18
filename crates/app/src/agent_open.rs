@@ -99,6 +99,42 @@ pub fn title_of(click: &RowClick) -> String {
     }
 }
 
+/// What a tab is called while its Claude Code shows a worker's view
+/// (giverny#460): the worker, as its management-panel row names it
+/// ([`title_of`]), else the label Claude Code puts on the view (the Agent
+/// call's description). `None` on the manager's own view (`label` none),
+/// where the tab keeps its own title.
+///
+/// `label` is read off the screen ([`viewing_worker`], [`prompt_box`]), so
+/// it follows the view however it was left: the pane's back button, a
+/// second click on the row, Esc or ← typed by hand, the strip's `main`.
+pub fn viewed_title(label: Option<&str>, row: Option<&RowClick>) -> Option<String> {
+    let label = label?;
+    Some(match row {
+        Some(row) => title_of(row),
+        None => label.to_string(),
+    })
+}
+
+/// What the rail calls a tab, and what a hover over its row says: the
+/// worker whose view it shows (`viewed`, [`viewed_title`]), else its
+/// place (giverny#435), else its own title. A name shown over the tab's
+/// own is the hover's: over a worker, the manager's place or title.
+pub fn tab_titles(
+    viewed: Option<&str>,
+    place: Option<&str>,
+    own: String,
+) -> (String, Option<String>) {
+    let manager = match place {
+        Some(place) => (place.to_string(), Some(own)),
+        None => (own, None),
+    };
+    match viewed {
+        Some(worker) => (worker.to_string(), Some(manager.0)),
+        None => manager,
+    }
+}
+
 fn agent_id(click: &RowClick) -> Option<&str> {
     click.agent_id.as_deref().filter(|id| !id.is_empty())
 }
@@ -1678,6 +1714,49 @@ mod tests {
         assert_eq!(title_of(&c), "acme#158");
         c.name.clear();
         assert_eq!(title_of(&c), "a93");
+    }
+
+    #[test]
+    fn a_tab_on_a_workers_view_is_titled_after_the_worker() {
+        // giverny#460.
+        let mut c = click(Stage::Running);
+        c.name = "fix the rail".into();
+        // On the manager's view: no title of the worker's, whatever the row.
+        assert_eq!(viewed_title(None, Some(&c)), None);
+        assert_eq!(viewed_title(None, None), None);
+        // On the worker's view: the panel row's title, else the view's label.
+        assert_eq!(
+            viewed_title(Some("g460: attached title"), Some(&c)).as_deref(),
+            Some("acme#158 · fix the rail")
+        );
+        assert_eq!(
+            viewed_title(Some("g460: attached title"), None).as_deref(),
+            Some("g460: attached title")
+        );
+    }
+
+    #[test]
+    fn the_worker_on_view_names_the_tab_over_its_place_and_title() {
+        // giverny#460, over giverny#435.
+        let own = || "✳ Claude Code".to_string();
+        // The manager's own view: its place, its title under it; or its title.
+        assert_eq!(
+            tab_titles(None, Some("Rotem's Workshop"), own()),
+            ("Rotem's Workshop".into(), Some("✳ Claude Code".into()))
+        );
+        assert_eq!(
+            tab_titles(None, None, own()),
+            ("✳ Claude Code".into(), None)
+        );
+        // A worker's view: the worker, the manager's name under it.
+        assert_eq!(
+            tab_titles(Some("g460 · fix"), Some("Rotem's Workshop"), own()),
+            ("g460 · fix".into(), Some("Rotem's Workshop".into()))
+        );
+        assert_eq!(
+            tab_titles(Some("g460 · fix"), None, own()),
+            ("g460 · fix".into(), Some("✳ Claude Code".into()))
+        );
     }
 
     #[test]
