@@ -622,6 +622,7 @@ mod tests {
             cpu_use: Default::default(),
             cpu: Default::default(),
             live_sessions: None,
+            run_bounds: Default::default(),
         }
     }
 

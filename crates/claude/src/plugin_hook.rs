@@ -10,7 +10,9 @@
 //! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
 //! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
 //! hook that, with names on, asks a tab's session to name itself
-//! ([`crate::names`]) — or, for a session whose start ran no such hook, its
+//! ([`crate::names`]), and puts a tab's claude under its cap before its
+//! first command ([`crate::tab_cap::on_session_start`], giverny#270)
+//! — or, for a session whose start ran no such name hook, its
 //! next prompt does (giverny#356) — and tells a manager's compacted
 //! session it is one ([`crate::managers::start_context`],
 //! giverny#448). And it is the `SubagentStop` hook, which
@@ -589,6 +591,12 @@ pub fn main() -> i32 {
         return 0;
     }
     if let Some(start) = crate::names::start_payload(&input) {
+        // A tab's claude is put under its cap before its first command,
+        // not on the sampler's next pass (giverny#270).
+        if start.get("agent_id").is_none() {
+            let env_file = std::env::var_os("CLAUDE_ENV_FILE").map(PathBuf::from);
+            crate::tab_cap::on_session_start(env_file.as_deref());
+        }
         let feeds = crate::feed::feed_dir();
         let on = crate::names::is_on(&feeds);
         let name = crate::names::start_context(&start, &feeds, on, on && tabs_own());
