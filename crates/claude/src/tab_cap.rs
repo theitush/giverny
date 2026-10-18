@@ -379,7 +379,12 @@ fn adopt_now(claude: u32, cgroup_of: impl Fn(u32) -> Option<String>) -> bool {
     if std::env::var_os(crate::manage_run::NO_SYSTEMD_ENV).is_some_and(|v| !v.is_empty()) {
         return false;
     }
-    let _ = cap_slice_now();
+    // A slice already there was capped by whoever made it (the sampler, a
+    // `run`), and is capped again by the sampler when the limits change:
+    // no systemd round trip for it on every session's start.
+    if !slice_dir(&cgroup_of(claude).unwrap_or_default()).is_some_and(|d| d.is_dir()) {
+        let _ = cap_slice_now();
+    }
     let page_kb = crate::session_use::sysconf(libc::_SC_PAGESIZE).unwrap_or(4096) / 1024;
     let procs = crate::session_use::proc_table(page_kb);
     let pids = moved_with(&procs, claude, &cgroup_of);
@@ -387,6 +392,23 @@ fn adopt_now(claude: u32, cgroup_of: impl Fn(u32) -> Option<String>) -> bool {
     run_quiet("busctl", &adopt_args(&scope_name(claude), &pids, &lease)).is_ok()
         // The sampler's pass may have taken it a moment before.
         || cgroup_of(claude).is_some_and(|cg| in_slice(&cg))
+}
+
+/// Where [`SLICE`]'s cgroup is, under the user manager a process with
+/// `cgroup` (its `/proc/<pid>/cgroup` text) runs under; `None` outside one.
+pub fn slice_dir(cgroup: &str) -> Option<std::path::PathBuf> {
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let end = path.find(".service/").or_else(|| {
+        path.trim_end()
+            .ends_with(".service")
+            .then(|| path.trim_end().len() - ".service".len())
+    })?;
+    let manager = &path[..end + ".service".len()];
+    manager
+        .rsplit('/')
+        .next()
+        .is_some_and(|m| m.starts_with("user@"))
+        .then(|| std::path::PathBuf::from(format!("/sys/fs/cgroup{manager}/giverny.slice/{SLICE}")))
 }
 
 /// The app's sampler's half of the cap: [`Adopter::tick`] each pass.
@@ -728,6 +750,20 @@ mod tests {
             "never reaches the app"
         );
         assert_eq!(tab_claude(10, 1, parent, is_claude), None, "no claude");
+    }
+
+    #[test]
+    fn the_slice_is_found_under_the_user_manager() {
+        assert_eq!(
+            slice_dir("0::/user.slice/user-1000.slice/user@1000.service/app.slice/giverny.scope\n"),
+            Some(std::path::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/\
+                 giverny.slice/giverny-claude.slice"
+            ))
+        );
+        assert!(slice_dir("0::/user.slice/user-1000.slice/user@1000.service\n").is_some());
+        assert_eq!(slice_dir("0::/init.scope\n"), None);
+        assert_eq!(slice_dir("0::/system.slice/ssh.service/x\n"), None);
     }
 
     #[test]
