@@ -17,7 +17,9 @@
 //!   authority on what is running *now*.
 //! * **The worker's own transcript.**
 //!   `projects/<munged cwd>/<parent session>/subagents/agent-<id>.jsonl`, with
-//!   `agent-<id>.meta.json` beside it (`description`, `agentType`, `model`).
+//!   `agent-<id>.meta.json` beside it (`description`, `agentType`, `model`,
+//!   and for an agent another agent spawned `parentAgentId` and
+//!   `spawnDepth`: what nests it under its parent's row, giverny#464).
 //!   The last `tool_use` in it is what the worker is doing ([`read_activity`]).
 //! * **The parent's transcript.** When a worker stops, Claude Code queues a
 //!   `<task-notification>` naming its `<task-id>` and a `<status>` —
@@ -309,6 +311,12 @@ pub struct AgentMeta {
     pub agent_type: Option<String>,
     /// Only when the spawn passed one.
     pub model: Option<String>,
+    /// The agent that spawned it (`parentAgentId`), when that was an agent
+    /// and not the session itself.
+    pub parent_id: Option<String>,
+    /// How deep it was spawned (`spawnDepth`): 1 for the session's own
+    /// workers, 2 for an agent one of them spawned, and so on.
+    pub depth: Option<u32>,
 }
 
 pub fn read_meta(subagents_dir: &Path, id: &str) -> AgentMeta {
@@ -323,6 +331,8 @@ pub fn read_meta(subagents_dir: &Path, id: &str) -> AgentMeta {
         description: as_str(&v, "description"),
         agent_type: as_str(&v, "agentType"),
         model: as_str(&v, "model"),
+        parent_id: as_str(&v, "parentAgentId"),
+        depth: as_u64(&v, "spawnDepth").map(|d| d.min(u64::from(u32::MAX)) as u32),
     }
 }
 
@@ -904,6 +914,14 @@ pub struct SubagentRow {
     /// Spans it stood stopped on an API error ([`Stop`]), oldest first.
     #[serde(default)]
     pub stops: Vec<Stop>,
+    /// The agent that spawned it, when another agent did (its meta's
+    /// `parentAgentId`): the pane draws it under that agent's row
+    /// (giverny#464). `None` for the session's own workers.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Its meta's `spawnDepth`: 1 for the session's own workers.
+    #[serde(default)]
+    pub depth: Option<u32>,
 }
 
 impl SubagentRow {
@@ -926,6 +944,8 @@ impl SubagentRow {
             tokens_from_transcript: false,
             live_tokens: None,
             stops: Vec::new(),
+            parent_id: None,
+            depth: None,
         }
     }
 
@@ -1074,6 +1094,12 @@ impl SubagentRow {
         if self.model.is_none() {
             self.model = meta.model;
         }
+        if meta.parent_id.is_some() {
+            self.parent_id = meta.parent_id;
+        }
+        if meta.depth.is_some() {
+            self.depth = meta.depth;
+        }
     }
 }
 
@@ -1096,6 +1122,9 @@ impl crate::feed::LiveAgent for SubagentRow {
     }
     fn ended_ms(&self) -> Option<u64> {
         self.ended_ms
+    }
+    fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
     }
 }
 
@@ -1138,6 +1167,11 @@ pub struct Tracker {
     /// transcript after a restart, and then left alone.
     #[serde(skip)]
     checked: std::collections::HashSet<String>,
+    /// Workers whose `agent-<id>.meta.json` this process has read: once
+    /// each, as a worker the live list announced first (or one restored from
+    /// before its parent was kept) has its parent only there.
+    #[serde(skip)]
+    meta_read: std::collections::HashSet<String>,
     /// Workers whose Done rows were cleared by hand ([`Tracker::clear_done`]):
     /// not brought back by the disk or the live list unless they run again.
     #[serde(default)]
@@ -1376,6 +1410,7 @@ impl Tracker {
                     continue;
                 }
                 let unchecked = !self.checked.contains(&id);
+                let want_meta = !self.meta_read.contains(&id);
                 let needs_read = !known
                     || self.rows.iter().any(|r| {
                         r.id == id
@@ -1383,7 +1418,7 @@ impl Tracker {
                                 || r.transcript.is_none()
                                 || (unchecked && !r.tokens_from_transcript))
                     });
-                if !needs_read && completion.is_none() {
+                if !needs_read && completion.is_none() && !want_meta {
                     continue;
                 }
                 let path = agent_transcript(dir, &id);
@@ -1406,7 +1441,12 @@ impl Tracker {
                 } else {
                     None
                 };
-                let meta = (!known).then(|| read_meta(dir, &id));
+                let meta = want_meta.then(|| read_meta(dir, &id));
+                // Written at the spawn, but a worker's transcript can show
+                // up first: one with no meta yet is looked at again.
+                if meta.as_ref().is_some_and(|m| *m != AgentMeta::default()) {
+                    self.meta_read.insert(id.clone());
+                }
                 // A worker new to us is Done unless it has written since its
                 // notification: messaged again and still going, with no live
                 // entry yet — Running until the list or the next
@@ -1934,6 +1974,71 @@ mod tests {
         t.clear();
         assert!(t.is_empty());
         assert_eq!(t.session_id.as_deref(), Some("s1"));
+    }
+
+    /// giverny#464: an agent a worker spawned names its parent only in its
+    /// `agent-<id>.meta.json` (the live list carries no parent). A row the
+    /// live list announced first still gets it, read once, as Claude Code
+    /// 2.1.302 writes it for a fork of a fork.
+    #[test]
+    fn a_nested_agent_carries_its_parent_from_its_meta() {
+        let (config, subs, _) = layout("nested", "s1");
+        for id in ["w1", "c1", "g1"] {
+            append(
+                &subs.join(format!("agent-{id}.jsonl")),
+                "{\"type\":\"user\"}\n",
+            );
+        }
+        std::fs::write(
+            subs.join("agent-w1.meta.json"),
+            r#"{"agentType":"general-purpose","description":"g463a: triage","spawnDepth":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            subs.join("agent-c1.meta.json"),
+            r#"{"agentType":"fork","isFork":true,"description":"Triage group E","toolUseId":"t","parentAgentId":"w1","spawnDepth":2,"model":"inherit","finished":true}"#,
+        )
+        .unwrap();
+        let mut t = Tracker::new(Some(config.clone()));
+        t.apply_live(
+            &live("s1", &[("w1", "running", T0), ("c1", "running", T0 + 5)]),
+            T0 + 10,
+        );
+        // Its meta is not there yet: no parent, and it is looked for again.
+        t.apply_live(
+            &live(
+                "s1",
+                &[
+                    ("w1", "running", T0),
+                    ("c1", "running", T0 + 5),
+                    ("g1", "running", T0 + 9),
+                ],
+            ),
+            T0 + 11,
+        );
+        t.refresh();
+        let w1 = t.get("w1").unwrap();
+        assert_eq!((w1.parent_id.as_deref(), w1.depth), (None, Some(1)));
+        let c1 = t.get("c1").unwrap();
+        assert_eq!((c1.parent_id.as_deref(), c1.depth), (Some("w1"), Some(2)));
+        assert_eq!(
+            c1.description.as_deref(),
+            Some("Work c1"),
+            "the live list's stays"
+        );
+        assert_eq!(t.get("g1").unwrap().parent_id, None);
+        std::fs::write(
+            subs.join("agent-g1.meta.json"),
+            r#"{"description":"deeper","parentAgentId":"c1","spawnDepth":3}"#,
+        )
+        .unwrap();
+        t.refresh();
+        let g1 = t.get("g1").unwrap();
+        assert_eq!((g1.parent_id.as_deref(), g1.depth), (Some("c1"), Some(3)));
+        // Kept over a restart.
+        let back: Tracker = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.get("g1").unwrap().parent_id.as_deref(), Some("c1"));
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[test]

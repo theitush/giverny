@@ -44,6 +44,11 @@
 //! it leaves no mark: a row is tinted only while the pointer is on it
 //! ([`row_tint`]), so nothing stays highlighted after a click.
 //!
+//! **Nesting** (giverny#464): an agent a worker spawned is drawn under
+//! that worker's row, indented a step per level, and goes where that row
+//! goes ([`nest`]); a toggle at the head of the worker's title folds them
+//! away ([`Fold`]), kept per tab while Giverny runs.
+//!
 //! **Resources**: what a row's `giverny manage run`
 //! commands use in a quiet column — live CPU and memory while one runs, the
 //! memory peak once the row is Done, zero when there is neither — its lease from the machine ledger in
@@ -172,6 +177,9 @@ struct View {
     flash_due: bool,
     /// The newly done rows breathing now, if any.
     flash: Option<Flash>,
+    /// The rows whose agents' own agents are folded away under them
+    /// (giverny#464), by [`fold_ident`]: kept for as long as the tab is.
+    folded: HashSet<String>,
 }
 
 /// The newly done rows' frames breathing together (giverny#394): which rows
@@ -1242,7 +1250,48 @@ pub struct Line {
     /// The hover's lines under the title (giverny#423): where the row is
     /// and why, in words ([`running_why`], [`Wait::why`], [`done_why`]).
     pub why: Vec<String>,
+    /// How deep under another row it hangs (giverny#464): 0 for a row of
+    /// its own, 1 for an agent a worker spawned, 2 for one that agent
+    /// spawned. Its title is drawn indented a step per level.
+    pub depth: usize,
+    /// The row's agent spawned agents of its own, drawn under it: whether
+    /// they are folded away and how many there are.
+    pub fold: Option<Fold>,
     pub click: RowClick,
+}
+
+/// A row whose agent spawned agents of its own (giverny#464): the toggle
+/// on its row folds them away under it or shows them again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fold {
+    /// What the pane keeps the fold by ([`fold_ident`]).
+    pub ident: String,
+    /// They are folded away.
+    pub folded: bool,
+    /// How many rows hang under it, every level down.
+    pub under: usize,
+    /// How many of those still run.
+    pub running: usize,
+}
+
+impl Fold {
+    /// The toggle drawn at the head of the title: `▸` while folded,
+    /// `▾` while open.
+    pub fn glyph(&self) -> char {
+        if self.folded { '▸' } else { '▾' }
+    }
+
+    /// What a folded row says of what it hides: `+6`, `+6, 2 running`.
+    /// Nothing while open.
+    pub fn note(&self) -> String {
+        if !self.folded {
+            return String::new();
+        }
+        match self.running {
+            0 => format!("+{}", self.under),
+            r => format!("+{}, {r} running", self.under),
+        }
+    }
 }
 
 impl Line {
@@ -1266,6 +1315,9 @@ impl Line {
 pub struct Table {
     pub lines: Vec<Line>,
     pub footer: Option<String>,
+    /// Some row has agents hung under it ([`Line::fold`]): every
+    /// top-level title leaves room for the toggle, so they stay aligned.
+    pub nested: bool,
 }
 
 impl Table {
@@ -1295,13 +1347,26 @@ pub fn build_at(
     clock: &Clock,
     logs: &Logs,
 ) -> Table {
-    build_with(feed, live, now_ms, clock, logs, DoneRows::All, Drawn::Every)
+    build_with(
+        feed,
+        live,
+        now_ms,
+        clock,
+        logs,
+        DoneRows::All,
+        Drawn::Every,
+        &HashSet::new(),
+    )
 }
 
 /// [`build_at`], showing only the Done rows `done` keeps
 /// (`management_panel.done_rows`) and the rows `drawn` keeps (giverny#357).
 /// Rows are dropped before they are formatted, so a `"` never stands for a
 /// row that is not drawn.
+///
+/// An agent another drawn agent spawned hangs under that agent's row
+/// ([`nest`], giverny#464), unless that row is in `folded`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_with(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -1310,6 +1375,7 @@ pub fn build_with(
     logs: &Logs,
     done: DoneRows,
     drawn: Drawn,
+    folded: &HashSet<String>,
 ) -> Table {
     with_rows(feed, live, logs, now_ms, |feed, rows| {
         // What a Next up row waits for is read off every row, drawn or not:
@@ -1325,20 +1391,255 @@ pub fn build_with(
         // Next up in the order its rows will start, the next on top
         // (giverny#442); Running and Done as they were.
         kept.sort_by_key(|(_, o)| *o);
-        keep_done(&mut kept, done, |((r, _), _)| r.stage);
-        let (mut rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().map(|(rw, _)| rw).unzip();
+        let (rows, waits): (Vec<_>, Vec<_>) = kept.into_iter().map(|(rw, _)| rw).unzip();
+        let nested = nest(&rows, done, folded);
+        let mut slots: Vec<Option<_>> = rows.into_iter().zip(waits).map(Some).collect();
+        let (mut rows, waits): (Vec<_>, Vec<_>) =
+            nested.iter().filter_map(|n| slots[n.at].take()).unzip();
         reditto(&mut rows);
         let written = feed.and_then(|f| f.written_ms);
         let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-        for (row, wait) in rows.iter().zip(waits) {
-            lines.push(format_row(row, now_ms, written, clock, wait));
+        for ((row, wait), n) in rows.iter().zip(waits).zip(&nested) {
+            let mut line = format_row(row, now_ms, written, clock, wait);
+            line.depth = n.depth;
+            line.fold = n.fold.clone();
+            if let Some(f) = &n.fold {
+                line.why.push(fold_why(f));
+            }
+            if let Some(p) = &n.parent {
+                line.why.push(format!("spawned by {p}"));
+            }
+            lines.push(line);
         }
         dittos(&rows, &mut lines);
         Table {
+            nested: lines.iter().any(|l| l.fold.is_some()),
             lines,
             footer: feed.and_then(|f| f.footer.clone()),
         }
     })
+}
+
+/// One row as [`nest`] places it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Nested {
+    /// Its place among the rows handed to [`nest`].
+    at: usize,
+    depth: usize,
+    fold: Option<Fold>,
+    /// The row it hangs under, by name, for its hover.
+    parent: Option<String>,
+}
+
+/// What a row's fold is kept by: its feed key, else its agent's id — as
+/// [`done_ident`] knows a row, so a worker's fold holds from Running to
+/// Done.
+fn fold_ident(row: &PaneRow<'_, SubagentRow>) -> String {
+    match (
+        row.feed.map(|f| f.key.as_str()).filter(|k| !k.is_empty()),
+        row.agent_id(),
+    ) {
+        (Some(k), _) => format!("k:{k}"),
+        (None, Some(a)) => format!("a:{a}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// A row by name, for a hover: its feed key, else its agent's name.
+fn row_name(row: &PaneRow<'_, SubagentRow>) -> String {
+    row.feed
+        .map(|f| f.key.clone())
+        .filter(|k| !k.is_empty())
+        .or_else(|| row.live.map(|l| l.display_name().to_string()))
+        .unwrap_or_default()
+}
+
+/// The row each row hangs under, by place: the drawn row of the agent that
+/// spawned it ([`SubagentRow::parent_id`]). A worker that holds several
+/// rows (tasks one after another) takes it under the one whose task was
+/// under way when it spawned it — the latest to start no later — else its
+/// first. An agent whose spawner holds no row stands on its own, and so
+/// does one caught in a loop of parents (never seen; never trusted).
+fn parent_rows(rows: &[PaneRow<'_, SubagentRow>]) -> Vec<Option<usize>> {
+    let mut up: Vec<Option<usize>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let l = r.live?;
+            let p = l.parent_id.as_deref()?;
+            let holds = |(j, o): &(usize, &PaneRow<'_, SubagentRow>)| {
+                *j != i && o.stage != Stage::Planned && o.agent_id() == Some(p)
+            };
+            let under_way = rows
+                .iter()
+                .enumerate()
+                .filter(holds)
+                .filter(|(_, o)| match (o.started_ms(), l.started_ms) {
+                    (Some(a), Some(b)) => a <= b,
+                    _ => false,
+                })
+                .max_by_key(|(_, o)| o.started_ms());
+            under_way
+                .or_else(|| rows.iter().enumerate().find(holds))
+                .map(|(j, _)| j)
+        })
+        .collect();
+    for i in 0..up.len() {
+        let mut at = up[i];
+        let mut steps = 0;
+        while let Some(j) = at {
+            if j == i || steps > up.len() {
+                up[i] = None;
+                break;
+            }
+            at = up[j];
+            steps += 1;
+        }
+    }
+    up
+}
+
+/// Place the rows as the pane draws them (giverny#464): each agent another
+/// drawn agent spawned right under its spawner's row, a level deeper, in
+/// the order the rows came; its spawner's Running or Done row carries it
+/// wherever that row is. A row in `folded` hides everything under it and
+/// says how much ([`Fold`]).
+///
+/// `done` keeps the newest Done rows of their own (`Last(n)` counts only
+/// those) and what hangs under them. What hung under a Done row that is
+/// not kept goes with it, but an agent still running there stands on its
+/// own instead: a running agent is never hidden by the Done setting.
+/// `Hide` hides every Done row, nested or not.
+fn nest(
+    rows: &[PaneRow<'_, SubagentRow>],
+    done: DoneRows,
+    folded: &HashSet<String>,
+) -> Vec<Nested> {
+    let n = rows.len();
+    let mut up = parent_rows(rows);
+    let level = |up: &[Option<usize>], i: usize| {
+        let (mut d, mut at) = (0, up[i]);
+        while let Some(j) = at {
+            d += 1;
+            at = up[j];
+        }
+        d
+    };
+    let mut dropped = vec![false; n];
+    if done != DoneRows::All {
+        let keep = match done {
+            DoneRows::Last(k) => k,
+            _ => 0,
+        };
+        let mut seen = 0;
+        for i in 0..n {
+            if rows[i].stage != Stage::Done {
+                continue;
+            }
+            if done == DoneRows::Hide {
+                dropped[i] = true;
+            } else if up[i].is_none() {
+                seen += 1;
+                dropped[i] = seen > keep;
+            }
+        }
+        // Shallowest first, so a row's spawner is settled before it is.
+        let mut by_level: Vec<usize> = (0..n).collect();
+        let levels: Vec<usize> = (0..n).map(|i| level(&up, i)).collect();
+        by_level.sort_by_key(|&i| levels[i]);
+        for i in by_level {
+            if let Some(p) = up[i]
+                && dropped[p]
+            {
+                if rows[i].stage == Stage::Done {
+                    dropped[i] = true;
+                } else {
+                    up[i] = None;
+                }
+            }
+        }
+    }
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in (0..n).filter(|&i| !dropped[i]) {
+        if let Some(p) = up[i] {
+            kids[p].push(i);
+        }
+    }
+    // Everything under a row, every level down, and how much of it runs.
+    fn under(i: usize, kids: &[Vec<usize>], rows: &[PaneRow<'_, SubagentRow>]) -> (usize, usize) {
+        kids[i].iter().fold((0, 0), |(all, run), &k| {
+            let (a, r) = under(k, kids, rows);
+            let me = usize::from(rows[k].stage == Stage::Running);
+            (all + 1 + a, run + me + r)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        i: usize,
+        depth: usize,
+        parent: Option<String>,
+        kids: &[Vec<usize>],
+        rows: &[PaneRow<'_, SubagentRow>],
+        folded: &HashSet<String>,
+        out: &mut Vec<Nested>,
+    ) {
+        let fold = (!kids[i].is_empty()).then(|| {
+            let (under, running) = under(i, kids, rows);
+            let ident = fold_ident(&rows[i]);
+            Fold {
+                folded: folded.contains(&ident),
+                ident,
+                under,
+                running,
+            }
+        });
+        let open = fold.as_ref().is_none_or(|f| !f.folded);
+        out.push(Nested {
+            at: i,
+            depth,
+            fold,
+            parent,
+        });
+        if open {
+            for &k in &kids[i] {
+                place(
+                    k,
+                    depth + 1,
+                    Some(row_name(&rows[i])),
+                    kids,
+                    rows,
+                    folded,
+                    out,
+                );
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in (0..n).filter(|&i| !dropped[i] && up[i].is_none()) {
+        place(i, 0, None, &kids, rows, folded, &mut out);
+    }
+    out
+}
+
+/// A row with agents under it, in its hover: how many, how many run, and
+/// what the toggle does.
+fn fold_why(f: &Fold) -> String {
+    let agents = if f.under == 1 { "agent" } else { "agents" };
+    let running = match f.running {
+        0 => String::new(),
+        r => format!(", {r} running"),
+    };
+    if f.folded {
+        format!(
+            "{} {agents} of its own folded under it{running} — ▸ shows them",
+            f.under
+        )
+    } else {
+        format!(
+            "{} {agents} of its own under it{running} — ▾ folds them",
+            f.under
+        )
+    }
 }
 
 /// The pane's rows, as it places them at `now_ms`: the feed with the
@@ -1515,24 +1816,6 @@ pub fn chores(
         }
         out
     })
-}
-
-/// Drop the Done rows `done` does not keep. Done rows sit newest first, so
-/// `Last(n)` keeps the first `n` of them met.
-fn keep_done<R>(rows: &mut Vec<R>, done: DoneRows, stage: impl Fn(&R) -> Stage) {
-    let keep = match done {
-        DoneRows::All => return,
-        DoneRows::Hide => 0,
-        DoneRows::Last(n) => n,
-    };
-    let mut seen = 0;
-    rows.retain(|r| {
-        if stage(r) != Stage::Done {
-            return true;
-        }
-        seen += 1;
-        seen <= keep
-    });
 }
 
 /// A cell is `"` when its row is the same worker as the row above
@@ -1887,6 +2170,8 @@ fn format_row(
         oom,
         flag: flag.is_some(),
         landed_ms: row.ended_ms().filter(|_| row.stage == Stage::Done),
+        depth: 0,
+        fold: None,
         click: RowClick {
             stage: row.stage,
             key,
@@ -2506,6 +2791,7 @@ pub fn show(
         &view.logs,
         panel.done(),
         drawn,
+        &view.folded,
     );
     if table.is_empty() {
         return (None, None);
@@ -2589,7 +2875,7 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let (click, rects, hover) = draw_table(
+                    let drew = draw_table(
                         ui,
                         id.with("rows"),
                         &table,
@@ -2604,13 +2890,19 @@ pub fn show(
                         cols,
                         &mut view.sel,
                     );
-                    clicked = click;
-                    view.hover = hover;
+                    clicked = drew.clicked;
+                    view.hover = drew.hover;
+                    if let Some(ident) = drew.fold {
+                        if !view.folded.remove(&ident) {
+                            view.folded.insert(ident);
+                        }
+                        ui.ctx().request_repaint();
+                    }
                     #[cfg(debug_assertions)]
                     {
                         view.clicks = table.lines.iter().map(|l| l.click.clone()).collect();
                     }
-                    view.rows_at = rects;
+                    view.rows_at = drew.rects;
                     view.cell_w = cell.x.max(1.0);
                 });
             outer.advance_cursor_after_rect(inner.min_rect());
@@ -2737,6 +3029,8 @@ struct Cols {
     /// does ([`table_cols`]).
     usew: usize,
     x_use: usize,
+    /// The table nests rows ([`Table::nested`]).
+    nested: bool,
 }
 
 impl Cols {
@@ -2822,6 +3116,7 @@ impl Cols {
             x_tok_end,
             usew,
             x_use,
+            nested: table.nested,
         }
     }
 
@@ -2837,17 +3132,51 @@ impl Cols {
         }
     }
 
+    /// Where a row's title starts, in columns from the row's left: past
+    /// the id. `None` with the title off.
+    fn title_x(&self) -> Option<usize> {
+        self.title_w()?;
+        Some(self.x_task + if self.idw > 0 { self.idw + 1 } else { 0 })
+    }
+
+    /// The column of a row's fold toggle ([`Fold::glyph`]), when it has
+    /// one and the title is shown.
+    fn fold_x(&self, line: &Line) -> Option<usize> {
+        line.fold.as_ref()?;
+        Some(self.title_x()? + NEST_W * line.depth)
+    }
+
+    /// A click in `line`'s cell `col` is on its fold toggle — the glyph or
+    /// the space after it: the fold it toggles ([`Fold::ident`]).
+    fn fold_hit(&self, line: &Line, col: usize) -> Option<String> {
+        let x = self.fold_x(line)?;
+        (col == x || col == x + 1).then(|| line.fold.as_ref().map(|f| f.ident.clone()))?
+    }
+
     /// A row's cells as drawn: each one's text and the column it starts at.
     /// Always the same seven, in this order ([`ETA_SEG`], [`LEASE_SEG`]); a
     /// column switched off is an empty cell.
     fn segments(&self, line: &Line) -> Vec<(usize, String)> {
         let on = &self.on;
         let idw = self.idw;
-        // The id is never cut; the title takes what is left.
+        // The id is never cut; the title takes what is left, after its
+        // nesting and before a folded row's note, which are never cut
+        // either.
+        let title = |w: usize| {
+            let head = nest_head(line, self.nested);
+            let note = line.fold.as_ref().map(Fold::note).unwrap_or_default();
+            let tail = if note.is_empty() {
+                String::new()
+            } else {
+                format!("  {note}")
+            };
+            let room = w.saturating_sub(head.chars().count() + tail.chars().count());
+            format!("{head}{}{tail}", cut(&line.title, room))
+        };
         let task = match self.title_w() {
             None => line.id.clone(),
-            Some(w) if idw > 0 => format!("{:<idw$} {}", line.id, cut(&line.title, w)),
-            Some(w) => cut(&line.title, w),
+            Some(w) if idw > 0 => format!("{:<idw$} {}", line.id, title(w)),
+            Some(w) => title(w),
         };
         let cell = |shown: bool, at: usize, text: String| {
             if shown {
@@ -2885,6 +3214,24 @@ impl Cols {
             ),
             cell(self.usew > 0, self.x_use, cut(&line.usage, self.usew)),
         ]
+    }
+}
+
+/// How far each level of nesting moves a title in (giverny#464).
+const NEST_W: usize = 3;
+
+/// What a title is drawn behind (giverny#464): its level's indent, then its
+/// fold toggle, or `└` for a nested row with nothing under it. A row of its
+/// own with nothing under it has none — but leaves the toggle's room while
+/// another row has one (`nested`), so the titles stay aligned.
+fn nest_head(line: &Line, nested: bool) -> String {
+    let indent = " ".repeat(NEST_W * line.depth);
+    match (&line.fold, line.depth) {
+        (Some(f), _) => format!("{indent}{} ", f.glyph()),
+        // The toggle's room: the glyph and the space after it.
+        (None, 0) if nested => "  ".into(),
+        (None, 0) => String::new(),
+        (None, _) => format!("{indent}└ "),
     }
 }
 
@@ -2966,6 +3313,8 @@ pub fn selected_text(rows: &[String], sel: &Selection) -> String {
 struct RowsInput {
     /// A plain click: the row it landed on.
     clicked: Option<usize>,
+    /// The cell a plain click landed in, counted from the rows' left.
+    click_col: Option<usize>,
     /// The row under the pointer, while it is not dragging.
     hovered: Option<usize>,
     /// The pointer is held on a row, not (yet) dragging.
@@ -3054,7 +3403,11 @@ fn rows_input(
     }
     if resp.clicked() {
         *sel = None;
-        out.clicked = at(resp.interact_pointer_pos()).map(|(r, _)| r);
+        let p = resp.interact_pointer_pos();
+        out.clicked = at(p).map(|(r, _)| r);
+        out.click_col = p
+            .zip(rects.first())
+            .map(|(p, first)| ((p.x - first.left()) / cw.max(1.0)).floor().max(0.0) as usize);
     }
     if !out.dragging {
         out.hovered = resp
@@ -3085,7 +3438,7 @@ fn draw_table(
     row_h: f32,
     cols: usize,
     sel: &mut Option<Selection>,
-) -> (Option<RowClick>, Vec<egui::Rect>, Option<Option<RowClick>>) {
+) -> Drew {
     let cw = cell.x.max(1.0);
     let layout = Cols::shown(table, cols, shown);
     let mut segs: Vec<Vec<(usize, String)>> =
@@ -3102,7 +3455,10 @@ fn draw_table(
         })
         .collect();
     let Some((input, resp)) = rows_input(ui, id, &rects, &texts, cw, sel) else {
-        return (None, rects, None);
+        return Drew {
+            rects,
+            ..Drew::default()
+        };
     };
     let n = table.lines.len();
     let hovered_line = input.hovered.filter(|&r| r < n);
@@ -3202,14 +3558,35 @@ fn draw_table(
             shared.paint_text(&p, at, s, ink);
         }
     }
-    let clicked = input
-        .clicked
-        .and_then(|i| table.lines.get(i))
+    // A click on a row's fold toggle, or the space after it, folds or
+    // unfolds what hangs under it (giverny#464) and opens nothing.
+    let clicked_line = input.clicked.and_then(|i| table.lines.get(i));
+    let fold = clicked_line.and_then(|l| layout.fold_hit(l, input.click_col?));
+    let clicked = clicked_line
+        .filter(|_| fold.is_none())
         .map(|l| l.click.clone());
     let hover = input
         .hovered
         .map(|i| table.lines.get(i).map(|l| l.click.clone()));
-    (clicked, rects, hover)
+    Drew {
+        clicked,
+        rects,
+        hover,
+        fold,
+    }
+}
+
+/// What [`draw_table`] saw this frame.
+#[derive(Default)]
+struct Drew {
+    /// The row a click opens.
+    clicked: Option<RowClick>,
+    /// Where each row was drawn.
+    rects: Vec<egui::Rect>,
+    /// The pointer over the rows: `Some(None)` on the pane but on no row.
+    hover: Option<Option<RowClick>>,
+    /// A click on a row's fold toggle: that row's [`Fold::ident`].
+    fold: Option<String>,
 }
 
 #[cfg(test)]
@@ -3338,6 +3715,318 @@ mod tests {
         assert_eq!(l.tokens, "64.1k");
         assert_eq!(l.eta, "");
         assert_eq!(l.click.agent_id.as_deref(), Some("a1"));
+    }
+
+    /// Live rows from `(id, status, start offset s, parent)`: each named
+    /// `Work <id>`, its parent as its meta would give it (giverny#464).
+    fn family(rows: &[(&str, &str, u64, Option<&str>)]) -> Vec<SubagentRow> {
+        let tasks: Vec<String> = rows
+            .iter()
+            .map(|(id, status, at, _)| {
+                format!(
+                    r#"{{"id":"{id}","status":"{status}","description":"Work {id}",
+                       "startTime":{},"tokenCount":1000}}"#,
+                    T0 - 600_000 + at * 1000
+                )
+            })
+            .collect();
+        let mut out = live(&format!(
+            r#"{{"session_id":"s","tasks":[{}]}}"#,
+            tasks.join(",")
+        ));
+        for r in &mut out {
+            let (.., parent) = rows.iter().find(|(id, ..)| *id == r.id).unwrap();
+            r.parent_id = parent.map(str::to_string);
+        }
+        out
+    }
+
+    fn titles(t: &Table) -> Vec<(String, usize, Stage)> {
+        t.lines
+            .iter()
+            .map(|l| (l.title.clone(), l.depth, l.stage))
+            .collect()
+    }
+
+    fn drawn_titles(t: &Table) -> Vec<String> {
+        let cols = Cols::new(t, 160);
+        t.lines
+            .iter()
+            .map(|l| cols.segments(l)[1].1.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_agent_a_worker_spawned_hangs_under_its_row() {
+        let rows = family(&[
+            ("w1", "running", 0, None),
+            ("w2", "running", 10, None),
+            ("c1", "running", 20, Some("w1")),
+            ("c2", "completed", 30, Some("w1")),
+        ]);
+        let t = build(None, &rows, T0);
+        assert_eq!(
+            titles(&t),
+            [
+                ("Work w1".into(), 0, Stage::Running),
+                ("Work c1".into(), 1, Stage::Running),
+                ("Work c2".into(), 1, Stage::Done),
+                ("Work w2".into(), 0, Stage::Running),
+            ]
+        );
+        let fold = t.lines[0].fold.as_ref().expect("a toggle on the worker");
+        assert_eq!((fold.under, fold.running, fold.folded), (2, 1, false));
+        assert!(t.nested);
+        // Each with its own state, time and tokens; the worker's count is
+        // its own, not its agents' too.
+        let c2 = &t.lines[2];
+        assert_eq!(c2.stage, Stage::Done);
+        assert_eq!(c2.tokens, "1k");
+        assert_eq!(t.lines[0].tokens, "1k");
+        assert_eq!(t.lines[1].elapsed, "9:40");
+        // Indented under the toggle; a row of its own keeps the toggle's
+        // room.
+        assert_eq!(
+            drawn_titles(&t),
+            ["▾ Work w1", "   └ Work c1", "   └ Work c2", "  Work w2"]
+        );
+        assert!(t.lines[1].tip().contains("spawned by Work w1"));
+        assert!(
+            t.lines[0]
+                .tip()
+                .contains("2 agents of its own under it, 1 running")
+        );
+        // A click on it is any worker's: its own id and transcript.
+        assert_eq!(t.lines[1].click.agent_id.as_deref(), Some("c1"));
+        assert_eq!(t.lines[2].click.stage, Stage::Done);
+    }
+
+    #[test]
+    fn nesting_goes_as_deep_as_the_spawns() {
+        let rows = family(&[
+            ("w1", "running", 0, None),
+            ("c1", "running", 20, Some("w1")),
+            ("g1", "running", 30, Some("c1")),
+            ("g2", "completed", 40, Some("c1")),
+        ]);
+        let t = build(None, &rows, T0);
+        assert_eq!(
+            titles(&t),
+            [
+                ("Work w1".into(), 0, Stage::Running),
+                ("Work c1".into(), 1, Stage::Running),
+                ("Work g1".into(), 2, Stage::Running),
+                ("Work g2".into(), 2, Stage::Done),
+            ]
+        );
+        assert_eq!(
+            drawn_titles(&t),
+            [
+                "▾ Work w1",
+                "   ▾ Work c1",
+                "      └ Work g1",
+                "      └ Work g2"
+            ]
+        );
+        let w1 = t.lines[0].fold.as_ref().unwrap();
+        assert_eq!((w1.under, w1.running), (3, 2), "every level down");
+        assert!(t.lines[2].tip().contains("spawned by Work c1"));
+    }
+
+    #[test]
+    fn an_agent_whose_spawner_has_no_row_is_a_row_of_its_own() {
+        let rows = family(&[
+            ("w1", "running", 0, None),
+            ("c9", "running", 20, Some("gone")),
+        ]);
+        let t = build(None, &rows, T0);
+        assert_eq!(
+            titles(&t),
+            [
+                ("Work w1".into(), 0, Stage::Running),
+                ("Work c9".into(), 0, Stage::Running),
+            ]
+        );
+        assert!(!t.nested && t.lines.iter().all(|l| l.fold.is_none()));
+        assert_eq!(drawn_titles(&t), ["Work w1", "Work c9"], "drawn as today");
+        // A loop of parents (never seen) is no nesting either.
+        let rows = family(&[
+            ("a", "running", 0, Some("b")),
+            ("b", "running", 10, Some("a")),
+        ]);
+        let t = build(None, &rows, T0);
+        assert_eq!(t.lines.len(), 2);
+    }
+
+    #[test]
+    fn a_done_workers_running_agent_stays_under_it() {
+        let rows = family(&[
+            ("w1", "completed", 0, None),
+            ("w2", "running", 10, None),
+            ("c1", "running", 20, Some("w1")),
+        ]);
+        let t = build(None, &rows, T0);
+        assert_eq!(
+            titles(&t),
+            [
+                ("Work w2".into(), 0, Stage::Running),
+                ("Work w1".into(), 0, Stage::Done),
+                ("Work c1".into(), 1, Stage::Running),
+            ]
+        );
+        let fold = t.lines[1].fold.as_ref().unwrap();
+        assert_eq!((fold.under, fold.running), (1, 1));
+        // Its own stage word and ticking clock, under a Done row.
+        assert_eq!(t.lines[2].elapsed, "9:40");
+    }
+
+    #[test]
+    fn a_folded_worker_says_what_it_hides() {
+        let rows = family(&[
+            ("w1", "running", 0, None),
+            ("c1", "running", 20, Some("w1")),
+            ("c2", "completed", 30, Some("w1")),
+            ("g1", "running", 40, Some("c1")),
+            ("w2", "completed", 50, None),
+            ("d1", "completed", 60, Some("w2")),
+        ]);
+        let folded: HashSet<String> = ["a:w1".to_string(), "a:w2".to_string()].into();
+        let (clock, logs) = (Clock::plain(), Logs::new());
+        let t = build_with(
+            None,
+            &rows,
+            T0,
+            &clock,
+            &logs,
+            DoneRows::All,
+            Drawn::Every,
+            &folded,
+        );
+        assert_eq!(
+            titles(&t),
+            [
+                ("Work w1".into(), 0, Stage::Running),
+                ("Work w2".into(), 0, Stage::Done),
+            ]
+        );
+        let w1 = t.lines[0].fold.as_ref().unwrap();
+        assert_eq!((w1.under, w1.running, w1.folded), (3, 2, true));
+        assert_eq!(
+            drawn_titles(&t),
+            ["▸ Work w1  +3, 2 running", "▸ Work w2  +1"]
+        );
+        assert!(
+            t.lines[0]
+                .tip()
+                .contains("3 agents of its own folded under it, 2 running")
+        );
+        // The toggle is the glyph, or the space after it; the rest of the
+        // row opens it.
+        let cols = Cols::new(&t, 160);
+        let x = cols.title_x().unwrap();
+        assert_eq!(cols.fold_hit(&t.lines[0], x).as_deref(), Some("a:w1"));
+        assert_eq!(cols.fold_hit(&t.lines[0], x + 1).as_deref(), Some("a:w1"));
+        assert_eq!(cols.fold_hit(&t.lines[0], x + 2), None);
+        assert_eq!(cols.fold_hit(&t.lines[0], x - 1), None);
+        // The note is never cut: the title gives way.
+        let narrow = Cols::new(&t, 40);
+        let cell = narrow.segments(&t.lines[0])[1].1.trim_end().to_string();
+        assert!(cell.ends_with("+3, 2 running"), "{cell}");
+        // Folding one leaves the other's open.
+        let folded: HashSet<String> = ["a:c1".to_string()].into();
+        let t = build_with(
+            None,
+            &rows,
+            T0,
+            &clock,
+            &logs,
+            DoneRows::All,
+            Drawn::Every,
+            &folded,
+        );
+        assert_eq!(t.lines.len(), 5, "only g1 is folded away");
+        assert_eq!(
+            t.lines[1].fold.as_ref().map(Fold::note).as_deref(),
+            Some("+1, 1 running")
+        );
+    }
+
+    #[test]
+    fn the_done_setting_counts_rows_of_their_own() {
+        let mut rows = family(&[
+            ("old", "completed", 0, None),
+            ("new", "completed", 10, None),
+            ("c-old", "running", 20, Some("old")),
+            ("d-old", "completed", 25, Some("old")),
+            ("c-new", "completed", 30, Some("new")),
+        ]);
+        for r in &mut rows {
+            r.ended_ms = Some(match r.id.as_str() {
+                "old" => T0 - 100_000,
+                "new" => T0 - 10_000,
+                _ => T0 - 5_000,
+            });
+        }
+        let (clock, logs) = (Clock::plain(), Logs::new());
+        let at = |done| {
+            titles(&build_with(
+                None,
+                &rows,
+                T0,
+                &clock,
+                &logs,
+                done,
+                Drawn::Every,
+                &HashSet::new(),
+            ))
+        };
+        // The newest Done row of its own, with what hangs under it; the
+        // older one's running agent stands on its own, its Done one goes.
+        assert_eq!(
+            at(DoneRows::Last(1)),
+            [
+                ("Work c-old".into(), 0, Stage::Running),
+                ("Work new".into(), 0, Stage::Done),
+                ("Work c-new".into(), 1, Stage::Done),
+            ]
+        );
+        assert_eq!(
+            at(DoneRows::Hide),
+            [("Work c-old".into(), 0, Stage::Running)]
+        );
+        assert_eq!(at(DoneRows::All).len(), 5);
+    }
+
+    /// An agent a worker spawned that names its worker's task is still its
+    /// own row under the worker, never taken for the task's worker.
+    #[test]
+    fn an_agent_naming_its_workers_task_is_not_its_worker() {
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"g463a","stage":"running","agent_id":"w1","started":{s},"eta_s":3600}},
+              {{"key":"g470","stage":"running","started":{s},"eta_s":3600}}]}}"#,
+            s = T0 - 600_000
+        ));
+        let mut rows = family(&[
+            ("w1", "running", 0, None),
+            ("c1", "running", 20, Some("w1")),
+        ]);
+        rows[1].description = Some("g463a triage group A, for g470".into());
+        let t = build(Some(&f), &rows, T0);
+        let ids: Vec<(&str, Option<&str>, usize)> = t
+            .lines
+            .iter()
+            .map(|l| (l.click.key.as_str(), l.click.agent_id.as_deref(), l.depth))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("g463a", Some("w1"), 0),
+                ("", Some("c1"), 1),
+                ("g470", None, 0),
+            ]
+        );
+        assert_eq!(t.lines[0].fold.as_ref().unwrap().ident, "k:g463a");
     }
 
     #[test]
@@ -3472,6 +4161,7 @@ mod tests {
                 &Logs::new(),
                 done,
                 Drawn::Every,
+                &HashSet::new(),
             )
             .lines
             .into_iter()
@@ -5137,7 +5827,16 @@ mod tests {
     fn drawn_table(f: &Feed, live: &[SubagentRow], manager: bool) -> Table {
         let (clock, logs) = (Clock::plain(), Logs::new());
         let d = Drawn::of(manager);
-        build_with(Some(f), live, T0, &clock, &logs, DoneRows::All, d)
+        build_with(
+            Some(f),
+            live,
+            T0,
+            &clock,
+            &logs,
+            DoneRows::All,
+            d,
+            &HashSet::new(),
+        )
     }
 
     /// giverny#357, the case that prompted it: a session that is no
@@ -6788,6 +7487,7 @@ mod tests {
         r.press(at);
         let (input, copied) = r.frame(vec![button(at, false)]);
         assert_eq!(input.clicked, Some(1));
+        assert_eq!(input.click_col, Some(12), "the cell it fell in");
         assert_eq!(r.sel, None);
         assert!(copied.is_empty());
     }
