@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.7.2 — 2026-10-18
+
+- Clearer rail status marks: idle agents use a filled dot, and the calm busy
+  mark morphs from that dot to an open ring. Shells use matching filled and
+  hollow squares to distinguish the prompt, running commands and exited tabs.
+- Category working badges now include running shell commands and animate
+  even when the group is collapsed. Disabling rail animation keeps the marks
+  still. Thanks to [@theitush](https://github.com/theitush). (#24)
+
 ## v1.7.1 — 2026-10-18
 
 - Fix a dead Claude conversation being adopted by a shell tab after a Linux
