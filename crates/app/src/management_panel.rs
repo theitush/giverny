@@ -1292,6 +1292,15 @@ impl Fold {
             r => format!("+{}, {r} running", self.under),
         }
     }
+
+    /// [`Fold::note`] for a narrow row: just `+6`.
+    pub fn short_note(&self) -> String {
+        if self.folded {
+            format!("+{}", self.under)
+        } else {
+            String::new()
+        }
+    }
 }
 
 impl Line {
@@ -3077,8 +3086,28 @@ impl Cols {
         .sum();
         let stage_cols = if on.stage { STAGE_W + GAP } else { 0 };
         // TASK is the id and the title; with the title off, just the id.
+        // However narrow the pane, it holds the id and, on every row, its
+        // nesting, a few cells of title and a folded row's short note
+        // (`+3`), so nothing spills into ELAPSED (giverny#464): the table
+        // runs off the right instead.
         let taskw = if on.title {
-            cols.saturating_sub(stage_cols + fixed_right).max(MIN_TITLE)
+            let id_room = if idw > 0 { idw + 1 } else { 0 };
+            let least = table
+                .lines
+                .iter()
+                .map(|l| {
+                    let note = l.fold.as_ref().map(Fold::short_note).unwrap_or_default();
+                    let note = if note.is_empty() {
+                        0
+                    } else {
+                        note.chars().count() + 2
+                    };
+                    nest_head(l, table.nested).chars().count() + note + TITLE_KEEP
+                })
+                .max()
+                .unwrap_or(0);
+            cols.saturating_sub(stage_cols + fixed_right)
+                .max(id_room + MIN_TITLE.max(least))
         } else {
             idw
         };
@@ -3159,20 +3188,9 @@ impl Cols {
     fn segments(&self, line: &Line) -> Vec<(usize, String)> {
         let on = &self.on;
         let idw = self.idw;
-        // The id is never cut; the title takes what is left, after its
-        // nesting and before a folded row's note, which are never cut
-        // either.
-        let title = |w: usize| {
-            let head = nest_head(line, self.nested);
-            let note = line.fold.as_ref().map(Fold::note).unwrap_or_default();
-            let tail = if note.is_empty() {
-                String::new()
-            } else {
-                format!("  {note}")
-            };
-            let room = w.saturating_sub(head.chars().count() + tail.chars().count());
-            format!("{head}{}{tail}", cut(&line.title, room))
-        };
+        // The id is never cut; the title fits in what is left
+        // ([`fit_title`]).
+        let title = |w: usize| fit_title(line, self.nested, w);
         let task = match self.title_w() {
             None => line.id.clone(),
             Some(w) if idw > 0 => format!("{:<idw$} {}", line.id, title(w)),
@@ -3219,6 +3237,38 @@ impl Cols {
 
 /// How far each level of nesting moves a title in (giverny#464).
 const NEST_W: usize = 3;
+
+/// The least of a title kept beside a folded row's note before the note
+/// shortens: `Work …` (giverny#464).
+const TITLE_KEEP: usize = 6;
+
+/// A row's title cell, `w` cells wide (giverny#464): its nesting, the
+/// title, and a folded row's note, never wider than `w`. The nesting is
+/// never cut ([`Cols::shown`] leaves it room). As the cell narrows the
+/// title gives way first, down to [`TITLE_KEEP`]; then the note shortens
+/// (`+3, 2 running` to `+3`); then it drops and the title takes it all.
+fn fit_title(line: &Line, nested: bool, w: usize) -> String {
+    let head = nest_head(line, nested);
+    let hw = head.chars().count();
+    let keep = line.title.chars().count().min(TITLE_KEEP);
+    let notes = line
+        .fold
+        .as_ref()
+        .filter(|f| f.folded)
+        .map(|f| [f.note(), f.short_note()])
+        .unwrap_or_default();
+    for note in notes.iter().filter(|n| !n.is_empty()) {
+        let tail = format!("  {note}");
+        let used = hw + tail.chars().count();
+        if used + keep <= w {
+            return format!("{head}{}{tail}", cut(&line.title, w - used));
+        }
+    }
+    cut(
+        &format!("{head}{}", cut(&line.title, w.saturating_sub(hw))),
+        w,
+    )
+}
 
 /// What a title is drawn behind (giverny#464): its level's indent, then its
 /// fold toggle, or `└` for a nested row with nothing under it. A row of its
@@ -3928,10 +3978,11 @@ mod tests {
         assert_eq!(cols.fold_hit(&t.lines[0], x + 1).as_deref(), Some("a:w1"));
         assert_eq!(cols.fold_hit(&t.lines[0], x + 2), None);
         assert_eq!(cols.fold_hit(&t.lines[0], x - 1), None);
-        // The note is never cut: the title gives way.
+        // The title gives way to the note, then the note shortens
+        // ([`folded_rows_never_overlap_at_any_width`]).
         let narrow = Cols::new(&t, 40);
         let cell = narrow.segments(&t.lines[0])[1].1.trim_end().to_string();
-        assert!(cell.ends_with("+3, 2 running"), "{cell}");
+        assert_eq!(cell, "▸ Work …  +3");
         // Folding one leaves the other's open.
         let folded: HashSet<String> = ["a:c1".to_string()].into();
         let t = build_with(
@@ -3949,6 +4000,150 @@ mod tests {
             t.lines[1].fold.as_ref().map(Fold::note).as_deref(),
             Some("+1, 1 running")
         );
+    }
+
+    /// Each drawn piece of a row — every cell, and in TASK the id, the
+    /// nesting, the title and the note — as `(start, end, text)` columns.
+    fn pieces(cols: &Cols, line: &Line) -> Vec<(usize, usize, String)> {
+        let mut out = Vec::new();
+        for (k, (at, text)) in cols.segments(line).into_iter().enumerate() {
+            let text = text.trim_end().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            if k != 1 {
+                out.push((at, at + text.chars().count(), text));
+                continue;
+            }
+            // TASK: the id, then the nesting's glyph, then the title and
+            // the note, drawn two blanks apart.
+            let chars: Vec<char> = text.chars().collect();
+            let piece = |from: usize, to: usize, out: &mut Vec<_>| {
+                let to = to.min(chars.len());
+                let p: String = chars.get(from..to).unwrap_or(&[]).iter().collect();
+                let lead = p.chars().take_while(|c| *c == ' ').count();
+                let p = p.trim().to_string();
+                if !p.is_empty() {
+                    out.push((at + from + lead, at + from + lead + p.chars().count(), p));
+                }
+            };
+            let mut i = 0;
+            if cols.idw > 0 {
+                piece(0, cols.idw, &mut out);
+                i = cols.idw + 1;
+            }
+            if cols.title_w().is_some() {
+                let hw = nest_head(line, cols.nested).chars().count();
+                piece(i, i + hw, &mut out);
+                i += hw;
+                let body: String = chars.get(i..).unwrap_or(&[]).iter().collect();
+                for part in body.split("  ") {
+                    piece(i, i + part.chars().count(), &mut out);
+                    i += part.chars().count() + 2;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn folded_rows_never_overlap_at_any_width() {
+        // A folded worker of its own, and an open one whose agent is
+        // folded under it at depth 1 with one of its own at depth 2.
+        let rows = family(&[
+            ("w1", "running", 0, None),
+            ("c1", "running", 20, Some("w1")),
+            ("c2", "completed", 30, Some("w1")),
+            ("g1", "running", 40, Some("c1")),
+            ("w2", "running", 50, None),
+            ("d1", "running", 60, Some("w2")),
+            ("e1", "running", 70, Some("d1")),
+            ("f1", "running", 80, Some("e1")),
+        ]);
+        let folded: HashSet<String> = ["a:w1".to_string(), "a:e1".to_string()].into();
+        let (clock, logs) = (Clock::plain(), Logs::new());
+        let mut t = build_with(
+            None,
+            &rows,
+            T0,
+            &clock,
+            &logs,
+            DoneRows::All,
+            Drawn::Every,
+            &folded,
+        );
+        assert_eq!(
+            titles(&t).iter().map(|(_, d, _)| *d).collect::<Vec<_>>(),
+            [0, 0, 1, 2],
+            "w1 folded; w2, d1, e1 (folded) open"
+        );
+        assert!(t.lines[0].fold.as_ref().unwrap().folded);
+        assert!(t.lines[3].fold.as_ref().unwrap().folded);
+        for l in &mut t.lines {
+            l.title = format!("FEATURE: panel: {} sits under its worker's row", l.title);
+        }
+        let no_id = t.clone();
+        for l in &mut t.lines {
+            l.id = "giverny#464".into();
+        }
+        let title_off = PaneColumns {
+            title: false,
+            ..PaneColumns::default()
+        };
+        let mut seen = HashSet::new();
+        for (table, on) in [
+            (&t, PaneColumns::default()),
+            (&no_id, PaneColumns::default()),
+            (&t, title_off),
+        ] {
+            // From wide down to the pane's least ([`table_cols`]).
+            for w in (40..=200).rev() {
+                let cols = Cols::shown(table, w, &on);
+                for line in &table.lines {
+                    let ps = pieces(&cols, line);
+                    let mut spans = ps.clone();
+                    spans.sort();
+                    for pair in spans.windows(2) {
+                        assert!(
+                            pair[0].1 < pair[1].0,
+                            "at {w} cols, {:?} runs into {:?}: {:?}",
+                            pair[0].2,
+                            pair[1].2,
+                            compose(&cols.segments(line)),
+                        );
+                    }
+                    let task = &cols.segments(line)[1].1;
+                    assert!(task.chars().count() <= cols.taskw, "{task:?} at {w}");
+                    if on.title {
+                        // The nesting is whole and some title is left.
+                        let head = nest_head(line, cols.nested);
+                        assert!(task.contains(&head), "{task:?} at {w}");
+                        assert!(task.contains("FEATU"), "{task:?} at {w}");
+                    }
+                    if let Some(f) = line.fold.as_ref().filter(|f| f.folded) {
+                        let note = ps.iter().find(|p| p.2.starts_with('+'));
+                        let state = match note.map(|p| p.2.as_str()) {
+                            Some(n) if n == f.note() && n != f.short_note() => "whole",
+                            Some(n) if n == f.short_note() => "short",
+                            Some(n) => panic!("a cut note {n:?} at {w}"),
+                            None => "dropped",
+                        };
+                        // TASK always keeps room for the short one.
+                        assert!(!on.title || state != "dropped", "at {w}");
+                        seen.insert((on.title, line.depth, state));
+                    }
+                }
+            }
+        }
+        // Each folded row went through the steps, wide to narrow.
+        for depth in [0, 2] {
+            for state in ["whole", "short"] {
+                assert!(
+                    seen.contains(&(true, depth, state)),
+                    "{depth} {state}: {seen:?}"
+                );
+            }
+        }
     }
 
     #[test]
