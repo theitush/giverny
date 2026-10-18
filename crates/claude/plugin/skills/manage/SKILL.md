@@ -34,10 +34,11 @@ choose:
   row and its worker.
 - a **title**: one line saying what the task is. If the project types its
   tasks, start the title with the type word and a colon (`BUG: …`,
-  `FEATURE: …`): how your instinct runs is told per type.
-- an **estimate** in minutes for how long its worker will take: your instinct
-  scaled by the factor Giverny tells you (below). The figure you give is the
-  figure the pane shows.
+  `FEATURE: …`): how far off your gut runs is told per type.
+- an **estimate** in minutes for how long its worker will take, given as two
+  figures: your **gut** figure (`--gut`), the raw one, and the one you
+  **settle on** (`--eta`) after allowing for how far off your gut usually
+  runs (below). The settled figure is the figure the pane shows.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another: plan
@@ -52,12 +53,12 @@ worker will be told before it starts. Every `plan` gets one; a `plan` without
 Record every task, in the order you mean to run it:
 
 ```bash
-giverny-manage plan auth-fix --eta 25 --title "Fix the token refresh race" --brief briefs/auth-fix.md
-giverny-manage plan docs-api --eta 15 --title "Document the new endpoints" --brief briefs/docs-api.md
+giverny-manage plan auth-fix --eta 25 --gut 50 --title "Fix the token refresh race" --brief briefs/auth-fix.md
+giverny-manage plan docs-api --eta 15 --gut 30 --title "Document the new endpoints" --brief briefs/docs-api.md
 ```
 
 ```bash
-giverny-manage plan auth-tests --eta 10 --title "Test the refresh race" --after auth-fix --brief briefs/auth-tests.md
+giverny-manage plan auth-tests --eta 10 --gut 20 --title "Test the refresh race" --after auth-fix --brief briefs/auth-tests.md
 ```
 
 Keep the briefs somewhere that outlives the manager session and the machine: a
@@ -67,39 +68,40 @@ stored absolute. If the prompt changes before the
 spawn, write the new one and pass it again on `start` (`--brief FILE`).
 
 Each `plan` (and `start --eta`) prints the figure the pane will count down
-from, which is the one you gave, and how your instinct runs. Giverny keeps a
-history of every task that landed: its estimate, the factor you had been
-shown when you gave it, its wall time and its working time (wall time less
-pauses and waits). It takes the most recent 20 landed tasks like this one
-(same project and type, else same project, else all; five at least) and tells
-you the median of working time ÷ your instinct figure (the figure you gave ÷
-the factor you had been shown):
+from, which is the one you settled on, and how far off your gut runs.
+Giverny keeps a history of every task that landed: its estimate, your gut
+figure behind it, its wall time and its working time (wall time less pauses
+and waits). It takes the most recent 20 landed tasks like this one (same
+project and type, else same project, else all; five at least) and tells you
+the median of working time ÷ your gut figure, in words:
 
 ```
-planned auth-fix: ~25m
-  your instinct on BUG in myapp runs ×0.48 (last 9, median): scale your figure by it
+planned auth-fix: ~25m (gut 50m)
+  your gut estimates on BUG tasks in myapp have usually run about 2.1× too high (last 9, median); give your gut figure and the one you settle on: `--eta <settled> --gut <gut>`
 ```
 
-Nothing is corrected for you: scale your gut figure by the factor yourself,
-every time, and what you give is what the pane shows. The factor describes
-your instinct, not your last figures, so it does not fade as your scaled
-figures land on target: keep applying it. With too little history the second
-line says so. Pass `--repo <name>` when the task
-belongs to a project other than the directory you run in.
+Nothing is corrected for you. Give your gut figure as `--gut` every time, and
+settle on the figure you believe after allowing for that line: how much to
+allow for it is your judgement. What you settle on is what the pane shows.
+The history learns from the gut figure, not the settled one, so the line
+describes your gut and does not fade as your settled figures land on target.
+Leave out `--gut` and the figure counts as your gut figure. With too little
+history the second line says so. Pass `--repo <name>` when the task belongs
+to a project other than the directory you run in.
 
-A worker's re-estimate is scored too, on its own track: its first `eta` on a
-running task (the one Giverny asks for five minutes in, after it has read the
-code) goes on the pane as given and is later checked against the working
-time that was still to come. How the worker's instinct on its kind's
-re-estimates runs reaches it before its first figure — Giverny puts it in its
-context on its first tool call on the task — and again in each ask and in the
-`eta` output, for it to scale its figure by.
+A worker's re-estimate is scored too, on its own track and the same way: its
+first `eta` on a running task (the one Giverny asks for five minutes in,
+after it has read the code) goes on the pane as given, and its gut figure
+(`--gut`) is later checked against the working time that was still to come.
+How far off the worker's gut on its kind's re-estimates runs reaches it only
+in Giverny's asks, never as a note between them.
 
 `giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
 older tasks against recent: the dispatcher's guess and the worker's
-re-estimate, each with its instinct factor and how the figures as given
-landed (near ×1.00 when the factor is applied). When the
-user asks whether estimates are getting better, answer from it.
+re-estimate. For each it shows the instinct (working time ÷ the gut figure,
+what the line tells) and how the figures as given landed (near ×1.00 when
+the line is allowed for). When the user asks whether estimates are getting
+better, answer from it.
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
@@ -204,8 +206,12 @@ When you spawn one:
   > You are the worker for task `<task>`. Work only on this task and only in the
   > files it needs. Once you have read the code (Giverny will ask you about
   > five minutes in), re-estimate once with how many minutes are left, even
-  > if the figure stands: `giverny-manage eta <task> <minutes> --note "<why>"`.
-  > Do the same whenever the estimate turns out wrong. When you are waiting on
+  > if the figure stands. Each ask tells you how far off your gut figures on
+  > such tasks usually run: give your gut figure and the one you settle on
+  > after allowing for that, as you judge: `giverny-manage eta <task>
+  > <settled> --gut <gut> --note "<why>"`. Do the same whenever the estimate
+  > turns out wrong, allowing for what the last ask said; before any ask,
+  > give your gut figure. When you are waiting on
   > something that is not the work (a build slot, a lock, a person), say so
   > with `--why wait`; your next `eta` without it ends the wait. Do not run
   > `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy
@@ -217,16 +223,15 @@ When you spawn one:
   > to the dispatcher, who claims more. End with a short report: what you did,
   > how you checked it, and anything left undone.
 
-  On the worker's first tool call on a task, Giverny's plugin puts one line
-  into its context, once per task: how its instinct on its kind's
-  re-estimates runs (nothing with too little history), to scale its figure by
-  when it re-estimates. It is
-  told, not asked for anything. About five minutes into the task, the plugin
-  puts a request for that re-estimate into the worker's context, once, unless
-  it has re-estimated already. It asks again as each figure runs out: once when five minutes of
+  About five minutes into the task, the plugin puts a request for that
+  re-estimate into the worker's context, once, unless it has re-estimated
+  already. It asks again as each figure runs out: once when five minutes of
   it are left, and once if the work runs past it, unless the worker has just
-  re-estimated. Each ask tells the worker how its instinct on its kind's
-  re-estimates runs; none changes its figure. Its answer is the `eta` command.
+  re-estimated. Each ask tells the worker how far off its gut on its kind's
+  re-estimates usually runs (`your gut re-estimates on BUG tasks in myapp
+  have usually run about 2.5× too high (last 20, median)`; nothing with too
+  little history) and asks for both figures; none changes its figure. Its
+  answer is the `eta` command. Nothing is put in its context between asks.
 
 ## 3. While it runs
 

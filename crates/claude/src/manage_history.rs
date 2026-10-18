@@ -1278,4 +1278,125 @@ mod tests {
              (last 20, median)"
         );
     }
+
+    /// giverny#469: replays a real history (`$GIVERNY_REPLAY_HISTORY`, a
+    /// copy; it is only read) through the factor as told before and as told
+    /// now, printing per repo and type the factor each would have shown on
+    /// every tenth task of the group and its last. `cargo test -p
+    /// giverny-claude replay_real_history -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn replay_real_history() {
+        let Some(file) = std::env::var_os("GIVERNY_REPLAY_HISTORY") else {
+            return;
+        };
+        let all = load(Path::new(&file));
+        let repos: Vec<String> = std::env::var("GIVERNY_REPLAY_REPOS")
+            .unwrap_or_else(|_| "giverny,poly".into())
+            .split(',')
+            .map(String::from)
+            .collect();
+        // The factor as told before giverny#469: working time ÷ (the figure
+        // as given ÷ the factor shown), unheld, at the same level.
+        let before = |past: &[Record], track: Track, repo: &str, kind: Option<&str>| {
+            let (ratios, _) = level_ratios(past, track, Some(repo), kind)?;
+            let n = ratios.len();
+            let old: Vec<f64> = past
+                .iter()
+                .rev()
+                .filter(|h| h.repo.as_deref() == Some(repo))
+                .filter(|h| {
+                    // The level level_ratios settled on: kind if it had enough.
+                    kind.is_none_or(|k| h.kind.as_deref() == Some(k))
+                })
+                .filter_map(|h| {
+                    let x = match track {
+                        Track::Guess => h.told_x,
+                        Track::Reestimate => h.reest_told_x,
+                    }
+                    .filter(|x| *x > 0.0)
+                    .unwrap_or(1.0);
+                    Some(track.given_ratio(h)? * x)
+                })
+                .take(n)
+                .collect();
+            (old.len() == n).then(|| median(old))
+        };
+        for track in Track::ALL {
+            println!("\n== {}", track.heading());
+            for repo in &repos {
+                let mut kinds: Vec<Option<String>> = vec![None];
+                let mut ks: Vec<String> = all
+                    .iter()
+                    .filter(|h| h.repo.as_deref() == Some(repo))
+                    .filter(|h| track.pair(h).is_some())
+                    .filter_map(|h| h.kind.clone())
+                    .collect();
+                ks.sort();
+                ks.dedup();
+                kinds.extend(ks.into_iter().map(Some));
+                for kind in kinds {
+                    let k = kind.as_deref();
+                    let idx: Vec<usize> = (0..all.len())
+                        .filter(|&i| all[i].repo.as_deref() == Some(repo.as_str()))
+                        .filter(|&i| k.is_none_or(|k| all[i].kind.as_deref() == Some(k)))
+                        .filter(|&i| track.pair(&all[i]).is_some())
+                        .collect();
+                    if idx.len() < 2 * MIN_SAMPLES {
+                        continue;
+                    }
+                    let mut old_line = Vec::new();
+                    let mut new_line = Vec::new();
+                    // What the figures as given would have run, had each been
+                    // the gut ×the factor shown now: left ÷ (gut × new).
+                    let mut applied = Vec::new();
+                    let mut actual = Vec::new();
+                    for (j, &i) in idx.iter().enumerate() {
+                        let past = &all[..i];
+                        // The level a task's own line is found at.
+                        let kk = if k.is_some() {
+                            k
+                        } else {
+                            all[i].kind.as_deref()
+                        };
+                        let new = instinct(past, track, Some(repo), kk);
+                        if let (Some(n), Some(r)) = (&new, track.ratio(&all[i])) {
+                            applied.push(r / n.x);
+                            actual.push(track.given_ratio(&all[i]).unwrap());
+                        }
+                        if (j + 1) % 10 == 0 || j + 1 == idx.len() {
+                            let lvl = level_ratios(past, track, Some(repo), kk);
+                            let level_kind = lvl
+                                .as_ref()
+                                .and_then(|(_, w)| w.contains(" on ").then_some(kk).flatten());
+                            let fmt =
+                                |x: Option<f64>| x.map_or("  —  ".into(), |x| format!("{x:.3}"));
+                            old_line.push(fmt(before(past, track, repo, level_kind)));
+                            new_line.push(fmt(new.map(|n| n.x)));
+                        }
+                    }
+                    let half = |v: &[f64]| {
+                        let (a, b) = v.split_at(v.len() / 2);
+                        let m = |v: &[f64]| {
+                            if v.is_empty() {
+                                f64::NAN
+                            } else {
+                                median(v.to_vec())
+                            }
+                        };
+                        format!("{:.2} → {:.2}", m(a), m(b))
+                    };
+                    println!(
+                        "{repo} {} (n {}): every 10th task and the last\n  old  {}\n  new  {}\n  given as given {}; given had the new factor been applied {}",
+                        k.unwrap_or("(all)"),
+                        idx.len(),
+                        old_line.join(" "),
+                        new_line.join(" "),
+                        half(&actual),
+                        half(&applied),
+                    );
+                }
+            }
+        }
+    }
 }
