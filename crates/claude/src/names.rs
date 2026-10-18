@@ -73,6 +73,14 @@ const ON: &str = "on";
 /// ([`tell`]), so the prompt hook's fallback ([`first_prompt`]) never tells
 /// it twice.
 const ASKED: &str = "asked";
+/// Under [`DIR`], the lock every rewrite of a names document is made under
+/// ([`lock`], giverny#433, giverny#441), so two sessions drawing at once
+/// never share a first name and a room is drawn once.
+const LOCK: &str = ".lock";
+/// How long a names document just written counts its session as live
+/// though Claude Code's registry does not list it yet (giverny#433): a
+/// session drawing in the instant another starts sees its name.
+const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Giverny's own first names, drawn for a session that asks for a name
 /// without giving one (giverny#364): sessions left to pick kept picking the
@@ -731,6 +739,26 @@ fn write_doc(file: &Path, doc: &Value) -> std::io::Result<()> {
     std::fs::rename(&tmp, file)
 }
 
+/// The names lock (giverny#433, giverny#441): held, every read of what
+/// others hold and every rewrite of a names document is one step, so two
+/// sessions starting at once draw in turn, and a room is drawn and written
+/// once. Released when dropped. Best effort: where the file system takes
+/// no lock (a share), the step runs unlocked, as it always did.
+#[must_use]
+struct Lock(#[allow(dead_code)] Option<std::fs::File>);
+
+fn lock(feeds: &Path) -> Lock {
+    let _ = std::fs::create_dir_all(dir(feeds));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir(feeds).join(LOCK))
+        .ok()
+        .filter(|f| f.lock().is_ok());
+    Lock(file)
+}
+
 /// The name recorded for `session` itself: one small file read.
 pub fn read(feeds: &Path, session: &str) -> Option<String> {
     name_in(&session_file(feeds, session)?)
@@ -760,7 +788,13 @@ pub fn find_among(
     let root = crate::subagents::conversation_root(transcript?)?;
     let doc = read_doc(&root_file(feeds, &root)?)?;
     let name = doc_name(&doc)?;
-    if held_by(&holders(feeds, &live(), session, Some(&root)), &name).is_some() {
+    let live = live();
+    // Checked and taken in one step (giverny#433).
+    let _lock = lock(feeds);
+    if let Some(name) = read(feeds, session) {
+        return Some(name);
+    }
+    if held_by(&holders(feeds, &live, session, Some(&root)), &name).is_some() {
         return None;
     }
     if let Some(file) = session_file(feeds, session) {
@@ -790,11 +824,18 @@ fn on_feed(feeds: &Path, session: &str) -> Option<String> {
 /// the name recorded, if any; a session already stamped costs one read.
 pub fn keep_root(feeds: &Path, session: &str, transcript: Option<&Path>) -> Option<String> {
     let file = session_file(feeds, session)?;
-    let mut doc = read_doc(&file)?;
+    let doc = read_doc(&file)?;
     let name = doc_name(&doc)?;
-    if doc.get("root").and_then(Value::as_str).is_none()
+    let unstamped = |doc: &Value| doc.get("root").and_then(Value::as_str).is_none();
+    if unstamped(&doc)
         && let Some(root) = transcript.and_then(crate::subagents::conversation_root)
     {
+        // Re-read under the lock: a room drawn meanwhile ([`room`]) stays
+        // (giverny#441).
+        let _lock = lock(feeds);
+        let Some(mut doc) = read_doc(&file).filter(unstamped) else {
+            return Some(name);
+        };
         doc["root"] = json!(root);
         let _ = write_doc(&file, &doc);
         if let Some(rf) = root_file(feeds, &root) {
@@ -824,6 +865,13 @@ pub fn room(feeds: &Path, session: &str) -> Option<String> {
     let file = session_file(feeds, session)?;
     let mut doc = read_doc(&file)?;
     doc_name(&doc)?;
+    if let Some(room) = doc_room(&doc) {
+        return Some(room);
+    }
+    // Drawn and written in one step (giverny#441): two looks at once, or a
+    // root stamped meanwhile ([`keep_root`]), draw it once.
+    let _lock = lock(feeds);
+    doc = read_doc(&file)?;
     if let Some(room) = doc_room(&doc) {
         return Some(room);
     }
@@ -984,6 +1032,48 @@ fn holders(feeds: &Path, live: &Live, session: &str, root: Option<&str>) -> Vec<
     out
 }
 
+/// The sessions not in `live` whose names document was written in the
+/// last `within` (giverny#433): just named, and live by now though
+/// Claude Code's registry may not list them yet. `session` itself and
+/// another id of its conversation (`root`) hold nothing against it. What a
+/// draw steers clear of beside [`holders`]; a name given by hand is checked
+/// against the live ones alone.
+fn fresh(
+    feeds: &Path,
+    live: &Live,
+    session: &str,
+    root: Option<&str>,
+    within: std::time::Duration,
+) -> Vec<Holder> {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(dir(feeds)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let id = path.file_stem()?.to_str()?.to_string();
+            if path.extension()? != "json" || id == session || live.contains_key(&id) {
+                return None;
+            }
+            let age = now.duration_since(e.metadata().ok()?.modified().ok()?);
+            if age.is_ok_and(|a| a > within) {
+                return None;
+            }
+            let doc = read_doc(&path)?;
+            if root.is_some() && doc.get("root").and_then(Value::as_str) == root {
+                return None;
+            }
+            Some(Holder {
+                session: id,
+                name: doc_name(&doc)?,
+                cwd: PathBuf::new(),
+            })
+        })
+        .collect()
+}
+
 /// A name's first name, for comparing: case aside.
 fn first_of(name: &str) -> Option<String> {
     name.split_whitespace().next().map(str::to_lowercase)
@@ -1036,6 +1126,8 @@ pub fn record_among(
     surname: impl FnOnce() -> String,
     live: &Live,
 ) -> Result<(String, Option<String>), String> {
+    // Who holds what, read and written in one step (giverny#433).
+    let _lock = lock(feeds);
     record_held(
         feeds,
         session,
@@ -1112,7 +1204,11 @@ pub fn draw_and_record_among(
     live: &Live,
 ) -> Result<String, String> {
     let root = transcript.and_then(crate::subagents::conversation_root);
-    let held = holders(feeds, live, session, root.as_deref());
+    // Drawn and recorded in one step (giverny#433): a session drawing at
+    // the same instant draws after, and sees this one's name.
+    let _lock = lock(feeds);
+    let mut held = holders(feeds, live, session, root.as_deref());
+    held.extend(fresh(feeds, live, session, root.as_deref(), FRESH));
     // A full name: `record` keeps it as given and adds nothing. Drawn
     // clear of `held` already, so checked against nobody: with every first
     // name held, the draw from the whole pool still stands.
@@ -1823,8 +1919,15 @@ mod tests {
         let name = draw_and_record_among(&feeds, "me", None, "Giverny", &live).unwrap();
         assert!(name.starts_with(&format!("{last} ")), "{name}");
         // Its session ended: h0's first name is free again (two now, the
-        // last being taken by "me" is not live).
+        // last being taken by "me" is not live), once its name is no
+        // longer fresh (giverny#433).
         live.remove("h0");
+        std::fs::File::options()
+            .write(true)
+            .open(session_file(&feeds, "h0").unwrap())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * FRESH)
+            .unwrap();
         live.insert("me".into(), PathBuf::new());
         let name = draw_and_record_among(&feeds, "you", None, "Giverny", &live).unwrap();
         assert!(name.starts_with(&format!("{} ", held[0])), "{name}");
@@ -1918,6 +2021,119 @@ mod tests {
         let taken = || live_of(&["other", "later"]);
         assert_eq!(find_among(&feeds, "later", Some(&t), taken), None);
         assert_eq!(read(&feeds, "later"), None);
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    /// Every first name but `free` held by a live session in `feeds`.
+    fn all_held_but(feeds: &Path, free: &[&str]) -> Live {
+        let ids: Vec<String> = FIRST_NAMES
+            .iter()
+            .filter(|f| !free.contains(f))
+            .enumerate()
+            .map(|(i, first)| {
+                let id = format!("h{i}");
+                record_held(
+                    feeds,
+                    &id,
+                    &format!("{first} Ashby"),
+                    None,
+                    || panic!(),
+                    &[],
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+        live_of(&ids.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn two_sessions_drawing_at_once_never_share_a_first_name() {
+        // giverny#433: both read the holders before either recorded. Two
+        // first names left: drawn at once, one each, every time; with the
+        // two racers live, and with neither in the registry yet (their
+        // names fresh).
+        let free = ["Rotem", "Tamsin"];
+        for registered in [true, false] {
+            let feeds = scratch(&format!("race-{registered}"));
+            let live = all_held_but(&feeds, &free);
+            for round in 0..25 {
+                let (a, b) = (format!("a{round}"), format!("b{round}"));
+                let mut live = live.clone();
+                if registered {
+                    live.insert(a.clone(), PathBuf::new());
+                    live.insert(b.clone(), PathBuf::new());
+                }
+                let gate = std::sync::Barrier::new(2);
+                let (na, nb) = std::thread::scope(|s| {
+                    let draw = |id: &str| {
+                        let (feeds, live, gate) = (&feeds, &live, &gate);
+                        let id = id.to_string();
+                        s.spawn(move || {
+                            gate.wait();
+                            draw_and_record_among(feeds, &id, None, "Giverny", live).unwrap()
+                        })
+                    };
+                    let (ta, tb) = (draw(&a), draw(&b));
+                    (ta.join().unwrap(), tb.join().unwrap())
+                });
+                assert_ne!(first_of(&na), first_of(&nb), "round {round}: {na} / {nb}");
+                for n in [&na, &nb] {
+                    assert!(free.contains(&n.split_once(' ').unwrap().0), "{n}");
+                }
+                // Both done with: their first names free for the next round.
+                for id in [&a, &b] {
+                    let _ = std::fs::remove_file(session_file(&feeds, id).unwrap());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&feeds);
+        }
+    }
+
+    #[test]
+    fn a_pre_room_doc_draws_its_room_once_however_many_look_at_once() {
+        // giverny#441: a document from before rooms, looked at by several
+        // at once while its root is stamped: one room, on both files.
+        let feeds = scratch("room-race");
+        let t = feeds.join("t.jsonl");
+        std::fs::create_dir_all(&feeds).unwrap();
+        std::fs::write(
+            &t,
+            "{\"type\":\"user\",\"uuid\":\"root-1\",\"parentUuid\":null}\n",
+        )
+        .unwrap();
+        for round in 0..25 {
+            let id = format!("s{round}");
+            let file = session_file(&feeds, &id).unwrap();
+            write_doc(&file, &json!({"session": id, "name": "Rotem Ashby"})).unwrap();
+            let _ = std::fs::remove_file(root_file(&feeds, "root-1").unwrap());
+            let gate = std::sync::Barrier::new(5);
+            let rooms: Vec<String> = std::thread::scope(|s| {
+                let (feeds, id, gate, t) = (&feeds, &id, &gate, &t);
+                let stamp = s.spawn(move || {
+                    gate.wait();
+                    keep_root(feeds, id, Some(t));
+                });
+                let lookers: Vec<_> = (0..4)
+                    .map(|_| {
+                        s.spawn(move || {
+                            gate.wait();
+                            room(feeds, id).unwrap()
+                        })
+                    })
+                    .collect();
+                stamp.join().unwrap();
+                lookers.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let doc = read_doc(&file).unwrap();
+            let kept = doc_room(&doc).expect("kept");
+            assert!(
+                rooms.iter().all(|r| *r == kept),
+                "round {round}: {rooms:?} / {kept}"
+            );
+            assert_eq!(doc.get("root").and_then(Value::as_str), Some("root-1"));
+            assert_eq!(room(&feeds, &id), Some(kept));
+        }
         let _ = std::fs::remove_dir_all(&feeds);
     }
 }
