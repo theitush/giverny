@@ -19,9 +19,13 @@
 //! `giverny-manage eta <key> <settled> --gut <gut> …`". Advice, not an
 //! order: how much to allow for it is the worker's judgement, and the gut
 //! figure it gives is what the history learns from. Only an ask carries it,
-//! never a note between asks: a figure given before any ask is the gut
-//! figure. The factor told is stamped on the row (`track_x`), and the
-//! first `eta` keeps it beside the figure (`reest_told_x`).
+//! never a note between asks. A worker that runs `eta` before any ask, or
+//! with no `--gut`, is asked by the `eta` reply itself (giverny#470,
+//! [`crate::manage`]): the figure is kept as its gut figure, the line
+//! told, and the figure it settles on with `--gut` soon after takes that
+//! one's place; the five-minute ask then skips the row. The factor told is
+//! stamped on the row (`track_x`), and the first `eta` keeps it beside the
+//! figure (`reest_told_x`).
 //!
 //! **Near the end.** Each figure is asked about again as it runs out: once
 //! when [`DEADLINE_LEFT_MS`] of it are left (only a figure that had more than
@@ -137,8 +141,12 @@ fn ask(row: &mut Map<String, Value>, now: u64, history: Option<&Path>) -> Option
     }
     let started = manage::ms_of(row, "started")?;
     let worked = now.saturating_sub(started);
-    // Asked once; a worker that has re-estimated already needs no asking.
-    if !row.contains_key("reestimate_asked") && !row.contains_key("eta_first_s") {
+    // Asked once; a worker that has re-estimated already needs no asking:
+    // its `eta` reply was its ask (giverny#470).
+    if !row.contains_key("reestimate_asked")
+        && !row.contains_key("eta_first_s")
+        && !row.contains_key("reest_s")
+    {
         if worked < AFTER_MS {
             return None;
         }
@@ -189,7 +197,7 @@ fn how(row: &mut Map<String, Value>, key: &str, history: Option<&Path>) -> Strin
 }
 
 /// `s` with its first letter upper-case.
-fn capitalised(s: &str) -> String {
+pub(crate) fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next()
         .map(|f| f.to_uppercase().chain(c).collect())

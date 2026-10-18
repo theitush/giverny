@@ -572,9 +572,89 @@ fn forget_known(path: &Path) {
     }
 }
 
+/// Bring the manage skill in the plugin at `plugin_root` (`CLAUDE_PLUGIN_ROOT`,
+/// `<marketplace>/plugins/giverny`) up to this binary's text, when the
+/// marketplace is ours and the skill is in it (giverny#470). The app writes
+/// the plugin only when it starts, while the launchers run the binary on
+/// disk: rebuilt under a running app, the CLI is new and the skill telling
+/// dispatchers and workers how to use it old. The hook calls this, so the
+/// skill a session reads matches the `giverny-manage` it runs. Only the
+/// skill's own file is touched, and only when its bytes differ; a skill
+/// switched off (no file) stays off. True when it was rewritten.
+pub fn refresh_skill(plugin_root: &Path) -> std::io::Result<bool> {
+    let Some(market) = plugin_root.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let ours = std::fs::read(market.join(".claude-plugin/marketplace.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .is_some_and(|v| v.get("name").and_then(Value::as_str) == Some(MARKETPLACE));
+    let path = market.join(SKILL_PATH);
+    if !ours || path != plugin_root.join("skills/manage/SKILL.md") {
+        return Ok(false);
+    }
+    match std::fs::read(&path) {
+        Ok(b) if b != SKILL.as_bytes() => {}
+        _ => return Ok(false),
+    }
+    let tmp = path.with_extension("giverny-tmp");
+    std::fs::write(&tmp, SKILL)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
+}
+
+/// [`refresh_skill`] for the plugin this hook runs from:
+/// `$CLAUDE_PLUGIN_ROOT`, which Claude Code sets for a plugin's hooks, else
+/// the plugin in Giverny's default config dir.
+pub fn refresh_own_skill() {
+    let root = std::env::var_os("CLAUDE_PLUGIN_ROOT")
+        .filter(|r| !r.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let base = crate::feed::default_dir().parent()?.to_path_buf();
+            Some(marketplace_dir(&base).join("plugins").join(PLUGIN))
+        });
+    if let Some(root) = root {
+        let _ = refresh_skill(&root);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// giverny#470: a skill older than the binary is rewritten; one that
+    /// matches, a missing one (the skill switched off) and a marketplace
+    /// that is not ours are left alone.
+    #[test]
+    fn a_stale_skill_is_brought_up_to_the_binary() {
+        let d = scratch("refresh");
+        sync(&d, &["/bin/giverny".to_string()], true).unwrap();
+        let root = d.join("plugins/giverny");
+        let skill = d.join(SKILL_PATH);
+        assert!(!refresh_skill(&root).unwrap(), "up to date");
+        std::fs::write(&skill, "old text").unwrap();
+        assert!(refresh_skill(&root).unwrap());
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), SKILL);
+        assert!(
+            !d.join("plugins/giverny/skills/manage/SKILL.giverny-tmp")
+                .exists()
+        );
+        // Switched off: no file, none written.
+        std::fs::remove_file(&skill).unwrap();
+        assert!(!refresh_skill(&root).unwrap());
+        assert!(!skill.exists());
+        // Not our marketplace.
+        std::fs::write(&skill, "old text").unwrap();
+        std::fs::write(
+            d.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"other"}"#,
+        )
+        .unwrap();
+        assert!(!refresh_skill(&root).unwrap());
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), "old text");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("giverny-plugin-{name}-{}", std::process::id()));

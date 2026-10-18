@@ -242,7 +242,17 @@ pub struct Flags {
     /// this command prints for its guess, kept on the row as `guess_level`
     /// so a later figure of the session knows its giver has seen that line.
     pub guess_level: Option<String>,
+    /// Set by [`tell_record`], not parsed: the factor a worker's `eta` reply
+    /// tells it (giverny#470), stamped on the row as `track_x` after the
+    /// figure is kept, so the figure it settles on next is known to have
+    /// been given under it.
+    pub reest_x: Option<f64>,
 }
+
+/// How long after an `eta` reply asked for the figure a worker settles on
+/// (giverny#470) a follow-up with `--gut` takes the first figure's place as
+/// the scored re-estimate, rather than counting as a later one.
+pub const SETTLE_MS: u64 = 10 * 60 * 1000;
 
 impl Flags {
     /// The ledger request these flags make: no RAM unless said.
@@ -1284,6 +1294,7 @@ pub fn apply(
                     "reestimate_asked",
                     "track_told",
                     "track_x",
+                    "reest_open_at",
                     "eta_at",
                     "left_s",
                     "left_at",
@@ -1359,6 +1370,20 @@ pub fn apply(
         Cmd::Eta(_, left) => {
             let i = at.ok_or_else(missing)?;
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+            let first = stage == Some(feed::Stage::Running) && !row.contains_key("reest_s");
+            // The figure a worker settles on after its `eta` reply asked for
+            // it (giverny#470): with `--gut`, soon after, it takes the
+            // asked-about figure's place as the scored re-estimate, so one
+            // estimate does not count twice in the history.
+            let settles = stage == Some(feed::Stage::Running)
+                && !first
+                && f.gut_s.is_some()
+                && ms_of(row, "reest_open_at").is_some_and(|t| now.saturating_sub(t) < SETTLE_MS);
+            let replaced = settles.then(|| u64_of(row, "reest_s")).flatten();
+            if settles {
+                row.remove("reest_s");
+                row.remove("reest_open_at");
+            }
             if stage == Some(feed::Stage::Running) && !row.contains_key("reest_s") {
                 // The worker's first re-estimate: kept, with
                 // when it was made in working time, to be scored at landing.
@@ -1371,6 +1396,16 @@ pub fn apply(
                 // call, if any (giverny#371), for the record.
                 let shown = row.get("track_x").and_then(Value::as_f64).unwrap_or(1.0);
                 row.insert("reest_told_x".into(), json!(shown));
+            }
+            if let (Some(x), Some(feed::Stage::Running)) = (f.reest_x, stage) {
+                // This reply tells the worker its line and asks for the
+                // figure it settles on (giverny#470): the row remembers the
+                // factor told, and the hook's five-minute ask is not needed.
+                row.insert("track_x".into(), json!(x));
+                row.entry("reestimate_asked").or_insert(json!(stamp(now)));
+                if first {
+                    row.insert("reest_open_at".into(), json!(stamp(now)));
+                }
             }
             if stage == Some(feed::Stage::Planned) {
                 // A dispatcher's new guess on a row not started yet.
@@ -1414,7 +1449,14 @@ pub fn apply(
                     close_wait(row, now);
                 }
             }
-            let msg = format!("{key}: ~{} left", feed::fmt_span(*left as i64));
+            let mut msg = format!("{key}: ~{} left", feed::fmt_span(*left as i64));
+            if let (Some(old), Some(gut)) = (replaced, f.gut_s) {
+                msg.push_str(&format!(
+                    " (gut {}), in place of the {} just given",
+                    feed::fmt_span(gut as i64),
+                    feed::fmt_span(old as i64)
+                ));
+            }
             // `--agent` moves the row to that worker, as `start --agent` does.
             let Some(agent) = f.agent.as_deref() else {
                 return Ok(msg);
@@ -2410,15 +2452,13 @@ fn tell_record(
     // factor is kept, its line not printed.
     let planned_eta = track == manage_history::Track::Reestimate
         && row.is_some_and(|r| stage_of(r) == Some(feed::Stage::Planned));
-    if track == manage_history::Track::Reestimate
-        && !planned_eta
-        && !row.is_some_and(|r| {
-            stage_of(r) == Some(feed::Stage::Running) && !r.contains_key("reest_s")
-        })
-    {
-        // Not a first re-estimate: a later one is not scored.
+    let running = row.is_some_and(|r| stage_of(r) == Some(feed::Stage::Running));
+    if track == manage_history::Track::Reestimate && !planned_eta && !running {
+        // No row yet (`eta` starts one) or a landed one: nothing to tell.
         return None;
     }
+    // A worker's first re-estimate is the scored one; a later one is not.
+    let first = running && !row.is_some_and(|r| r.contains_key("reest_s"));
     let row_str = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
     if flags.repo.is_none() {
         flags.repo = row_str("repo").map(String::from).or_else(|| {
@@ -2436,9 +2476,30 @@ fn tell_record(
         .map(|g| format!(" (gut {})", feed::fmt_span(g as i64)))
         .unwrap_or_default();
     if track == manage_history::Track::Reestimate && !planned_eta {
-        // How far off the gut runs reaches a worker only in the hook's asks
-        // (giverny#469).
-        return (!gut.is_empty()).then_some(gut);
+        // How far off the gut runs reaches a worker only when it is asked
+        // for an estimate (giverny#469). Its `eta` reply is such an ask when
+        // the worker has not been told the line on this task yet, or gave
+        // no gut figure (giverny#470): a figure is never taken without the
+        // worker having seen the line.
+        let told = row.is_some_and(|r| r.contains_key("track_x"));
+        let ask = (flags.gut_s.is_none() || !told)
+            .then(|| manage_history::instinct(&past, manage_history::Track::Reestimate, repo, kind))
+            .flatten();
+        let Some(ask) = ask else {
+            return (first && !gut.is_empty()).then_some(gut);
+        };
+        flags.reest_x = Some(ask.x);
+        let gut_min = (flags.gut_s.unwrap_or(given) + 30) / 60;
+        let as_gut = if gut.is_empty() {
+            ", taken as your gut figure".to_string()
+        } else {
+            gut
+        };
+        return Some(format!(
+            "{as_gut}\n  {}. Give the figure you settle on for the minutes left: \
+             `giverny-manage eta {key} <settled> --gut {gut_min} --note \"<why>\"`",
+            crate::manage_nudge::capitalised(&ask.line()),
+        ));
     }
     let told = manage_history::instinct(&past, manage_history::Track::Guess, repo, kind);
     let seen = |level: &str| {
@@ -2959,6 +3020,136 @@ mod tests {
         // `accuracy` reads the same history.
         let out = run(&dir, "accuracy --repo demo", T0).unwrap();
         assert!(out.contains("over 6 landed tasks in demo"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#470: a worker that re-estimates before any ask (poly's 165,
+    /// at minute 2, no `--gut`) hears its line in the `eta` reply, which
+    /// asks for the figure it settles on; that figure, given with `--gut`
+    /// soon after, takes the first one's place as the scored re-estimate.
+    #[test]
+    fn an_eta_before_any_ask_is_the_ask() {
+        let dir = scratch("first-ask");
+        let h = dir.join(manage_history::FILE);
+        // Past RESEARCH re-estimates in demo: 60m said, 20m taken (×3 high).
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
+                key: "demo#1".into(),
+                repo: Some("demo".into()),
+                kind: Some("RESEARCH".into()),
+                reest_s: Some(3600),
+                reest_at_s: Some(300),
+                wall_s: 1500,
+                work_s: 1500,
+                outcome: Some("Done".into()),
+                ..manage_history::Record::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        let row = |k: &str| {
+            let doc: Value =
+                serde_json::from_slice(&std::fs::read(feed::feed_path(&dir, "s1")).unwrap())
+                    .unwrap();
+            doc["rows"][0][k].clone()
+        };
+        run(&dir, "start demo#9 --eta 30 --title RESEARCH:x", T0).unwrap();
+        // Minute 2, before the hook's five-minute ask, with no gut figure.
+        let said = run(&dir, "eta demo#9 75", T0 + 2 * MIN).unwrap();
+        assert_eq!(
+            said,
+            "demo#9: ~1h15m left, taken as your gut figure\n  Your gut re-estimates on \
+             RESEARCH tasks in demo have usually run about 3.0× too high (last 5, median). \
+             Give the figure you settle on for the minutes left: `giverny-manage eta demo#9 \
+             <settled> --gut 75 --note \"<why>\"`"
+        );
+        assert_eq!(row("reest_s"), 75 * 60, "kept as given");
+        assert_eq!(row("reest_gut_s"), 75 * 60, "the figure is the gut");
+        assert_eq!(row("reest_told_x"), 1.0, "it had heard no line");
+        let x = row("track_x").as_f64().unwrap();
+        assert!((x - 1.0 / 3.0).abs() < 1e-9, "{x}");
+        assert!(row("reestimate_asked").is_string(), "the reply was the ask");
+        // So the hook asks nothing at five minutes.
+        let file = feed::feed_path(&dir, "s1");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        doc["rows"][0]["agent_id"] = json!("w");
+        assert_eq!(
+            crate::manage_nudge::check(&mut doc, "w", None, T0 + 6 * MIN, Some(&h)),
+            None
+        );
+        // The settled figure, a minute later: it replaces the first.
+        let said = run(&dir, "eta demo#9 30 --gut 75", T0 + 3 * MIN).unwrap();
+        assert_eq!(
+            said,
+            "demo#9: ~30m left (gut 1h15m), in place of the 1h15m just given"
+        );
+        assert_eq!(row("reest_s"), 30 * 60);
+        assert_eq!(row("reest_gut_s"), 75 * 60);
+        assert_eq!(row("reest_told_x"), json!(x), "given under the line");
+        assert_eq!(
+            row("reest_at_s"),
+            3 * 60,
+            "counted from when it was settled"
+        );
+        assert!(row("reest_open_at").is_null(), "settled once");
+        // A later figure with a gut, the line heard: taken as given, not scored.
+        let said = run(&dir, "eta demo#9 20 --gut 40", T0 + 4 * MIN).unwrap();
+        assert_eq!(said, "demo#9: ~20m left");
+        assert_eq!(row("reest_s"), 30 * 60);
+        // One with no gut figure hears the line again, and asks again.
+        let said = run(&dir, "eta demo#9 15", T0 + 20 * MIN).unwrap();
+        assert!(
+            said.starts_with("demo#9: ~15m left, taken as your gut figure\n  Your gut"),
+            "{said}"
+        );
+        assert!(said.contains("--gut 15 --note"), "{said}");
+        // Its follow-up is a later figure: the scored one stands.
+        run(&dir, "eta demo#9 10 --gut 15", T0 + 21 * MIN).unwrap();
+        assert_eq!(row("reest_s"), 30 * 60);
+        // Landed: one re-estimate in the history, the settled one.
+        run(&dir, "land demo#9", T0 + 33 * MIN).unwrap();
+        let last = manage_history::load(&h).pop().unwrap();
+        assert_eq!(
+            (last.reest_s, last.reest_gut_s, last.reest_at_s),
+            (Some(1800), Some(4500), Some(180))
+        );
+        let r = manage_history::Track::Reestimate.ratio(&last).unwrap();
+        assert!((r - 30.0 / 75.0).abs() < 1e-9, "30m left of a 75m gut: {r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#470: a first `eta` with a gut figure but before any line was
+    /// told is asked too, and with too little history nothing is said.
+    #[test]
+    fn a_gut_figure_given_unasked_is_asked_about_too() {
+        let dir = scratch("gut-unasked");
+        run(&dir, "start z#1 --eta 30 --title BUG:z", T0).unwrap();
+        // No history: the plain reply.
+        assert_eq!(run(&dir, "eta z#1 20", T0 + MIN).unwrap(), "z#1: ~20m left");
+        let h = dir.join(manage_history::FILE);
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
+                key: "z#0".into(),
+                repo: Some("z".into()),
+                kind: Some("BUG".into()),
+                reest_s: Some(600),
+                reest_at_s: Some(300),
+                wall_s: 900,
+                work_s: 900,
+                outcome: Some("Done".into()),
+                ..manage_history::Record::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        run(&dir, "start z#2 --eta 30 --title BUG:z --repo z", T0).unwrap();
+        let said = run(&dir, "eta z#2 40 --gut 50", T0 + MIN).unwrap();
+        assert!(
+            said.starts_with(
+                "z#2: ~40m left (gut 50m)\n  Your gut re-estimates on BUG tasks in z have \
+                 usually been about right"
+            ),
+            "{said}"
+        );
+        assert!(said.contains("eta z#2 <settled> --gut 50 --note"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

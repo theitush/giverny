@@ -609,6 +609,10 @@ pub fn main() -> i32 {
             .and_then(|p| crate::names::first_prompt(&p, &feeds, on, tabs_own));
         let manage = crate::manage_trigger::asks_to_manage(&prompt)
             .then_some(crate::manage_trigger::CONTEXT);
+        if manage.is_some() {
+            // The skill about to be read is this binary's (giverny#470).
+            crate::plugin::refresh_own_skill();
+        }
         // What a finished subagent left running, if its parent has not
         // heard yet (giverny#370).
         let session = session_of(&input);
@@ -651,6 +655,10 @@ pub fn main() -> i32 {
         }
         let feeds = crate::feed::feed_dir();
         if start.get("agent_id").is_none() {
+            // The skill this session reads matches the CLI it runs, though
+            // the app that writes the plugin has not restarted since the
+            // binary was rebuilt (giverny#470).
+            crate::plugin::refresh_own_skill();
             crate::escapes::prune_hooked(&feeds);
             mark_hooked(&feeds, text(&start, "session_id").as_deref());
         }
@@ -1186,6 +1194,62 @@ mod tests {
         assert_eq!(back.rows[0].agent_id.as_deref(), Some("abc"), "stamped");
         // Its estimate is the row's: no agent ETA is asked for or made.
         assert!(agent_eta::read(&feeds, "s1").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#470: after #469 the asks still reach a subagent, each with
+    /// its line: a task worker's `PostToolUse` calls at minute 0 hear
+    /// nothing, at minute 5 the ask, and as its figure runs out the
+    /// near-the-end and overdue asks. Its `PreToolUse` calls are the
+    /// guard's, never an ask's.
+    #[test]
+    fn a_subagent_hears_each_ask_with_its_line() {
+        let dir = temp("asks");
+        let feeds = dir.join("feeds");
+        std::fs::create_dir_all(&feeds).unwrap();
+        let h = feeds.join(manage_history::FILE);
+        for _ in 0..manage_history::MIN_SAMPLES {
+            let rec = manage_history::Record {
+                key: "poly#1".into(),
+                repo: Some("poly".into()),
+                kind: Some("RESEARCH".into()),
+                reest_s: Some(3600),
+                reest_at_s: Some(300),
+                wall_s: 1500,
+                work_s: 1500,
+                ..manage_history::Record::default()
+            };
+            manage_history::append(&h, &rec).unwrap();
+        }
+        let f = feed::feed_path(&feeds, "s1");
+        let d = doc(json!([{"key": "165", "stage": "running", "repo": "poly",
+            "title": "RESEARCH: cut graphs", "started": manage::stamp(T0), "eta_s": 1200}]));
+        manage::write(&f, &d).unwrap();
+        let p = worker_payload(&dir, "s1", "a46", "165: 1% cut graphs and Venns", T0);
+        let line = "Your gut re-estimates on RESEARCH tasks in poly have usually run about \
+                    3.0× too high (last 5, median). Give your gut figure and the one you \
+                    settle on for the minutes left: `giverny-manage eta 165 <settled> --gut \
+                    <gut> --note \"<why>\"`";
+        // A PreToolUse call is the guard's: no ask rides on it.
+        let pre = json!({"session_id": "s1", "agent_id": "a46", "hook_event_name": "PreToolUse",
+                         "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        .to_string();
+        assert!(pre_tool(&pre).is_some(), "main hands it to the guard");
+        assert_eq!(run(&p, &feeds, T0, false), None, "minute 0");
+        let five = context(&run(&p, &feeds, T0 + 5 * MIN, false).unwrap());
+        assert!(
+            five.contains("you have been on task `165` for 5m"),
+            "{five}"
+        );
+        assert!(five.contains(line), "{five}");
+        assert_eq!(run(&p, &feeds, T0 + 6 * MIN, false), None, "asked once");
+        let near = context(&run(&p, &feeds, T0 + 15 * MIN, false).unwrap());
+        assert!(near.contains("has about 5m left of its estimate"), "{near}");
+        assert!(near.contains(line), "{near}");
+        let over = context(&run(&p, &feeds, T0 + 21 * MIN, false).unwrap());
+        assert!(over.contains("has run 1m past its estimate"), "{over}");
+        assert!(over.contains(line), "{over}");
+        println!("minute 5:\n{five}\n\nnear the end:\n{near}\n\npast it:\n{over}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
