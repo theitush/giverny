@@ -10,16 +10,15 @@ Written in Rust on `alacritty_terminal`, with no web engine.
 
 ## Features
 
-- **Claude state per tab.** A spinner while Claude works, a flag and desktop notification when it needs input, a ✓ when a background tab finishes. Driven by Claude Code hooks, with a zero-config fallback that reads Claude's local session registry.
-- **Codex support.** Type `codex` normally in a tab. Codex is detected automatically, with allowance meters and automatic or manual refresh. Install the observer hooks from Settings → codex and trust them with `/hooks` for live state, notifications and conversation restore. Disable automatic detection in Settings if unwanted. See [Codex setup](docs/codex-integration.md).
-- **Multiple Claude accounts.** Each `CLAUDE_CONFIG_DIR` is an account, discovered automatically. Assign one per category; the rail shows 5-hour, weekly and per-model limits with reset times.
-- **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
-- **Background agents.** Forked and `run_in_background` sessions appear in the rail. Click one to attach a tab.
+- **Agent state per tab.** A spinner while Claude or Codex works, a flag and desktop notification when it needs input, a ✓ when a background tab finishes. Claude uses Claude Code hooks, with a zero-config fallback to its session registry. Codex uses observer hooks installed from Settings → codex and trusted with `/hooks` ([setup](docs/codex-integration.md)).
+- **Multiple accounts.** Each `CLAUDE_CONFIG_DIR` and Codex home is an account, discovered automatically. The rail shows each account's limits with reset times. Claude accounts can be assigned per category.
+- **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude and Codex conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
+- **Background agents.** Forked and `run_in_background` Claude sessions appear in the rail. Click one to attach a tab.
 - **Rail views.** Group tabs by your own categories or by git repository.
 - **Terminal support.** Kitty keyboard protocol (Shift+Enter works in Claude without `/terminal-setup`), kitty graphics, synchronized output, OSC 7 and 52, sanitized bracketed paste, SGR mouse, file drag-and-drop.
 - **Right-to-left text.** Hebrew and Arabic render in reading order. Cascadia Mono Hebrew is bundled.
 - **Plain config.** `~/.config/giverny/config.toml` hot-reloads. The `Ctrl+,` settings screen writes back to it with comments preserved. See [all options](docs/options.md).
-- **`giverny doctor`** prints accounts, hook status, usage freshness and live sessions.
+- **`giverny doctor`** prints Claude and Codex accounts, hook status, usage freshness and live sessions.
 
 ## Install
 
@@ -51,13 +50,13 @@ Giverny checks GitHub daily for a new release and offers a one-click update; `gi
 
 Linux (Wayland and X11) is the primary platform. macOS and Windows build in CI but haven't been tested on real hardware; reports are welcome.
 
-On Windows, Claude accounts inside WSL are discovered and their tabs open in the matching distribution. Under WSLg, an outdated Windows GPU driver makes Giverny fall back to CPU rendering; `GIVERNY_GPU=software` forces that mode.
+On Windows, Claude accounts and Codex homes inside WSL are discovered and their tabs open in the matching distribution. Under WSLg, an outdated Windows GPU driver makes Giverny fall back to CPU rendering; `GIVERNY_GPU=software` forces that mode.
 
 ## Privacy
 
-Giverny never contacts Anthropic and never reads credential files. Usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. Giverny’s direct network request is the update check, which sends nothing but a User-Agent. When Codex is detected (unless disabled in Settings), Giverny also asks an official local Codex helper to fetch allowance data; that helper contacts OpenAI using Codex’s existing sign-in. Giverny does not read Codex credentials or manage authentication.
+Giverny itself never contacts Anthropic or OpenAI and never reads credential files. Claude usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. Codex usage comes from the official local `codex app-server` helper, which contacts OpenAI using Codex's own sign-in; it never runs if Codex is disabled in Settings. Giverny's only direct network request is the update check, which sends nothing but a User-Agent.
 
-Hook installation shows what it adds, keeps your existing hooks and writes a `.giverny-bak` backup. Pasted text is stripped of escape bytes, and the in-band control channel is nonce-authenticated so terminal output can't fake Claude states. Details in [Claude Code integration](docs/claude-integration.md).
+Hook installation shows what it adds, keeps your existing hooks and writes a `.giverny-bak` backup. Pasted text is stripped of escape bytes, and the in-band control channel is nonce-authenticated so terminal output can't fake agent states. Details in [Claude Code integration](docs/claude-integration.md) and [Codex integration](docs/codex-integration.md).
 
 ## Keys
 
