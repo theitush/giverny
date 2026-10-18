@@ -33,13 +33,28 @@ pub struct ClaudeTab {
     /// at its prompt. Not a working state — marked, never animated.
     pub background: bool,
     /// Work this session delegated — subagents, a workflow, teammates, a
-    /// cloud session — was still running when its last turn ended, and the
-    /// registry has not said since that it stopped: the agent is free to
-    /// talk while its workers go on (giverny#363). Set by the `Stop` hook's
-    /// `background_tasks`, kept while the registry says `busy` (which, with
-    /// the turn over, is that work: Claude Code counts it as working), and
-    /// cleared by the first scan that does not, or by the next turn.
+    /// cloud session — still runs: the agent is free to talk while its
+    /// workers go on (giverny#363). What [`ClaudeTab::subagents`] and
+    /// `agents_unnamed` add up to, kept in step by
+    /// [`ClaudeTab::sync_agents`].
     pub agents: bool,
+    /// The delegated work, by task id, this session's turns left running
+    /// and nothing has said since has ended (giverny#467). A `Stop`'s
+    /// `background_tasks` adds what it lists; it is no word on the rest:
+    /// Claude Code drops a subagent from the list once it waits on
+    /// background work of its own, while it still lives. Ended by the
+    /// worker's hand-back, the `<task-notification>` that says it finished,
+    /// a `TaskStop`, the registry back at plain `idle`, or the session's
+    /// end. A worker heard working while the session is at its prompt is
+    /// running in the background, so it is added too.
+    subagents: HashSet<String>,
+    /// The last `Stop` listed delegated work without an id: kept as the
+    /// whole flag was before ids were read, until the next turn or the
+    /// registry's `idle`.
+    agents_unnamed: bool,
+    /// When each worker that ended was told to (`emitted_at`): a call of its
+    /// relayed later than its hand-back is no sign it lives on.
+    ended: HashMap<String, u64>,
     /// What the tab was when a compaction began: Busy for one Claude Code
     /// started mid-turn, whatever the last turn left for a `/compact`. The
     /// compaction's `SessionStart` puts it back (giverny#408).
@@ -57,6 +72,9 @@ pub struct ClaudeTab {
     /// what a registry entry's `statusUpdatedAt` is told apart by, older
     /// than what the hooks said or newer (giverny#443).
     heard_at_ms: u64,
+    /// The newest `emitted_at` among the hook messages this tab has applied
+    /// (giverny#467).
+    last_applied: Option<u64>,
     seen_in_scan: bool,
 }
 
@@ -90,6 +108,25 @@ impl ClaudeTab {
     /// three-dot wave says (giverny#352, giverny#363).
     pub fn working_in_background(&self) -> bool {
         self.background || self.agents
+    }
+
+    /// `agents` from what still runs.
+    fn sync_agents(&mut self) {
+        self.agents = self.agents_unnamed || !self.subagents.is_empty();
+    }
+
+    /// Nothing delegated runs any more.
+    fn clear_agents(&mut self) {
+        self.subagents.clear();
+        self.agents_unnamed = false;
+        self.sync_agents();
+    }
+
+    /// The worker `id` has ended, as told by a message stamped `at`.
+    fn agent_ended(&mut self, id: &str, at: Option<u64>) {
+        self.subagents.remove(id);
+        self.ended.insert(id.to_string(), at.unwrap_or(u64::MAX));
+        self.sync_agents();
     }
 
     /// Is a claude running in this tab now: seen in the last scan, or heard
@@ -657,6 +694,66 @@ fn merge_registry(
     }
 }
 
+/// `GIVERNY_HOOK_TRACE=<file>`: one line per hook message a Claude tab
+/// applies, and per registry scan that moves a tab's state or wave — what
+/// the tab was told, when it was stamped, and what it is after, to pin down
+/// an order the relay delivers things in (giverny#467). Off unless set.
+fn trace(tab: TabId, what: &str, emitted_at: Option<u64>, detail: &str, tab_now: &ClaudeTab) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("GIVERNY_HOOK_TRACE").filter(|p| !p.is_empty())?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    });
+    let Some(file) = file else { return };
+    let line = format!(
+        "{} tab={} {what} emitted_at={} {detail} -> state={:?} agents={} subagents={:?} last_applied={}\n",
+        now_ms(),
+        tab.0,
+        emitted_at.map_or("-".into(), |t| t.to_string()),
+        tab_now.state,
+        tab_now.agents,
+        tab_now.subagents,
+        tab_now.last_applied.map_or("-".into(), |t| t.to_string()),
+    );
+    if let Ok(mut f) = file.lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// What [`trace`] says of a hook message beyond its event.
+fn trace_detail(msg: &RelayMsg) -> String {
+    let field = |k: &str| msg.event.get(k).and_then(|v| v.as_str()).unwrap_or("-");
+    let tasks: Vec<String> = msg
+        .event
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let mut t = t.clone();
+            if let Some(o) = t.as_object_mut() {
+                o.remove("description");
+                o.remove("output_file");
+            }
+            t.to_string()
+        })
+        .collect();
+    format!(
+        "session={} agent_id={} tool={} kind={} background_tasks=[{}]",
+        field("session_id"),
+        field("agent_id"),
+        field("tool_name"),
+        field("notification_type"),
+        tasks.join(",")
+    )
+}
+
 /// Now, by the wall clock, in milliseconds since the epoch: what Claude Code
 /// dates a registry status by.
 fn now_ms() -> u64 {
@@ -1060,6 +1157,21 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // The relay hooks run async, each its own process: a message can
+        // reach Giverny after one the session sent after it. One stamped
+        // before the newest of the session's own already applied is old
+        // news, and must not undo it — a turn's last tool call landing after
+        // its `Stop` re-opened the turn it closed (giverny#467). Only the
+        // session's own messages set the bar: its workers' run beside it.
+        let stale = msg
+            .emitted_at
+            .zip(entry.last_applied)
+            .is_some_and(|(at, last)| at < last);
+        if !msg.from_subagent()
+            && let Some(at) = msg.emitted_at
+        {
+            entry.last_applied = Some(entry.last_applied.map_or(at, |last| last.max(at)));
+        }
 
         match msg.hook_event() {
             // A compaction is the same session carrying on: the turn it
@@ -1087,7 +1199,8 @@ impl ClaudeWatch {
             }
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
-                entry.agents = false;
+                entry.clear_agents();
+                entry.ended.clear();
                 entry.before_compact = None;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
@@ -1104,12 +1217,19 @@ impl ClaudeWatch {
                     .push((tab_id, msg.session_id().map(str::to_string), config_dir));
             }
             Some("UserPromptSubmit") => {
-                entry.state = ClaudeState::Busy;
-                // A compaction cancelled with Esc says nothing more.
-                entry.before_compact = None;
-                // A turn is running: whatever it leaves behind, its `Stop`
-                // says.
-                entry.agents = false;
+                if !stale {
+                    entry.state = ClaudeState::Busy;
+                    // A compaction cancelled with Esc says nothing more.
+                    entry.before_compact = None;
+                    // A turn is running: what it leaves behind without an
+                    // id, its `Stop` says.
+                    entry.agents_unnamed = false;
+                }
+                // A turn Claude Code starts to say a task ended.
+                for id in msg.prompt().map(hooks::ended_tasks).unwrap_or_default() {
+                    entry.agent_ended(id, msg.emitted_at);
+                }
+                entry.sync_agents();
                 // The hook fires for every turn, also the ones Claude Code or
                 // another agent sends (a finished background task, a
                 // subagent's hand-back, another session's message): those
@@ -1136,24 +1256,50 @@ impl ClaudeWatch {
             // own `agent_id`. A session free at its prompt while its workers
             // run stays free, with the wave its `Stop` gave it, and one
             // mid-turn keeps its spinner anyway (giverny#374).
-            Some("PostToolUse") if msg.from_subagent() => {}
+            Some("PostToolUse") if msg.from_subagent() => {
+                if let Some(id) = msg.handed_back() {
+                    entry.agent_ended(id, msg.emitted_at);
+                } else if let Some(id) = msg.agent_id()
+                    && !stale
+                    && entry.state != ClaudeState::Busy
+                    && entry
+                        .ended
+                        .get(id)
+                        .is_none_or(|&end| msg.emitted_at.is_some_and(|at| at > end))
+                {
+                    // Working while the session is at its prompt: a
+                    // background worker, alive whatever the last `Stop`
+                    // listed.
+                    entry.ended.remove(id);
+                    entry.subagents.insert(id.to_string());
+                    entry.sync_agents();
+                }
+            }
             // The session's own tool call is work happening now. It is what
             // tells a tab apart from the turn that ended before it: a session
             // carrying on after a permission was granted, or an agent
             // continuing by itself, emits nothing else.
             Some("PostToolUse") => {
-                entry.state = ClaudeState::Busy;
-                entry.agents = false;
+                if let Some(id) = msg.stopped_task() {
+                    entry.agent_ended(id, msg.emitted_at);
+                }
+                if !stale {
+                    entry.state = ClaudeState::Busy;
+                }
             }
             // A subagent compacting its own context is its work, as its
             // tool calls are.
             Some("PreCompact") if msg.from_subagent() => {}
             // Compacting is work, and nothing else says so: `/compact` sends
             // no `UserPromptSubmit` (giverny#408).
+            Some("PreCompact") if stale => {}
             Some("PreCompact") => {
                 entry.before_compact.get_or_insert(entry.state);
                 entry.state = ClaudeState::Busy;
             }
+            // A `Stop` older than what the session has said since ended a
+            // turn that is not the one running now.
+            Some("Stop") if stale => {}
             Some("Stop") => {
                 entry.before_compact = None;
                 entry.state = if is_active {
@@ -1164,8 +1310,18 @@ impl ClaudeWatch {
                 // The turn is over; are its subagents? The hook says so
                 // exactly as the turn ends, where the registry's `busy`
                 // cannot yet tell them from the turn itself (giverny#363).
-                entry.agents = msg.delegated_work_running();
+                // What it lists runs; what it leaves out may be waiting on
+                // work of its own, and runs on until something says it ended
+                // (giverny#467).
+                let (ids, unnamed) = msg.delegated_ids();
+                for id in ids {
+                    entry.ended.remove(id);
+                    entry.subagents.insert(id.to_string());
+                }
+                entry.agents_unnamed = unnamed;
+                entry.sync_agents();
             }
+            Some("Notification") if stale => {}
             Some("Notification") => {
                 if let Some(kind) = msg.notification_type() {
                     // Whoever asks — the session or one of its subagents —
@@ -1199,7 +1355,8 @@ impl ClaudeWatch {
             Some("SessionEnd") => {
                 self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
-                entry.agents = false;
+                entry.clear_agents();
+                entry.ended.clear();
                 entry.before_compact = None;
                 entry.set_session(None, &mut self.prompts_asked);
                 entry.session_name = None;
@@ -1207,6 +1364,18 @@ impl ClaudeWatch {
             }
             _ => {}
         }
+        let what = msg.hook_event().unwrap_or("?");
+        trace(
+            tab_id,
+            &if stale {
+                format!("{what}(stale)")
+            } else {
+                what.to_string()
+            },
+            msg.emitted_at,
+            &trace_detail(msg),
+            entry,
+        );
     }
 
     /// Periodic merge: hook stream + registry scan + usage refresh.
@@ -1558,12 +1727,31 @@ impl ClaudeWatch {
                 {
                     entry.state = ClaudeState::Idle;
                 }
-                // Delegated work the last `Stop` reported runs for as long as
-                // the registry says `busy`; the first scan that says
-                // otherwise is its end, and the dots go with it.
-                // A session without hooks never sets it: its
-                // `busy` is a spinner, as it cannot tell the two apart.
-                entry.agents &= hooks_own && live.entry.busy();
+                let had_agents = entry.agents;
+                // Plain `idle`, written after the last hook, is nothing
+                // running at all; `busy` and `shell` are not the end of it:
+                // a worker waiting on a background shell of its own makes the
+                // registry say `shell` while it lives (giverny#467). A
+                // session without hooks never sets it: its `busy` is a
+                // spinner, as it cannot tell the two apart.
+                let news = heard.is_none_or(|heard| {
+                    live.entry.status_updated_at == 0 || live.entry.status_updated_at > heard
+                });
+                if !hooks_own || (live.entry.status == "idle" && news) {
+                    entry.clear_agents();
+                }
+                if entry.state != was || entry.agents != had_agents {
+                    trace(
+                        tab_id,
+                        "scan",
+                        None,
+                        &format!(
+                            "registry={} updated_at={} heard={heard:?} was={was:?}",
+                            live.entry.status, live.entry.status_updated_at
+                        ),
+                        entry,
+                    );
+                }
                 // A session new to the tab has its earlier turns read back
                 // from the transcript, once: adopted mid-way, resumed after a
                 // restart, or resumed with a prompt on the command line
@@ -1584,14 +1772,17 @@ impl ClaudeWatch {
                 }
             }
             // Sessions gone from the registry: clear unless hooks spoke recently.
-            for tab in self.tabs.values_mut() {
+            for (&tab_id, tab) in self.tabs.iter_mut() {
                 let hook_recent = tab
                     .last_hook
                     .is_some_and(|t| t.elapsed() < Duration::from_secs(5));
                 if !tab.seen_in_scan && !hook_recent && tab.state != ClaudeState::DoneUnseen {
+                    if tab.state != ClaudeState::None || tab.agents {
+                        trace(tab_id, "gone", None, "not in the registry", tab);
+                    }
                     tab.state = ClaudeState::None;
                     tab.background = false;
-                    tab.agents = false;
+                    tab.clear_agents();
                     tab.session_name = None;
                     // The session is gone — its hook evidence goes with it, so
                     // a future claude (with or without hooks) starts fresh.
@@ -3781,12 +3972,15 @@ mod tests {
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
         assert!(!waves(&w));
 
-        // Workers done but a background shell left: still the wave, now
-        // the shell's.
+        // A background shell running: the wave, whoever's it is. It is no
+        // word that the worker ended: one waiting on a shell of its own
+        // makes the registry say `shell` while it lives (giverny#467).
         feed(&mut w, &hook("Stop", agent), Some(TAB));
         scan(&mut w, "shell");
-        assert!(!w.tabs[&TAB].agents);
+        assert!(w.tabs[&TAB].agents, "the worker may be waiting on it");
         assert!(waves(&w));
+        scan(&mut w, "idle");
+        assert!(!waves(&w));
 
         // In a tab you are not looking at, the turn stays unseen while its
         // workers keep the registry `busy`: that is not a new turn. The
@@ -3845,13 +4039,268 @@ mod tests {
         assert_eq!(w.state_of(TAB), ClaudeState::NeedsYou);
         assert_eq!(fx.notify.len(), 1);
 
-        // The session's own call is the session working: the spinner.
+        // The session's own call is the session working: the spinner, which
+        // wins over the wave of its worker running on.
         feed(&mut w, &own_call, Some(TAB));
         assert_eq!(w.state_of(TAB), ClaudeState::Busy);
-        assert!(!waves(&w));
 
         // Mid-turn, a foreground worker's calls keep the spinner.
         feed(&mut w, &worker_call, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+    }
+
+    /// `m` as the relay stamped it at `at`.
+    fn stamped(mut m: RelayMsg, at: u64) -> RelayMsg {
+        m.emitted_at = Some(at);
+        m
+    }
+
+    /// A `<task-notification>` turn's prompt, as Claude Code injects it.
+    fn notified(id: &str, summary: &str) -> String {
+        let prompt = format!(
+            "<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n\
+             <summary>Agent \"x\" {summary}</summary>\n</task-notification>"
+        );
+        format!(r#","prompt":{}"#, serde_json::Value::from(prompt))
+    }
+
+    /// The manager's tab, idle at its prompt with its workers running,
+    /// showed the plain ring: a worker that stops to wait on background
+    /// work of its own is `completed` to Claude Code, which leaves it out of
+    /// every later `Stop`'s `background_tasks` while it still runs, so the
+    /// first such `Stop` took the wave down. Replayed from a trace of the
+    /// relay (Claude Code 2.1.302): the worker runs on until its hand-back
+    /// or the notification that it finished, and the wave with it, and ends
+    /// with the last of them (giverny#467).
+    #[test]
+    fn a_worker_waiting_on_its_own_work_keeps_the_wave_until_it_ends() {
+        let mut w = ClaudeWatch::for_tests();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let two = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"},{"id":"a2","type":"subagent","status":"running"}]"#;
+        let a2_and_its_shell = r#","background_tasks":[{"id":"a2","type":"subagent","status":"running"},{"id":"b1","type":"shell","status":"running"}]"#;
+        let its_shell = r#","background_tasks":[{"id":"b1","type":"shell","status":"running"}]"#;
+        let none = r#","background_tasks":[]"#;
+        let call = |agent: &str, tool: &str| {
+            hook(
+                "PostToolUse",
+                &format!(r#","agent_id":"{agent}","tool_name":"{tool}""#),
+            )
+        };
+
+        feed(&mut w, &stamped(hook("SessionStart", ""), 100), Some(TAB));
+        feed(
+            &mut w,
+            &stamped(hook("UserPromptSubmit", ""), 110),
+            Some(TAB),
+        );
+        feed(&mut w, &stamped(hook("Stop", two), 120), Some(TAB));
+        assert!(waves(&w), "two workers out: the wave");
+
+        // a1 hands back; its notification is a turn, which lists a2.
+        feed(
+            &mut w,
+            &stamped(call("a1", "SubagentHandback"), 130),
+            Some(TAB),
+        );
+        let a1_done = hook("UserPromptSubmit", &notified("a1", "finished"));
+        feed(&mut w, &stamped(a1_done, 131), Some(TAB));
+        feed(
+            &mut w,
+            &stamped(hook("Stop", a2_and_its_shell), 135),
+            Some(TAB),
+        );
+        assert!(waves(&w));
+
+        // a2 stops to wait on its shell: `completed`, and gone from the
+        // list of the turn its notification starts. It still runs.
+        let a2_waits = hook(
+            "UserPromptSubmit",
+            &notified("a2", "is waiting on its own background work"),
+        );
+        feed(&mut w, &stamped(a2_waits, 140), Some(TAB));
+        feed(&mut w, &stamped(hook("Stop", its_shell), 142), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w), "a2 waits on its own work: still the wave");
+        // Nor does a turn the person asks for, with nothing listed.
+        feed(
+            &mut w,
+            &stamped(hook("UserPromptSubmit", r#","prompt":"hi""#), 150),
+            Some(TAB),
+        );
+        feed(&mut w, &stamped(hook("Stop", none), 152), Some(TAB));
+        assert!(waves(&w), "a turn of its own does not end a2");
+        // Its own calls, once its shell reports, leave the wave up.
+        feed(&mut w, &stamped(call("a2", "Bash"), 160), Some(TAB));
+        assert!(waves(&w));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // a2 hands back: the last worker is done, the ring.
+        feed(
+            &mut w,
+            &stamped(call("a2", "SubagentHandback"), 170),
+            Some(TAB),
+        );
+        assert!(!waves(&w), "the last worker ended: no wave");
+        let a2_done = hook("UserPromptSubmit", &notified("a2", "finished"));
+        feed(&mut w, &stamped(a2_done, 171), Some(TAB));
+        feed(&mut w, &stamped(hook("Stop", none), 173), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(!waves(&w));
+        // A call of its relayed late does not bring it back.
+        feed(&mut w, &stamped(call("a2", "Bash"), 165), Some(TAB));
+        assert!(!waves(&w), "a call from before its hand-back");
+    }
+
+    /// The other ways a worker ends: the notification that it finished
+    /// with no hand-back, a `TaskStop`, the registry at plain `idle`, and a
+    /// worker this tab never heard launched, heard working while the
+    /// session is at its prompt, waves too (giverny#467).
+    #[test]
+    fn a_worker_ends_by_notification_task_stop_or_the_registry() {
+        let me = std::process::id();
+        let shells = HashMap::from([(TAB, me)]);
+        let scan = |w: &mut ClaudeWatch, status: &str| {
+            let mut live = session(status);
+            live.pid = me;
+            w.scanned = ScanResult {
+                live: vec![registry::LiveSession {
+                    entry: live,
+                    config_dir: PathBuf::from("/tmp/giverny-nowhere-467"),
+                }],
+                ..ScanResult::default()
+            };
+            w.merge_scan(&shells, None, &mut WatchEffects::default());
+        };
+        let one = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let start = |w: &mut ClaudeWatch| {
+            feed(w, &hook("SessionStart", ""), Some(TAB));
+            feed(w, &hook("UserPromptSubmit", ""), Some(TAB));
+            feed(w, &hook("Stop", one), Some(TAB));
+            assert!(waves(w));
+        };
+
+        let mut w = ClaudeWatch::for_tests();
+        start(&mut w);
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", &notified("a1", "finished")),
+            Some(TAB),
+        );
+        feed(
+            &mut w,
+            &hook("Stop", r#","background_tasks":[]"#),
+            Some(TAB),
+        );
+        assert!(!waves(&w), "finished, says its notification");
+
+        let mut w = ClaudeWatch::for_tests();
+        start(&mut w);
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"stop it""#),
+            Some(TAB),
+        );
+        let stop = hook(
+            "PostToolUse",
+            r#","tool_name":"TaskStop","tool_input":{"task_id":"a1"}"#,
+        );
+        feed(&mut w, &stop, Some(TAB));
+        feed(
+            &mut w,
+            &hook("Stop", r#","background_tasks":[]"#),
+            Some(TAB),
+        );
+        assert!(!waves(&w), "stopped by the session");
+
+        let mut w = ClaudeWatch::for_tests();
+        start(&mut w);
+        scan(&mut w, "busy");
+        scan(&mut w, "shell");
+        assert!(waves(&w), "busy and shell are not the end of it");
+        scan(&mut w, "idle");
+        assert!(!waves(&w), "plain idle: nothing runs");
+
+        // Heard working while the session waits at its prompt: a
+        // background worker, though no `Stop` listed it.
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        let call = hook("PostToolUse", r#","agent_id":"a9","tool_name":"Bash""#);
+        feed(&mut w, &call, Some(TAB));
+        assert!(waves(&w));
+        let back = hook(
+            "PostToolUse",
+            r#","agent_id":"a9","tool_name":"SubagentHandback""#,
+        );
+        feed(&mut w, &back, Some(TAB));
+        assert!(!waves(&w));
+    }
+
+    /// The relay hooks run async, a process each, so the app can hear them
+    /// out of order: a turn's last tool call after its `Stop`. One stamped
+    /// before the newest the session has said does not undo it: the turn
+    /// stays ended, its workers' wave up (giverny#467).
+    #[test]
+    fn an_older_message_does_not_undo_a_newer_stop() {
+        let mut w = ClaudeWatch::for_tests();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let one = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
+
+        feed(&mut w, &stamped(hook("SessionStart", ""), 100), Some(TAB));
+        feed(
+            &mut w,
+            &stamped(hook("UserPromptSubmit", ""), 110),
+            Some(TAB),
+        );
+        feed(&mut w, &stamped(hook("Stop", one), 300), Some(TAB));
+        // The turn's last call, and a notification of it, land late.
+        let last_call = hook("PostToolUse", r#","tool_name":"Agent""#);
+        feed(&mut w, &stamped(last_call, 200), Some(TAB));
+        let note = hook(
+            "Notification",
+            r#","notification_type":"permission_prompt""#,
+        );
+        feed(&mut w, &stamped(note, 250), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle, "the turn stays ended");
+        assert!(waves(&w), "its worker's wave stays up");
+
+        // A foreground worker's call from before the `Stop` is no
+        // background worker.
+        let fg = hook("PostToolUse", r#","agent_id":"f1","tool_name":"Bash""#);
+        feed(&mut w, &stamped(fg, 290), Some(TAB));
+        assert!(!w.tabs[&TAB].subagents.contains("f1"));
+
+        // Newer news still counts: the next turn, and its end.
+        feed(
+            &mut w,
+            &stamped(hook("UserPromptSubmit", r#","prompt":"next""#), 400),
+            Some(TAB),
+        );
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        // The `Stop` before it, heard again late, does not end it.
+        feed(&mut w, &stamped(hook("Stop", one), 300), Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        // A prompt relayed late is still the person's prompt.
+        feed(
+            &mut w,
+            &stamped(hook("UserPromptSubmit", r#","prompt":"late""#), 350),
+            Some(TAB),
+        );
+        assert_eq!(w.state_of(TAB), ClaudeState::Busy);
+        assert!(w.tabs[&TAB].prompts.iter().any(|p| p == "late"));
+        feed(
+            &mut w,
+            &stamped(hook("Stop", r#","background_tasks":[]"#), 500),
+            Some(TAB),
+        );
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+        assert!(waves(&w), "a1 was never said to end");
+        // Unstamped messages (an older relay) are taken as they come.
+        feed(
+            &mut w,
+            &hook("PostToolUse", r#","tool_name":"Bash""#),
+            Some(TAB),
+        );
         assert_eq!(w.state_of(TAB), ClaudeState::Busy);
     }
 

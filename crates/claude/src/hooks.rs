@@ -109,6 +109,48 @@ impl RelayMsg {
         self.event.get("agent_id").and_then(|v| v.as_str())
     }
 
+    /// The subagent whose final report this tool call delivered: a
+    /// `PostToolUse` of `SubagentHandback` from a subagent. Its last call —
+    /// the worker has ended (Claude Code 2.1.302, giverny#467).
+    pub fn handed_back(&self) -> Option<&str> {
+        let tool = self.event.get("tool_name").and_then(|v| v.as_str());
+        (tool == Some(HANDBACK_TOOL))
+            .then(|| self.agent_id())
+            .flatten()
+            .filter(|a| !a.trim().is_empty())
+    }
+
+    /// On the session's own `PostToolUse` of `TaskStop`: the background task
+    /// it stopped.
+    pub fn stopped_task(&self) -> Option<&str> {
+        if self.event.get("tool_name").and_then(|v| v.as_str()) != Some("TaskStop") {
+            return None;
+        }
+        let input = self.event.get("tool_input")?;
+        input
+            .get("task_id")
+            .or_else(|| input.get("shell_id"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// On `Stop`: the ids of the delegated work [`Self::delegated_work_running`]
+    /// counts, and whether any of it came without one.
+    pub fn delegated_ids(&self) -> (Vec<&str>, bool) {
+        let mut ids = Vec::new();
+        let mut unnamed = false;
+        for task in in_flight(&self.event).filter(|task| {
+            task.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| DELEGATED.contains(&t))
+        }) {
+            match task.get("id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => ids.push(id),
+                _ => unnamed = true,
+            }
+        }
+        (ids, unnamed)
+    }
+
     /// On `Stop`: is work this session delegated still running as the turn
     /// ends — a subagent, a workflow, a teammate, a cloud session?
     ///
@@ -145,6 +187,50 @@ pub const DELEGATED: &[&str] = &[
     "cloud session",
     "remote_agent",
 ];
+
+/// The tool a subagent delivers its final report with.
+pub const HANDBACK_TOOL: &str = "SubagentHandback";
+
+/// The tasks a turn's injected `<task-notification>`s say have ended: the
+/// `<task-id>` of each that is `completed`, `failed` or `killed` and not
+/// merely paused. Claude Code marks a subagent `completed` as soon as it
+/// stops with background work of its own still running — "is waiting on its
+/// own background work", to resume when that work reports — and drops it
+/// from every later `Stop`'s `background_tasks` while it is still alive
+/// (2.1.302, giverny#467). Only each notification's head is read: its
+/// `<result>` is the task's own output, model text that could spell anything.
+pub fn ended_tasks(prompt: &str) -> Vec<&str> {
+    const OPEN: &str = "<task-notification>";
+    const CLOSE: &str = "</task-notification>";
+    fn tag<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = head.find(&open)? + open.len();
+        let len = head[start..].find(&close)?;
+        Some(head[start..start + len].trim())
+    }
+    let mut out = Vec::new();
+    let mut rest = prompt;
+    while let Some(at) = rest.find(OPEN) {
+        let block = &rest[at + OPEN.len()..];
+        let end = block.find(CLOSE).unwrap_or(block.len());
+        let mut head = &block[..end];
+        if let Some(result) = head.find("<result>") {
+            head = &head[..result];
+        }
+        rest = &block[end..];
+        let ended = matches!(tag(head, "status"), Some("completed" | "failed" | "killed"));
+        let paused = head.contains("waiting on its own background work")
+            || head.contains("background work of its own still running");
+        if ended
+            && !paused
+            && let Some(id) = tag(head, "task-id").filter(|id| !id.is_empty())
+        {
+            out.push(id);
+        }
+    }
+    out
+}
 
 /// The `background_tasks` types that are commands rather than agents: a
 /// background shell (a Bash `run_in_background`, or one the person sent to
@@ -1609,6 +1695,61 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A notification ends the task it names only when the task is done:
+    /// not one paused on background work of its own, and never by what its
+    /// `<result>` says (giverny#467).
+    #[test]
+    fn ended_tasks_reads_only_finished_notifications() {
+        let finished = "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n\
+            <summary>Agent \"x\" finished</summary>\n<result>done <task-id>a9</task-id> \
+            <status>killed</status></result>\n</task-notification>";
+        let paused = "<task-notification>\n<task-id>a2</task-id>\n<status>completed</status>\n\
+            <summary>Agent \"y\" is waiting on its own background work</summary>\n\
+            <note>This agent stopped with background work of its own still running.</note>\n\
+            </task-notification>";
+        let killed =
+            "<task-notification><task-id>b3</task-id><status>killed</status></task-notification>";
+        let running =
+            "<task-notification><task-id>b4</task-id><status>running</status></task-notification>";
+        assert_eq!(ended_tasks(finished), vec!["a1"]);
+        assert!(ended_tasks(paused).is_empty());
+        assert_eq!(
+            ended_tasks(&format!("{paused}\n{killed}\n{running}\n{finished}")),
+            vec!["b3", "a1"]
+        );
+        assert!(ended_tasks("hello").is_empty());
+    }
+
+    /// A worker's hand-back and the session's `TaskStop` name what ended;
+    /// a `Stop` names what runs, with or without an id.
+    #[test]
+    fn handbacks_task_stops_and_delegated_ids() {
+        let msg = |event: serde_json::Value| Target::Tab("t".into()).msg(None, event);
+        let back = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "agent_id": "a1", "tool_name": "SubagentHandback"
+        }));
+        assert_eq!(back.handed_back(), Some("a1"));
+        let call = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "agent_id": "a1", "tool_name": "Bash"
+        }));
+        assert_eq!(call.handed_back(), None);
+        let stop = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "tool_name": "TaskStop",
+            "tool_input": {"task_id": "a2"}
+        }));
+        assert_eq!(stop.stopped_task(), Some("a2"));
+        let turn_end = msg(serde_json::json!({
+            "hook_event_name": "Stop",
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running"},
+                {"id": "b1", "type": "shell", "status": "running"},
+                {"id": "a3", "type": "subagent", "status": "completed"},
+                {"type": "workflow", "status": "running"}
+            ]
+        }));
+        assert_eq!(turn_end.delegated_ids(), (vec!["a1"], true));
+    }
 
     /// A short socket path of its own: a long one does not fit `sun_path`.
     #[cfg(unix)]
