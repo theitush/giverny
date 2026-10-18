@@ -48,12 +48,22 @@
 //! duty-cycles the busy ones over the CPU limit, from what it measures,
 //! with the gaps a sampler has.
 //!
-//! What it does not hold: a process a claude started and that detached
-//! before the first pass saw the claude, a command's first second before
-//! the pass raises its `oom_score_adj`, and anything a command reaches
-//! outside its own process tree (a daemon it talks to, a Windows program
-//! through WSL interop). The plugin's Bash guard ([`crate::bash_guard`])
-//! refuses the commands that would leave the scope on purpose.
+//! **Before the first command** (giverny#270). A pass comes up to a second
+//! after the claude appears, and every command used to start at the
+//! claude's own `oom_score_adj` (0) until the next pass raised it. So the
+//! plugin's `SessionStart` hook does the same move itself, before the
+//! session runs anything ([`on_session_start`]), and adds a line to the
+//! session's `$CLAUDE_ENV_FILE`, which Claude Code sources in every Bash
+//! command's shell, raising that shell's `oom_score_adj` before the command
+//! starts. A claude with no plugin hook (one started before the plugin
+//! was written) still waits for the pass.
+//!
+//! What it does not hold: anything a command reaches outside its own
+//! process tree (a daemon it talks to, a Windows program through WSL
+//! interop), and a process that is not a Bash command (an MCP server) in
+//! the second before the pass raises it. The plugin's Bash guard
+//! ([`crate::bash_guard`]) refuses the commands that would leave the
+//! scope on purpose.
 
 use std::collections::{HashMap, HashSet};
 
@@ -250,6 +260,135 @@ pub fn commands_under(
     out
 }
 
+/// The claude a hook process runs for, when it is a tab's own: walking up
+/// from `start` (the hook's parent) through `parent`, the first process
+/// `is_claude` knows, with no second claude between it and `app`. `None`
+/// for a claude inside a claude (it rides with the outer one), one whose
+/// parents never reach the app (a multiplexer's server, a background
+/// job's daemon: the sampler, which walks down from the app, never sees
+/// those either), or no claude at all.
+pub fn tab_claude(
+    start: u32,
+    app: u32,
+    parent: impl Fn(u32) -> Option<u32>,
+    is_claude: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let mut found = None;
+    let mut pid = start;
+    for _ in 0..64 {
+        if pid == app {
+            return found;
+        }
+        if is_claude(pid) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(pid);
+        }
+        match parent(pid) {
+            Some(p) if p != pid && p != 0 => pid = p,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// What a capped tab's session start adds to `$CLAUDE_ENV_FILE`, which
+/// Claude Code sources in the shell of every Bash command it runs: the
+/// shell puts itself first in line for an OOM kill
+/// ([`COMMAND_OOM_ADJ`]) before the command starts, and the command
+/// inherits it, where the sampler's raise comes up to a second later
+/// (giverny#270). Silent and never failing, so a shell where `/proc`
+/// cannot be written runs the command as before.
+pub fn env_file_line() -> String {
+    format!(
+        "{{ echo {COMMAND_OOM_ADJ} > /proc/self/oom_score_adj; }} 2>/dev/null || :  \
+         # Giverny: commands die before claude (giverny#270)\n"
+    )
+}
+
+/// Add [`env_file_line`] to `text` (an env file's contents), unless it is
+/// there already (a resume or compact of the same session).
+pub fn with_env_line(text: &str) -> Option<String> {
+    let line = env_file_line();
+    if text.contains(line.trim_end()) {
+        return None;
+    }
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&line);
+    Some(out)
+}
+
+/// The session start's half of the cap (giverny#270), run by the plugin's
+/// `SessionStart` hook: the sampler adopts a claude on its next pass, up
+/// to a second after it appears, and what the claude starts and detaches
+/// before then, or the first second of every command before its
+/// `oom_score_adj` is raised, is outside. So the hook does both itself,
+/// before the session's first command:
+///
+/// - a tab's own claude ([`tab_claude`]) not yet in [`SLICE`] is moved
+///   into its scope there, with what shares its cgroup, as the sampler
+///   would (whose later pass finds it in the slice and leaves it);
+/// - a claude in the slice (moved now or before) has
+///   [`env_file_line`] added to its `$CLAUDE_ENV_FILE` (`env_file`), so
+///   every Bash command starts first in line for an OOM kill.
+///
+/// Nothing for a session that is no tab's own, where there is no user
+/// systemd (or `$GIVERNY_RUN_NO_SYSTEMD` is set), or anywhere but Linux.
+/// Quiet whatever happens: a failure leaves it to the sampler.
+#[cfg(target_os = "linux")]
+pub fn on_session_start(env_file: Option<&std::path::Path>) {
+    use crate::lineage;
+    let Some(app) = std::env::var(lineage::APP_PID_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    if lineage::in_bg_job() || lineage::giverny_var("GIVERNY_TAB_ID").is_none() {
+        return;
+    }
+    let Some(start) = lineage::proc_parent(std::process::id()) else {
+        return;
+    };
+    let Some(claude) = tab_claude(start, app, lineage::proc_parent, lineage::proc_is_claude) else {
+        return;
+    };
+    let cgroup_of = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+    let Some(cg) = cgroup_of(claude) else { return };
+    let capped = in_slice(&cg) || adopt_now(claude, cgroup_of);
+    if capped && let Some(f) = env_file {
+        let now = std::fs::read_to_string(f).unwrap_or_default();
+        if let Some(text) = with_env_line(&now) {
+            let _ = std::fs::write(f, text);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn on_session_start(_env_file: Option<&std::path::Path>) {}
+
+/// Move `claude`, with what shares its cgroup, into its scope in [`SLICE`]
+/// now, the slice capped first: what the sampler's pass does
+/// ([`Adopter::tick`]). Whether it is in the slice after.
+#[cfg(target_os = "linux")]
+fn adopt_now(claude: u32, cgroup_of: impl Fn(u32) -> Option<String>) -> bool {
+    if std::env::var_os(crate::manage_run::NO_SYSTEMD_ENV).is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    let _ = cap_slice_now();
+    let page_kb = crate::session_use::sysconf(libc::_SC_PAGESIZE).unwrap_or(4096) / 1024;
+    let procs = crate::session_use::proc_table(page_kb);
+    let pids = moved_with(&procs, claude, &cgroup_of);
+    let lease = DefaultLease::load();
+    run_quiet("busctl", &adopt_args(&scope_name(claude), &pids, &lease)).is_ok()
+        // The sampler's pass may have taken it a moment before.
+        || cgroup_of(claude).is_some_and(|cg| in_slice(&cg))
+}
+
 /// The app's sampler's half of the cap: [`Adopter::tick`] each pass.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Default)]
@@ -321,6 +460,11 @@ impl Adopter {
                         lease.ram,
                         pids.len()
                     );
+                }
+                // The claude's session-start hook took it a moment before
+                // (giverny#270): its scope is there already.
+                Err(_) if cgroup_of(pid).is_some_and(|cg| in_slice(&cg)) => {
+                    self.capped.insert(pid);
                 }
                 Err(err) => {
                     self.failures += 1;
@@ -553,6 +697,69 @@ mod tests {
             vec![31, 32, 41],
             "a pid back with another start is another process"
         );
+    }
+
+    #[test]
+    fn the_session_start_takes_only_a_tabs_own_claude() {
+        // app 1 → shell 10 → claude 20 → hook sh 30 → hook 31;
+        // claude 20 → bash 32 → claude 40 → hook 41;
+        // tmux server 50 (parent init) → claude 60 → hook 61.
+        let parent = |pid: u32| {
+            Some(match pid {
+                10 => 1,
+                20 => 10,
+                30 | 32 => 20,
+                31 => 30,
+                40 => 32,
+                41 => 40,
+                60 => 50,
+                61 => 60,
+                50 => 0,
+                _ => return None,
+            })
+        };
+        let is_claude = |pid: u32| matches!(pid, 20 | 40 | 60);
+        assert_eq!(tab_claude(30, 1, parent, is_claude), Some(20));
+        assert_eq!(tab_claude(31, 1, parent, is_claude), Some(20));
+        assert_eq!(tab_claude(41, 1, parent, is_claude), None, "nested");
+        assert_eq!(
+            tab_claude(61, 1, parent, is_claude),
+            None,
+            "never reaches the app"
+        );
+        assert_eq!(tab_claude(10, 1, parent, is_claude), None, "no claude");
+    }
+
+    #[test]
+    fn the_env_file_raises_each_commands_shell_once() {
+        let line = env_file_line();
+        assert!(
+            line.starts_with("{ echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || :"),
+            "{line}"
+        );
+        assert!(line.ends_with('\n'));
+        let first = with_env_line("").unwrap();
+        assert_eq!(first, line);
+        assert_eq!(with_env_line(&first), None, "a resume adds no second line");
+        let theirs = with_env_line("export A=1").unwrap();
+        assert_eq!(theirs, format!("export A=1\n{line}"));
+        // It runs, silently, in a shell, and what the shell starts has the
+        // adj (or more, where it was higher: it cannot be lowered); a shell
+        // that cannot write `/proc` goes on all the same.
+        if cfg!(unix) {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{line}echo ran; cat /proc/self/oom_score_adj"))
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.starts_with("ran\n"), "{text}");
+            if cfg!(target_os = "linux") {
+                let adj: i32 = text["ran\n".len()..].trim().parse().unwrap();
+                assert!(adj >= COMMAND_OOM_ADJ, "{text}");
+            }
+            assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+        }
     }
 
     #[test]
