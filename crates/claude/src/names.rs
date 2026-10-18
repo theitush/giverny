@@ -560,7 +560,8 @@ pub fn place_of(name: &str, room: &str) -> Option<String> {
 
 /// The environment variable a Giverny tab's shell carries the name of the
 /// rail category the tab sits in when its shell starts (giverny#434): what a
-/// session born there takes as its surname ([`surname`]).
+/// session born there takes as its surname ([`surname`]) when the app's
+/// saved workspace cannot say where the tab sits now (giverny#439).
 pub const CATEGORY_ENV: &str = "GIVERNY_CATEGORY";
 
 /// The surname a session is born with (giverny#434): the name of the rail
@@ -571,7 +572,8 @@ pub const CATEGORY_ENV: &str = "GIVERNY_CATEGORY";
 /// session comes from, and it is fixed at birth: recorded with the first
 /// name, it is never recomputed, so moving or renaming the tab later
 /// renames nobody. `feeds` is the app's feed directory, which finds its
-/// `state/tabs.json` when the tab's shell predates [`CATEGORY_ENV`].
+/// `state/tabs.json`: the tab's category there comes first (giverny#439),
+/// [`CATEGORY_ENV`] only when the tab is not found in it.
 pub fn surname(feeds: &Path, cwd: Option<&Path>) -> String {
     surname_in(&|name| std::env::var(name).ok(), feeds, cwd)
 }
@@ -583,9 +585,16 @@ pub fn surname_in(
     cwd: Option<&Path>,
 ) -> String {
     let var = |name: &str| crate::lineage::giverny_var_in(name, get);
-    var(CATEGORY_ENV)
+    // The category the tab sits in now, by the workspace the app saves
+    // within seconds of a change (giverny#439): a tab moved, or its
+    // category renamed, since its shell started. The shell's own word for
+    // it only where the app's state is out of reach (a WSL tab of a Windows
+    // Giverny) or does not know the tab.
+    tabs_file(feeds)
+        .zip(var("GIVERNY_TAB_ID"))
+        .and_then(|(tabs, tab)| tab_category(&tabs, &tab))
+        .or_else(|| var(CATEGORY_ENV))
         .and_then(|c| as_surname(&c))
-        .or_else(|| as_surname(&tab_category(&tabs_file(feeds)?, &var("GIVERNY_TAB_ID")?)?))
         .or_else(|| {
             let cwd = cwd
                 .map(Path::to_path_buf)
@@ -1540,8 +1549,17 @@ mod tests {
             "WeatherBaseline"
         );
         assert_eq!(at(&[("GIVERNY_TAB_ID", "giverny-99")], &repo), "ToLaD");
-        // The variable wins: it is the tab's own word for it.
-        assert_eq!(at(&tab, &repo), "Giverny");
+        // giverny#439: the tab moved to inbar since its shell started in
+        // giverny: where it sits now wins.
+        assert_eq!(at(&tab, &repo), "Inbar");
+        // A tab the saved workspace does not know: the shell's own word.
+        assert_eq!(
+            at(
+                &[(CATEGORY_ENV, "giverny"), ("GIVERNY_TAB_ID", "giverny-99")],
+                &repo
+            ),
+            "Giverny"
+        );
         // A feed directory not the app's own has no workspace beside it.
         assert_eq!(
             surname_in(
