@@ -61,9 +61,11 @@
 //! What it does not hold: anything a command reaches outside its own
 //! process tree (a daemon it talks to, a Windows program through WSL
 //! interop), and a process that is not a Bash command (an MCP server) in
-//! the second before the pass raises it. The plugin's Bash guard
-//! ([`crate::bash_guard`]) refuses the commands that would leave the
-//! scope on purpose.
+//! the second before the pass raises it. Leaving it is not refused
+//! (giverny#271): the plugin's Bash guard ([`crate::bash_guard`]) reminds
+//! the session of the cap once per kind of escape, and each pass's sweep
+//! ([`crate::escapes::Sweep`]) finds what left anyway and tells its
+//! session, without moving it back. The memory cap is the floor.
 
 use std::collections::{HashMap, HashSet};
 
@@ -428,6 +430,10 @@ pub struct Adopter {
     /// limits change.
     slice_set: Option<Vec<String>>,
     failures: u32,
+    /// What left the slice since (giverny#271): told to its session,
+    /// never moved back.
+    sweep: crate::escapes::Sweep,
+    look: Option<crate::escapes::System>,
 }
 
 impl Adopter {
@@ -502,6 +508,24 @@ impl Adopter {
             self.raised
                 .insert(pid, start.get(&pid).copied().unwrap_or_default());
             raise_oom_adj(pid);
+        }
+        let look = self.look.get_or_insert_with(crate::escapes::System::new);
+        let found = self.sweep.tick(
+            procs,
+            &self.capped,
+            claudes,
+            look,
+            crate::session_use::now_ms(),
+        );
+        if !found.is_empty() {
+            for (session, f) in &found {
+                tracing::info!(
+                    "pid {} of session {session} runs outside {SLICE} (in {}): told on its next call",
+                    f.pid,
+                    f.cgroup
+                );
+            }
+            crate::escapes::record(&crate::feed::feed_dir(), &found);
         }
     }
 

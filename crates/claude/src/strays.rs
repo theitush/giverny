@@ -424,7 +424,7 @@ const QUOTE_CHARS: usize = 60;
 
 /// A command as a line quotes it: its first line, backticks made quotes,
 /// cut to [`QUOTE_CHARS`].
-fn quote(what: &str) -> String {
+pub(crate) fn quote(what: &str) -> String {
     let first = what.lines().next().unwrap_or("").trim().replace('`', "'");
     if first.chars().count() <= QUOTE_CHARS {
         return first;

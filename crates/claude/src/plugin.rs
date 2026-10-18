@@ -32,9 +32,10 @@
 //!   call costs a few `stat`s. The same launcher runs as a `PreToolUse` hook
 //!   on Bash: a command that would leave its tab's resource cap
 //!   (`systemd-run`, `systemctl --user set-property`, a write into
-//!   `/sys/fs/cgroup`, …) is refused ([`crate::bash_guard`]), as is one
+//!   `/sys/fs/cgroup`, …) runs with a reminder, once per kind a session
+//!   ([`crate::bash_guard`], giverny#271), and one
 //!   that reaches into another session's processes, run scopes or
-//!   worktrees, and on Edit/Write an edit in such a worktree
+//!   worktrees, and on Edit/Write an edit in such a worktree, is refused
 //!   ([`crate::reach_guard`], giverny#415). And with the
 //!   skill in, it runs as a `UserPromptSubmit` hook: a prompt that asks to
 //!   manage ("manage that task") gets context telling Claude to invoke
