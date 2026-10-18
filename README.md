@@ -50,8 +50,6 @@ Giverny checks GitHub daily for a new release and offers a one-click update; `gi
 
 Giverny runs on Linux (Wayland and X11), macOS and Windows.
 
-On Windows, Claude accounts and Codex homes inside WSL are discovered and their tabs open in the matching distribution. Under WSLg, an outdated Windows GPU driver makes Giverny fall back to CPU rendering; `GIVERNY_GPU=software` forces that mode.
-
 ## Privacy
 
 Giverny itself never contacts Anthropic or OpenAI and never reads credential files. Claude usage comes from the `.claude.json` cache Claude Code writes; session state comes from hooks and Claude's session registry. Codex usage comes from the official local `codex app-server` helper, which contacts OpenAI using Codex's own sign-in; it never runs if Codex is disabled in Settings. Giverny's only direct network request is the update check, which sends nothing but a User-Agent.
