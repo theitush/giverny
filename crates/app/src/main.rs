@@ -1102,10 +1102,12 @@ pub struct TabRuntime {
     /// the picture is held, so the header over the terminal
     /// changes in the same frame as the view under it.
     shown_viewed: Option<String>,
-    /// What the tab is called while [`Self::shown_viewed`] is a worker's
-    /// view: that worker, as its pane row names it (giverny#460). Kept
-    /// while the tab is in the background, where the screen is not read.
-    viewed_title: Option<String>,
+    /// The name the tab's status line gives while [`Self::shown_viewed`]
+    /// is a worker's view: that worker, as its pane row names it
+    /// (giverny#460), as last told to `giverny statusline`
+    /// ([`giverny_claude::hooks::set_viewing`]). Kept while the tab is in
+    /// the background, where the screen is not read.
+    viewing_name: Option<String>,
     /// The worker view whose header was closed with its `×`; it stays
     /// closed until the tab leaves that view.
     header_closed: Option<String>,
@@ -1902,6 +1904,9 @@ impl App {
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name), shared.opacity);
         record_accent(&chrome);
+        // No tab is on a worker's view yet: a status line left naming one
+        // by a run that ended there names the manager again (giverny#460).
+        giverny_claude::hooks::clear_viewing(&paths.hook_spool());
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -2263,6 +2268,12 @@ impl App {
                 // recent stack yet. Commit the walk first, so closing the
                 // previewed tab goes back to it.
                 self.end_switch();
+                // A closed tab's status line names no worker (giverny#460).
+                let _ = giverny_claude::hooks::set_viewing(
+                    &self.paths.hook_spool(),
+                    &tab_env_id(id),
+                    None,
+                );
                 if let Some(rt) = self.rt.remove(&id)
                     && let Some(session) = rt.session
                 {
@@ -2339,9 +2350,8 @@ impl App {
                     RenameTarget::Tab(id) => self
                         .ws
                         .tab(*id)
-                        // What they see, not the raw title behind it — the
-                        // tab's own, not a worker's on view (giverny#460).
-                        .map(|t| self.own_title(t))
+                        // What they see, not the raw title behind it.
+                        .map(|t| self.shown_title(t))
                         .unwrap_or_default(),
                     RenameTarget::Category(id) => self
                         .ws
@@ -2842,7 +2852,7 @@ impl App {
                     worker_checked: None,
                     viewed: None,
                     shown_viewed: None,
-                    viewed_title: None,
+                    viewing_name: None,
                     header_closed: None,
                     prompt_bar: prompt_bar::Owner::default(),
                 });
@@ -3314,27 +3324,15 @@ impl App {
         )
     }
 
-    /// A tab's title as the rail shows it: the worker whose view it shows
-    /// (giverny#460), else its place (giverny#435), else its title tidied
-    /// per `[titles]`.
+    /// A tab's title as the rail shows it: its place (giverny#435), else
+    /// its title tidied per `[titles]`. A worker's view on screen does not
+    /// change it (giverny#460): the tab is still the manager's place; the
+    /// status line names the worker.
     pub fn shown_title(&self, t: &giverny_core::tabs::Tab) -> String {
-        self.tab_titles(t).0
-    }
-
-    /// The rail's title for a tab, and its hover: see
-    /// [`agent_open::tab_titles`].
-    pub fn tab_titles(&self, t: &giverny_core::tabs::Tab) -> (String, Option<String>) {
-        agent_open::tab_titles(
-            self.rt.get(&t.id).and_then(|rt| rt.viewed_title.as_deref()),
-            self.tab_place(t),
-            t.display_title(&self.cfg.titles),
-        )
-    }
-
-    /// A tab's own title, whatever view its Claude Code shows: its place,
-    /// else its title. What a rename starts from and a notification names.
-    pub fn own_title(&self, t: &giverny_core::tabs::Tab) -> String {
-        agent_open::tab_titles(None, self.tab_place(t), t.display_title(&self.cfg.titles)).0
+        match self.tab_place(t) {
+            Some(place) => place.to_string(),
+            None => t.display_title(&self.cfg.titles),
+        }
     }
 
     /// Is this tab stopped by a usage limit at all, reset time known or not?
@@ -5782,7 +5780,7 @@ impl eframe::App for App {
             .ws
             .tabs
             .iter()
-            .map(|t| (t.id, self.own_title(t)))
+            .map(|t| (t.id, self.shown_title(t)))
             .collect();
         // The sessions whose place the rail titles their tab after
         // (giverny#435), looked up by the next scan; none while that is off.
@@ -6095,8 +6093,8 @@ impl eframe::App for App {
             // The worker whose view the tab shows, or is on its way to: its
             // pane row is marked, from the click on.
             // The worker whose view is in the picture: what the header over
-            // the terminal is about, unless its `×` closed it, and what the
-            // tab is titled after (giverny#460).
+            // the terminal is about, unless its `×` closed it, and who the
+            // tab's status line names (giverny#460).
             let shown_label = self.rt.get(&active).and_then(|rt| rt.shown_viewed.clone());
             let header_closed = self.rt.get(&active).is_some_and(|rt| {
                 rt.header_closed.is_some() && rt.header_closed == rt.shown_viewed
@@ -6135,17 +6133,27 @@ impl eframe::App for App {
                 shown_row = line.clone();
                 header = line.filter(|_| !header_closed);
             }
-            let title = agent_open::viewed_title(
+            let name = agent_open::viewed_name(
                 shown_label.as_deref(),
                 shown_row.as_ref().map(|l| &l.click),
             );
             if let Some(rt) = self.rt.get_mut(&active)
-                && rt.viewed_title != title
+                && rt.viewing_name != name
             {
-                tracing::debug!("tab {active:?}: titled {title:?} (worker view)");
-                rt.viewed_title = title;
-                // The rail is drawn before this: draw it again.
-                ctx.request_repaint();
+                // Told to the status line, which Claude Code reruns every
+                // second (`STATUSLINE_REFRESH_S`): it follows within one.
+                let spool = self.paths.hook_spool();
+                match giverny_claude::hooks::set_viewing(
+                    &spool,
+                    &tab_env_id(active),
+                    name.as_deref(),
+                ) {
+                    Ok(()) => {
+                        tracing::debug!("tab {active:?}: status line names {name:?}");
+                        rt.viewing_name = name;
+                    }
+                    Err(err) => tracing::debug!("tab {active:?}: viewing: {err}"),
+                }
             }
 
             if let Some(rt) = self.rt.get_mut(&active) {

@@ -99,40 +99,37 @@ pub fn title_of(click: &RowClick) -> String {
     }
 }
 
-/// What a tab is called while its Claude Code shows a worker's view
-/// (giverny#460): the worker, as its management-panel row names it
-/// ([`title_of`]), else the label Claude Code puts on the view (the Agent
-/// call's description). `None` on the manager's own view (`label` none),
-/// where the tab keeps its own title.
+/// The longest worker name the status line gives, in characters: it
+/// shares the line with the model and the token counts.
+pub const VIEWED_NAME_MAX: usize = 40;
+
+/// Who a tab's status line names while its Claude Code shows a worker's
+/// view (giverny#460): the worker, as its management-panel row names it
+/// ([`title_of`]: `acme#158 · name`), else the label Claude Code puts on the
+/// view (the Agent call's description), cut to [`VIEWED_NAME_MAX`]. `None`
+/// on the manager's own view (`label` none), where the status line names
+/// the manager's session. The tab keeps its own title either way: it is
+/// still the manager's place.
 ///
 /// `label` is read off the screen ([`viewing_worker`], [`prompt_box`]), so
 /// it follows the view however it was left: the pane's back button, a
 /// second click on the row, Esc or ← typed by hand, the strip's `main`.
-pub fn viewed_title(label: Option<&str>, row: Option<&RowClick>) -> Option<String> {
+pub fn viewed_name(label: Option<&str>, row: Option<&RowClick>) -> Option<String> {
     let label = label?;
-    Some(match row {
+    let name = match row {
         Some(row) => title_of(row),
         None => label.to_string(),
-    })
+    };
+    Some(shorten(name.trim(), VIEWED_NAME_MAX))
 }
 
-/// What the rail calls a tab, and what a hover over its row says: the
-/// worker whose view it shows (`viewed`, [`viewed_title`]), else its
-/// place (giverny#435), else its own title. A name shown over the tab's
-/// own is the hover's: over a worker, the manager's place or title.
-pub fn tab_titles(
-    viewed: Option<&str>,
-    place: Option<&str>,
-    own: String,
-) -> (String, Option<String>) {
-    let manager = match place {
-        Some(place) => (place.to_string(), Some(own)),
-        None => (own, None),
-    };
-    match viewed {
-        Some(worker) => (worker.to_string(), Some(manager.0)),
-        None => manager,
+/// `text` cut to `max` characters, the cut marked with `…`.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
 }
 
 fn agent_id(click: &RowClick) -> Option<&str> {
@@ -1717,46 +1714,28 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_on_a_workers_view_is_titled_after_the_worker() {
+    fn the_status_line_names_the_worker_on_view() {
         // giverny#460.
         let mut c = click(Stage::Running);
         c.name = "fix the rail".into();
-        // On the manager's view: no title of the worker's, whatever the row.
-        assert_eq!(viewed_title(None, Some(&c)), None);
-        assert_eq!(viewed_title(None, None), None);
-        // On the worker's view: the panel row's title, else the view's label.
+        // On the manager's view: no worker's name, whatever the row.
+        assert_eq!(viewed_name(None, Some(&c)), None);
+        assert_eq!(viewed_name(None, None), None);
+        // On the worker's view: the panel row's name, else the view's label.
         assert_eq!(
-            viewed_title(Some("g460: attached title"), Some(&c)).as_deref(),
+            viewed_name(Some("g460: attached title"), Some(&c)).as_deref(),
             Some("acme#158 · fix the rail")
         );
         assert_eq!(
-            viewed_title(Some("g460: attached title"), None).as_deref(),
+            viewed_name(Some("g460: attached title"), None).as_deref(),
             Some("g460: attached title")
         );
-    }
-
-    #[test]
-    fn the_worker_on_view_names_the_tab_over_its_place_and_title() {
-        // giverny#460, over giverny#435.
-        let own = || "✳ Claude Code".to_string();
-        // The manager's own view: its place, its title under it; or its title.
-        assert_eq!(
-            tab_titles(None, Some("Rotem's Workshop"), own()),
-            ("Rotem's Workshop".into(), Some("✳ Claude Code".into()))
-        );
-        assert_eq!(
-            tab_titles(None, None, own()),
-            ("✳ Claude Code".into(), None)
-        );
-        // A worker's view: the worker, the manager's name under it.
-        assert_eq!(
-            tab_titles(Some("g460 · fix"), Some("Rotem's Workshop"), own()),
-            ("g460 · fix".into(), Some("Rotem's Workshop".into()))
-        );
-        assert_eq!(
-            tab_titles(Some("g460 · fix"), None, own()),
-            ("g460 · fix".into(), Some("✳ Claude Code".into()))
-        );
+        // Cut to fit the line beside the model and the tokens.
+        c.name = "the status line names the worker whose view is on screen".into();
+        let long = viewed_name(Some("x"), Some(&c)).unwrap();
+        assert_eq!(long.chars().count(), VIEWED_NAME_MAX);
+        assert!(long.starts_with("acme#158 · the status line"), "{long}");
+        assert!(long.ends_with('…'), "{long}");
     }
 
     #[test]
