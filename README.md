@@ -2,21 +2,21 @@
 
 # Giverny
 
-A GPU-rendered terminal for running Claude Code and Codex sessions side by side. Tabs sit in categories on a left rail, each tab shows what its agent is doing, and every account's rate limits are visible in the corner.
+A native terminal for running Claude Code and Codex sessions side by side, across several accounts at once. Tabs sit in categories on a left rail and show what each agent is doing. Each category can run on its own Claude account, and the rail shows every account's limits with reset times.
 
 ![Giverny: categorized tabs with live Claude state and multi-account usage meters](assets/demo.gif)
 
-Written in Rust on `alacritty_terminal`, with no web engine.
+Written in Rust on `alacritty_terminal` and rendered on the GPU, with no web engine. Runs on Linux, macOS and Windows.
 
 ## Features
 
+- **Multiple accounts.** Each `CLAUDE_CONFIG_DIR` and Codex home is an account, discovered automatically. Claude accounts can be assigned per category, so work and personal projects draw from different plans. The rail shows each account's limits with reset times.
 - **Agent state per tab.** A spinner while Claude or Codex works, a flag and desktop notification when it needs input, a ✓ when a background tab finishes. Claude uses Claude Code hooks, with a zero-config fallback to its session registry. Codex uses observer hooks installed from Settings → codex and trusted with `/hooks` ([setup](docs/codex-integration.md)).
-- **Multiple accounts.** Each `CLAUDE_CONFIG_DIR` and Codex home is an account, discovered automatically. The rail shows each account's limits with reset times. Claude accounts can be assigned per category.
-- **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude and Codex conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
 - **Background agents.** Forked and `run_in_background` Claude sessions appear in the rail. Click one to attach a tab.
+- **Persistent sessions.** Tabs, categories, working directories and scrollback survive restarts. Claude and Codex conversations resume in the right directory and account. Monitors on the `restore_apps` list (btop, k9s, lazygit) restart; other commands are never re-run.
+- **Right-to-left text.** Hebrew and Arabic render in reading order. Cascadia Mono Hebrew is bundled.
 - **Rail views.** Group tabs by your own categories or by git repository.
 - **Terminal support.** Kitty keyboard protocol (Shift+Enter works in Claude without `/terminal-setup`), kitty graphics, synchronized output, OSC 7 and 52, sanitized bracketed paste, SGR mouse, file drag-and-drop.
-- **Right-to-left text.** Hebrew and Arabic render in reading order. Cascadia Mono Hebrew is bundled.
 - **Plain config.** `~/.config/giverny/config.toml` hot-reloads. The `Ctrl+,` settings screen writes back to it with comments preserved. See [all options](docs/options.md).
 - **`giverny doctor`** prints Claude and Codex accounts, hook status, usage freshness and live sessions.
 
