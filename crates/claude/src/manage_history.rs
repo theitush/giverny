@@ -12,25 +12,32 @@
 //! as given. Each estimator is scored on its own **track** — the
 //! dispatcher's guess against the whole working time, and the worker's first
 //! re-estimate (made after reading the code) against the working time that
-//! was still to come when it was made — and is *told* how its instinct runs
-//! ([`track_record`]): the median of working time ÷ its *instinct* figure
-//! over the most recent landed tasks of the same kind (the same repo and the
-//! same type word in the title, `BUG:`, `FEATURE:` …, else the same repo,
-//! else every task). Plain arithmetic over the file, nothing else.
+//! was still to come when it was made — and is *told* how far off its gut
+//! figure runs ([`track_record`]): the median of working time ÷ its *gut*
+//! figure over the most recent landed tasks of the same kind (the same repo
+//! and the same type word in the title, `BUG:`, `FEATURE:` …, else the same
+//! repo, else every task). Plain arithmetic over the file, nothing else.
 //! [`accuracy`] reports every track's error, older against recent, so
 //! whether estimates improve is read from the data.
 //!
-//! **The instinct, not the figure** (giverny#371). Each figure is kept with
-//! the factor its giver had been shown for its track when giving it
-//! (`told_x`, `reest_told_x`; none shown is ×1). The figure as given is the
-//! instinct already scaled by that factor, so the instinct figure is
-//! `given ÷ told_x` and the factor told is `median(work × told_x ÷ given)`.
-//! Scoring the figures as given instead undid itself: once givers applied
-//! the factor and landed on target, the records came in at ×1.0, the factor
-//! drifted to ×1.0, the givers went back to their instinct and it swung
-//! back. Learned from the instinct, the factor stays for as long as the
-//! instinct is off, and follows it to ×1.0 only when the instinct itself
-//! improves.
+//! **The gut, not the figure** (giverny#371, #469). Scoring the figures as
+//! given undoes itself: once givers allow for the factor and land on
+//! target, the records come in at ×1.0, the factor drifts to ×1.0, the
+//! givers go back to their gut and it swings back. So each figure is kept
+//! with the giver's gut figure, its raw figure before allowing for how far
+//! off it usually runs (`gut_s`, `reest_gut_s`: `--gut`, else the figure
+//! itself), and the factor told is `median(work ÷ gut)`. It stays for as
+//! long as the gut is off, and follows it to ×1.0 only when the gut itself
+//! improves; how much of it a giver allows for is the giver's judgement.
+//!
+//! **Lines from before giverny#469** carry no gut. A dispatcher then
+//! scaled its gut by the factor it had been shown (`told_x`), as a rule, so
+//! its gut is worked back out as `given ÷ told_x`. A worker was told its
+//! factor as information and mostly gave its gut: assuming it applied the
+//! factor read each figure as a gut ×factor too low, the factor told fell
+//! further, and the track ran away toward ×0.01. Its gut is the figure as
+//! given. And the factor told is held to [`X_MIN`]–[`X_MAX`], a band a
+//! giver can believe, should anything run away again.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -49,6 +56,12 @@ pub const MIN_SAMPLES: usize = 5;
 /// How many of the most recent matching tasks the median is taken over.
 pub const RECENT: usize = 20;
 
+/// The band the factor told is held to (giverny#469): outside it, a factor
+/// no giver would believe.
+pub const X_MIN: f64 = 0.2;
+/// See [`X_MIN`].
+pub const X_MAX: f64 = 3.0;
+
 /// One landed task.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -64,6 +77,10 @@ pub struct Record {
     /// The guess as given to `plan`/`start --eta`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_s: Option<u64>,
+    /// The dispatcher's gut figure behind it (`--gut`, else the guess
+    /// itself; giverny#469). `None` on lines written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gut_s: Option<u64>,
     /// What the pane counted down from at the start: the guess itself, or
     /// on lines written before giverny#229, the guess corrected. Kept so old
     /// lines read; no track scores it.
@@ -80,6 +97,9 @@ pub struct Record {
     /// The worker's first re-estimate of the time left, as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reest_s: Option<u64>,
+    /// The worker's gut figure behind it, as [`Record::gut_s`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reest_gut_s: Option<u64>,
     /// The factor the worker had been shown for its re-estimate track when
     /// it gave `reest_s` (giverny#371), as [`Record::told_x`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,11 +183,28 @@ impl Track {
         x.filter(|x| x.is_finite() && *x > 0.0).unwrap_or(1.0)
     }
 
-    /// How the giver's *instinct* ran on `r`: took ÷ the instinct figure,
-    /// which is the figure as given ÷ the factor shown. What the giver is
-    /// told ([`track_record`]).
+    /// The giver's gut figure on `r`, seconds: `--gut` (on lines from
+    /// giverny#469 on, the figure itself when none was given); before it, a
+    /// dispatcher's figure as given ÷ the factor it had been shown and a
+    /// worker's figure as given (see the module's doc).
+    pub fn gut(self, r: &Record) -> Option<f64> {
+        let (est, _) = self.pair(r)?;
+        let gut = match self {
+            Track::Guess => r.gut_s.map(|g| g as f64),
+            Track::Reestimate => r.reest_gut_s.map(|g| g as f64),
+        };
+        let gut = gut.unwrap_or(match self {
+            Track::Guess => est as f64 / self.told_x(r),
+            Track::Reestimate => est as f64,
+        });
+        (gut > 0.0).then_some(gut)
+    }
+
+    /// How the giver's *gut* ran on `r`: took ÷ the gut figure. What the
+    /// giver is told ([`track_record`]).
     pub fn ratio(self, r: &Record) -> Option<f64> {
-        self.given_ratio(r).map(|g| g * self.told_x(r))
+        let (_, took) = self.pair(r)?;
+        Some(took as f64 / self.gut(r)?)
     }
 
     /// How the figure *as given* ran on `r`: took ÷ estimated. Near ×1.0
@@ -310,9 +347,9 @@ fn level_ratios(
         if ratios.len() < MIN_SAMPLES {
             continue;
         }
-        // What the instinct is on: ` on FEATURE in demo`, ` in demo`, ``.
+        // What the gut is on: ` on FEATURE tasks in demo`, ` in demo`, ``.
         let words = match (r, k) {
-            (Some(r), Some(k)) => format!(" on {k} in {r}"),
+            (Some(r), Some(k)) => format!(" on {k} tasks in {r}"),
             (Some(r), None) => format!(" in {r}"),
             _ => String::new(),
         };
@@ -321,31 +358,69 @@ fn level_ratios(
     None
 }
 
-/// How an estimator's instinct runs on tasks like this one (giverny#371):
-/// the factor it is told, how many tasks it is the median of, and the level
-/// it was found at (` on BUG in giverny`, ` in giverny` or empty), which is
-/// also what tells one line from another. `None` with too little history.
+/// How an estimator's gut runs on tasks like this one (giverny#371, #469):
+/// the factor it is told (`x`, held to [`X_MIN`]–[`X_MAX`]; `measured` is
+/// the median itself), how many tasks it is the median of, and the level
+/// it was found at (` on BUG tasks in giverny`, ` in giverny` or empty),
+/// which is also what tells one line from another. `None` with too little
+/// history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instinct {
+    pub track: Track,
     pub x: f64,
+    pub measured: f64,
     pub n: usize,
     pub level: String,
 }
 
 impl Instinct {
-    /// The line its giver reads: `your instinct on BUG in giverny runs
-    /// ×0.30 (last 20, median): scale your figure by it`.
+    /// How far off the gut runs, in words a reader cannot turn around:
+    /// `about 3.0× too high`, `about 1.5× too low`, `about right`; a
+    /// factor held to the band says `or more`.
+    pub fn how_far(&self) -> String {
+        let held = if self.measured == self.x {
+            ""
+        } else {
+            " or more"
+        };
+        if self.x < 1.0 / 1.15 {
+            format!("about {:.1}× too high{held}", 1.0 / self.x)
+        } else if self.x > 1.15 {
+            format!("about {:.1}× too low{held}", self.x)
+        } else {
+            "about right".to_string()
+        }
+    }
+
+    /// The line its giver reads: `your gut re-estimates on BUG tasks in
+    /// giverny have usually run about 3.0× too high (last 20, median)`.
     pub fn line(&self) -> String {
+        let what = match self.track {
+            Track::Guess => "estimates",
+            Track::Reestimate => "re-estimates",
+        };
+        let verb = if self.how_far() == "about right" {
+            "been"
+        } else {
+            "run"
+        };
         format!(
-            "your instinct{} runs ×{:.2} (last {}, median): scale your figure by it",
-            self.level, self.x, self.n
+            "your gut {what}{} have usually {verb} {} (last {}, median)",
+            self.level,
+            self.how_far(),
+            self.n
         )
     }
 }
 
-/// The instinct factor of `track` for a task of this repo and kind: the
-/// median of working time ÷ instinct figure over the most recent finished
-/// tasks at the narrowest level with [`MIN_SAMPLES`].
+/// What to give after the line ([`Instinct::line`]): the gut figure and the
+/// one settled on, the figure the pane shows (giverny#469). How much to
+/// allow for the line is the giver's judgement.
+pub const GIVE_BOTH: &str = "give your gut figure and the one you settle on";
+
+/// The gut factor of `track` for a task of this repo and kind: the median
+/// of working time ÷ gut figure over the most recent finished tasks at the
+/// narrowest level with [`MIN_SAMPLES`], held to [`X_MIN`]–[`X_MAX`].
 pub fn instinct(
     history: &[Record],
     track: Track,
@@ -353,16 +428,19 @@ pub fn instinct(
     kind: Option<&str>,
 ) -> Option<Instinct> {
     let (ratios, level) = level_ratios(history, track, repo, kind)?;
+    let measured = median(ratios.clone());
     Some(Instinct {
+        track,
+        x: measured.clamp(X_MIN, X_MAX),
+        measured,
         n: ratios.len(),
-        x: median(ratios),
         level,
     })
 }
 
-/// How an estimator's instinct runs, for it to see before it makes the
-/// next figure: [`Instinct::line`]. Told, never applied: the figure it gives
-/// next is the figure the pane shows. `None` with too little history.
+/// How an estimator's gut runs, for it to see before it makes the next
+/// figure: [`Instinct::line`]. Told, never applied: the figure it settles
+/// on is the figure the pane shows. `None` with too little history.
 pub fn track_record(
     history: &[Record],
     track: Track,
@@ -372,9 +450,9 @@ pub fn track_record(
     instinct(history, track, repo, kind).map(|i| i.line())
 }
 
-/// One group's figures on a track: how many, the median instinct ratio
-/// (the factor its givers are told, giverny#371), the median ratio of the
-/// figures as given (bias: near ×1.0 when the factor is applied) and their
+/// One group's figures on a track: how many, the median gut ratio (the
+/// factor its givers are told, giverny#371, #469), the median ratio of the
+/// figures as given (bias: near ×1.0 when the factor is allowed for) and their
 /// typical miss either way (the median of `max(r, 1/r)`: ×1.5 means half the
 /// figures were within half again of the truth).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -409,10 +487,11 @@ pub fn accuracy(history: &[Record], repo: Option<&str>) -> String {
         .collect();
     let mut out = format!(
         "Estimate accuracy over {} landed task{}{}.\n\
-         instinct = time worked ÷ the figure before the factor shown (median): the \
-         factor the line tells; ×1.00 is an instinct that is right.\n\
+         instinct = time worked ÷ the gut figure (median; `--gut`, else the figure as \
+         given, and on a dispatcher's guess from before giverny#469 the figure as given \
+         ÷ the factor shown): the factor the line tells; ×1.00 is a gut that is right.\n\
          given = time worked ÷ the figure as given (median): near ×1.00 when the line \
-         is applied, drifting from it when it is not.\n\
+         is allowed for, drifting from it when it is not.\n\
          off = the typical miss of the figures as given, either way (median of the \
          ratio or its inverse): ×1.00 is perfect.\n\
          older / recent = the first and second half of each group, oldest first.\n",
@@ -722,17 +801,18 @@ mod tests {
         let told = |repo, kind| track_record(&h, Track::Guess, repo, kind).unwrap();
         assert_eq!(
             told(Some("demo"), Some("FEATURE")),
-            "your instinct on FEATURE in demo runs ×0.40 (last 5, median): scale your figure by it"
+            "your gut estimates on FEATURE tasks in demo have usually run about 2.5× too high \
+             (last 5, median)"
         );
         // No RESEARCH history in demo: repo alone, median of 0.4 and 1.0.
         assert_eq!(
             told(Some("demo"), Some("RESEARCH")),
-            "your instinct in demo runs ×0.70 (last 10, median): scale your figure by it"
+            "your gut estimates in demo have usually run about 1.4× too high (last 10, median)"
         );
         // A repo with no history at all: everything (0.4, 1, 2 → 1).
         assert_eq!(
             told(Some("planets"), Some("BUG")),
-            "your instinct runs ×1.00 (last 15, median): scale your figure by it"
+            "your gut estimates have usually been about right (last 15, median)"
         );
         // No repo known: straight to everything.
         assert_eq!(told(None, Some("BUG")), told(Some("planets"), None));
@@ -758,13 +838,20 @@ mod tests {
         h.extend([blocked, guessless, review]);
         assert_eq!(
             track_record(&h, Track::Guess, Some("g"), None).unwrap(),
-            "your instinct in g runs ×0.50 (last 20, median): scale your figure by it"
+            "your gut estimates in g have usually run about 2.0× too high (last 20, median)"
         );
-        // A wild history is told as measured.
+        // A wild history is held to the band, and says so (giverny#469).
         let wild: Vec<Record> = (0..5).map(|_| rec("w", None, 10, 1000)).collect();
         assert_eq!(
             track_record(&wild, Track::Guess, Some("w"), None).unwrap(),
-            "your instinct in w runs ×100.00 (last 5, median): scale your figure by it"
+            "your gut estimates in w have usually run about 3.0× too low or more (last 5, median)"
+        );
+        let i = instinct(&wild, Track::Guess, Some("w"), None).unwrap();
+        assert_eq!((i.x, i.measured), (X_MAX, 100.0));
+        let tiny: Vec<Record> = (0..5).map(|_| rec("w", None, 1000, 10)).collect();
+        assert_eq!(
+            track_record(&tiny, Track::Guess, Some("w"), None).unwrap(),
+            "your gut estimates in w have usually run about 5.0× too high or more (last 5, median)"
         );
     }
 
@@ -818,11 +905,12 @@ mod tests {
             .collect();
         assert_eq!(
             track_record(&h, Track::Guess, Some("g"), Some("FEATURE")).unwrap(),
-            "your instinct on FEATURE in g runs ×0.20 (last 6, median): scale your figure by it"
+            "your gut estimates on FEATURE tasks in g have usually run about 5.0× too high \
+             (last 6, median)"
         );
         assert_eq!(
             track_record(&h, Track::Reestimate, Some("x"), None).unwrap(),
-            "your instinct runs ×1.50 (last 6, median): scale your figure by it"
+            "your gut re-estimates have usually run about 1.5× too low (last 6, median)"
         );
         assert_eq!(track_record(&h[..4], Track::Guess, None, None), None);
     }
@@ -957,7 +1045,8 @@ mod tests {
         assert_eq!(
             track_record(&h, Track::Guess, Some("giverny"), Some("BUG")).as_deref(),
             Some(
-                "your instinct on BUG in giverny runs ×0.30 (last 20, median): scale your figure by it"
+                "your gut estimates on BUG tasks in giverny have usually run about 3.3× too high \
+                 (last 20, median)"
             )
         );
 
@@ -985,7 +1074,9 @@ mod tests {
     }
 
     /// Lines from before giverny#371 have no `told_x`: they count as ×1,
-    /// which is what they were (mostly untold); a new line keeps both.
+    /// which is what they were (mostly untold); a line from before
+    /// giverny#469 has no gut, so a dispatcher's is worked back out from the
+    /// factor it had been shown and a worker's is its figure as given.
     #[test]
     fn old_lines_count_as_untold_and_new_ones_keep_the_factor() {
         let old: Record = serde_json::from_str(
@@ -1008,8 +1099,20 @@ mod tests {
         assert!(line.contains(r#""told_x":0.5"#) && line.contains(r#""reest_told_x":2.0"#));
         // Said 600s while shown ×0.5: the gut said 1200s, and took 300s.
         assert_eq!(Track::Guess.ratio(&new), Some(0.25));
-        // 300s said while shown ×2: the gut said 150s, and 240s were left.
-        assert_eq!(Track::Reestimate.ratio(&new), Some(1.6));
+        // 300s said while shown ×2: a worker's figure was its gut figure
+        // (giverny#469), and 240s were left.
+        assert_eq!(Track::Reestimate.ratio(&new), Some(0.8));
+        // From giverny#469 on, the gut is given: it is what counts.
+        let gut = Record {
+            gut_s: Some(2400),
+            reest_gut_s: Some(480),
+            ..new.clone()
+        };
+        assert_eq!(Track::Guess.ratio(&gut), Some(0.125));
+        assert_eq!(Track::Reestimate.ratio(&gut), Some(0.5));
+        assert_eq!(Track::Guess.given_ratio(&gut), Some(0.5));
+        let line = serde_json::to_string(&gut).unwrap();
+        assert!(line.contains(r#""gut_s":2400"#) && line.contains(r#""reest_gut_s":480"#));
         // A factor that is no factor counts as none.
         let bad = Record {
             told_x: Some(0.0),
@@ -1034,5 +1137,266 @@ mod tests {
         // in the median; recent: all applied. The instinct is ×0.30 in both.
         assert_eq!(all.matches("×0.30").count(), 2, "{out}");
         assert!(all.ends_with("×1.00  ×1.00"), "{all}");
+    }
+
+    /// One worker's first re-estimate, given `gut_m` minutes by its gut
+    /// with `shown` told, the figure allowing for `allow` of it (0: none,
+    /// 1: all), and `runs` × the gut still to come. `with_gut`: given
+    /// with `--gut` (giverny#469), else as a line from before.
+    fn worker(gut_m: f64, shown: Option<f64>, allow: f64, runs: f64, with_gut: bool) -> Record {
+        let x = shown.unwrap_or(1.0);
+        let given = (gut_m * x.powf(allow) * 60.0).round() as u64;
+        let left = (gut_m * runs * 60.0).round() as u64;
+        Record {
+            reest_s: Some(given),
+            reest_gut_s: with_gut.then_some((gut_m * 60.0).round() as u64),
+            reest_told_x: Some(x),
+            reest_at_s: Some(300),
+            ..rec("giverny", Some("BUG"), 0, 0)
+        }
+        .worked(300 + left)
+    }
+
+    /// Forty re-estimates in a row, each told what `told` says before it.
+    fn simulate_workers(
+        allow: f64,
+        runs: f64,
+        with_gut: bool,
+        told: impl Fn(&[Record]) -> Option<f64>,
+    ) -> Vec<Option<f64>> {
+        let mut h = Vec::new();
+        let mut shown = Vec::new();
+        for i in 0..40 {
+            let x = told(&h);
+            shown.push(x);
+            // A gut that wobbles: ×0.5 … ×2 of 40m around the same run.
+            let gut = 40.0 * [1.0, 0.5, 2.0, 1.5, 0.75][i % 5];
+            h.push(worker(gut, x, allow, runs, with_gut));
+        }
+        shown
+    }
+
+    fn worker_told_now(h: &[Record]) -> Option<f64> {
+        instinct(h, Track::Reestimate, Some("giverny"), Some("BUG")).map(|i| i.x)
+    }
+
+    /// The worker's factor as giverny#371 told it: working time ÷ (the
+    /// figure as given ÷ the factor shown), assuming the factor applied.
+    fn worker_told_before(h: &[Record]) -> Option<f64> {
+        let ratios: Vec<f64> = h
+            .iter()
+            .rev()
+            .filter_map(|r| Some(Track::Reestimate.given_ratio(r)? * r.reest_told_x?))
+            .take(RECENT)
+            .collect();
+        (ratios.len() >= MIN_SAMPLES).then(|| median(ratios))
+    }
+
+    /// giverny#469, the feedback case: a worker that ignores every factor
+    /// it is shown. Read as if it applied each one, the factor ran away
+    /// toward zero; read from its gut it stays where its gut runs.
+    #[test]
+    fn a_worker_that_ignores_every_factor_does_not_drive_it_to_zero() {
+        // Lines from before giverny#469 (no `--gut`): the gut is the figure.
+        let before = simulate_workers(0.0, 0.3, false, worker_told_before);
+        let last = before.last().unwrap().unwrap();
+        assert!(last < 0.01, "the old reading runs away: {before:?}");
+        let now = simulate_workers(0.0, 0.3, false, worker_told_now);
+        for (i, x) in now.iter().enumerate().skip(MIN_SAMPLES) {
+            assert!((x.unwrap() - 0.3).abs() < 0.01, "task {i} told {x:?}");
+        }
+        // With `--gut` given, the same.
+        let now = simulate_workers(0.0, 0.3, true, worker_told_now);
+        assert!(
+            now[MIN_SAMPLES..]
+                .iter()
+                .all(|x| (x.unwrap() - 0.3).abs() < 0.01)
+        );
+    }
+
+    /// With the gut given, however much of the factor a worker allows for —
+    /// none, half or all — the factor stays where the gut runs: it neither
+    /// runs away nor fades as the figures improve.
+    #[test]
+    fn the_gut_factor_holds_however_much_of_it_is_allowed_for() {
+        for allow in [0.0, 0.5, 1.0] {
+            let shown = simulate_workers(allow, 0.3, true, worker_told_now);
+            for (i, x) in shown.iter().enumerate().skip(MIN_SAMPLES) {
+                assert!(
+                    (x.unwrap() - 0.3).abs() < 0.01,
+                    "allow {allow}, task {i}: {x:?}"
+                );
+            }
+        }
+        // Allowed for in full, the figures as given land on target.
+        let mut h = Vec::new();
+        for i in 0..30 {
+            let x = worker_told_now(&h);
+            h.push(worker(40.0 + i as f64, x, 1.0, 0.3, true));
+        }
+        let s = score(
+            &h[MIN_SAMPLES..]
+                .iter()
+                .filter_map(|r| {
+                    Some((
+                        Track::Reestimate.ratio(r)?,
+                        Track::Reestimate.given_ratio(r)?,
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            (s.instinct - 0.3).abs() < 0.01 && (s.bias - 1.0).abs() < 0.01,
+            "{s:?}"
+        );
+    }
+
+    /// The words cannot be read the wrong way round.
+    #[test]
+    fn how_far_off_is_said_with_its_direction() {
+        let i = |x: f64, measured: f64| Instinct {
+            track: Track::Reestimate,
+            x,
+            measured,
+            n: 20,
+            level: " on BUG tasks in giverny".into(),
+        };
+        assert_eq!(i(0.33, 0.33).how_far(), "about 3.0× too high");
+        assert_eq!(i(1.6, 1.6).how_far(), "about 1.6× too low");
+        assert_eq!(i(0.9, 0.9).how_far(), "about right");
+        assert_eq!(i(1.1, 1.1).how_far(), "about right");
+        assert_eq!(i(X_MIN, 0.01).how_far(), "about 5.0× too high or more");
+        assert_eq!(
+            i(0.33, 0.33).line(),
+            "your gut re-estimates on BUG tasks in giverny have usually run about 3.0× too \
+             high (last 20, median)"
+        );
+        assert_eq!(
+            i(1.0, 1.0).line(),
+            "your gut re-estimates on BUG tasks in giverny have usually been about right \
+             (last 20, median)"
+        );
+    }
+
+    /// giverny#469: replays a real history (`$GIVERNY_REPLAY_HISTORY`, a
+    /// copy; it is only read) through the factor as told before and as told
+    /// now, printing per repo and type the factor each would have shown on
+    /// every tenth task of the group and its last. `cargo test -p
+    /// giverny-claude replay_real_history -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn replay_real_history() {
+        let Some(file) = std::env::var_os("GIVERNY_REPLAY_HISTORY") else {
+            return;
+        };
+        let all = load(Path::new(&file));
+        let repos: Vec<String> = std::env::var("GIVERNY_REPLAY_REPOS")
+            .unwrap_or_else(|_| "giverny,poly".into())
+            .split(',')
+            .map(String::from)
+            .collect();
+        // The factor as told before giverny#469: working time ÷ (the figure
+        // as given ÷ the factor shown), unheld, at the same level.
+        let before = |past: &[Record], track: Track, repo: &str, kind: Option<&str>| {
+            let (ratios, _) = level_ratios(past, track, Some(repo), kind)?;
+            let n = ratios.len();
+            let old: Vec<f64> = past
+                .iter()
+                .rev()
+                .filter(|h| h.repo.as_deref() == Some(repo))
+                .filter(|h| {
+                    // The level level_ratios settled on: kind if it had enough.
+                    kind.is_none_or(|k| h.kind.as_deref() == Some(k))
+                })
+                .filter_map(|h| {
+                    let x = match track {
+                        Track::Guess => h.told_x,
+                        Track::Reestimate => h.reest_told_x,
+                    }
+                    .filter(|x| *x > 0.0)
+                    .unwrap_or(1.0);
+                    Some(track.given_ratio(h)? * x)
+                })
+                .take(n)
+                .collect();
+            (old.len() == n).then(|| median(old))
+        };
+        for track in Track::ALL {
+            println!("\n== {}", track.heading());
+            for repo in &repos {
+                let mut kinds: Vec<Option<String>> = vec![None];
+                let mut ks: Vec<String> = all
+                    .iter()
+                    .filter(|h| h.repo.as_deref() == Some(repo))
+                    .filter(|h| track.pair(h).is_some())
+                    .filter_map(|h| h.kind.clone())
+                    .collect();
+                ks.sort();
+                ks.dedup();
+                kinds.extend(ks.into_iter().map(Some));
+                for kind in kinds {
+                    let k = kind.as_deref();
+                    let idx: Vec<usize> = (0..all.len())
+                        .filter(|&i| all[i].repo.as_deref() == Some(repo.as_str()))
+                        .filter(|&i| k.is_none_or(|k| all[i].kind.as_deref() == Some(k)))
+                        .filter(|&i| track.pair(&all[i]).is_some())
+                        .collect();
+                    if idx.len() < 2 * MIN_SAMPLES {
+                        continue;
+                    }
+                    let mut old_line = Vec::new();
+                    let mut new_line = Vec::new();
+                    // What the figures as given would have run, had each been
+                    // the gut ×the factor shown now: left ÷ (gut × new).
+                    let mut applied = Vec::new();
+                    let mut actual = Vec::new();
+                    for (j, &i) in idx.iter().enumerate() {
+                        let past = &all[..i];
+                        // The level a task's own line is found at.
+                        let kk = if k.is_some() {
+                            k
+                        } else {
+                            all[i].kind.as_deref()
+                        };
+                        let new = instinct(past, track, Some(repo), kk);
+                        if let (Some(n), Some(r)) = (&new, track.ratio(&all[i])) {
+                            applied.push(r / n.x);
+                            actual.push(track.given_ratio(&all[i]).unwrap());
+                        }
+                        if (j + 1) % 10 == 0 || j + 1 == idx.len() {
+                            let lvl = level_ratios(past, track, Some(repo), kk);
+                            let level_kind = lvl
+                                .as_ref()
+                                .and_then(|(_, w)| w.contains(" on ").then_some(kk).flatten());
+                            let fmt =
+                                |x: Option<f64>| x.map_or("  —  ".into(), |x| format!("{x:.3}"));
+                            old_line.push(fmt(before(past, track, repo, level_kind)));
+                            new_line.push(fmt(new.map(|n| n.x)));
+                        }
+                    }
+                    let half = |v: &[f64]| {
+                        let (a, b) = v.split_at(v.len() / 2);
+                        let m = |v: &[f64]| {
+                            if v.is_empty() {
+                                f64::NAN
+                            } else {
+                                median(v.to_vec())
+                            }
+                        };
+                        format!("{:.2} → {:.2}", m(a), m(b))
+                    };
+                    println!(
+                        "{repo} {} (n {}): every 10th task and the last\n  old  {}\n  new  {}\n  given as given {}; given had the new factor been applied {}",
+                        k.unwrap_or("(all)"),
+                        idx.len(),
+                        old_line.join(" "),
+                        new_line.join(" "),
+                        half(&actual),
+                        half(&applied),
+                    );
+                }
+            }
+        }
     }
 }
