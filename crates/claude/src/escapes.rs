@@ -184,19 +184,25 @@ pub fn told(found: &[Found]) -> String {
             f.cgroup
         )
     };
-    let tail = "Yours? Giverny does not move it back: heavy work goes through \
-                `giverny-manage run <task> -- <command>`, or stays in the tab.";
+    let tail = |it: &str| {
+        format!(
+            "Yours? Giverny does not move {it} back: heavy work goes through \
+             `giverny-manage run <task> -- <command>`, or stays in the tab."
+        )
+    };
     if let [one] = found {
         return format!(
             "Giverny found a process of this session running outside its tab's limits: {}. \
-             {tail}",
-            line(one)
+             {}",
+            line(one),
+            tail("it")
         );
     }
     let list: Vec<String> = found.iter().map(|f| format!("- {}", line(f))).collect();
     format!(
-        "Giverny found processes of this session running outside its tab's limits:\n{}\n{tail}",
-        list.join("\n")
+        "Giverny found processes of this session running outside its tab's limits:\n{}\n{}",
+        list.join("\n"),
+        tail("them")
     )
 }
 
@@ -726,5 +732,33 @@ mod tests {
         assert!(!dir.join("x").exists());
         prune_hooked(&dir);
         assert!(hooked(&dir, &["old"]));
+    }
+
+    /// The sweep on this machine's `/proc` (giverny#271's live check):
+    /// `G271_CLAUDE` names a capped claude, `G271_FEEDS` a scratch feed
+    /// dir; prints what it finds and what its session would be told.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn live_sweep_finds_what_left_the_slice() {
+        let claude: u32 = std::env::var("G271_CLAUDE").unwrap().parse().unwrap();
+        let feeds = PathBuf::from(std::env::var("G271_FEEDS").unwrap());
+        let procs = crate::session_use::proc_table(4);
+        let set: HashSet<u32> = [claude].into();
+        let mut sweep = Sweep::default();
+        let found = sweep.tick(&procs, &set, &set, &System::new(), 1);
+        for (s, f) in &found {
+            println!(
+                "found: session {s} pid {} `{}` in {}",
+                f.pid, f.cmd, f.cgroup
+            );
+        }
+        assert!(!found.is_empty());
+        assert!(sweep.tick(&procs, &set, &set, &System::new(), 2).is_empty());
+        record(&feeds, &found);
+        for s in found.iter().map(|f| f.0.as_str()).collect::<HashSet<_>>() {
+            println!("told {s}: {:?}", deliver(&feeds, s));
+            assert_eq!(deliver(&feeds, s), None);
+        }
     }
 }

@@ -194,8 +194,7 @@ const HOOKLESS_GRACE: Duration = Duration::from_secs(20);
 
 /// The pane's mark for a session no Giverny plugin hook ran in
 /// ([`giverny_claude::escapes::hooked`], giverny#271).
-pub const HOOKLESS: &str = "no guard: no Giverny plugin hook ran in this session (plugin off, \
-     or the claude started before it), so it hears no cap reminders; the memory cap still holds";
+pub const HOOKLESS: &str = "no guard: this session ran no Giverny plugin hook (plugin off, or an older claude); the memory cap still holds";
 
 /// The table's footer with the hookless mark, when the session has it,
 /// put first.
