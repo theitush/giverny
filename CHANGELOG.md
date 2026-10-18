@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v1.7.1 — 2026-10-18
+
+- Fix a dead Claude conversation being adopted by a shell tab after a Linux
+  or WSL reboot reuses its process ID. Registry checks now compare the
+  process start time as well as its PID when Claude supplies `procStart`.
+  Older Claude registry entries remain compatible. Thanks to
+  [@theitush](https://github.com/theitush). (#22)
+
 ## v1.7.0 — 2026-10-17
 
 - Codex CLI support alongside Claude Code: automatic installation/profile
