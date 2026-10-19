@@ -247,6 +247,24 @@ When you spawn one:
   and restart it with `giverny-manage resume <task>`. Paused spans, and spans a
   worker marked with `eta --why wait`, are left out of the working time the
   history learns from; the pane still shows the wall time.
+- **`pause` stops only the clock.** The worker and its commands keep going.
+  When the user asks you to pause a worker (or everyone), `pause` its task,
+  then:
+  - tell the worker to come to a safe point: start no new build or test, and
+    let a running one finish or stop it;
+  - have it commit and push its work in progress, write its next step where
+    the project keeps it, and end its turn with a short report;
+  - stop your own background commands for that task (a poll loop, a build
+    you ran);
+  - tell the user it has paused only once the reports are in and `pause`
+    names nothing still running. `pause` lists the task's `run` commands
+    still going, each with the command that stops it (`kill <pid>`); Giverny
+    stops nothing itself, so stopping or keeping each is your call. A task
+    paused ten minutes with one still going is told to you once.
+- **`resume` restarts only the clock** too. It says whether the task's worker
+  is working or has ended its turn; one that ended will not carry on by
+  itself: wake it with SendMessage saying what to do next, or spawn a fresh
+  worker with a brief. Tell the user it has resumed once someone works on it.
 - A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
 - A worker that reports an OOM needs a bigger lease: `giverny-manage release
   <task>`, then `claim` it again with more `--ram`, then send the worker on

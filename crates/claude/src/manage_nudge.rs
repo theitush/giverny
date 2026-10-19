@@ -284,6 +284,81 @@ fn deadline(
     ))
 }
 
+/// How long a task has been paused, with a `run` command of its still
+/// going, before its manager hears of it (giverny#471).
+pub const PAUSED_RUN_MS: u64 = 10 * 60 * 1000;
+
+/// On the dispatcher's own call: each paused task of `session` whose `run`
+/// commands still go [`PAUSED_RUN_MS`] into its pause is told once per
+/// pause (the row stamped `pause_runs_told` with the pause's start), with
+/// what runs and how to stop it. A suggestion: Giverny stops nothing, the
+/// manager decides (giverny#471). With no live run of the session's, the
+/// feed is not read: a read of the small runs directory is all it costs.
+pub fn paused_runs(dir: &Path, session: &str, now: u64) -> Option<String> {
+    let runs_dir = crate::run_live::runs_dir(&resources::ledger_path(dir));
+    let live = crate::run_live::session_runs(&runs_dir, session);
+    if live.is_empty() {
+        return None;
+    }
+    let file = manage::file_for(dir, session);
+    let _lock = manage::Lock::take(&file).ok()?;
+    let mut doc = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .filter(|d| manage::writer_of(d) == Some(manage::WRITER))?;
+    let rows = doc.get_mut("rows").and_then(Value::as_array_mut)?;
+    let mut lines = Vec::new();
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        let Some(since) = manage::ms_of(row, "paused_since") else {
+            continue;
+        };
+        let told = manage::stamp(since);
+        if manage::stage_of(row) != Some(feed::Stage::Running)
+            || now.saturating_sub(since) < PAUSED_RUN_MS
+            || row.get("pause_runs_told").and_then(Value::as_str) == Some(told.as_str())
+        {
+            continue;
+        }
+        let key = row
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let runs: Vec<_> = live
+            .iter()
+            .filter(|(t, _)| *t == key)
+            .map(|(_, r)| r.clone())
+            .collect();
+        if runs.is_empty() {
+            continue;
+        }
+        row.insert("pause_runs_told".into(), json!(told));
+        let (what, it) = if runs.len() == 1 {
+            (
+                "a `giverny-manage run` command of it still runs".to_string(),
+                "it",
+            )
+        } else {
+            let n = runs.len();
+            (
+                format!("{n} `giverny-manage run` commands of it still run"),
+                "them",
+            )
+        };
+        lines.push(format!(
+            "`{key}` has been paused {}, but {what} (Giverny stops nothing): {}. Stop {it} if \
+             the pause is meant to stop the work, or let {it} run on if needed.",
+            span(now.saturating_sub(since) / 1000),
+            manage::run_lines(&runs, now).join("; ")
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    manage::write(&file, &doc).ok()?;
+    Some(lines.join("\n\n"))
+}
+
 /// Where the hook's heartbeat markers live, beside the ledger.
 pub const BEATS_DIR: &str = "beats";
 
@@ -533,5 +608,67 @@ mod tests {
             "d is another agent's"
         );
         assert!(check(&mut d, "other", None, T0 + 10 * MIN, None).is_some());
+    }
+
+    /// A task paused ten minutes with its `run` still going is told to its
+    /// manager once per pause, with the command that stops it; nothing is
+    /// stopped, and a row with no live run, or paused less, is not told
+    /// (giverny#471).
+    #[test]
+    fn a_paused_tasks_live_run_is_told_once_per_pause() {
+        let dir = std::env::temp_dir().join(format!("giverny-nudge-paused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = manage::file_for(&dir, "s1");
+        let paused = manage::stamp(T0);
+        let write = |rows: Value| manage::write(&file, &doc(rows)).unwrap();
+        write(json!([
+            {"key": "a", "stage": "running", "started": manage::stamp(T0 - MIN), "paused_since": paused},
+            {"key": "b", "stage": "running", "started": manage::stamp(T0 - MIN), "paused_since": paused},
+            {"key": "c", "stage": "running", "started": manage::stamp(T0 - MIN)}
+        ]));
+        assert_eq!(paused_runs(&dir, "s1", T0 + 20 * MIN), None, "nothing runs");
+        let runs = crate::run_live::runs_dir(&resources::ledger_path(&dir));
+        std::fs::create_dir_all(&runs).unwrap();
+        let cmd = ["sleep".to_string(), "300".to_string()];
+        let _a = crate::run_live::register_bound(
+            &runs.join("1-0.stats"),
+            "a",
+            "s1",
+            T0 - MIN,
+            None,
+            &cmd,
+        )
+        .unwrap();
+        let _c = crate::run_live::register_bound(
+            &runs.join("1-1.stats"),
+            "c",
+            "s1",
+            T0 - MIN,
+            None,
+            &cmd,
+        )
+        .unwrap();
+        assert_eq!(paused_runs(&dir, "s1", T0 + 9 * MIN), None, "too soon");
+        let me = std::process::id();
+        let told = paused_runs(&dir, "s1", T0 + 10 * MIN).expect("told");
+        assert_eq!(
+            told,
+            format!(
+                "`a` has been paused 10m, but a `giverny-manage run` command of it still runs \
+                 (Giverny stops nothing): `sleep 300`, 11m in, pid {me}: `kill {me}` stops it \
+                 and all it started. Stop it if the pause is meant to stop the work, or let it \
+                 run on if needed."
+            )
+        );
+        assert!(crate::run_live::alive(me));
+        assert_eq!(paused_runs(&dir, "s1", T0 + 30 * MIN), None, "once");
+        // A new pause is told again.
+        write(json!([
+            {"key": "a", "stage": "running", "started": manage::stamp(T0), "paused_since": manage::stamp(T0 + 40 * MIN)}
+        ]));
+        assert_eq!(paused_runs(&dir, "s1", T0 + 45 * MIN), None);
+        assert!(paused_runs(&dir, "s1", T0 + 50 * MIN).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -873,7 +873,7 @@ fn execute(
         // Seen by the management panel while it runs; the ledger counts its
         // lease at least at its `MemoryHigh` until it ends (giverny#456).
         let bound = (cap.ram_mb > 0).then(|| high_mb(cap));
-        let live = run_live::register_bound(&stats, task, session, manage::now_ms(), bound);
+        let live = run_live::register_bound(&stats, task, session, manage::now_ms(), bound, cmd);
         // giverny#426: a signal to `run` stops its scope, as Ctrl-C would
         // stop the command, and `run` still releases and records. Taken
         // before the spawn: a caught signal is the default again after exec.
@@ -973,7 +973,9 @@ fn execute(
         None => {}
     }
     // No scope weighs it: on macOS, low priority instead, so the person's
-    // work goes first (giverny#387).
+    // work goes first (giverny#387). The `.live` file names the command
+    // as given.
+    let given = cmd;
     let cmd = low_priority(cmd);
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]);
@@ -988,6 +990,7 @@ fn execute(
             session,
             manage::now_ms(),
             held.map(|c| c.ram_mb),
+            given,
         )
     });
     // giverny#436: a signal to `run` stops the command's whole tree, as
