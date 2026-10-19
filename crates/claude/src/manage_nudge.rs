@@ -135,6 +135,14 @@ fn running_row<'a>(
         .find(|r| is_mine(r, agent_id, description))
 }
 
+/// On a worker's call: leave its manager's progress check pending when the
+/// Running row it holds has run out of its figure (giverny#473,
+/// [`crate::manage_progress::overdue`]). True when the row changed.
+pub fn overdue(doc: &mut Value, agent_id: &str, description: Option<&str>, now: u64) -> bool {
+    running_row(doc, agent_id, description)
+        .is_some_and(|row| crate::manage_progress::overdue(row, now))
+}
+
 /// The row this worker holds and whether it is due an ask at `now`: the
 /// five-minute one, else one near or past the end of its estimate
 /// ([`deadline`]). On a match the row is stamped and the request returned.

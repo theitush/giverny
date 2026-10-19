@@ -47,7 +47,9 @@
 //!   its turn with background shells of its own still running
 //!   ([`crate::bg_shells`], giverny#472: the shells a task's worker leaves
 //!   in the background are recorded on its `PostToolUse`, checked on its
-//!   `SubagentStop`).
+//!   `SubagentStop`), and a worker that ran out of its figure or asked for
+//!   much more time, with what it has done so far, for the manager to
+//!   judge ([`crate::manage_progress`], giverny#473).
 //! - **What a subagent leaves running.** A subagent finishing with a
 //!   background shell or monitor of its own still running is asked, once,
 //!   whether it should keep running ([`crate::leftovers::subagent_stop`]);
@@ -181,6 +183,7 @@ pub fn payload_of(input: &str) -> Option<Value> {
     let spawn = matches!(h.tool_name.as_deref(), Some("Agent" | "Task")) && h.agent_id.is_none();
     let skill = h.tool_name.as_deref() == Some("Skill") && h.agent_id.is_none();
     let bash = h.tool_name.as_deref() == Some("Bash") && h.agent_id.is_some();
+    let own_bash = h.tool_name.as_deref() == Some("Bash") && h.agent_id.is_none();
     for (k, v) in [
         ("session_id", h.session_id),
         ("agent_id", h.agent_id),
@@ -230,6 +233,21 @@ pub fn payload_of(input: &str) -> Option<Value> {
         if let (Some(id), Some(cmd)) = (id, cmd) {
             m.insert("bg_shell".into(), json!({"id": id, "cmd": cmd}));
         }
+    }
+    // The dispatcher's own `eta` on a task: its decision, which drops that
+    // task's pending more-time check (giverny#473). Read whole only when
+    // the call looks like one.
+    if own_bash
+        && input.contains("manage eta ")
+        && let Ok(s) = serde_json::from_str::<Spawn>(input)
+        && let Some(task) = s
+            .tool_input
+            .as_ref()
+            .and_then(|i| i.get("command"))
+            .and_then(Value::as_str)
+            .and_then(crate::manage_progress::own_eta)
+    {
+        m.insert("own_eta".into(), json!(task));
     }
     // The session's own `Skill` call: which skill, for the manager mark
     // ([`crate::managers`]). Its response is the skill's text, never read.
@@ -333,6 +351,20 @@ pub fn run_with(
         resources::news(&ledger, session, now),
         manage_chores::deliver(dir, session, now),
         crate::manage_nudge::paused_runs(dir, session, now),
+        crate::manage_progress::deliver(
+            dir,
+            session,
+            payload,
+            now,
+            &crate::manage_progress::System {
+                feed_dir: dir,
+                session,
+                transcript: payload
+                    .get("transcript_path")
+                    .and_then(Value::as_str)
+                    .map(Path::new),
+            },
+        ),
         crate::bg_shells::deliver(dir, session, now, &crate::bg_shells::System),
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),
@@ -404,8 +436,14 @@ fn worker(caller: &Caller, payload: &Value, dir: &Path, now: u64, in_tab: bool) 
                 now,
                 manage_history::path(dir).as_deref(),
             );
-            if stamped || ask.is_some() {
+            // Run out of its figure: its manager hears of it too
+            // (giverny#473).
+            let late = crate::manage_nudge::overdue(&mut d, &caller.agent_id, desc, now);
+            if stamped || ask.is_some() || late {
                 manage::write(&file, &d).ok()?;
+            }
+            if late {
+                crate::manage_progress::mark(dir, &caller.session, &d);
             }
             return ask;
         }
