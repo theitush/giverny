@@ -70,6 +70,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, CursorIcon, Sense, Ui};
 use giverny_claude::agent_eta::{self, Etas};
+use giverny_claude::bg_shells;
 use giverny_claude::feed::{
     self, Drawn, Feed, FeedCache, LeaseState, PaneRow, RowLease, RowUsage, Stage,
 };
@@ -186,6 +187,10 @@ struct View {
     /// No Giverny plugin hook ever ran in the session (giverny#271): the
     /// pane says so ([`HOOKLESS`]). Looked up with the feed.
     hookless: bool,
+    /// The workers' own background shells still running (giverny#476):
+    /// what tells a worker asleep on its own work from one that ended.
+    /// Looked at with the feed.
+    shells: giverny_claude::bg_shells::Watch,
 }
 
 /// How long a session may run before its missing hook mark is shown: its
@@ -323,6 +328,7 @@ impl View {
         self.etas_now = session
             .map(|_| self.etas.poll_any(&dir, &ids).clone())
             .unwrap_or_default();
+        self.shells.poll(&dir, &ids, now_ms());
         self.logs_due = true;
     }
 }
@@ -421,7 +427,14 @@ impl Views {
                         with_ledger(f, &sessions, l)
                     });
                     let f = leased.as_ref().unwrap_or(f);
-                    due_chores(drawn, f, tracker.rows(), &view.logs, now)
+                    due_chores(
+                        drawn,
+                        f,
+                        tracker.rows(),
+                        &view.logs,
+                        view.shells.live(),
+                        now,
+                    )
                 }
                 None => Vec::new(),
             };
@@ -666,7 +679,13 @@ pub struct Clock<'a> {
     /// Each worker's agent ETA, by agent id: what a row with no feed
     /// estimate counts down from.
     pub etas: &'a Etas,
+    /// Each worker's own background shells still running, by agent id
+    /// (giverny#476): a worker whose turn ended with one is asleep.
+    pub shells: &'a Shells,
 }
+
+/// The workers' live background shells, by agent id ([`bg_shells::Watch`]).
+pub type Shells = HashMap<String, Vec<bg_shells::Shell>>;
 
 /// No worker measured.
 #[cfg(any(test, debug_assertions))]
@@ -676,6 +695,10 @@ static NO_WORKERS: std::sync::LazyLock<HashMap<String, RunLive>> =
 /// No agent ETAs.
 #[cfg(any(test, debug_assertions))]
 static NO_ETAS: std::sync::LazyLock<Etas> = std::sync::LazyLock::new(Etas::new);
+
+/// No background shells.
+#[cfg(any(test, debug_assertions))]
+static NO_SHELLS: std::sync::LazyLock<Shells> = std::sync::LazyLock::new(Shells::new);
 
 #[cfg(any(test, debug_assertions))]
 impl Clock<'_> {
@@ -687,6 +710,7 @@ impl Clock<'_> {
             tz: jiff::tz::TimeZone::system(),
             workers: &NO_WORKERS,
             etas: &NO_ETAS,
+            shells: &NO_SHELLS,
         }
     }
 }
@@ -1191,6 +1215,10 @@ pub struct RowClick {
     /// its agent list, so there is no view to walk into: a click opens its
     /// transcript as a Done row's does (giverny#274).
     pub finished: bool,
+    /// That finished worker is asleep on background shells of its own
+    /// (giverny#476): Claude Code wakes it when one ends, so its transcript
+    /// is not final and is followed as it grows.
+    pub asleep: bool,
     /// The worker's name or description, for a tab title.
     pub name: String,
     /// The worker's `agent-<id>.jsonl`, once known.
@@ -1769,9 +1797,10 @@ pub fn due_chores(
     feed: &Feed,
     live: &[SubagentRow],
     logs: &Logs,
+    shells: &Shells,
     now_ms: u64,
 ) -> Vec<Chore> {
-    chores(drawn, Some(feed), live, logs, now_ms)
+    chores(drawn, Some(feed), live, logs, shells, now_ms)
         .into_iter()
         .filter(|c| c.is_due(now_ms))
         .filter(|c| !feed.rows.iter().any(|r| r.key == c.key && c.told(r)))
@@ -1799,6 +1828,7 @@ pub fn chores(
     feed: Option<&Feed>,
     live: &[SubagentRow],
     logs: &Logs,
+    shells: &Shells,
     now_ms: u64,
 ) -> Vec<Chore> {
     with_rows(feed, live, logs, now_ms, |_, rows| {
@@ -1808,6 +1838,9 @@ pub fn chores(
                 continue;
             };
             let chore = match row.stage {
+                // Asleep on its own shell: Claude Code wakes it, nothing to
+                // land (giverny#476).
+                Stage::Running if asleep_on(row, shells, now_ms).is_some() => None,
                 Stage::Running => match unworked(row, now_ms) {
                     Some(Unworked::Finished { how, ended_ms }) => ended_ms.map(|since| Chore {
                         key,
@@ -2079,6 +2112,11 @@ fn format_row(
         Stage::Running => unworked(row, now_ms).and_then(Unworked::flag),
         Stage::Planned | Stage::Done => None,
     };
+    // Its worker's turn ended with shells of its own still running: asleep
+    // (giverny#476).
+    let asleep = (row.stage == Stage::Running)
+        .then(|| asleep_on(row, clock.shells, now_ms))
+        .flatten();
     let now = match row.stage {
         // What is not running comes first: a Running row whose worker
         // stopped on an error, or that has none, says so before anything
@@ -2092,6 +2130,10 @@ fn format_row(
             // Its worker ended its turn: when, and the wait it marked, so
             // the row does not read as work going on (giverny#471).
             (None, None) => match unworked(row, now_ms) {
+                // Asleep on its own work, not ended (giverny#476).
+                Some(Unworked::Finished { .. }) if asleep.is_some() => {
+                    asleep_now(asleep.unwrap_or_default(), waiting, now_ms)
+                }
                 Some(Unworked::Finished { ended_ms, .. }) => {
                     turn_ended(ended_ms, waiting, now_ms, &clock.tz)
                 }
@@ -2164,29 +2206,33 @@ fn format_row(
                 .and_then(|f| f.spawned_ms)
                 .or(row_start)
                 .map(|s| clock_at(s, now_ms, &clock.tz));
-            let state = match unworked(row, now_ms) {
-                Some(Unworked::Stopped(r)) => {
-                    Some(format!("stopped: {r} — its worker is not working"))
-                }
-                Some(Unworked::Finished { how, ended_ms }) => Some(match ended_ms {
-                    Some(e) => format!(
-                        "its worker {how} at {} — not landed yet; nothing works on it \
-                         until its manager wakes the worker or lands it",
-                        clock_at(e, now_ms, &clock.tz)
+            let state =
+                match unworked(row, now_ms) {
+                    Some(Unworked::Stopped(r)) => {
+                        Some(format!("stopped: {r} — its worker is not working"))
+                    }
+                    Some(Unworked::Finished { ended_ms, .. }) if asleep.is_some() => Some(
+                        asleep_why(asleep.unwrap_or_default(), ended_ms, now_ms, &clock.tz),
                     ),
-                    None => format!("its worker {how} — not landed yet"),
-                }),
-                _ => None,
-            }
-            .or_else(|| {
-                limit.map(|lim| {
-                    format!(
-                        "{} — out of usage; its clock is held",
-                        limit_note(lim, now_ms, &clock.tz)
-                    )
+                    Some(Unworked::Finished { how, ended_ms }) => Some(match ended_ms {
+                        Some(e) => format!(
+                            "its worker {how} at {} — not landed yet; nothing works on it \
+                         until its manager wakes the worker or lands it",
+                            clock_at(e, now_ms, &clock.tz)
+                        ),
+                        None => format!("its worker {how} — not landed yet"),
+                    }),
+                    _ => None,
+                }
+                .or_else(|| {
+                    limit.map(|lim| {
+                        format!(
+                            "{} — out of usage; its clock is held",
+                            limit_note(lim, now_ms, &clock.tz)
+                        )
+                    })
                 })
-            })
-            .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
+                .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
             // The worker's open wait, in full: NOW cuts it (giverny#471).
             let waited = waiting
                 .filter(|_| paused.is_none())
@@ -2241,6 +2287,7 @@ fn format_row(
             key,
             agent_id: row.agent_id().map(str::to_string),
             finished: row.stage == Stage::Running && l.is_some_and(|l| !l.running()),
+            asleep: asleep.is_some(),
             name: l
                 .map(|l| l.display_name().to_string())
                 .or_else(|| f.and_then(|f| f.title.clone()))
@@ -2592,6 +2639,89 @@ fn running_why(
     std::iter::once(head).chain(state).chain([est]).collect()
 }
 
+/// The background shells a Running row's worker sleeps on (giverny#476):
+/// its turn ended as a plain finish — Claude Code lists it as completed,
+/// "waiting on its own background work" — while shells it started still
+/// run ([`bg_shells::Watch`]). Claude Code wakes it when one ends, so it is
+/// asleep, not ended: nothing to land, nobody to wake. Oldest first.
+fn asleep_on<'s>(
+    row: &PaneRow<'_, SubagentRow>,
+    shells: &'s Shells,
+    now_ms: u64,
+) -> Option<&'s [bg_shells::Shell]> {
+    let l = row.live?;
+    match unworked(row, now_ms) {
+        Some(Unworked::Finished {
+            how: "finished", ..
+        }) => {}
+        _ => return None,
+    }
+    shells
+        .get(&l.id)
+        .map(Vec::as_slice)
+        .filter(|s| !s.is_empty())
+}
+
+/// NOW of a Running row whose worker is asleep on its own background
+/// shells (giverny#476): `asleep · wrangler deploy (30m) · wakes when it
+/// ends`, `+N` for more, and the wait it marked, if any, as [`turn_ended`]
+/// has it. What it sleeps on comes first: the cell is cut, the hover has
+/// it all.
+fn asleep_now(
+    shells: &[bg_shells::Shell],
+    waiting: Option<(u64, Option<&str>)>,
+    now_ms: u64,
+) -> String {
+    let when = if shells.len() == 1 {
+        "it ends"
+    } else {
+        "one ends"
+    };
+    let base = format!(
+        "asleep · {} · wakes when {when}",
+        bg_shells::named(shells, now_ms)
+    );
+    match waiting {
+        Some((_, Some(n))) if !n.trim().is_empty() => format!("{base} · waiting: {}", n.trim()),
+        Some(_) => format!("{base} · waiting"),
+        None => base,
+    }
+}
+
+/// The hover's line for an asleep worker (giverny#476): since when, each
+/// shell in full, and that Claude Code wakes it.
+fn asleep_why(
+    shells: &[bg_shells::Shell],
+    ended_ms: Option<u64>,
+    now_ms: u64,
+    tz: &jiff::tz::TimeZone,
+) -> String {
+    let since = ended_ms.map_or(String::new(), |e| {
+        format!(" since {}", clock_at(e, now_ms, tz))
+    });
+    let list: Vec<String> = shells
+        .iter()
+        .map(|s| {
+            format!(
+                "`{}` ({} in, shell {})",
+                bg_shells::gist(&s.cmd),
+                feed::fmt_span((now_ms.saturating_sub(s.started_ms) / 1000) as i64),
+                s.id
+            )
+        })
+        .collect();
+    let (what, when) = if shells.len() == 1 {
+        ("its own background shell runs", "that ends")
+    } else {
+        ("its own background shells run", "one ends")
+    };
+    format!(
+        "its worker is asleep{since}: its turn ended while {what}: {}. Claude Code wakes it \
+         when {when}; nothing to land yet",
+        list.join(", ")
+    )
+}
+
 /// A paused row's hover: `paused since 15:10: <note>`, else why its
 /// clock stands.
 /// NOW of a Running row whose worker ended its turn (giverny#471): when,
@@ -2848,6 +2978,7 @@ pub fn show(
         tz: jiff::tz::TimeZone::system(),
         workers: &workers,
         etas: &view.etas_now,
+        shells: view.shells.live(),
     };
     // Done rows cleared by hand go from the feed too, whoever wrote it.
     let cleared = tracker
@@ -3747,6 +3878,7 @@ mod tests {
             key: key.into(),
             agent_id: agent.map(Into::into),
             finished: false,
+            asleep: false,
             name: "w".into(),
             transcript: None,
             open: None,
@@ -4971,6 +5103,149 @@ mod tests {
         );
     }
 
+    /// giverny#476, poly's 170: its worker ended its turn while its own
+    /// `wrangler deploy` ran on in the background. The row and its click
+    /// read asleep, with the deploy and how long it has run, the wait kept,
+    /// and no land chore; with two shells the first is named and `+1`;
+    /// once no shell of its own is left it reads `turn ended` as before;
+    /// woken, its activity.
+    #[test]
+    fn a_worker_asleep_on_its_own_shell_reads_asleep_not_ended() {
+        const M: u64 = 60_000;
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"170","stage":"running","agent_id":"a1","started":{st},
+                "eta_s":33433,"waiting_since":{w},"note":"deploy upload slow"}}]}}"#,
+            st = T0 - 300 * M,
+            w = T0 - 26 * M,
+        ));
+        let worker = |status: &str| {
+            live(&format!(
+                r#"{{"session_id":"s","tasks":[{{"id":"a1","status":"{status}",
+                    "description":"170: finish per-minute runs",
+                    "startTime":{st},"endTime":{en},"label":"Retry wrangler deploy"}}]}}"#,
+                st = T0 - 300 * M,
+                en = T0 - 26 * M,
+            ))
+        };
+        let deploy = bg_shells::Shell {
+            id: "bohhzzia9".into(),
+            agent: "a1".into(),
+            task: "170".into(),
+            cmd: "cd /home/ita/poly; T=/tmp/t170; npx wrangler deploy > $T/deploy4.log 2>&1; \
+                  echo \"exit $?\""
+                .into(),
+            started_ms: T0 - 30 * M,
+        };
+        let mut shells = Shells::new();
+        shells.insert("a1".into(), vec![deploy.clone()]);
+        let clock = Clock {
+            shells: &shells,
+            ..Clock::plain()
+        };
+        let tz = clock.tz.clone();
+        let ended = worker("completed");
+        let t = build_at(Some(&f), &ended, T0, &clock, &Logs::new());
+        let l = &t.lines[0];
+        assert_eq!(
+            l.now,
+            "asleep · wrangler deploy (30m) · wakes when it ends · waiting: deploy upload slow"
+        );
+        assert!(
+            l.why.iter().any(|w| w
+                == &format!(
+                    "its worker is asleep since {}: its turn ended while its own background \
+                     shell runs: `wrangler deploy` (30m in, shell bohhzzia9). Claude Code wakes \
+                     it when that ends; nothing to land yet",
+                    clock_at(T0, T0, &tz)
+                )),
+            "{:?}",
+            l.why
+        );
+        assert!(!l.why.iter().any(|w| w.contains("until its manager wakes")));
+        // Its click follows the transcript and says asleep at the top.
+        assert!(l.click.finished && l.click.asleep);
+        assert!(
+            l.click.facts.iter().any(|x| x.starts_with("asleep · ")),
+            "{:?}",
+            l.click.facts
+        );
+        // No land chore for it; one once it really ended.
+        let logs = Logs::new();
+        assert!(
+            chores(
+                Drawn::Manager,
+                Some(&f),
+                &ended,
+                &logs,
+                &shells,
+                T0 + 30 * M
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            chores(
+                Drawn::Manager,
+                Some(&f),
+                &ended,
+                &logs,
+                &NO_SHELLS,
+                T0 + 30 * M
+            )
+            .iter()
+            .map(|c| c.kind)
+            .collect::<Vec<_>>(),
+            [manage_chores::Kind::Land]
+        );
+        // Two shells: the first named, `+1`.
+        let mut two = Shells::new();
+        let mut sleep = deploy.clone();
+        sleep.id = "bsleep".into();
+        sleep.cmd = "sleep 100000".into();
+        sleep.started_ms = T0 - 5 * M;
+        two.insert("a1".into(), vec![deploy.clone(), sleep]);
+        let c2 = Clock {
+            shells: &two,
+            ..Clock::plain()
+        };
+        let t = build_at(Some(&f), &ended, T0, &c2, &Logs::new());
+        assert!(
+            t.lines[0]
+                .now
+                .starts_with("asleep · wrangler deploy (30m) +1 · wakes when one ends"),
+            "{}",
+            t.lines[0].now
+        );
+        // No shell of its own left: turn ended, as before (giverny#471).
+        let t = build_at(Some(&f), &ended, T0, &Clock::plain(), &Logs::new());
+        assert_eq!(
+            t.lines[0].now,
+            format!(
+                "turn ended {} · waiting: deploy upload slow",
+                clock_at(T0, T0, &tz)
+            )
+        );
+        assert!(!t.lines[0].click.asleep);
+        // Another worker's shell does not make it asleep.
+        let mut others = Shells::new();
+        others.insert("zz9".into(), vec![deploy.clone()]);
+        let c3 = Clock {
+            shells: &others,
+            ..Clock::plain()
+        };
+        let t = build_at(Some(&f), &ended, T0, &c3, &Logs::new());
+        assert!(
+            t.lines[0].now.starts_with("turn ended "),
+            "{}",
+            t.lines[0].now
+        );
+        // Woken: its activity, as any working worker.
+        let woken = worker("running");
+        let t = build_at(Some(&f), &woken, T0, &clock, &Logs::new());
+        assert_eq!(t.lines[0].now, "Retry wrangler deploy");
+        assert!(!t.lines[0].click.asleep);
+    }
+
     #[test]
     fn a_made_up_agent_key_is_not_drawn() {
         // A row a worker with no task started under giverny#158's first round.
@@ -5623,11 +5898,14 @@ mod tests {
             since: T0 - 10 * MIN,
             how: None,
         };
-        let all = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
+        let all = chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0);
         assert_eq!(all, [land, staff.clone()]);
-        assert_eq!(due_chores(Drawn::Manager, &f, &rows, &logs, T0), all);
         assert_eq!(
-            due_chores(Drawn::Manager, &f, &rows, &logs, T0 - 3 * MIN),
+            due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0),
+            all
+        );
+        assert_eq!(
+            due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0 - 3 * MIN),
             [staff],
             "the land chore in its grace"
         );
@@ -5649,13 +5927,13 @@ mod tests {
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got = t.lines.iter().find(|l| l.id == "acme#615").unwrap();
         assert_eq!((got.now.as_str(), got.flag), ("stopped: failed", false));
-        let told = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
+        let told = chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0);
         assert_eq!(told[0].how.as_deref(), Some("failed"));
         // Told once: a row stamped for that end is no chore any more.
         let mut stamped = f.clone();
         stamped.rows[0].land_nudged_ms = Some(T0 - 5 * MIN);
         assert!(
-            due_chores(Drawn::Manager, &stamped, &rows, &logs, T0)
+            due_chores(Drawn::Manager, &stamped, &rows, &logs, &NO_SHELLS, T0)
                 .iter()
                 .all(|c| c.key != "acme#615")
         );
@@ -5665,7 +5943,7 @@ mod tests {
         assert!(!got.flag, "{got:?}");
         assert!(!got.click.finished, "a working worker is walked into");
         assert!(
-            chores(Drawn::Manager, Some(&f), &rows, &logs, T0)
+            chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0)
                 .iter()
                 .all(|c| c.key != "acme#615")
         );
@@ -5706,12 +5984,15 @@ mod tests {
         };
         for at in [T0, T0 + MIN, T0 + 2 * MIN] {
             assert_eq!(
-                chores(Drawn::Manager, Some(&f), &rows, &logs, at),
+                chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, at),
                 [],
                 "at T0+{}m",
                 (at - T0) / MIN
             );
-            assert_eq!(due_chores(Drawn::Manager, &f, &rows, &logs, at), []);
+            assert_eq!(
+                due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, at),
+                []
+            );
             let got = row(&build_at(Some(&f), &rows, at, &Clock::plain(), &logs));
             assert_eq!(got.stage, Stage::Running);
             assert!(!got.flag, "plain while it is picked up: {got:?}");
@@ -5721,7 +6002,7 @@ mod tests {
         // its manager is told to staff it (giverny#334).
         let late = T0 + 3 * MIN;
         assert_eq!(
-            chores(Drawn::Manager, Some(&f), &rows, &logs, late),
+            chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, late),
             [Chore {
                 key: "acme#614".into(),
                 kind: manage_chores::Kind::Worker,
@@ -5742,7 +6023,14 @@ mod tests {
         lines.push(reply("m3", T0 + 10 * MIN, 3_000, 25_000, 900));
         let (dir, mut rows, logs) = reused_worker("332-again", &lines, false);
         rows[0].ended_ms = Some(T0 + 10 * MIN);
-        let all = chores(Drawn::Manager, Some(&f), &rows, &logs, T0 + 10 * MIN);
+        let all = chores(
+            Drawn::Manager,
+            Some(&f),
+            &rows,
+            &logs,
+            &NO_SHELLS,
+            T0 + 10 * MIN,
+        );
         assert_eq!(
             all,
             [Chore {
@@ -5753,12 +6041,12 @@ mod tests {
             }]
         );
         assert_eq!(
-            due_chores(Drawn::Manager, &f, &rows, &logs, T0 + 12 * MIN),
+            due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0 + 12 * MIN),
             [],
             "in its grace"
         );
         assert_eq!(
-            due_chores(Drawn::Manager, &f, &rows, &logs, T0 + 13 * MIN),
+            due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0 + 13 * MIN),
             all
         );
         let got = row(&build_at(
@@ -5792,7 +6080,7 @@ mod tests {
             e613 = T0 - 30 * MIN,
             s614 = T0 - 2 * MIN,
         ));
-        let got = chores(Drawn::Manager, Some(&f), &rows, &logs, T0);
+        let got = chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].since, T0 - 5 * MIN);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5851,7 +6139,7 @@ mod tests {
         // Only the row nobody set aside is its manager's to staff, and the
         // idle Next up row is no chore for being below it.
         assert_eq!(
-            chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0),
+            chores(Drawn::Manager, Some(&f), &[], &Logs::new(), &NO_SHELLS, T0),
             [
                 Chore {
                     key: "acme#702".into(),
@@ -5871,7 +6159,7 @@ mod tests {
         let mut stamped = f.clone();
         stamped.rows[2].worker_nudged_ms = Some(T0 - 30 * MIN);
         assert!(
-            due_chores(Drawn::Manager, &stamped, &[], &Logs::new(), T0)
+            due_chores(Drawn::Manager, &stamped, &[], &Logs::new(), &NO_SHELLS, T0)
                 .iter()
                 .all(|c| c.key != "acme#702")
         );
@@ -5883,9 +6171,16 @@ mod tests {
         assert_eq!(at("acme#700"), Stage::Planned);
         assert_eq!(at("acme#701"), Stage::Planned);
         assert!(
-            chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0 - 29 * MIN)
-                .iter()
-                .all(|c| c.kind != manage_chores::Kind::Worker)
+            chores(
+                Drawn::Manager,
+                Some(&f),
+                &[],
+                &Logs::new(),
+                &NO_SHELLS,
+                T0 - 29 * MIN
+            )
+            .iter()
+            .all(|c| c.kind != manage_chores::Kind::Worker)
         );
 
         // A worker that handed its row back: the row paused rather than
@@ -5909,7 +6204,7 @@ mod tests {
         assert_eq!(t.lines[0].stage, Stage::Planned, "{:?}", t.lines[0]);
         assert_eq!(t.lines[0].now, PAUSED_FINISHED);
         assert_eq!(
-            chores(Drawn::Manager, Some(&f), &rows, &logs, T0),
+            chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0),
             [Chore {
                 key: "acme#613".into(),
                 kind: manage_chores::Kind::LandPaused,
@@ -5968,29 +6263,32 @@ mod tests {
                 (Stage::Planned, PAUSED_FINISHED, false)
             );
             assert_eq!(
-                chores(Drawn::Manager, Some(&f), &rows, &logs, T0),
+                chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0),
                 std::slice::from_ref(&land)
             );
             assert_eq!(
-                due_chores(Drawn::Manager, &f, &rows, &logs, T0 - 3 * MIN),
+                due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0 - 3 * MIN),
                 [],
                 "in its grace"
             );
             assert_eq!(
-                due_chores(Drawn::Manager, &f, &rows, &logs, T0),
+                due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0),
                 std::slice::from_ref(&land)
             );
             // Told once: told of this finish — paused, or Running before
             // the pause — it is no chore any more.
             let mut stamped = f.clone();
             stamped.rows[0].land_nudged_ms = Some(T0 - 5 * MIN);
-            assert_eq!(due_chores(Drawn::Manager, &stamped, &rows, &logs, T0), []);
+            assert_eq!(
+                due_chores(Drawn::Manager, &stamped, &rows, &logs, &NO_SHELLS, T0),
+                []
+            );
         }
         // Unpaused, the same finish is the Running row's land chore, as
         // before.
         let mut running = paused_at(T0 - 10 * MIN);
         running.rows[0].paused_since_ms = None;
-        let got = chores(Drawn::Manager, Some(&running), &rows, &logs, T0);
+        let got = chores(Drawn::Manager, Some(&running), &rows, &logs, &NO_SHELLS, T0);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].kind, manage_chores::Kind::Land);
         assert_eq!(got[0].since, T0 - 5 * MIN);
@@ -6005,7 +6303,10 @@ mod tests {
         // row says only since when it is paused.
         let (dir2, rows, logs) = reused_worker("379-working", &lines, true);
         let f = paused_at(T0 - 10 * MIN);
-        assert_eq!(chores(Drawn::Manager, Some(&f), &rows, &logs, T0), []);
+        assert_eq!(
+            chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0),
+            []
+        );
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         assert!(
             t.lines[0].now.starts_with("paused since "),
@@ -6212,12 +6513,15 @@ mod tests {
             s = T0 - 30 * MIN,
         ));
         assert!(drawn_table(&f, &[], false).is_empty());
-        assert_eq!(chores(Drawn::Agents, Some(&f), &[], &Logs::new(), T0), []);
+        assert_eq!(
+            chores(Drawn::Agents, Some(&f), &[], &Logs::new(), &NO_SHELLS, T0),
+            []
+        );
         // A manager's own: both under Next up, and its chores.
         let t = drawn_table(&f, &[], true);
         let ids: Vec<_> = t.lines.iter().map(|l| (l.id.as_str(), l.stage)).collect();
         assert_eq!(ids, [("build", Stage::Planned), ("later", Stage::Planned)]);
-        let kinds: Vec<_> = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), T0)
+        let kinds: Vec<_> = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), &NO_SHELLS, T0)
             .into_iter()
             .map(|c| (c.key, c.kind))
             .collect();
@@ -6832,7 +7136,7 @@ mod tests {
         // instant, due only past five minutes of it.
         let f = feed(&json);
         let idle = |now: u64| -> Vec<(String, u64)> {
-            due_chores(Drawn::Manager, &f, &[], &Logs::new(), now)
+            due_chores(Drawn::Manager, &f, &[], &Logs::new(), &NO_SHELLS, now)
                 .into_iter()
                 // 280-reuse has no worker: its manager's to staff
                 // (giverny#334), not an idle Next up row.
@@ -6858,7 +7162,7 @@ mod tests {
                 k("287-after-done", 28),
             ]
         );
-        let line = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), 0)
+        let line = chores(Drawn::Manager, Some(&f), &[], &Logs::new(), &NO_SHELLS, 0)
             .into_iter()
             .find(|c| c.key == "284-idle")
             .unwrap()
@@ -7309,6 +7613,7 @@ mod tests {
             tz: jiff::tz::TimeZone::UTC,
             workers: &NO_WORKERS,
             etas: &NO_ETAS,
+            shells: &NO_SHELLS,
         }
     }
 

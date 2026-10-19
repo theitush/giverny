@@ -1206,6 +1206,7 @@ mod tests {
                 key: "demo#23".into(),
                 agent_id: Some("a1".into()),
                 finished: false,
+                asleep: false,
                 name: "attach".into(),
                 transcript: None,
                 open: None,

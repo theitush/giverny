@@ -2475,11 +2475,24 @@ fn run_feed(
             if let Cmd::Resume(key) = cmd {
                 let agent = row_agent(&doc, key).map(str::to_string);
                 let state = agent.as_deref().map(|a| worker_state(cfg, &sessions, a));
+                // Ended with a shell of its own still running: asleep, and
+                // Claude Code wakes it (giverny#476).
+                let asleep: Vec<crate::bg_shells::Shell> = match (&agent, state) {
+                    (Some(a), Some(WorkerState::Ended { .. })) => {
+                        crate::bg_shells::task_shells(dir, session, key, &crate::bg_shells::System)
+                            .into_iter()
+                            .map(|l| l.shell)
+                            .filter(|s| &s.agent == a)
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
                 msg.push_str(&resume_note(
                     key,
                     agent.as_deref(),
                     state,
                     row_wait(&doc, key),
+                    &asleep,
                     now,
                 ));
             }
@@ -2574,16 +2587,27 @@ fn row_wait(doc: &Value, key: &str) -> Option<(u64, Option<String>)> {
 
 /// What `resume` adds under its line (giverny#471): whether the task's
 /// worker is working or has ended its turn and needs waking, and how; or
-/// that none holds it; and a wait it marked that is still open.
+/// that none holds it; and a wait it marked that is still open. A worker
+/// that ended its turn with background shells of its own still running
+/// (`asleep`) is asleep: Claude Code wakes it when one ends (giverny#476).
 pub fn resume_note(
     key: &str,
     agent: Option<&str>,
     state: Option<WorkerState>,
     wait: Option<(u64, Option<String>)>,
+    asleep: &[crate::bg_shells::Shell],
     now: u64,
 ) -> String {
     let ago = |t: u64| feed::fmt_span((now.saturating_sub(t) / 1000) as i64);
     let mut out = match (agent, state) {
+        (Some(a), Some(WorkerState::Ended { at_ms })) if !asleep.is_empty() => format!(
+            "\n  its worker {a} ended its turn {} ago and is asleep, {}: Claude Code wakes \
+             it when {} ends. Nothing to wake; if it should not wait, stop the shell (below) \
+             or message it with SendMessage (to: \"{a}\"). Giverny wakes nothing.",
+            ago(at_ms),
+            crate::bg_shells::waiting_on(asleep, now),
+            if asleep.len() == 1 { "that" } else { "one" },
+        ),
         (Some(a), Some(WorkerState::Ended { at_ms })) => format!(
             "\n  its worker {a} ended its turn {} ago and will not carry on by itself: wake \
              it with SendMessage (to: \"{a}\") saying what to do next, or spawn a fresh \
@@ -3616,6 +3640,7 @@ mod tests {
                 at_ms: T0 - 12 * MIN,
             }),
             Some((T0 - 13 * MIN, Some("machine time".into()))),
+            &[],
             T0,
         );
         assert_eq!(
@@ -3633,13 +3658,42 @@ mod tests {
                 last_ms: Some(T0 - MIN),
             }),
             None,
+            &[],
             T0,
         );
         assert_eq!(
             working,
             "\n  its worker ad22 is working (last wrote 1m ago)"
         );
-        assert!(resume_note("170", None, None, None, T0).contains("no worker holds 170"));
+        assert!(resume_note("170", None, None, None, &[], T0).contains("no worker holds 170"));
+        // Ended with its own deploy still running: asleep, and Claude Code
+        // wakes it (giverny#476).
+        let deploy = crate::bg_shells::Shell {
+            id: "bohhzzia9".into(),
+            agent: "ad22".into(),
+            task: "170".into(),
+            cmd: "cd /home/ita/poly; T=/tmp/t170; npx wrangler deploy > $T/deploy4.log 2>&1; \
+                  echo \"exit $?\""
+                .into(),
+            started_ms: T0 - 30 * MIN,
+        };
+        let asleep = resume_note(
+            "170",
+            Some("ad22"),
+            Some(WorkerState::Ended {
+                at_ms: T0 - 26 * MIN,
+            }),
+            None,
+            std::slice::from_ref(&deploy),
+            T0,
+        );
+        assert_eq!(
+            asleep,
+            "\n  its worker ad22 ended its turn 26m ago and is asleep, waiting on wrangler \
+             deploy (30m): Claude Code wakes it when that ends. Nothing to wake; if it should \
+             not wait, stop the shell (below) or message it with SendMessage (to: \"ad22\"). \
+             Giverny wakes nothing."
+        );
         // The real command: a row with no worker, its wait kept open.
         let dir = scratch("resume-note");
         run(&dir, "start a --eta 30", T0).unwrap();

@@ -19,8 +19,14 @@
 //!   `status`, `command`, but no owner). A recorded shell no longer in
 //!   flight there has ended and drops off; one still running is told to
 //!   the manager once, on its next tool call ([`turn_ended`], [`deliver`]):
-//!   "`g472`'s worker ended its turn; 1 background shell still running:
-//!   `sleep 600` (40m) …".
+//!   "`g472`'s worker ended its turn and is asleep, waiting on 1
+//!   background shell of its own still running: `sleep 600` (40m) …".
+//!   A shell the hook never recorded (one started before it was installed,
+//!   as poly's 170's `wrangler deploy` was, giverny#476) is recorded then,
+//!   from the worker's transcript ([`crate::plugin_hook`]'s backfill).
+//! - **Asleep, in the pane** (giverny#476): [`Watch`] follows the recorded
+//!   shells for the management panel, which reads a worker whose turn
+//!   ended with one still running as asleep ([`gist`], [`named`]).
 //! - **On `pause` and `resume`** the task's live shells are listed with how
 //!   long each has run and how to stop it ([`task_shells`], [`lines`]).
 //!
@@ -114,13 +120,59 @@ impl Probe for System {
 /// not the shell's.
 #[cfg(target_os = "linux")]
 fn look_proc(session: &str, shells: &[Shell]) -> Vec<Found> {
+    let Some(held) = holders_proc(session, shells) else {
+        return vec![Found::default(); shells.len()];
+    };
+    shells
+        .iter()
+        .zip(held.pids)
+        .map(|(shell, pids)| {
+            if pids.is_empty() {
+                return Found {
+                    running: Some(false),
+                    pid: None,
+                };
+            }
+            let pids: Vec<u32> = pids.iter().map(|(p, _)| *p).collect();
+            let tops: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|p| held.parent.get(p).is_none_or(|pp| !pids.contains(pp)))
+                .collect();
+            let pid = match tops[..] {
+                [top] if wrapper_of(top, &shell.cmd) => Some(top),
+                _ => None,
+            };
+            Found {
+                running: Some(true),
+                pid,
+            }
+        })
+        .collect()
+}
+
+/// One look at `/proc`: for each shell, the processes holding its output
+/// file (`…/<session>/tasks/<id>.output`), each with its start (clock
+/// ticks after boot), and every process's parent. `None` when `/proc`
+/// could not be read.
+#[cfg(target_os = "linux")]
+struct Held {
+    pids: Vec<Vec<(u32, u64)>>,
+    parent: std::collections::HashMap<u32, u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn holders_proc(session: &str, shells: &[Shell]) -> Option<Held> {
     use std::collections::HashSet;
     if shells.is_empty() {
-        return Vec::new();
+        return Some(Held {
+            pids: Vec::new(),
+            parent: Default::default(),
+        });
     }
     let table = crate::session_use::proc_table(4);
     if table.is_empty() {
-        return vec![Found::default(); shells.len()];
+        return None;
     }
     let parent: std::collections::HashMap<u32, u32> =
         table.iter().map(|p| (p.pid, p.ppid)).collect();
@@ -136,7 +188,7 @@ fn look_proc(session: &str, shells: &[Shell]) -> Vec<Found> {
         .iter()
         .map(|s| format!("/{session}/tasks/{}.output", s.id))
         .collect();
-    let mut holders: Vec<Vec<u32>> = vec![Vec::new(); shells.len()];
+    let mut pids: Vec<Vec<(u32, u64)>> = vec![Vec::new(); shells.len()];
     for p in &table {
         if mine.contains(&p.pid) {
             continue;
@@ -152,37 +204,13 @@ fn look_proc(session: &str, shells: &[Shell]) -> Vec<Found> {
                 continue;
             };
             for (i, w) in wanted.iter().enumerate() {
-                if target.ends_with(w.as_str()) && !holders[i].contains(&p.pid) {
-                    holders[i].push(p.pid);
+                if target.ends_with(w.as_str()) && !pids[i].iter().any(|(x, _)| *x == p.pid) {
+                    pids[i].push((p.pid, p.start));
                 }
             }
         }
     }
-    shells
-        .iter()
-        .zip(holders)
-        .map(|(shell, pids)| {
-            if pids.is_empty() {
-                return Found {
-                    running: Some(false),
-                    pid: None,
-                };
-            }
-            let tops: Vec<u32> = pids
-                .iter()
-                .copied()
-                .filter(|p| parent.get(p).is_none_or(|pp| !pids.contains(pp)))
-                .collect();
-            let pid = match tops[..] {
-                [top] if wrapper_of(top, &shell.cmd) => Some(top),
-                _ => None,
-            };
-            Found {
-                running: Some(true),
-                pid,
-            }
-        })
-        .collect()
+    Some(Held { pids, parent })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -395,14 +423,24 @@ pub fn deliver(feed_dir: &Path, session: &str, now: u64, probe: &dyn Probe) -> O
     (!lines.is_empty()).then(|| lines.join("\n\n"))
 }
 
-/// The turn-end notice: "`g472`'s worker ended its turn; 1 background shell
-/// still running: `sleep 600` (40m) …".
+/// The turn-end notice: "`g472`'s worker ended its turn and is asleep,
+/// waiting on 1 background shell of its own still running: `sleep 600`
+/// (40m) …". Asleep, not ended: Claude Code wakes the worker when the shell
+/// ends (giverny#476), the word the pane uses too.
 pub fn notice(task: &str, live: &[Live], now: u64) -> String {
     let n = live.len();
-    let (what, it) = if n == 1 {
-        ("1 background shell still running".to_string(), "it")
+    let (what, it, when) = if n == 1 {
+        (
+            "1 background shell of its own still running".to_string(),
+            "it",
+            "that ends",
+        )
     } else {
-        (format!("{n} background shells still running"), "each")
+        (
+            format!("{n} background shells of its own still running"),
+            "each",
+            "one ends",
+        )
     };
     let list: Vec<String> = live
         .iter()
@@ -417,8 +455,9 @@ pub fn notice(task: &str, live: &[Live], now: u64) -> String {
         .collect();
     let stop: Vec<String> = live.iter().map(stop_with).collect();
     format!(
-        "Giverny: `{task}`'s worker ended its turn; {what}: {}. Giverny stops nothing: if \
-         the work is meant to stop, stop {it} ({}), or let {it} run on if needed.",
+        "Giverny: `{task}`'s worker ended its turn and is asleep, waiting on {what}: {}. \
+         Claude Code wakes it when {when}. Giverny stops nothing: if the work is meant to \
+         stop, stop {it} ({}), or let {it} run on if needed.",
         list.join(", "),
         stop.join("; ")
     )
@@ -521,6 +560,430 @@ pub fn still_running(task: &str, live: &[Live], now: u64) -> String {
     out
 }
 
+/// A shell's command as the pane names it (giverny#476): the program and
+/// its first words, past the setup around it — `cd`, variables, `echo`,
+/// `npx`, `giverny-manage run <task> --`, redirections — and with paths cut
+/// to their last part: `cd ~/poly; T=…; npx wrangler deploy > $T/d.log
+/// 2>&1; echo $?` is `wrangler deploy`.
+pub fn gist(cmd: &str) -> String {
+    const SETUP: &[&str] = &[
+        "cd", "pushd", "popd", "export", "set", "unset", "source", ".", "echo", "printf", "true",
+        ":", "mkdir", "local", "declare", "trap", "ulimit", "umask", "chmod", "ln",
+    ];
+    // A path is named after these only: `node sim.js`, but `deploy.sh`,
+    // not `deploy.sh wt178`.
+    const INTERPRETERS: &[&str] = &[
+        "node", "python", "python3", "bash", "sh", "zsh", "deno", "bun", "ruby", "perl", "tsx",
+        "ts-node", "Rscript",
+    ];
+    const WRAPPERS: &[&str] = &[
+        "npx", "sudo", "nohup", "time", "env", "exec", "command", "nice", "stdbuf", "setsid",
+        "timeout", "ionice", "chrt",
+    ];
+    let segments = segments(cmd);
+    let pick = |seg: &[String]| -> Option<Vec<String>> {
+        let mut w: Vec<String> = seg.to_vec();
+        loop {
+            // `X=1 cmd`: the assignments go.
+            while w.first().is_some_and(|x| is_assignment(x)) {
+                w.remove(0);
+            }
+            let first = w.first()?.clone();
+            let name = base(&first);
+            if WRAPPERS.contains(&name) {
+                w.remove(0);
+                // Its own flags and a bare number (`timeout 600`, `nice -n 5`).
+                while w
+                    .first()
+                    .is_some_and(|x| x.starts_with('-') || x.parse::<f64>().is_ok())
+                {
+                    w.remove(0);
+                }
+                continue;
+            }
+            // `giverny-manage run <task> -- cmd`, `systemd-run … -- cmd`:
+            // the command after `--`.
+            if (name.starts_with("giverny") || name == "systemd-run")
+                && let Some(i) = w.iter().position(|x| x == "--")
+            {
+                w.drain(..=i);
+                continue;
+            }
+            return Some(w);
+        }
+    };
+    // `cat > f <<'EOF'`, a file written: setup too.
+    let setup = |w: &[String]| {
+        w.first().is_some_and(|f| {
+            SETUP.contains(&base(f))
+                || (matches!(base(f), "cat" | "tee") && w.iter().any(|x| x == "<<"))
+        })
+    };
+    let chosen = segments
+        .iter()
+        .filter_map(|seg| pick(seg))
+        .find(|w| !setup(w))
+        .or_else(|| segments.iter().find_map(|seg| pick(seg)));
+    let Some(words) = chosen else {
+        return crate::strays::quote(cmd);
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let interpreter = words
+        .first()
+        .is_some_and(|f| INTERPRETERS.contains(&base(f)));
+    for (i, w) in words.iter().enumerate() {
+        let path = w.contains('/') && !interpreter;
+        if i > 0 && (w.starts_with('-') || is_redirect(w) || path || out.len() >= 3) {
+            break;
+        }
+        out.push(base(w));
+    }
+    let one = out.join(" ");
+    const MAX: usize = 32;
+    if one.chars().count() <= MAX {
+        return one;
+    }
+    let cut: String = one.chars().take(MAX - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The last part of a path: `/tmp/x/run.sh` is `run.sh`.
+fn base(word: &str) -> &str {
+    let w = word.trim_end_matches('/');
+    w.rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or(w)
+}
+
+fn is_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn is_redirect(word: &str) -> bool {
+    word.starts_with('>')
+        || word.starts_with('<')
+        || word.starts_with("2>")
+        || word.starts_with("&>")
+        || word.starts_with("1>")
+}
+
+/// A command line cut into its simple commands, each as words: split at
+/// `;`, `&&`, `||`, `|`, `&` and new lines outside quotes, quotes taken
+/// off. Rough, as a name needs no more.
+fn segments(cmd: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut seg: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = cmd.chars().peekable();
+    // Here-documents opened on this line, by their delimiters: their bodies
+    // are skipped at its end.
+    let mut heredocs: Vec<String> = Vec::new();
+    let end_word = |seg: &mut Vec<String>, word: &mut String, in_word: &mut bool| {
+        if *in_word {
+            seg.push(std::mem::take(word));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '<' if chars.peek() == Some(&'<') => {
+                chars.next();
+                if chars.peek() == Some(&'<') {
+                    // `<<<`, a here-string: a word, no body.
+                    chars.next();
+                    end_word(&mut seg, &mut word, &mut in_word);
+                    seg.push("<<<".into());
+                    continue;
+                }
+                end_word(&mut seg, &mut word, &mut in_word);
+                seg.push("<<".into());
+                if chars.peek() == Some(&'-') {
+                    chars.next();
+                }
+                while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+                    chars.next();
+                }
+                let mut delim = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>') {
+                        break;
+                    }
+                    chars.next();
+                    if !matches!(c, '\'' | '"' | '\\') {
+                        delim.push(c);
+                    }
+                }
+                if !delim.is_empty() {
+                    heredocs.push(delim);
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    word.push(c);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                word.push(n);
+                            }
+                        }
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                if let Some(n) = chars.next()
+                    && n != '\n'
+                {
+                    in_word = true;
+                    word.push(n);
+                }
+            }
+            ';' | '|' | '\n' => {
+                end_word(&mut seg, &mut word, &mut in_word);
+                if chars.peek() == Some(&c) {
+                    chars.next();
+                }
+                out.push(std::mem::take(&mut seg));
+                if c == '\n' {
+                    for delim in std::mem::take(&mut heredocs) {
+                        let mut line = String::new();
+                        for c in chars.by_ref() {
+                            if c != '\n' {
+                                line.push(c);
+                                continue;
+                            }
+                            if line.trim() == delim {
+                                break;
+                            }
+                            line.clear();
+                        }
+                    }
+                }
+            }
+            '&' => {
+                // `2>&1`, `&>` stay words; `&&` and a lone `&` split.
+                if in_word && word.ends_with('>') {
+                    word.push(c);
+                    continue;
+                }
+                if chars.peek() == Some(&'>') {
+                    end_word(&mut seg, &mut word, &mut in_word);
+                    in_word = true;
+                    word.push(c);
+                    continue;
+                }
+                end_word(&mut seg, &mut word, &mut in_word);
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+                out.push(std::mem::take(&mut seg));
+            }
+            c if c.is_whitespace() => end_word(&mut seg, &mut word, &mut in_word),
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    end_word(&mut seg, &mut word, &mut in_word);
+    out.push(seg);
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// What an asleep worker waits on, as `resume` says it (giverny#476):
+/// `waiting on wrangler deploy (30m)`, and `+N` for more than one.
+pub fn waiting_on(shells: &[Shell], now: u64) -> String {
+    format!("waiting on {}", named(shells, now))
+}
+
+/// The shells an asleep worker waits on, short, as the pane's NOW names
+/// them (giverny#476): the oldest's [`gist`] and how long it has run,
+/// `wrangler deploy (30m)`, and `+N` for the rest.
+pub fn named(shells: &[Shell], now: u64) -> String {
+    let mut sorted: Vec<&Shell> = shells.iter().collect();
+    sorted.sort_by_key(|s| s.started_ms);
+    let Some(first) = sorted.first() else {
+        return String::new();
+    };
+    let more = match sorted.len() {
+        1 => String::new(),
+        n => format!(" +{}", n - 1),
+    };
+    format!(
+        "{} ({}){more}",
+        gist(&first.cmd),
+        ran(first.started_ms, now)
+    )
+}
+
+/// The processes holding a shell's output file: pid and start (clock ticks
+/// after boot).
+pub type Pids = Vec<(u32, u64)>;
+
+/// How the pane looks at shells: who holds their output files, and
+/// whether a process that did is still the one running.
+pub trait Holders {
+    /// For each of `session`'s `shells`, the processes holding its output
+    /// file, with their starts; `None` when nothing could be read.
+    fn holders(&self, session: &str, shells: &[Shell]) -> Option<Vec<Pids>>;
+    /// Whether `pid` runs still, and is the process that started at
+    /// `start`.
+    fn alive(&self, pid: u32, start: u64) -> bool;
+}
+
+impl Holders for System {
+    #[cfg(target_os = "linux")]
+    fn holders(&self, session: &str, shells: &[Shell]) -> Option<Vec<Pids>> {
+        holders_proc(session, shells).map(|h| h.pids)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn holders(&self, _session: &str, _shells: &[Shell]) -> Option<Vec<Pids>> {
+        None
+    }
+
+    fn alive(&self, pid: u32, start: u64) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| crate::registry::stat_start_ticks(&s))
+            == Some(start)
+    }
+}
+
+/// What the pane knows of one shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    /// These processes held its output file when it was first looked at.
+    Held(Pids),
+    /// Nothing runs it any more: final.
+    Ended,
+}
+
+/// The pane's view of a session's background shells (giverny#476): what
+/// tells a worker asleep on its own work from one that ended.
+///
+/// The recorded shells ([`record`]) are re-read when their file changes (a
+/// `stat` a poll otherwise). A shell is looked for in `/proc` once, when it
+/// is first seen: the processes holding its output file then are its own.
+/// After that each poll asks only whether one of them still runs, by pid
+/// and start time, which is cheap and never wavers: a pid that came back
+/// as another process is not it. A shell found ended stays ended, and a
+/// look that could not read `/proc` decides nothing, so a row does not
+/// flicker between asleep and ended.
+#[derive(Debug, Default)]
+pub struct Watch {
+    stamps: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    recorded: Vec<(String, Shell)>,
+    seen: std::collections::HashMap<String, Seen>,
+    live: std::collections::HashMap<String, Vec<Shell>>,
+}
+
+impl Watch {
+    /// Look again at `sessions`' shells (the session and its earlier ids).
+    pub fn poll(&mut self, feed_dir: &Path, sessions: &[&str], now: u64) {
+        self.poll_with(feed_dir, sessions, now, &System);
+    }
+
+    /// [`Watch::poll`], with `look` for `/proc`.
+    pub fn poll_with(&mut self, feed_dir: &Path, sessions: &[&str], now: u64, look: &dyn Holders) {
+        let files: Vec<(String, PathBuf)> = sessions
+            .iter()
+            .filter(|s| safe(s))
+            .map(|s| (s.to_string(), path(feed_dir, s)))
+            .collect();
+        let stamps: Vec<(PathBuf, Option<std::time::SystemTime>)> = files
+            .iter()
+            .map(|(_, f)| {
+                let m = std::fs::metadata(f).and_then(|m| m.modified()).ok();
+                (f.clone(), m)
+            })
+            .collect();
+        if stamps != self.stamps {
+            self.stamps = stamps;
+            self.recorded = files
+                .iter()
+                .flat_map(|(s, f)| {
+                    read::<Book>(f)
+                        .shells
+                        .into_iter()
+                        .map(move |sh| (s.clone(), sh))
+                })
+                .collect();
+            let ids: Vec<&str> = self.recorded.iter().map(|(_, s)| s.id.as_str()).collect();
+            self.seen.retain(|id, _| ids.contains(&id.as_str()));
+        }
+        // First looks, one `/proc` walk per session for all its new shells.
+        let mut by_session: Vec<(&str, Vec<Shell>)> = Vec::new();
+        for (session, shell) in &self.recorded {
+            if self.seen.contains_key(&shell.id) {
+                continue;
+            }
+            match by_session.iter_mut().find(|(s, _)| *s == session.as_str()) {
+                Some((_, v)) => v.push(shell.clone()),
+                None => by_session.push((session.as_str(), vec![shell.clone()])),
+            }
+        }
+        let mut first = Vec::new();
+        for (session, shells) in by_session {
+            if let Some(held) = look.holders(session, &shells) {
+                for (shell, pids) in shells.into_iter().zip(held) {
+                    let seen = if pids.is_empty() {
+                        Seen::Ended
+                    } else {
+                        Seen::Held(pids)
+                    };
+                    first.push((shell.id, seen));
+                }
+            }
+        }
+        self.seen.extend(first);
+        // Later looks: does one of its processes still run?
+        for seen in self.seen.values_mut() {
+            if let Seen::Held(pids) = seen
+                && !pids.iter().any(|(p, s)| look.alive(*p, *s))
+            {
+                *seen = Seen::Ended;
+            }
+        }
+        let mut live: std::collections::HashMap<String, Vec<Shell>> = Default::default();
+        for (_, shell) in &self.recorded {
+            if matches!(self.seen.get(&shell.id), Some(Seen::Held(_)))
+                && now.saturating_sub(shell.started_ms) < KEEP_MS
+            {
+                live.entry(shell.agent.clone())
+                    .or_default()
+                    .push(shell.clone());
+            }
+        }
+        for v in live.values_mut() {
+            v.sort_by_key(|s| s.started_ms);
+        }
+        self.live = live;
+    }
+
+    /// The live shells, by the worker that started them, oldest first.
+    pub fn live(&self) -> &std::collections::HashMap<String, Vec<Shell>> {
+        &self.live
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,9 +1055,11 @@ mod tests {
         assert_eq!(
             deliver(&dir, "s1", T0 + 41 * MIN, &probe).as_deref(),
             Some(
-                "Giverny: `g472`'s worker ended its turn; 1 background shell still running: \
-                 `sleep 600` (41m, shell b1). Giverny stops nothing: if the work is meant to \
-                 stop, stop it (`TaskStop b1` or `pkill -s 4242`), or let it run on if needed."
+                "Giverny: `g472`'s worker ended its turn and is asleep, waiting on 1 \
+                 background shell of its own still running: `sleep 600` (41m, shell b1). \
+                 Claude Code wakes it when that ends. Giverny stops nothing: if the work is \
+                 meant to stop, stop it (`TaskStop b1` or `pkill -s 4242`), or let it run on \
+                 if needed."
             )
         );
         assert_eq!(deliver(&dir, "s1", T0 + 42 * MIN, &probe), None, "once");
@@ -661,8 +1126,9 @@ mod tests {
         let told = deliver(&dir, "s1", T0 + 3 * MIN, &probe).unwrap();
         assert_eq!(
             told,
-            "Giverny: `t`'s worker ended its turn; 1 background shell still running: `npm run \
-             sim -- --long` (2m, shell b2). Giverny stops nothing: if the work is meant to stop, \
+            "Giverny: `t`'s worker ended its turn and is asleep, waiting on 1 background \
+             shell of its own still running: `npm run sim -- --long` (2m, shell b2). Claude \
+             Code wakes it when that ends. Giverny stops nothing: if the work is meant to stop, \
              stop it (`TaskStop b2`), or let it run on if needed."
         );
         // Both still running: listed together.
@@ -673,7 +1139,10 @@ mod tests {
         turn_ended(&dir2, "s1", "a1", &["b1", "b2"], T0 + 30_000, &probe);
         let both = deliver(&dir2, "s1", T0 + 30_000, &probe).unwrap();
         assert!(
-            both.contains("2 background shells still running: `sleep 600` (30s, shell b1), `sleep 700` (30s, shell b2)"),
+            both.contains(
+                "2 background shells of its own still running: `sleep 600` (30s, shell b1), \
+                 `sleep 700` (30s, shell b2). Claude Code wakes it when one ends."
+            ),
             "{both}"
         );
         assert!(
@@ -757,6 +1226,196 @@ mod tests {
         // SAFETY: a signal to the session's group the test's own child leads.
         unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#476: the pane's name for a shell's command, past its setup.
+    #[test]
+    fn a_shells_gist_is_its_program_past_the_setup() {
+        for (cmd, want) in [
+            (
+                "cd /home/ita/poly; T=/tmp/claude-1000/x/t170; npx wrangler deploy > \
+                 $T/deploy4.log 2>&1; echo \"exit $?\"; grep -E \"Version ID|Deployed\" \
+                 $T/deploy4.log | head",
+                "wrangler deploy",
+            ),
+            ("sleep 100000", "sleep 100000"),
+            (
+                "giverny-manage run 176 -- /tmp/claude-1000/s/scratchpad/runall.sh > \
+                 /tmp/runall.log 2>&1",
+                "runall.sh",
+            ),
+            (
+                "cd /tmp/wt-174 && giverny-manage run 174 -- npm run deploy > ../deploy174.log \
+                 2>&1; echo exit $?",
+                "npm run deploy",
+            ),
+            (
+                "RUST_LOG=debug cargo build --release -p giverny",
+                "cargo build",
+            ),
+            ("timeout 600 node /tmp/x/sim.js --long", "node sim.js"),
+            (
+                "nohup python3 scripts/fit.py data.csv &",
+                "python3 fit.py data.csv",
+            ),
+            ("for i in 1 2 3; do sleep 1; done", "for i in"),
+            ("echo hi", "echo hi"),
+            // poly's 178: a script written by a here-document, then run.
+            (
+                "S=/tmp/s; cd $S/wt178 && cat > $S/t178/deploy.sh <<'EOF'\n#!/bin/bash\ncd \
+                 \"$1\"\nnpm run deploy && exit 0\nfor i in 1 2; do npx wrangler deploy && exit \
+                 0; sleep 20; done\nEOF\nchmod +x $S/t178/deploy.sh; giverny-manage run 178 -- \
+                 $S/t178/deploy.sh $S/wt178 > $S/t178/deploy.log ",
+                "deploy.sh",
+            ),
+            ("cat <<< \"$x\" | jq .", "cat"),
+        ] {
+            assert_eq!(gist(cmd), want, "{cmd}");
+        }
+        let one = shell("b1", "a1", "170", "npx wrangler deploy", T0);
+        let two = shell("b2", "a1", "170", "sleep 9", T0 + MIN);
+        assert_eq!(
+            waiting_on(std::slice::from_ref(&one), T0 + 30 * MIN),
+            "waiting on wrangler deploy (30m)"
+        );
+        assert_eq!(
+            waiting_on(&[two, one], T0 + 30 * MIN),
+            "waiting on wrangler deploy (30m) +1",
+            "the oldest named"
+        );
+    }
+
+    /// A `/proc` that says what it was told: holders by shell id, and the
+    /// processes alive.
+    #[derive(Default)]
+    struct FakeProc {
+        holders: RefCell<Vec<(String, Pids)>>,
+        alive: RefCell<Vec<(u32, u64)>>,
+        unreadable: std::cell::Cell<bool>,
+        walks: std::cell::Cell<usize>,
+    }
+
+    impl Holders for FakeProc {
+        fn holders(&self, _session: &str, shells: &[Shell]) -> Option<Vec<Pids>> {
+            self.walks.set(self.walks.get() + 1);
+            if self.unreadable.get() {
+                return None;
+            }
+            let h = self.holders.borrow();
+            Some(
+                shells
+                    .iter()
+                    .map(|s| {
+                        h.iter()
+                            .find(|(i, _)| *i == s.id)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            )
+        }
+
+        fn alive(&self, pid: u32, start: u64) -> bool {
+            self.alive.borrow().contains(&(pid, start))
+        }
+    }
+
+    /// giverny#476: the pane's watch. A shell held when first seen is live
+    /// for as long as one of its processes runs (by pid and start); once
+    /// none does it is ended for good; an unreadable `/proc` decides
+    /// nothing; `/proc` is walked only for a shell not seen yet.
+    #[test]
+    fn the_watch_says_which_shells_still_run_without_flicker() {
+        let dir = temp("watch");
+        let look = FakeProc::default();
+        let mut w = Watch::default();
+        w.poll_with(&dir, &["s1"], T0, &look);
+        assert!(w.live().is_empty(), "no file: nothing");
+        record(
+            &dir,
+            "s1",
+            shell("b1", "a1", "170", "npx wrangler deploy", T0),
+            T0,
+        );
+        record(&dir, "s1", shell("b2", "a2", "171", "sleep 5", T0), T0);
+        look.holders
+            .borrow_mut()
+            .push(("b1".into(), vec![(4242, 77)]));
+        look.alive.borrow_mut().push((4242, 77));
+        // `/proc` unreadable at the first look: neither is decided.
+        look.unreadable.set(true);
+        w.poll_with(&dir, &["s1"], T0 + MIN, &look);
+        assert!(w.live().is_empty());
+        look.unreadable.set(false);
+        w.poll_with(&dir, &["s1"], T0 + MIN, &look);
+        assert_eq!(w.live().get("a1").map(Vec::len), Some(1));
+        assert!(!w.live().contains_key("a2"), "nothing held b2: ended");
+        let walks = look.walks.get();
+        for i in 0..5 {
+            w.poll_with(&dir, &["s1"], T0 + (2 + i) * MIN, &look);
+            assert_eq!(w.live().get("a1").map(Vec::len), Some(1));
+        }
+        assert_eq!(look.walks.get(), walks, "no walk for shells seen");
+        // Its pid came back as another process: ended, and stays so.
+        look.alive.borrow_mut().clear();
+        look.alive.borrow_mut().push((4242, 99));
+        w.poll_with(&dir, &["s1"], T0 + 8 * MIN, &look);
+        assert!(w.live().is_empty());
+        look.alive.borrow_mut().push((4242, 77));
+        w.poll_with(&dir, &["s1"], T0 + 9 * MIN, &look);
+        assert!(w.live().is_empty(), "ended is final");
+        // A shell recorded under an earlier id of the session counts too.
+        record(&dir, "s0", shell("b3", "a1", "170", "make", T0), T0);
+        look.holders
+            .borrow_mut()
+            .push(("b3".into(), vec![(5000, 1)]));
+        look.alive.borrow_mut().push((5000, 1));
+        w.poll_with(&dir, &["s1", "s0"], T0 + 10 * MIN, &look);
+        assert_eq!(w.live()["a1"][0].id, "b3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real watch on a real shell held like Claude Code's: live while
+    /// it runs, ended once it is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_real_watch_follows_a_real_shell() {
+        use std::os::unix::process::CommandExt;
+        let dir = temp("realwatch");
+        let session = "0d5e2a4c-0000-4000-8000-0000000476aa";
+        let tasks = dir.join(session).join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let out = std::fs::File::create(tasks.join("bzz476.output")).unwrap();
+        let mut child = std::process::Command::new("/bin/bash")
+            .args(["-c", "sleep 30; true"])
+            .stdout(out)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        record(
+            &dir,
+            session,
+            shell("bzz476", "a1", "t", "sleep 30", T0),
+            T0,
+        );
+        let mut w = Watch::default();
+        w.poll(&dir, &[session], T0);
+        assert_eq!(w.live().get("a1").map(Vec::len), Some(1), "{w:?}");
+        // SAFETY: a signal to the group the test's own child leads.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+        let mut gone = false;
+        for _ in 0..50 {
+            w.poll(&dir, &[session], T0);
+            if w.live().is_empty() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "{w:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -147,8 +147,9 @@ pub fn plan(click: &RowClick) -> Plan {
     match click.stage {
         Stage::Running | Stage::Done => {
             // A finished worker's transcript is final: opened at its end,
-            // on the report, as a Done row's is.
-            let live = click.stage == Stage::Running && !click.finished;
+            // on the report, as a Done row's is. An asleep one's is not: it
+            // goes on when the worker wakes, so it is followed (giverny#476).
+            let live = click.stage == Stage::Running && (!click.finished || click.asleep);
             if let Some(t) = &click.transcript {
                 return Plan::Watch {
                     title,
@@ -1539,6 +1540,7 @@ mod tests {
             key: "acme#158".into(),
             agent_id: Some("a93".into()),
             finished: false,
+            asleep: false,
             name: "Wren".into(),
             transcript: None,
             open: None,
@@ -1611,6 +1613,26 @@ mod tests {
             panic!("{:?}", plan(&c));
         };
         assert!(why.contains("No transcript was found"), "{why}");
+    }
+
+    /// giverny#476: an asleep worker is out of Claude Code's list as a
+    /// finished one is, but its transcript goes on when it wakes: it is
+    /// followed live, and still nothing is walked into.
+    #[test]
+    fn an_asleep_worker_opens_its_transcript_live() {
+        let mut c = click(Stage::Running);
+        c.finished = true;
+        c.asleep = true;
+        c.transcript = Some("/t/agent-a93.jsonl".into());
+        assert_eq!(offer(&c), Offer::Nothing);
+        assert_eq!(
+            plan(&c),
+            Plan::Watch {
+                title: "acme#158 · Wren".into(),
+                transcript: "/t/agent-a93.jsonl".into(),
+                live: true,
+            }
+        );
     }
 
     #[test]

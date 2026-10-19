@@ -175,6 +175,7 @@ mod tests {
                 key: String::new(),
                 agent_id: None,
                 finished: false,
+                asleep: false,
                 name: String::new(),
                 transcript: None,
                 open: None,
