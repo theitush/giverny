@@ -23,6 +23,7 @@ pub mod manage_hint;
 pub mod manage_history;
 pub mod manage_inbox;
 pub mod manage_nudge;
+pub mod manage_progress;
 pub mod manage_run;
 pub mod manage_trigger;
 pub mod managers;

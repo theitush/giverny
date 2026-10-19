@@ -264,6 +264,16 @@ When you spawn one:
     `pause` lists the worker's own background shells still running as well,
     each with `TaskStop <shell id>` (from your session) to stop it, and a
     worker that ends its turn with one still running is told to you once.
+- **A progress check** reaches you, once per event, when a worker's figure
+  runs out or it asks for much more time (an `eta` that moves its finish at
+  least 10 minutes and a quarter of its figure before later); at most one
+  per task every 10 minutes. It names the ask or how overdue it is, its note,
+  its working time, what it is doing now, its runs and background shells,
+  and its transcript. Read its recent work there, judge whether it makes
+  sense, is all needed, or could be done faster, then tell the worker
+  (SendMessage) to cut, change course or go on, or let it go on; re-estimate
+  the row or split the task if that is what it needs. Giverny stops and
+  re-estimates nothing.
 - **`resume` restarts only the clock** too. It says whether the task's worker
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh

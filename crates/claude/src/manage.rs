@@ -576,7 +576,7 @@ fn close_wait(row: &mut Map<String, Value>, now: u64) {
 /// Working time so far on a Running row, in seconds: since `started`
 /// (already moved on by closed pauses) up to an open pause, less its closed
 /// and open waiting spans and what the machine slept through.
-fn worked_s(row: &Map<String, Value>, now: u64, sleeps: &[sleeps::Span]) -> u64 {
+pub(crate) fn worked_s(row: &Map<String, Value>, now: u64, sleeps: &[sleeps::Span]) -> u64 {
     let Some(started) = ms_of(row, "started") else {
         return 0;
     };
@@ -1304,6 +1304,10 @@ pub fn apply(
                     "left_at",
                     "deadline_asked",
                     "overdue_asked",
+                    "progress_more",
+                    "progress_overdue",
+                    "progress_told",
+                    "overdue_told",
                     "after",
                     "held",
                     "held_at",
@@ -1374,6 +1378,8 @@ pub fn apply(
         Cmd::Eta(_, left) => {
             let i = at.ok_or_else(missing)?;
             let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+            // The figure before, for the progress check (giverny#473).
+            let before = figure_left(row, now, sleeps);
             let first = stage == Some(feed::Stage::Running) && !row.contains_key("reest_s");
             // The figure a worker settles on after its `eta` reply asked for
             // it (giverny#470): with `--gut`, soon after, it takes the
@@ -1442,6 +1448,11 @@ pub fn apply(
                 row.insert("left_s".into(), json!(left));
                 let at = ms_of(row, "paused_since").unwrap_or(now);
                 row.insert("left_at".into(), json!(stamp(at)));
+                // A finish moved much later is put before the manager
+                // (giverny#473).
+                if !row.contains_key("paused_since") {
+                    crate::manage_progress::more_time(row, before, *left, now);
+                }
             }
             set_str(row, "note", &f.note);
             if stage == Some(feed::Stage::Running) {
@@ -1624,6 +1635,26 @@ fn last_figure(r: &Map<String, Value>) -> Option<(u64, u64)> {
     let at = ms_of(r, "left_at")?;
     let left = u64_of(r, "left_s")?;
     Some((ms_of(r, "started").map_or(at, |s| at.max(s)), left))
+}
+
+/// What a Running row's figure still has left at `now`, seconds (below
+/// zero past it), as the pane counts it, and that figure itself: the
+/// latest re-estimate less the work since it, else the whole estimate less
+/// the work since the start. `None` with no figure.
+pub(crate) fn figure_left(
+    r: &Map<String, Value>,
+    now: u64,
+    sleeps: &[sleeps::Span],
+) -> Option<(i64, u64)> {
+    let upto = ms_of(r, "paused_since").unwrap_or(now);
+    let (at, figure) = match last_figure(r) {
+        Some(f) => f,
+        None => (ms_of(r, "started")?, u64_of(r, "eta_s").filter(|e| *e > 0)?),
+    };
+    Some((
+        figure as i64 - (work_ms(sleeps, at, upto) / 1000) as i64,
+        figure,
+    ))
 }
 
 /// The rows as text, in the pane's section order.
@@ -2056,7 +2087,7 @@ pub(crate) fn run_lines(runs: &[crate::run_live::LiveRun], now: u64) -> Vec<Stri
 
 /// A command as a one-line listing quotes it: in backticks, held to about
 /// 60 characters.
-fn short_cmd(cmd: &str) -> String {
+pub(crate) fn short_cmd(cmd: &str) -> String {
     let one: String = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX: usize = 60;
     let cut = match one.char_indices().nth(MAX) {
@@ -2460,6 +2491,9 @@ fn run_feed(
                 msg = format!("{msg}\n{note}");
             }
             write(&file, &doc).map_err(|e| format!("{}: {e}", file.display()))?;
+            if let Cmd::Eta(..) = cmd {
+                crate::manage_progress::mark(dir, session, &doc);
+            }
             if let Some(h) = &history {
                 learn(&doc, &before, session, h, &sleeps);
             }
@@ -4718,6 +4752,60 @@ mod tests {
         assert!(said.contains("handed on from cfg-keys"), "{said}");
         assert!(said.contains("released 3G"), "{said}");
         assert!(!held(&dir, "s1", "cfg-keys", T0 + 15 * MIN));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#473: a worker's `eta` that moves its finish much later, and
+    /// its figure running out, each reach its manager once, on the
+    /// manager's own next call, with what it has done; a small slip does
+    /// not.
+    #[test]
+    fn more_time_and_overdue_reach_the_manager_once_each() {
+        let dir = scratch("progress");
+        run_cfg(&dir, "s1", "start t9 --eta 30 --agent w9", None, T0);
+        let cfg = spawned(&dir, "s1", "w9", "t9: the thing");
+        let transcript = cfg.join("projects").join("-w").join("s1.jsonl");
+        let manager = |now: u64| {
+            let p = json!({"session_id": "s1", "transcript_path": transcript,
+                "tool_name": "Bash", "tool_input": {"command": "echo next"}});
+            crate::plugin_hook::run(&p, &dir, now, true).map(|o| {
+                let v: Value = serde_json::from_str(&o).unwrap();
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+        };
+        let worker = |now: u64| {
+            let p = json!({"session_id": "s1", "agent_id": "w9",
+                "transcript_path": transcript});
+            crate::plugin_hook::run(&p, &dir, now, true)
+        };
+        let marker = crate::manage_progress::marker(&dir, "s1");
+        // 5m in, 30m left: 5m later than the 30m figure, let be.
+        run_cfg(&dir, "s1", "eta t9 30", None, T0 + 5 * MIN);
+        assert!(!marker.exists());
+        assert!(manager(T0 + 6 * MIN).is_none_or(|n| !n.contains("progress check")));
+        // 10m in, 60m left: 35m later.
+        run_cfg(&dir, "s1", "eta t9 60 --note tests", None, T0 + 10 * MIN);
+        assert!(marker.exists());
+        let n = manager(T0 + 11 * MIN).unwrap();
+        assert!(
+            n.contains("progress check on `t9`: its worker asked for 35m more"),
+            "{n}"
+        );
+        assert!(n.contains("Its note: \"tests\""), "{n}");
+        assert!(n.contains("So far: 11m of work"), "{n}");
+        assert!(n.contains("agent-w9.jsonl"), "{n}");
+        assert!(n.contains("SendMessage `w9`"), "{n}");
+        assert!(manager(T0 + 12 * MIN).is_none_or(|n| !n.contains("progress check")));
+        // The 70m figure runs out: the worker's own call sees it, the
+        // manager hears it once.
+        worker(T0 + 75 * MIN);
+        let n = manager(T0 + 75 * MIN).unwrap();
+        assert!(n.contains("its worker is overdue by 5m"), "{n}");
+        worker(T0 + 80 * MIN);
+        assert!(manager(T0 + 80 * MIN).is_none_or(|n| !n.contains("progress check")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
