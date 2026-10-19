@@ -170,17 +170,30 @@ ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "$d/status" 2>/dev/null)
 printf '%s\t%s\t%s\t%s\n' "$id" "${d#/proc/}" "$ppid" "$cwd"
 done
 printf 'pids'
-for d in /proc/[0-9]*; do printf ' %s' "${d#/proc/}"; done
+for d in /proc/[0-9]*; do
+s=
+read -r s < "$d/stat" 2>/dev/null || continue
+set -- ${s##*)}
+printf ' %s:%s' "${d#/proc/}" "${20}"
+done
 printf '\n'"#;
 
-/// The `pids` line: every process id the distribution had when asked.
+/// The `pids` line: every process id the distribution had when asked, each
+/// as `<pid>:<starttime>` (field 22 of its `/proc/<pid>/stat`, read after
+/// the last `)`), or a bare `<pid>` whose start is unknown.
 #[cfg(any(windows, test))]
-fn parse_live_pids(text: &str) -> Vec<u32> {
+fn parse_live_pids(text: &str) -> Vec<(u32, Option<u64>)> {
     text.lines()
         .find_map(|line| line.strip_prefix("pids "))
         .map(|list| {
             list.split_whitespace()
-                .filter_map(|p| p.parse().ok())
+                .filter_map(|p| {
+                    let (pid, start) = match p.split_once(':') {
+                        Some((pid, start)) => (pid, start.parse().ok()),
+                        None => (p, None),
+                    };
+                    Some((pid.parse().ok()?, start))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -192,12 +205,15 @@ fn parse_live_pids(text: &str) -> Vec<u32> {
 /// from the UI thread, and a `wsl.exe` launch there is a frozen window. So the
 /// sweep — already off-thread, already walking `/proc` — leaves the answer
 /// here, and the registry only ever reads it.
-static LIVE_PIDS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u32>>>,
-> = std::sync::LazyLock::new(Default::default);
+static LIVE_PIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Seen>>> =
+    std::sync::LazyLock::new(Default::default);
 
-/// Publish one distribution's live pids. Called only by the sweep.
-pub fn publish_live_pids(distro: &str, pids: Vec<u32>) {
+/// One distribution's pids, each with its start time when the sweep read it.
+type Seen = std::collections::HashMap<u32, Option<u64>>;
+
+/// Publish one distribution's live pids, each with its start time when the
+/// sweep read one. Called only by the sweep.
+pub fn publish_live_pids(distro: &str, pids: Vec<(u32, Option<u64>)>) {
     if pids.is_empty() {
         return;
     }
@@ -206,17 +222,23 @@ pub fn publish_live_pids(distro: &str, pids: Vec<u32>) {
     }
 }
 
-/// Is `pid` running inside the distribution holding `config_dir`?
+/// Is `pid` running inside the distribution holding `config_dir` — and,
+/// when `start` is given and the sweep read that pid's start time, is it the
+/// process that started then?
 ///
 /// `None` when no sweep has reported that distribution yet — at startup, or
 /// where Giverny has no tab in it. The caller decides what to do with not
 /// knowing; treating it as "still running" would refuse to restore a
 /// conversation on exactly the launch that wants to.
-pub fn pid_alive_in(config_dir: &Path, pid: u32) -> Option<bool> {
+pub fn pid_alive_in(config_dir: &Path, pid: u32, start: Option<u64>) -> Option<bool> {
     let (distro, _) = split_unc(config_dir)?;
     let map = LIVE_PIDS.lock().ok()?;
     let pids = map.get(&distro)?;
-    Some(pids.contains(&pid))
+    Some(match (pids.get(&pid), start) {
+        (None, _) => false,
+        (Some(Some(seen)), Some(start)) => *seen == start,
+        (Some(_), _) => true,
+    })
 }
 
 /// One directory per tab, from the script's per-process lines.
@@ -672,13 +694,47 @@ mod tests {
     /// a tab.
     #[test]
     fn the_pid_line_is_read_and_not_confused_for_a_tab() {
-        let text = "giverny-3\t900\t1\t/home/ita/proj\npids 1 2 900 1043\n";
-        assert_eq!(parse_live_pids(text), vec![1, 2, 900, 1043]);
+        let text = "giverny-3\t900\t1\t/home/ita/proj\npids 1:135 2 900:4410 1043:x\n";
+        assert_eq!(
+            parse_live_pids(text),
+            vec![(1, Some(135)), (2, None), (900, Some(4410)), (1043, None)]
+        );
         assert_eq!(
             parse_tab_cwds(text),
             vec![("giverny-3".to_string(), "/home/ita/proj".to_string())]
         );
         assert!(parse_live_pids("giverny-3\t900\t1\t/home/x\n").is_empty());
+    }
+
+    /// The sweep reads each pid's start time, so the registry can tell a
+    /// reused pid from the claude that wrote the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_reports_start_times() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(TAB_CWD_SCRIPT)
+            .output()
+            .expect("sh");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let me = std::process::id();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let start = crate::registry::stat_start_ticks(&stat);
+        assert!(start.is_some());
+        assert!(parse_live_pids(&text).contains(&(me, start)), "{text}");
+    }
+
+    #[test]
+    fn a_reused_pid_in_a_distribution_is_not_alive() {
+        let distro = format!("test-reused-pid-{}", std::process::id());
+        let dir = unc_path(&distro, "/home/u/.claude");
+        assert_eq!(pid_alive_in(&dir, 3204, None), None, "no sweep yet");
+        publish_live_pids(&distro, vec![(3204, Some(48254)), (77, None)]);
+        assert_eq!(pid_alive_in(&dir, 3204, Some(48254)), Some(true));
+        assert_eq!(pid_alive_in(&dir, 3204, Some(2300)), Some(false));
+        assert_eq!(pid_alive_in(&dir, 3204, None), Some(true));
+        assert_eq!(pid_alive_in(&dir, 77, Some(5)), Some(true), "start unread");
+        assert_eq!(pid_alive_in(&dir, 78, None), Some(false));
     }
 
     /// A directory with a space in it is still one field.
