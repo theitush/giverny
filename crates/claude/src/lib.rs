@@ -9,6 +9,7 @@ pub mod agent_eta;
 pub mod attach;
 pub mod away;
 pub mod bash_guard;
+pub mod bg_shells;
 pub mod continuation;
 pub mod escapes;
 pub mod feed;

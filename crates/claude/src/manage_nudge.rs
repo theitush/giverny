@@ -82,6 +82,24 @@ pub(crate) fn holds_row(doc: &Value, agent_id: &str, description: Option<&str>) 
         })
 }
 
+/// The key of the row this worker holds: its Running one, else any
+/// ([`holds_row`]). What its background shells are recorded against
+/// ([`crate::bg_shells`], giverny#472).
+pub(crate) fn row_key(doc: &Value, agent_id: &str, description: Option<&str>) -> Option<String> {
+    let rows: Vec<&Map<String, Value>> = doc
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|r| is_mine(r, agent_id, description))
+        .collect();
+    let row = rows
+        .iter()
+        .find(|r| manage::stage_of(r) == Some(feed::Stage::Running))
+        .or(rows.first())?;
+    row.get("key").and_then(Value::as_str).map(String::from)
+}
+
 /// Put the worker's id on the Running rows its spawn description names that
 /// carry none yet: a dispatcher that ran `start` before the spawn could not
 /// give it, and a later `start <next> --agent <id>` finds the worker's
