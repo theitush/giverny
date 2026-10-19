@@ -21,10 +21,12 @@
 //!   asks); a later `eta` before it is told folds in, against the same
 //!   finish before, and one that takes it back under the threshold drops it.
 //! - **Overdue.** The worker's figure has run out: its row's clock (the same
-//!   wall clock the worker's own overdue ask counts by) is past `eta_s`. Seen
-//!   on the worker's own hook calls, which read its row anyway; the row keeps
-//!   the figure it is for (`progress_overdue`), and once told
-//!   (`overdue_told`) the same figure is not told again.
+//!   wall clock the worker's own overdue ask counts by) is past `eta_s`. A
+//!   fact about the row, found off the clock by whoever checks — the
+//!   manager's hook, its watch, the worker's own hook — with no call from
+//!   the worker needed; the row keeps the figure it is for
+//!   (`progress_overdue`), and once told (`overdue_told`) the same figure is
+//!   not told again.
 //!
 //! **One notice per [`QUIET_MS`] per task.** An event that comes sooner after
 //! the task's last notice (`progress_told`) waits, pending, and is told when
@@ -36,9 +38,21 @@
 //! dispatcher's own Bash call running `eta <task>` drops that task's pending
 //! more-time ask ([`own_eta`]).
 //!
+//! **Two ways in, one state.** The manager hears a check on its next own
+//! tool call ([`deliver`]), or, idle, from `giverny manage watch`
+//! ([`watch`]): a command it keeps running in the background, which sleeps
+//! until the next check falls due ([`next_due`]: a figure running out, a
+//! pending check's quiet ending) or the feed changes, prints the check and
+//! ends — and Claude Code wakes a manager whose background command ended.
+//! Both tell through [`check`] and stamp the row, so what one told the
+//! other does not tell again. A more-time ask waits [`GRACE_MS`] first, so
+//! the manager's own `eta` is dropped on its hook before the watch sees it.
+//!
 //! **Cheap.** Whoever leaves an event pending touches
-//! `<feed dir>/progress/<session>`, so the manager's calls cost a `stat` when
-//! none is pending; the marker goes once nothing is.
+//! `<feed dir>/progress/<session>`, and each check leaves when the next one
+//! falls due in `progress/<session>.due`, keyed by the feed's mtime: the
+//! manager's calls cost a `stat` or two and a small read while nothing is
+//! pending or due. The watch looks at the feed's mtime every [`POLL_MS`].
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +69,10 @@ pub const MORE_FRAC: f64 = 0.25;
 
 /// At most one progress check per task in this span.
 pub const QUIET_MS: u64 = 10 * 60 * 1000;
+
+/// A more-time ask this fresh waits: the manager's own `eta` drops it on
+/// its hook first ([`own_eta`]), and the watch must not tell it meanwhile.
+pub const GRACE_MS: u64 = 15_000;
 
 /// Where the pending markers live, under the feed directory.
 pub const DIR: &str = "progress";
@@ -251,7 +269,9 @@ impl Look for System<'_> {
 }
 
 /// On the dispatcher's own call: each task's pending event told once, when
-/// its quiet is up ([`QUIET_MS`]). A `stat` when none is pending.
+/// its quiet is up ([`QUIET_MS`]), and a figure run out found off the clock
+/// (giverny#473 round 2), whoever last called. A `stat` or two when nothing
+/// is pending or due ([`due_by`]).
 pub fn deliver(
     feed_dir: &Path,
     session: &str,
@@ -262,19 +282,135 @@ pub fn deliver(
     if !safe(session) {
         return None;
     }
-    let m = marker(feed_dir, session);
-    std::fs::metadata(&m).ok()?;
-    let file = manage::file_for(feed_dir, session);
-    let _lock = Lock::take(&file).ok()?;
-    let Some(mut doc) = std::fs::read(&file)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .filter(|d| manage::writer_of(d) == Some(manage::WRITER))
-    else {
-        let _ = std::fs::remove_file(&m);
+    if !marker(feed_dir, session).exists() && !due_by(feed_dir, session, now) {
         return None;
-    };
+    }
     let mine = payload.get("own_eta").and_then(Value::as_str);
+    check(feed_dir, session, mine, now, look).0
+}
+
+/// `<feed dir>/progress/<session>.due`: when the session's next check falls
+/// due ([`next_due`]), for the feed as it stood (its mtime, nanoseconds).
+fn due_cache(feed_dir: &Path, session: &str) -> PathBuf {
+    feed_dir.join(DIR).join(format!("{session}.due"))
+}
+
+fn mtime_ns(path: &Path) -> Option<u128> {
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())
+}
+
+/// Whether a check may be due on `session`'s feed at `now`: its feed changed
+/// since the cache was written, or the cache's due time has come. A session
+/// with no feed of its own name has none.
+fn due_by(feed_dir: &Path, session: &str, now: u64) -> bool {
+    let Some(mtime) = mtime_ns(&feed::feed_path(feed_dir, session)) else {
+        return false;
+    };
+    let cached = std::fs::read_to_string(due_cache(feed_dir, session)).ok();
+    let mut words = cached.as_deref().unwrap_or("").split_whitespace();
+    match (
+        words.next().and_then(|m| m.parse::<u128>().ok()),
+        words.next(),
+    ) {
+        (Some(m), Some(due)) if m == mtime => due.parse::<u64>().is_ok_and(|d| d <= now),
+        _ => true,
+    }
+}
+
+fn write_cache(feed_dir: &Path, session: &str, file: &Path, doc: &Value) {
+    if file != feed::feed_path(feed_dir, session) {
+        return; // a feed under an earlier id: the watch reads it whole
+    }
+    let Some(mtime) = mtime_ns(file) else {
+        return;
+    };
+    let due = next_due(doc).map_or("-".to_string(), |d| d.to_string());
+    let path = due_cache(feed_dir, session);
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(feed_dir));
+    let _ = std::fs::write(path, format!("{mtime} {due}\n"));
+}
+
+/// When the next check on `doc` falls due, epoch ms (in the past: due
+/// already): a Running row's figure running out, a pending event's
+/// quiet ending, a fresh more-time ask's [`GRACE_MS`] passing. `None` when
+/// nothing falls due without the feed changing: no Running row with a
+/// figure still to run out, or only paused ones.
+pub fn next_due(doc: &Value) -> Option<u64> {
+    let rows = doc.get("rows").and_then(Value::as_array)?;
+    rows.iter()
+        .filter_map(Value::as_object)
+        .filter_map(|row| {
+            let pending = row.contains_key(MORE) || row.contains_key(OVERDUE);
+            if manage::stage_of(row) != Some(feed::Stage::Running) {
+                return pending.then_some(0); // moot: dropped on the next check
+            }
+            if row.contains_key("paused_since") {
+                return None; // its resume changes the feed
+            }
+            let quiet = manage::ms_of(row, "progress_told").map_or(0, |t| t + QUIET_MS);
+            let more = row
+                .get(MORE)
+                .and_then(Value::as_object)
+                .map(|m| (m.get("at").and_then(Value::as_u64).unwrap_or(0) + GRACE_MS).max(quiet));
+            let late = if row.contains_key(OVERDUE) {
+                Some(quiet)
+            } else {
+                figure_end(row).map(|end| (end + 1).max(quiet))
+            };
+            [more, late].into_iter().flatten().min()
+        })
+        .min()
+}
+
+/// When a Running row's figure runs out, on the worker's own overdue
+/// clock, unless that figure was told overdue already.
+fn figure_end(row: &Map<String, Value>) -> Option<u64> {
+    let eta = manage::u64_of(row, "eta_s").filter(|e| *e > 0)?;
+    if manage::u64_of(row, "overdue_told") == Some(eta) {
+        return None;
+    }
+    Some(manage::ms_of(row, "started")? + eta * 1000)
+}
+
+/// The check itself, for the hook and the watch: read the feed; leave the
+/// overdue event pending on each Running row whose figure has run out; tell
+/// what is due; keep the marker and the due cache. Returns what to tell
+/// and the feed as it stands after (`None` with no feed of this writer's).
+fn check(
+    feed_dir: &Path,
+    session: &str,
+    mine: Option<&str>,
+    now: u64,
+    look: &dyn Look,
+) -> (Option<String>, Option<Value>) {
+    let m = marker(feed_dir, session);
+    let file = manage::file_for(feed_dir, session);
+    let read = || {
+        std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .filter(|d| manage::writer_of(d) == Some(manage::WRITER))
+    };
+    let Some(doc) = read() else {
+        let _ = std::fs::remove_file(&m);
+        return (None, None);
+    };
+    // Nothing pending or due: no lock, no write.
+    let due = |d: &Value| next_due(d).is_some_and(|t| t <= now);
+    if !due(&doc) && mine.is_none_or(|k| !pending_on(&doc, k)) {
+        if !any_pending(&doc) {
+            let _ = std::fs::remove_file(&m);
+        }
+        write_cache(feed_dir, session, &file, &doc);
+        return (None, Some(doc));
+    }
+    let Ok(_lock) = Lock::take(&file) else {
+        return (None, Some(doc));
+    };
+    let Some(mut doc) = read() else {
+        return (None, None);
+    };
     let mut lines = Vec::new();
     let mut changed = false;
     for row in doc
@@ -284,6 +420,11 @@ pub fn deliver(
         .flatten()
         .filter_map(Value::as_object_mut)
     {
+        let running = manage::stage_of(row) == Some(feed::Stage::Running);
+        // Off the clock: a figure run out is an event, whoever looks.
+        if running {
+            changed |= overdue(row, now);
+        }
         if !row.contains_key(MORE) && !row.contains_key(OVERDUE) {
             continue;
         }
@@ -292,7 +433,7 @@ pub fn deliver(
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
-        if manage::stage_of(row) != Some(feed::Stage::Running) {
+        if !running {
             changed |= row.remove(MORE).is_some() | row.remove(OVERDUE).is_some();
             continue;
         }
@@ -312,7 +453,14 @@ pub fn deliver(
         }
         let quiet =
             manage::ms_of(row, "progress_told").is_some_and(|t| now.saturating_sub(t) < QUIET_MS);
-        if row.contains_key("paused_since") || quiet {
+        // A more-time ask just made waits a moment: the manager's own `eta`
+        // drops it on its hook ([`own_eta`]) before the watch tells it.
+        let fresh = row
+            .get(MORE)
+            .and_then(|m| m.get("at"))
+            .and_then(Value::as_u64)
+            .is_some_and(|at| now < at + GRACE_MS);
+        if row.contains_key("paused_since") || quiet || fresh {
             continue; // kept: told when it runs, or when the quiet is up
         }
         let work = look.work(row, &key, now);
@@ -324,13 +472,159 @@ pub fn deliver(
         row.insert("progress_told".into(), json!(manage::stamp(now)));
         changed = true;
     }
-    if changed {
-        manage::write(&file, &doc).ok()?;
+    if changed && manage::write(&file, &doc).is_err() {
+        return (None, Some(doc));
     }
-    if !any_pending(&doc) {
+    if any_pending(&doc) {
+        mark(feed_dir, session, &doc);
+    } else {
         let _ = std::fs::remove_file(&m);
     }
-    (!lines.is_empty()).then(|| lines.join("\n\n"))
+    write_cache(feed_dir, session, &file, &doc);
+    ((!lines.is_empty()).then(|| lines.join("\n\n")), Some(doc))
+}
+
+/// Whether the row `key` of `doc` has a more-time ask pending.
+fn pending_on(doc: &Value, key: &str) -> bool {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .any(|r| r.get("key").and_then(Value::as_str) == Some(key) && r.contains_key(MORE))
+}
+
+/// What one look of the watch found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Watch {
+    /// A progress check (or several) to print.
+    Told(String),
+    /// No Running row: nothing to watch.
+    Idle,
+    /// Nothing yet; look again at this time (epoch ms), or when the feed
+    /// changes (`None`: only then).
+    Until(Option<u64>),
+}
+
+/// One look of `giverny manage watch` at `now`: the same check the hook
+/// makes ([`check`]), so a check told here is not told again on the hook,
+/// nor one told there here.
+pub fn watch_step(feed_dir: &Path, session: &str, now: u64, look: &dyn Look) -> Watch {
+    let (told, doc) = check(feed_dir, session, None, now, look);
+    if let Some(t) = told {
+        return Watch::Told(t);
+    }
+    let running = doc
+        .as_ref()
+        .and_then(|d| d.get("rows"))
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .any(|r| manage::stage_of(r) == Some(feed::Stage::Running))
+        });
+    if !running {
+        return Watch::Idle;
+    }
+    // Never sooner than a moment on: what is due now was just looked at.
+    Watch::Until(doc.as_ref().and_then(next_due).map(|t| t.max(now + 1000)))
+}
+
+/// How often the watch looks at the feed between due times.
+pub const POLL_MS: u64 = 2000;
+
+/// `<feed dir>/progress/<session>.watch`: held (flock) by the session's
+/// watch while it runs, with its pid.
+fn watch_lock_path(feed_dir: &Path, session: &str) -> PathBuf {
+    feed_dir.join(DIR).join(format!("{session}.watch"))
+}
+
+/// The session's one watch: held while it runs. `Err` with the running
+/// one's pid (if it wrote one) when another holds it.
+struct WatchLock {
+    _file: std::fs::File,
+}
+
+impl WatchLock {
+    fn take(feed_dir: &Path, session: &str) -> Result<WatchLock, Option<u32>> {
+        let path = watch_lock_path(feed_dir, session);
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(feed_dir));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| None)?;
+        #[cfg(unix)]
+        {
+            use std::io::{Read, Seek, Write};
+            use std::os::fd::AsRawFd;
+            // SAFETY: a valid open descriptor; LOCK_NB never blocks.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let mut s = String::new();
+                let _ = file.read_to_string(&mut s);
+                return Err(s.trim().parse().ok());
+            }
+            let _ = file.set_len(0);
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = write!(file, "{}", std::process::id());
+        }
+        Ok(WatchLock { _file: file })
+    }
+}
+
+/// What tells the watch the feed changed: the feed's mtime and whether a
+/// check is pending.
+fn feed_stamp(feed_dir: &Path, session: &str, file: &Path) -> (Option<u128>, bool) {
+    (mtime_ns(file), marker(feed_dir, session).exists())
+}
+
+/// `giverny manage watch`: wait until a progress check is due on this
+/// session's rows — a figure running out, a pending check's quiet ending,
+/// a new ask — print it and end, so the manager's background command ends
+/// and Claude Code wakes the manager even mid-idle. It only prints: it
+/// stops, pauses and re-estimates nothing. With nothing Running it ends at
+/// once; a second watch on the session ends at once too.
+pub fn watch(feed_dir: &Path, session: &str, look: &dyn Look) -> String {
+    if !safe(session) {
+        return format!("giverny manage watch: not a session id: {session:?}");
+    }
+    let _held = match WatchLock::take(feed_dir, session) {
+        Ok(l) => l,
+        Err(pid) => {
+            let pid = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            return format!(
+                "giverny manage watch: one is already running for this session{pid}; this one \
+                 ends. Keep that one."
+            );
+        }
+    };
+    loop {
+        let now = manage::now_ms();
+        let until = match watch_step(feed_dir, session, now, look) {
+            Watch::Told(t) => return t,
+            Watch::Idle => {
+                return "giverny manage watch: no task is Running in this session, so there is \
+                        nothing to watch; it ends. Start one again once a task runs."
+                    .to_string();
+            }
+            Watch::Until(t) => t,
+        };
+        let file = manage::file_for(feed_dir, session);
+        let seen = feed_stamp(feed_dir, session, &file);
+        loop {
+            let now = manage::now_ms();
+            if until.is_some_and(|t| now >= t) {
+                break;
+            }
+            let nap = until.map_or(POLL_MS, |t| (t - now).min(POLL_MS));
+            std::thread::sleep(std::time::Duration::from_millis(nap));
+            if feed_stamp(feed_dir, session, &file) != seen {
+                break;
+            }
+        }
+    }
 }
 
 /// How far past its figure a Running row is, seconds, on the clock the
@@ -381,9 +675,13 @@ pub fn notice(
         && let Some(late) = late
     {
         let eta = manage::u64_of(row, "eta_s").unwrap_or(0);
+        // The watch tells it the moment it runs out: not "overdue by 0m".
+        let by = match late {
+            0..60 => "its worker's figure has just run out".to_string(),
+            _ => format!("its worker is overdue by {}", span(late)),
+        };
         why.push(format!(
-            "its worker is overdue by {} (its figure, {} in all, ran out at {})",
-            span(late),
+            "{by} (its figure, {} in all, ran out at {})",
             span(eta),
             clock(now.saturating_sub(late * 1000))
         ));
@@ -705,6 +1003,187 @@ mod tests {
         assert_eq!(deliver(&dir, "s1", &own, now, &look), None);
         assert!(rows(&dir)[2].get(MORE).is_none());
         assert!(!marker(&dir, "s1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#473 round 2: a figure that runs out is found off the clock,
+    /// with no call from the worker, and told once, by the hook or the
+    /// watch, whichever looks first.
+    #[test]
+    fn a_figure_run_out_is_told_off_the_clock_once_by_either_way() {
+        let dir = scratch("clock");
+        let look = Fake(work());
+        let call = json!({"tool_name": "Bash", "tool_input": {"command": "echo next"}});
+        write_rows(
+            &dir,
+            json!([{"key": "g1", "stage": "running", "agent_id": "a1",
+                "started": manage::stamp(T0), "eta_s": 120}]),
+        );
+        assert!(!marker(&dir, "s1").exists(), "nothing pending");
+        let end = T0 + 2 * MIN;
+        // Before it runs out: nothing, and the cache knows when it will.
+        assert_eq!(deliver(&dir, "s1", &call, T0 + MIN, &look), None);
+        assert!(due_by(&dir, "s1", end + 1) && !due_by(&dir, "s1", end));
+        assert_eq!(
+            watch_step(&dir, "s1", T0 + MIN, &look),
+            Watch::Until(Some(end + 1))
+        );
+        // No worker call; the manager's next call hears it.
+        let n = deliver(&dir, "s1", &call, end + 30_000, &look).unwrap();
+        assert!(
+            n.contains("progress check on `g1`: its worker's figure has just run out (its figure,"),
+            "{n}"
+        );
+        assert_eq!(rows(&dir)[0]["overdue_told"], 120);
+        // Told: the watch does not tell it again, and has nothing to wait for.
+        assert_eq!(watch_step(&dir, "s1", end + MIN, &look), Watch::Until(None));
+        assert_eq!(deliver(&dir, "s1", &call, end + 2 * MIN, &look), None);
+        // The other way round: the watch tells a new figure's end, the hook not again.
+        let mut r = rows(&dir);
+        r[0]["eta_s"] = json!(20 * 60);
+        r[0]["progress_told"] = json!(manage::stamp(end + 30_000 - QUIET_MS));
+        write_rows(&dir, r);
+        let Watch::Told(n) = watch_step(&dir, "s1", T0 + 21 * MIN, &look) else {
+            panic!("the watch tells it");
+        };
+        assert!(n.contains("overdue by 1m (its figure, 20m in all"), "{n}");
+        assert_eq!(deliver(&dir, "s1", &call, T0 + 22 * MIN, &look), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_next_due_time_is_the_earliest_end_quiet_or_grace() {
+        let now = T0 + 10 * MIN;
+        let doc = |rows: Value| json!({"rows": rows});
+        let run = |extra: Value| {
+            let mut r = json!({"key": "g1", "stage": "running", "started": manage::stamp(T0),
+                "eta_s": 1800});
+            r.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            r
+        };
+        assert_eq!(
+            next_due(&doc(json!([run(json!({}))]))),
+            Some(T0 + 30 * MIN + 1)
+        );
+        // Told overdue for this figure: nothing until the feed changes.
+        assert_eq!(
+            next_due(&doc(json!([run(json!({"overdue_told": 1800}))]))),
+            None
+        );
+        // A paused row: its resume changes the feed.
+        assert_eq!(
+            next_due(&doc(json!([run(
+                json!({"paused_since": manage::stamp(now)})
+            )]))),
+            None
+        );
+        // Run out inside the quiet of the last check: when the quiet ends.
+        let told = T0 + 25 * MIN;
+        assert_eq!(
+            next_due(&doc(json!([run(
+                json!({"progress_told": manage::stamp(told)})
+            )]))),
+            Some(told + QUIET_MS)
+        );
+        // A fresh ask waits its grace.
+        let more =
+            json!({"from": now, "to": now + 40 * MIN, "figure_s": 1800, "asks": 1, "at": now});
+        assert_eq!(
+            next_due(&doc(json!([run(json!({MORE: more}))]))),
+            Some(now + GRACE_MS)
+        );
+        // The earliest of several rows; a landed row's pending one at once.
+        let other = json!({"key": "g2", "stage": "running", "started": manage::stamp(T0),
+            "eta_s": 600});
+        assert_eq!(
+            next_due(&doc(json!([run(json!({})), other]))),
+            Some(T0 + 10 * MIN + 1)
+        );
+        let landed = json!({"key": "g3", "stage": "done", MORE: more});
+        assert_eq!(next_due(&doc(json!([run(json!({})), landed]))), Some(0));
+        assert_eq!(next_due(&doc(json!([]))), None);
+    }
+
+    #[test]
+    fn a_fresh_ask_waits_its_grace_and_the_managers_own_eta_drops_it() {
+        let dir = scratch("grace");
+        let look = Fake(work());
+        let now = T0 + 10 * MIN;
+        let more =
+            json!({"from": now, "to": now + 40 * MIN, "figure_s": 1800, "asks": 1, "at": now});
+        write_rows(
+            &dir,
+            json!([{"key": "g1", "stage": "running", "started": manage::stamp(T0),
+                "eta_s": 70 * 60, MORE: more}]),
+        );
+        assert_eq!(
+            watch_step(&dir, "s1", now + 1000, &look),
+            Watch::Until(Some(now + GRACE_MS))
+        );
+        // The manager's own eta's hook drops it within the grace.
+        let own = json!({"tool_name": "Bash", "own_eta": "g1"});
+        assert_eq!(deliver(&dir, "s1", &own, now + 2000, &look), None);
+        assert!(rows(&dir)[0].get(MORE).is_none());
+        assert!(!marker(&dir, "s1").exists());
+        // A worker's: the watch tells it once the grace is up.
+        let mut r = rows(&dir);
+        r[0][MORE] = more;
+        write_rows(&dir, r);
+        let Watch::Told(n) = watch_step(&dir, "s1", now + GRACE_MS, &look) else {
+            panic!("told after the grace");
+        };
+        assert!(n.contains("asked for 40m more"), "{n}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_watch_ends_at_once_with_nothing_running_and_once_per_session() {
+        let dir = scratch("watch");
+        let look = Fake(work());
+        write_rows(&dir, json!([{"key": "g1", "stage": "done"}]));
+        assert_eq!(watch_step(&dir, "s1", T0, &look), Watch::Idle);
+        let n = watch(&dir, "s1", &look);
+        assert!(n.contains("no task is Running"), "{n}");
+        // No feed at all: nothing Running either.
+        assert_eq!(watch_step(&dir, "s9", T0, &look), Watch::Idle);
+        // A second watch on the session ends at once, naming the first.
+        let held = WatchLock::take(&dir, "s1").ok().unwrap();
+        let n = watch(&dir, "s1", &look);
+        assert_eq!(
+            n,
+            format!(
+                "giverny manage watch: one is already running for this session (pid {}); this \
+                 one ends. Keep that one.",
+                std::process::id()
+            )
+        );
+        drop(held);
+        assert!(WatchLock::take(&dir, "s1").is_ok(), "free once it ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watch on the real clock: it sleeps to the figure's end and
+    /// prints the check then, with no call from anyone.
+    #[test]
+    fn the_watch_wakes_when_the_figure_runs_out() {
+        let dir = scratch("watch-clock");
+        let look = Fake(work());
+        // The feed keeps whole seconds.
+        let t = manage::now_ms() / 1000 * 1000;
+        write_rows(
+            &dir,
+            json!([{"key": "g1", "stage": "running", "agent_id": "a1",
+                "started": manage::stamp(t), "eta_s": 2}]),
+        );
+        let n = watch(&dir, "s1", &look);
+        let took = manage::now_ms() - t;
+        assert!(
+            n.contains("progress check on `g1`: its worker's figure has just run out (its figure,"),
+            "{n}"
+        );
+        assert!((2000..6000).contains(&took), "{took}ms");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -200,7 +200,8 @@ When you spawn one:
   `auth-fix: fix the token refresh race`. The pane joins the row to its worker
   by this name.
 - Run workers in the background when several run at once, and never start two
-  workers that touch the same files.
+  workers that touch the same files. Once one is Running, keep a
+  `giverny-manage watch` going in the background (see **A progress check**).
 - Give the worker everything it needs in its prompt; it cannot see this
   conversation. Include these lines, with the task name filled in:
 
@@ -274,6 +275,16 @@ When you spawn one:
   (SendMessage) to cut, change course or go on, or let it go on; re-estimate
   the row or split the task if that is what it needs. Giverny stops and
   re-estimates nothing.
+  - **Keep one `giverny-manage watch` running in the background** (Bash with
+    `run_in_background`) while you have Running rows: it sleeps until the
+    next check falls due, prints it and exits, and its exit wakes you even
+    while you wait idle for your workers. Read its output file — that is the
+    check — act on it, then start a fresh `watch`. One that says nothing is
+    Running needs no restart until a task runs again; a second one says one
+    is already running and exits. It only prints. A check it printed is not
+    told again on your next tool call, nor the other way round.
+  - A worker deep in one long foreground command hears its own overdue ask
+    only on its next tool call; that is fine, you are the one who judges.
 - **`resume` restarts only the clock** too. It says whether the task's worker
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh

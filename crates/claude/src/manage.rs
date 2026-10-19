@@ -83,6 +83,12 @@ usage: giverny manage <command> [args] [--session <id>]
   accuracy [--repo R]         how every estimator's instinct and figures fared
                               against the time really worked, older tasks
                               against recent
+  watch                       wait for this session's next progress check (a
+                              worker's figure runs out, or it asked for much
+                              more time), print it and end; with nothing
+                              Running, end at once. Run it in the background
+                              while tasks run: its end wakes you. One per
+                              session; it only prints
   path                        print the feed file's path
   clear-done                  clear the Done rows: from this session's feed,
                               and from the management panel of the Giverny tab it runs in
@@ -184,6 +190,9 @@ pub enum Cmd {
     Reply(String, String),
     /// How each estimator's figures fared, older against recent.
     Accuracy,
+    /// Wait for the session's next progress check, print it and end
+    /// (giverny#473): the manager runs it in the background.
+    Watch,
 }
 
 impl Cmd {
@@ -427,6 +436,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         "release" => Cmd::Release(task()?),
         "resources" => Cmd::Resources,
         "accuracy" => Cmd::Accuracy,
+        "watch" => Cmd::Watch,
         "run" => Cmd::Run(task()?),
         "ask" | "reply" => {
             let what = task()?;
@@ -1212,6 +1222,7 @@ pub fn apply(
         | Cmd::Release(_)
         | Cmd::Resources
         | Cmd::Accuracy
+        | Cmd::Watch
         | Cmd::Run(_)
         | Cmd::Ask(..)
         | Cmd::Reply(..) => {
@@ -1589,6 +1600,7 @@ pub fn apply(
         | Cmd::Release(_)
         | Cmd::Resources
         | Cmd::Accuracy
+        | Cmd::Watch
         | Cmd::Run(_)
         | Cmd::Ask(..)
         | Cmd::Reply(..) => unreachable!(),
@@ -1914,6 +1926,10 @@ pub fn run_in_code(
     // A name is the session's, not a manager's: no feed, no lease.
     if let Cmd::Name(given) = cmd {
         return name(dir, session, given.as_deref(), flags.claude_dir.as_deref()).map(|m| (m, 0));
+    }
+    // The watch waits on the clock: the command line's own (`main`).
+    if *cmd == Cmd::Watch {
+        return Err("`watch` runs only as its own command: `giverny manage watch`".into());
     }
     adopt_continued(dir, session, flags.claude_dir.as_deref());
     let ledger = resources::ledger_path(dir);
@@ -2922,6 +2938,18 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
             eprintln!("giverny manage: {why}");
             return 1;
         }
+    }
+    if cmd == Cmd::Watch {
+        let dir = feed::feed_dir();
+        let transcript = continuation::config_dir()
+            .and_then(|c| crate::subagents::session_transcript(&c, &session));
+        let look = crate::manage_progress::System {
+            feed_dir: &dir,
+            session: &session,
+            transcript: transcript.as_deref(),
+        };
+        println!("{}", crate::manage_progress::watch(&dir, &session, &look));
+        return 0;
     }
     let now = now_ms();
     match run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None) {
