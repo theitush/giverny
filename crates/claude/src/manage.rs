@@ -65,7 +65,10 @@ usage: giverny manage <command> [args] [--session <id>]
                               moves the row to that worker, as on `start`
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
                               the task landed now (Done)
-  pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it
+  pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it.
+                              It stops nothing else: the task's `run`
+                              commands still going are listed, each with
+                              the command that would stop it
   drop  <task>                remove the task's row
   name  [<First> | <First Last>]
                               this session's name, printed in full. With no
@@ -1962,6 +1965,12 @@ pub fn run_in_code(
             return Err(e);
         }
     };
+    // A pause stops the clock only: what still runs for the task is named
+    // for the manager to stop or keep (giverny#471). Giverny stops nothing.
+    if let Cmd::Pause(task) = cmd {
+        let runs = crate::run_live::task_runs(&crate::run_live::runs_dir(&ledger), session, task);
+        msg.push_str(&still_running(task, &runs, now));
+    }
     // A task that lands — by `land`, or handed off by a `start --agent` — or
     // is dropped gives its lease back, after the feed's lock is let go (the
     // ledger's is never taken under it).
@@ -1981,6 +1990,72 @@ pub fn run_in_code(
         }
     }
     Ok((msg, 0))
+}
+
+/// What `pause` adds for a task's `run` commands still going: each one's
+/// command, how long it has run, its pid and the command that stops it
+/// (`kill <pid>`: its `run` stops the command's scope, or its whole tree,
+/// and records, giverny#426/#436). Nothing when none is (giverny#471).
+fn still_running(task: &str, runs: &[crate::run_live::LiveRun], now: u64) -> String {
+    if runs.is_empty() {
+        return String::new();
+    }
+    let n = runs.len();
+    let (what, it) = if n == 1 {
+        (
+            "1 `giverny-manage run` command still runs".to_string(),
+            "it",
+        )
+    } else {
+        (
+            format!("{n} `giverny-manage run` commands still run"),
+            "them",
+        )
+    };
+    let mut out = format!(
+        "\n  only its clock: {what} for {task}, and Giverny stops nothing. Have the worker \
+         finish or stop {it} at a safe point, or stop {it} yourself:"
+    );
+    for line in run_lines(runs, now) {
+        out.push_str(&format!("\n    {line}"));
+    }
+    out
+}
+
+/// Each live run as a line: `` `sleep 300`, 8m in, pid 4242: `kill 4242`
+/// stops it and all it started ``.
+pub(crate) fn run_lines(runs: &[crate::run_live::LiveRun], now: u64) -> Vec<String> {
+    runs.iter()
+        .map(|r| {
+            let what = r
+                .cmd
+                .as_deref()
+                .map_or("(command not recorded)".into(), short_cmd);
+            let ran = r.started_ms.map_or(String::new(), |t| {
+                let s = now.saturating_sub(t) / 1000;
+                match s {
+                    0..60 => format!(", {s}s in"),
+                    _ => format!(", {} in", feed::fmt_span(s as i64)),
+                }
+            });
+            format!(
+                "{what}{ran}, pid {pid}: `kill {pid}` stops it and all it started",
+                pid = r.pid
+            )
+        })
+        .collect()
+}
+
+/// A command as a one-line listing quotes it: in backticks, held to about
+/// 60 characters.
+fn short_cmd(cmd: &str) -> String {
+    let one: String = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 60;
+    let cut = match one.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…", &one[..i]),
+        None => one,
+    };
+    format!("`{}`", cut.replace('`', "'"))
 }
 
 /// `release` of a task this session holds no lease for, which another
@@ -2339,6 +2414,20 @@ fn run_feed(
             };
             freeze_tokens(&mut doc, &before, handed, read_log);
             let mut msg = msg;
+            // A resume restarts the clock only: whether anyone works on the
+            // task now, and how to wake it, is the manager's to see
+            // (giverny#471). Giverny wakes nothing.
+            if let Cmd::Resume(key) = cmd {
+                let agent = row_agent(&doc, key).map(str::to_string);
+                let state = agent.as_deref().map(|a| worker_state(cfg, &sessions, a));
+                msg.push_str(&resume_note(
+                    key,
+                    agent.as_deref(),
+                    state,
+                    row_wait(&doc, key),
+                    now,
+                ));
+            }
             for (agent, keys) in &linked {
                 msg.push_str(&format!(
                     "\n  {} handed to {agent} by message: its tokens are its own",
@@ -2387,6 +2476,88 @@ fn run_feed(
             Ok((msg, landed))
         }
     }
+}
+
+/// What a task's worker is doing, as `resume` reports it (giverny#471).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerState {
+    /// Its transcript was last written then, after its latest finish.
+    Working { last_ms: Option<u64> },
+    /// It ended its turn then: its finish notice is as new as its last turn.
+    Ended { at_ms: u64 },
+}
+
+/// Worker `agent`'s state: ended when the session's transcript holds a
+/// finish notice for it as new as its last turn ([`crate::subagents::is_finished`]).
+fn worker_state(cfg: Option<&Path>, sessions: &[String], agent: &str) -> WorkerState {
+    let last = last_written(cfg, sessions, agent);
+    let cfg = cfg.map(Path::to_path_buf).or_else(continuation::config_dir);
+    let done = sessions
+        .iter()
+        .filter_map(|s| crate::subagents::session_transcript(cfg.as_deref()?, s))
+        .find_map(|t| crate::subagents::read_completions(&t).remove(agent));
+    match done.filter(|c| crate::subagents::is_finished(c, last)) {
+        Some(c) => WorkerState::Ended { at_ms: c.at_ms },
+        None => WorkerState::Working { last_ms: last },
+    }
+}
+
+/// The row `key`'s open wait: since when, and its note.
+fn row_wait(doc: &Value, key: &str) -> Option<(u64, Option<String>)> {
+    let row = doc
+        .get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| find(rows, key).map(|i| &rows[i]))
+        .and_then(Value::as_object)?;
+    let since = ms_of(row, "waiting_since")?;
+    let note = row.get("note").and_then(Value::as_str).map(str::to_string);
+    Some((since, note))
+}
+
+/// What `resume` adds under its line (giverny#471): whether the task's
+/// worker is working or has ended its turn and needs waking, and how; or
+/// that none holds it; and a wait it marked that is still open.
+pub fn resume_note(
+    key: &str,
+    agent: Option<&str>,
+    state: Option<WorkerState>,
+    wait: Option<(u64, Option<String>)>,
+    now: u64,
+) -> String {
+    let ago = |t: u64| feed::fmt_span((now.saturating_sub(t) / 1000) as i64);
+    let mut out = match (agent, state) {
+        (Some(a), Some(WorkerState::Ended { at_ms })) => format!(
+            "\n  its worker {a} ended its turn {} ago and will not carry on by itself: wake \
+             it with SendMessage (to: \"{a}\") saying what to do next, or spawn a fresh \
+             worker with a brief and `giverny-manage start {key} --agent <its id>`. Giverny \
+             wakes nothing.",
+            ago(at_ms)
+        ),
+        (Some(a), Some(WorkerState::Working { last_ms: Some(t) })) => {
+            format!("\n  its worker {a} is working (last wrote {} ago)", ago(t))
+        }
+        (Some(a), _) => format!(
+            "\n  its worker {a} has written nothing Giverny can read: check it is working, \
+             or wake it with SendMessage (to: \"{a}\")"
+        ),
+        (None, _) => format!(
+            "\n  no worker holds {key}: spawn one with a brief, or hand it to an idle one \
+             (`giverny-manage start {key} --agent <id>`)"
+        ),
+    };
+    if let Some((since, note)) = wait {
+        let why = note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map_or(String::new(), |n| format!(" ({n})"));
+        out.push_str(&format!(
+            "\n  its wait{why} is still open, {} in: off its working time until the worker's \
+             next `eta` without --why",
+            ago(since)
+        ));
+    }
+    out
 }
 
 /// The worker the row `key` has, if it has one.
@@ -3257,6 +3428,138 @@ mod tests {
         let r = &read_feed(&dir).rows[1];
         assert_eq!(r.landing.as_deref(), Some("Blocked — no-network"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pause` stops the clock only, and names the task's `run` commands
+    /// still going with how to stop each; with none, its line is as it was
+    /// (giverny#471).
+    #[test]
+    fn a_pause_names_the_runs_still_going_and_stops_none() {
+        let dir = scratch("pause-runs");
+        run(&dir, "start a --eta 30", T0).unwrap();
+        run(&dir, "start b --eta 30", T0).unwrap();
+        let runs = crate::run_live::runs_dir(&resources::ledger_path(&dir));
+        std::fs::create_dir_all(&runs).unwrap();
+        let cmd = ["sleep".to_string(), "300".to_string()];
+        let live = crate::run_live::register_bound(
+            &runs.join("1-0.stats"),
+            "a",
+            "s1",
+            T0 + 2 * MIN,
+            None,
+            &cmd,
+        )
+        .expect("registered");
+        let me = std::process::id();
+        let out = run(&dir, "pause a", T0 + 10 * MIN).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "paused a\n  only its clock: 1 `giverny-manage run` command still runs for a, \
+                 and Giverny stops nothing. Have the worker finish or stop it at a safe point, \
+                 or stop it yourself:\n    `sleep 300`, 8m in, pid {me}: `kill {me}` stops it \
+                 and all it started"
+            )
+        );
+        assert!(crate::run_live::alive(me), "nothing was stopped");
+        assert_eq!(read_feed(&dir).rows[0].paused_since_ms, Some(T0 + 10 * MIN));
+        // Another task's run is not b's.
+        assert_eq!(run(&dir, "pause b", T0 + 10 * MIN).unwrap(), "paused b");
+        drop(live);
+        run(&dir, "resume a", T0 + 11 * MIN).unwrap();
+        assert_eq!(run(&dir, "pause a", T0 + 12 * MIN).unwrap(), "paused a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resume` says whether anyone works on the task now and how to wake
+    /// its worker, and a wait still open; it wakes nothing (giverny#471).
+    #[test]
+    fn resume_says_whether_the_worker_works_and_how_to_wake_it() {
+        let ended = resume_note(
+            "170",
+            Some("ad22"),
+            Some(WorkerState::Ended {
+                at_ms: T0 - 12 * MIN,
+            }),
+            Some((T0 - 13 * MIN, Some("machine time".into()))),
+            T0,
+        );
+        assert_eq!(
+            ended,
+            "\n  its worker ad22 ended its turn 12m ago and will not carry on by itself: wake it \
+             with SendMessage (to: \"ad22\") saying what to do next, or spawn a fresh worker \
+             with a brief and `giverny-manage start 170 --agent <its id>`. Giverny wakes \
+             nothing.\n  its wait (machine time) is still open, 13m in: off its working time \
+             until the worker's next `eta` without --why"
+        );
+        let working = resume_note(
+            "170",
+            Some("ad22"),
+            Some(WorkerState::Working {
+                last_ms: Some(T0 - MIN),
+            }),
+            None,
+            T0,
+        );
+        assert_eq!(
+            working,
+            "\n  its worker ad22 is working (last wrote 1m ago)"
+        );
+        assert!(resume_note("170", None, None, None, T0).contains("no worker holds 170"));
+        // The real command: a row with no worker, its wait kept open.
+        let dir = scratch("resume-note");
+        run(&dir, "start a --eta 30", T0).unwrap();
+        run(&dir, "eta a 20 --why wait --note sims", T0 + MIN).unwrap();
+        run(&dir, "pause a", T0 + 2 * MIN).unwrap();
+        let out = run(&dir, "resume a", T0 + 3 * MIN).unwrap();
+        assert!(out.starts_with("resumed a\n  no worker holds a"), "{out}");
+        assert!(
+            !out.contains("its wait"),
+            "the pause closed the wait: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn still_running_lists_each_run_short() {
+        use crate::run_live::LiveRun;
+        let long = format!("cargo test {}", "x".repeat(80));
+        let runs = [
+            LiveRun {
+                pid: 7,
+                cmd: Some(long),
+                started_ms: Some(T0),
+            },
+            LiveRun {
+                pid: 8,
+                cmd: None,
+                started_ms: None,
+            },
+        ];
+        let out = still_running("g1", &runs, T0 + 90 * MIN);
+        assert!(
+            out.contains("2 `giverny-manage run` commands still run for g1"),
+            "{out}"
+        );
+        assert!(out.contains("stop them yourself"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "`cargo test {}…`, 1h30m in, pid 7: `kill 7`",
+                "x".repeat(49)
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n    (command not recorded), pid 8: `kill 8`"),
+            "{out}"
+        );
+        assert_eq!(still_running("g1", &[], T0), "");
+        let fresh = LiveRun {
+            pid: 9,
+            cmd: Some("sleep 300".into()),
+            started_ms: Some(T0 - 40_000),
+        };
+        assert!(still_running("g1", &[fresh], T0).contains("`sleep 300`, 40s in, pid 9"));
     }
 
     #[test]

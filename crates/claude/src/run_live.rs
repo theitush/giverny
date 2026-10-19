@@ -5,7 +5,8 @@
 //! `stats`, `started_ms`, `cwd`: the worktree it works in, which the
 //! reach guard keeps other sessions out of, [`crate::reach_guard`], and
 //! `bound_mb`: the memory the command is held to, null when nothing holds
-//! it, giverny#456), and removes it when the command ends. The shim
+//! it, giverny#456; `cmd`: the command, which `pause` names, giverny#471),
+//! and removes it when the command ends. The shim
 //! inside the command's systemd scope adds `cgroup <dir>` to the stats file
 //! as it starts, so a reader finds the scope's cgroup without asking
 //! systemd. The app's one sampler ([`crate::use_reading`]) lists them
@@ -87,18 +88,20 @@ impl Drop for Registered {
 /// to nothing. Sweeps `.live` files whose `run` is gone first. A failure
 /// only costs the pane its live figure, so it is `None`, not an error.
 pub fn register(stats: &Path, task: &str, session: &str, now_ms: u64) -> Option<Registered> {
-    register_bound(stats, task, session, now_ms, None)
+    register_bound(stats, task, session, now_ms, None, &[])
 }
 
 /// [`register`], for a command held to `bound_mb` of memory (a scope's
 /// `MemoryHigh`, Giverny's own kill), which the ledger counts its lease at
-/// until it ends ([`crate::resources::RunBounds`], giverny#456).
+/// until it ends ([`crate::resources::RunBounds`], giverny#456). `cmd` is
+/// kept for `pause` to name it ([`task_runs`], giverny#471).
 pub fn register_bound(
     stats: &Path,
     task: &str,
     session: &str,
     now_ms: u64,
     bound_mb: Option<u64>,
+    cmd: &[String],
 ) -> Option<Registered> {
     if let Some(dir) = stats.parent() {
         sweep(dir);
@@ -112,6 +115,7 @@ pub fn register_bound(
         "started_ms": now_ms,
         "cwd": std::env::current_dir().ok().map(|d| d.display().to_string()),
         "bound_mb": bound_mb,
+        "cmd": (!cmd.is_empty()).then(|| cmd.join(" ")),
     });
     let tmp = path.with_extension("live.tmp");
     std::fs::write(&tmp, body.to_string()).ok()?;
@@ -139,6 +143,8 @@ struct LiveFile {
     /// Held to that much memory; `None` when nothing holds it (or the file
     /// is older than giverny#456 and does not say).
     bound_mb: Option<u64>,
+    /// The command, when the file says (giverny#471).
+    cmd: Option<String>,
 }
 
 fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
@@ -152,6 +158,7 @@ fn parse_live(bytes: &[u8]) -> Option<LiveFile> {
         started_ms: v.get("started_ms").and_then(Value::as_u64),
         cwd: s("cwd").map(PathBuf::from),
         bound_mb: v.get("bound_mb").and_then(Value::as_u64),
+        cmd: s("cmd"),
     })
 }
 
@@ -240,6 +247,49 @@ pub fn records(runs_dir: &Path) -> Vec<RunRecord> {
             cwd: l.cwd,
         })
         .collect()
+}
+
+/// One of a task's `run` commands still going: what `pause` names
+/// (giverny#471), for the manager to stop or keep. Giverny stops nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRun {
+    /// The `run` process. A SIGTERM to it stops the command's scope, or
+    /// run plain its whole tree, and still records and releases
+    /// (giverny#426, #436): `kill <pid>`.
+    pub pid: u32,
+    /// The command, when its `.live` file says (older ones do not).
+    pub cmd: Option<String>,
+    /// When it started, epoch ms.
+    pub started_ms: Option<u64>,
+}
+
+/// `session`'s `run` commands for `task` that are still going under
+/// `runs_dir`, oldest first.
+pub fn task_runs(runs_dir: &Path, session: &str, task: &str) -> Vec<LiveRun> {
+    session_runs(runs_dir, session)
+        .into_iter()
+        .filter(|(t, _)| t == task)
+        .map(|(_, r)| r)
+        .collect()
+}
+
+/// `session`'s `run` commands still going under `runs_dir`, each with its
+/// task, oldest first.
+pub fn session_runs(runs_dir: &Path, session: &str) -> Vec<(String, LiveRun)> {
+    let mut out: Vec<(String, LiveRun)> = read_dir(runs_dir)
+        .into_iter()
+        .filter(|(_, l)| l.session == session && alive(l.pid))
+        .map(|(_, l)| {
+            let r = LiveRun {
+                pid: l.pid,
+                cmd: l.cmd,
+                started_ms: l.started_ms,
+            };
+            (l.task, r)
+        })
+        .collect();
+    out.sort_by_key(|(_, r)| (r.started_ms, r.pid));
+    out
 }
 
 /// The `cgroup <dir>` line the shim wrote into a stats file.
@@ -380,6 +430,49 @@ mod tests {
             [("s1".to_string(), "demo#2".to_string(), std::process::id())]
         );
         assert_eq!(running(&runs).len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `pause` finds its session's live runs of the task, with their
+    /// command; another task's, another session's and a dead run's are not
+    /// its (giverny#471).
+    #[test]
+    fn a_tasks_live_runs_are_found_with_their_command() {
+        let d = scratch("task-runs");
+        let runs = d.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let cmd = ["sleep".to_string(), "300".to_string()];
+        let _a = register_bound(&runs.join("1-0.stats"), "g471", "s1", 2_000, None, &cmd)
+            .expect("registered");
+        let _b = register(&runs.join("1-1.stats"), "g471", "s1", 1_000).expect("registered");
+        let _c = register_bound(&runs.join("1-2.stats"), "other", "s1", 1_000, None, &cmd)
+            .expect("registered");
+        let _d = register_bound(&runs.join("1-3.stats"), "g471", "s2", 1_000, None, &cmd)
+            .expect("registered");
+        std::fs::write(
+            runs.join("2-0.live"),
+            json!({"task":"g471","session":"s1","pid":u32::MAX - 1,
+                   "stats":"x","cmd":"gone"})
+            .to_string(),
+        )
+        .unwrap();
+        let me = std::process::id();
+        assert_eq!(
+            task_runs(&runs, "s1", "g471"),
+            [
+                LiveRun {
+                    pid: me,
+                    cmd: None,
+                    started_ms: Some(1_000)
+                },
+                LiveRun {
+                    pid: me,
+                    cmd: Some("sleep 300".into()),
+                    started_ms: Some(2_000)
+                },
+            ]
+        );
+        assert!(task_runs(&runs, "s1", "nope").is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

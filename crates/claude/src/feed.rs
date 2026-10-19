@@ -124,6 +124,10 @@ pub struct FeedRow {
     /// `giverny manage`: the seconds of closed waiting spans (`eta --why
     /// wait`), left out of the working time a Done row is measured by.
     pub wait_s: Option<u64>,
+    /// `giverny manage`: when the worker's still-open wait began (`eta
+    /// --why wait`); the pane says so on a row nothing works on now
+    /// (giverny#471).
+    pub waiting_since_ms: Option<u64>,
     /// `giverny manage`: the dispatcher's figure at the start, kept when a
     /// worker's `eta` replaced `eta_s`; `eta_guess_s` the raw guess a row
     /// from before giverny#229 kept beside a corrected `eta_s`. A Done row
@@ -484,6 +488,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         left_s: u64_field(v, "left_s"),
         left_at_ms: millis_field(v, "left_at"),
         wait_s: u64_field(v, "wait_s"),
+        waiting_since_ms: millis_field(v, "waiting_since"),
         eta_first_s: u64_field(v, "eta_first_s"),
         eta_guess_s: u64_field(v, "eta_guess_s"),
         reest_s: u64_field(v, "reest_s"),
@@ -848,6 +853,11 @@ impl<L: LiveAgent> PaneRow<'_, L> {
     /// - a row that began well after its worker did
     ///   ([`LATER_TASK_MS`]): one worker given a second task later holds a
     ///   row per task, each started at its own time;
+    /// - a row that began well before its worker did ([`LATER_TASK_MS`]): a
+    ///   fresh worker taking over a task, often after a pause. Its pauses
+    ///   came before that worker, so the worker's start moved on by them
+    ///   would lie ahead and hold the clock at zero (giverny#471); the
+    ///   feed's `started` already has them off;
     /// - the row's paused spans, which Claude Code knows nothing of: the
     ///   worker's start is moved on by the same amount the writer moved
     ///   `started` on by (`started − spawned`, else `paused_s`).
@@ -882,7 +892,9 @@ impl<L: LiveAgent> PaneRow<'_, L> {
         let began = started.saturating_sub(moved);
         // A task the spawn named is the worker's first, whenever the writer
         // stamped it.
-        if began > worker.saturating_add(LATER_TASK_MS) && !self.spawn_task() {
+        if began > worker.saturating_add(LATER_TASK_MS) && !self.spawn_task()
+            || worker > began.saturating_add(LATER_TASK_MS)
+        {
             Some(started)
         } else {
             Some(worker.saturating_add(moved))

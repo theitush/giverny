@@ -3220,10 +3220,12 @@ mod tests {
         std::fs::create_dir_all(&runs).unwrap();
         let ledger = dir.join("ledger.json");
         std::fs::write(run_caps_path(&ledger), "capped\n").unwrap();
-        let _a = crate::run_live::register_bound(&runs.join("1-0.stats"), "a", "s", T0, Some(6144))
-            .unwrap();
-        let _b = crate::run_live::register_bound(&runs.join("1-1.stats"), "a", "s", T0, Some(2048))
-            .unwrap();
+        let _a =
+            crate::run_live::register_bound(&runs.join("1-0.stats"), "a", "s", T0, Some(6144), &[])
+                .unwrap();
+        let _b =
+            crate::run_live::register_bound(&runs.join("1-1.stats"), "a", "s", T0, Some(2048), &[])
+                .unwrap();
         let _c = crate::run_live::register(&runs.join("1-2.stats"), "b", "s", T0).unwrap();
         let b = RunBounds::detect(&ledger);
         assert!(b.caps);

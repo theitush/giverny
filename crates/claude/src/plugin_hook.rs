@@ -41,7 +41,9 @@
 //!   calls, its unread `ask`/`reply` messages delivered
 //!   ([`manage_inbox`]), and its rows' chores — a finished worker's task to
 //!   land, a Next up task idle with nothing to wait on — told once each
-//!   ([`manage_chores`]).
+//!   ([`manage_chores`]), as is a task paused ten minutes with a `run`
+//!   command of it still going, with how to stop it
+//!   ([`manage_nudge::paused_runs`], giverny#471).
 //! - **What a subagent leaves running.** A subagent finishing with a
 //!   background shell or monitor of its own still running is asked, once,
 //!   whether it should keep running ([`crate::leftovers::subagent_stop`]);
@@ -81,7 +83,8 @@
 //! reads would raise a permission prompt for it.
 //!
 //! **Cheap when idle.** A call that is not a spawn and not a worker's costs a
-//! few `stat`s, the clocks and the session's small away record; a worker's
+//! few `stat`s, the clocks, the session's small away record and a read of
+//! the small `run` records directory; a worker's
 //! call before its five minutes, a `stat` of its spawn metadata, and after
 //! them a read of its small agent-ETA file. A `SubagentStop` with no
 //! background command in flight reads no file either. Whatever happens the hook exits 0, so it
@@ -300,6 +303,7 @@ pub fn run_with(
         manage_inbox::deliver(dir, &ledger, session, now),
         resources::news(&ledger, session, now),
         manage_chores::deliver(dir, session, now),
+        crate::manage_nudge::paused_runs(dir, session, now),
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),
         crate::strays::between(dir, session, now, &crate::strays::System),

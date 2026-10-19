@@ -2071,6 +2071,10 @@ fn format_row(
     // Only what the person has to know is flagged: a worker stopped on an
     // API error, a row nothing runs. A finished worker's row and an idle
     // Next up row are their manager's ([`chores`]), drawn plain.
+    // The worker's open wait (`eta --why wait`) and what it said of it.
+    let waiting = f
+        .filter(|_| row.stage == Stage::Running)
+        .and_then(|f| f.waiting_since_ms.map(|w| (w, f.note.as_deref())));
     let flag = match row.stage {
         Stage::Running => unworked(row, now_ms).and_then(Unworked::flag),
         Stage::Planned | Stage::Done => None,
@@ -2085,10 +2089,17 @@ fn format_row(
             (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
             (None, Some(p)) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
             (None, None) if stopped.is_some() => stopped.map(|(_, why)| why).unwrap_or_default(),
-            (None, None) => l
-                .filter(|l| l.running())
-                .and_then(|l| l.activity.clone())
-                .unwrap_or_default(),
+            // Its worker ended its turn: when, and the wait it marked, so
+            // the row does not read as work going on (giverny#471).
+            (None, None) => match unworked(row, now_ms) {
+                Some(Unworked::Finished { ended_ms, .. }) => {
+                    turn_ended(ended_ms, waiting, now_ms, &clock.tz)
+                }
+                _ => l
+                    .filter(|l| l.running())
+                    .and_then(|l| l.activity.clone())
+                    .unwrap_or_default(),
+            },
         },
         // What it waits for ([`planned_wait`]); nothing when it waits on
         // nothing recorded. A Running row benched while paused: since when,
@@ -2157,9 +2168,14 @@ fn format_row(
                 Some(Unworked::Stopped(r)) => {
                     Some(format!("stopped: {r} — its worker is not working"))
                 }
-                Some(Unworked::Finished { how, .. }) => {
-                    Some(format!("its worker {how} — not landed yet"))
-                }
+                Some(Unworked::Finished { how, ended_ms }) => Some(match ended_ms {
+                    Some(e) => format!(
+                        "its worker {how} at {} — not landed yet; nothing works on it \
+                         until its manager wakes the worker or lands it",
+                        clock_at(e, now_ms, &clock.tz)
+                    ),
+                    None => format!("its worker {how} — not landed yet"),
+                }),
                 _ => None,
             }
             .or_else(|| {
@@ -2171,6 +2187,10 @@ fn format_row(
                 })
             })
             .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
+            // The worker's open wait, in full: NOW cuts it (giverny#471).
+            let waited = waiting
+                .filter(|_| paused.is_none())
+                .map(|(w, n)| waiting_why(w, n, now_ms, &clock.tz));
             // What the worker is doing right now, whole: NOW cuts it to fit.
             let doing = l
                 .filter(|l| l.running())
@@ -2179,6 +2199,7 @@ fn format_row(
             doing
                 .into_iter()
                 .chain(running_why(&who, since.as_deref(), eta_s, left_s, state))
+                .chain(waited)
                 .collect()
         }
         Stage::Planned => {
@@ -2573,6 +2594,35 @@ fn running_why(
 
 /// A paused row's hover: `paused since 15:10: <note>`, else why its
 /// clock stands.
+/// NOW of a Running row whose worker ended its turn (giverny#471): when,
+/// and the wait it marked, if any — `turn ended 11:41 · waiting: machine
+/// time`.
+fn turn_ended(
+    ended_ms: Option<u64>,
+    waiting: Option<(u64, Option<&str>)>,
+    now_ms: u64,
+    tz: &jiff::tz::TimeZone,
+) -> String {
+    let ended = match ended_ms {
+        Some(e) => format!("turn ended {}", clock_at(e, now_ms, tz)),
+        None => "turn ended".into(),
+    };
+    match waiting {
+        Some((_, Some(n))) if !n.trim().is_empty() => format!("{ended} · waiting: {}", n.trim()),
+        Some(_) => format!("{ended} · waiting"),
+        None => ended,
+    }
+}
+
+/// The hover's line for a worker's open wait (giverny#471).
+fn waiting_why(since_ms: u64, note: Option<&str>, now_ms: u64, tz: &jiff::tz::TimeZone) -> String {
+    let since = clock_at(since_ms, now_ms, tz);
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("waiting since {since}: {n}"),
+        None => format!("waiting since {since}, on something that is not the work"),
+    }
+}
+
 fn paused_why(since: &str, note: Option<&str>) -> String {
     match note.filter(|n| !n.is_empty()) {
         Some(n) => format!("paused since {since}: {n}"),
@@ -4845,6 +4895,82 @@ mod tests {
         assert_eq!(t.lines[0].eta, countdown(1800 - 300));
     }
 
+    /// giverny#471, poly's row `170`: paused 987 s under its first worker,
+    /// resumed, and taken over by a fresh worker that marked a wait and
+    /// ended its turn. Its clock counted from the new worker's start moved
+    /// on by pauses that came before that worker: in the future, so 0:00
+    /// and frozen; NOW was empty. Now the clock is the task's, and NOW says
+    /// the turn ended, and the wait.
+    #[test]
+    fn a_resumed_row_taken_over_by_a_fresh_worker_reads_clearly() {
+        const M: u64 = 60_000;
+        let spawned = T0 - 112 * M;
+        let started = spawned + 987_000;
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"170","stage":"running","agent_id":"a1","spawned":{spawned},
+                "started":{started},"paused_s":987,"eta_s":33433,"left_s":28500,
+                "left_at":{la},"waiting_since":{la},"wait_s":1490,
+                "note":"machine time: re-sims and scorer running"}}]}}"#,
+            la = T0 - 13 * M,
+        ));
+        let worker = |status: &str| {
+            live(&format!(
+                r#"{{"session_id":"s","tasks":[{{"id":"a1","status":"{status}",
+                    "description":"170: finish per-minute scores",
+                    "startTime":{st},"endTime":{en},"label":"Running the sims"}}]}}"#,
+                st = T0 - 15 * M,
+                en = T0 - 12 * M,
+            ))
+        };
+        let tz = Clock::plain().tz;
+        let ended = worker("completed");
+        let t = build(Some(&f), &ended, T0);
+        let l = &t.lines[0];
+        assert_eq!(l.stage, Stage::Running);
+        assert_eq!(
+            l.elapsed,
+            stopwatch((112 * 60) - 987),
+            "the task's clock, moving"
+        );
+        // Ended when the live list first saw it so (here T0).
+        assert_eq!(
+            l.now,
+            format!(
+                "turn ended {} · waiting: machine time: re-sims and scorer running",
+                clock_at(T0, T0, &tz)
+            )
+        );
+        assert!(
+            l.why
+                .iter()
+                .any(|w| w.contains("until its manager wakes the worker")),
+            "{:?}",
+            l.why
+        );
+        assert!(
+            l.why.iter().any(|w| w.starts_with("waiting since")
+                && w.ends_with(": machine time: re-sims and scorer running")),
+            "the wait in full: {:?}",
+            l.why
+        );
+        let later = build(Some(&f), &ended, T0 + 2 * M);
+        assert_eq!(later.lines[0].elapsed, stopwatch((114 * 60) - 987));
+        // Working again: its activity, and the hover keeps the wait.
+        let working = worker("running");
+        let t = build(Some(&f), &working, T0);
+        assert_eq!(t.lines[0].now, "Running the sims");
+        assert_eq!(t.lines[0].elapsed, stopwatch((112 * 60) - 987));
+        assert!(
+            t.lines[0]
+                .why
+                .iter()
+                .any(|w| w.starts_with("waiting since")),
+            "{:?}",
+            t.lines[0].why
+        );
+    }
+
     #[test]
     fn a_made_up_agent_key_is_not_drawn() {
         // A row a worker with no task started under giverny#158's first round.
@@ -5472,7 +5598,9 @@ mod tests {
         let line = |id: &str| t.lines.iter().find(|l| l.id == id).unwrap();
         let got = line("acme#615");
         assert_eq!(got.stage, Stage::Running, "the feed's stage, never Done");
-        assert_eq!(got.now, "", "no chore text");
+        // When its turn ended, a fact (giverny#471), and no chore text.
+        assert!(got.now.starts_with("turn ended "), "{}", got.now);
+        assert!(!got.now.contains("land"), "{}", got.now);
         assert!(!got.flag, "drawn in its own colour");
         assert!(
             !got.click.facts.iter().any(|f| f.contains("landed")),
@@ -5867,9 +5995,11 @@ mod tests {
         assert_eq!(got[0].kind, manage_chores::Kind::Land);
         assert_eq!(got[0].since, T0 - 5 * MIN);
         let t = build_at(Some(&running), &rows, T0, &Clock::plain(), &logs);
-        assert_eq!(
-            (t.lines[0].stage, t.lines[0].now.as_str()),
-            (Stage::Running, "")
+        assert_eq!(t.lines[0].stage, Stage::Running);
+        assert!(
+            t.lines[0].now.starts_with("turn ended "),
+            "{}",
+            t.lines[0].now
         );
         // A worker still at work under the paused row: no chore, and the
         // row says only since when it is paused.
