@@ -675,9 +675,13 @@ pub fn notice(
         && let Some(late) = late
     {
         let eta = manage::u64_of(row, "eta_s").unwrap_or(0);
+        // The watch tells it the moment it runs out: not "overdue by 0m".
+        let by = match late {
+            0..60 => "its worker's figure has just run out".to_string(),
+            _ => format!("its worker is overdue by {}", span(late)),
+        };
         why.push(format!(
-            "its worker is overdue by {} (its figure, {} in all, ran out at {})",
-            span(late),
+            "{by} (its figure, {} in all, ran out at {})",
             span(eta),
             clock(now.saturating_sub(late * 1000))
         ));
@@ -1027,7 +1031,7 @@ mod tests {
         // No worker call; the manager's next call hears it.
         let n = deliver(&dir, "s1", &call, end + 30_000, &look).unwrap();
         assert!(
-            n.contains("progress check on `g1`: its worker is overdue"),
+            n.contains("progress check on `g1`: its worker's figure has just run out (its figure,"),
             "{n}"
         );
         assert_eq!(rows(&dir)[0]["overdue_told"], 120);
@@ -1176,7 +1180,7 @@ mod tests {
         let n = watch(&dir, "s1", &look);
         let took = manage::now_ms() - t;
         assert!(
-            n.contains("progress check on `g1`: its worker is overdue"),
+            n.contains("progress check on `g1`: its worker's figure has just run out (its figure,"),
             "{n}"
         );
         assert!((2000..6000).contains(&took), "{took}ms");
