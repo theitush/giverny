@@ -1226,6 +1226,23 @@ impl Tracker {
         before - self.rows.len()
     }
 
+    /// The session these rows belong to was stopped from its tab
+    /// (giverny#474): its workers died with it, so every Running row is
+    /// Done as of `now_ms`, `Stopped`. Returns how many were.
+    pub fn end_running(&mut self, now_ms: u64) -> usize {
+        let mut ended = 0;
+        for r in &mut self.rows {
+            if r.stage == Stage::Running {
+                r.mark_done(Outcome::Stopped, now_ms);
+                ended += 1;
+            }
+        }
+        if ended > 0 {
+            self.sort();
+        }
+        ended
+    }
+
     /// Has anything worth keeping over a restart: rows, or a clear that has
     /// to keep holding.
     pub fn worth_saving(&self) -> bool {
@@ -1931,6 +1948,26 @@ mod tests {
         assert!(is_finished(&c, Some(T0 + 500)), "within slack");
         assert!(!is_finished(&c, Some(T0 + 60_000)), "messaged again");
         assert!(is_finished(&c, None));
+    }
+
+    #[test]
+    fn a_stopped_session_ends_its_running_rows() {
+        let mut t = Tracker::new(None);
+        t.apply_live(
+            &live("s1", &[("a1", "running", T0), ("a2", "completed", T0)]),
+            T0 + 1,
+        );
+        assert_eq!(t.end_running(T0 + 5_000), 1);
+        let a1 = t.get("a1").unwrap();
+        assert_eq!(a1.stage, Stage::Done);
+        assert_eq!(a1.outcome, Some(Outcome::Stopped));
+        assert_eq!(a1.ended_ms, Some(T0 + 5_000));
+        assert_eq!(
+            t.get("a2").unwrap().outcome,
+            Some(Outcome::Completed),
+            "a finished row keeps how it finished"
+        );
+        assert_eq!(t.end_running(T0 + 9_000), 0);
     }
 
     #[test]

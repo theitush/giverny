@@ -2454,6 +2454,15 @@ impl ClaudeWatch {
         }
     }
 
+    /// `tab` was stopped from the rail (giverny#474): nothing of the Claude
+    /// that ran there is live any more, as for a tab restored after a
+    /// restart, and its pane's workers ended with it. The conversation it
+    /// resumes is the workspace's (`Tab::claude_session`), not this.
+    pub fn stopped(&mut self, tab: TabId) {
+        self.agents.stopped(tab);
+        self.tabs.remove(&tab);
+    }
+
     pub fn state_of(&self, tab: TabId) -> ClaudeState {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }

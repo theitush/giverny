@@ -20,6 +20,7 @@ mod rail;
 mod sessions_load;
 mod settings_ui;
 mod splash;
+mod tab_stop;
 mod taskbar;
 mod titlebar;
 mod translucency;
@@ -1032,6 +1033,18 @@ pub enum Action {
     /// Esc, or the terminal's "back to manager" button, in a tab
     /// showing a worker's view: walk its Claude Code back to the main view.
     BackToMain(TabId),
+    /// The rail's `stop` / `stop all` (giverny#474): end what these tabs
+    /// run and keep the tabs, asking first when more than an idle prompt
+    /// would die.
+    StopTabs(Vec<TabId>),
+    /// The stop confirm's answer: stop them (`true`), or leave them be.
+    ConfirmStop(bool),
+}
+
+/// A stop waiting on its confirm: the tabs, and what in them would die.
+pub struct StopConfirm {
+    pub tabs: Vec<TabId>,
+    pub lines: Vec<String>,
 }
 
 /// One Ctrl+Tab walk. The order is snapshotted at the first press so that
@@ -1340,6 +1353,15 @@ pub struct App {
     /// the shell marks its prompts, which the two-second foreground poll
     /// would miss for an `ls` (giverny#388).
     osc_running: HashSet<TabId>,
+    /// The command each tab's shell has in front, as the foreground poll saw
+    /// it, and since when: what a stop's confirm names (giverny#474).
+    fg_since: HashMap<TabId, (String, Instant)>,
+    /// A stop asked for that waits on its confirm (giverny#474).
+    pub stop_confirm: Option<StopConfirm>,
+    /// The tab stopped while it was the one on screen: it stays stopped,
+    /// showing its saved scrollback, until it is clicked or chosen again
+    /// (giverny#474). Any other stopped tab starts as a restored one does.
+    held: Option<TabId>,
     /// Each tab's input count (`Session::input_seq`) when its last command
     /// finished. A finish with nothing typed since is none you ran: the rc
     /// file's own `$(dircolors)` as a shell starts, a prompt hook's helper
@@ -2092,6 +2114,9 @@ impl App {
             unseen_done: HashSet::new(),
             fg_running: HashMap::new(),
             osc_running: HashSet::new(),
+            fg_since: HashMap::new(),
+            stop_confirm: None,
+            held: None,
             finish_input: HashMap::new(),
             repo_cache: HashMap::new(),
             repo_rx: None,
@@ -2306,6 +2331,11 @@ impl App {
             }
             Action::Select(id) => {
                 self.end_switch();
+                // A stopped tab clicked starts (giverny#474).
+                if self.held == Some(id) {
+                    self.held = None;
+                    self.walk_preview = None;
+                }
                 self.ws.set_active(id);
                 self.refresh_tab_info(id);
                 self.mark_seen(id);
@@ -2381,7 +2411,30 @@ impl App {
                     }
                 }
             }
+            Action::StopTabs(tabs) => {
+                let tabs: Vec<TabId> = tabs.into_iter().filter(|&t| self.stoppable(t)).collect();
+                if tabs.is_empty() {
+                    return;
+                }
+                let lines = self.what_dies(&tabs);
+                if lines.is_empty() {
+                    self.stop_tabs(&tabs);
+                } else {
+                    self.stop_confirm = Some(StopConfirm { tabs, lines });
+                }
+            }
+            Action::ConfirmStop(yes) => {
+                if let Some(asked) = self.stop_confirm.take()
+                    && yes
+                {
+                    self.stop_tabs(&asked.tabs);
+                }
+                self.focus_terminal = true;
+            }
             Action::Respawn(id) => {
+                if self.held == Some(id) {
+                    self.held = None;
+                }
                 self.spawn_session(ctx, id, None);
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
@@ -3867,6 +3920,15 @@ impl App {
             // A command seen in front last time and gone now has finished.
             // Only one seen this run: see `fg_running`.
             let running = cmd.is_some();
+            match &cmd {
+                Some(line) if self.fg_since.get(&id).is_none_or(|(was, _)| was != line) => {
+                    self.fg_since.insert(id, (line.clone(), Instant::now()));
+                }
+                Some(_) => {}
+                None => {
+                    self.fg_since.remove(&id);
+                }
+            }
             if self.fg_running.insert(id, running) == Some(true) && !running {
                 self.command_finished(id);
             }
@@ -4052,6 +4114,142 @@ impl App {
             id,
             Inject::Raw(bytes),
         ));
+    }
+
+    /// Can tab `id` be stopped (giverny#474): it is started, and is no
+    /// BACKGROUND agent's tab — that agent runs in Claude Code's daemon, not
+    /// in the tab, and its tab has `stop agent` and closes back to the list.
+    pub fn stoppable(&self, id: TabId) -> bool {
+        self.rt.contains_key(&id) && self.ws.tab(id).is_some_and(|t| t.bg_job.is_none())
+    }
+
+    /// What stopping `tabs` would end beyond an idle prompt, one line each
+    /// for the confirm: a command in front (`cargo build (3m)`), a Claude
+    /// working or with workers, `manage run` commands, Codex working. Empty
+    /// when every one of them idles, and the stop goes without asking.
+    fn what_dies(&self, tabs: &[TabId]) -> Vec<String> {
+        use claude_watch::ClaudeState;
+        let several = tabs.len() > 1;
+        let runs_dir = giverny_claude::run_live::runs_dir(&giverny_claude::resources::ledger_path(
+            &giverny_claude::feed::feed_dir(),
+        ));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut out = Vec::new();
+        for &id in tabs {
+            let Some(tab) = self.ws.tab(id) else { continue };
+            let mut what = Vec::new();
+            let ct = self.claude.tabs.get(&id);
+            let claude_here =
+                ct.is_some_and(|c| c.session_id.is_some() || c.state != ClaudeState::None);
+            if let Some((line, since)) = self.fg_since.get(&id)
+                && self.fg_running.get(&id) == Some(&true)
+                && !claude_here
+                && !tab_stop::is_agent(line)
+            {
+                what.push(format!(
+                    "{} ({})",
+                    tab_stop::command(line, 40),
+                    tab_stop::took(since.elapsed())
+                ));
+            }
+            if let Some(c) = ct {
+                let workers = self.claude.agents.running_workers(id);
+                if workers > 0 {
+                    let s = if workers == 1 { "" } else { "s" };
+                    what.push(format!("claude: {workers} worker{s} running"));
+                } else if c.agents {
+                    what.push("claude: workers running".into());
+                }
+                if c.state == ClaudeState::Busy {
+                    what.push("claude: working".into());
+                }
+                if c.background {
+                    what.push("claude: background shell running".into());
+                }
+                if let Some(sid) = c.session_id.as_deref() {
+                    for (task, run) in giverny_claude::run_live::session_runs(&runs_dir, sid) {
+                        let cmd = run
+                            .cmd
+                            .as_deref()
+                            .map_or_else(|| "run".to_string(), |c| tab_stop::command(c, 32));
+                        let took = run
+                            .started_ms
+                            .map(|at| {
+                                let ran = Duration::from_millis(now_ms.saturating_sub(at));
+                                format!(" ({})", tab_stop::took(ran))
+                            })
+                            .unwrap_or_default();
+                        what.push(format!("{task}: {cmd}{took}"));
+                    }
+                }
+            }
+            if self.codex.state_of(id) == giverny_core::agent::AgentState::Busy {
+                what.push("codex: working".into());
+            }
+            let title = several.then(|| self.shown_title(tab));
+            out.extend(tab_stop::lines_for(title.as_deref(), what));
+        }
+        out
+    }
+
+    /// Stop each of `tabs` ([`App::stop_tab`]).
+    fn stop_tabs(&mut self, tabs: &[TabId]) {
+        for &id in tabs {
+            self.stop_tab(id);
+        }
+        self.state_dirty = true;
+    }
+
+    /// End what tab `id` runs and keep the tab (giverny#474): back to the
+    /// state a tab restored after a restart is in — not started, its saved
+    /// scrollback, its folder, title, account and the conversation it
+    /// resumes — so the next focus starts it the way a restored tab starts
+    /// ([`App::queue_resume`]). What runs ends as closing a tab ends it, and
+    /// what outlives that is terminated ([`tab_stop::end`]).
+    fn stop_tab(&mut self, id: TabId) {
+        if !self.stoppable(id) {
+            return;
+        }
+        // What the restart's tab would come back with.
+        self.snapshot_tab(id);
+        let Some(rt) = self.rt.remove(&id) else {
+            return;
+        };
+        if let Some(session) = rt.session {
+            let mut tree = session.child_pid.map(tab_stop::tree).unwrap_or_default();
+            // A `manage run` command outside the tab's tree still goes:
+            // it was the session's.
+            if let Some(sid) = self.claude.tabs.get(&id).and_then(|c| c.session_id.clone()) {
+                let runs_dir = giverny_claude::run_live::runs_dir(
+                    &giverny_claude::resources::ledger_path(&giverny_claude::feed::feed_dir()),
+                );
+                for (_, run) in giverny_claude::run_live::session_runs(&runs_dir, &sid) {
+                    if !tree.iter().any(|p| p.pid == run.pid) {
+                        tree.extend(tab_stop::tree(run.pid));
+                    }
+                }
+            }
+            tracing::info!("tab {id:?}: stopping ({} process(es))", tree.len());
+            tab_stop::end(session, tree, move || {
+                tracing::info!("tab {id:?}: stopped");
+            });
+        }
+        if let Some(tab) = self.ws.tab_mut(id) {
+            tab.exited = false;
+        }
+        self.fg_running.remove(&id);
+        self.osc_running.remove(&id);
+        self.fg_since.remove(&id);
+        // A stopped tab's status line names no worker, as a closed one's.
+        let _ = giverny_claude::hooks::set_viewing(&self.paths.hook_spool(), &tab_env_id(id), None);
+        self.claude.stopped(id);
+        self.codex.tabs.remove(&id);
+        if self.ws.active == Some(id) {
+            self.held = Some(id);
+            self.walk_preview = None;
+        }
     }
 
     /// Queue the auto-resume command for a freshly restored tab.
@@ -5885,6 +6083,12 @@ impl eframe::App for App {
         self.watch_for_limits();
         self.note_unseen_turns();
         for (id, session, config_dir) in effects.captured {
+            // The `SessionEnd` of a Claude a stop ended (giverny#474): the
+            // tab keeps the conversation it resumes, as a restart's tab does.
+            if session.is_none() && !self.rt.contains_key(&id) {
+                self.claude.tabs.remove(&id);
+                continue;
+            }
             if let Some(tab) = self.ws.tab_mut(id) {
                 if session.is_some() {
                     tab.agent_session = None;
@@ -6059,11 +6263,17 @@ impl eframe::App for App {
             // through, and the tab it stops on starts when Ctrl comes up
             // (giverny#365).
             let walking = self.walking();
-            if walk::starts_now(
-                self.rt.contains_key(&active),
-                self.ws.tab(active).is_some_and(|t| t.exited),
-                walking,
-            ) {
+            // A tab stopped on screen is held only until another is chosen.
+            if self.held.is_some_and(|h| h != active) {
+                self.held = None;
+            }
+            if self.held != Some(active)
+                && walk::starts_now(
+                    self.rt.contains_key(&active),
+                    self.ws.tab(active).is_some_and(|t| t.exited),
+                    walking,
+                )
+            {
                 let preseed = state::load_snapshot(&self.paths, active)
                     .map(|dump| format!("{dump}\x1b[0m\x1b[2m── restored ──\x1b[0m\r\n\r\n"));
                 self.spawn_session(&ctx, active, preseed);
@@ -6206,6 +6416,7 @@ impl eframe::App for App {
                     let overlay = self.palette.is_some()
                         || self.session_picker.is_some()
                         || self.keys_overlay.is_some()
+                        || self.stop_confirm.is_some()
                         || self.rename.is_some();
                     if self.focus_terminal || terminal_lost_keys(&ctx, response.id, overlay) {
                         response.request_focus();
@@ -6255,16 +6466,30 @@ impl eframe::App for App {
                         ui.label("no session");
                     });
                 }
-            } else if walking {
+            } else if walking || self.held == Some(active) {
                 // A walk passing over a tab that has not started: its saved
                 // scrollback, read-only, until Ctrl comes up (giverny#365).
+                // A tab stopped while on screen shows the same until it is
+                // clicked (giverny#474).
                 if self.walk_preview.as_ref().is_none_or(|p| p.tab != active) {
                     let dump = state::load_snapshot(&self.paths, active);
                     self.walk_preview = Some(walk::Preview::new(active, dump.as_deref()));
                 }
                 if let Some(preview) = &self.walk_preview {
                     let rect = ui.available_rect_before_wrap();
-                    preview.show(ui, rect, &self.chrome, self.shared.font_size);
+                    let caption = if walking {
+                        walk::WALKING
+                    } else {
+                        walk::STOPPED
+                    };
+                    preview.show(ui, rect, &self.chrome, self.shared.font_size, caption);
+                    if !walking
+                        && ui
+                            .interact(rect, ui.id().with("stopped-tab"), egui::Sense::click())
+                            .clicked()
+                    {
+                        actions.push(Action::Select(active));
+                    }
                 }
             }
         });
@@ -6288,6 +6513,7 @@ impl eframe::App for App {
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
         actions.extend(overlays::brief_ui(self, &ctx));
+        actions.extend(overlays::stop_confirm_ui(self, &ctx));
 
         for action in actions {
             self.apply(&ctx, action);

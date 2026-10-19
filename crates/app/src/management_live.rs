@@ -123,6 +123,25 @@ impl ManagementLive {
         self.waiting.remove(&tab);
     }
 
+    /// `tab` was stopped from the rail (giverny#474): its session is down,
+    /// as [`ManagementLive::session_ended`] has it, and the workers that ran
+    /// in it ended with it — its Running rows are Done, stopped. Only this
+    /// tab's rows: no other manager's are looked at.
+    pub fn stopped(&mut self, tab: TabId) {
+        self.session_ended(tab);
+        if let Some(t) = self.trackers.get_mut(&tab)
+            && t.end_running(now_ms()) > 0
+        {
+            self.dirty = true;
+        }
+    }
+
+    /// Running rows `tab`'s pane shows now: what a stop would end.
+    pub fn running_workers(&self, tab: TabId) -> usize {
+        self.shown(tab)
+            .map_or(0, |t| t.rows().iter().filter(|r| r.running()).count())
+    }
+
     /// The same, for the pane's own edits (a manual clear). Marks the store
     /// for saving.
     pub fn tracker_mut(&mut self, tab: TabId) -> Option<&mut Tracker> {
