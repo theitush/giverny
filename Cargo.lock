@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "giverny"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-claude"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-codex"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-core"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "giverny-term"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
