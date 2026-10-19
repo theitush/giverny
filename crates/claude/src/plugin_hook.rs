@@ -456,6 +456,55 @@ fn worker(caller: &Caller, payload: &Value, dir: &Path, now: u64, in_tab: bool) 
         .or_else(|| agent_eta::deadline_ask(dir, &caller.session, &caller.agent_id, spawned, now))
 }
 
+/// At a task worker's `SubagentStop`: the background shells of its own
+/// still in flight that were never recorded, recorded now against its task
+/// (giverny#476). Its transcript says which are its own and when each was
+/// started or moved to the background ([`crate::leftovers::owned`]); the
+/// payload's registry says they are in flight. Poly's 170 lost its
+/// `wrangler deploy` (`bohhzzia9`) so: the call's timeout moved it to the
+/// background at 16:45:28Z, 52 s before the hook that records shells was
+/// installed, and only its turn's end came after. Cheap: nothing is read
+/// unless a command is in flight that is not recorded, and the worker holds
+/// a row.
+fn backfill(stop: &crate::leftovers::Stop, dir: &Path, now: u64) {
+    let missing: Vec<crate::leftovers::Task> = stop
+        .commands
+        .iter()
+        .filter(|c| !crate::bg_shells::is_recorded(dir, &stop.session, &c.id))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let Ok(Some((_, doc))) = manager_doc(dir, &stop.session) else {
+        return;
+    };
+    let desc = stop.description.as_deref();
+    if !holds_row(&doc, &stop.agent_id, desc) {
+        return;
+    }
+    let (Some(task), Some(transcript)) = (
+        row_key(&doc, &stop.agent_id, desc),
+        stop.transcript.as_deref(),
+    ) else {
+        return;
+    };
+    for l in crate::leftovers::owned(transcript, &missing) {
+        crate::bg_shells::record(
+            dir,
+            &stop.session,
+            crate::bg_shells::Shell {
+                id: l.task.id,
+                agent: stop.agent_id.clone(),
+                task: task.clone(),
+                cmd: l.task.what,
+                started_ms: l.started_ms.unwrap_or(now),
+            },
+            now,
+        );
+    }
+}
+
 /// The `PostToolUse` reply carrying `text` into the caller's context.
 pub fn reply(text: &str) -> String {
     json!({
@@ -678,6 +727,9 @@ pub fn main() -> i32 {
     if let Some(stop) = crate::leftovers::stop_payload(&input) {
         let feeds = crate::feed::feed_dir();
         let now = manage::now_ms();
+        // A task worker's shell its PostToolUse never recorded: recorded
+        // now, so the manager hears of it with its task (giverny#476).
+        backfill(&stop, &feeds, now);
         if let Some(out) = crate::leftovers::subagent_stop(&stop, &feeds, now, in_giverny_tab) {
             println!("{out}");
             return 0;
@@ -1342,8 +1394,9 @@ mod tests {
         let told = crate::bg_shells::deliver(&feeds, "s1", T0 + 42 * MIN, &Running).unwrap();
         assert!(
             told.starts_with(
-                "Giverny: `g472`'s worker ended its turn; 1 background shell still running: \
-                 `sleep 600` (41m, shell bjj5phx0d)."
+                "Giverny: `g472`'s worker ended its turn and is asleep, waiting on 1 \
+                 background shell of its own still running: `sleep 600` (41m, shell \
+                 bjj5phx0d). Claude Code wakes it when that ends."
             ),
             "{told}"
         );
@@ -1358,6 +1411,120 @@ mod tests {
             None,
             "told once, by bg_shells only"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#476: poly's 170. A foreground `wrangler deploy` its 600 s
+    /// timeout moved to the background: the `PostToolUse` payload as Claude
+    /// Code 2.1.303 sends it (`timedOutAfterMs`, `backgroundCwdHint`) is
+    /// recorded like a `run_in_background` call. And a shell started before
+    /// the recorder was installed (what lost `bohhzzia9`) is recorded at its
+    /// worker's `SubagentStop`, from the transcript's real tool result, so
+    /// the manager hears of it with its task and leftovers does not tell it
+    /// a second time.
+    #[test]
+    fn a_shell_its_timeout_moved_is_recorded_and_a_missed_one_at_the_turns_end() {
+        let dir = temp("bg-timeout");
+        let feeds = dir.join("feeds");
+        std::fs::create_dir_all(&feeds).unwrap();
+        let f = feed::feed_path(&feeds, "s1");
+        let d = doc(
+            json!([{"key": "170", "stage": "running", "agent_id": "ad22",
+                            "started": manage::stamp(T0), "eta_s": 4500}]),
+        );
+        manage::write(&f, &d).unwrap();
+        let deploy = "cd /home/ita/poly; T=/tmp/t170; npx wrangler deploy > $T/deploy4.log \
+                      2>&1; echo \"exit $?\"";
+        let mut input = worker_payload(&dir, "s1", "ad22", "170: per-minute runs", T0);
+        input["tool_name"] = json!("Bash");
+        input["tool_input"] = json!({"command": deploy, "description": "Retry wrangler deploy"});
+        input["tool_response"] = json!({"stdout": "", "stderr": "", "interrupted": false,
+            "isImage": false, "noOutputExpected": false, "backgroundTaskId": "bohhzzia9",
+            "timedOutAfterMs": 600000, "backgroundCwdHint": "Session cwd remains /home/ita/poly; \
+            directory changes made by the backgrounded command do not apply to subsequent \
+            commands."});
+        let p = payload_of(&input.to_string()).unwrap();
+        assert_eq!(p["bg_shell"], json!({"id": "bohhzzia9", "cmd": deploy}));
+        run(&p, &feeds, T0 + MIN, false);
+        assert!(crate::bg_shells::is_recorded(&feeds, "s1", "bohhzzia9"));
+        // Missed: a second deploy whose PostToolUse an older hook ran. Its
+        // transcript has the real tool result; its turn's end records it.
+        let sub = dir.join("proj/s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let t = sub.join("agent-ad22.jsonl");
+        std::fs::write(
+            &t,
+            json!({"type": "user", "agentId": "ad22", "timestamp": "2026-10-19T16:45:28.887Z",
+                   "message": {"role": "user", "content": [{"tool_use_id": "toolu_014g",
+                   "type": "tool_result", "is_error": false, "content":
+                   "Command did not complete within its 600s timeout and was moved to the \
+                    background (ID: bmissed01). Output is being written to: \
+                    /tmp/claude-1000/-home-ita-poly/s1/tasks/bmissed01.output. You will be \
+                    notified when it completes. To check interim output, use Read on that \
+                    file path."}]},
+                   "toolUseResult": {"stdout": "", "backgroundTaskId": "bmissed01",
+                   "timedOutAfterMs": 600000}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let stop = json!({"session_id": "s1", "agent_id": "ad22",
+            "hook_event_name": "SubagentStop", "stop_hook_active": false,
+            "agent_transcript_path": t.display().to_string(),
+            "background_tasks": [
+                {"id": "ad22", "type": "subagent", "status": "running",
+                 "description": "170: per-minute runs"},
+                {"id": "bohhzzia9", "type": "shell", "status": "running", "command": deploy},
+                {"id": "bmissed01", "type": "shell", "status": "running", "command": deploy},
+                {"id": "bmanager1", "type": "shell", "status": "running",
+                 "command": "tail -f x"}]})
+        .to_string();
+        let stop = crate::leftovers::stop_payload(&stop).unwrap();
+        backfill(&stop, &feeds, T0 + 5 * MIN);
+        assert!(crate::bg_shells::is_recorded(&feeds, "s1", "bmissed01"));
+        assert!(
+            !crate::bg_shells::is_recorded(&feeds, "s1", "bmanager1"),
+            "not the worker's own"
+        );
+        let shells: Vec<crate::bg_shells::Shell> = serde_json::from_value(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(crate::bg_shells::path(&feeds, "s1")).unwrap(),
+            )
+            .unwrap()["shells"]
+                .clone(),
+        )
+        .unwrap();
+        let missed = shells.iter().find(|s| s.id == "bmissed01").unwrap();
+        assert_eq!(
+            (missed.task.as_str(), missed.agent.as_str()),
+            ("170", "ad22")
+        );
+        assert_eq!(missed.cmd, deploy);
+        assert_eq!(
+            missed.started_ms,
+            "2026-10-19T16:45:28.887Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond() as u64,
+            "when its tool result came back"
+        );
+        // Recorded: leftovers, asked already, tells neither to the parent.
+        let seen = crate::leftovers::seen_path(&feeds, "s1");
+        manage::write(&seen, &json!({"asked": ["ad22"], "told": []})).unwrap();
+        assert!(crate::leftovers::subagent_stop(&stop, &feeds, T0 + 5 * MIN, || true).is_none());
+        let told = crate::leftovers::deliver(&feeds, "s1").unwrap_or_default();
+        assert!(
+            !told.contains("bohhzzia9") && !told.contains("bmissed01"),
+            "{told}"
+        );
+        assert!(told.contains("bmanager1") || told.is_empty(), "{told}");
+        // A worker holding no row: nothing recorded.
+        let mut other = stop.clone();
+        other.agent_id = "zz9".into();
+        other.description = Some("other work".into());
+        other.commands.retain(|c| c.id == "bmanager1");
+        backfill(&other, &feeds, T0 + 5 * MIN);
+        assert!(!crate::bg_shells::is_recorded(&feeds, "s1", "bmanager1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

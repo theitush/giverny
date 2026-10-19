@@ -289,6 +289,10 @@ When you spawn one:
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh
   worker with a brief. Tell the user it has resumed once someone works on it.
+  One that ended its turn with a background shell of its own still running
+  is **asleep**, not ended (`resume`, the pane and the turn-end notice say
+  so): Claude Code wakes it when that shell ends, so there is nothing to wake
+  or land; stop the shell only if the work should not go on.
 - A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
 - A worker that reports an OOM needs a bigger lease: `giverny-manage release
   <task>`, then `claim` it again with more `--ram`, then send the worker on
