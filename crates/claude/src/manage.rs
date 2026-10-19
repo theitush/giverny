@@ -67,8 +67,9 @@ usage: giverny manage <command> [args] [--session <id>]
                               the task landed now (Done)
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it.
                               It stops nothing else: the task's `run`
-                              commands still going are listed, each with
-                              the command that would stop it
+                              commands and its worker's background shells
+                              still going are listed, each with the
+                              command that would stop it
   drop  <task>                remove the task's row
   name  [<First> | <First Last>]
                               this session's name, printed in full. With no
@@ -1971,6 +1972,13 @@ pub fn run_in_code(
         let runs = crate::run_live::task_runs(&crate::run_live::runs_dir(&ledger), session, task);
         msg.push_str(&still_running(task, &runs, now));
     }
+    // Pause and resume name the background shells the task's worker left
+    // running too, with how to stop each (giverny#472). Giverny stops
+    // nothing.
+    if let Cmd::Pause(task) | Cmd::Resume(task) = cmd {
+        let live = crate::bg_shells::task_shells(dir, session, task, &crate::bg_shells::System);
+        msg.push_str(&crate::bg_shells::still_running(task, &live, now));
+    }
     // A task that lands — by `land`, or handed off by a `start --agent` — or
     // is dropped gives its lease back, after the feed's lock is let go (the
     // ledger's is never taken under it).
@@ -3467,6 +3475,70 @@ mod tests {
         assert_eq!(run(&dir, "pause b", T0 + 10 * MIN).unwrap(), "paused b");
         drop(live);
         run(&dir, "resume a", T0 + 11 * MIN).unwrap();
+        assert_eq!(run(&dir, "pause a", T0 + 12 * MIN).unwrap(), "paused a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pause` and `resume` name the background shells the task's worker
+    /// left running, found live by the real look (a session-leading
+    /// `bash -c` holding the shell's output file, as Claude Code starts
+    /// one), with how to stop each; nothing is stopped, and a shell that
+    /// ended drops off (giverny#472).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pause_and_resume_name_a_workers_background_shells() {
+        use std::os::unix::process::CommandExt;
+        let dir = scratch("pause-shells");
+        run(&dir, "start a --eta 30", T0).unwrap();
+        let tasks = dir.join("cc/s1/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let out = std::fs::File::create(tasks.join("bpause1.output")).unwrap();
+        // SAFETY: `setsid` is async-signal-safe, all `pre_exec` may call.
+        let mut child = unsafe {
+            std::process::Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    "true && eval 'sleep 30' < /dev/null && pwd -P >| /dev/null",
+                ])
+                .stdout(out)
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let shell = |id: &str| crate::bg_shells::Shell {
+            id: id.into(),
+            agent: "w1".into(),
+            task: "a".into(),
+            cmd: "sleep 30".into(),
+            started_ms: T0 + MIN,
+        };
+        crate::bg_shells::record(&dir, "s1", shell("bpause1"), T0 + MIN);
+        crate::bg_shells::record(&dir, "s1", shell("bpausegone"), T0 + MIN);
+        let pid = child.id();
+        let out = run(&dir, "pause a", T0 + 10 * MIN).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "paused a\n  1 background shell its worker started still runs for a (Giverny \
+                 stops nothing):\n    `sleep 30` (shell bpause1), 9m in: `TaskStop bpause1` \
+                 from this session stops it, or `pkill -s {pid}` (its shell, pid {pid}, and all \
+                 it started)"
+            )
+        );
+        assert!(crate::run_live::alive(pid), "nothing was stopped");
+        assert!(
+            !crate::bg_shells::is_recorded(&dir, "s1", "bpausegone"),
+            "ended: dropped"
+        );
+        let out = run(&dir, "resume a", T0 + 11 * MIN).unwrap();
+        assert!(out.contains("`sleep 30` (shell bpause1), 10m in"), "{out}");
+        // SAFETY: a signal to the group the test's own child leads.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        let _ = child.wait();
         assert_eq!(run(&dir, "pause a", T0 + 12 * MIN).unwrap(), "paused a");
         let _ = std::fs::remove_dir_all(&dir);
     }

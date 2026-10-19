@@ -261,6 +261,9 @@ When you spawn one:
     still going, each with the command that stops it (`kill <pid>`); Giverny
     stops nothing itself, so stopping or keeping each is your call. A task
     paused ten minutes with one still going is told to you once.
+    `pause` lists the worker's own background shells still running as well,
+    each with `TaskStop <shell id>` (from your session) to stop it, and a
+    worker that ends its turn with one still running is told to you once.
 - **`resume` restarts only the clock** too. It says whether the task's worker
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh

@@ -43,7 +43,11 @@
 //!   land, a Next up task idle with nothing to wait on — told once each
 //!   ([`manage_chores`]), as is a task paused ten minutes with a `run`
 //!   command of it still going, with how to stop it
-//!   ([`manage_nudge::paused_runs`], giverny#471).
+//!   ([`manage_nudge::paused_runs`], giverny#471), and a worker that ended
+//!   its turn with background shells of its own still running
+//!   ([`crate::bg_shells`], giverny#472: the shells a task's worker leaves
+//!   in the background are recorded on its `PostToolUse`, checked on its
+//!   `SubagentStop`).
 //! - **What a subagent leaves running.** A subagent finishing with a
 //!   background shell or monitor of its own still running is asked, once,
 //!   whether it should keep running ([`crate::leftovers::subagent_stop`]);
@@ -96,7 +100,7 @@ use std::time::SystemTime;
 use serde_json::{Map, Value, json};
 
 use crate::manage::{self, Lock};
-use crate::manage_nudge::{beat, check, holds_row, stamp_agent};
+use crate::manage_nudge::{beat, check, holds_row, row_key, stamp_agent};
 use crate::{agent_eta, away, manage_chores, manage_history, manage_inbox, resources};
 
 /// What the hook payload says about who is calling.
@@ -176,6 +180,7 @@ pub fn payload_of(input: &str) -> Option<Value> {
     let mut m = Map::new();
     let spawn = matches!(h.tool_name.as_deref(), Some("Agent" | "Task")) && h.agent_id.is_none();
     let skill = h.tool_name.as_deref() == Some("Skill") && h.agent_id.is_none();
+    let bash = h.tool_name.as_deref() == Some("Bash") && h.agent_id.is_some();
     for (k, v) in [
         ("session_id", h.session_id),
         ("agent_id", h.agent_id),
@@ -201,6 +206,30 @@ pub fn payload_of(input: &str) -> Option<Value> {
         let background = r.get("status").and_then(Value::as_str) == Some("async_launched")
             || r.get("isAsync").and_then(Value::as_bool) == Some(true);
         m.insert("spawned_background".into(), json!(background));
+    }
+    // A worker's Bash call that left a shell in the background (its
+    // response names it, Claude Code 2.1.303): its id and command, to
+    // record against its task (giverny#472). Only then is it read whole;
+    // such a response carries no output.
+    if bash
+        && input.contains("\"backgroundTaskId\"")
+        && let Ok(s) = serde_json::from_str::<Spawn>(input)
+    {
+        let id = s
+            .tool_response
+            .as_ref()
+            .and_then(|r| r.get("backgroundTaskId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|i| !i.is_empty());
+        let cmd = s
+            .tool_input
+            .as_ref()
+            .and_then(|i| i.get("command"))
+            .and_then(Value::as_str);
+        if let (Some(id), Some(cmd)) = (id, cmd) {
+            m.insert("bg_shell".into(), json!({"id": id, "cmd": cmd}));
+        }
     }
     // The session's own `Skill` call: which skill, for the manager mark
     // ([`crate::managers`]). Its response is the skill's text, never read.
@@ -287,7 +316,7 @@ pub fn run_with(
         // A subagent's call hears of its session's escapes too: it may be
         // the one that ran it (giverny#271).
         let asks: Vec<String> = [
-            worker(&caller, dir, now, in_tab),
+            worker(&caller, payload, dir, now, in_tab),
             crate::escapes::deliver(dir, session),
         ]
         .into_iter()
@@ -304,6 +333,7 @@ pub fn run_with(
         resources::news(&ledger, session, now),
         manage_chores::deliver(dir, session, now),
         crate::manage_nudge::paused_runs(dir, session, now),
+        crate::bg_shells::deliver(dir, session, now, &crate::bg_shells::System),
         spawned(payload, dir, session, in_tab),
         crate::leftovers::deliver(dir, session),
         crate::strays::between(dir, session, now, &crate::strays::System),
@@ -338,12 +368,31 @@ fn spawned(payload: &Value, dir: &Path, session: &str, in_tab: bool) -> Option<S
 
 /// A worker's call: its re-estimate ask, when something tracks it — a
 /// Giverny tab, or a manager session.
-fn worker(caller: &Caller, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
+fn worker(caller: &Caller, payload: &Value, dir: &Path, now: u64, in_tab: bool) -> Option<String> {
     let description = caller.description();
     let desc = description.as_deref();
     match manager_doc(dir, &caller.session) {
         Err(()) => return None,
         Ok(Some((file, d))) if holds_row(&d, &caller.agent_id, desc) => {
+            // A shell it left in the background is its task's
+            // (giverny#472).
+            if let Some(bg) = payload.get("bg_shell")
+                && let Some(task) = row_key(&d, &caller.agent_id, desc)
+            {
+                let field = |k: &str| bg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                crate::bg_shells::record(
+                    dir,
+                    &caller.session,
+                    crate::bg_shells::Shell {
+                        id: field("id"),
+                        agent: caller.agent_id.clone(),
+                        task,
+                        cmd: field("cmd"),
+                        started_ms: now,
+                    },
+                    now,
+                );
+            }
             // Under the lock, re-read: the dispatcher may be writing it.
             let _lock = Lock::take(&file).ok()?;
             let mut d: Value = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
@@ -590,11 +639,22 @@ pub fn main() -> i32 {
     // still runs (giverny#370).
     if let Some(stop) = crate::leftovers::stop_payload(&input) {
         let feeds = crate::feed::feed_dir();
-        if let Some(out) =
-            crate::leftovers::subagent_stop(&stop, &feeds, manage::now_ms(), in_giverny_tab)
-        {
+        let now = manage::now_ms();
+        if let Some(out) = crate::leftovers::subagent_stop(&stop, &feeds, now, in_giverny_tab) {
             println!("{out}");
+            return 0;
         }
+        // Let through: the worker's turn ended. Its background shells
+        // still running are its manager's to hear of (giverny#472).
+        let in_flight: Vec<&str> = stop.in_flight.iter().map(String::as_str).collect();
+        crate::bg_shells::turn_ended(
+            &feeds,
+            &stop.session,
+            &stop.agent_id,
+            &in_flight,
+            now,
+            &crate::bg_shells::System,
+        );
         return 0;
     }
     if let Some(prompt) = crate::manage_trigger::prompt_of(&input) {
@@ -1157,6 +1217,109 @@ mod tests {
              running in the background (task bgej3bpqh)."
         );
         assert_eq!(run(&me, &dir, T0 + 2 * MIN, false), None, "told once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#472: a task worker's Bash call that leaves a shell in the
+    /// background (the payload as Claude Code 2.1.303 sends it) is recorded
+    /// against its row; its turn's end with the shell still in flight is
+    /// told to the manager once, on the manager's own call, and not by
+    /// [`crate::leftovers`] as well. Nothing is stopped.
+    #[test]
+    fn a_task_workers_background_shell_is_told_to_its_manager_at_its_turns_end() {
+        let dir = temp("bg-shell");
+        let feeds = dir.join("feeds");
+        std::fs::create_dir_all(&feeds).unwrap();
+        let f = feed::feed_path(&feeds, "s1");
+        let d = doc(
+            json!([{"key": "g472", "stage": "running", "agent_id": "af57",
+                            "started": manage::stamp(T0), "eta_s": 4500}]),
+        );
+        manage::write(&f, &d).unwrap();
+        let mut input = worker_payload(&dir, "s1", "af57", "g472: shells", T0);
+        input["tool_name"] = json!("Bash");
+        input["tool_input"] = json!({"command": "sleep 600", "description": "Sleep",
+                                     "run_in_background": true});
+        input["tool_response"] = json!({"stdout": "", "stderr": "", "interrupted": false,
+            "isImage": false, "noOutputExpected": false, "backgroundTaskId": "bjj5phx0d"});
+        let p = payload_of(&input.to_string()).unwrap();
+        assert_eq!(
+            p["bg_shell"],
+            json!({"id": "bjj5phx0d", "cmd": "sleep 600"})
+        );
+        assert_eq!(run(&p, &feeds, T0 + MIN, false), None);
+        assert!(crate::bg_shells::is_recorded(&feeds, "s1", "bjj5phx0d"));
+        // Another worker's background call (no row) is not recorded; the
+        // manager's own is not a worker's.
+        let mut other = worker_payload(&dir, "s1", "zz9", "other work", T0);
+        other["tool_name"] = json!("Bash");
+        other["tool_input"] = json!({"command": "sleep 5"});
+        other["tool_response"] = json!({"backgroundTaskId": "bother1"});
+        run(
+            &payload_of(&other.to_string()).unwrap(),
+            &feeds,
+            T0 + MIN,
+            false,
+        );
+        assert!(!crate::bg_shells::is_recorded(&feeds, "s1", "bother1"));
+        let mine = json!({"session_id": "s1", "hook_event_name": "PostToolUse",
+            "tool_name": "Bash", "tool_input": {"command": "sleep 5"},
+            "tool_response": {"backgroundTaskId": "bmine1"}});
+        assert!(
+            payload_of(&mine.to_string())
+                .unwrap()
+                .get("bg_shell")
+                .is_none()
+        );
+        // Its SubagentStop, let through (outside a tab, leftovers asks nothing).
+        let stop = json!({"session_id": "s1", "agent_id": "af57",
+            "hook_event_name": "SubagentStop", "stop_hook_active": false,
+            "agent_transcript_path": dir.join("none.jsonl").display().to_string(),
+            "background_tasks": [
+                {"id": "af57", "type": "subagent", "status": "running"},
+                {"id": "bjj5phx0d", "type": "shell", "status": "running",
+                 "description": "Sleep", "command": "sleep 600"}]})
+        .to_string();
+        let stop = crate::leftovers::stop_payload(&stop).unwrap();
+        assert_eq!(stop.in_flight, ["af57", "bjj5phx0d"]);
+        assert!(crate::leftovers::subagent_stop(&stop, &feeds, T0 + 2 * MIN, || false).is_none());
+        let in_flight: Vec<&str> = stop.in_flight.iter().map(String::as_str).collect();
+        struct Running;
+        impl crate::bg_shells::Probe for Running {
+            fn look(&self, _: &str, s: &[crate::bg_shells::Shell]) -> Vec<crate::bg_shells::Found> {
+                vec![
+                    crate::bg_shells::Found {
+                        running: Some(true),
+                        pid: None
+                    };
+                    s.len()
+                ]
+            }
+        }
+        crate::bg_shells::turn_ended(&feeds, "s1", "af57", &in_flight, T0 + 2 * MIN, &Running);
+        // The worker's own next call hears nothing of it.
+        assert!(run(&p, &feeds, T0 + 2 * MIN, false).is_none_or(|o| !o.contains("sleep 600")));
+        // The manager's does, once. (The real look finds no such shell
+        // here, so the hook's own delivery is read through the module.)
+        let told = crate::bg_shells::deliver(&feeds, "s1", T0 + 42 * MIN, &Running).unwrap();
+        assert!(
+            told.starts_with(
+                "Giverny: `g472`'s worker ended its turn; 1 background shell still running: \
+                 `sleep 600` (41m, shell bjj5phx0d)."
+            ),
+            "{told}"
+        );
+        assert!(told.contains("`TaskStop bjj5phx0d`"), "{told}");
+        assert_eq!(
+            crate::bg_shells::deliver(&feeds, "s1", T0 + 43 * MIN, &Running),
+            None
+        );
+        let me = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Read"});
+        assert_eq!(
+            run(&me, &feeds, T0 + 43 * MIN, false),
+            None,
+            "told once, by bg_shells only"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

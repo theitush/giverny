@@ -78,6 +78,9 @@ pub struct Stop {
     pub description: Option<String>,
     /// The session's background commands in flight, the subagent's or not.
     pub commands: Vec<Task>,
+    /// Every id in flight, commands and agents alike: a recorded shell not
+    /// among them has ended ([`crate::bg_shells::turn_ended`]).
+    pub in_flight: Vec<String>,
 }
 
 /// A command of the subagent's own, still running as it finishes.
@@ -109,8 +112,10 @@ pub fn stop_payload(input: &str) -> Option<Stop> {
     let agent_id = text(&v, "agent_id")?;
     let mut description = None;
     let mut commands = Vec::new();
+    let mut in_flight = Vec::new();
     for task in crate::hooks::in_flight(&v) {
         let Some(id) = text(task, "id") else { continue };
+        in_flight.push(id.clone());
         if id == agent_id {
             description = text(task, "description");
         }
@@ -134,6 +139,7 @@ pub fn stop_payload(input: &str) -> Option<Stop> {
         transcript,
         description,
         commands,
+        in_flight,
     })
 }
 
@@ -313,9 +319,12 @@ pub fn subagent_stop(
     }
     // Asked already: its answer stands. What it kept running, its parent
     // hears of.
+    // A task worker's shell is told to its manager with its task
+    // ([`crate::bg_shells`], giverny#472), not here as well.
     let new: Vec<&Leftover> = left
         .iter()
         .filter(|l| !seen.told.contains(&l.task.id))
+        .filter(|l| !crate::bg_shells::is_recorded(feed_dir, &stop.session, &l.task.id))
         .collect();
     if new.is_empty() {
         return None;
