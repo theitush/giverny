@@ -4,7 +4,7 @@
 
 A native terminal for running Claude Code and Codex sessions side by side, across several accounts at once. Tabs sit in categories on a left rail and show what each agent is doing. Each category can run on its own Claude account, and the rail shows every account's limits with reset times.
 
-![Giverny: categorized tabs with live Claude state and multi-account usage meters](assets/demo.gif)
+![Giverny: categorized tabs with live Claude Code and Codex state, and usage meters for three accounts](assets/demo.gif)
 
 Written in Rust on `alacritty_terminal` and rendered on the GPU, with no web engine. Runs on Linux, macOS and Windows.
 
