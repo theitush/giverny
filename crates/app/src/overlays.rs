@@ -295,7 +295,7 @@ pub struct BriefOverlay {
     pub button: Button,
     /// Bumped whenever the text changes; the laid-out text is cached on it.
     generation: u64,
-    galley: Option<(u64, u32, std::sync::Arc<egui::Galley>)>,
+    galley: Option<Laid>,
     /// A scroll the keyboard asked for, applied next frame.
     scroll_to: Option<f32>,
     /// The scroll area's offset and its visible height, last frame.
@@ -303,8 +303,20 @@ pub struct BriefOverlay {
     page: f32,
 }
 
+/// The body as laid out last: (generation, width bits, the galley, which
+/// of its paragraphs sit on the prompt band).
+type Laid = (
+    u64,
+    u32,
+    std::sync::Arc<egui::Galley>,
+    std::sync::Arc<Vec<bool>>,
+);
+
 pub enum Content {
     Text(String),
+    /// Rows drawn as a transcript is: a Next up row's brief, as the
+    /// worker's prompt (giverny#477).
+    Rows(Vec<transcript::Row>),
     Transcript(TranscriptView),
 }
 
@@ -314,6 +326,7 @@ pub struct TranscriptView {
     /// Follow it as it grows (a Running worker).
     pub live: bool,
     tail: transcript::Tail,
+    render: transcript::Render,
     rows: Vec<transcript::Row>,
     /// Why the file could not be read, when it could not.
     error: Option<String>,
@@ -352,12 +365,18 @@ impl BriefOverlay {
             path,
             live,
             tail: transcript::Tail::default(),
+            render: transcript::Render::new(transcript::Fold::OVERLAY),
             rows: Vec::new(),
             error: None,
             polled: Instant::now(),
         };
         view.poll();
         Self::with(title, None, Content::Transcript(view))
+    }
+
+    /// Rows in the transcript's look: a brief as the prompt it will be.
+    pub fn rows(title: String, source: Option<PathBuf>, rows: Vec<transcript::Row>) -> Self {
+        Self::with(title, source, Content::Rows(rows))
     }
 
     fn with(title: String, source: Option<PathBuf>, content: Content) -> Self {
@@ -390,12 +409,8 @@ impl BriefOverlay {
     pub fn plain_text(&self) -> String {
         match &self.content {
             Content::Text(t) => t.clone(),
-            Content::Transcript(v) => v
-                .lines_for_view()
-                .iter()
-                .map(|r| r.plain())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Content::Rows(rows) => plain_rows(rows),
+            Content::Transcript(v) => plain_rows(&v.lines_for_view()),
         }
     }
 }
@@ -409,11 +424,11 @@ impl TranscriptView {
                 let was_error = self.error.take().is_some();
                 if update.restarted {
                     self.rows.clear();
+                    self.render = transcript::Render::new(transcript::Fold::OVERLAY);
                 }
                 let before = self.rows.len();
                 for line in &update.lines {
-                    self.rows
-                        .extend(transcript::render_rows(line, transcript::Fold::OVERLAY));
+                    transcript::push(&mut self.rows, self.render.line(line));
                 }
                 was_error || update.restarted || self.rows.len() != before
             }
@@ -432,26 +447,21 @@ impl TranscriptView {
         if !self.live
             && let Some(rest) = self.tail.rest()
         {
-            rows.extend(transcript::render_rows(rest, transcript::Fold::OVERLAY));
+            transcript::push(&mut rows, self.render.clone().line(rest));
         }
         if let Some(err) = &self.error {
-            rows.push(transcript::Row {
-                indent: "",
-                clock: None,
-                tone: transcript::Tone::Error,
-                text: err.clone(),
-            });
+            let mut row = transcript::Row::one(transcript::Tone::Error, err.clone());
+            row.starts = true;
+            rows.push(row);
         } else if rows.is_empty() {
-            rows.push(transcript::Row {
-                indent: "",
-                clock: None,
-                tone: transcript::Tone::Dim,
-                text: if self.live {
-                    "waiting for the worker's first turn…".into()
+            rows.push(transcript::Row::one(
+                transcript::Tone::Dim,
+                if self.live {
+                    "waiting for the worker's first turn…"
                 } else {
-                    "(the transcript is empty)".into()
+                    "(the transcript is empty)"
                 },
-            });
+            ));
         }
         rows
     }
@@ -544,21 +554,105 @@ fn overlay_rect(session: Option<egui::Rect>, ctx: &egui::Context) -> egui::Rect 
     }
 }
 
-fn tone_color(c: &crate::chrome::Chrome, tone: transcript::Tone) -> Color32 {
-    use transcript::Tone;
-    match tone {
-        Tone::Plain => c.fg,
-        Tone::Reply => c.accent,
-        Tone::Tool => c.green,
-        Tone::Prompt => c.amber,
-        Tone::Dim => c.dim,
-        Tone::Error => c.poppy,
+/// The colours Claude Code draws a worker's view in (its dark or light
+/// theme, by the chrome's), so the overlay reads as that view (giverny#477).
+struct Look {
+    fg: Color32,
+    strong: Color32,
+    code: Color32,
+    dim: Color32,
+    error: Color32,
+    band: Color32,
+    said: Color32,
+    ok: Color32,
+}
+
+fn look(c: &crate::chrome::Chrome) -> Look {
+    let [r, g, b, _] = c.panel.to_array();
+    let dark = (r as u32 + g as u32 + b as u32) < 3 * 128;
+    if dark {
+        Look {
+            fg: c.fg,
+            strong: c.fg.lerp_to_gamma(Color32::WHITE, 0.6),
+            code: Color32::from_rgb(177, 185, 249),
+            dim: c.dim,
+            error: Color32::from_rgb(255, 107, 128),
+            band: Color32::from_rgb(55, 55, 55),
+            said: Color32::WHITE,
+            ok: Color32::from_rgb(78, 186, 101),
+        }
+    } else {
+        Look {
+            fg: c.fg,
+            strong: c.fg.lerp_to_gamma(Color32::BLACK, 0.4),
+            code: Color32::from_rgb(87, 105, 247),
+            dim: c.dim,
+            error: Color32::from_rgb(171, 43, 63),
+            band: Color32::from_rgb(232, 232, 232),
+            said: Color32::BLACK,
+            ok: Color32::from_rgb(44, 122, 57),
+        }
     }
 }
 
-fn layout_body(ov: &BriefOverlay, c: &crate::chrome::Chrome, width: f32) -> egui::text::LayoutJob {
+fn tone_color(l: &Look, tone: transcript::Tone) -> Color32 {
+    use transcript::{Call, Tone};
+    match tone {
+        Tone::Plain | Tone::Prompt => l.fg,
+        Tone::Strong => l.strong,
+        Tone::Code => l.code,
+        Tone::Dim | Tone::Bullet(Call::Running) => l.dim,
+        Tone::Error | Tone::Bullet(Call::Failed) => l.error,
+        Tone::Said => l.said,
+        Tone::Bullet(Call::Done) => l.ok,
+    }
+}
+
+/// The body's text, and for each of its paragraphs (`\n`-separated)
+/// whether it is drawn on the prompt band.
+/// The body's font.
+fn body_font() -> FontId {
+    FontId::monospace(11.5)
+}
+
+/// How the body's rows are fitted to the overlay: the columns a line holds
+/// (rows are wrapped to them, hung as Claude Code hangs them), and whether
+/// the font has Claude Code's `⎿` — Giverny's own terminal has none, and
+/// shows a blank there, so the overlay does too rather than a box.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    cols: usize,
+    hook: bool,
+}
+
+fn fit(ui: &egui::Ui, width: f32) -> Fit {
+    let font = body_font();
+    ui.ctx().fonts_mut(|f| {
+        // A laid-out run, not one glyph's advance: what a line really takes.
+        let w = f
+            .layout_no_wrap("M".repeat(100), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            / 100.0;
+        Fit {
+            cols: if w > 0.0 {
+                ((width / w).floor() as usize).saturating_sub(1)
+            } else {
+                0
+            },
+            hook: f.has_glyph(&font, '⎿'),
+        }
+    })
+}
+
+fn layout_body(
+    ov: &BriefOverlay,
+    c: &crate::chrome::Chrome,
+    width: f32,
+    fit: Fit,
+) -> (egui::text::LayoutJob, Vec<bool>) {
     use egui::text::{LayoutJob, TextFormat};
-    let font = FontId::monospace(11.5);
+    let font = body_font();
     let fmt = |color: Color32| TextFormat {
         font_id: font.clone(),
         color,
@@ -566,22 +660,82 @@ fn layout_body(ov: &BriefOverlay, c: &crate::chrome::Chrome, width: f32) -> egui
     };
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
-    match &ov.content {
-        Content::Text(t) => job.append(t, 0.0, fmt(c.fg)),
-        Content::Transcript(v) => {
-            for (i, row) in v.lines_for_view().iter().enumerate() {
-                if i > 0 {
-                    job.append("\n", 0.0, fmt(c.fg));
+    let mut band = Vec::new();
+    let mut rows_job = |rows: &[transcript::Row], job: &mut LayoutJob| {
+        let l = look(c);
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                job.append("\n", 0.0, fmt(l.fg));
+                if row.starts {
+                    band.push(false);
+                    job.append("\n", 0.0, fmt(l.fg));
                 }
-                job.append(row.indent, 0.0, fmt(c.fg));
-                if let Some(at) = &row.clock {
-                    job.append(&format!("{at} "), 0.0, fmt(c.dim));
+            }
+            for (k, line) in transcript::wrap(row, fit.cols).iter().enumerate() {
+                if k > 0 {
+                    job.append("\n", 0.0, fmt(l.fg));
                 }
-                job.append(&row.text, 0.0, fmt(tone_color(c, row.tone)));
+                band.push(row.is_prompt());
+                for sp in &line.spans {
+                    let text = if fit.hook {
+                        std::borrow::Cow::Borrowed(sp.text.as_str())
+                    } else {
+                        std::borrow::Cow::Owned(sp.text.replace('⎿', " "))
+                    };
+                    job.append(&text, 0.0, fmt(tone_color(&l, sp.tone)));
+                }
             }
         }
+    };
+    match &ov.content {
+        Content::Text(t) => job.append(t, 0.0, fmt(c.fg)),
+        Content::Rows(rows) => rows_job(rows, &mut job),
+        Content::Transcript(v) => rows_job(&v.lines_for_view(), &mut job),
     }
-    job
+    (job, band)
+}
+
+/// Rows as the overlay's plain text: a blank line before each entry, and
+/// no clock (the terminal's, not drawn here).
+fn plain_rows(rows: &[transcript::Row]) -> String {
+    let rows: Vec<transcript::Row> = rows
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.clock = None;
+            r
+        })
+        .collect();
+    transcript::lay_out(&rows, true, transcript::Style { color: false }).join("\n")
+}
+
+/// The prompt band behind the galley's banded paragraphs, the full width
+/// of the body, as Claude Code draws a prompt.
+fn paint_band(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    band: &[bool],
+    origin: egui::Pos2,
+    width: f32,
+    color: Color32,
+) {
+    let mut para = 0;
+    for row in &galley.rows {
+        if band.get(para).copied().unwrap_or(false) {
+            let r = row.rect().translate(origin.to_vec2());
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(origin.x, r.min.y),
+                    egui::pos2(origin.x + width, r.max.y),
+                ),
+                0.0,
+                color,
+            );
+        }
+        if row.ends_with_newline {
+            para += 1;
+        }
+    }
 }
 
 /// The stop's confirm (giverny#474), while one is asked: what would die,
@@ -878,15 +1032,20 @@ fn draw_overlay(
                     let out = area.show(ui, |ui| {
                         let width = ui.available_width();
                         let key = (ov.generation, width.to_bits());
-                        let galley = match &ov.galley {
-                            Some((g, w, galley)) if (*g, *w) == key => galley.clone(),
+                        let (galley, band) = match &ov.galley {
+                            Some((g, w, galley, band)) if (*g, *w) == key => {
+                                (galley.clone(), band.clone())
+                            }
                             _ => {
-                                let job = layout_body(ov, &c, width);
+                                let (job, band) = layout_body(ov, &c, width, fit(ui, width));
                                 let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-                                ov.galley = Some((key.0, key.1, galley.clone()));
-                                galley
+                                let band = std::sync::Arc::new(band);
+                                ov.galley = Some((key.0, key.1, galley.clone(), band.clone()));
+                                (galley, band)
                             }
                         };
+                        let origin = ui.cursor().min;
+                        paint_band(ui, &galley, &band, origin, width, look(&c).band);
                         ui.add(egui::Label::new(galley).selectable(true));
                     });
                     ov.offset = out.state.offset.y;
@@ -1290,6 +1449,58 @@ mod tests {
         })
         .to_string()
             + "\n"
+    }
+
+    /// giverny#477: the overlay reads as Claude Code's view of a worker —
+    /// the prompt, then each call with its result under it — and the
+    /// prompt's lines, and only those, are drawn on the band.
+    #[test]
+    fn a_transcript_reads_as_claude_codes_worker_view() {
+        let dir = std::env::temp_dir().join(format!("giverny-ov-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-l.jsonl");
+        let lines = [
+            r#"{"type":"user","message":{"content":"Run seq.\nThen report."}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"seq 1 5"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"1\n2\n3\n4\n5"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let ov = BriefOverlay::transcript("t".into(), path, false);
+        assert_eq!(
+            ov.plain_text(),
+            "❯ Run seq.\n  Then report.\n\n● Bash(seq 1 5)\n  ⎿  1\n     2\n     3\n     … +2 lines\n\n● Done."
+        );
+        let (_, band) = layout_body(
+            &ov,
+            &chrome(),
+            800.0,
+            Fit {
+                cols: 100,
+                hook: true,
+            },
+        );
+        assert_eq!(&band[..4], &[true, true, false, false]);
+        assert!(!band[4..].contains(&true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Next up brief is drawn as the prompt the worker will be given.
+    #[test]
+    fn a_brief_is_drawn_as_the_workers_prompt() {
+        let rows = giverny_claude::transcript::prompt_rows("# g9\n\nDo it.", None);
+        let ov = BriefOverlay::rows("t".into(), Some("/b.md".into()), rows);
+        assert_eq!(ov.plain_text(), "❯ # g9\n  \n  Do it.");
+        let (_, band) = layout_body(
+            &ov,
+            &chrome(),
+            800.0,
+            Fit {
+                cols: 100,
+                hook: false,
+            },
+        );
+        assert_eq!(band, vec![true, true, true]);
     }
 
     #[test]

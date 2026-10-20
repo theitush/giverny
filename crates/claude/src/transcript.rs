@@ -1,16 +1,38 @@
-//! A worker's transcript, rendered for a person.
+//! A worker's transcript, rendered for a person the way Claude Code draws a
+//! worker's own view (giverny#477).
 //!
-//! Claude Code cannot open a subagent by id, so Giverny reads the worker's
-//! own `agent-<id>.jsonl` instead: what it said, each tool it called (one
-//! line, the argument that says what it is doing), and the first lines of
-//! what came back. Thinking, attachments and bookkeeping lines are left out.
-//! Two views use it: the overlay a Running or Done row of the management panel
-//! opens, which keeps the task text whole, and
-//! `giverny transcript [--follow]`, which folds it to watch in a terminal.
+//! Claude Code cannot open a subagent by id, and keeps no view of one whose
+//! turn has ended, so Giverny reads the worker's own `agent-<id>.jsonl`
+//! instead and draws it as Claude Code's subagent view does (as captured from
+//! Claude Code 2.1.304, `.claude/review/477/`):
 //!
-//! [`render_rows`] is the pure half — one JSONL line in, zero or more rows
-//! out — so it is tested without a file; [`render_line`] paints those rows
-//! for a terminal. [`Tail`] is the `tail -f` under both views: it reads a
+//! ```text
+//! ❯ the prompt the worker was given, on a grey band
+//!
+//! ● Read(/tmp/proj/notes.txt)
+//!   ⎿  Read 4 lines
+//!
+//! ● Bash(seq 1 40)
+//!   ⎿  1
+//!      2
+//!      3
+//!      … +37 lines
+//!
+//! ● What the worker said, `code` in its own colour.
+//! ```
+//!
+//! A tool call's `●` is green once its result is back, red when the result
+//! is an error, grey while it runs ([`settle`]). Thinking, attachments and
+//! bookkeeping lines are left out, and so is the reply to a worker's
+//! `SubagentHandback`: its report is shown as what the worker said.
+//!
+//! Two views use it: the overlay a row of the management panel opens, which
+//! keeps a prompt whole, and `giverny transcript [--follow]`, which folds it
+//! to watch in a terminal and adds each entry's clock.
+//!
+//! [`Render`] is the pure half — one JSONL line in, zero or more rows out —
+//! so it is tested without a file; [`Row::to_ansi`] paints a row for a
+//! terminal. [`Tail`] is the `tail -f` under both views: it reads a
 //! whole line at a time, holds back a half-written last line until its
 //! newline arrives, and notices when the file is truncated or replaced.
 //!
@@ -18,27 +40,36 @@
 //! fields are pulled out one at a time, and a line that does not parse is
 //! skipped rather than stopping the view.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::subagents::describe_tool_use;
-
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
-const CYAN: &str = "\x1b[36m";
-const RED: &str = "\x1b[31m";
-const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
 
-/// Lines of a tool result shown before it is folded.
-const RESULT_LINES: usize = 4;
+/// Lines of a tool result shown before it is folded: Claude Code's three.
+const RESULT_LINES: usize = 3;
 /// Lines of a prompt (the brief, or a message sent to the worker) shown.
 const PROMPT_LINES: usize = 12;
-/// Widest single line we print from a result or prompt, in characters.
+/// Widest single line we print from a result, in characters.
 const LINE_MAX: usize = 200;
+/// Widest argument a tool call's line shows, in characters.
+const CALL_MAX: usize = 300;
+
+/// The bullet a tool call starts with, as Claude Code draws it.
+pub const BULLET: &str = "● ";
+/// What a prompt starts with.
+pub const PROMPT: &str = "❯ ";
+/// What a tool's result hangs off.
+pub const RESULT: &str = "  ⎿  ";
+/// The indent of a result's later lines.
+const RESULT_MORE: &str = "     ";
+/// The indent of a reply's or a prompt's later lines.
+const MORE: &str = "  ";
 
 /// Options for one render.
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +80,7 @@ pub struct Style {
 
 impl Style {
     fn paint(&self, code: &str, text: &str) -> String {
-        if self.color {
+        if self.color && !code.is_empty() {
             format!("{code}{text}{RESET}")
         } else {
             text.to_string()
@@ -80,69 +111,240 @@ impl Fold {
     };
 }
 
-/// What a rendered row is, which is how it is coloured.
+/// Where a tool call stands, which is its bullet's colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    /// No result yet: it runs.
+    Running,
+    Done,
+    Failed,
+}
+
+/// What a span is, which is how it is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
-    /// The worker's own words, and a prompt's text.
+    /// The worker's own words, a tool's argument and its output.
     Plain,
-    /// `◆`: a reply starts.
-    Reply,
-    /// `● Tool: what`.
-    Tool,
-    /// `▸ prompt` / `▸ message`.
-    Prompt,
-    /// Tool output, fold marks.
+    /// A tool's name, a `**bold**` or a heading in a reply.
+    Strong,
+    /// `inline code` and code blocks in a reply.
+    Code,
+    /// Fold marks, `(No output)`, a hint.
     Dim,
     /// Tool output that is an error.
     Error,
+    /// A prompt's text: drawn on the prompt band.
+    Prompt,
+    /// The `●` before what the worker said.
+    Said,
+    /// The `●` before a tool call.
+    Bullet(Call),
 }
 
-/// One rendered row: `indent`, then the clock (for a row that starts an
-/// entry), then `text` in `tone`.
+/// A run of text in one tone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    pub indent: &'static str,
-    pub clock: Option<String>,
+pub struct Span {
     pub tone: Tone,
     pub text: String,
 }
 
+/// One rendered row: spans, drawn on one line (wrapped if it must).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Row {
+    pub spans: Vec<Span>,
+    /// The row starts an entry (a prompt, a call, a reply): a blank line
+    /// goes before it, unless it is the first.
+    pub starts: bool,
+    /// For a row that starts an entry: its time, `HH:MM:SS` local.
+    pub clock: Option<String>,
+    /// On a tool call's row: the call's id, so its result can settle the
+    /// bullet ([`settle`]).
+    pub call: Option<String>,
+    /// On a result's first row: the call it answers, and whether it failed.
+    pub answers: Option<(String, bool)>,
+}
+
 impl Row {
-    fn new(indent: &'static str, tone: Tone, text: impl Into<String>) -> Row {
+    fn of(spans: Vec<Span>) -> Row {
         Row {
-            indent,
-            clock: None,
-            tone,
-            text: text.into(),
+            spans,
+            ..Row::default()
         }
     }
 
-    /// The row as a terminal line.
-    pub fn to_ansi(&self, style: Style) -> String {
-        let at = self
-            .clock
-            .as_deref()
-            .map(|c| style.paint(DIM, c) + " ")
-            .unwrap_or_default();
-        let code = match self.tone {
-            Tone::Plain => "",
-            Tone::Reply => BOLD,
-            Tone::Tool => CYAN,
-            Tone::Prompt => MAGENTA,
-            Tone::Dim => DIM,
-            Tone::Error => RED,
-        };
-        let text = if code.is_empty() {
-            self.text.clone()
-        } else {
-            style.paint(code, &self.text)
-        };
-        format!("{}{at}{text}", self.indent)
+    /// A row in one tone.
+    pub fn one(tone: Tone, text: impl Into<String>) -> Row {
+        Row::of(vec![span(tone, text)])
     }
 
-    /// The row as plain text.
+    /// The row's text, without colour or clock.
     pub fn plain(&self) -> String {
-        self.to_ansi(Style { color: false })
+        self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Whether the row is part of a prompt, drawn on its band.
+    pub fn is_prompt(&self) -> bool {
+        self.spans.first().is_some_and(|s| s.tone == Tone::Prompt)
+    }
+
+    /// The row as a terminal line, its clock (if it has one) after it.
+    pub fn to_ansi(&self, style: Style) -> String {
+        let mut out: String = self
+            .spans
+            .iter()
+            .map(|s| style.paint(ansi(s.tone), &s.text))
+            .collect();
+        if let Some(c) = &self.clock {
+            out.push_str("  ");
+            out.push_str(&style.paint(DIM, c));
+        }
+        out
+    }
+}
+
+/// The ANSI colour of a tone; Claude Code's own for its marks.
+fn ansi(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Plain => "",
+        Tone::Strong | Tone::Said => BOLD,
+        Tone::Code => "\x1b[38;2;177;185;249m",
+        Tone::Dim | Tone::Bullet(Call::Running) => DIM,
+        Tone::Error | Tone::Bullet(Call::Failed) => "\x1b[38;2;255;107;128m",
+        Tone::Prompt => "\x1b[48;2;55;55;55m",
+        Tone::Bullet(Call::Done) => "\x1b[38;2;78;186;101m",
+    }
+}
+
+fn span(tone: Tone, text: impl Into<String>) -> Span {
+    Span {
+        tone,
+        text: text.into(),
+    }
+}
+
+/// Settle the bullets of the tool calls in `rows` whose results are there:
+/// green, or red for a failed one. Rows are rendered a line at a time and a
+/// call's result comes on a later line, so this runs over the rows so far.
+pub fn settle(rows: &mut [Row]) {
+    let mut failed = std::collections::HashMap::new();
+    for r in rows.iter() {
+        if let Some((id, err)) = &r.answers {
+            failed.insert(id.clone(), *err);
+        }
+    }
+    for r in rows.iter_mut() {
+        let Some(id) = &r.call else { continue };
+        let Some(err) = failed.get(id) else { continue };
+        if let Some(s) = r.spans.first_mut() {
+            s.tone = Tone::Bullet(if *err { Call::Failed } else { Call::Done });
+        }
+    }
+}
+
+/// The columns a row's wrapped lines hang under: its marks (`● `, `❯ `,
+/// `  ⎿  `) and the spaces around them, as Claude Code indents a long line.
+fn hang(row: &Row) -> usize {
+    row.plain()
+        .chars()
+        .take_while(|c| c.is_whitespace() || matches!(c, '●' | '❯' | '⎿'))
+        .count()
+}
+
+/// `row` wrapped at `cols` columns, its later lines hung under its text
+/// rather than under its mark, at a space where there is one. A row that
+/// fits comes back as it is.
+pub fn wrap(row: &Row, cols: usize) -> Vec<Row> {
+    let chars: Vec<(Tone, char)> = row
+        .spans
+        .iter()
+        .flat_map(|s| s.text.chars().map(move |c| (s.tone, c)))
+        .collect();
+    if cols == 0 || chars.len() <= cols {
+        return vec![row.clone()];
+    }
+    let hang = hang(row).min(cols / 2);
+    let pad = row.spans.first().map_or(Tone::Plain, |s| s.tone);
+    let mut out: Vec<Row> = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let room = if out.is_empty() { cols } else { cols - hang };
+        let mut end = (at + room).min(chars.len());
+        // Break at the last space that fits, never inside the marks.
+        let marks = if out.is_empty() { hang } else { 0 };
+        if end < chars.len()
+            && chars[end].1 != ' '
+            && let Some(sp) = chars[at..end].iter().rposition(|(_, c)| *c == ' ')
+            && sp > marks
+        {
+            end = at + sp;
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        if !out.is_empty() && hang > 0 {
+            spans.push(span(pad, " ".repeat(hang)));
+        }
+        for &(tone, c) in &chars[at..end] {
+            match spans.last_mut() {
+                Some(s) if s.tone == tone => s.text.push(c),
+                _ => spans.push(span(tone, c.to_string())),
+            }
+        }
+        let mut r = if out.is_empty() {
+            Row {
+                spans,
+                ..row.clone()
+            }
+        } else {
+            Row::of(spans)
+        };
+        if !out.is_empty() {
+            r.starts = false;
+        }
+        out.push(r);
+        at = end;
+        // The space a line was broken at is not carried to the next one.
+        if at < chars.len() && chars[at].1 == ' ' {
+            at += 1;
+        }
+    }
+    out
+}
+
+/// Add `new` to `rows` as Claude Code lays a transcript out: a tool's
+/// result goes under its own call, even when the worker made several calls
+/// at once and their results came after all of them; anything else goes at
+/// the end. Bullets are settled ([`settle`]) as results come in.
+pub fn push(rows: &mut Vec<Row>, new: Vec<Row>) {
+    let mut groups: Vec<Vec<Row>> = Vec::new();
+    for r in new {
+        match groups.last_mut() {
+            Some(g) if !r.starts && r.answers.is_none() => g.push(r),
+            _ => groups.push(vec![r]),
+        }
+    }
+    let mut settled = false;
+    for g in groups {
+        let call = g[0].answers.as_ref().map(|(id, _)| id.clone());
+        let at = call.and_then(|id| {
+            let i = rows
+                .iter()
+                .rposition(|r| r.call.as_deref() == Some(id.as_str()))?;
+            Some(
+                rows[i + 1..]
+                    .iter()
+                    .position(|r| r.starts)
+                    .map_or(rows.len(), |n| i + 1 + n),
+            )
+        });
+        settled |= g[0].answers.is_some();
+        match at {
+            Some(at) => {
+                rows.splice(at..at, g);
+            }
+            None => rows.extend(g),
+        }
+    }
+    if settled {
+        settle(rows);
     }
 }
 
@@ -168,39 +370,60 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// The first `keep` non-empty lines of `text` (all of them, unclipped, when
-/// `keep` is `None`), and a `… +N lines` tail when some were dropped.
-fn folded(text: &str, keep: Option<usize>, indent: &'static str, tone: Tone) -> Vec<Row> {
-    let lines: Vec<&str> = match keep {
-        Some(_) => text
-            .lines()
-            .map(str::trim_end)
-            .filter(|l| !l.trim().is_empty())
-            .collect(),
-        // Whole: keep its blank lines too, only not the trailing ones.
-        None => text.trim_end().lines().map(str::trim_end).collect(),
+fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+/// `… +N lines`, as Claude Code marks a fold.
+fn more(n: usize) -> String {
+    format!("… +{n} line{}", if n == 1 { "" } else { "s" })
+}
+
+/// A tool call as Claude Code titles it: the name, and the one argument
+/// that says what it does — `Bash(cargo test)`, `Read(/a/b.rs)`.
+pub fn call_title(tool_use: &Value) -> (String, String) {
+    let name = str_of(tool_use, "name").unwrap_or("Tool");
+    let input = tool_use.get("input").unwrap_or(&Value::Null);
+    let name = match name.strip_prefix("mcp__") {
+        Some(rest) => match rest.split_once("__") {
+            Some((server, tool)) => format!("{server} - {tool} (MCP)"),
+            None => rest.to_string(),
+        },
+        None if name == "TodoWrite" => return ("Update Todos".into(), String::new()),
+        None => name.to_string(),
     };
-    let keep_n = keep.unwrap_or(usize::MAX);
-    let mut out: Vec<Row> = lines
+    let arg = match name.as_str() {
+        "Grep" => str_of(input, "pattern").map(|p| match str_of(input, "path") {
+            Some(path) => format!("pattern: \"{p}\", path: \"{path}\""),
+            None => format!("pattern: \"{p}\""),
+        }),
+        "Agent" | "Task" => str_of(input, "description").map(String::from),
+        _ => [
+            "command",
+            "file_path",
+            "notebook_path",
+            "path",
+            "pattern",
+            "url",
+            "query",
+            "skill",
+            "to",
+            "description",
+            "prompt",
+        ]
         .iter()
-        .take(keep_n)
-        .map(|l| {
-            let text = if keep.is_some() {
-                clip(l, LINE_MAX)
-            } else {
-                l.to_string()
-            };
-            Row::new(indent, tone, text)
+        .find_map(|k| str_of(input, k))
+        .map(String::from),
+    };
+    let arg = arg
+        .map(|a| {
+            clip(
+                &a.split_whitespace().collect::<Vec<_>>().join(" "),
+                CALL_MAX,
+            )
         })
-        .collect();
-    if lines.len() > keep_n {
-        out.push(Row::new(
-            indent,
-            Tone::Dim,
-            format!("… +{} lines", lines.len() - keep_n),
-        ));
-    }
-    out
+        .unwrap_or_default();
+    (name, arg)
 }
 
 /// A tool result's `content`: a string, or a list of `{type:"text"}` blocks
@@ -225,103 +448,327 @@ fn result_text(content: &Value) -> String {
     }
 }
 
-/// Render one JSONL line as terminal lines. Unknown or uninteresting lines
-/// render as nothing.
-pub fn render_line(line: &str, style: Style) -> Vec<String> {
-    render_rows(line, Fold::TERMINAL)
+/// What Claude Code says in place of a file tool's output: `Read 4 lines`,
+/// `Wrote 12 lines to …`, `Updated … with 2 additions and 1 removal`.
+fn file_summary(r: &Value) -> Option<String> {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    if let Some(n) = r.pointer("/file/numLines").and_then(Value::as_u64) {
+        return Some(format!("Read {}", plural(n as usize, "line", "lines")));
+    }
+    let path = str_of(r, "filePath")?;
+    if r.get("type").and_then(Value::as_str) == Some("create") {
+        let n = str_of(r, "content").map_or(0, |c| c.lines().count());
+        return Some(format!("Wrote {} to {path}", plural(n, "line", "lines")));
+    }
+    let hunks = r.get("structuredPatch")?.as_array()?;
+    let (mut add, mut del) = (0, 0);
+    for line in hunks
         .iter()
-        .map(|r| r.to_ansi(style))
-        .collect()
+        .filter_map(|h| h.get("lines")?.as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if line.starts_with('+') {
+            add += 1;
+        } else if line.starts_with('-') {
+            del += 1;
+        }
+    }
+    Some(format!(
+        "Updated {path} with {} and {}",
+        plural(add, "addition", "additions"),
+        plural(del, "removal", "removals")
+    ))
 }
 
-/// Render one JSONL line as rows: the pure half of both views.
-pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return Vec::new();
-    };
-    let at = clock(&v);
-    let head = |tone: Tone, text: String| Row {
-        indent: "",
-        clock: at.clone(),
-        tone,
-        text,
-    };
+/// `text` as a prompt: `❯ ` on its first line, the rest under it, all on
+/// the band; folded to `keep` lines when given.
+pub fn prompt_rows(text: &str, keep: Option<usize>) -> Vec<Row> {
+    let lines: Vec<&str> = text.trim().lines().map(str::trim_end).collect();
+    let keep_n = keep.unwrap_or(usize::MAX);
+    let mut out: Vec<Row> = lines
+        .iter()
+        .take(keep_n)
+        .enumerate()
+        .map(|(i, l)| {
+            let lead = if i == 0 { PROMPT } else { MORE };
+            Row::one(Tone::Prompt, format!("{lead}{l}"))
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(Row::one(Tone::Prompt, PROMPT.trim_end()));
+    }
+    if lines.len() > keep_n {
+        out.push(Row::one(
+            Tone::Dim,
+            format!("{MORE}{}", more(lines.len() - keep_n)),
+        ));
+    }
+    if let Some(first) = out.first_mut() {
+        first.starts = true;
+    }
+    out
+}
+
+/// One line of a reply, its `` `code` `` and `**bold**` picked out.
+fn inline(line: &str) -> Vec<Span> {
     let mut out = Vec::new();
-    match v.get("type").and_then(Value::as_str) {
-        Some("assistant") => {
-            let Some(parts) = v.pointer("/message/content").and_then(Value::as_array) else {
-                return out;
-            };
-            for part in parts {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-                        let mut lines = text.lines().map(str::trim_end);
-                        let Some(first) = lines.next() else { continue };
-                        out.push(head(Tone::Reply, "◆".into()));
-                        out.push(Row::new("  ", Tone::Plain, first));
-                        out.extend(lines.map(|l| Row::new("  ", Tone::Plain, l)));
-                    }
-                    Some("tool_use") => {
-                        out.push(head(Tone::Tool, format!("● {}", describe_tool_use(part))));
-                    }
-                    // Thinking is private and often redacted; the tool calls
-                    // around it say what it decided.
-                    _ => {}
-                }
-            }
+    let mut tone = Tone::Plain;
+    let mut code = false;
+    let mut buf = String::new();
+    let mut chars = line.chars().peekable();
+    let flush = |buf: &mut String, out: &mut Vec<Span>, tone: Tone| {
+        if !buf.is_empty() {
+            out.push(span(tone, std::mem::take(buf)));
         }
-        Some("user") => match v.pointer("/message/content") {
-            Some(Value::String(s)) => {
-                if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
-                    return out;
-                }
-                out.push(head(Tone::Prompt, "▸ prompt".into()));
-                out.extend(folded(s, fold.prompt_lines, "  ", Tone::Plain));
+    };
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            flush(&mut buf, &mut out, if code { Tone::Code } else { tone });
+            code = !code;
+        } else if !code && c == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            flush(&mut buf, &mut out, tone);
+            tone = if tone == Tone::Strong {
+                Tone::Plain
+            } else {
+                Tone::Strong
+            };
+        } else {
+            buf.push(c);
+        }
+    }
+    flush(&mut buf, &mut out, if code { Tone::Code } else { tone });
+    out
+}
+
+/// What the worker said: `● ` and its first line, the rest under it, with
+/// light markdown (code, bold, headings) as Claude Code shows it.
+fn said_rows(text: &str) -> Vec<Row> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in text.trim().lines().map(str::trim_end) {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if line.trim().is_empty() && !out.is_empty() {
+            out.push(Row::default());
+            continue;
+        }
+        let lead = if out.is_empty() { BULLET } else { MORE };
+        let lead_tone = if out.is_empty() {
+            Tone::Said
+        } else {
+            Tone::Plain
+        };
+        let mut spans = vec![span(lead_tone, lead)];
+        if fenced {
+            spans.push(span(Tone::Code, line));
+        } else if let Some(h) = line
+            .strip_prefix('#')
+            .map(|h| h.trim_start_matches('#'))
+            .and_then(|h| h.strip_prefix(' '))
+        {
+            spans.push(span(Tone::Strong, h));
+        } else {
+            spans.extend(inline(line));
+        }
+        out.push(Row::of(spans));
+    }
+    if let Some(first) = out.first_mut() {
+        first.starts = true;
+    }
+    out
+}
+
+/// A tool's result: `  ⎿  ` and its first line, up to `keep` lines, then
+/// `… +N lines`.
+fn result_rows(text: &str, keep: usize, error: bool) -> Vec<Row> {
+    let text = text
+        .replace("<tool_use_error>", "")
+        .replace("</tool_use_error>", "");
+    let lines: Vec<&str> = text.trim_end().lines().map(str::trim_end).collect();
+    let lines: Vec<&str> = lines
+        .iter()
+        .skip_while(|l| l.trim().is_empty())
+        .copied()
+        .collect();
+    let tone = if error { Tone::Error } else { Tone::Plain };
+    if lines.is_empty() {
+        return vec![Row::of(vec![
+            span(Tone::Plain, RESULT),
+            span(Tone::Dim, "(No output)"),
+        ])];
+    }
+    // Claude Code shows a result of up to one more line than it keeps
+    // whole: `… +1 line` would hide nothing.
+    let shown = if lines.len() > keep + 1 {
+        keep
+    } else {
+        lines.len()
+    };
+    let mut out: Vec<Row> = lines
+        .iter()
+        .take(shown)
+        .enumerate()
+        .map(|(i, l)| {
+            let lead = if i == 0 { RESULT } else { RESULT_MORE };
+            Row::of(vec![span(Tone::Plain, lead), span(tone, clip(l, LINE_MAX))])
+        })
+        .collect();
+    if lines.len() > shown {
+        out.push(Row::of(vec![
+            span(Tone::Plain, RESULT_MORE),
+            span(Tone::Dim, more(lines.len() - shown)),
+        ]));
+    }
+    out
+}
+
+/// Renders a transcript a line at a time. It remembers the calls whose
+/// results are not shown (a `SubagentHandback`'s), so it is kept across
+/// the lines of one transcript.
+#[derive(Debug, Clone)]
+pub struct Render {
+    fold: Fold,
+    hidden: HashSet<String>,
+}
+
+impl Render {
+    pub fn new(fold: Fold) -> Render {
+        Render {
+            fold,
+            hidden: HashSet::new(),
+        }
+    }
+
+    /// Render one JSONL line as rows. Unknown or uninteresting lines
+    /// render as nothing.
+    pub fn line(&mut self, line: &str) -> Vec<Row> {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return Vec::new();
+        };
+        let at = clock(&v);
+        let mut out = Vec::new();
+        let entry = |rows: Vec<Row>, out: &mut Vec<Row>| {
+            let mut rows = rows.into_iter();
+            if let Some(mut first) = rows.next() {
+                first.starts = true;
+                first.clock = at.clone();
+                out.push(first);
             }
-            Some(Value::Array(parts)) => {
+            out.extend(rows);
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                let Some(parts) = v.pointer("/message/content").and_then(Value::as_array) else {
+                    return out;
+                };
                 for part in parts {
                     match part.get("type").and_then(Value::as_str) {
-                        Some("tool_result") => {
-                            let error = part.get("is_error").and_then(Value::as_bool) == Some(true);
-                            let text = result_text(part.get("content").unwrap_or(&Value::Null));
-                            let tone = if error { Tone::Error } else { Tone::Dim };
-                            let mut body = folded(&text, Some(fold.result_lines), "    ", tone);
-                            if body.is_empty() {
-                                body.push(Row::new("    ", Tone::Dim, "(no output)"));
-                            }
-                            // The first line hangs off the ⎿, the rest indent under it.
-                            let first = body.remove(0);
-                            out.push(Row::new("  ", tone, format!("⎿ {}", first.text)));
-                            out.extend(body);
-                        }
                         Some("text") => {
                             let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-                            out.push(head(Tone::Prompt, "▸ message".into()));
-                            out.extend(folded(text, fold.prompt_lines, "  ", Tone::Plain));
+                            entry(said_rows(text), &mut out);
                         }
+                        // The final report: shown as what the worker said.
+                        Some("tool_use") if str_of(part, "name") == Some("SubagentHandback") => {
+                            if let Some(id) = str_of(part, "id") {
+                                self.hidden.insert(id.to_string());
+                            }
+                            let msg = part.pointer("/input/message").and_then(Value::as_str);
+                            entry(said_rows(msg.unwrap_or("")), &mut out);
+                        }
+                        Some("tool_use") => {
+                            let (name, arg) = call_title(part);
+                            let mut spans = vec![
+                                span(Tone::Bullet(Call::Running), BULLET),
+                                span(Tone::Strong, name),
+                            ];
+                            if !arg.is_empty() {
+                                spans.push(span(Tone::Plain, format!("({arg})")));
+                            }
+                            let mut row = Row::of(spans);
+                            row.call = str_of(part, "id").map(String::from);
+                            entry(vec![row], &mut out);
+                        }
+                        // Thinking is private and often redacted; the tool calls
+                        // around it say what it decided.
                         _ => {}
                     }
                 }
             }
-            _ => {}
-        },
-        // A message typed to a running worker in its own view (the view
-        // Open in Claude Code puts the tab on) is not a `user`
-        // line: it lands as a queued command attachment, origin human, when
-        // the worker takes it.
-        Some("attachment") => {
-            let att = v.get("attachment").unwrap_or(&Value::Null);
-            let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
-            if att.get("type").and_then(Value::as_str) == Some("queued_command")
-                && human
-                && let Some(text) = att.get("prompt").and_then(Value::as_str)
-            {
-                out.push(head(Tone::Prompt, "▸ message".into()));
-                out.extend(folded(text, fold.prompt_lines, "  ", Tone::Plain));
+            Some("user") => match v.pointer("/message/content") {
+                Some(Value::String(s)) => {
+                    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+                        return out;
+                    }
+                    entry(prompt_rows(s, self.fold.prompt_lines), &mut out);
+                }
+                Some(Value::Array(parts)) => {
+                    let summary = v.get("toolUseResult").and_then(file_summary);
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("tool_result") => {
+                                let id = str_of(part, "tool_use_id").unwrap_or("").to_string();
+                                if self.hidden.contains(&id) {
+                                    continue;
+                                }
+                                let error =
+                                    part.get("is_error").and_then(Value::as_bool) == Some(true);
+                                let text = match (&summary, error) {
+                                    (Some(s), false) => s.clone(),
+                                    _ => result_text(part.get("content").unwrap_or(&Value::Null)),
+                                };
+                                let mut rows = result_rows(&text, self.fold.result_lines, error);
+                                rows[0].answers = Some((id, error));
+                                out.extend(rows);
+                            }
+                            Some("text") => {
+                                let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                                entry(prompt_rows(text, self.fold.prompt_lines), &mut out);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            // A message typed to a running worker in its own view (the view
+            // Open in Claude Code puts the tab on) is not a `user`
+            // line: it lands as a queued command attachment, origin human, when
+            // the worker takes it.
+            Some("attachment") => {
+                let att = v.get("attachment").unwrap_or(&Value::Null);
+                let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+                if att.get("type").and_then(Value::as_str) == Some("queued_command")
+                    && human
+                    && let Some(text) = att.get("prompt").and_then(Value::as_str)
+                {
+                    entry(prompt_rows(text, self.fold.prompt_lines), &mut out);
+                }
             }
+            _ => {}
         }
-        _ => {}
+        out
+    }
+}
+
+/// Render one JSONL line on its own (no memory of the lines before it).
+pub fn render_rows(line: &str, fold: Fold) -> Vec<Row> {
+    Render::new(fold).line(line)
+}
+
+/// Rows as lines of text, with a blank line before each entry but the
+/// first: how both views lay them out.
+pub fn lay_out(rows: &[Row], first: bool, style: Style) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if r.starts && !(first && i == 0) {
+            out.push(String::new());
+        }
+        out.push(r.to_ansi(style));
     }
     out
 }
@@ -410,12 +857,22 @@ pub fn header(path: &Path, style: Style) -> Vec<String> {
 /// until the writer (the terminal) goes away. Returns when the output is
 /// closed, or — without `follow` — at the end of the file.
 pub fn follow(path: &Path, follow: bool, out: &mut impl Write) -> std::io::Result<()> {
-    let style = Style { color: true };
+    follow_styled(path, follow, Style { color: true }, out)
+}
+
+fn follow_styled(
+    path: &Path,
+    follow: bool,
+    style: Style,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     for l in header(path, style) {
         writeln!(out, "{l}")?;
     }
     let mut waited = false;
     let mut tail = Tail::default();
+    let mut render = Render::new(Fold::TERMINAL);
+    let mut first = true;
     loop {
         let update = match tail.read(path) {
             Ok(u) => u,
@@ -433,19 +890,25 @@ pub fn follow(path: &Path, follow: bool, out: &mut impl Write) -> std::io::Resul
         if update.restarted {
             // Truncated or replaced: start over rather than read garbage.
             writeln!(out, "{}", style.paint(DIM, "── transcript restarted ──"))?;
+            render = Render::new(Fold::TERMINAL);
+            first = true;
         }
-        for line in &update.lines {
-            for l in render_line(line, style) {
-                writeln!(out, "{l}")?;
-            }
+        // A call whose result came in the same read gets its colour and the
+        // result goes under it; one still running when printed keeps the
+        // grey bullet.
+        let mut rows: Vec<Row> = Vec::new();
+        for l in &update.lines {
+            push(&mut rows, render.line(l));
         }
+        if !follow && let Some(rest) = tail.rest() {
+            push(&mut rows, render.line(rest));
+        }
+        for l in lay_out(&rows, first, style) {
+            writeln!(out, "{l}")?;
+        }
+        first &= rows.is_empty();
         out.flush()?;
         if !follow {
-            if let Some(rest) = tail.rest() {
-                for l in render_line(rest, style) {
-                    writeln!(out, "{l}")?;
-                }
-            }
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -458,77 +921,254 @@ mod tests {
 
     const PLAIN: Style = Style { color: false };
 
-    fn strip_clock(lines: Vec<String>) -> Vec<String> {
-        // The clock is local time; drop the `HH:MM:SS ` prefix.
-        lines
+    /// A transcript's lines rendered as the overlay lays them out, plain.
+    fn view(lines: &[&str]) -> Vec<String> {
+        let mut r = Render::new(Fold::OVERLAY);
+        let mut rows: Vec<Row> = Vec::new();
+        for l in lines {
+            push(&mut rows, r.line(l));
+        }
+        lay_out(&rows, true, PLAIN)
             .into_iter()
             .map(|l| {
-                if l.len() > 9 && l.as_bytes()[2] == b':' && l.as_bytes()[5] == b':' {
-                    l[9..].to_string()
-                } else {
-                    l
+                // The clock is local time; drop it.
+                match l.rsplit_once("  ") {
+                    Some((head, c)) if c.len() == 8 && c.as_bytes()[2] == b':' => head.to_string(),
+                    _ => l,
                 }
             })
             .collect()
     }
 
+    /// The test worker of giverny#477's capture, as Claude Code 2.1.304
+    /// wrote it, and as its subagent view (ctrl+o) showed it.
     #[test]
-    fn tool_use_is_one_line_with_its_argument() {
-        let line = r#"{"type":"assistant","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test","description":"Run tests"}}]}}"#;
+    fn a_worker_reads_as_claude_codes_view_of_it() {
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-10-20T11:55:01Z","message":{"role":"user","content":"Read notes.txt. Then run seq 1 40 with Bash."}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>\nx\n</system-reminder>"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/tmp/g477/h/proj/notes.txt"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"seq 1 40","description":"Print numbers 1 through 40"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"r1","type":"tool_result","content":"1\tThe pier.\n2\tSeven planks.\n3\tLilies.\n4\t"}]},"toolUseResult":{"type":"text","file":{"filePath":"/tmp/g477/h/proj/notes.txt","numLines":4,"startLine":1,"totalLines":4}}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"b1","type":"tool_result","content":"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40","is_error":false}]},"toolUseResult":{"stdout":"1\n2","stderr":""}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"h1","name":"SubagentHandback","input":{"message":"notes.txt has 3 lines.\nRan `seq 1 40`."}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"h1","type":"tool_result","content":[{"type":"text","text":"{\"success\":true}"}]}]}}"#,
+        ];
         assert_eq!(
-            strip_clock(render_line(line, PLAIN)),
-            vec!["● Bash: Run tests"]
+            view(&lines),
+            vec![
+                "❯ Read notes.txt. Then run seq 1 40 with Bash.",
+                "",
+                "● Read(/tmp/g477/h/proj/notes.txt)",
+                "  ⎿  Read 4 lines",
+                "",
+                "● Bash(seq 1 40)",
+                "  ⎿  1",
+                "     2",
+                "     3",
+                "     … +37 lines",
+                "",
+                "● notes.txt has 3 lines.",
+                "  Ran seq 1 40.",
+            ]
         );
     }
 
     #[test]
-    fn text_is_shown_whole_and_thinking_is_not() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Done.\nAll green."}]}}"#;
+    fn bullets_settle_green_red_or_stay_grey() {
+        let mut r = Render::new(Fold::OVERLAY);
+        let mut rows: Vec<Row> = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"true"}},{"type":"tool_use","id":"b","name":"Bash","input":{"command":"false"}},{"type":"tool_use","id":"c","name":"Bash","input":{"command":"sleep 9"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"a","type":"tool_result","content":""},{"tool_use_id":"b","type":"tool_result","is_error":true,"content":"<tool_use_error>Exit code 1</tool_use_error>"}]}}"#,
+        ]
+        .iter()
+        .flat_map(|l| r.line(l))
+        .collect();
+        settle(&mut rows);
+        let bullets: Vec<Tone> = rows
+            .iter()
+            .filter(|r| r.call.is_some())
+            .map(|r| r.spans[0].tone)
+            .collect();
         assert_eq!(
-            render_line(line, PLAIN),
-            vec!["◆", "  Done.", "  All green."]
+            bullets,
+            vec![
+                Tone::Bullet(Call::Done),
+                Tone::Bullet(Call::Failed),
+                Tone::Bullet(Call::Running)
+            ]
+        );
+        let texts: Vec<String> = rows.iter().map(Row::plain).collect();
+        assert!(texts.contains(&"  ⎿  (No output)".to_string()), "{texts:?}");
+        assert!(texts.contains(&"  ⎿  Exit code 1".to_string()), "{texts:?}");
+        let err = rows
+            .iter()
+            .find(|r| r.plain().contains("Exit code"))
+            .unwrap();
+        assert_eq!(err.spans[1].tone, Tone::Error);
+    }
+
+    #[test]
+    fn results_fold_after_three_lines_but_never_hide_one() {
+        let fold = |n: usize| {
+            let content: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+            let line = serde_json::json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"x","content":content.join("\n")}]}})
+            .to_string();
+            render_rows(&line, Fold::OVERLAY)
+                .iter()
+                .map(Row::plain)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fold(4), vec!["  ⎿  1", "     2", "     3", "     4"]);
+        assert_eq!(
+            fold(6),
+            vec!["  ⎿  1", "     2", "     3", "     … +3 lines"]
         );
     }
 
     #[test]
-    fn results_fold_after_four_lines() {
-        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"a\nb\nc\nd\ne\nf"}]}}"#;
+    fn calls_are_titled_as_claude_code_titles_them() {
+        let t = |v: serde_json::Value| {
+            let (n, a) = call_title(&v);
+            if a.is_empty() { n } else { format!("{n}({a})") }
+        };
+        use serde_json::json;
         assert_eq!(
-            render_line(line, PLAIN),
-            vec!["  ⎿ a", "    b", "    c", "    d", "    … +2 lines"]
+            t(json!({"name":"Bash","input":{"command":"cargo  test\n -p x","description":"Run"}})),
+            "Bash(cargo test -p x)"
+        );
+        assert_eq!(
+            t(json!({"name":"Grep","input":{"pattern":"fn main","path":"src"}})),
+            "Grep(pattern: \"fn main\", path: \"src\")"
+        );
+        assert_eq!(
+            t(json!({"name":"Agent","input":{"description":"g1","prompt":"long"}})),
+            "Agent(g1)"
+        );
+        assert_eq!(
+            t(json!({"name":"TodoWrite","input":{"todos":[]}})),
+            "Update Todos"
+        );
+        assert_eq!(
+            t(json!({"name":"mcp__docs__read","input":{"url":"u"}})),
+            "docs - read (MCP)(u)"
         );
     }
 
     #[test]
-    fn block_results_and_empty_results() {
-        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":[{"type":"text","text":"boom"}]},{"type":"tool_result","content":""}]}}"#;
+    fn edits_and_writes_say_what_changed() {
+        let edit = r#"{"type":"user","message":{"content":[{"tool_use_id":"e","type":"tool_result","content":"The file /a.rs has been updated."}]},"toolUseResult":{"filePath":"/a.rs","structuredPatch":[{"lines":[" a","-b","+c","+d"]}]}}"#;
         assert_eq!(
-            render_line(line, PLAIN),
-            vec!["  ⎿ boom", "  ⎿ (no output)"]
+            render_rows(edit, Fold::OVERLAY)[0].plain(),
+            "  ⎿  Updated /a.rs with 2 additions and 1 removal"
         );
+        let write = r#"{"type":"user","message":{"content":[{"tool_use_id":"w","type":"tool_result","content":"File created"}]},"toolUseResult":{"type":"create","filePath":"/b.md","content":"x\ny\n"}}"#;
+        assert_eq!(
+            render_rows(write, Fold::OVERLAY)[0].plain(),
+            "  ⎿  Wrote 2 lines to /b.md"
+        );
+    }
+
+    #[test]
+    fn replies_pick_out_code_and_bold() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Ran `seq` **twice**.\n\n## Next\n```\nlet x = 1;\n```"}]}}"#;
+        let rows = render_rows(line, Fold::OVERLAY);
+        let texts: Vec<String> = rows.iter().map(Row::plain).collect();
+        assert_eq!(
+            texts,
+            vec!["● Ran seq twice.", "", "  Next", "  let x = 1;"]
+        );
+        let tones: Vec<Tone> = rows[0].spans.iter().map(|s| s.tone).collect();
+        assert_eq!(
+            tones,
+            vec![
+                Tone::Said,
+                Tone::Plain,
+                Tone::Code,
+                Tone::Plain,
+                Tone::Strong,
+                Tone::Plain
+            ]
+        );
+        assert_eq!(rows[2].spans[1].tone, Tone::Strong);
+        assert_eq!(rows[3].spans[1].tone, Tone::Code);
     }
 
     #[test]
     fn prompts_show_and_meta_and_attachments_do_not() {
         let prompt = r#"{"type":"user","message":{"content":"Work task 5.\nRead the issue."}}"#;
+        let rows = render_rows(prompt, Fold::OVERLAY);
         assert_eq!(
-            render_line(prompt, PLAIN),
-            vec!["▸ prompt", "  Work task 5.", "  Read the issue."]
+            rows.iter().map(Row::plain).collect::<Vec<_>>(),
+            vec!["❯ Work task 5.", "  Read the issue."]
         );
+        assert!(rows.iter().all(Row::is_prompt));
         let meta = r#"{"type":"user","isMeta":true,"message":{"content":"<system>"}}"#;
-        assert!(render_line(meta, PLAIN).is_empty());
+        assert!(render_rows(meta, Fold::OVERLAY).is_empty());
         let att = r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta"}}"#;
-        assert!(render_line(att, PLAIN).is_empty());
+        assert!(render_rows(att, Fold::OVERLAY).is_empty());
         // A line typed to the worker in its view (Claude Code 2.1.281, as
-        // captured while testing the worker view) shows as a message.
+        // captured while testing the worker view) shows as a prompt.
         let typed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"Hello sigma","source_uuid":"1b","origin":{"kind":"human"},"isMeta":true}}"#;
         assert_eq!(
-            render_line(typed, PLAIN),
-            vec!["▸ message", "  Hello sigma"]
+            render_rows(typed, Fold::OVERLAY)[0].plain(),
+            "❯ Hello sigma"
         );
         let relayed = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"task-notification"}}}"#;
-        assert!(render_line(relayed, PLAIN).is_empty());
-        assert!(render_line("not json", PLAIN).is_empty());
+        assert!(render_rows(relayed, Fold::OVERLAY).is_empty());
+        assert!(render_rows("not json", Fold::OVERLAY).is_empty());
+    }
+
+    #[test]
+    fn the_overlay_keeps_a_prompt_whole_and_the_terminal_folds_it() {
+        let body: String = (1..=20).map(|i| format!("line {i}\n\n")).collect();
+        let long = "x".repeat(300);
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {"content": format!("{body}{long}")},
+        })
+        .to_string();
+        let rows = render_rows(&line, Fold::OVERLAY);
+        let texts: Vec<String> = rows.iter().map(Row::plain).collect();
+        assert_eq!(texts[0], "❯ line 1");
+        assert!(texts.contains(&"  line 20".to_string()), "{texts:?}");
+        assert!(texts.contains(&"  ".to_string()), "blank lines are kept");
+        assert_eq!(texts.last().unwrap().chars().count(), 302, "not clipped");
+        assert!(!texts.iter().any(|t| t.contains("… +")));
+        let folded = render_rows(&line, Fold::TERMINAL);
+        assert!(folded.last().unwrap().plain().contains("… +"));
+    }
+
+    #[test]
+    fn rows_carry_clock_and_entry_starts() {
+        let line = r#"{"type":"assistant","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_use","id":"t","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+        let rows = render_rows(line, Fold::OVERLAY);
+        assert!(rows[0].starts);
+        assert!(rows[0].clock.is_some());
+        assert_eq!(rows[0].call.as_deref(), Some("t"));
+        // The terminal puts the clock after the row, dim.
+        assert!(rows[0].to_ansi(PLAIN).starts_with("● Read(/a/b.rs)  "));
+    }
+
+    #[test]
+    fn long_rows_wrap_hung_under_their_text() {
+        let said = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"one two three four five six"}]}}"#;
+        let rows = render_rows(said, Fold::OVERLAY);
+        let lines: Vec<String> = wrap(&rows[0], 12).iter().map(Row::plain).collect();
+        assert_eq!(lines, vec!["● one two", "  three four", "  five six"]);
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"abcdefghijklmnop"}]}}"#;
+        let rows = render_rows(result, Fold::OVERLAY);
+        let lines: Vec<String> = wrap(&rows[0], 12).iter().map(Row::plain).collect();
+        assert_eq!(lines, vec!["  ⎿  abcdefg", "     hijklmn", "     op"]);
+        // A prompt's wrapped lines stay on its band.
+        let rows = prompt_rows("alpha beta gamma delta", None);
+        let wrapped = wrap(&rows[0], 12);
+        assert!(wrapped.iter().all(Row::is_prompt));
+        assert_eq!(wrapped[1].plain(), "  gamma");
+        // A row that fits is left alone.
+        assert_eq!(wrap(&rows[0], 80), rows[..1].to_vec());
     }
 
     #[test]
@@ -552,47 +1192,12 @@ mod tests {
         )
         .unwrap();
         let mut buf = Vec::new();
-        follow(&path, false, &mut buf).unwrap();
+        follow_styled(&path, false, PLAIN, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Work demo#5"));
         assert!(text.contains("general-purpose · opus"));
-        assert!(text.contains("  hi"));
-        assert!(text.contains("  tail"));
+        assert!(text.contains("● hi\n\n● tail\n"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn the_overlay_keeps_a_prompt_whole() {
-        let body: String = (1..=20).map(|i| format!("line {i}\n\n")).collect();
-        let long = "x".repeat(300);
-        let line = serde_json::json!({
-            "type": "user",
-            "message": {"content": format!("{body}{long}")},
-        })
-        .to_string();
-        let rows = render_rows(&line, Fold::OVERLAY);
-        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(texts[0], "▸ prompt");
-        assert!(texts.contains(&"line 20"), "{texts:?}");
-        assert!(texts.contains(&""), "blank lines are kept");
-        assert_eq!(texts.last().unwrap().chars().count(), 300, "not clipped");
-        assert!(!texts.iter().any(|t| t.starts_with("… +")));
-        // The terminal view folds the same prompt.
-        let folded = render_rows(&line, Fold::TERMINAL);
-        assert!(folded.last().unwrap().text.starts_with("… +"));
-    }
-
-    #[test]
-    fn rows_carry_tone_and_clock() {
-        let line = r#"{"type":"user","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"boom"}]}}"#;
-        let rows = render_rows(line, Fold::OVERLAY);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tone, Tone::Error);
-        assert_eq!(rows[0].plain(), "  ⎿ boom");
-        let line = r#"{"type":"assistant","timestamp":"2026-09-23T10:00:00Z","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
-        let rows = render_rows(line, Fold::OVERLAY);
-        assert_eq!(rows[0].tone, Tone::Tool);
-        assert!(rows[0].clock.is_some());
     }
 
     #[test]

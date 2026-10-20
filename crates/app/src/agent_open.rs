@@ -22,7 +22,9 @@
 //!   and say it may have left (giverny#274). It opens as a Done row does.
 //! * **Done** workers (and a Running one that cannot be opened) open an
 //!   overlay over the current terminal showing the
-//!   worker's transcript, rendered as `giverny transcript` renders it: a
+//!   worker's transcript, drawn as Claude Code draws a worker's own view
+//!   (`giverny_claude::transcript`, giverny#477; `giverny transcript`
+//!   renders it the same way): a
 //!   Running one live, following it as it grows; a Done one opened at its
 //!   end, on the final report. Nothing is typed into Claude Code.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
@@ -34,8 +36,9 @@
 //!   `/tasks`, and its transcript is not a resumable session), and the one
 //!   way back in — the parent's `SendMessage` — speaks for the user, so the old
 //!   **Revive** that typed a line at the parent's prompt is gone.
-//! * **Planned** shows the row's brief in the same overlay; without one, its
-//!   task, title and note, and how a dispatcher adds a brief.
+//! * **Planned** shows the row's brief in the same overlay, drawn as the
+//!   worker's prompt; without one, its task, title and note as that prompt,
+//!   and how a dispatcher adds a brief.
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab — unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave.
@@ -71,8 +74,15 @@ pub enum Plan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    /// A brief on disk, read when the overlay opens.
+    /// A brief on disk, read when the overlay opens, and shown as the
+    /// worker's prompt.
     File(PathBuf),
+    /// A Next up row with no brief: what it has (task, title, note) as the
+    /// prompt, then how a dispatcher adds a brief.
+    Unbriefed {
+        prompt: String,
+        hint: String,
+    },
     Text(String),
 }
 
@@ -197,17 +207,19 @@ pub fn plan(click: &RowClick) -> Plan {
                     body: Body::File(b.clone()),
                 };
             }
+            let (prompt, hint) = planned_without_brief(click);
             Plan::Show {
                 title,
-                body: Body::Text(planned_without_brief(click)),
+                body: Body::Unbriefed { prompt, hint },
             }
         }
     }
 }
 
 /// A Next up row with no brief still says what it has: its
-/// task, its title and its note, then how a dispatcher gives it a brief.
-fn planned_without_brief(click: &RowClick) -> String {
+/// task, its title and its note (the prompt it has so far), then how a
+/// dispatcher gives it a brief.
+fn planned_without_brief(click: &RowClick) -> (String, String) {
     let some = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
     let mut parts: Vec<String> = Vec::new();
     if let Some(k) = some(&click.key) {
@@ -219,12 +231,10 @@ fn planned_without_brief(click: &RowClick) -> String {
     if let Some(n) = click.note.as_deref().and_then(some) {
         parts.push(n);
     }
-    parts.push(
-        "No brief was given for this row. The dispatcher adds one with \
+    let hint = "No brief was given for this row. The dispatcher adds one with \
          `giverny-manage plan <task> --eta <min> --brief FILE` (or `start … --brief FILE`)."
-            .to_string(),
-    );
-    parts.join("\n\n")
+        .to_string();
+    (parts.join("\n\n"), hint)
 }
 
 /// What the overlay for this click offers. A finished worker is no longer
@@ -1694,14 +1704,14 @@ mod tests {
         c.note = Some("lane 2".into());
         let Plan::Show {
             title,
-            body: Body::Text(t),
+            body: Body::Unbriefed { prompt, hint },
         } = plan(&c)
         else {
-            panic!("expected text");
+            panic!("expected the row's own text");
         };
         assert_eq!(title, "acme#158 · Wren");
-        assert!(t.starts_with("Task: acme#158\n\nWren\n\nlane 2\n\n"), "{t}");
-        assert!(t.contains("--brief FILE"), "{t}");
+        assert_eq!(prompt, "Task: acme#158\n\nWren\n\nlane 2");
+        assert!(hint.contains("--brief FILE"), "{hint}");
         c.brief = Some("/b/brief.md".into());
         assert_eq!(
             plan(&c),
@@ -1715,13 +1725,14 @@ mod tests {
         c.note = None;
         c.name = "acme#158".into();
         let Plan::Show {
-            body: Body::Text(t),
+            body: Body::Unbriefed { prompt, hint },
             ..
         } = plan(&c)
         else {
-            panic!("expected text");
+            panic!("expected the row's own text");
         };
-        assert!(t.starts_with("Task: acme#158\n\nNo brief was given"), "{t}");
+        assert_eq!(prompt, "Task: acme#158");
+        assert!(hint.starts_with("No brief was given"), "{hint}");
     }
 
     #[test]
