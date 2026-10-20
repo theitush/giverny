@@ -5667,9 +5667,20 @@ impl App {
                 live,
             } => overlays::BriefOverlay::transcript(title, transcript, live),
             Plan::Show { title, body } => match body {
+                // A brief is what the worker will be given: drawn as its
+                // prompt, as Claude Code draws one (giverny#477).
                 Body::File(path) => {
                     let text = agent_open::read_brief(&path);
-                    overlays::BriefOverlay::text(title, Some(path), text)
+                    let rows = giverny_claude::transcript::prompt_rows(&text, None);
+                    overlays::BriefOverlay::rows(title, Some(path), rows)
+                }
+                Body::Unbriefed { prompt, hint } => {
+                    use giverny_claude::transcript::{Row, Tone, prompt_rows};
+                    let mut rows = prompt_rows(&prompt, None);
+                    let mut hint = Row::one(Tone::Dim, hint);
+                    hint.starts = true;
+                    rows.push(hint);
+                    overlays::BriefOverlay::rows(title, None, rows)
                 }
                 Body::Text(text) => overlays::BriefOverlay::text(title, None, text),
             },
