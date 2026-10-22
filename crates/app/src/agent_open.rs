@@ -110,37 +110,37 @@ pub fn title_of(click: &RowClick) -> String {
     }
 }
 
-/// The longest worker name the status line gives, in characters: it
-/// shares the line with the model and the token counts.
-pub const VIEWED_NAME_MAX: usize = 40;
-
-/// Who a tab's status line names while its Claude Code shows a worker's
-/// view (giverny#460): the worker, as its management-panel row names it
-/// ([`title_of`]: `acme#158 · name`), else the label Claude Code puts on the
-/// view (the Agent call's description), cut to [`VIEWED_NAME_MAX`]. `None`
-/// on the manager's own view (`label` none), where the status line names
-/// the manager's session. The tab keeps its own title either way: it is
-/// still the manager's place.
+/// What a tab's status line is told while its Claude Code shows a worker's
+/// view (giverny#460): enough for the line to be that worker's alone — its
+/// task name (the management-panel row's key, `g477`; never the
+/// description), its agent id and its transcript, for its model and tokens.
+/// `agent` is the worker the view's label names in the tab's tracker; the
+/// row's own agent id wins over its. `None` on the manager's own view
+/// (`label` none), where the line is the manager's session's. The tab keeps
+/// its own title either way: it is still the manager's place.
 ///
 /// `label` is read off the screen ([`viewing_worker`], [`prompt_box`]), so
 /// it follows the view however it was left: the pane's back button, a
 /// second click on the row, Esc or ← typed by hand, the strip's `main`.
-pub fn viewed_name(label: Option<&str>, row: Option<&RowClick>) -> Option<String> {
+pub fn viewed(
+    label: Option<&str>,
+    row: Option<&RowClick>,
+    agent: Option<&giverny_claude::subagents::SubagentRow>,
+) -> Option<giverny_claude::hooks::Viewing> {
     let label = label?;
-    let name = match row {
-        Some(row) => title_of(row),
-        None => label.to_string(),
-    };
-    Some(shorten(name.trim(), VIEWED_NAME_MAX))
-}
-
-/// `text` cut to `max` characters, the cut marked with `…`.
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", kept.trim_end())
+    let given = |s: &Option<String>| s.clone().filter(|s| !s.trim().is_empty());
+    Some(giverny_claude::hooks::Viewing {
+        task: row.map(|r| r.key.clone()).filter(|k| !k.trim().is_empty()),
+        agent_id: row
+            .and_then(|r| given(&r.agent_id))
+            .or_else(|| agent.map(|a| a.id.clone())),
+        transcript: row
+            .and_then(|r| r.transcript.clone())
+            .or_else(|| agent.and_then(|a| a.transcript.clone())),
+        label: agent
+            .and_then(|a| given(&a.name))
+            .or_else(|| Some(label.trim().to_string())),
+    })
 }
 
 fn agent_id(click: &RowClick) -> Option<&str> {
@@ -1748,28 +1748,31 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_names_the_worker_on_view() {
+    fn the_status_line_is_told_the_worker_on_view() {
         // giverny#460.
         let mut c = click(Stage::Running);
         c.name = "fix the rail".into();
-        // On the manager's view: no worker's name, whatever the row.
-        assert_eq!(viewed_name(None, Some(&c)), None);
-        assert_eq!(viewed_name(None, None), None);
-        // On the worker's view: the panel row's name, else the view's label.
-        assert_eq!(
-            viewed_name(Some("g460: attached title"), Some(&c)).as_deref(),
-            Some("acme#158 · fix the rail")
-        );
-        assert_eq!(
-            viewed_name(Some("g460: attached title"), None).as_deref(),
-            Some("g460: attached title")
-        );
-        // Cut to fit the line beside the model and the tokens.
-        c.name = "the status line names the worker whose view is on screen".into();
-        let long = viewed_name(Some("x"), Some(&c)).unwrap();
-        assert_eq!(long.chars().count(), VIEWED_NAME_MAX);
-        assert!(long.starts_with("acme#158 · the status line"), "{long}");
-        assert!(long.ends_with('…'), "{long}");
+        c.transcript = Some("/t/agent-a93.jsonl".into());
+        // On the manager's view: no worker, whatever the row.
+        assert_eq!(viewed(None, Some(&c), None), None);
+        assert_eq!(viewed(None, None, None), None);
+        // On the worker's view: the row's key is its task name, never the
+        // row's name or description.
+        let v = viewed(Some("g460: attached title"), Some(&c), None).unwrap();
+        assert_eq!(v.task.as_deref(), Some("acme#158"));
+        assert_eq!(v.agent_id.as_deref(), Some("a93"));
+        assert_eq!(v.transcript, Some("/t/agent-a93.jsonl".into()));
+        // No row: the tracker's worker gives its id and transcript, the
+        // status line looks its task name up by the id.
+        let agent: giverny_claude::subagents::SubagentRow =
+            serde_json::from_value(serde_json::json!({"id": "a77", "stage": "running",
+                "description": "g460: attached title", "transcript": "/t/agent-a77.jsonl"}))
+            .unwrap();
+        let v = viewed(Some("g460: attached title"), None, Some(&agent)).unwrap();
+        assert_eq!(v.task, None);
+        assert_eq!(v.agent_id.as_deref(), Some("a77"));
+        assert_eq!(v.transcript, Some("/t/agent-a77.jsonl".into()));
+        assert_eq!(v.label.as_deref(), Some("g460: attached title"));
     }
 
     #[test]

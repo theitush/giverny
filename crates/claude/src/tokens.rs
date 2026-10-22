@@ -137,6 +137,23 @@ pub fn tokens_of(path: &Path) -> Option<u64> {
     tail_find(path, last_in)
 }
 
+/// The model of a transcript's last reply (`claude-opus-5-5`), read from its
+/// tail like [`tokens_of`]: the reply that set its context. `None` before
+/// its first reply.
+pub fn last_model(path: &Path) -> Option<String> {
+    tail_find(path, |buf| {
+        buf.split(|&c| c == b'\n').rev().find_map(|line| {
+            line_tokens(line)?;
+            let v: Value = serde_json::from_slice(line).ok()?;
+            if v.get("type").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            let model = v.get("message")?.get("model")?.as_str()?.trim();
+            (!model.is_empty()).then(|| model.to_string())
+        })
+    })
+}
+
 /// The transcript's last reply, as far as the prompt cache goes: when it was
 /// written, the cache TTL it wrote, and what the next request would re-cache
 /// if that TTL has run out — its context plus its own output, which the next

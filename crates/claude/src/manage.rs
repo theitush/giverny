@@ -64,13 +64,19 @@ usage: giverny manage <command> [args] [--session <id>]
                               figure given (default: the figure); --agent
                               moves the row to that worker, as on `start`
   land  <task> [--outcome Done|Blocked|...] [--review TEXT] [--note N]
-                              the task landed now (Done)
+                              the task landed now (Done). Refused, for every
+                              outcome and with no override, while anything of
+                              it still runs: its worker mid-turn or asleep on
+                              its own shells, a `run` command of it, a
+                              background shell of its worker; each is listed
+                              with how to stop it, and nothing changes
   pause <task> [--note N]     stop the task's clock; `resume <task>` restarts it.
                               It stops nothing else: the task's `run`
                               commands and its worker's background shells
                               still going are listed, each with the
                               command that would stop it
-  drop  <task>                remove the task's row
+  drop  <task>                remove the task's row; refused as `land` is
+                              while anything of it still runs
   name  [<First> | <First Last>]
                               this session's name, printed in full. With no
                               name, the one recorded, else Giverny draws a
@@ -646,16 +652,7 @@ fn hand_off(
         let Some(row) = row.as_object_mut() else {
             continue;
         };
-        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
-        let theirs = match row.get("agent_id").and_then(Value::as_str) {
-            Some(a) => a == agent,
-            None => desc.is_some_and(|d| feed::names_key(d, key)),
-        };
-        let earlier = i != new
-            && theirs
-            && stage_of(row) == Some(feed::Stage::Running)
-            && ms_of(row, "started").is_some_and(|s| s.saturating_add(feed::LATER_TASK_MS) <= now);
-        if !earlier {
+        if i == new || !earlier_task(row, agent, desc, now) {
             continue;
         }
         close_pause(row, now);
@@ -670,6 +667,36 @@ fn hand_off(
         }
     }
     landed
+}
+
+/// Whether `row` is an earlier task of worker `agent` that handing it a
+/// new one lands ([`hand_off`]): Running, its own (by `agent_id`, or with
+/// none by its spawn description `desc`), and started at least
+/// [`feed::LATER_TASK_MS`] before `now`.
+fn earlier_task(row: &Map<String, Value>, agent: &str, desc: Option<&str>, now: u64) -> bool {
+    let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+    let theirs = match row.get("agent_id").and_then(Value::as_str) {
+        Some(a) => a == agent,
+        None => desc.is_some_and(|d| feed::names_key(d, key)),
+    };
+    theirs
+        && stage_of(row) == Some(feed::Stage::Running)
+        && ms_of(row, "started").is_some_and(|s| s.saturating_add(feed::LATER_TASK_MS) <= now)
+}
+
+/// The keys handing `task` to `agent` would land ([`hand_off`]), before
+/// it is done: what `start --agent` checks for anything still running
+/// (giverny#478).
+fn handed_keys(doc: &Value, task: &str, agent: &str, desc: Option<&str>, now: u64) -> Vec<String> {
+    doc.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter(|r| r.get("key").and_then(Value::as_str) != Some(task))
+        .filter(|r| earlier_task(r, agent, desc, now))
+        .filter_map(|r| r.get("key").and_then(Value::as_str).map(str::to_string))
+        .collect()
 }
 
 /// Whether a `start --agent` could hand off a row the agent id alone does
@@ -2000,6 +2027,26 @@ pub fn run_in_code(
         }
         _ => {}
     }
+    // A task with anything of it still running is not done: `land` and
+    // `drop` refuse it, whatever the outcome, with no override, and change
+    // nothing (giverny#478). Giverny gates its own command; it stops
+    // nothing.
+    if let Cmd::Land(task) | Cmd::Drop(task) = cmd {
+        let verb = if matches!(cmd, Cmd::Land(_)) {
+            "land"
+        } else {
+            "drop"
+        };
+        let still = task_still_runs(dir, &ledger, session, task, flags, now);
+        if let Some(why) = refusal(
+            &format!("`{task}` still runs, so it is not done and does not {verb}"),
+            &format!("`giverny-manage {verb} {task}`"),
+            &still,
+            now,
+        ) {
+            return Err(why);
+        }
+    }
     let (mut msg, landed) = match run_feed(dir, session, cmd, flags, now) {
         Ok(x) => x,
         // A task that is over gives its lease back even when its row could
@@ -2075,6 +2122,185 @@ fn still_running(task: &str, runs: &[crate::run_live::LiveRun], now: u64) -> Str
         out.push_str(&format!("\n    {line}"));
     }
     out
+}
+
+/// How long a worker's transcript may go unwritten and the worker still
+/// count as mid-turn for `land`'s refusal (giverny#478). A working worker
+/// writes a line at least as each tool call returns, and a Bash call is
+/// moved to the background after ten minutes at most; a worker silent for
+/// longer has gone without a report (its claude restarted, say), and only
+/// its runs and shells, which `/proc` shows, can still hold the task.
+pub const WORKER_QUIET_MS: u64 = 15 * 60 * 1000;
+
+/// What still runs for a task, as `land` and `drop` look before they act
+/// (giverny#478): its worker mid-turn or asleep on its own shells, its
+/// live `giverny-manage run` commands, its worker's live background
+/// shells.
+#[derive(Debug, Clone, Default)]
+pub struct StillRuns {
+    /// The line for its worker, when it is mid-turn or asleep.
+    pub worker: Option<String>,
+    pub runs: Vec<crate::run_live::LiveRun>,
+    pub shells: Vec<crate::bg_shells::Live>,
+}
+
+impl StillRuns {
+    pub fn is_empty(&self) -> bool {
+        self.worker.is_none() && self.runs.is_empty() && self.shells.is_empty()
+    }
+}
+
+/// The line for a task's worker that keeps it from landing, or none: one
+/// mid-turn (written within [`WORKER_QUIET_MS`]) is still working; one
+/// that ended its turn with shells of its own still running is asleep on
+/// them (giverny#476).
+pub fn worker_line(
+    agent: &str,
+    state: WorkerState,
+    asleep: &[crate::bg_shells::Shell],
+    now: u64,
+) -> Option<String> {
+    let ago = |t: u64| match now.saturating_sub(t) / 1000 {
+        s @ 0..60 => format!("{s}s"),
+        s => feed::fmt_span(s as i64),
+    };
+    match state {
+        WorkerState::Working { last_ms: Some(t) } if now.saturating_sub(t) < WORKER_QUIET_MS => {
+            Some(format!(
+                "its worker {agent} is still working (last wrote {} ago): wait for its report",
+                ago(t)
+            ))
+        }
+        WorkerState::Ended { at_ms } if !asleep.is_empty() => Some(format!(
+            "its worker {agent} ended its turn {} ago and is asleep, {}: Claude Code wakes it \
+             when {} ends. Stop the shells below, or wait for its report",
+            ago(at_ms),
+            crate::bg_shells::waiting_on(asleep, now),
+            if asleep.len() == 1 { "that" } else { "one" },
+        )),
+        _ => None,
+    }
+}
+
+/// Why a command refuses to land a task that still runs (`head`), with
+/// each live thing and how to stop it, and what to run again once they
+/// are stopped (`again`); `None` when nothing runs.
+pub fn refusal(head: &str, again: &str, s: &StillRuns, now: u64) -> Option<String> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "{head}: a task with anything still running is not done. Giverny stops nothing, and \
+         nothing overrides this:"
+    );
+    if let Some(w) = &s.worker {
+        out.push_str(&format!("\n  {w}"));
+    }
+    if !s.shells.is_empty() {
+        let what = match s.shells.len() {
+            1 => "1 background shell its worker started still runs".to_string(),
+            n => format!("{n} background shells its worker started still run"),
+        };
+        out.push_str(&format!("\n  {what}:"));
+        for line in crate::bg_shells::lines(&s.shells, now) {
+            out.push_str(&format!("\n    {line}"));
+        }
+    }
+    if !s.runs.is_empty() {
+        let what = match s.runs.len() {
+            1 => "1 `giverny-manage run` command still runs".to_string(),
+            n => format!("{n} `giverny-manage run` commands still run"),
+        };
+        out.push_str(&format!("\n  {what}:"));
+        for line in run_lines(&s.runs, now) {
+            out.push_str(&format!("\n    {line}"));
+        }
+    }
+    out.push_str(&format!(
+        "\n  Nothing was changed. Once they are stopped or done, run {again} again."
+    ));
+    Some(out)
+}
+
+/// What still runs for `task` in `session` ([`StillRuns`]): its live runs
+/// and its worker's live shells always, and with `worker` its worker's
+/// turn, read from the manager session's file and the transcripts under
+/// the Claude config dir given (else this machine's).
+/// The worker counts only while the task is its current one: a Running row
+/// none of its later Running rows came after (a batch it was spawned with
+/// is all current).
+fn still_runs(
+    dir: &Path,
+    ledger: &Path,
+    session: &str,
+    task: &str,
+    worker: Option<(&Value, Option<&Path>)>,
+    now: u64,
+) -> StillRuns {
+    let runs = crate::run_live::task_runs(&crate::run_live::runs_dir(ledger), session, task);
+    let shells = crate::bg_shells::task_shells(dir, session, task, &crate::bg_shells::System);
+    let worker = worker.and_then(|(doc, cfg)| {
+        let agent = current_worker(doc, task)?;
+        {
+            let sessions = continuation::ids(doc);
+            let state = worker_state(cfg, &sessions, &agent);
+            let asleep: Vec<crate::bg_shells::Shell> = shells
+                .iter()
+                .map(|l| l.shell.clone())
+                .filter(|s| s.agent == agent)
+                .collect();
+            worker_line(&agent, state, &asleep, now)
+        }
+    });
+    StillRuns {
+        worker,
+        runs,
+        shells,
+    }
+}
+
+/// The worker of the Running row `task` when that task is its current one:
+/// no Running row of the same worker started [`feed::LATER_TASK_MS`] or
+/// more after it.
+fn current_worker(doc: &Value, task: &str) -> Option<String> {
+    let rows = doc.get("rows").and_then(Value::as_array)?;
+    let row = rows.get(find(rows, task)?)?.as_object()?;
+    if stage_of(row) != Some(feed::Stage::Running) {
+        return None;
+    }
+    let agent = row.get("agent_id").and_then(Value::as_str)?;
+    let started = ms_of(row, "started").unwrap_or(0);
+    let later = rows.iter().filter_map(Value::as_object).any(|r| {
+        r.get("key").and_then(Value::as_str) != Some(task)
+            && r.get("agent_id").and_then(Value::as_str) == Some(agent)
+            && stage_of(r) == Some(feed::Stage::Running)
+            && ms_of(r, "started").is_some_and(|s| s >= started.saturating_add(feed::LATER_TASK_MS))
+    });
+    (!later).then(|| agent.to_string())
+}
+
+/// [`still_runs`] for `land` and `drop`: the session's file read as it is
+/// (no lock: nothing is written), the worker's turn counted.
+fn task_still_runs(
+    dir: &Path,
+    ledger: &Path,
+    session: &str,
+    task: &str,
+    flags: &Flags,
+    now: u64,
+) -> StillRuns {
+    let doc = std::fs::read(file_for(dir, session))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .filter(|d| writer_of(d).is_none_or(|w| w == WRITER));
+    still_runs(
+        dir,
+        ledger,
+        session,
+        task,
+        doc.as_ref().map(|d| (d, flags.claude_dir.as_deref())),
+        now,
+    )
 }
 
 /// Each live run as a line: `` `sleep 300`, 8m in, pid 4242: `kill 4242`
@@ -2461,6 +2687,38 @@ fn run_feed(
             let linked = link_handoffs(&mut doc, read_log);
             for (agent, _) in &linked {
                 freeze_tokens(&mut doc, &before, Some(agent), read_log);
+            }
+            // A hand-off lands the worker's earlier task: refused, as
+            // `land` is, while anything of it still runs (giverny#478).
+            // Its worker is the one being handed on, so only its runs and
+            // shells count.
+            let handing = match (cmd, flags.agent.as_deref()) {
+                (Cmd::Start(task), Some(agent)) => Some((task, agent)),
+                (Cmd::Eta(task, _), Some(agent)) if row_agent(&doc, task) != Some(agent) => {
+                    Some((task, agent))
+                }
+                _ => None,
+            };
+            if let Some((task, agent)) = handing {
+                let ledger = resources::ledger_path(dir);
+                for earlier in handed_keys(&doc, task, agent, flags.agent_desc.as_deref(), now) {
+                    let still = still_runs(dir, &ledger, session, &earlier, None, now);
+                    if let Some(why) = refusal(
+                        &format!(
+                            "handing {agent} on to `{task}` lands `{earlier}`, which still runs"
+                        ),
+                        &match cmd {
+                            Cmd::Start(_) => {
+                                format!("`giverny-manage start {task} --agent {agent}`")
+                            }
+                            _ => format!("your `giverny-manage eta {task} … --agent {agent}`"),
+                        },
+                        &still,
+                        now,
+                    ) {
+                        return Err(why);
+                    }
+                }
             }
             let msg = apply(&mut doc, cmd, &flags, now, &sleeps)?;
             let handed = match cmd {
@@ -3629,6 +3887,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `land` and `drop` refuse a task with a `run` command still going,
+    /// for every outcome, change nothing and stop nothing; with it done,
+    /// `land` goes through. A `start --agent` that would land the worker's
+    /// earlier task is refused the same way (giverny#478).
+    #[test]
+    fn land_drop_and_a_hand_off_refuse_while_a_run_still_runs() {
+        let dir = scratch("land-runs");
+        run(&dir, "start a --eta 30 --agent w1", T0).unwrap();
+        let runs = crate::run_live::runs_dir(&resources::ledger_path(&dir));
+        std::fs::create_dir_all(&runs).unwrap();
+        let cmd = ["sleep".to_string(), "300".to_string()];
+        let live = crate::run_live::register_bound(
+            &runs.join("1-0.stats"),
+            "a",
+            "s1",
+            T0 + 2 * MIN,
+            None,
+            &cmd,
+        )
+        .expect("registered");
+        let me = std::process::id();
+        let before = std::fs::read(file_for(&dir, "s1")).unwrap();
+        for line in [
+            "land a",
+            "land a --outcome Blocked --note waiting",
+            "land a --review ita — look",
+            "drop a",
+        ] {
+            let e = run(&dir, line, T0 + 10 * MIN).unwrap_err();
+            let verb = line.split(' ').next().unwrap();
+            assert_eq!(
+                e,
+                format!(
+                    "`a` still runs, so it is not done and does not {verb}: a task with \
+                     anything still running is not done. Giverny stops nothing, and nothing \
+                     overrides this:\n  1 `giverny-manage run` command still runs:\n    \
+                     `sleep 300`, 8m in, pid {me}: `kill {me}` stops it and all it started\n  \
+                     Nothing was changed. Once they are stopped or done, run \
+                     `giverny-manage {verb} a` again."
+                ),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(file_for(&dir, "s1")).unwrap(),
+            before,
+            "nothing changed"
+        );
+        assert!(crate::run_live::alive(me), "nothing was stopped");
+        // Handing w1 on lands a: refused too, and b is not started.
+        let e = run(&dir, "start b --eta 30 --agent w1", T0 + 10 * MIN).unwrap_err();
+        assert!(
+            e.starts_with("handing w1 on to `b` lands `a`, which still runs: "),
+            "{e}"
+        );
+        assert!(
+            e.ends_with("run `giverny-manage start b --agent w1` again."),
+            "{e}"
+        );
+        assert_eq!(read_feed(&dir).rows.len(), 1);
+        // Another task with nothing running lands.
+        run(&dir, "start c --eta 30", T0).unwrap();
+        assert!(run(&dir, "land c", T0 + 10 * MIN).is_ok());
+        drop(live);
+        assert!(
+            run(&dir, "start b --eta 30 --agent w1", T0 + 11 * MIN)
+                .unwrap()
+                .contains("w1 handed on from a")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `land` refuses a task whose worker's background shell still runs,
+    /// found live by the real look, naming `TaskStop`; with it gone, the
+    /// task lands (giverny#478).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn land_refuses_while_a_workers_background_shell_runs() {
+        use std::os::unix::process::CommandExt;
+        let dir = scratch("land-shells");
+        run(&dir, "start a --eta 30", T0).unwrap();
+        let tasks = dir.join("cc/s1/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let out = std::fs::File::create(tasks.join("bland1.output")).unwrap();
+        // SAFETY: `setsid` is async-signal-safe, all `pre_exec` may call.
+        let mut child = unsafe {
+            std::process::Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    "true && eval 'sleep 30' < /dev/null && pwd -P >| /dev/null",
+                ])
+                .stdout(out)
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::bg_shells::record(
+            &dir,
+            "s1",
+            crate::bg_shells::Shell {
+                id: "bland1".into(),
+                agent: "w1".into(),
+                task: "a".into(),
+                cmd: "sleep 30".into(),
+                started_ms: T0 + MIN,
+            },
+            T0 + MIN,
+        );
+        let pid = child.id();
+        let e = run(&dir, "land a", T0 + 10 * MIN).unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "\n  1 background shell its worker started still runs:\n    `sleep 30` (shell \
+                 bland1), 9m in: `TaskStop bland1` from this session stops it, or `pkill -s \
+                 {pid}`"
+            )),
+            "{e}"
+        );
+        assert!(crate::run_live::alive(pid), "nothing was stopped");
+        // SAFETY: a signal to the group the test's own child leads.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        let _ = child.wait();
+        assert_eq!(
+            run(&dir, "land a", T0 + 12 * MIN).unwrap(),
+            "landed a: Done"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `land` refuses a task whose worker is mid-turn (its transcript
+    /// written after its latest finish notice), saying to wait for its
+    /// report; once the notice comes, it lands. A worker quiet past
+    /// [`WORKER_QUIET_MS`] holds nothing, and one asleep on its own
+    /// shells says so (giverny#478).
+    #[test]
+    fn land_refuses_while_its_worker_is_mid_turn() {
+        let dir = scratch("land-worker");
+        let cfg = dir.join("claude");
+        let proj = cfg.join("projects/-srv-x");
+        let sub = proj.join("s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let transcript = proj.join("s1.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        std::fs::write(sub.join("agent-w1.jsonl"), "{}\n").unwrap();
+        let now = now_ms();
+        let go = |line: &str, at: u64| {
+            let (cmd, mut flags) = parse_args(&args(line))?;
+            flags.claude_dir = Some(cfg.clone());
+            run_in(&dir, "s1", &cmd, &flags, at)
+        };
+        go("start a --eta 30 --agent w1", now - 20 * MIN).unwrap();
+        let e = go("land a", now).unwrap_err();
+        assert!(
+            e.contains(
+                "\n  its worker w1 is still working (last wrote 0s ago): wait for its report"
+            ),
+            "{e}"
+        );
+        // Its report: the finish notice, newer than its last line.
+        let notice = json!({"type": "user", "timestamp": now + 5_000,
+            "message": {"content": "<task-notification><task-id>w1</task-id>\
+                <status>completed</status></task-notification>"}});
+        std::fs::write(&transcript, format!("{notice}\n")).unwrap();
+        assert_eq!(go("land a", now + 6_000).unwrap(), "landed a: Done");
+
+        // The line itself: quiet too long holds nothing; asleep says so.
+        let quiet = WorkerState::Working {
+            last_ms: Some(T0 - WORKER_QUIET_MS),
+        };
+        assert_eq!(worker_line("w1", quiet, &[], T0), None);
+        assert_eq!(
+            worker_line("w1", WorkerState::Ended { at_ms: T0 }, &[], T0),
+            None
+        );
+        let shell = crate::bg_shells::Shell {
+            id: "b1".into(),
+            agent: "w1".into(),
+            task: "a".into(),
+            cmd: "sleep 600".into(),
+            started_ms: T0 - 30 * MIN,
+        };
+        let asleep = worker_line(
+            "w1",
+            WorkerState::Ended {
+                at_ms: T0 - 26 * MIN,
+            },
+            &[shell],
+            T0,
+        )
+        .unwrap();
+        assert!(
+            asleep.starts_with("its worker w1 ended its turn 26m ago and is asleep, waiting on"),
+            "{asleep}"
+        );
+        assert!(asleep.ends_with("Stop the shells below, or wait for its report"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `resume` says whether anyone works on the task now and how to wake
     /// its worker, and a wait still open; it wakes nothing (giverny#471).
     #[test]
@@ -4750,7 +5210,17 @@ mod tests {
             meta.to_string(),
         )
         .unwrap();
-        std::fs::write(sub.join(format!("agent-{agent}.jsonl")), "").unwrap();
+        // Last written on the tests' clock, long before they act: a
+        // worker idle since (a file written now would be one mid-turn to
+        // `land`, giverny#478).
+        let t = sub.join(format!("agent-{agent}.jsonl"));
+        std::fs::write(&t, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&t)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(T0 - 60 * MIN))
+            .unwrap();
         cfg
     }
 
@@ -4959,6 +5429,7 @@ mod tests {
 
         lines.push(turn("c", T0 + 20 * MIN, 400));
         write(&lines);
+        reported(&cfg, "w1", T0 + 25 * MIN);
         run_cfg(&dir, "s1", "land lex-fix", Some(&cfg), T0 + 25 * MIN);
         lines.push(turn("d", T0 + 30 * MIN, 50_000));
         write(&lines);
@@ -4998,6 +5469,7 @@ mod tests {
             .join("subagents")
             .join("agent-w1.jsonl");
         std::fs::write(&log, turn("a", T0 + MIN, 1_000) + "\n").unwrap();
+        reported(&cfg, "w1", T0 + 10 * MIN);
         run_cfg(&dir, "s1", "land a", Some(&cfg), T0 + 10 * MIN);
         assert_eq!(
             task_tokens(&read_feed_of(&dir, "s1"), "a"),
@@ -5056,6 +5528,7 @@ mod tests {
         let write = |lines: &[String]| std::fs::write(&log, lines.join("\n") + "\n").unwrap();
         let mut lines = vec![turn("a", T0 + MIN, 1_000), turn("b", T0 + 5 * MIN, 2_000)];
         write(&lines);
+        reported(&cfg, "w1", T0 + 8 * MIN);
         run_cfg(&dir, "s1", "land inbar#828", Some(&cfg), T0 + 8 * MIN);
 
         // A plain start: the idle worker is pointed out.
@@ -5069,6 +5542,7 @@ mod tests {
         ));
         lines.push(turn("c", T0 + 10 * MIN, 400));
         write(&lines);
+        reported(&cfg, "w1", T0 + 12 * MIN);
         let (said, _) = run_cfg(&dir, "s1", "land inbar#829", Some(&cfg), T0 + 12 * MIN);
         assert!(said.contains("inbar#829 handed to w1 by message"), "{said}");
         let f = read_feed_of(&dir, "s1");
@@ -5092,6 +5566,7 @@ mod tests {
         ));
         lines.push(turn("d", T0 + 16 * MIN, 50));
         write(&lines);
+        reported(&cfg, "w1", T0 + 17 * MIN);
         run_cfg(&dir, "s1", "land inbar#828-r1", Some(&cfg), T0 + 17 * MIN);
         lines.push(turn("e", T0 + 20 * MIN, 90_000));
         write(&lines);
@@ -5150,7 +5625,9 @@ mod tests {
                 + "\n",
         )
         .unwrap();
+        reported(&cfg, "w1", T0 + 5 * MIN);
         run_cfg(dir, "s1", "land lex-fix", Some(&cfg), T0 + 5 * MIN);
+        reported(&cfg, "w2", T0 + 10 * MIN);
         run_cfg(dir, "s1", "land parse-fix", Some(&cfg), T0 + 10 * MIN);
         cfg
     }
@@ -5276,6 +5753,25 @@ mod tests {
         let mut old = std::fs::read_to_string(&parent).unwrap_or_default();
         old.push_str(&(line.to_string() + "\n"));
         std::fs::write(parent, old).unwrap();
+    }
+
+    /// `agent` sent its report at `at`: its transcript last written just
+    /// before, and Claude Code's finish notice in the manager's — what a
+    /// worker's task looks like when its manager lands it (giverny#478).
+    fn reported(cfg: &Path, agent: &str, at: u64) {
+        let path = cfg
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents")
+            .join(format!("agent-{agent}.jsonl"));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(at - 1_000))
+            .unwrap();
+        notified(cfg, agent, at);
     }
 
     /// The dispatcher resumed `histfan` with a fresh worker after its first
@@ -5454,6 +5950,7 @@ mod tests {
         let log = subs.join("agent-a1bbcad.jsonl");
         let mut lines = vec![turn("a", T0 + MIN, 1_000)];
         std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        reported(&cfg, "a1bbcad", T0 + 14 * MIN);
         run_cfg(&dir, "s1", "land inbar#855", Some(&cfg), T0 + 14 * MIN);
         let at = T0 + 14 * MIN + 30_000;
         run_cfg(&dir, "s1", "start inbar#856 --eta 45", Some(&cfg), at);
@@ -5499,6 +5996,7 @@ mod tests {
 
         // a1bbcad lands #865 and is handed the next task the way the skill
         // says: a plain start and `New task for you: …`.
+        reported(&cfg, "a1bbcad", at + 11 * MIN);
         run_cfg(&dir, "s1", "land inbar#865", Some(&cfg), at + 11 * MIN);
         run_cfg(&dir, "s1", "start inbar#870", Some(&cfg), at + 12 * MIN);
         lines.push(sent_at(
