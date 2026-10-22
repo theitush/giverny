@@ -1569,7 +1569,7 @@ fn manage_skill_on(cfg: &config::Config) -> bool {
     cfg.management_panel.manage_skill
 }
 
-/// Are sessions asked to name themselves (giverny#343)?
+/// Is every session given a name at its start (giverny#343)?
 fn names_on(cfg: &config::Config) -> bool {
     cfg.management_panel.ask_names
 }

@@ -161,8 +161,8 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 ///
 /// The same launcher is a `SessionStart` hook too, on every source (startup,
 /// resume, clear, compact): with `management_panel.ask_names` on
-/// (giverny#343), a Giverny tab's session is asked to name itself, or told
-/// the name it has ([`crate::names`]). It is registered whatever the switch
+/// (giverny#343), a Giverny tab's session is given a name and told it, or
+/// told the name it has ([`crate::names`]). It is registered whatever the switch
 /// says, which the hook reads as it runs: Claude Code loads `hooks.json` once
 /// per process, so a hook written only with the switch on misses every
 /// session started before it went on (giverny#356). Off, it costs a `stat`.
