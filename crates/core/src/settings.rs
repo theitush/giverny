@@ -381,8 +381,8 @@ pub const SETTINGS: &[SettingDef] = &[
         section: Section::Titles,
         doc: "Title a Claude tab after its session's name, as a place: Rotem's Workshop.",
         note: &[
-            "Only for a session that has a name (management panel → ask",
-            "sessions to name themselves); the room is drawn once per",
+            "Only for a session that has a name (management panel → name",
+            "every session); the room is drawn once per",
             "session and kept across resumes. Claude's own title moves to",
             "the tab's hover. A title you typed yourself still wins.",
         ],
@@ -688,7 +688,7 @@ pub const SETTINGS: &[SettingDef] = &[
     },
     SettingDef {
         key: "management_panel.ask_names",
-        label: "ask sessions to name themselves",
+        label: "name every session",
         section: Section::ManagementPanel,
         doc: "Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line.",
         note: &[
@@ -1493,6 +1493,11 @@ mod tests {
         );
         let cfg = set("management_panel.ask_names", Value::Bool(true));
         assert!(cfg.management_panel.ask_names);
+        // Giverny names every session itself; none is asked to (giverny#487).
+        assert_eq!(
+            by_key("management_panel.ask_names").unwrap().label,
+            "name every session"
+        );
         // The Done rows have no row in Settings, but a hand-written pair
         // still loads, unflagged.
         assert!(by_key("management_panel.done_rows").is_none());

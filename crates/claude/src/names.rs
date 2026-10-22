@@ -1,5 +1,5 @@
-//! Session names (giverny#343): with Settings → Management panel → "ask
-//! sessions to name themselves" on, every Claude session in a Giverny tab is
+//! Session names (giverny#343): with Settings → Management panel → "name
+//! every session" on, every Claude session in a Giverny tab is
 //! named at its start, before its first turn (giverny#401): its
 //! `SessionStart` hook draws it a first name ([`draw_name`], giverny#364:
 //! sessions left to pick one kept picking the same few), gives it the
