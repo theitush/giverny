@@ -101,14 +101,17 @@ usage: giverny manage <command> [args] [--session <id>]
   clear                       delete this session's feed
 
   claim <task> [--ram 3G] [--gpu N --vram 8G] [--slot NAME]...
-               [--min-ram 2G] [--priority asap|high|medium|low]
+               [--min-ram 2G] [--priority asap|high|medium|low] [--wait]
                               ask the machine ledger for the memory (and GPUs,
                               slots) the task's worker needs — never cores: CPU
                               is shared and measured. Granted (exit 0), granted
                               smaller (3: less RAM, down to --min-ram), queued
                               behind its holders or while the CPU is busy (4;
                               re-run to poll), refused as larger than the
-                              limits (5)
+                              limits (5). --wait: while queued, print the
+                              first answer, re-claim every 30s, and end with
+                              the final answer and its code; run it in the
+                              background, and its end wakes you
   release <task>              give the task's lease back (land and drop do it)
   resources                   capacity, limits, how busy the CPU is, leases
   ask   <task-or-session> \"<msg>\" [--task <yours>] [--priority P]
@@ -246,6 +249,8 @@ pub struct Flags {
     pub command: Vec<String>,
     /// `ask`: the asker's own task, when the ledger does not make it plain.
     pub task: Option<String>,
+    /// `claim --wait`: re-claim while queued, until granted or refused.
+    pub wait: bool,
     /// Set by [`run_in`], not parsed: the `--agent` worker's spawn
     /// description, which names the rows a dispatcher started for it before
     /// its id was known.
@@ -396,6 +401,7 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
             "--slot" => flags.slots.push(val("--slot")?),
             "--priority" => flags.priority = Some(val("--priority")?),
             "--task" => flags.task = Some(val("--task")?),
+            "--wait" => flags.wait = true,
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => pos.push(a.clone()),
@@ -473,6 +479,9 @@ pub fn parse_args(args: &[String]) -> Result<(Cmd, Flags), String> {
         return Err(format!(
             "`run` needs a command after `--`, e.g. `giverny manage run t -- cargo test`\n\n{USAGE}"
         ));
+    }
+    if flags.wait && !matches!(cmd, Cmd::Claim(_)) {
+        return Err("`--wait` goes only with `claim`".into());
     }
     if flags.gpu.unwrap_or(0) > 0 && flags.vram_mb.is_none() {
         return Err("`--gpu` needs --vram: how much of each GPU the worker needs".into());
@@ -2442,6 +2451,61 @@ fn claim(
     Ok((line, out.exit_code()))
 }
 
+/// How often `claim --wait` re-claims: the queue also moves on other
+/// sessions' calls, and a grant waits 10 minutes to be taken up.
+pub const WAIT_POLL_MS: u64 = 30_000;
+
+/// `claim <task> --wait` (giverny#484): claim, and while the answer is
+/// `queued`, re-claim every [`WAIT_POLL_MS`] until it is anything else
+/// (granted, granted smaller, refused, an error). The first queued answer
+/// goes to `say` at once (it may suggest an `ask`); the final one, with how
+/// long it waited, is returned with its exit code. `clock` and `nap` are the
+/// time's, so tests run it without waiting.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_wait(
+    dir: &Path,
+    session: &str,
+    task: &str,
+    flags: &Flags,
+    cap: Option<&resources::Capacity>,
+    clock: &mut dyn FnMut() -> u64,
+    nap: &mut dyn FnMut(u64),
+    say: &mut dyn FnMut(&str),
+) -> Result<(String, i32), String> {
+    let cmd = Cmd::Claim(task.to_string());
+    let from = clock();
+    let mut told = false;
+    loop {
+        let now = clock();
+        let (msg, code) = run_in_code(dir, session, &cmd, flags, now, cap)?;
+        if code != resources::exit::QUEUED {
+            let waited = now.saturating_sub(from);
+            return Ok(if told {
+                (format!("{msg} (after {} queued)", fmt_wait(waited)), code)
+            } else {
+                (msg, code)
+            });
+        }
+        if !told {
+            say(&format!(
+                "{msg}\nwaiting: re-claiming every 30s until granted or refused"
+            ));
+            told = true;
+        }
+        nap(WAIT_POLL_MS);
+    }
+}
+
+/// A wait as `claim --wait` says it: `40s`, `12m`, `1h05m`.
+fn fmt_wait(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
+    }
+}
+
 /// What past tasks peaked at under `giverny manage run`: the history,
 /// read once, and the feeds that give a task its kind.
 pub(crate) struct Peaks<'a> {
@@ -3234,7 +3298,24 @@ pub fn main(args: &[String], spool: &Path) -> i32 {
         return 0;
     }
     let now = now_ms();
-    match run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None) {
+    let answer = match &cmd {
+        Cmd::Claim(task) if flags.wait => claim_wait(
+            &feed::feed_dir(),
+            &session,
+            task,
+            &flags,
+            None,
+            &mut now_ms,
+            &mut |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+            &mut |line| {
+                use std::io::Write;
+                println!("{line}");
+                let _ = std::io::stdout().flush();
+            },
+        ),
+        _ => run_in_code(&feed::feed_dir(), &session, &cmd, &flags, now, None),
+    };
+    match answer {
         Ok((msg, _)) if cmd == Cmd::ClearDone => {
             let pane = if crate::hooks::send_clear_done(spool, Some(&session), now) {
                 "asked Giverny to clear the management panel's Done rows in this tab"
@@ -4836,6 +4917,66 @@ mod tests {
             run_as(&dir, "b", "release t2", T0 + 22 * MIN).0,
             "t2 held no lease"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#484: `claim --wait` re-claims while queued and ends with the
+    /// final answer: granted once the holder lands, refused at once.
+    #[test]
+    fn claim_wait_re_claims_until_granted_or_refused() {
+        let dir = scratch("claim-wait");
+        run_as(&dir, "a", "start t1 --eta 30", T0);
+        run_as(&dir, "a", "claim t1 --ram 10G", T0);
+        run_as(&dir, "b", "plan t2 --eta 10", T0);
+        let (_, flags) = parse_args(&args("claim t2 --ram 6G --wait")).unwrap();
+        assert!(flags.wait);
+        let now = std::cell::Cell::new(T0 + MIN);
+        let naps = std::cell::Cell::new(0);
+        let mut said = Vec::new();
+        let (msg, code) = claim_wait(
+            &dir,
+            "b",
+            "t2",
+            &flags,
+            Some(&machine()),
+            &mut || now.get(),
+            &mut |ms| {
+                assert_eq!(ms, WAIT_POLL_MS);
+                naps.set(naps.get() + 1);
+                now.set(now.get() + ms);
+                // The holder lands while b waits.
+                if naps.get() == 3 {
+                    run_as(&dir, "a", "land t1", now.get());
+                }
+            },
+            &mut |l| said.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(code, resources::exit::GRANTED, "{msg}");
+        assert_eq!(naps.get(), 3);
+        assert!(msg.starts_with("granted t2: 6G"), "{msg}");
+        assert!(msg.ends_with("(after 1m queued)"), "{msg}");
+        assert_eq!(said.len(), 1, "the first queued answer, once: {said:?}");
+        assert!(
+            said[0].starts_with("queued #1 for 6G behind t1"),
+            "{said:?}"
+        );
+
+        // Refused is final at once, with no nap and nothing said first.
+        let (_, flags) = parse_args(&args("claim huge --ram 20G --wait")).unwrap();
+        let (msg, code) = claim_wait(
+            &dir,
+            "b",
+            "huge",
+            &flags,
+            Some(&machine()),
+            &mut || T0 + 10 * MIN,
+            &mut |_| panic!("no nap on a refusal"),
+            &mut |l| panic!("nothing said: {l}"),
+        )
+        .unwrap();
+        assert_eq!(code, resources::exit::REFUSED, "{msg}");
+        assert!(parse_args(&args("show --wait")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
