@@ -485,6 +485,23 @@ fn stop_with(l: &Live) -> String {
 /// `task`'s live background shells in `session`, oldest first. Those
 /// `probe` finds ended drop off the record.
 pub fn task_shells(feed_dir: &Path, session: &str, task: &str, probe: &dyn Probe) -> Vec<Live> {
+    live_shells(feed_dir, session, probe, |s| s.task == task)
+}
+
+/// Worker `agent`'s live background shells in `session`, of any task,
+/// oldest first. Those `probe` finds ended drop off the record.
+pub fn agent_shells(feed_dir: &Path, session: &str, agent: &str, probe: &dyn Probe) -> Vec<Live> {
+    live_shells(feed_dir, session, probe, |s| s.agent == agent)
+}
+
+/// The recorded shells `wanted` picks that `probe` does not find ended,
+/// oldest first; those it finds ended drop off the record.
+fn live_shells(
+    feed_dir: &Path,
+    session: &str,
+    probe: &dyn Probe,
+    wanted: impl Fn(&Shell) -> bool,
+) -> Vec<Live> {
     if !safe(session) {
         return Vec::new();
     }
@@ -502,7 +519,7 @@ pub fn task_shells(feed_dir: &Path, session: &str, task: &str, probe: &dyn Probe
     for (s, f) in book.shells.iter().zip(found) {
         if f.running == Some(false) {
             ended.push(s.id.clone());
-        } else if s.task == task {
+        } else if wanted(s) {
             live.push(Live {
                 shell: s.clone(),
                 pid: f.pid,
@@ -541,6 +558,86 @@ pub fn lines(live: &[Live], now: u64) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// `<feed dir>/bgshells/<session>.held.json`: the tasks whose worker's
+/// report was held back once already (giverny#478).
+pub fn held_path(feed_dir: &Path, session: &str) -> PathBuf {
+    feed_dir.join(DIR).join(format!("{session}.held.json"))
+}
+
+/// The tasks whose report was held, newest last.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HeldBack {
+    #[serde(default)]
+    tasks: Vec<String>,
+}
+
+/// At most this many held tasks are remembered, the oldest going first.
+const HELD_KEEP: usize = 200;
+
+/// A task worker's final report (its `SubagentHandback` call, giverny#478)
+/// while background shells of its own still run: the reason to hold it
+/// back, once per task (`task`, the row it holds, else its shells' task).
+/// `None` lets it through: no shell of its own runs, or this task's report
+/// was held before. Nothing is stopped; the worker is told to stop them.
+/// Cheap: a `stat` when the session has no shell recorded.
+pub fn handback(
+    feed_dir: &Path,
+    session: &str,
+    agent: &str,
+    task: Option<&str>,
+    now: u64,
+    probe: &dyn Probe,
+) -> Option<String> {
+    if !safe(session) || agent.is_empty() {
+        return None;
+    }
+    std::fs::metadata(path(feed_dir, session)).ok()?;
+    let live = agent_shells(feed_dir, session, agent, probe);
+    let first = live.first()?;
+    let key = task.map_or_else(|| first.shell.task.clone(), str::to_string);
+    let file = held_path(feed_dir, session);
+    let _lock = Lock::take(&file).ok()?;
+    let mut held: HeldBack = read(&file);
+    if held.tasks.contains(&key) {
+        return None;
+    }
+    held.tasks.push(key.clone());
+    if held.tasks.len() > HELD_KEEP {
+        let cut = held.tasks.len() - HELD_KEEP;
+        held.tasks.drain(..cut);
+    }
+    manage::write(&file, &json!(held)).ok()?;
+    Some(handback_reason(&key, &live, now))
+}
+
+/// Why a worker's report is held back (giverny#478): its shells still
+/// running, each with how to stop it.
+pub fn handback_reason(task: &str, live: &[Live], now: u64) -> String {
+    let what = match live.len() {
+        1 => "1 background shell of your own still runs".to_string(),
+        n => format!("{n} background shells of your own still run"),
+    };
+    let mut out = format!(
+        "Giverny held your report back, once: {what} (task `{task}`), and a task with \
+         anything still running is not done:"
+    );
+    for line in lines(live, now) {
+        out.push_str(&format!("\n  {line}"));
+    }
+    let ids: Vec<String> = live
+        .iter()
+        .map(|l| format!("`TaskStop {}`", l.shell.id))
+        .collect();
+    out.push_str(&format!(
+        "\nStop {} ({}) before you report, then send your report again. Your next report \
+         goes through, and your manager's `giverny-manage land` refuses the task while any \
+         of them still runs.",
+        if live.len() == 1 { "it" } else { "each" },
+        ids.join(", ")
+    ));
+    out
 }
 
 /// What `pause` and `resume` add for `task`'s live shells: nothing when
