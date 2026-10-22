@@ -9,9 +9,7 @@ You are the dispatcher. You split the work into tasks, give each task its own
 subagent, and keep the manager session's state in Giverny's management panel with
 `giverny-manage`. The pane reads what `giverny-manage` writes: every row you plan
 shows under **Next up** with its estimate, a started row counts its time under
-**Running**, and a landed row shows under **Done** with how it came out against
-its estimate. Your own clock is not needed: every command stamps the time it
-runs.
+**Running**, and a landed row shows under **Done** against its estimate.
 
 If the project has its own rules for picking or finishing work (a task list, a
 CONTRIBUTING file, instructions from the user), those decide *what* to do;
@@ -21,24 +19,23 @@ this skill only says how to run it and keep the pane true.
 
 Your name: when Giverny asks its sessions to name themselves (a setting,
 off by default), you got one at the session's start; keep it.
-`giverny-manage name` prints it (and gives you one if you have none yet). If the project signs its tasks, sign your
-umbrella task with that full name, and introduce yourself with it once, in
-your first message to the user. When Giverny does not ask, do not name
-yourself.
+`giverny-manage name` prints it (and gives you one if you have none yet). If
+the project signs its tasks, sign your umbrella task with that full name, and
+introduce yourself with it once, in your first message to the user. When
+Giverny does not ask, do not name yourself.
 
 Break the work into tasks a single subagent can finish on its own. For each,
 choose:
 
-- a **task name**: short, unique in this manager session, letters, digits and `-` (`auth-fix`,
-  `docs-api`, `12`). It is the row's name in the pane, and the link between the
-  row and its worker.
+- a **task name**: short, unique in this manager session, letters, digits and
+  `-` (`auth-fix`, `docs-api`, `12`). It is the row's name in the pane, and the
+  link between the row and its worker.
 - a **title**: one line saying what the task is. If the project types its
   tasks, start the title with the type word and a colon (`BUG: …`,
   `FEATURE: …`): how far off your gut runs is told per type.
-- an **estimate** in minutes for how long its worker will take, given as two
-  figures: your **gut** figure (`--gut`), the raw one, and the one you
-  **settle on** (`--eta`) after allowing for how far off your gut usually
-  runs (below). The settled figure is the figure the pane shows.
+- an **estimate** in minutes, as two figures: your **gut** figure (`--gut`),
+  the raw one, and the one you **settle on** (`--eta`) after allowing for how
+  far off your gut usually runs. The settled figure is the one the pane shows.
 
 Group the tasks into **lanes** by the files they will touch. Tasks in different
 lanes may run at the same time; tasks sharing files run one after another: plan
@@ -46,86 +43,51 @@ each one after the task ahead of it in its lane (`--after <task>`).
 
 Write each task's **brief** to a file: the prompt you will give its worker
 (see [Start a task](#2-start-a-task)), or at least the task's own text. Its
-**Next up** row opens to it when clicked, so the user can read what each
-worker will be told before it starts. Every `plan` gets one; a `plan` without
-`--brief` says so.
+**Next up** row opens to it, so the user can read what each worker will be
+told. Keep the briefs in a folder inside the project that git ignores
+(`.claude/briefs/`, say), not under `/tmp`, which a reboot wipes. If the
+prompt changes before the spawn, pass the new file on `start` (`--brief FILE`).
 
 Record every task, in the order you mean to run it:
 
 ```bash
 giverny-manage plan auth-fix --eta 25 --gut 50 --title "Fix the token refresh race" --brief briefs/auth-fix.md
 giverny-manage plan docs-api --eta 15 --gut 30 --title "Document the new endpoints" --brief briefs/docs-api.md
-```
-
-```bash
 giverny-manage plan auth-tests --eta 10 --gut 20 --title "Test the refresh race" --after auth-fix --brief briefs/auth-tests.md
 ```
 
-Keep the briefs somewhere that outlives the manager session and the machine: a
-folder inside the project that git ignores (`.claude/briefs/`, say), not a scratch
-directory under `/tmp`, which a WSL restart or a reboot wipes. A relative path is
-stored absolute. If the prompt changes before the
-spawn, write the new one and pass it again on `start` (`--brief FILE`).
-
-Each `plan` (and `start --eta`) prints the figure the pane will count down
-from, which is the one you settled on, and how far off your gut runs.
-Giverny keeps a history of every task that landed: its estimate, your gut
-figure behind it, its wall time and its working time (wall time less pauses
-and waits). It takes the most recent 20 landed tasks like this one (same
-project and type, else same project, else all; five at least) and tells you
-the median of working time ÷ your gut figure, in words:
+Each `plan` (and `start --eta`) prints the figure the pane counts down from
+and how far off your gut on such tasks has run:
 
 ```
 planned auth-fix: ~25m (gut 50m)
   your gut estimates on BUG tasks in myapp have usually run about 2.1× too high (last 9, median); give your gut figure and the one you settle on: `--eta <settled> --gut <gut>`
 ```
 
-Nothing is corrected for you. Give your gut figure as `--gut` every time, and
-settle on the figure you believe after allowing for that line: how much to
-allow for it is your judgement. What you settle on is what the pane shows.
-The history learns from the gut figure, not the settled one, so the line
-describes your gut and does not fade as your settled figures land on target.
-Leave out `--gut` and the figure counts as your gut figure. With too little
-history the second line says so. Pass `--repo <name>` when the task belongs
-to a project other than the directory you run in.
-
-A worker's re-estimate is scored too, on its own track and the same way: its
-first `eta` on a running task (the one Giverny asks for five minutes in,
-after it has read the code) goes on the pane as given, and its gut figure
-(`--gut`) is later checked against the working time that was still to come.
-How far off the worker's gut on its kind's re-estimates runs reaches it only
-in Giverny's asks, never as a note between them; an `eta` reply to a figure
-given before any ask, or without `--gut`, is one.
-
-`giverny-manage accuracy` (optionally `--repo <name>`) shows every track,
-older tasks against recent: the dispatcher's guess and the worker's
-re-estimate. For each it shows the instinct (working time ÷ the gut figure,
-what the line tells) and how the figures as given landed (near ×1.00 when
-the line is allowed for). When the user asks whether estimates are getting
-better, answer from it.
+Give your gut figure as `--gut` every time, and settle `--eta` on the figure
+you believe after allowing for that line; how much is your judgement. Nothing
+is corrected for you. Pass `--repo <name>` when the task belongs to a project
+other than the directory you run in. When the user asks whether estimates are
+getting better, answer from `giverny-manage accuracy` (optionally
+`--repo <name>`).
 
 Tell the user the plan in a few lines (task, lane, estimate) before you start.
 
 ### A planned task never waits silently
 
 Start every planned task whose lane is free and whose claim is granted, right
-away. A planned task may wait on only three things, and each shows on its
-**Next up** row:
+away. A planned task may wait on only three things:
 
-- **a lease**: its `claim` was queued (`queued for 3G behind …`);
-- **another task**: it was planned `--after` that task (`after auth-fix`),
-  until that one lands;
+- **a lease**: its `claim` was queued;
+- **another task**: it was planned `--after` that task, until that one lands;
 - **a hold you record**, with its reason, and tell the user about:
-  `giverny-manage hold <task> --why "<reason>"` (`held: <reason>`);
-  `giverny-manage unhold <task>` ends it. Hold only for a reason that will
-  end: a person to answer, a review, a fix to land elsewhere. "A quieter
-  machine" is not one: the ledger already decides that, so claim and let it
+  `giverny-manage hold <task> --why "<reason>"`; `giverny-manage unhold <task>`
+  ends it. Hold only for a reason that will end: a person to answer, a review,
+  a fix to land elsewhere. "A quieter machine" is not one: claim and let it
   queue.
 
-A Next up row with none of these that sits five minutes is yours to act on:
-Giverny tells you once, on your next tool call (`<task> has waited 12m with a
-free lane: start it, or giverny-manage hold <task> --why …`). Start it, or
-record what it waits for.
+Giverny tells you on your next tool call when a Next up row has waited five
+minutes with none of these: start it, or record what it waits for.
 
 ## 2. Start a task
 
@@ -138,40 +100,31 @@ yours; workers never do.
 giverny-manage claim auth-fix --ram 3G
 ```
 
-**Reserve RAM; CPU is shared and measured.** There are no cores to pick: a
-lease holds memory, never CPU. Running out of memory kills a build; running
-out of CPU only slows everyone, and the kernel already shares the cores (every
-worker's `run` at the same weight, the user's own Claude tabs ahead of them).
-`claim` itself watches the CPU and answers `queued … CPU busy` while it has been
-saturated for about a minute with workers already building; then wait as for
-any queue. `giverny-manage resources` shows how busy it is (`cpu  6.3 of 8
-busy`).
-
+**Reserve RAM; CPU is shared and measured.** A lease holds memory, never CPU;
+`claim` queues on its own while the CPU is busy with workers already building.
 Size the RAM from the hint `claim` prints once there is history (`the last 4
-BUG tasks in myapp peaked at 1.8G (median), 2.6G at most`), else with the
-default lease (Settings → Management panel; `giverny-manage resources` prints
-it). The RAM also sets the worker's build jobs (`CARGO_BUILD_JOBS`, a job a
-GiB), so a build never outgrows its memory. Add `--slot <name>` for something
-only one task at a time may use (a shared build folder), `--priority` when the
-task is urgent, `--gpu N --vram 8G` for a GPU. Once tasks like it have landed,
-a lease counts at what such tasks really peaked at (`counted at its kind's
-peak 1.3G`), not at its size, so ask for what a build needs: idle memory does
-not keep others waiting. The answer is one line and an exit code:
+BUG tasks in myapp peaked at 1.8G (median), 2.6G at most`), else take the
+default lease (`giverny-manage resources` prints it). Add `--slot <name>` for
+something only one task at a time may use (a shared build folder), and
+`--priority` when the task is urgent.
 
-- `granted` (0): go on.
-- `granted smaller` (3, only with `--min-ram`): go on, with what it says; `run`
-  holds the worker to it.
-- `queued` (4): something it needs is held, or the CPU is busy; its row says
-  so. Start another planned task from a free lane instead, and re-run the same
-  `claim` now and then until it is granted. The queue also moves on other
-  sessions' calls: when your turn comes while you are not polling, your next
-  tool call says `the ledger granted your queued claim for <task>` — start it
-  then (`claim` answers `granted`), within 10 minutes, or the grant lapses and
-  waits for your next `claim`. When it says the wait is longer than the task
-  itself and suggests `ask`, send `giverny-manage ask <holder's task> "<why, the
-  priority, how long you need it>"` and keep polling; the holder may release.
-- `refused` (5): larger than this machine's limits (Settings → Management panel →
-  Limits). Ask for less, or tell the user.
+Each answer is one line that says what to do:
+
+- `granted`: go on.
+- `queued`: something it needs is held, or the CPU is busy. Run the same claim
+  with `--wait` in the background (Bash with `run_in_background`) and start
+  another planned task from a free lane meanwhile:
+
+  ```bash
+  giverny-manage claim auth-fix --ram 3G --wait
+  ```
+
+  It prints the queued answer at once, re-claims every 30 seconds, and ends
+  when the claim is granted or refused; its end wakes you: act on its last
+  line. When the queued answer suggests `ask`, send
+  `giverny-manage ask <holder's task> "<why, the priority, how long you need
+  it>"`; the holder may release.
+- `refused`: larger than this machine's limits. Ask for less, or tell the user.
 
 Then, once granted, stamp the task and spawn its worker in the same breath:
 
@@ -180,19 +133,8 @@ giverny-manage start auth-fix
 ```
 
 Then spawn **one subagent for this task** with the Agent tool. One task, one
-agent is the default. Reuse a worker instead only when **both** hold:
-
-- it is **light**: under 100k tokens of context (the TOKENS column; `start`
-  prints it for each idle worker), and
-- the next task is **in the files it has already read, or follows on from what
-  it just did**.
-
-Otherwise spawn a fresh worker with a full brief. Every turn of a reused worker
-re-reads its whole context, so a worker 300k tokens deep makes the next task
-slow and expensive on every turn, and its old context crowds the new task. A
-fresh worker that reads a few files costs far less than that. Hand a reused
-worker over as in [Giving a worker its next task](#giving-a-worker-its-next-task),
-never as a second task folded into the first.
+agent is the default; to reuse an idle worker instead, see
+[Giving a worker its next task](#giving-a-worker-its-next-task).
 
 When you spawn one:
 
@@ -227,29 +169,14 @@ When you spawn one:
   > still running is not done. End with a short report: what you did,
   > how you checked it, and anything left undone.
 
-  About five minutes into the task, the plugin puts a request for that
-  re-estimate into the worker's context, once, unless it has re-estimated
-  already. It asks again as each figure runs out: once when five minutes of
-  it are left, and once if the work runs past it, unless the worker has just
-  re-estimated. Each ask tells the worker how far off its gut on its kind's
-  re-estimates usually runs (`your gut re-estimates on BUG tasks in myapp
-  have usually run about 2.5× too high (last 20, median)`; nothing with too
-  little history) and asks for both figures; none changes its figure. Its
-  answer is the `eta` command. Nothing is put in its context between asks.
-  An `eta` given before any ask, or without `--gut`, is answered as an ask
-  itself: the reply keeps the figure as the gut figure, tells the line and
-  asks for the figure the worker settles on, which takes the first one's
-  place when it comes with `--gut` soon after.
-
 ## 3. While it runs
 
 - When you learn a task will take longer or shorter, re-estimate it:
   `giverny-manage eta <task> <minutes left>`.
 - If a worker has to wait on something outside the work (a person, a quota, a
   build slot), stop its clock with `giverny-manage pause <task> --note "<why>"`
-  and restart it with `giverny-manage resume <task>`. Paused spans, and spans a
-  worker marked with `eta --why wait`, are left out of the working time the
-  history learns from; the pane still shows the wall time.
+  and restart it with `giverny-manage resume <task>`. Paused spans are left out
+  of the working time the history learns from.
 - **`pause` stops only the clock.** The worker and its commands keep going.
   When the user asks you to pause a worker (or everyone), `pause` its task,
   then:
@@ -257,110 +184,75 @@ When you spawn one:
     let a running one finish or stop it;
   - have it commit and push its work in progress, write its next step where
     the project keeps it, and end its turn with a short report;
-  - stop your own background commands for that task (a poll loop, a build
-    you ran);
+  - stop your own background commands for that task (a `claim --wait`, a
+    build you ran);
   - tell the user it has paused only once the reports are in and `pause`
-    names nothing still running. `pause` lists the task's `run` commands
-    still going, each with the command that stops it (`kill <pid>`); Giverny
-    stops nothing itself, so stopping or keeping each is your call. A task
-    paused ten minutes with one still going is told to you once.
-    `pause` lists the worker's own background shells still running as well,
-    each with `TaskStop <shell id>` (from your session) to stop it, and a
-    worker that ends its turn with one still running is told to you once.
+    names nothing still running. `pause` lists the task's `run` commands and
+    its worker's background shells still going, each with the command that
+    stops it (`kill <pid>`, `TaskStop <shell id>`); Giverny stops nothing
+    itself, so stopping or keeping each is your call.
 - **A progress check** reaches you, once per event, when a worker's figure
-  runs out or it asks for much more time (an `eta` that moves its finish at
-  least 10 minutes and a quarter of its figure before later); at most one
-  per task every 10 minutes. It names the ask or how overdue it is, its note,
-  its working time, what it is doing now, its runs and background shells,
-  and its transcript. Read its recent work there, judge whether it makes
-  sense, is all needed, or could be done faster, then tell the worker
-  (SendMessage) to cut, change course or go on, or let it go on; re-estimate
-  the row or split the task if that is what it needs. Giverny stops and
-  re-estimates nothing.
+  runs out or it asks for much more time. It names what the worker is doing
+  and its transcript. Read its recent work there, judge
+  whether it makes sense, is all needed, or could be done faster, then tell
+  the worker (SendMessage) to cut, change course or go on, or let it go on;
+  re-estimate the row or split the task if that is what it needs. Giverny
+  stops and re-estimates nothing.
   - **Keep one `giverny-manage watch` running in the background** (Bash with
     `run_in_background`) while you have Running rows: it sleeps until the
     next check falls due, prints it and exits, and its exit wakes you even
     while you wait idle for your workers. Read its output file — that is the
     check — act on it, then start a fresh `watch`. One that says nothing is
-    Running needs no restart until a task runs again; a second one says one
-    is already running and exits. It only prints. A check it printed is not
-    told again on your next tool call, nor the other way round.
-  - A worker deep in one long foreground command hears its own overdue ask
-    only on its next tool call; that is fine, you are the one who judges.
+    Running needs no restart until a task runs again.
 - **`resume` restarts only the clock** too. It says whether the task's worker
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh
   worker with a brief. Tell the user it has resumed once someone works on it.
   One that ended its turn with a background shell of its own still running
-  is **asleep**, not ended (`resume`, the pane and the turn-end notice say
-  so): Claude Code wakes it when that shell ends, so there is nothing to wake
-  or land (`land` refuses it while the shell runs); stop the shell only if
-  the work should not go on.
+  is **asleep**, not ended: Claude Code wakes it when that shell ends, so
+  there is nothing to wake or land; stop the shell only if the work should
+  not go on.
 - A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
   Like `land`, `drop` refuses it while anything of it still runs (section 4).
 - A worker that reports an OOM needs a bigger lease: `giverny-manage release
   <task>`, then `claim` it again with more `--ram`, then send the worker on
   (`run` takes the new grant). A held lease never grows through `claim`. Once,
   not in a loop: if the bigger claim fails too, tell the user.
-- **Another manager may ask for your resources.** When a line like
-  `Giverny: another manager on this machine asks for resources (message
-  mXXXXXX, …)` arrives in your context, weigh its priority and time left
-  against your task's, then answer, always, even with no:
-  - give way: `giverny-manage release <task>` frees everything, slots included
-    (the worker's next `run` claims afresh and waits its turn), or
-    `giverny-manage claim <task> --ram <less>` shrinks in place and
-    keeps the slots (a `run` already going keeps its cap; the next one uses the
-    new grant), which does not help an asker waiting for your slot: release for that;
-  - `giverny-manage reply <id> "<answer>"`, then carry on.
-
-  The same hook tells you when a reply to your own ask arrives: re-run your
-  `claim` at once.
+- **Another manager may ask for your resources** (`Giverny: another manager
+  on this machine asks for resources (message mXXXXXX, …)`). Weigh its
+  priority and time left against your task's, then always answer with
+  `giverny-manage reply <id> "<answer>"`, even with no. To give way,
+  `giverny-manage release <task>` frees everything, slots included;
+  `giverny-manage claim <task> --ram <less>` shrinks the lease and keeps its
+  slots. When a reply to your own ask arrives, re-run your `claim` at once.
 - `giverny-manage show` prints the manager session as it stands.
 
 ### Giving a worker its next task
 
-Only a light worker (under 100k tokens of context) whose next task is in code
-it has read gets one; see [Start a task](#2-start-a-task) for why. To hand
-such a worker its next task with `SendMessage` instead of spawning a new one,
-record the hand-off in the same breath as the message, and run it **before**
-you send the message:
+Reuse a worker only when **both** hold: it is **light**, under 100k tokens of
+context (`start` prints each idle worker's), and the next task is **in the
+files it has already read, or follows on from what it just did**. Otherwise
+spawn a fresh worker with a full brief: every turn of a reused worker re-reads
+its whole context, so a heavy one makes each turn slow and expensive.
+
+To hand it over, run this **before** you send the worker its next task with
+SendMessage:
 
 ```bash
 giverny-manage start <next task> --agent <worker's agent id>
 ```
 
-`start --agent` refuses a worker over the limit, naming its context: spawn a
-fresh worker then. Pass `--heavy-ok` only when the task truly needs what that
+That lands the worker's earlier task with its own measured time and starts
+the new one with its own clock; like `land`, it refuses while anything of the
+earlier task still runs. It refuses a worker over the limit too: spawn a fresh
+worker then. Pass `--heavy-ok` only when the task truly needs what that
 worker has in its context and a brief cannot carry it.
 
-That lands the worker's earlier task now, with its own measured time, and
-starts the new one with its own clock (refused, as `land` is, while a `run`
-command or a background shell of that earlier task still runs); the pane shows each task as its own row,
-and each finished row counts only the tokens spent on that task. A plain
-`start <next task>` (with no `--agent`) works too when the message assigns the
-task: it begins `New task for you: <next task>`, or names the task right after
-a holding phrase (`Next you hold acme#614`, `Your next task is acme#614`, or `a
-review round on #613` for `acme#613-r1`). The manager session and the pane
-then link the row to the worker the message went to, and `start` points out the
-idle worker to pass as `--agent`, with its context, and names any idle worker
-over the limit as one to leave alone. A task the message only mentions
-(`another worker now holds acme#615`) is never linked to it, and a row a
-worker already holds — or that a worker was spawned for — is never moved by a
-message; `start`/`eta --agent` is how to move one. Beginning the message with
-`New task for you: <next task>` is what tells a hand-off to a worker still busy
-on its last task apart from a mid-task note.
-
-A Running row whose worker has finished and that you have not landed three
-minutes later is told to you once, on your next tool call (`<task>'s worker
-finished 4m ago: check its report and giverny-manage land <task>`). A Running
-row with no worker three minutes after you started or handed it is told to you
-once too (`<task> is Running with no worker`): spawn a worker for it, hand it to
-an idle one (`start <task> --agent <id>`), or `pause` or `drop` it. The pane
-draws a task nobody works on under Next up, not Running, with why: `no worker
-yet`, `paused since 10:42`, `held: <why>`. A task you resume with a fresh
-worker (its description naming the task, as always) moves to that worker by
-itself once the old one has finished; `start <task> --agent <new id>` moves it
-at once.
+Giverny tells you once, on your next tool call, when a Running row's worker
+finished three minutes ago and you have not landed it (check its report and
+land it), and when a Running row has had no worker for three minutes: spawn
+one, hand it to an idle one with `start <task> --agent <id>`, or `pause` or
+`drop` it.
 
 ## 4. Land a task
 
@@ -377,12 +269,9 @@ A task with anything still running is not done, so `land` refuses it, for
 every `--outcome` and with no override: its worker still mid-turn (wait for its
 report), or asleep on background shells of its own; a `giverny-manage run`
 command of the task still going; a background shell its worker started still
-running. The refusal lists each one with how to stop it (`TaskStop <shell id>`
-from your session, `kill <pid>` or `pkill -s <pid>` where the pid is certain),
-exits 1 and changes nothing; once they are stopped, land it again. Giverny
-stops nothing itself. A worker that sends its final report while background
-shells of its own still run has that report held back once, with the same
-list; its next report goes through, and this refusal catches what is left.
+running. The refusal lists each with how to stop it (`TaskStop <shell id>`,
+`kill <pid>`) and changes nothing; Giverny stops nothing itself. Once they are
+stopped, land it again.
 
 Use `--review` when the work is finished but a person has to look at it before
 it counts: anything visual, a judgement call between two good options, an
@@ -397,15 +286,13 @@ Then start, at once, every planned task whose lane is now free (those planned
 
 When every task has landed, tell the user what landed, what is blocked or
 waiting for review, and what was left undone. Leave the rows: the pane keeps
-them as the manager session's record. `giverny-manage clear` removes them when the user
-asks.
+them as the manager session's record. `giverny-manage clear` removes them
+when the user asks.
 
 ## If `giverny-manage` is missing
 
 The command comes with Giverny. If running it fails with "command not found",
 carry on without it: the management works the same, the pane just shows the
-workers without the plan and the estimates.
-
-If it is there but has no `claim` (an older Giverny: `giverny-manage` prints its
-usage with no `claim` in it), skip claiming, `run`, `ask` and `reply`, and carry
-on as before; workers run their commands themselves.
+workers without the plan and the estimates. If its usage has no `claim` (an
+older Giverny), skip `claim`, `run`, `ask` and `reply`; workers run their
+commands themselves.
