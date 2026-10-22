@@ -4,7 +4,10 @@
 //! The same command is the plugin's `PreToolUse` Bash hook, which lets a
 //! command that would leave its tab's resource cap run and reminds the
 //! session, once per kind, to keep heavy work in the cap ([`guard`],
-//! [`crate::bash_guard`], giverny#271), and, with the manage skill in, its `PreToolUse`
+//! [`crate::bash_guard`], giverny#271), and its `PreToolUse` hook on a
+//! subagent's report (`SubagentHandback`), which holds a task worker's report
+//! back once while background shells of its own still run ([`handback`],
+//! giverny#478), and, with the manage skill in, its `PreToolUse`
 //! Agent hook, which nudges a session that is no manager toward the skill
 //! when a subagent it starts looks like task work ([`crate::manage_hint`],
 //! giverny#358), and the plugin's
@@ -505,6 +508,44 @@ fn backfill(stop: &crate::leftovers::Stop, dir: &Path, now: u64) {
     }
 }
 
+/// The tool a subagent sends its final report with (measured on Claude
+/// Code 2.1.308, in auto mode: its `PreToolUse` payload carries
+/// `agent_id`, `session_id`, the parent's `transcript_path` and
+/// `tool_input.message`, but no `background_tasks`).
+pub const HANDBACK_TOOL: &str = "SubagentHandback";
+
+/// A task worker's final report (`SubagentHandback`'s `PreToolUse`) while
+/// background shells of its own still run: denied once per task, with the
+/// shells and how to stop each; the next try goes through
+/// ([`crate::bg_shells::handback`], giverny#478). Its turn's end, asleep on
+/// its shells (giverny#476), is the `SubagentStop` hook's and untouched.
+/// Cheap: a `stat` when the session has no shell recorded.
+pub fn handback(
+    payload: &Value,
+    dir: &Path,
+    now: u64,
+    probe: &dyn crate::bg_shells::Probe,
+) -> Option<String> {
+    if payload.get("tool_name").and_then(Value::as_str) != Some(HANDBACK_TOOL) {
+        return None;
+    }
+    let caller = Caller::of(payload)?;
+    std::fs::metadata(crate::bg_shells::path(dir, &caller.session)).ok()?;
+    let task = match manager_doc(dir, &caller.session) {
+        Ok(Some((_, doc))) => row_key(&doc, &caller.agent_id, caller.description().as_deref()),
+        _ => None,
+    };
+    let why = crate::bg_shells::handback(
+        dir,
+        &caller.session,
+        &caller.agent_id,
+        task.as_deref(),
+        now,
+        probe,
+    )?;
+    Some(deny(&why))
+}
+
 /// The `PostToolUse` reply carrying `text` into the caller's context.
 pub fn reply(text: &str) -> String {
     json!({
@@ -844,6 +885,21 @@ pub fn main() -> i32 {
     if let Some(pre) = pre_tool(&input) {
         let feeds = crate::feed::feed_dir();
         mark_hooked(&feeds, pre.session.as_deref());
+        // A task worker's report while shells of its own still run: held
+        // back once (giverny#478).
+        if pre.tool == HANDBACK_TOOL {
+            if let Ok(payload) = serde_json::from_str::<Value>(&input)
+                && let Some(out) = handback(
+                    &payload,
+                    &feeds,
+                    manage::now_ms(),
+                    &crate::bg_shells::System,
+                )
+            {
+                println!("{out}");
+            }
+            return 0;
+        }
         // Another session's work is refused (giverny#415); leaving the cap
         // only reminded of (giverny#271), and only for a call that runs.
         let refused = pre.session.as_deref().and_then(|session| {
@@ -1315,6 +1371,108 @@ mod tests {
     /// against its row; its turn's end with the shell still in flight is
     /// told to the manager once, on the manager's own call, and not by
     /// [`crate::leftovers`] as well. Nothing is stopped.
+    /// A task worker's report while a background shell of its own still
+    /// runs is held back once, with the shell and how to stop it; the next
+    /// try goes through, as does another worker's report and a report with
+    /// nothing running (giverny#478). The payload is the one measured on
+    /// Claude Code 2.1.308.
+    #[test]
+    fn a_workers_report_is_held_back_once_while_its_own_shell_runs() {
+        struct Probe(bool);
+        impl crate::bg_shells::Probe for Probe {
+            fn look(&self, _: &str, s: &[crate::bg_shells::Shell]) -> Vec<crate::bg_shells::Found> {
+                vec![
+                    crate::bg_shells::Found {
+                        running: Some(self.0),
+                        pid: None
+                    };
+                    s.len()
+                ]
+            }
+        }
+        let dir = temp("handback");
+        let feeds = dir.join("feeds");
+        std::fs::create_dir_all(&feeds).unwrap();
+        let d = doc(json!([
+            {"key": "g478", "stage": "running", "agent_id": "af57",
+             "started": manage::stamp(T0), "eta_s": 3600},
+            {"key": "g479", "stage": "running", "agent_id": "bb12",
+             "started": manage::stamp(T0), "eta_s": 3600}]));
+        manage::write(&feed::feed_path(&feeds, "s1"), &d).unwrap();
+        let report = |agent: &str| {
+            let mut p = worker_payload(&dir, "s1", agent, "work", T0);
+            p["hook_event_name"] = json!("PreToolUse");
+            p["tool_name"] = json!(HANDBACK_TOOL);
+            p["tool_input"] = json!({"message": "done"});
+            p
+        };
+        // Nothing recorded: through, unread.
+        assert_eq!(handback(&report("af57"), &feeds, T0, &Probe(true)), None);
+        crate::bg_shells::record(
+            &feeds,
+            "s1",
+            crate::bg_shells::Shell {
+                id: "bq4h1i6dn".into(),
+                agent: "af57".into(),
+                task: "g478".into(),
+                cmd: "sleep 600".into(),
+                started_ms: T0 + MIN,
+            },
+            T0 + MIN,
+        );
+        // Another tool's call is not a report.
+        let mut bash = report("af57");
+        bash["tool_name"] = json!("Bash");
+        assert_eq!(handback(&bash, &feeds, T0, &Probe(true)), None);
+        // Another worker's report: none of its own runs.
+        assert_eq!(handback(&report("bb12"), &feeds, T0, &Probe(true)), None);
+        let out = handback(&report("af57"), &feeds, T0 + 4 * MIN, &Probe(true)).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            why,
+            "Giverny held your report back, once: 1 background shell of your own still runs \
+             (task `g478`), and a task with anything still running is not done:\n  `sleep \
+             600` (shell bq4h1i6dn), 3m in: `TaskStop bq4h1i6dn` from this session stops it \
+             (its pid is not certain)\nStop it (`TaskStop bq4h1i6dn`) before you report, \
+             then send your report again. Your next report goes through, and your manager's \
+             `giverny-manage land` refuses the task while any of them still runs."
+        );
+        // Once per task: the second try goes through, shell or not.
+        assert_eq!(
+            handback(&report("af57"), &feeds, T0 + 5 * MIN, &Probe(true)),
+            None
+        );
+        assert!(
+            crate::bg_shells::is_recorded(&feeds, "s1", "bq4h1i6dn"),
+            "nothing stopped"
+        );
+        // A shell that ended holds nothing back.
+        let d2 = temp("handback-ended");
+        let feeds2 = d2.join("feeds");
+        crate::bg_shells::record(
+            &feeds2,
+            "s1",
+            crate::bg_shells::Shell {
+                id: "bend".into(),
+                agent: "af57".into(),
+                task: "g478".into(),
+                cmd: "sleep 1".into(),
+                started_ms: T0,
+            },
+            T0,
+        );
+        let mut p = report("af57");
+        p["transcript_path"] = json!(d2.join("proj/s1.jsonl").display().to_string());
+        assert_eq!(handback(&p, &feeds2, T0 + MIN, &Probe(false)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
     #[test]
     fn a_task_workers_background_shell_is_told_to_its_manager_at_its_turns_end() {
         let dir = temp("bg-shell");

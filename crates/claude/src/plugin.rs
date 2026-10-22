@@ -36,7 +36,10 @@
 //!   ([`crate::bash_guard`], giverny#271), and one
 //!   that reaches into another session's processes, run scopes or
 //!   worktrees, and on Edit/Write an edit in such a worktree, is refused
-//!   ([`crate::reach_guard`], giverny#415). And with the
+//!   ([`crate::reach_guard`], giverny#415). Before a subagent's
+//!   `SubagentHandback` it holds a task worker's report back once while
+//!   background shells of its own still run ([`crate::plugin_hook::handback`],
+//!   giverny#478). And with the
 //!   skill in, it runs as a `UserPromptSubmit` hook: a prompt that asks to
 //!   manage ("manage that task") gets context telling Claude to invoke
 //!   `giverny:manage` first, since a skill picked only by its description
@@ -175,8 +178,10 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// The tools the `PreToolUse` guard sees: Bash, for the cap
 /// ([`crate::bash_guard`]) and for reaching into another session's work,
 /// and the editing tools, for its worktrees ([`crate::reach_guard`],
-/// giverny#415).
-pub const PRE_MATCHER: &str = "Bash|Edit|Write|MultiEdit|NotebookEdit";
+/// giverny#415), and a subagent's report tool, held back once while a task
+/// worker's own background shells still run
+/// ([`crate::plugin_hook::handback`], giverny#478).
+pub const PRE_MATCHER: &str = "Bash|Edit|Write|MultiEdit|NotebookEdit|SubagentHandback";
 
 fn session_hooks(skill: bool) -> Value {
     let hook = || {
@@ -856,6 +861,12 @@ mod tests {
         let pre = &h["hooks"]["PreToolUse"][0];
         assert_eq!(pre["matcher"], PRE_MATCHER);
         assert_eq!(pre["hooks"][0]["command"].as_str(), Some(cmd));
+        // And before a worker's report (giverny#478).
+        assert!(
+            PRE_MATCHER
+                .split('|')
+                .any(|t| t == crate::plugin_hook::HANDBACK_TOOL)
+        );
         // And the nudge toward the manage skill, before Agent calls
         // (giverny#358).
         let agent = &h["hooks"]["PreToolUse"][1];

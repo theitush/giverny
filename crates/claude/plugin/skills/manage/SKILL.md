@@ -222,7 +222,9 @@ When you spawn one:
   > granted, shares the CPU fairly, and measures them. Never set CPU or memory
   > caps or build jobs by hand. If `run`
   > says the memory cap killed your command (OOM), do not retry it: report that
-  > to the dispatcher, who claims more. End with a short report: what you did,
+  > to the dispatcher, who claims more. Before your report, stop every
+  > background shell you started (`TaskStop <shell id>`): a task with anything
+  > still running is not done. End with a short report: what you did,
   > how you checked it, and anything left undone.
 
   About five minutes into the task, the plugin puts a request for that
@@ -292,8 +294,10 @@ When you spawn one:
   One that ended its turn with a background shell of its own still running
   is **asleep**, not ended (`resume`, the pane and the turn-end notice say
   so): Claude Code wakes it when that shell ends, so there is nothing to wake
-  or land; stop the shell only if the work should not go on.
+  or land (`land` refuses it while the shell runs); stop the shell only if
+  the work should not go on.
 - A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
+  Like `land`, `drop` refuses it while anything of it still runs (section 4).
 - A worker that reports an OOM needs a bigger lease: `giverny-manage release
   <task>`, then `claim` it again with more `--ram`, then send the worker on
   (`run` takes the new grant). A held lease never grows through `claim`. Once,
@@ -330,7 +334,8 @@ fresh worker then. Pass `--heavy-ok` only when the task truly needs what that
 worker has in its context and a brief cannot carry it.
 
 That lands the worker's earlier task now, with its own measured time, and
-starts the new one with its own clock; the pane shows each task as its own row,
+starts the new one with its own clock (refused, as `land` is, while a `run`
+command or a background shell of that earlier task still runs); the pane shows each task as its own row,
 and each finished row counts only the tokens spent on that task. A plain
 `start <next task>` (with no `--agent`) works too when the message assigns the
 task: it begins `New task for you: <next task>`, or names the task right after
@@ -367,6 +372,17 @@ giverny-manage land auth-fix                                   # done
 giverny-manage land auth-fix --outcome Blocked --note "needs the API key"
 giverny-manage land ui-empty-state --review "<who> — <what to look at> — <where>"
 ```
+
+A task with anything still running is not done, so `land` refuses it, for
+every `--outcome` and with no override: its worker still mid-turn (wait for its
+report), or asleep on background shells of its own; a `giverny-manage run`
+command of the task still going; a background shell its worker started still
+running. The refusal lists each one with how to stop it (`TaskStop <shell id>`
+from your session, `kill <pid>` or `pkill -s <pid>` where the pid is certain),
+exits 1 and changes nothing; once they are stopped, land it again. Giverny
+stops nothing itself. A worker that sends its final report while background
+shells of its own still run has that report held back once, with the same
+list; its next report goes through, and this refusal catches what is left.
 
 Use `--review` when the work is finished but a person has to look at it before
 it counts: anything visual, a judgement call between two good options, an
