@@ -29,6 +29,7 @@ mod view_header;
 mod walk;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wayland_dnd;
+mod worker_page;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod wslg;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
@@ -1027,9 +1028,9 @@ pub enum Action {
     /// A row of the management panel was clicked: Running and Done open the
     /// worker, Planned shows its brief (`agent_open`).
     AgentRowClicked(TabId, Box<management_panel::RowClick>),
-    /// The worker overlay's Open in Claude Code: attach the
-    /// row's running worker in its parent tab.
-    OpenWorkerInClaude(TabId, Box<management_panel::RowClick>),
+    /// The "back to manager" button, or Esc, on the worker page a tab
+    /// shows: the tab's terminal again.
+    ClosePage(TabId),
     /// Esc, or the terminal's "back to manager" button, in a tab
     /// showing a worker's view: walk its Claude Code back to the main view.
     BackToMain(TabId),
@@ -1396,13 +1397,11 @@ pub struct App {
     /// (`sessions_load::latest`): taken once a frame so the sidebar and the
     /// management panel draw the same one.
     pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
-    /// The overlay a management-panel row opens: a brief, or a worker's
-    /// transcript (`overlays::BriefOverlay`).
-    pub brief: Option<overlays::BriefOverlay>,
-    /// The tab and row that opened `brief`, when a row did: a second click
-    /// on that row closes it.
-    brief_row: Option<(TabId, management_panel::RowClick)>,
-    /// The terminal session's rect last frame: where that overlay goes.
+    /// The worker page a tab shows in its terminal's place
+    /// (`worker_page`): a worker Claude Code has no view of, or a Next up
+    /// row's brief. A second click on its row closes it.
+    pub brief: Option<worker_page::WorkerPage>,
+    /// The terminal session's rect last frame.
     pub session_rect: Option<egui::Rect>,
     /// Tabs opened for a worker (a Done row's follower, a row's open
     /// command): painted on the worker background, like a subagent view.
@@ -2139,7 +2138,6 @@ impl App {
             agent_views: management_panel::Views::default(),
             use_now: None,
             brief: None,
-            brief_row: None,
             session_rect: None,
             worker_tabs: HashSet::new(),
             attach: None,
@@ -2358,7 +2356,7 @@ impl App {
                 self.state_dirty = true;
             }
             Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
-            Action::OpenWorkerInClaude(tab, click) => self.open_worker_in_claude(ctx, tab, &click),
+            Action::ClosePage(tab) => self.close_page(tab),
             Action::BackToMain(tab) => self.back_to_main(ctx, tab),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
@@ -4573,21 +4571,24 @@ impl App {
     ) {
         // The row the tab already shows, clicked again, is the way back to
         // the manager.
-        let overlay = self
+        let page = self
             .brief
             .as_ref()
-            .and(self.brief_row.as_ref())
-            .filter(|(tab, _)| *tab == parent)
-            .map(|(_, row)| row);
+            .filter(|p| p.tab == parent)
+            .and_then(|p| p.row.as_ref());
         let viewed = self.viewed_worker(parent);
-        let toggle = management_panel::toggle(click, viewed.as_deref(), overlay);
+        let toggle = management_panel::toggle(click, viewed.as_deref(), page);
         tracing::info!("management panel: row {} clicked: {toggle:?}", click.name);
         match toggle {
-            management_panel::Toggle::Open => {}
+            management_panel::Toggle::Open => {
+                // Whatever is opened next takes the tab: a page up in it
+                // gives way, as a worker's view gives way to another's.
+                if self.brief.as_ref().is_some_and(|p| p.tab == parent) {
+                    self.close_page(parent);
+                }
+            }
             management_panel::Toggle::Close => {
-                self.brief = None;
-                self.brief_row = None;
-                self.focus_terminal = true;
+                self.close_page(parent);
                 return;
             }
             management_panel::Toggle::Home => {
@@ -4603,10 +4604,10 @@ impl App {
             self.apply(ctx, Action::Select(id));
             return;
         }
-        // A Running worker opens straight into its view: no
-        // overlay. The overlay is what is left when that cannot start, and
-        // what a finished worker not yet landed opens at once: Claude Code
-        // lists it no more, so there is no view to walk to (giverny#274).
+        // A Running worker opens straight into its view. Giverny's page of
+        // it is what is left when that cannot start, and what a finished
+        // worker not yet landed opens at once: Claude Code lists it no
+        // more, so there is no view to walk to (giverny#274, giverny#477).
         if let (giverny_claude::feed::Stage::Running, Some(agent_id)) =
             (click.stage, click.agent_id.as_deref())
             && matches!(
@@ -4621,13 +4622,14 @@ impl App {
             }
         }
         let plan = agent_open::plan(click);
-        let button = self.overlay_button(parent, click);
-        // A Done row's task may have landed in Review: the line its
-        // manager wrote (`land --review`) goes at the top of the overlay.
-        let review = overlays::review_line(click.stage, click.review.as_deref());
-        self.carry_out_open(ctx, parent, plan, click.facts.clone(), button, review);
-        if self.brief.is_some() {
-            self.brief_row = Some((parent, click.clone()));
+        self.carry_out_open(ctx, parent, plan, click);
+    }
+
+    /// The page `tab` shows goes, and its terminal is back.
+    fn close_page(&mut self, tab: TabId) {
+        if self.brief.as_ref().is_some_and(|p| p.tab == tab) {
+            self.brief = None;
+            self.focus_terminal = true;
         }
     }
 
@@ -4724,53 +4726,6 @@ impl App {
                 giverny_claude::subagents::read_meta(dir, agent_id).description
             })
             .filter(|d| !d.trim().is_empty())
-    }
-
-    /// The worker overlay's footer for this row.
-    fn overlay_button(
-        &self,
-        parent: TabId,
-        click: &management_panel::RowClick,
-    ) -> overlays::Button {
-        use overlays::Button;
-        let no_tab = "This tab has no live terminal to type into.";
-        match agent_open::offer(click) {
-            agent_open::Offer::Nothing => Button::None,
-            agent_open::Offer::OpenInClaude { .. } if !self.tab_is_live(parent) => {
-                Button::Disabled {
-                    label: "Open in Claude Code",
-                    why: no_tab.into(),
-                }
-            }
-            agent_open::Offer::OpenInClaude { .. } => Button::Open {
-                tab: parent,
-                click: Box::new(click.clone()),
-            },
-        }
-    }
-
-    /// The overlay's Open in Claude Code: attach the worker, or say why not.
-    fn open_worker_in_claude(
-        &mut self,
-        ctx: &egui::Context,
-        parent: TabId,
-        click: &management_panel::RowClick,
-    ) {
-        let title = agent_open::title_of(click);
-        let Some(agent_id) = click.agent_id.clone() else {
-            return;
-        };
-        if !self.start_attach(ctx, parent, &title, &agent_id, click) {
-            self.brief_row = None;
-            self.brief = Some(overlays::BriefOverlay::text(
-                title,
-                None,
-                "Giverny cannot find this worker's description, which is what Claude Code \
-                 lists it by, so it cannot open it there. In this tab, press ↓ at the prompt \
-                 until the agent list under it is selected, then Enter on the worker."
-                    .into(),
-            ));
-        }
     }
 
     /// Attach a running worker: show its parent tab and start
@@ -5030,8 +4985,7 @@ impl App {
                     self.attach = None;
                     self.settings = None;
                     self.keys_overlay = None;
-                    self.brief_row = None;
-                    self.brief = Some(overlays::BriefOverlay::text(title, None, text));
+                    self.brief = Some(worker_page::WorkerPage::text(tab, title, text));
                     self.release_picture(tab);
                     return;
                 }
@@ -5214,28 +5168,23 @@ impl App {
         }
     }
 
-    /// Debug builds only: `GIVERNY_DEBUG_CLICK=<row key>[:button]` clicks
-    /// the active tab's management-panel row with that key a few seconds in, and
-    /// with `:button` presses the overlay's footer button a few seconds
-    /// later — the path after a pointer click, driven in-process, so it can
-    /// be watched with `GIVERNY_CAPTURE` without synthetic input events.
+    /// Debug builds only: `GIVERNY_DEBUG_CLICK=<row key>` clicks the active
+    /// tab's management-panel row with that key a few seconds in — the path
+    /// after a pointer click, driven in-process, so it can be watched with
+    /// `GIVERNY_CAPTURE` without synthetic input events.
     #[cfg(debug_assertions)]
     fn debug_click(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static FRAME: AtomicU32 = AtomicU32::new(0);
         const CLICK_AT: u32 = 150;
-        const BUTTON_AT: u32 = 400;
         let Ok(spec) = std::env::var("GIVERNY_DEBUG_CLICK") else {
             return;
         };
         let frame = FRAME.fetch_add(1, Ordering::Relaxed);
-        if frame <= BUTTON_AT {
+        if frame <= CLICK_AT {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
-        let (key, button) = match spec.split_once(":button") {
-            Some((k, _)) => (k, true),
-            None => (spec.as_str(), false),
-        };
+        let key = spec.as_str();
         if frame == CLICK_AT {
             let Some(active) = self.ws.active else { return };
             let Some(tracker) = self.claude.agents.tracker(active) else {
@@ -5260,19 +5209,6 @@ impl App {
                 None => tracing::warn!("debug click: no row {key}"),
             }
         }
-        if frame == BUTTON_AT && button {
-            let action = self.brief.as_ref().and_then(|ov| match &ov.button {
-                overlays::Button::Open { tab, click } => {
-                    Some(Action::OpenWorkerInClaude(*tab, click.clone()))
-                }
-                _ => None,
-            });
-            tracing::info!("debug click: button {}", action.is_some());
-            if let Some(action) = action {
-                self.brief = None;
-                self.apply(ctx, action);
-            }
-        }
     }
 
     /// Debug builds only: `GIVERNY_DEBUG_CMD=<file>`. When the file shows up
@@ -5282,9 +5218,9 @@ impl App {
     ///
     /// * `click <row>` — select the tab whose management panel has the row (its
     ///   id, worker id, name or key) and click it;
-    /// * `open` — the overlay's Open in Claude Code;
     /// * `esc` — an Esc key press, into the terminal as typed;
-    /// * `back` — a pointer click on the terminal's back button;
+    /// * `back` — a pointer click on the terminal's back button, or the
+    ///   worker page's;
     /// * `xheader` — a pointer click on the worker header's `×`;
     /// * `type <text>` — the text, written to the active tab (`\r` in it: Enter);
     /// * `key <enter|up|down>` — that key press, as typed;
@@ -5354,18 +5290,6 @@ impl App {
                         None => tracing::warn!("debug cmd: no row {arg}"),
                     }
                 }
-                "open" => {
-                    let action = self.brief.as_ref().and_then(|ov| match &ov.button {
-                        overlays::Button::Open { tab, click } => {
-                            Some(Action::OpenWorkerInClaude(*tab, click.clone()))
-                        }
-                        _ => None,
-                    });
-                    if let Some(action) = action {
-                        self.brief = None;
-                        self.apply(ctx, action);
-                    }
-                }
                 "esc" => {
                     let key = |pressed| egui::Event::Key {
                         key: egui::Key::Escape,
@@ -5378,8 +5302,14 @@ impl App {
                     feed(vec![key(false)]);
                 }
                 "back" | "xheader" => {
+                    let page = self
+                        .brief
+                        .as_ref()
+                        .filter(|p| Some(p.tab) == self.ws.active);
                     let rect = if cmd == "xheader" {
                         self.header_close
+                    } else if let Some(page) = page {
+                        page.button_rect
                     } else {
                         self.ws
                             .active
@@ -5648,41 +5578,40 @@ impl App {
         }
     }
 
-    /// Carry out a management-panel plan: the overlay, or (a Running row with
-    /// only an `open` command) a new tab.
+    /// Carry out a management-panel plan: the worker page in `parent`, or
+    /// (a Running row with only an `open` command) a new tab.
     fn carry_out_open(
         &mut self,
         ctx: &egui::Context,
         parent: TabId,
         plan: agent_open::Plan,
-        facts: Vec<String>,
-        button: overlays::Button,
-        review: Option<String>,
+        click: &management_panel::RowClick,
     ) {
         use agent_open::{Body, Plan};
-        let mut overlay = match plan {
+        use worker_page::WorkerPage;
+        let page = match plan {
             Plan::Watch {
                 title,
                 transcript,
                 live,
-            } => overlays::BriefOverlay::transcript(title, transcript, live),
+            } => WorkerPage::transcript(parent, title, transcript, live),
             Plan::Show { title, body } => match body {
                 // A brief is what the worker will be given: drawn as its
                 // prompt, as Claude Code draws one (giverny#477).
                 Body::File(path) => {
                     let text = agent_open::read_brief(&path);
                     let rows = giverny_claude::transcript::prompt_rows(&text, None);
-                    overlays::BriefOverlay::rows(title, Some(path), rows)
+                    WorkerPage::rows(parent, title, rows)
                 }
                 Body::Unbriefed { prompt, hint } => {
                     use giverny_claude::transcript::{Row, Tone, prompt_rows};
                     let mut rows = prompt_rows(&prompt, None);
-                    let mut hint = Row::one(Tone::Dim, hint);
+                    let mut hint = Row::one(Tone::Dim, format!("  {hint}"));
                     hint.starts = true;
                     rows.push(hint);
-                    overlays::BriefOverlay::rows(title, None, rows)
+                    WorkerPage::rows(parent, title, rows)
                 }
-                Body::Text(text) => overlays::BriefOverlay::text(title, None, text),
+                Body::Text(text) => WorkerPage::text(parent, title, text),
             },
             Plan::Run { title, command } => {
                 // The same guard a resume has: two claudes on one
@@ -5699,9 +5628,9 @@ impl App {
                             self.apply(ctx, Action::Select(id));
                             return;
                         }
-                        overlays::BriefOverlay::text(
+                        WorkerPage::text(
+                            parent,
                             title,
-                            None,
                             format!(
                                 "This worker's conversation is already running outside \
                                  Giverny ({sid}). Resuming it here as well would put two \
@@ -5719,12 +5648,27 @@ impl App {
                 }
             }
         };
-        overlay.facts = facts;
-        overlay.button = button;
-        overlay.review = review;
+        let name = self.task_name(parent, click);
         self.settings = None;
         self.keys_overlay = None;
-        self.brief = Some(overlay);
+        if self.ws.active != Some(parent) {
+            self.apply(ctx, Action::Select(parent));
+        }
+        self.brief = Some(page.of_row(click.clone(), name));
+    }
+
+    /// The task's name for `click`'s row, as the header over a worker gives
+    /// it (giverny#477): its feed key, or its worker's description up to
+    /// the first `:`.
+    fn task_name(&self, parent: TabId, click: &management_panel::RowClick) -> String {
+        let mut line_click = click.clone();
+        if line_click.name.trim().is_empty()
+            && let Some(id) = click.agent_id.as_deref()
+            && let Some(d) = self.worker_description(parent, id, click)
+        {
+            line_click.name = d;
+        }
+        view_header::name_of(&line_click, "", &agent_open::title_of(click))
     }
 
     /// A new tab beside `parent` — its category, its directory — titled for
@@ -5763,10 +5707,12 @@ impl App {
     /// key list take the terminal's place, so a tab clicked in the rail while
     /// one of them is open used to look like a click that did nothing — the
     /// only way back was the button that opened it.
+    ///
+    /// A worker page is the tab's own, as a worker's view in its Claude
+    /// Code is, and stays.
     fn reveal_terminal(&mut self) {
         self.settings = None;
         self.keys_overlay = None;
-        self.brief = None;
         self.focus_terminal = true;
     }
 
@@ -5796,9 +5742,9 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
-        // The worker overlay takes the keyboard while it is open: Esc and
-        // its own keys, and nothing typed reaches the shell underneath.
-        actions.extend(overlays::brief_keys(self, ctx));
+        // A worker page takes the keyboard while its tab shows it: Esc and
+        // the scroll keys, and nothing typed reaches the shell underneath.
+        actions.extend(worker_page::keys(self, ctx));
         ctx.input_mut(|i| {
             let cs = Modifiers::CTRL | Modifiers::SHIFT;
             if i.consume_key(cs, Key::T)
@@ -6324,6 +6270,21 @@ impl eframe::App for App {
             let shown_id = shown_label
                 .as_deref()
                 .and_then(|l| self.worker_id(active, l));
+            // A worker page up in the tab is the worker it shows, as a
+            // worker's view in its Claude Code is (giverny#477).
+            let page_row = self
+                .brief
+                .as_ref()
+                .filter(|p| p.tab == active)
+                .and_then(|p| p.row.clone());
+            let on_view = match &page_row {
+                Some(row) => Some(management_panel::Shown::Row(row)),
+                None => viewed.as_deref().map(management_panel::Shown::Worker),
+            };
+            let on_header = match &page_row {
+                Some(row) => Some(management_panel::Shown::Row(row)),
+                None => shown_id.as_deref().map(management_panel::Shown::Worker),
+            };
             // The management panel takes the bottom of the terminal's area.
             let mut header = None;
             let mut shown_row = None;
@@ -6334,8 +6295,8 @@ impl eframe::App for App {
                     self.use_now.as_deref(),
                     // Only once the tab's session is up.
                     self.claude.agents.shown(active),
-                    viewed.as_deref(),
-                    shown_id.as_deref(),
+                    on_view,
+                    on_header,
                     management_panel::limit_for(
                         &self.claude,
                         active,
@@ -6389,7 +6350,39 @@ impl eframe::App for App {
                 rt.view.button_labels = BACK_LABELS;
                 rt.view.button_fill = self.chrome.accent;
                 rt.view.hold = holding;
-                if let Some(session) = &mut rt.session {
+                if let Some(page) = self.brief.as_mut().filter(|p| p.tab == active) {
+                    // The tab shows a worker page in its terminal's place,
+                    // as it shows a worker's view (giverny#477): the same
+                    // grid, header and button, and nothing reaches the
+                    // terminal under it.
+                    self.session_rect = Some(ui.available_rect_before_wrap());
+                    let drawn = page.show(ui, &mut self.shared, BACK_LABELS, self.chrome.accent);
+                    grid_rect = Some(drawn.rect);
+                    if drawn.back {
+                        actions.push(Action::ClosePage(active));
+                    }
+                    self.header_close = None;
+                    if page.header_closed {
+                        page.header_h = 0.0;
+                    } else {
+                        let head = match &shown_row {
+                            Some(line) => view_header::Head::of(line),
+                            None => view_header::Head::titled(&page.name),
+                        };
+                        let band = view_header::show(ui, drawn.rect, &head, &self.chrome, active);
+                        self.header_close = Some(band.close);
+                        // The rows under it are the banner's: a header that
+                        // grew moves the entries down, next frame.
+                        if (band.height - page.header_h).abs() > 0.5 {
+                            page.header_h = band.height;
+                            ctx.request_repaint();
+                        }
+                        if band.closed {
+                            page.header_closed = true;
+                        }
+                    }
+                    prompt_bar::hide(&ctx, active);
+                } else if let Some(session) = &mut rt.session {
                     // The worker overlay is laid out on this rect.
                     self.session_rect = Some(ui.available_rect_before_wrap());
                     // The wheel over the closed prompt bar scrolls the
@@ -6407,10 +6400,11 @@ impl eframe::App for App {
                     // what it is working on, in full.
                     self.header_close = None;
                     if let Some(line) = &header {
-                        let (closed, close) =
-                            view_header::show(ui, response.rect, line, &self.chrome, active);
-                        self.header_close = Some(close);
-                        if closed {
+                        let head = view_header::Head::of(line);
+                        let band =
+                            view_header::show(ui, response.rect, &head, &self.chrome, active);
+                        self.header_close = Some(band.close);
+                        if band.closed {
                             rt.header_closed = rt.shown_viewed.clone();
                             self.focus_terminal = true;
                         }
@@ -6523,7 +6517,6 @@ impl eframe::App for App {
         actions.extend(overlays::palette_ui(self, &ctx));
         actions.extend(overlays::sessions_ui(self, &ctx));
         actions.extend(keymap::overlay_ui(self, &ctx));
-        actions.extend(overlays::brief_ui(self, &ctx));
         actions.extend(overlays::stop_confirm_ui(self, &ctx));
 
         for action in actions {

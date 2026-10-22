@@ -34,8 +34,8 @@ pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// Render resources shared by all tabs.
 pub struct RenderShared {
-    fonts: FontSet,
-    atlas: Atlas,
+    pub(crate) fonts: FontSet,
+    pub(crate) atlas: Atlas,
     pub theme: Theme,
     /// Font size in logical points.
     pub font_size: f32,
@@ -43,7 +43,7 @@ pub struct RenderShared {
     /// the window was not made see-through.
     pub opacity: f32,
     metrics: Option<(u32, CellMetrics)>,
-    generation: u32,
+    pub(crate) generation: u32,
 }
 
 impl RenderShared {
@@ -70,7 +70,7 @@ impl RenderShared {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn metrics_for(&mut self, px: f32) -> CellMetrics {
+    pub(crate) fn metrics_for(&mut self, px: f32) -> CellMetrics {
         let key = px.to_bits();
         if let Some((k, m)) = self.metrics
             && k == key
@@ -462,7 +462,7 @@ impl TabView {
             // comes with the picture rather than a frame after it.
             self.marks = marks_for(&session.screen_text());
         }
-        let button = self.row_button(rect, ppp, metrics, cols);
+        let button = row_button(&self.marks, self.button_labels, rect, ppp, metrics, cols);
         self.button_rect = button.map(|(r, _)| r);
         let button_resp = button.map(|(r, _)| {
             ui.interact(r, response.id.with("row-button"), Sense::click())
@@ -678,16 +678,7 @@ impl TabView {
             }
         }
         if let (Some((r, label)), Some(resp)) = (button, &button_resp) {
-            let hot = resp.hovered() || resp.is_pointer_button_down_on();
-            let fill = if hot {
-                self.button_fill
-            } else {
-                self.button_fill.gamma_multiply(0.85)
-            };
-            painter.rect_filled(r, 3.0, bg);
-            painter.rect_filled(r.shrink2(Vec2::new(0.0, 1.0)), 4.0, fill);
-            let text_at = Pos2::new(r.min.x + cw_pt, r.min.y);
-            shared.paint_text(&painter, text_at, label, bg);
+            paint_row_button(&painter, shared, r, label, self.button_fill, bg, resp);
         }
 
         // Search match highlight + hovered link underline, over the grid.
@@ -749,43 +740,6 @@ impl TabView {
         }
 
         response
-    }
-
-    /// The row button's rect and label, when the marks ask for one and a
-    /// label fits the row's blank cells with a cell to spare each side.
-    fn row_button(
-        &self,
-        rect: Rect,
-        ppp: f32,
-        m: CellMetrics,
-        cols: u16,
-    ) -> Option<(Rect, &'static str)> {
-        let (row, used) = self.marks.button?;
-        if i32::from(row) >= rows_now(rect, ppp, m) {
-            return None;
-        }
-        // One cell of padding inside each end; at the right, the end one
-        // cell in; at the left, the label on the column asked for.
-        let end = self.marks.button_end.map_or(cols, |e| e.min(cols));
-        let (free, left) = match self.marks.button_left {
-            Some(at) => {
-                let start = at.saturating_sub(1).max(used);
-                (end.saturating_sub(start), Some(start))
-            }
-            None => (end.saturating_sub(used), None),
-        };
-        let label = self
-            .button_labels
-            .iter()
-            .find(|l| (l.chars().count() as u16) + 4 <= free)?;
-        let width = label.chars().count() as u16 + 2;
-        let start = left.unwrap_or(end - 1 - width);
-        let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
-        let r = Rect::from_min_size(
-            Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),
-            Vec2::new(width as f32 * cw, ch),
-        );
-        Some((r, *label))
     }
 
     fn handle_keyboard(
@@ -1519,8 +1473,67 @@ impl TabView {
     }
 }
 
+/// The row button's rect and label, when `marks` ask for one and a label
+/// fits the row's blank cells with a cell to spare each side: the first of
+/// `labels` (longest first) that fits. Shared by a tab's terminal and a
+/// [`crate::page::Page`], so the two draw the one button.
+pub(crate) fn row_button(
+    marks: &RowMarks,
+    labels: &'static [&'static str],
+    rect: Rect,
+    ppp: f32,
+    m: CellMetrics,
+    cols: u16,
+) -> Option<(Rect, &'static str)> {
+    let (row, used) = marks.button?;
+    if i32::from(row) >= rows_now(rect, ppp, m) {
+        return None;
+    }
+    // One cell of padding inside each end; at the right, the end one
+    // cell in; at the left, the label on the column asked for.
+    let end = marks.button_end.map_or(cols, |e| e.min(cols));
+    let (free, left) = match marks.button_left {
+        Some(at) => {
+            let start = at.saturating_sub(1).max(used);
+            (end.saturating_sub(start), Some(start))
+        }
+        None => (end.saturating_sub(used), None),
+    };
+    let label = labels
+        .iter()
+        .find(|l| (l.chars().count() as u16) + 4 <= free)?;
+    let width = label.chars().count() as u16 + 2;
+    let start = left.unwrap_or(end - 1 - width);
+    let (cw, ch) = (m.cell_w as f32 / ppp, m.cell_h as f32 / ppp);
+    let r = Rect::from_min_size(
+        Pos2::new(rect.min.x + start as f32 * cw, rect.min.y + row as f32 * ch),
+        Vec2::new(width as f32 * cw, ch),
+    );
+    Some((r, *label))
+}
+
+/// Paint the row button at `r`: `fill`, a shade lighter while the pointer
+/// is on it (`resp`), its label in the grid's background colour `bg`.
+pub(crate) fn paint_row_button(
+    painter: &egui::Painter,
+    shared: &mut RenderShared,
+    r: Rect,
+    label: &str,
+    fill: Color32,
+    bg: Color32,
+    resp: &Response,
+) {
+    let hot = resp.hovered() || resp.is_pointer_button_down_on();
+    let fill = if hot { fill } else { fill.gamma_multiply(0.85) };
+    let cw_pt = shared.cell_size(painter.ctx().pixels_per_point()).x;
+    painter.rect_filled(r, 3.0, bg);
+    painter.rect_filled(r.shrink2(Vec2::new(0.0, 1.0)), 4.0, fill);
+    let text_at = Pos2::new(r.min.x + cw_pt, r.min.y);
+    shared.paint_text(painter, text_at, label, bg);
+}
+
 /// Visible row count for the current geometry.
-fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
+pub(crate) fn rows_now(rect: Rect, ppp: f32, m: CellMetrics) -> i32 {
     (rect.height() * ppp / m.cell_h as f32).floor() as i32
 }
 
@@ -1566,7 +1579,7 @@ fn drawn_span(orders: &[(u16, RowOrder)], line: u16, start: u16, len: u16) -> (u
 }
 
 /// Pointer position → 0-based viewport cell + cell side.
-fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
+pub(crate) fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, u16, Side) {
     let x_px = ((pos.x - rect.min.x) * ppp).max(0.0);
     let y_px = ((pos.y - rect.min.y) * ppp).max(0.0);
     let col = (x_px / m.cell_w as f32).floor() as u16;

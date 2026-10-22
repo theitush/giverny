@@ -15,35 +15,36 @@
 //!   view is final ([`Settle`]), so the steps between are never drawn, and
 //!   a one-column [`Nudge`] of the pty's width brings the relay's run
 //!   forward so the hold is short. Only when that cannot start does the
-//!   row open the overlay below.
+//!   row open Giverny's page of the worker below.
 //! * A Running row whose worker has **finished** but is not landed yet
 //!   ([`RowClick::finished`]) is not walked into: Claude Code has dropped
 //!   that worker from its list, so a walk could only wait out [`DEADLINE`]
 //!   and say it may have left (giverny#274). It opens as a Done row does.
-//! * **Done** workers (and a Running one that cannot be opened) open an
-//!   overlay over the current terminal showing the
-//!   worker's transcript, drawn as Claude Code draws a worker's own view
-//!   (`giverny_claude::transcript`, giverny#477; `giverny transcript`
-//!   renders it the same way): a
-//!   Running one live, following it as it grows; a Done one opened at its
-//!   end, on the final report. Nothing is typed into Claude Code.
+//! * **Done** workers (and a Running one that cannot be opened) open
+//!   Giverny's page of the worker in the tab (`worker_page`, giverny#477):
+//!   it takes the tab as the running view does, under the same header and
+//!   "back to manager" button, and draws the worker's transcript as Claude
+//!   Code draws a worker's own view (`giverny_claude::transcript`;
+//!   `giverny transcript` renders it the same way): a Running one live,
+//!   following it as it grows; a Done one opened at its end, on the final
+//!   report. Nothing is typed into Claude Code.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
 //!   manager" button walk it back to the main view ([`Walk::home`]),
 //!   and the strip's own `main` row is not drawn
 //!   ([`row_marks`]).
-//! * A Done worker's overlay only reads: nothing is offered. Claude Code
+//! * A Done worker's page only reads: nothing is offered. Claude Code
 //!   keeps no view of a finished subagent (it leaves the agent strip and
 //!   `/tasks`, and its transcript is not a resumable session), and the one
 //!   way back in — the parent's `SendMessage` — speaks for the user, so the old
 //!   **Revive** that typed a line at the parent's prompt is gone.
-//! * **Planned** shows the row's brief in the same overlay, drawn as the
+//! * **Planned** shows the row's brief on the same page, drawn as the
 //!   worker's prompt; without one, its task, title and note as that prompt,
 //!   and how a dispatcher adds a brief.
 //! * A Running row that names no worker but has a feed `open` command runs
 //!   it in a new tab — unless it resumes a conversation something is already
 //!   running, which two claudes on one transcript would interleave.
 //!
-//! A row with none of these still answers the click, with an overlay saying
+//! A row with none of these still answers the click, with a page saying
 //! what is missing, rather than doing nothing.
 
 use std::collections::VecDeque;
@@ -54,13 +55,13 @@ use giverny_claude::feed::Stage;
 
 use crate::management_panel::RowClick;
 
-/// The largest brief read; past it the overlay shows the head and says so.
+/// The largest brief read; past it the page shows the head and says so.
 /// A safety net, not a fold: no brief comes near it.
 pub const BRIEF_MAX: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// Show a worker's transcript in the overlay; `live` follows it.
+    /// Show a worker's transcript on its page; `live` follows it.
     Watch {
         title: String,
         transcript: PathBuf,
@@ -68,13 +69,13 @@ pub enum Plan {
     },
     /// Run the feed's `open` command in a new tab titled `title`.
     Run { title: String, command: String },
-    /// Show text in the overlay.
+    /// Show text on the page.
     Show { title: String, body: Body },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    /// A brief on disk, read when the overlay opens, and shown as the
+    /// A brief on disk, read when the page opens, and shown as the
     /// worker's prompt.
     File(PathBuf),
     /// A Next up row with no brief: what it has (task, title, note) as the
@@ -86,7 +87,7 @@ pub enum Body {
     Text(String),
 }
 
-/// What the overlay offers besides reading.
+/// What a click on the row can open besides the page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Offer {
     Nothing,
@@ -96,7 +97,7 @@ pub enum Offer {
     },
 }
 
-/// The row's title for a tab or overlay: `acme#158 · name`, whichever exist.
+/// The row's title for a tab or page: `acme#158 · name`, whichever exist.
 pub fn title_of(click: &RowClick) -> String {
     match (click.key.is_empty(), click.name.is_empty()) {
         (false, false) if click.key != click.name => format!("{} · {}", click.key, click.name),
@@ -237,7 +238,7 @@ fn planned_without_brief(click: &RowClick) -> (String, String) {
     (parts.join("\n\n"), hint)
 }
 
-/// What the overlay for this click offers. A finished worker is no longer
+/// What this click can open in Claude Code. A finished worker is no longer
 /// in Claude Code's list, so there is nothing to open it in.
 pub fn offer(click: &RowClick) -> Offer {
     match (click.stage, agent_id(click)) {
@@ -250,7 +251,7 @@ pub fn offer(click: &RowClick) -> Offer {
 
 /// The conversation a Done row's `open` command resumes, if it does: a
 /// click on it goes to the tab running that conversation rather than
-/// showing the overlay.
+/// showing its page.
 pub fn done_resumes(click: &RowClick) -> Option<String> {
     if click.stage != Stage::Done {
         return None;
@@ -265,7 +266,7 @@ fn note_then(click: &RowClick, text: &str) -> String {
     }
 }
 
-/// Read a brief for the overlay: the file, capped, or a line saying why not.
+/// Read a brief for the page: the file, capped, or a line saying why not.
 pub fn read_brief(path: &Path) -> String {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() > BRIEF_MAX => {
@@ -696,7 +697,7 @@ pub enum Stuck {
 }
 
 impl Stuck {
-    /// What the overlay tells the user.
+    /// What the page tells the user.
     pub fn explain(&self, description: &str) -> String {
         match self {
             Stuck::NoPrompt => "This means typing into this tab's Claude Code, and its prompt \

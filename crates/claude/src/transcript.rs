@@ -26,7 +26,7 @@
 //! bookkeeping lines are left out, and so is the reply to a worker's
 //! `SubagentHandback`: its report is shown as what the worker said.
 //!
-//! Two views use it: the overlay a row of the management panel opens, which
+//! Two views use it: the worker page a row of the management panel opens, which
 //! keeps a prompt whole, and `giverny transcript [--follow]`, which folds it
 //! to watch in a terminal and adds each entry's clock.
 //!
@@ -103,7 +103,7 @@ impl Fold {
         prompt_lines: Some(PROMPT_LINES),
         result_lines: RESULT_LINES,
     };
-    /// Giverny's overlay: the task text whole, tool output
+    /// Giverny's worker page: the task text whole, tool output
     /// still folded — it is the noise, not the task.
     pub const OVERLAY: Fold = Fold {
         prompt_lines: None,
@@ -783,7 +783,7 @@ pub struct Update {
 }
 
 /// Reads a growing JSONL file a whole line at a time: the `tail -f` under
-/// both the follower tab and the overlay's live view.
+/// both the follower tab and the worker page's live view.
 #[derive(Debug, Default)]
 pub struct Tail {
     offset: u64,
@@ -921,7 +921,7 @@ mod tests {
 
     const PLAIN: Style = Style { color: false };
 
-    /// A transcript's lines rendered as the overlay lays them out, plain.
+    /// A transcript's lines rendered as the worker page lays them out, plain.
     fn view(lines: &[&str]) -> Vec<String> {
         let mut r = Render::new(Fold::OVERLAY);
         let mut rows: Vec<Row> = Vec::new();

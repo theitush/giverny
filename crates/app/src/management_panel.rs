@@ -1251,6 +1251,25 @@ impl RowClick {
     }
 }
 
+/// The worker a tab shows: in Claude Code's own view, by its id; on
+/// Giverny's page (`worker_page`), by its row (giverny#477), which a Next up
+/// row with no worker yet is known by.
+#[derive(Debug, Clone, Copy)]
+pub enum Shown<'a> {
+    Worker(&'a str),
+    Row(&'a RowClick),
+}
+
+impl Shown<'_> {
+    /// Whether `click` is the row of the worker shown.
+    pub fn is(&self, click: &RowClick) -> bool {
+        match self {
+            Shown::Worker(id) => click.agent_id.as_deref() == Some(*id),
+            Shown::Row(row) => row.same_row(click),
+        }
+    }
+}
+
 /// What a row click does: a click on the row the tab is
 /// already showing takes it back to the manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2922,8 +2941,8 @@ fn cut(s: &str, max: usize) -> String {
 ///
 /// `limit` is the usage limit the tab's account is out on ([`limit_for`]):
 /// while it is, the Running rows' clocks are held. `viewed` is the worker
-/// whose view the tab's Claude Code shows (its id): its row is lit as the
-/// selection. `header` names the worker the terminal's
+/// the tab shows, in Claude Code's view or on Giverny's page: its row is
+/// lit as the selection. `header` names the worker the terminal's
 /// header is about, whose row comes back with the click, as
 /// the pane drew it.
 #[allow(clippy::too_many_arguments)]
@@ -2932,8 +2951,8 @@ pub fn show(
     tab: TabId,
     reading: Option<&giverny_claude::use_reading::Reading>,
     tracker: Option<&Tracker>,
-    viewed: Option<&str>,
-    header: Option<&str>,
+    viewed: Option<Shown<'_>>,
+    header: Option<Shown<'_>>,
     limit: Option<Limit>,
     panel: &ManagementPanelConfig,
     chrome: &Chrome,
@@ -3047,13 +3066,7 @@ pub fn show(
     }
     let flash = view.flash.as_ref().zip(glow).map(|(f, g)| (&f.rows, g));
     // The first of a worker's rows: the one with no ditto in it.
-    let header_line = header.and_then(|id| {
-        table
-            .lines
-            .iter()
-            .find(|l| l.click.agent_id.as_deref() == Some(id))
-            .cloned()
-    });
+    let header_line = header.and_then(|h| table.lines.iter().find(|l| h.is(&l.click)).cloned());
     if table.any_running() {
         // ELAPSED is a stopwatch.
         ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -3695,7 +3708,7 @@ fn draw_table(
     id: egui::Id,
     table: &Table,
     shown: &PaneColumns,
-    viewed: Option<&str>,
+    viewed: Option<Shown<'_>>,
     flash: Option<(&HashSet<String>, f32)>,
     animate: bool,
     chrome: &Chrome,
@@ -3752,7 +3765,7 @@ fn draw_table(
         if let Some(line) = line {
             // The worker whose view the terminal above shows:
             // held lit, with a bar at its left edge, as a selection.
-            let on_view = viewed.is_some() && line.click.agent_id.as_deref() == viewed;
+            let on_view = viewed.is_some_and(|v| v.is(&line.click));
             if on_view {
                 p.rect_filled(rect, 2.0, color.gamma_multiply(VIEWED_TINT));
                 // In the pane's left margin, clear of the text.
