@@ -6285,7 +6285,9 @@ mod tests {
                 "paused_since":{p}}}
             ]}}"#,
             s = T0 - 60 * MIN,
-            p = T0 - 10 * MIN,
+            // Paused after its worker ended (T0 - 5m): one that stops
+            // during the pause stopped for it (giverny#486).
+            p = T0 - 2 * MIN,
         ));
         let (dir, rows, logs) = reused_worker("334-paused", &lines, false);
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
@@ -7880,7 +7882,9 @@ mod tests {
             let t = build_at(Some(&f), &rows, now, &utc(&[], None), &Logs::new());
             assert_eq!(t.lines[0].elapsed, "10:00", "{now}");
             assert_eq!(t.lines[0].eta, "~20m");
-            assert_eq!(t.lines[0].now, "paused since 14:13");
+            // Its worker still at work: only the clock is paused
+            // (giverny#486).
+            assert_eq!(t.lines[0].now, PAUSED_FINISHING);
         }
         // The writer paused it for a limit: its `started` already
         // leaves the wait out, so the pane's own hold must not take it off

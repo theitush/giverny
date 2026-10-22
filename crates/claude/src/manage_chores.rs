@@ -191,8 +191,12 @@ impl Chore {
             ),
             Kind::NowPaused => format!(
                 "Giverny: `{key}` is now really paused: its worker has stopped (ended its \
-                 turn {ago} ago). Read its report: `giverny-manage land {key}` if it is \
-                 done, else `giverny-manage resume {key}` when the work goes on."
+                 turn {} ago). Read its report: `giverny-manage land {key}` if it is \
+                 done, else `giverny-manage resume {key}` when the work goes on.",
+                match now.saturating_sub(self.since) / 1000 {
+                    s @ 0..60 => format!("{s}s"),
+                    _ => ago.clone(),
+                }
             ),
             Kind::Start => format!(
                 "Giverny: `{key}` has waited {ago} with a free lane: start it, or \
