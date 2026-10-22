@@ -1115,12 +1115,11 @@ pub struct TabRuntime {
     /// the picture is held, so the header over the terminal
     /// changes in the same frame as the view under it.
     shown_viewed: Option<String>,
-    /// The name the tab's status line gives while [`Self::shown_viewed`]
-    /// is a worker's view: that worker, as its pane row names it
-    /// (giverny#460), as last told to `giverny statusline`
-    /// ([`giverny_claude::hooks::set_viewing`]). Kept while the tab is in
-    /// the background, where the screen is not read.
-    viewing_name: Option<String>,
+    /// The worker the tab's status line is about while [`Self::shown_viewed`]
+    /// is a worker's view (giverny#460), as last told to `giverny
+    /// statusline` ([`giverny_claude::hooks::set_viewing`]). Kept while the
+    /// tab is in the background, where the screen is not read.
+    viewing_name: Option<giverny_claude::hooks::Viewing>,
     /// The worker view whose header was closed with its `×`; it stays
     /// closed until the tab leaves that view.
     header_closed: Option<String>,
@@ -6354,9 +6353,18 @@ impl eframe::App for App {
                 shown_row = line.clone();
                 header = line.filter(|_| !header_closed);
             }
-            let name = agent_open::viewed_name(
+            let shown_agent = shown_id.as_deref().and_then(|id| {
+                self.claude
+                    .agents
+                    .tracker(active)?
+                    .rows()
+                    .iter()
+                    .find(|r| r.id == id)
+            });
+            let name = agent_open::viewed(
                 shown_label.as_deref(),
                 shown_row.as_ref().map(|l| &l.click),
+                shown_agent,
             );
             if let Some(rt) = self.rt.get_mut(&active)
                 && rt.viewing_name != name
@@ -6364,11 +6372,8 @@ impl eframe::App for App {
                 // Told to the status line, which Claude Code reruns every
                 // second (`STATUSLINE_REFRESH_S`): it follows within one.
                 let spool = self.paths.hook_spool();
-                match giverny_claude::hooks::set_viewing(
-                    &spool,
-                    &tab_env_id(active),
-                    name.as_deref(),
-                ) {
+                match giverny_claude::hooks::set_viewing(&spool, &tab_env_id(active), name.as_ref())
+                {
                     Ok(()) => {
                         tracing::debug!("tab {active:?}: status line names {name:?}");
                         rt.viewing_name = name;
