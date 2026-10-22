@@ -5753,6 +5753,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// giverny#485, Amir Inbar's pane: worker `a3a7…` reported `970-r4` at
+    /// 14:12:13, was handed `970-r5` (`start 970-r5 --agent`) at 14:12:26,
+    /// messaged it at 14:12:46 and listed afresh from then, and wrote its
+    /// next turn only at 14:21:11. At every pass in between — a live list,
+    /// a refresh, a table, every five seconds — `970-r5` is Running, its
+    /// worker on it, and no "no worker" chore is due. The pane used to flip
+    /// it to Next up (`no worker yet`) and back on alternate passes.
+    #[test]
+    fn a_row_handed_to_a_woken_worker_stays_running() {
+        let ms = |hms: &str| {
+            format!("2026-10-22T{hms}Z")
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond() as u64
+        };
+        let id = "a3a763225618d8c13";
+        let config = std::env::temp_dir().join(format!("giverny-pane-485-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config.join("projects/-w/s/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let transcript = subs.join(format!("agent-{id}.jsonl"));
+        let turn = |at: u64| {
+            serde_json::json!({"type": "assistant", "timestamp": ts(at),
+                "message": {"id": format!("msg_{at}"), "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 2, "cache_read_input_tokens": 100_000,
+                        "output_tokens": 10},
+                    "content": [{"type": "tool_use", "name": "Bash",
+                        "input": {"command": "ls"}}]}})
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&transcript, turn(ms("14:12:13.106"))).unwrap();
+        std::fs::write(
+            subs.join(format!("agent-{id}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"970-r4: drop P&L caption, close 970"}"#,
+        )
+        .unwrap();
+        let notice = format!(
+            "<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n\
+             <summary>Agent finished</summary>\n</task-notification>"
+        );
+        std::fs::write(
+            config.join("projects/-w/s.jsonl"),
+            serde_json::json!({"type": "user", "timestamp": ts(ms("14:12:13.865")),
+                "message": {"role": "user", "content": notice}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        // The feed as the manager wrote it, in the shape of Amir's.
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"970-r4","stage":"done","agent_id":"{id}","started":{r4},"ended":{r5},
+                "eta_s":300,"landing":"Done","title":"CLEANUP: drop the P&L chart caption"}},
+              {{"key":"970-r5","stage":"running","agent_id":"{id}","started":{r5},
+                "planned":{planned},"eta_s":1443,
+                "lease":{{"id":"s:970-r5","state":"granted","ram_mb":1024,"granted_at":{r5}}},
+                "title":"FEATURE: Ofer/reference chips and a market-SD band"}}
+            ]}}"#,
+            r4 = ms("14:07:10"),
+            r5 = ms("14:12:26"),
+            planned = ms("14:09:01"),
+        ));
+        let snap = |status: &str, start: u64| {
+            LiveSnapshot::parse(&format!(
+                r#"{{"session_id":"s","tasks":[{{"id":"{id}","status":"{status}",
+                    "description":"970-r4: drop P&L caption, close 970",
+                    "startTime":{start},"tokenCount":107770}}]}}"#
+            ))
+        };
+        let mut tr = Tracker::new(Some(config.clone()));
+        tr.apply_live(&snap("completed", ms("14:07:15")), ms("14:12:15"));
+        tr.refresh();
+        let woken = ms("14:12:46.846");
+        let mut at = woken + 1_000;
+        while at < ms("14:21:11") {
+            tr.apply_live(&snap("running", woken), at);
+            tr.refresh();
+            let mut logs = Logs::new();
+            poll_logs(&mut logs, tr.rows());
+            let t = build_with(
+                Some(&f),
+                tr.rows(),
+                at,
+                &Clock::plain(),
+                &logs,
+                DoneRows::All,
+                Drawn::Manager,
+                &HashSet::new(),
+            );
+            let r5 = t.lines.iter().find(|l| l.id == "970-r5").unwrap();
+            assert_eq!(r5.stage, Stage::Running, "at {}: {r5:?}", ts(at));
+            assert_eq!(r5.click.agent_id.as_deref(), Some(id));
+            assert_ne!(r5.now, NO_WORKER_YET);
+            let due = chores(Drawn::Manager, Some(&f), tr.rows(), &logs, &NO_SHELLS, at);
+            assert_eq!(due, [], "at {}", ts(at));
+            at += 5_000;
+        }
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
     /// giverny#258, giverny#310: what the pane draws for a Running row that
     /// nothing runs. A row linked to a worker that has finished — here
     /// acme#615, which a hand-off message to `w` only mentioned — stays

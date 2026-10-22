@@ -242,9 +242,10 @@ SendMessage:
 giverny-manage start <next task> --agent <worker's agent id>
 ```
 
-That lands the worker's earlier task with its own measured time and starts
-the new one with its own clock; like `land`, it refuses while anything of the
-earlier task still runs. It refuses a worker over the limit too: spawn a fresh
+It is the only hand-off: a message alone gives the worker nothing in the
+panel, whatever it says. It lands the worker's earlier task with its own
+measured time and starts the new one with its own clock; like `land`, it
+refuses while anything of the earlier task still runs. It refuses a worker over the limit too: spawn a fresh
 worker then. Pass `--heavy-ok` only when the task truly needs what that
 worker has in its context and a brief cannot carry it.
 
