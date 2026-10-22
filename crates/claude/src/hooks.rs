@@ -892,9 +892,9 @@ pub fn run_statusline(spool: &Path) {
     // delivers it; a background job's says which job it is.
     let target = Target::of_this_process();
     // The worker whose view the tab shows, as the app tells it (giverny#460):
-    // only the tab's own claude's line names it, not one that inherited it.
+    // only the tab's own claude's line is about it, not one that inherited it.
     let viewing = match &target {
-        Some(Target::Tab(tab)) => viewing_name(spool, tab),
+        Some(Target::Tab(tab)) => viewing_of(spool, tab),
         _ => None,
     };
     let msg = match target {
@@ -915,7 +915,7 @@ pub fn run_statusline(spool: &Path) {
     deliver(&msg, spool);
 
     let now_ms = jiff::Timestamp::now().as_millisecond();
-    println!("{}", statusline_text(&payload, viewing.as_deref(), now_ms));
+    println!("{}", statusline_text(&payload, viewing.as_ref(), now_ms));
 }
 
 /// What Claude Code displays for the status line payload `payload` at
@@ -924,11 +924,14 @@ pub fn run_statusline(spool: &Path) {
 /// memory or GPU (giverny#384): the sidebar shows the usage, and its tab
 /// rows and category headers and the management panel's rows the use.
 ///
-/// `viewing` is the worker whose view the tab shows ([`viewing_name`],
-/// giverny#460): it takes the session's name's place while it is on screen.
-/// Claude Code builds the payload from the main session whatever view is
-/// shown, so nothing in `payload` says which one is.
-fn statusline_text(payload: &serde_json::Value, viewing: Option<&str>, now_ms: i64) -> String {
+/// `viewing` is the worker whose view the tab shows ([`viewing_of`],
+/// giverny#460): while it is on screen the whole line is that worker's
+/// ([`worker_statusline`]). Claude Code builds the payload from the main
+/// session whatever view is shown, so nothing in `payload` says which one is.
+fn statusline_text(payload: &serde_json::Value, viewing: Option<&Viewing>, now_ms: i64) -> String {
+    if let Some(viewing) = viewing {
+        return worker_statusline(payload, viewing, &crate::feed::feed_dir());
+    }
     let mut parts: Vec<String> = Vec::new();
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
     let transcript = transcript_of(payload);
@@ -937,11 +940,8 @@ fn statusline_text(payload: &serde_json::Value, viewing: Option<&str>, now_ms: i
         .and_then(|m| m.get("display_name"))
         .and_then(|d| d.as_str())
     {
-        let name = viewing.map(str::to_string).or_else(|| {
-            session_id.and_then(|s| {
-                crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref())
-            })
-        });
+        let name = session_id
+            .and_then(|s| crate::names::shown(&crate::feed::feed_dir(), s, transcript.as_deref()));
         parts.push(model_segment(model, name.as_deref(), || {
             accent_sgr(&statusline_accent_path())
         }));
@@ -949,6 +949,154 @@ fn statusline_text(payload: &serde_json::Value, viewing: Option<&str>, now_ms: i
     parts.extend(statusline_tokens(payload, transcript.as_deref()));
     parts.extend(cache_cold_segment(payload, transcript.as_deref(), now_ms));
     parts.join(crate::session_use::SEP)
+}
+
+/// The status line while a worker's view is on screen (giverny#460): only
+/// that worker, nothing of the whole session's.
+///
+/// * **Model:** the worker's, off its transcript's last reply
+///   ([`crate::tokens::last_model`]), named the way Claude Code names the
+///   main one (`Opus 5.5`, [`model_display`]); none until it has replied.
+/// * **Name:** its task name only ([`worker_name`]), in the accent, where
+///   the session's name stands on main.
+/// * **Tokens:** the same segments the main session gets
+///   ([`token_segments`]), counted off the worker's transcript alone:
+///   `session:` is the context it carries now, `(+<n>)` what it spent before
+///   its own compactions, `subagents:` the agents it spawned itself
+///   (giverny#464; their own spawns too), and `total:` those added.
+/// * **No cache-cold segment.** The main one is the manager's cache, and a
+///   worker on view is running, so its own cache is warm.
+fn worker_statusline(payload: &serde_json::Value, viewing: &Viewing, feeds: &Path) -> String {
+    let session_id = payload.get("session_id").and_then(|s| s.as_str());
+    let transcript = worker_transcript(viewing, transcript_of(payload).as_deref(), session_id);
+    let name = worker_name(viewing, feeds, session_id);
+    let model = transcript
+        .as_deref()
+        .and_then(crate::tokens::last_model)
+        .map(|m| model_display(&m));
+    let accent = || accent_sgr(&statusline_accent_path());
+    let mut parts = vec![match model {
+        Some(model) => model_segment(&model, Some(&name), accent),
+        None => format!("{}({name}){RESET}", accent()),
+    }];
+    if let Some(t) = transcript.as_deref() {
+        // `Null`: the payload's `context_window` is the manager's.
+        let spawned = worker_subagents(t);
+        parts.extend(token_segments(&serde_json::Value::Null, Some(t), &spawned));
+    }
+    parts.join(crate::session_use::SEP)
+}
+
+/// The transcripts of the agents the worker at `worker` (`agent-<id>.jsonl`)
+/// spawned, and theirs in turn: beside it, by their metas' `parentAgentId`.
+fn worker_subagents(worker: &Path) -> Vec<PathBuf> {
+    use crate::subagents::{agent_transcript, list_agent_ids, read_meta};
+    let (Some(dir), Some(id)) = (
+        worker.parent(),
+        worker
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("agent-")?.strip_suffix(".jsonl")),
+    ) else {
+        return Vec::new();
+    };
+    let parents: Vec<(String, Option<String>)> = list_agent_ids(dir)
+        .into_iter()
+        .map(|a| {
+            let parent = read_meta(dir, &a).parent_id;
+            (a, parent)
+        })
+        .collect();
+    let mut family = vec![id.to_string()];
+    let mut out = Vec::new();
+    loop {
+        let before = family.len();
+        for (a, parent) in &parents {
+            if !family.contains(a) && parent.as_ref().is_some_and(|p| family.contains(p)) {
+                family.push(a.clone());
+                out.push(agent_transcript(dir, a));
+            }
+        }
+        if family.len() == before {
+            return out;
+        }
+    }
+}
+
+/// The worker's `agent-<id>.jsonl`: the one the app named, else its agent
+/// id's in any `subagents/` dir of the session.
+fn worker_transcript(
+    viewing: &Viewing,
+    main: Option<&Path>,
+    session_id: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(t) = viewing.transcript.as_ref().filter(|t| t.is_file()) {
+        return Some(t.clone());
+    }
+    let id = viewing.agent_id.as_deref()?;
+    crate::tokens::session_subagent_dirs(main, config_dir().as_deref(), session_id)
+        .iter()
+        .map(|dir| crate::subagents::agent_transcript(dir, id))
+        .find(|p| p.is_file())
+}
+
+/// The worker's task name (`g477`), never its description: the one the app
+/// knew from the management panel's row, else the manager's feed row its
+/// agent id holds (a Running one first: a reused worker holds several),
+/// else the head of a view label shaped `g477: what it does`, else `worker`.
+fn worker_name(viewing: &Viewing, feeds: &Path, session_id: Option<&str>) -> String {
+    let from_feed = || {
+        let id = viewing.agent_id.as_deref()?;
+        let (_, feed) = crate::feed::find(feeds, session_id?)?;
+        let held: Vec<_> = feed
+            .rows
+            .iter()
+            .filter(|r| r.agent_id.as_deref() == Some(id))
+            // The `agent-<id>` key a worker with no task started its own
+            // row under names nothing.
+            .filter(|r| !(r.follows_worker && r.key.starts_with("agent-")))
+            .collect();
+        held.iter()
+            .rfind(|r| r.stage() == crate::feed::Stage::Running)
+            .or(held.last())
+            .map(|r| r.key.clone())
+    };
+    viewing
+        .task
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(from_feed)
+        .or_else(|| viewing.label.as_deref().and_then(task_of_label))
+        .unwrap_or_else(|| "worker".to_string())
+}
+
+/// The task name a label opens with: `g477` of `g477: one look`, or a label
+/// that is one short word itself. Not a description.
+fn task_of_label(label: &str) -> Option<String> {
+    let head = label.split_once(':').map_or(label, |(h, _)| h).trim();
+    (!head.is_empty() && head.chars().count() <= 24 && !head.contains(char::is_whitespace))
+        .then(|| head.to_string())
+}
+
+/// A model id as Claude Code names it on the status line: `claude-opus-5-5`
+/// → `Opus 5.5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`. An id of no
+/// known family is shown as it is.
+fn model_display(id: &str) -> String {
+    let base = id.split('[').next().unwrap_or(id).trim();
+    let mut parts = base.strip_prefix("claude-").unwrap_or(base).split('-');
+    let family = parts.next().unwrap_or_default();
+    if !["opus", "sonnet", "haiku", "fable"].contains(&family) {
+        return id.to_string();
+    }
+    let version: Vec<&str> = parts
+        .take_while(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let mut name = family[..1].to_ascii_uppercase() + &family[1..];
+    if !version.is_empty() {
+        name += " ";
+        name += &version.join(".");
+    }
+    name
 }
 
 /// Red `cache cold · next msg <n>` once the main conversation's prompt cache
@@ -1001,10 +1149,32 @@ fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> Strin
     }
 }
 
+/// What the app tells a tab's status line about the worker whose view its
+/// Claude Code shows (giverny#460), as JSON in [`viewing_flag`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewing {
+    /// Its task name, the management-panel row's key (`g477`), when the
+    /// pane has a row for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Its Claude Code agent id: finds its transcript, and its feed row
+    /// when `task` is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Its `agent-<id>.jsonl`, when the app knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<PathBuf>,
+    /// The agent's own name, else the label Claude Code puts on the view
+    /// (the Agent call's description): only its `g477:` head is ever shown
+    /// ([`task_of_label`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// The file the app leaves for tab `tab_id`'s status line while that tab's
-/// Claude Code shows a worker's view (giverny#460): the worker's name, as its
-/// management-panel row names it. Beside the spool, one per tab, like
-/// [`strip_flag`]; none while the tab is on the manager's own view.
+/// Claude Code shows a worker's view (giverny#460): a [`Viewing`]. Beside
+/// the spool, one per tab, like [`strip_flag`]; none while the tab is on the
+/// manager's own view.
 pub fn viewing_flag(spool: &Path, tab_id: &str) -> PathBuf {
     viewing_dir(spool).join(tab_id)
 }
@@ -1014,18 +1184,18 @@ fn viewing_dir(spool: &Path) -> PathBuf {
 }
 
 /// Tell tab `tab_id`'s status line which worker's view is on screen
-/// (`Some(name)`), or that the manager's own is again (`None`). Claude Code
+/// (`Some`), or that the manager's own is again (`None`). Claude Code
 /// reruns the status line every [`STATUSLINE_REFRESH_S`] seconds, so the
 /// line follows within one.
-pub fn set_viewing(spool: &Path, tab_id: &str, name: Option<&str>) -> std::io::Result<()> {
+pub fn set_viewing(spool: &Path, tab_id: &str, viewing: Option<&Viewing>) -> std::io::Result<()> {
     let flag = viewing_flag(spool, tab_id);
-    match name {
-        Some(name) => {
+    match viewing {
+        Some(viewing) => {
             if let Some(dir) = flag.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let tmp = flag.with_extension(format!("{}.tmp", std::process::id()));
-            std::fs::write(&tmp, name)?;
+            std::fs::write(&tmp, serde_json::to_vec(viewing)?)?;
             std::fs::rename(&tmp, &flag)
         }
         None => match std::fs::remove_file(&flag) {
@@ -1042,11 +1212,19 @@ pub fn clear_viewing(spool: &Path) {
 }
 
 /// The worker whose view tab `tab_id` shows, as the app last told it
-/// ([`set_viewing`]); `None` on the manager's own view.
-pub fn viewing_name(spool: &Path, tab_id: &str) -> Option<String> {
-    let name = std::fs::read_to_string(viewing_flag(spool, tab_id)).ok()?;
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_string())
+/// ([`set_viewing`]); `None` on the manager's own view. A flag from a
+/// Giverny before the [`Viewing`] JSON held the name alone: it is read as
+/// the label.
+pub fn viewing_of(spool: &Path, tab_id: &str) -> Option<Viewing> {
+    let text = std::fs::read_to_string(viewing_flag(spool, tab_id)).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(serde_json::from_str(text).unwrap_or_else(|_| Viewing {
+        label: Some(text.to_string()),
+        ..Viewing::default()
+    }))
 }
 
 /// Where the app leaves its chrome's accent colour for the status line: beside
@@ -1089,17 +1267,27 @@ fn statusline_tokens(payload: &serde_json::Value, transcript: Option<&Path>) -> 
     use crate::tokens;
     let session_id = payload.get("session_id").and_then(|s| s.as_str());
     let dirs = tokens::session_subagent_dirs(transcript, config_dir().as_deref(), session_id);
+    token_segments(payload, transcript, &tokens::subagent_transcripts(&dirs))
+}
+
+/// The token segments of one conversation ([`crate::tokens::segments`]):
+/// its own count off `payload` or `transcript`, what it spent before its
+/// compactions, and the `subagents` transcripts beside it. The main
+/// session's line and a worker's ([`worker_statusline`]) both draw them.
+fn token_segments(
+    payload: &serde_json::Value,
+    transcript: Option<&Path>,
+    subagents: &[PathBuf],
+) -> Vec<String> {
+    use crate::tokens;
     let session = tokens::session_tokens(payload, transcript);
     // What the session spent before its compactions: `(+<n>)` beside its own
     // count, and in the total.
     let compacted = transcript.map_or(0, |t| {
         tokens::compacted_tokens_cached(t, tokens::compact_cache_dir().as_deref())
     });
-    let (_, subagents, total) = tokens::session_subagents_total(
-        session.map(|s| s.tokens),
-        compacted,
-        &tokens::subagent_transcripts(&dirs),
-    );
+    let (_, subagents, total) =
+        tokens::session_subagents_total(session.map(|s| s.tokens), compacted, subagents);
     tokens::segments(session, compacted, subagents, total)
 }
 
@@ -2710,41 +2898,285 @@ mod tests {
     }
 
     /// While a tab's Claude Code shows a worker's view, the app tells that
-    /// tab's status line the worker's name, and the line gives it in the
-    /// session's name's place; back on main, the manager's again
+    /// tab's status line which worker it is; back on main, the file goes
     /// (giverny#460). Another tab's line is not told.
     #[test]
-    fn the_status_line_names_the_worker_whose_view_is_on_screen() {
+    fn the_app_tells_a_tabs_status_line_which_worker_is_on_view() {
         let spool = scratch("viewing").with_file_name("hooks.spool");
-        assert_eq!(viewing_name(&spool, "giverny-3"), None);
-        set_viewing(&spool, "giverny-3", Some("giverny#460 · g460-r1")).unwrap();
-        assert_eq!(
-            viewing_name(&spool, "giverny-3").as_deref(),
-            Some("giverny#460 · g460-r1")
-        );
-        assert_eq!(viewing_name(&spool, "giverny-4"), None);
+        assert_eq!(viewing_of(&spool, "giverny-3"), None);
+        let g477 = Viewing {
+            task: Some("g477".into()),
+            agent_id: Some("a8f8fcb8eb1e2cdba".into()),
+            transcript: None,
+            label: Some("g477: one look".into()),
+        };
+        set_viewing(&spool, "giverny-3", Some(&g477)).unwrap();
+        assert_eq!(viewing_of(&spool, "giverny-3"), Some(g477));
+        assert_eq!(viewing_of(&spool, "giverny-4"), None);
         // A second worker's view replaces the first's.
-        set_viewing(&spool, "giverny-3", Some("giverny#461 · other")).unwrap();
+        let other = Viewing {
+            agent_id: Some("a0bb7ba709a16fdba".into()),
+            ..Viewing::default()
+        };
+        set_viewing(&spool, "giverny-3", Some(&other)).unwrap();
+        assert_eq!(viewing_of(&spool, "giverny-3"), Some(other));
+        // A flag an older Giverny wrote (the name alone) still reads.
+        std::fs::write(viewing_flag(&spool, "giverny-6"), "g460-r1\n").unwrap();
         assert_eq!(
-            viewing_name(&spool, "giverny-3").as_deref(),
-            Some("giverny#461 · other")
+            viewing_of(&spool, "giverny-6").and_then(|v| v.label),
+            Some("g460-r1".into())
         );
-        let payload = serde_json::json!({
-            "model": {"display_name": "Opus 5.5"},
-            "transcript_path": "",
-        });
-        let line = statusline_text(&payload, Some("giverny#461 · other"), 0);
-        assert!(
-            line.starts_with("Opus 5.5 \x1b[") && line.contains("(giverny#461 · other)\x1b[0m"),
-            "{line:?}"
-        );
-        // Back on main: the file goes, and so does the worker's name.
+        // Back on main: the file goes.
         set_viewing(&spool, "giverny-3", None).unwrap();
         set_viewing(&spool, "giverny-3", None).unwrap();
-        assert_eq!(viewing_name(&spool, "giverny-3"), None);
+        assert_eq!(viewing_of(&spool, "giverny-3"), None);
         // An app starting over forgets every tab's.
-        set_viewing(&spool, "giverny-5", Some("w")).unwrap();
+        set_viewing(&spool, "giverny-5", Some(&Viewing::default())).unwrap();
         clear_viewing(&spool);
-        assert_eq!(viewing_name(&spool, "giverny-5"), None);
+        assert_eq!(viewing_of(&spool, "giverny-5"), None);
+    }
+
+    /// A worker's transcript line as Claude Code 2.1.308 writes it: a
+    /// sidechain assistant reply with its `agentId`, model and usage.
+    fn worker_reply(model: &str, read: u64, created: u64, out: u64) -> String {
+        serde_json::json!({
+            "parentUuid": "6e6604a3", "isSidechain": true, "agentId": "a8f8fcb8eb1e2cdba",
+            "requestedModel": model, "attributionAgent": "general-purpose",
+            "type": "assistant", "uuid": "46b672a9", "timestamp": "2026-10-22T13:14:18.256Z",
+            "sessionId": "3d545765", "version": "2.1.308",
+            "message": {"model": model, "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {}}],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": created,
+                    "cache_read_input_tokens": read, "output_tokens": out,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                        "ephemeral_5m_input_tokens": created},
+                    "iterations": [{"input_tokens": 2, "output_tokens": out,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": created, "type": "message"}]}}
+        })
+        .to_string()
+    }
+
+    /// The manager's session on disk: its transcript, one worker's beside it,
+    /// and the manager's feed with that worker's row.
+    fn manager_on_disk(name: &str, worker_lines: &[String]) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch(name).with_file_name("");
+        let main = dir.join("3d545765.jsonl");
+        // The manager: a big context on Opus, and a subagent's tokens on top.
+        std::fs::write(
+            &main,
+            serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5",
+                "usage": {"input_tokens": 1, "cache_read_input_tokens": 300_000}}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let subagents = dir.join("3d545765").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let worker = subagents.join("agent-a8f8fcb8eb1e2cdba.jsonl");
+        std::fs::write(&worker, worker_lines.join("\n") + "\n").unwrap();
+        let feeds = dir.join("feeds");
+        std::fs::create_dir_all(&feeds).unwrap();
+        std::fs::write(
+            feeds.join("3d545765.json"),
+            serde_json::json!({"version": 1, "session": "3d545765", "rows": [
+                {"key": "g470", "stage": "done", "agent_id": "a8f8fcb8eb1e2cdba"},
+                {"key": "g477", "stage": "running", "agent_id": "a8f8fcb8eb1e2cdba",
+                 "title": "FEATURE: one look"},
+                {"key": "g480", "stage": "running", "agent_id": "a0bb7ba709a16fdba"}]})
+            .to_string(),
+        )
+        .unwrap();
+        (main, worker, feeds)
+    }
+
+    /// The manager's payload as Claude Code builds it whatever view is shown.
+    fn manager_payload(main: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "3d545765",
+            "transcript_path": main,
+            "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+            "context_window": {"total_input_tokens": 300_001},
+            "prompt_cache": {"caching_observed": true, "warm": false,
+                "recache_tokens_if_cold": 300_001},
+        })
+    }
+
+    /// While a worker's view is on screen the whole line is that worker's
+    /// (giverny#460): its model off its transcript, its task name only, its
+    /// own context; nothing of the manager's — not the manager's model,
+    /// name, tokens, subagents or cold cache.
+    #[test]
+    fn a_workers_view_gets_a_status_line_of_its_own() {
+        let (main, worker, feeds) = manager_on_disk(
+            "worker-line",
+            &[
+                serde_json::json!({"type": "user", "isSidechain": true,
+                    "message": {"role": "user", "content": "go"}})
+                .to_string(),
+                worker_reply("claude-haiku-4-5-20251001", 40_000, 2_000, 500),
+                worker_reply("claude-haiku-4-5-20251001", 44_000, 1_200, 300),
+            ],
+        );
+        let payload = manager_payload(&main);
+        let viewing = Viewing {
+            task: Some("g477".into()),
+            agent_id: Some("a8f8fcb8eb1e2cdba".into()),
+            transcript: Some(worker.clone()),
+            label: Some("g477: a worker's overlay looks like Claude Code's".into()),
+        };
+        let line = worker_statusline(&payload, &viewing, &feeds);
+        let plain = strip_sgr(&line);
+        assert_eq!(plain, "Haiku 4.5 (g477)  ·  session: 45.2k", "{line:?}");
+        // The manager's line, by contrast.
+        let main_line = strip_sgr(&statusline_text(&payload, None, 0));
+        assert!(main_line.starts_with("Opus 5.5"), "{main_line}");
+        assert!(main_line.contains("session: 300k"), "{main_line}");
+        assert!(main_line.contains("cache cold"), "{main_line}");
+
+        // The app knew only its agent id: the transcript is found beside the
+        // manager's, and the name in the manager's feed (its Running row).
+        let by_id = Viewing {
+            agent_id: Some("a8f8fcb8eb1e2cdba".into()),
+            label: Some("g477: a worker's overlay looks like Claude Code's".into()),
+            ..Viewing::default()
+        };
+        assert_eq!(
+            strip_sgr(&worker_statusline(&payload, &by_id, &feeds)),
+            "Haiku 4.5 (g477)  ·  session: 45.2k"
+        );
+        // No feed row either: the label's task head, never the description.
+        let empty = feeds.with_file_name("no-feeds");
+        assert_eq!(
+            strip_sgr(&worker_statusline(&payload, &by_id, &empty)),
+            "Haiku 4.5 (g477)  ·  session: 45.2k"
+        );
+        let unnamed = Viewing {
+            label: Some("Explore the codebase".into()),
+            ..by_id.clone()
+        };
+        assert_eq!(
+            strip_sgr(&worker_statusline(&payload, &unnamed, &empty)),
+            "Haiku 4.5 (worker)  ·  session: 45.2k"
+        );
+
+        // An agent the worker spawned counts as its subagent (giverny#464);
+        // the manager's other worker does not.
+        let dir = worker.parent().unwrap();
+        for (id, parent, read) in [
+            ("ac1", Some("a8f8fcb8eb1e2cdba"), 10_000),
+            ("ac2", Some("ac1"), 5_000),
+            ("a0bb7ba709a16fdba", None, 90_000),
+        ] {
+            std::fs::write(
+                dir.join(format!("agent-{id}.jsonl")),
+                worker_reply("claude-haiku-4-5-20251001", read, 0, 1) + "\n",
+            )
+            .unwrap();
+            let meta = match parent {
+                Some(p) => serde_json::json!({"agentType": "general-purpose",
+                    "description": "sub", "parentAgentId": p, "spawnDepth": 2}),
+                None => serde_json::json!({"agentType": "general-purpose",
+                    "description": "g480: other", "spawnDepth": 1}),
+            };
+            std::fs::write(dir.join(format!("agent-{id}.meta.json")), meta.to_string()).unwrap();
+        }
+        assert_eq!(
+            strip_sgr(&worker_statusline(&payload, &viewing, &feeds)),
+            "Haiku 4.5 (g477)  ·  session: 45.2k  ·  subagents: 15k  ·  total: 60.2k"
+        );
+    }
+
+    /// A worker that has not replied yet has no model or tokens to show;
+    /// the line names it and borrows nothing from the manager's.
+    #[test]
+    fn a_worker_before_its_first_reply_shows_only_its_name() {
+        let (main, worker, feeds) = manager_on_disk(
+            "worker-fresh",
+            &[serde_json::json!({"type": "user", "isSidechain": true,
+                "message": {"role": "user", "content": "go"}})
+            .to_string()],
+        );
+        let viewing = Viewing {
+            task: Some("g477".into()),
+            transcript: Some(worker),
+            ..Viewing::default()
+        };
+        let line = worker_statusline(&manager_payload(&main), &viewing, &feeds);
+        assert_eq!(strip_sgr(&line), "(g477)", "{line:?}");
+    }
+
+    /// A worker that compacted shows what it spent before, as the main
+    /// session's line does: `(+<n>)` and `total:`.
+    #[test]
+    fn a_compacted_worker_counts_what_it_spent_before() {
+        let boundary = serde_json::json!({"type": "system", "subtype": "compact_boundary",
+            "isSidechain": true, "timestamp": "2026-10-22T13:20:00Z",
+            "compactMetadata": {"trigger": "auto", "preTokens": 150_000, "postTokens": 9_000}})
+        .to_string();
+        let (main, worker, feeds) = manager_on_disk(
+            "worker-compact",
+            &[
+                worker_reply("claude-opus-5-5", 148_000, 2_000, 900),
+                boundary,
+                worker_reply("claude-opus-5-5", 20_000, 1_000, 100),
+            ],
+        );
+        let viewing = Viewing {
+            task: Some("g477".into()),
+            transcript: Some(worker),
+            ..Viewing::default()
+        };
+        let line = strip_sgr(&worker_statusline(
+            &manager_payload(&main),
+            &viewing,
+            &feeds,
+        ));
+        assert!(
+            line.starts_with("Opus 5.5 (g477)  ·  session: 21k (+"),
+            "{line}"
+        );
+        assert!(line.contains("total: "), "{line}");
+        assert!(!line.contains("subagents"), "{line}");
+    }
+
+    #[test]
+    fn model_ids_are_named_as_claude_code_names_them() {
+        assert_eq!(model_display("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_display("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(model_display("claude-sonnet-4-6[1m]"), "Sonnet 4.6");
+        assert_eq!(model_display("claude-fable-1"), "Fable 1");
+        assert_eq!(
+            model_display("claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(model_display("gpt-5"), "gpt-5");
+    }
+
+    #[test]
+    fn a_label_gives_its_task_head_and_never_a_description() {
+        assert_eq!(task_of_label("g477: one look").as_deref(), Some("g477"));
+        assert_eq!(task_of_label("g460-r2").as_deref(), Some("g460-r2"));
+        assert_eq!(task_of_label("Explore the codebase"), None);
+        assert_eq!(task_of_label("fix the rail: now"), None);
+        assert_eq!(task_of_label(": x"), None);
+    }
+
+    /// The line without its colours.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }
