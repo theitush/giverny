@@ -278,6 +278,7 @@ impl WorkerPage {
             Some(input) => {
                 out.extend(input_box(cols, &self.name, input));
                 out.extend(status_lines(input, cols));
+                out.push(String::new());
             }
             None => {
                 out.extend(prompt_box(cols, &self.name));
@@ -589,7 +590,7 @@ fn input_box(cols: usize, name: &str, input: &Input) -> Vec<String> {
 /// wrapped to the grid.
 fn status_lines(input: &Input, cols: usize) -> Vec<String> {
     let (color, text) = match &input.state {
-        Sending::Idle | Sending::Going => return vec![String::new()],
+        Sending::Idle | Sending::Going => return Vec::new(),
         Sending::Sent(what) => (DIM, what),
         Sending::Refused(why) => ("\x1b[38;2;220;90;90m", why),
     };
