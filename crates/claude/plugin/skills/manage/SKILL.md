@@ -186,11 +186,13 @@ When you spawn one:
     the project keeps it, and end its turn with a short report;
   - stop your own background commands for that task (a `claim --wait`, a
     build you ran);
-  - tell the user it has paused only once the reports are in and `pause`
-    names nothing still running. `pause` lists the task's `run` commands and
-    its worker's background shells still going, each with the command that
-    stops it (`kill <pid>`, `TaskStop <shell id>`); Giverny stops nothing
-    itself, so stopping or keeping each is your call.
+  - tell the user it has paused only once it really has. `pause` says
+    `nothing of <task> runs` when it has; any other answer (`paused <task>'s
+    clock; its worker … is still working`, a `run` command or background
+    shell still going, each with the command that stops it) means it has
+    not, however the row reads. Giverny then tells you `<task> is now really
+    paused` when the worker stops, and once every task you paused has. Giverny
+    stops nothing itself, so stopping or keeping each is your call.
 - **A progress check** reaches you, once per event, when a worker's figure
   runs out or it asks for much more time. It names what the worker is doing
   and its transcript. Read its recent work there, judge

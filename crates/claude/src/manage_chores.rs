@@ -7,7 +7,10 @@
 //! or during the pause (giverny#379); a Next up row that has sat with
 //! **nothing recorded to wait on** (no hold, no queued lease, no task before
 //! it); and a Running row with **no worker** at all, that its manager has
-//! not paused (giverny#334). The panel draws each as an ordinary row (the
+//! not paused (giverny#334). A paused row whose worker was still working
+//! and has ended its turn since is a fifth (giverny#486): the task is now
+//! really paused, told at once, with whether every task paused has
+//! stopped. The panel draws each as an ordinary row (the
 //! paused one under Next up, `paused · worker finished`; the last there
 //! too, `no worker yet`); the manager session that owns them hears of each
 //! once, as one line on its next tool call.
@@ -78,6 +81,13 @@ pub enum Kind {
     /// row told of it Running and then paused is not told again.
     #[serde(rename = "land_paused")]
     LandPaused,
+    /// Its row was paused while its worker still worked, and the worker has
+    /// ended its turn since (giverny#486): the task is now really paused.
+    /// Told at once, not after [`LAND_GRACE_MS`]: the manager waits on
+    /// this to tell the user it has paused. Stamped on [`Kind::Land`]'s
+    /// field, the same finish.
+    #[serde(rename = "now_paused")]
+    NowPaused,
     /// It waits on nothing recorded: start it, or hold it with a reason.
     Start,
     /// It is Running with no worker: spawn or hand it one, or pause or drop
@@ -89,7 +99,7 @@ impl Kind {
     /// The row field delivering it stamps.
     fn field(self) -> &'static str {
         match self {
-            Kind::Land | Kind::LandPaused => "land_nudged",
+            Kind::Land | Kind::LandPaused | Kind::NowPaused => "land_nudged",
             Kind::Start => "start_nudged",
             Kind::Worker => "worker_nudged",
         }
@@ -103,7 +113,9 @@ impl Kind {
     /// Running.
     fn stands_in(self, stage: Option<Stage>) -> bool {
         match self {
-            Kind::Land | Kind::LandPaused => matches!(stage, Some(Stage::Running | Stage::Planned)),
+            Kind::Land | Kind::LandPaused | Kind::NowPaused => {
+                matches!(stage, Some(Stage::Running | Stage::Planned))
+            }
             Kind::Start => stage == Some(Stage::Planned),
             Kind::Worker => stage == Some(Stage::Running),
         }
@@ -112,6 +124,7 @@ impl Kind {
     fn threshold_ms(self) -> u64 {
         match self {
             Kind::Land | Kind::LandPaused => LAND_GRACE_MS,
+            Kind::NowPaused => 0,
             Kind::Start => IDLE_PLANNED_MS,
             Kind::Worker => feed::HANDOFF_WINDOW_MS,
         }
@@ -146,7 +159,7 @@ impl Chore {
     /// The manager has been told of it already: `row` carries its stamp.
     pub fn told(&self, row: &FeedRow) -> bool {
         let stamp = match self.kind {
-            Kind::Land | Kind::LandPaused => row.land_nudged_ms,
+            Kind::Land | Kind::LandPaused | Kind::NowPaused => row.land_nudged_ms,
             Kind::Start => row.start_nudged_ms,
             Kind::Worker => row.worker_nudged_ms,
         };
@@ -175,6 +188,11 @@ impl Chore {
                 "Giverny: `{key}`'s worker finished {ago} ago and its row is paused: \
                  check its report and `giverny-manage land {key}`, or \
                  `giverny-manage resume {key}`."
+            ),
+            Kind::NowPaused => format!(
+                "Giverny: `{key}` is now really paused: its worker has stopped (ended its \
+                 turn {ago} ago). Read its report: `giverny-manage land {key}` if it is \
+                 done, else `giverny-manage resume {key}` when the work goes on."
             ),
             Kind::Start => format!(
                 "Giverny: `{key}` has waited {ago} with a free lane: start it, or \
@@ -205,28 +223,56 @@ fn safe(session: &str) -> bool {
 }
 
 fn read(path: &Path) -> Vec<Chore> {
-    std::fs::read(path)
+    read_all(path).0
+}
+
+/// The chores kept, and the paused rows whose workers were still finishing
+/// when they were worked out (giverny#486).
+fn read_all(path: &Path) -> (Vec<Chore>, Vec<String>) {
+    let v = std::fs::read(path)
         .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.get("chores").cloned())
-        .and_then(|c| serde_json::from_value(c).ok())
-        .unwrap_or_default()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let field = |k: &str| v.as_ref().and_then(|v| v.get(k)).cloned();
+    (
+        field("chores")
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default(),
+        field("finishing")
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default(),
+    )
 }
 
 /// Write `chores` (or remove the file when there are none), under its lock.
-fn write(path: &Path, chores: &[Chore]) -> std::io::Result<()> {
+fn write(path: &Path, chores: &[Chore], finishing: &[String]) -> std::io::Result<()> {
     if chores.is_empty() {
         return match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
     }
-    manage::write(path, &json!({ "chores": chores }))
+    if finishing.is_empty() {
+        return manage::write(path, &json!({ "chores": chores }));
+    }
+    manage::write(path, &json!({ "chores": chores, "finishing": finishing }))
 }
 
 /// The app's side: keep `chores` — the ones due and not yet told — as what
 /// `session`'s manager is to hear. No file when there are none.
 pub fn publish(feed_dir: &Path, session: &str, chores: &[Chore]) -> Result<(), String> {
+    publish_with(feed_dir, session, chores, &[])
+}
+
+/// [`publish`], with the keys of the paused rows whose workers are still
+/// finishing their turns (`finishing`): what lets a [`Kind::NowPaused`]
+/// line say whether every task the manager paused has stopped
+/// (giverny#486).
+pub fn publish_with(
+    feed_dir: &Path,
+    session: &str,
+    chores: &[Chore],
+    finishing: &[String],
+) -> Result<(), String> {
     if !safe(session) {
         return Err(format!("{session:?} is no session id"));
     }
@@ -238,7 +284,7 @@ pub fn publish(feed_dir: &Path, session: &str, chores: &[Chore]) -> Result<(), S
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     let _lock = Lock::take(&path)?;
-    write(&path, chores).map_err(|e| format!("{}: {e}", path.display()))
+    write(&path, chores, finishing).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The hook's side, on a dispatcher's own call: `session`'s due chores
@@ -258,20 +304,28 @@ pub fn deliver(feed_dir: &Path, session: &str, now: u64) -> Option<String> {
     let path = path(feed_dir, session);
     std::fs::metadata(&path).ok()?;
     let _lock = Lock::take(&path).ok()?;
-    let chores = read(&path);
+    let (chores, finishing) = read_all(&path);
     let (due, later): (Vec<Chore>, Vec<Chore>) = chores.into_iter().partition(|c| c.is_due(now));
     let lines = if due.is_empty() {
         Vec::new()
     } else {
-        stamp(feed_dir, session, &due, now)
+        stamp(feed_dir, session, &due, &finishing, now)
     };
-    let _ = write(&path, &later);
+    let _ = write(&path, &later, &finishing);
     (!lines.is_empty()).then(|| lines.join("\n\n"))
 }
 
 /// Stamp each of `due` that still stands on its row in `session`'s file, and
-/// say it.
-fn stamp(feed_dir: &Path, session: &str, due: &[Chore], now: u64) -> Vec<String> {
+/// say it. A task now really paused ([`Kind::NowPaused`]) is followed by
+/// whether every task the manager paused has stopped, from `finishing`
+/// (giverny#486).
+fn stamp(
+    feed_dir: &Path,
+    session: &str,
+    due: &[Chore],
+    finishing: &[String],
+    now: u64,
+) -> Vec<String> {
     let file = manage::file_for(feed_dir, session);
     let Ok(_lock) = Lock::take(&file) else {
         return Vec::new();
@@ -287,6 +341,7 @@ fn stamp(feed_dir: &Path, session: &str, due: &[Chore], now: u64) -> Vec<String>
         return Vec::new();
     };
     let mut lines = Vec::new();
+    let mut stopped: Vec<String> = Vec::new();
     for c in due {
         let row = rows.iter_mut().filter_map(Value::as_object_mut).find(|r| {
             r.get("key").and_then(Value::as_str) == Some(c.key.as_str())
@@ -303,16 +358,70 @@ fn stamp(feed_dir: &Path, session: &str, due: &[Chore], now: u64) -> Vec<String>
         {
             continue; // set aside now
         }
-        if c.kind == Kind::LandPaused && !row.contains_key("paused_since") {
+        if matches!(c.kind, Kind::LandPaused | Kind::NowPaused) && !row.contains_key("paused_since")
+        {
             continue; // resumed: the Running row's land chore says it
         }
         row.insert(c.kind.field().into(), json!(c.since));
         lines.push(c.line(now));
+        if c.kind == Kind::NowPaused {
+            stopped.push(c.key.clone());
+        }
+    }
+    if !stopped.is_empty() {
+        lines.push(all_stopped(rows, &stopped, finishing));
     }
     if !lines.is_empty() && manage::write(&file, &doc).is_err() {
         return Vec::new();
     }
     lines
+}
+
+/// The line after a task is now really paused (giverny#486): which paused
+/// tasks still have a worker finishing (`finishing`, less those just told
+/// of and those no longer paused in `rows`), or that every task paused has
+/// stopped, for the manager to pass on.
+fn all_stopped(rows: &[Value], stopped: &[String], finishing: &[String]) -> String {
+    let paused = |k: &str| {
+        rows.iter().filter_map(Value::as_object).any(|r| {
+            r.get("key").and_then(Value::as_str) == Some(k)
+                && r.contains_key("paused_since")
+                && manage::stage_of(r) == Some(Stage::Running)
+        })
+    };
+    let left: Vec<&str> = finishing
+        .iter()
+        .map(String::as_str)
+        .filter(|k| !stopped.iter().any(|s| s == k) && paused(k))
+        .collect();
+    let tick = |ks: &[&str]| {
+        ks.iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !left.is_empty() {
+        let (verb, it) = if left.len() == 1 {
+            ("has", "it is")
+        } else {
+            ("have", "they are")
+        };
+        return format!(
+            "Giverny: {} still {verb} a worker finishing, so {it} not paused yet.",
+            tick(&left)
+        );
+    }
+    let all: Vec<&str> = rows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|r| r.contains_key("paused_since") && manage::stage_of(r) == Some(Stage::Running))
+        .filter_map(|r| r.get("key").and_then(Value::as_str))
+        .collect();
+    let it = if all.len() == 1 { "it is" } else { "they are" };
+    format!(
+        "Giverny: every task you paused has stopped ({}): you can tell the user {it} paused.",
+        tick(&all)
+    )
 }
 
 #[cfg(test)]
@@ -544,6 +653,83 @@ mod tests {
                 .unwrap()
                 .contains("`b`'s worker finished 5m ago: check its report")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn now_paused(key: &str, since: u64) -> Chore {
+        Chore {
+            kind: Kind::NowPaused,
+            ..land(key, since)
+        }
+    }
+
+    /// giverny#486: a paused row whose worker ends its turn is told at
+    /// once, with which paused tasks still have a worker finishing; the
+    /// last to stop says every task paused has, for the user.
+    #[test]
+    fn a_task_now_really_paused_is_told_at_once_and_the_last_says_all() {
+        assert!(now_paused("g483", T0).is_due(T0), "no grace");
+        assert_eq!(
+            now_paused("g483", T0).line(T0 + 20_000),
+            "Giverny: `g483` is now really paused: its worker has stopped (ended its turn \
+             20s ago). Read its report: `giverny-manage land g483` if it is done, else \
+             `giverny-manage resume g483` when the work goes on."
+        );
+        let dir = temp("now-paused");
+        let f = feed::feed_path(&dir, "s1");
+        let paused = |k: &str| {
+            json!({"key": k, "stage": "running", "started": manage::stamp(T0),
+                   "paused_since": manage::stamp(T0 + MIN)})
+        };
+        manage::write(
+            &f,
+            &doc(json!([paused("g483"), paused("g485"), paused("g385")])),
+        )
+        .unwrap();
+        let fin = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        publish_with(
+            &dir,
+            "s1",
+            &[now_paused("g483", T0 + 2 * MIN)],
+            &fin(&["g485", "g385"]),
+        )
+        .unwrap();
+        let said = deliver(&dir, "s1", T0 + 2 * MIN + 10_000).unwrap();
+        assert_eq!(
+            said,
+            "Giverny: `g483` is now really paused: its worker has stopped (ended its turn \
+             10s ago). Read its report: `giverny-manage land g483` if it is done, else \
+             `giverny-manage resume g483` when the work goes on.\n\nGiverny: `g485`, `g385` \
+             still have a worker finishing, so they are not paused yet."
+        );
+        assert_eq!(
+            feed::read(&f).unwrap().rows[0].land_nudged_ms,
+            Some(T0 + 2 * MIN)
+        );
+        // The other two stop on one poll: the line says all have.
+        publish_with(
+            &dir,
+            "s1",
+            &[
+                now_paused("g485", T0 + 3 * MIN),
+                now_paused("g385", T0 + 3 * MIN),
+            ],
+            &[],
+        )
+        .unwrap();
+        let said = deliver(&dir, "s1", T0 + 3 * MIN).unwrap();
+        assert!(said.contains("`g485` is now really paused"), "{said}");
+        assert!(said.contains("`g385` is now really paused"), "{said}");
+        assert!(
+            said.ends_with(
+                "Giverny: every task you paused has stopped (`g483`, `g485`, `g385`): you can \
+                 tell the user they are paused."
+            ),
+            "{said}"
+        );
+        // Told once; a row resumed before the hook runs is not told.
+        publish_with(&dir, "s1", &[now_paused("g485", T0 + 3 * MIN)], &[]).unwrap();
+        assert_eq!(deliver(&dir, "s1", T0 + 4 * MIN), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
