@@ -755,6 +755,12 @@ pub fn main() -> i32 {
     // own that its timeout moved there or that went quiet (giverny#450).
     if let Some(stop) = crate::strays::stop_payload(&input) {
         let feeds = crate::feed::feed_dir();
+        // A named session's `/resume` row follows its text (giverny#496).
+        if crate::names::is_on(&feeds)
+            && let Ok(payload) = serde_json::from_str::<Value>(&input)
+        {
+            crate::names::keep_title(&feeds, &payload);
+        }
         let probe = crate::strays::System;
         if let Some(out) =
             crate::strays::stop(&stop, &feeds, manage::now_ms(), &probe, in_giverny_tab)
@@ -841,6 +847,15 @@ pub fn main() -> i32 {
         }
         return 0;
     }
+    // A session's end: its `/resume` row, should what came after its last
+    // turn have pushed its title out of what the picker reads (giverny#496).
+    if let Some(end) = crate::names::end_payload(&input) {
+        let feeds = crate::feed::feed_dir();
+        if crate::names::is_on(&feeds) {
+            crate::names::keep_title(&feeds, &end);
+        }
+        return 0;
+    }
     if let Some(start) = crate::names::start_payload(&input) {
         // A tab's claude is put under its cap before its first command,
         // not on the sampler's next pass (giverny#270).
@@ -859,6 +874,10 @@ pub fn main() -> i32 {
         }
         let on = crate::names::is_on(&feeds);
         let name = crate::names::start_context(&start, &feeds, on, on && tabs_own());
+        if on {
+            // A resumed one's row, should its text have moved (giverny#496).
+            crate::names::keep_title(&feeds, &start);
+        }
         // A resume after a reboot or a relaunch hears of it here (giverny#373).
         let away = text(&start, "session_id")
             .filter(|_| start.get("agent_id").is_none())

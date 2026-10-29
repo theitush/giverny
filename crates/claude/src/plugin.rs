@@ -173,7 +173,9 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// giverny#370). And a `Stop` hook: a session's turn ending with a
 /// background shell of its own that its timeout moved there, or that has
 /// gone quiet, is held once per command with a question
-/// ([`crate::strays`], giverny#450). Like any hook here it reaches only
+/// ([`crate::strays`], giverny#450). The `Stop` hook and a `SessionEnd`
+/// hook also keep a named session's `/resume` row its name and its text
+/// ([`crate::names::keep_title`], giverny#496). Like any hook here it reaches only
 /// sessions started after the `hooks.json` that names it was written.
 /// The tools the `PreToolUse` guard sees: Bash, for the cap
 /// ([`crate::bash_guard`]) and for reaching into another session's work,
@@ -195,7 +197,8 @@ fn session_hooks(skill: bool) -> Value {
         "PostToolUse": [{ "matcher": "*", "hooks": hook() }],
         "SessionStart": [{ "hooks": hook() }],
         "SubagentStop": [{ "hooks": hook() }],
-        "Stop": [{ "hooks": hook() }]
+        "Stop": [{ "hooks": hook() }],
+        "SessionEnd": [{ "hooks": hook() }]
     });
     if skill {
         hooks["UserPromptSubmit"] = json!([{ "hooks": hook() }]);
@@ -808,6 +811,10 @@ mod tests {
             let own = &h["hooks"]["Stop"][0];
             assert!(own.get("matcher").is_none());
             assert_eq!(own["hooks"][0]["command"], start["hooks"][0]["command"]);
+            // giverny#496: every session's end, for its /resume row.
+            let end = &h["hooks"]["SessionEnd"][0];
+            assert!(end.get("matcher").is_none(), "every reason");
+            assert_eq!(end["hooks"][0]["command"], start["hooks"][0]["command"]);
         }
         assert!(remove_dir(&d).unwrap());
     }
