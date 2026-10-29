@@ -565,6 +565,8 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
         return;
     };
     row.remove("paused_since");
+    // A killed row's pause is its off span (giverny#489): closed, it runs.
+    row.remove("killed");
     let span = now.saturating_sub(since);
     if let Some(started) = ms_of(row, "started") {
         if !row.contains_key("spawned") {
@@ -607,6 +609,43 @@ fn reopen(row: &mut Map<String, Value>, key: &str, agent: &str, f: &Flags, now: 
          of its time",
         feed::fmt_span((off / 1000) as i64)
     )
+}
+
+/// Giverny, WSL or this manager session went off and every worker of the
+/// session went with it (giverny#489, told by [`crate::away`]): each Running
+/// row not paused already has its clock stopped at the last sign of life,
+/// `last_ms` (or its own last measured run, if later), and reads `killed`.
+/// The stop is an open pause, so the off span and the time until a revive
+/// are left out of its running time, its countdown and the history, as a
+/// pause is; only its manager closes it, with `resume` (or `start --agent`,
+/// `land`). Returns the keys killed.
+pub fn kill_running(doc: &mut Value, last_ms: u64, now: u64) -> Vec<String> {
+    let Ok(rows) = rows_mut(doc) else {
+        return Vec::new();
+    };
+    let mut killed = Vec::new();
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        if stage_of(row) != Some(feed::Stage::Running) || row.contains_key("paused_since") {
+            continue;
+        }
+        let ran = row
+            .get("usage")
+            .and_then(Value::as_object)
+            .and_then(|u| ms_of(u, "last_at"));
+        let since = last_ms
+            .max(ran.unwrap_or(0))
+            .max(ms_of(row, "started").unwrap_or(0))
+            .min(now);
+        // An open wait ends where the clock stops: counted once, as off.
+        close_wait(row, since);
+        row.insert("paused_since".into(), json!(stamp(since)));
+        row.entry("paused_s").or_insert(json!(0));
+        row.insert("killed".into(), json!(stamp(now)));
+        if let Some(k) = row.get("key").and_then(Value::as_str) {
+            killed.push(k.to_string());
+        }
+    }
+    killed
 }
 
 /// Is this `--why` the worker saying it is waiting rather than working?
@@ -1284,6 +1323,7 @@ pub fn apply(
                     "ended",
                     "paused_since",
                     "paused_s",
+                    "killed",
                     "spawned",
                     "waiting_since",
                     "wait_s",
@@ -1529,6 +1569,9 @@ pub fn apply(
                 row.insert("paused_since".into(), json!(stamp(now)));
                 row.entry("paused_s").or_insert(json!(0));
             }
+            // A killed row paused is set aside: its clock stays stopped
+            // where it went off, and it reads paused (giverny#489).
+            row.remove("killed");
             set_str(row, "note", &f.note);
             Ok(format!("paused {key}"))
         }
@@ -1693,7 +1736,9 @@ pub fn show(doc: &Value, now: u64, sleeps: &[sleeps::Span]) -> String {
                         el.map(|e| feed::fmt_span(e as i64)).unwrap_or("?".into()),
                         left.map(|l| format!("~{} left", feed::fmt_span(l.max(0))))
                             .unwrap_or("no estimate".into()),
-                        if r.contains_key("paused_since") {
+                        if r.contains_key("killed") {
+                            ", killed"
+                        } else if r.contains_key("paused_since") {
                             ", paused"
                         } else {
                             ""
@@ -4878,6 +4923,99 @@ mod tests {
             (h[1].key.as_str(), h[1].wait_s, h[1].work_s),
             ("b", 360, 240)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#489: a row killed with its session (here WSL restarted:
+    /// a new boot, told by `away`) keeps its clock stopped at the last sign
+    /// of life however long it stays killed and however often the feed is
+    /// written; `show` says killed; `resume` restarts the clock from there,
+    /// and the history never counts the off span.
+    #[test]
+    fn a_killed_row_stops_its_clock_until_resumed_and_the_off_span_is_not_learned() {
+        let dir = scratch("killed");
+        let (cmd, mut flags) = parse_args(&args("start demo#7 --eta 60 --agent w1")).unwrap();
+        flags.title = Some("BUG: x".into());
+        run_in(&dir, "s1", &cmd, &flags, T0).unwrap();
+        run(&dir, "plan other --eta 10", T0 + MIN).unwrap();
+        // 20 minutes of work; WSL restarts; back eight hours later.
+        let probe = |wall: u64, boot: &str| crate::away::Probe {
+            wall_ms: wall,
+            mono_ms: Some(wall - T0 + 1),
+            boot: Some(boot.into()),
+            claude: None,
+        };
+        let world = crate::away::World {
+            boot_ms: &|| None,
+            wsl: true,
+            clock: &|ms, _| format!("+{}", (ms - T0) / MIN),
+        };
+        let check = |p: &crate::away::Probe| {
+            crate::away::check(
+                &dir,
+                "s1",
+                p,
+                crate::away::Call::Tool,
+                |_| false,
+                |last| crate::away::kill_rows(&dir, "s1", last, p.wall_ms),
+                &world,
+            )
+        };
+        assert_eq!(check(&probe(T0 + 20 * MIN, "b1")), None);
+        let back = T0 + 8 * 60 * MIN;
+        let mut p = probe(back, "b2");
+        p.mono_ms = Some(MIN);
+        let said = check(&p).unwrap();
+        assert!(said.starts_with("Giverny: WSL restarted"), "{said}");
+        assert!(
+            said.contains("`demo#7` (the pane reads them `killed`)"),
+            "{said}"
+        );
+        let r = read_feed(&dir).rows[0].clone();
+        assert_eq!(r.paused_since_ms, Some(T0 + 20 * MIN));
+        assert_eq!(r.killed_ms, Some(back));
+        // Another command writes the feed an hour on: the clock stands.
+        run(&dir, "eta other 15", back + 60 * MIN).unwrap();
+        let shown = run(&dir, "show", back + 60 * MIN).unwrap();
+        assert!(shown.contains("20m elapsed, ~40m left, killed"), "{shown}");
+        // Revived: a fresh worker, then resume. The clock runs from there.
+        run(&dir, "resume demo#7", back + 90 * MIN).unwrap();
+        let r = read_feed(&dir).rows[0].clone();
+        assert_eq!(r.killed_ms, None);
+        assert_eq!(r.paused_since_ms, None);
+        let shown = run(&dir, "show", back + 100 * MIN).unwrap();
+        assert!(shown.contains("30m elapsed, ~30m left"), "{shown}");
+        run(&dir, "land demo#7", back + 100 * MIN).unwrap();
+        let h = history(&dir);
+        assert_eq!(h.len(), 1);
+        assert_eq!(
+            h[0].work_s,
+            30 * 60,
+            "the off span and the wait for a revive are out"
+        );
+        assert_eq!(h[0].paused_s, (back + 90 * MIN - (T0 + 20 * MIN)) / 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A killed row its manager pauses is set aside: paused, no longer
+    /// killed, its clock still stopped where it went off.
+    #[test]
+    fn pausing_a_killed_row_sets_it_aside() {
+        let dir = scratch("killpause");
+        run(&dir, "start demo#8 --eta 60 --agent w1", T0).unwrap();
+        let file = feed::feed_path(&dir, "s1");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            kill_running(&mut doc, T0 + 10 * MIN, T0 + 60 * MIN),
+            vec!["demo#8"]
+        );
+        // A second look kills nothing more: the row is stopped already.
+        assert!(kill_running(&mut doc, T0 + 70 * MIN, T0 + 80 * MIN).is_empty());
+        write(&file, &doc).unwrap();
+        run(&dir, "pause demo#8", T0 + 90 * MIN).unwrap();
+        let r = read_feed(&dir).rows[0].clone();
+        assert_eq!(r.killed_ms, None);
+        assert_eq!(r.paused_since_ms, Some(T0 + 10 * MIN));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

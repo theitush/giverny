@@ -206,6 +206,11 @@ When you spawn one:
     while you wait idle for your workers. Read its output file — that is the
     check — act on it, then start a fresh `watch`. One that says nothing is
     Running needs no restart until a task runs again.
+- **A row reads `killed`** when Giverny, WSL or your session went off with
+  its worker (Giverny tells you which on your comeback). Its clock stopped
+  there and stays stopped: revive it with a fresh worker (its description
+  naming the task) or an idle one handed it with `start <task> --agent <id>`,
+  then `giverny-manage resume <task>`; or `pause` or `drop` it.
 - **`resume` restarts only the clock** too. It says whether the task's worker
   is working or has ended its turn; one that ended will not carry on by
   itself: wake it with SendMessage saying what to do next, or spawn a fresh

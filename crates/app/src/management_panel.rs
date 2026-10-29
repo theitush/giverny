@@ -1498,7 +1498,7 @@ pub fn build_with(
         let (mut rows, waits): (Vec<_>, Vec<_>) =
             nested.iter().filter_map(|n| slots[n.at].take()).unzip();
         reditto(&mut rows);
-        let written = feed.and_then(|f| f.written_ms);
+        let written = feed.and_then(Feed::started_true_at);
         let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
         for ((row, wait), n) in rows.iter().zip(waits).zip(&nested) {
             let mut line = format_row(row, now_ms, written, clock, wait);
@@ -1774,6 +1774,11 @@ fn benched(row: &PaneRow<'_, SubagentRow>, now_ms: u64) -> bool {
     let Some(f) = row.feed.filter(|_| row.stage == Stage::Running) else {
         return false;
     };
+    // Killed with its session: it stays Running, reading `killed`, until
+    // its manager revives it (giverny#489).
+    if killed(row) {
+        return false;
+    }
     let set_aside = f.held.is_some() || f.paused_since_ms.is_some();
     match unworked(row, now_ms) {
         Some(Unworked::NoWorker { .. }) => true,
@@ -1870,6 +1875,9 @@ pub fn chores(
                 // Asleep on its own shell: Claude Code wakes it, nothing to
                 // land (giverny#476).
                 Stage::Running if asleep_on(row, shells, now_ms).is_some() => None,
+                // Killed with its session: its worker never finished, and
+                // the manager heard it on its comeback (giverny#489).
+                Stage::Running if killed(row) => None,
                 Stage::Running => match unworked(row, now_ms) {
                     Some(Unworked::Finished { how, ended_ms }) => ended_ms.map(|since| Chore {
                         key,
@@ -1965,6 +1973,18 @@ fn still_finishing(row: &PaneRow<'_, SubagentRow>) -> bool {
     row.stage == Stage::Running
         && row.feed.is_some_and(|f| f.paused_since_ms.is_some())
         && row.live.is_some_and(|l| l.running())
+        && !killed(row)
+}
+
+/// A Running row whose worker was killed with its session: Giverny, WSL or
+/// the manager session went off (giverny#489). Its clock stands stopped
+/// where the session last showed life until its manager revives it
+/// (`resume`): it reads [`KILLED`].
+fn killed(row: &PaneRow<'_, SubagentRow>) -> bool {
+    row.stage == Stage::Running
+        && row
+            .feed
+            .is_some_and(|f| f.killed_ms.is_some() && f.paused_since_ms.is_some())
 }
 
 /// A cell is `"` when its row is the same worker as the row above
@@ -2194,6 +2214,9 @@ fn format_row(
         // What is not running comes first: a Running row whose worker
         // stopped on an error, or that has none, says so before anything
         // else.
+        // Killed with its session first: nothing works on it, and only its
+        // manager revives it (giverny#489).
+        Stage::Running if killed(row) => KILLED.to_string(),
         Stage::Running if flag.is_some() => flag.clone().unwrap_or_default(),
         // The limit next: a row the writer paused for it says why.
         Stage::Running => match (limit, paused) {
@@ -2290,6 +2313,7 @@ fn format_row(
                 .map(|s| clock_at(s, now_ms, &clock.tz));
             let state =
                 match unworked(row, now_ms) {
+                    _ if killed(row) => Some(killed_why(row, now_ms, &clock.tz)),
                     Some(Unworked::Stopped(r)) => {
                         Some(format!("stopped: {r} — its worker is not working"))
                     }
@@ -2379,7 +2403,12 @@ fn format_row(
         click: RowClick {
             stage: row.stage,
             key,
-            agent_id: row.agent_id().map(str::to_string),
+            // The worker drawn: a fresh one that took the row from a
+            // finished or killed one (giverny#489) is the one to open and
+            // type to, not the id the feed still names.
+            agent_id: l
+                .map(|l| l.id.clone())
+                .or_else(|| row.agent_id().map(str::to_string)),
             finished: row.stage == Stage::Running && l.is_some_and(|l| !l.running()),
             asleep: asleep.is_some(),
             name: l
@@ -2676,6 +2705,24 @@ pub const PAUSED_FINISHED: &str = "paused · worker finished";
 /// its clock is paused, and it stays under Running until the worker ends
 /// its turn; then it moves to Next up, `paused since …`.
 pub const PAUSED_FINISHING: &str = "paused · worker still finishing";
+
+/// NOW of a Running row whose worker was killed with its session
+/// (giverny#489): Giverny, WSL or the manager session went off.
+pub const KILLED: &str = "killed";
+
+/// A killed row's hover: when it went off, and that only its manager
+/// restarts it.
+fn killed_why(row: &PaneRow<'_, SubagentRow>, now_ms: u64, tz: &jiff::tz::TimeZone) -> String {
+    let off = row
+        .feed
+        .and_then(|f| f.paused_since_ms)
+        .map(|p| format!(" at {}", clock_at(p, now_ms, tz)))
+        .unwrap_or_default();
+    format!(
+        "killed: Giverny, WSL or its manager session went off{off}, and its worker with it; \
+         its clock stopped there until its manager revives it (a fresh worker, then resume)"
+    )
+}
 
 /// The overlay header's facts, from the row's own cells before any ditto.
 /// `vs` names what a Done row's ± was measured against (giverny#402):
@@ -7933,6 +7980,106 @@ mod tests {
             &Logs::new(),
         );
         assert_eq!(t.lines[0].elapsed, "5:00");
+    }
+
+    /// giverny#489: a row killed with its session reads `killed` under
+    /// Running, its clock stopped where it went off however often its
+    /// `giverny manage` feed is written since; nothing nags its manager to
+    /// land it; and a fresh worker naming its task takes it, to type to.
+    #[test]
+    fn a_killed_row_reads_killed_with_its_clock_stopped_and_a_fresh_worker_takes_it() {
+        // a1 started ten minutes before T0, killed with its session at T0,
+        // found so an hour later: its tracker may still read it running.
+        let row = format!(
+            r#"{{"writer":"giverny/manage","rows":[{{"key":"g#1","stage":"running","agent_id":"a1",
+                "eta_s":1800,"started":{},"paused_since":{T0},"paused_s":0,"killed":{}}}]}}"#,
+            T0 - 10 * MIN,
+            T0 + 60 * MIN,
+        );
+        let mut f = feed(&row);
+        f.written_ms = Some(T0 + 60 * MIN);
+        let (stale, _) = ten_minutes_in();
+        // Or, once a live list came without it, finished.
+        let ended = {
+            let mut t = Tracker::new(None);
+            t.apply_live(
+                &LiveSnapshot::parse(
+                    r#"{"session_id":"s","tasks":[{"id":"a1","status":"running",
+                        "startTime":1789999400000,"label":"Editing"}]}"#,
+                ),
+                T0,
+            );
+            t.apply_live(
+                &LiveSnapshot::parse(r#"{"session_id":"s","tasks":[]}"#),
+                T0 + 61 * MIN,
+            );
+            t.rows().to_vec()
+        };
+        assert!(!ended[0].running());
+        for rows in [&stale, &ended] {
+            for now in [T0 + 61 * MIN, T0 + 3 * 60 * MIN] {
+                let t = build_at(Some(&f), rows, now, &utc(&[], None), &Logs::new());
+                assert_eq!(t.lines.len(), 1);
+                assert_eq!(t.lines[0].stage, Stage::Running, "not benched");
+                assert_eq!(t.lines[0].now, KILLED, "{now}");
+                assert_eq!(t.lines[0].elapsed, "10:00", "{now}");
+                assert_eq!(t.lines[0].eta, "~20m");
+                assert!(
+                    chores(
+                        Drawn::Manager,
+                        Some(&f),
+                        rows,
+                        &Logs::new(),
+                        &NO_SHELLS,
+                        now
+                    )
+                    .is_empty()
+                );
+                assert!(finishing(Drawn::Manager, &f, rows, &Logs::new(), now).is_empty());
+            }
+        }
+        // A fresh worker naming the task, spawned after the comeback: the
+        // row's worker now, the one a click opens and types to. It stays
+        // killed until its manager resumes it.
+        let mut fresh = live(&format!(
+            r#"{{"session_id":"s","tasks":[{{"id":"a2","status":"running",
+                "description":"g#1: carry on","startTime":{},"label":"Reading"}}]}}"#,
+            T0 + 65 * MIN
+        ));
+        fresh.extend(stale.iter().cloned());
+        let t = build_at(
+            Some(&f),
+            &fresh,
+            T0 + 70 * MIN,
+            &utc(&[], None),
+            &Logs::new(),
+        );
+        assert_eq!(t.lines.len(), 1, "the fresh worker is not drawn twice");
+        assert_eq!(t.lines[0].click.agent_id.as_deref(), Some("a2"));
+        assert_eq!(t.lines[0].now, KILLED);
+        assert_eq!(t.lines[0].elapsed, "10:00");
+    }
+
+    /// A `giverny manage` feed moves `started` only as a pause closes: its
+    /// paused row's clock stands at `paused_since` though the file was
+    /// written since (giverny#489).
+    #[test]
+    fn a_giverny_manage_pause_stands_at_its_start_whatever_the_write_time() {
+        let mut f = feed(&format!(
+            r#"{{"writer":"giverny/manage","rows":[{{"key":"g#1","stage":"running","agent_id":"a1",
+                "eta_s":1800,"started":{},"paused_since":{T0},"paused_s":0}}]}}"#,
+            T0 - 10 * MIN,
+        ));
+        f.written_ms = Some(T0 + 30 * MIN);
+        let (rows, _) = ten_minutes_in();
+        let t = build_at(
+            Some(&f),
+            &rows,
+            T0 + 40 * MIN,
+            &utc(&[], None),
+            &Logs::new(),
+        );
+        assert_eq!(t.lines[0].elapsed, "10:00");
     }
 
     /// A Running row re-estimated at `T0 + at` minutes: "`left` minutes

@@ -105,6 +105,11 @@ pub struct FeedRow {
     pub paused_s: Option<u64>,
     /// When the row's still-open pause began: its clock is stopped.
     pub paused_since_ms: Option<u64>,
+    /// `giverny manage`: when the row was found killed (giverny#489):
+    /// Giverny, WSL or its manager session went off and its worker with
+    /// it. Its clock is stopped at `paused_since`, the last sign of life,
+    /// until its manager revives it (`resume`), and NOW reads `killed`.
+    pub killed_ms: Option<u64>,
     /// Estimated total duration, in seconds, from `started`.
     pub eta_s: Option<u64>,
     /// How late (`+`) or early (`-`) a Done row landed against `eta_s`, when
@@ -379,9 +384,25 @@ pub struct Feed {
     /// arithmetic: a paused row's `started` is only true as of this instant.
     /// `None` for a feed parsed from bytes.
     pub written_ms: Option<u64>,
+    /// Who wrote it (`writer`): `giverny/manage` ([`crate::manage::WRITER`])
+    /// or another.
+    pub writer: Option<String>,
 }
 
 impl Feed {
+    /// The instant a paused row's `started` is true as of, for a writer that
+    /// moves it on by an open pause each time it writes: the write time.
+    /// `giverny manage` moves `started` only as a pause closes, so its
+    /// paused row's clock stands at `paused_since` however often the file is
+    /// written since (giverny#489: a killed row's stop is hours before the
+    /// write that killed it): `None`.
+    pub fn started_true_at(&self) -> Option<u64> {
+        if self.writer.as_deref() == Some(crate::manage::WRITER) {
+            return None;
+        }
+        self.written_ms
+    }
+
     /// The feed without the Done rows that landed by `cutoff_ms` (or never
     /// said when): what the pane shows after its Done rows were cleared by
     /// hand, whoever wrote the file.
@@ -483,6 +504,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         spawned_ms: millis_field(v, "spawned"),
         paused_s: u64_field(v, "paused_s"),
         paused_since_ms: millis_field(v, "paused_since"),
+        killed_ms: millis_field(v, "killed"),
         eta_s: u64_field(v, "eta_s"),
         eta_delta_s: i64_field(v, "eta_delta_s"),
         left_s: u64_field(v, "left_s"),
@@ -560,6 +582,7 @@ pub fn parse(bytes: &[u8]) -> Result<Feed, FeedError> {
         rows,
         footer,
         written_ms: None,
+        writer: str_field(&v, "writer"),
     })
 }
 
@@ -1087,8 +1110,9 @@ pub fn opens(has_agents: bool, manager: bool) -> bool {
 ///   `agent_id`, or one Claude Code no longer lists), the live row whose
 ///   description names the row's key — `Work demo#82 …` holds
 ///   `demo#82`, and one naming several keys holds each of them.
-///   A Running row whose named worker has finished carries a running one
-///   spawned after it whose description names the key, if there is one.
+///   A Running row whose named worker has finished, or was killed
+///   (giverny#489), carries a running one spawned after it whose
+///   description names the key, if there is one.
 ///   The feed's stage wins: one worker may hold a Done row and
 ///   a Running one at once.
 /// - A live row that no feed row carries, and whose description names no
@@ -1129,10 +1153,12 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
         let first = named.clone().next()?;
         Some(named.find(|l| l.running() == want_running).unwrap_or(first))
     };
-    // A Running row whose worker has finished, and a worker spawned after
-    // it for the same task is running: the dispatcher resumed the task with
-    // a fresh worker and never moved the row (giverny#287). One another row
-    // names by id is that row's.
+    // A Running row whose worker has finished, or was killed with its
+    // session (giverny#489: a killed worker never finishes, it may well
+    // still read running), and a worker spawned after it for the same task
+    // is running: the dispatcher resumed the task with a fresh worker and
+    // never moved the row (giverny#287). One another row names by id is
+    // that row's.
     let successor = |f: &FeedRow, held: &L| -> Option<&'a L> {
         live.iter().find(|l| {
             l.running()
@@ -1151,7 +1177,10 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
         .iter()
         .map(|f| {
             let live = match f.agent_id.as_deref().and_then(find_live) {
-                Some(held) if f.stage() == Stage::Running && !held.running() => {
+                Some(held)
+                    if f.stage() == Stage::Running
+                        && (!held.running() || f.killed_ms.is_some()) =>
+                {
                     successor(f, held).or(Some(held))
                 }
                 Some(held) => Some(held),

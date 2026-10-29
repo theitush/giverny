@@ -13,8 +13,15 @@
 //!   gone, `/tmp` and its scratchpad with them.
 //! - **Restarted** (another `claude` process, same boot: a Giverny relaunch,
 //!   a crash, a `--resume`): its background commands and subagents are gone,
-//!   `/tmp` is kept. A manager also hears which Running rows lost their
-//!   worker with it.
+//!   `/tmp` is kept.
+//!
+//! **A reboot or a restart stops a manager's clocks** (giverny#489): every
+//! Running row of the session lost its worker with it, so each not paused
+//! already is stopped where the session last showed life (the record's last
+//! call) and reads `killed` ([`manage::kill_running`]); the manager hears
+//! which, and revives each (a fresh or handed-over worker, then `resume`).
+//! Giverny restarts no clock itself. A sleep kills nothing: its frozen span
+//! comes off every clock through [`crate::sleeps`].
 //! - **Slept** (the wall clock ran ahead of the monotonic one by more than
 //!   [`MIN_SLEEP_MS`]): processes survived, connections, timeouts, rate
 //!   windows and ETAs may not have. A sleep in the middle of a tool call
@@ -197,18 +204,21 @@ pub struct World<'a> {
     pub clock: &'a dyn Fn(u64, u64) -> String,
 }
 
-/// The paragraph `event` is told as. `running` names the manager session's
-/// Running rows that had a worker, for a reboot or a restart.
-pub fn note(event: Event, now_ms: u64, running: &[String], world: &World) -> String {
+/// The paragraph `event` is told as. `killed` names the manager session's
+/// Running rows a reboot or a restart killed ([`manage::kill_running`]).
+pub fn note(event: Event, now_ms: u64, killed: &[String], world: &World) -> String {
     let at = |ms: u64| (world.clock)(ms, now_ms);
     let lost = || {
-        if running.is_empty() {
+        if killed.is_empty() {
             return String::new();
         }
-        let keys: Vec<String> = running.iter().map(|k| format!("`{k}`")).collect();
+        let keys: Vec<String> = killed.iter().map(|k| format!("`{k}`")).collect();
         format!(
-            " Your Running rows lost their workers with it: {}. Spawn a fresh worker for \
-             each (its description naming the task), or `pause` or `drop` it.",
+            " Your Running rows lost their workers with it, and their clocks stopped there: \
+             {} (the pane reads them `killed`). Revive each with a fresh worker (its \
+             description naming the task) or an idle one handed it with `giverny-manage \
+             start <task> --agent <id>`, then `giverny-manage resume <task>` restarts its \
+             clock; or `pause` or `drop` it.",
             keys.join(", ")
         )
     };
@@ -320,15 +330,15 @@ fn write(file: &Path, rec: &Record) {
 /// The hook call's check: the record compared with `now`, refreshed, and
 /// what the session is to hear (its subagents' queued lines and this
 /// call's event), or nothing. A subagent's call queues its event instead.
-/// `running` gives a manager session's Running rows, asked only on a
-/// reboot or a restart.
+/// `kill` stops a manager session's Running rows at the last call's wall
+/// clock and gives their keys, asked only on a reboot or a restart.
 pub fn check(
     feed_dir: &Path,
     session: &str,
     now: &Probe,
     call: Call,
     alive: impl Fn(Claude) -> bool,
-    running: impl FnOnce() -> Vec<String>,
+    kill: impl FnOnce(u64) -> Vec<String>,
     world: &World,
 ) -> Option<String> {
     if !safe(session) {
@@ -371,7 +381,7 @@ pub fn check(
     let event = detect(&rec.last, now, call, &alive);
     if let Some(e) = event {
         let rows = match e {
-            Event::Rebooted { .. } | Event::Restarted { .. } => running(),
+            Event::Rebooted { last_ms } | Event::Restarted { last_ms } => kill(last_ms),
             _ => Vec::new(),
         };
         rec.pending.push(note(e, now.wall_ms, &rows, world));
@@ -404,11 +414,19 @@ fn prune(feed_dir: &Path, now_ms: u64) {
     }
 }
 
-/// The Running rows with a worker in `session`'s manager session, when
-/// this writer wrote it: what a reboot or a restart took the workers of.
-pub fn running_rows(feed_dir: &Path, session: &str) -> Vec<String> {
+/// Stop the Running rows of `session`'s manager session, when this writer
+/// wrote it, at `last_ms` (the session's last sign of life) and mark them
+/// `killed` ([`manage::kill_running`]), under the feed's lock: what a
+/// reboot or a restart took the workers of. Their keys.
+pub fn kill_rows(feed_dir: &Path, session: &str, last_ms: u64, now_ms: u64) -> Vec<String> {
     let file = manage::file_for(feed_dir, session);
-    let Some(doc) = std::fs::read(&file)
+    if !file.exists() {
+        return Vec::new();
+    }
+    let Ok(_lock) = Lock::take(&file) else {
+        return Vec::new();
+    };
+    let Some(mut doc) = std::fs::read(&file)
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     else {
@@ -417,14 +435,11 @@ pub fn running_rows(feed_dir: &Path, session: &str) -> Vec<String> {
     if manage::writer_of(&doc) != Some(manage::WRITER) {
         return Vec::new();
     }
-    let rows = doc.get("rows").and_then(Value::as_array);
-    rows.into_iter()
-        .flatten()
-        .filter(|r| r.get("stage").and_then(Value::as_str) == Some("running"))
-        .filter(|r| r.get("paused_since").is_none_or(Value::is_null))
-        .filter(|r| r.get("agent_id").and_then(Value::as_str).is_some())
-        .filter_map(|r| r.get("key").and_then(Value::as_str).map(String::from))
-        .collect()
+    let killed = manage::kill_running(&mut doc, last_ms, now_ms);
+    if !killed.is_empty() {
+        let _ = manage::write(&file, &doc);
+    }
+    killed
 }
 
 /// This hook call's [`Probe`], at wall clock `now_ms`.
@@ -544,7 +559,7 @@ pub fn on_call(feed_dir: &Path, session: &str, now_ms: u64, call: Call) -> Optio
         &probe(now_ms),
         call,
         alive,
-        || running_rows(feed_dir, session),
+        |last_ms| kill_rows(feed_dir, session, last_ms, now_ms),
         &world(),
     )
 }
@@ -596,7 +611,7 @@ mod tests {
     /// manager rows are `rows`.
     fn call(dir: &Path, p: &Probe, call: Call, rows: &[&str]) -> Option<String> {
         let rows: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
-        check(dir, "s1", p, call, |_| false, || rows, &world())
+        check(dir, "s1", p, call, |_| false, |_| rows, &world())
     }
 
     #[test]
@@ -628,9 +643,11 @@ mod tests {
              Everything it had running is gone: background commands, subagents and \
              workers, servers, downloads. /tmp was wiped, your scratchpad with it. \
              Check what really runs now, and your board and pane rows, before acting \
-             on what you knew. Your Running rows lost their workers with it: \
-             `poly#12`. Spawn a fresh worker for each (its description naming the \
-             task), or `pause` or `drop` it."
+             on what you knew. Your Running rows lost their workers with it, and their \
+             clocks stopped there: `poly#12` (the pane reads them `killed`). Revive each \
+             with a fresh worker (its description naming the task) or an idle one handed \
+             it with `giverny-manage start <task> --agent <id>`, then `giverny-manage \
+             resume <task>` restarts its clock; or `pause` or `drop` it."
         );
         // Told once: the prompt that follows hears nothing.
         let mut q = at(61, 0, "b2", 11);
@@ -668,7 +685,17 @@ mod tests {
     #[test]
     fn a_second_live_claude_on_the_session_is_no_restart() {
         let dir = temp("second");
-        let quiet = |p: &Probe| check(&dir, "s1", p, Call::Tool, |_| true, Vec::new, &world());
+        let quiet = |p: &Probe| {
+            check(
+                &dir,
+                "s1",
+                p,
+                Call::Tool,
+                |_| true,
+                |_| Vec::new(),
+                &world(),
+            )
+        };
         assert_eq!(quiet(&at(0, 0, "b1", 10)), None);
         assert_eq!(quiet(&at(1, 1, "b1", 11)), None);
         assert_eq!(quiet(&at(2, 2, "b1", 10)), None);
@@ -744,18 +771,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// giverny#489: a restart stops every Running row not paused already
+    /// where the session last showed life, and marks it `killed`; a paused
+    /// row keeps its own stop, a Done or planned one is left alone, and
+    /// another writer's feed is never touched.
     #[test]
-    fn the_running_rows_are_the_manager_sessions_with_a_worker() {
-        let dir = temp("rows");
+    fn a_restart_kills_the_running_rows_at_the_last_sign_of_life() {
+        let dir = temp("kill");
+        let t = |m: u64| manage::stamp(T0 + m * MIN);
         let doc = json!({"version": 1, "session": "s1", "writer": manage::WRITER, "rows": [
-            {"key": "a#1", "stage": "running", "agent_id": "w1"},
-            {"key": "a#2", "stage": "running"},
-            {"key": "a#3", "stage": "running", "agent_id": "w3", "paused_since": "2026-10-13T10:00:00Z"},
-            {"key": "a#4", "stage": "done", "agent_id": "w4"},
-            {"key": "a#5", "stage": "planned"}]});
-        manage::write(&crate::feed::feed_path(&dir, "s1"), &doc).unwrap();
-        assert_eq!(running_rows(&dir, "s1"), vec!["a#1".to_string()]);
-        assert!(running_rows(&dir, "s2").is_empty());
+            {"key": "a#1", "stage": "running", "agent_id": "w1", "started": t(0), "eta_s": 3600},
+            {"key": "a#2", "stage": "running", "started": t(5),
+             "waiting_since": t(8)},
+            {"key": "a#3", "stage": "running", "agent_id": "w3", "started": t(0),
+             "paused_since": t(4), "paused_s": 0},
+            {"key": "a#4", "stage": "done", "agent_id": "w4", "started": t(0), "ended": t(3)},
+            {"key": "a#5", "stage": "planned"},
+            // Its build ran past the last hook call: its clock stops there.
+            {"key": "a#6", "stage": "running", "agent_id": "w6", "started": t(0),
+             "usage": {"last_at": t(12)}}]});
+        let file = crate::feed::feed_path(&dir, "s1");
+        manage::write(&file, &doc).unwrap();
+        // The session's calls, then Giverny closed at +10 and back at +70.
+        call(&dir, &at(0, 0, "b1", 10), Call::Tool, &[]);
+        assert_eq!(
+            check(
+                &dir,
+                "s1",
+                &at(10, 10, "b1", 10),
+                Call::Tool,
+                |_| false,
+                |_| Vec::new(),
+                &world()
+            ),
+            None
+        );
+        let said = check(
+            &dir,
+            "s1",
+            &at(70, 70, "b1", 22),
+            Call::Start,
+            |_| false,
+            |last| kill_rows(&dir, "s1", last, T0 + 70 * MIN),
+            &world(),
+        )
+        .unwrap();
+        assert!(said.contains("`a#1`, `a#2`, `a#6`"), "{said}");
+        let got: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let row = |k: &str| {
+            got["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["key"] == k)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let ms = |r: &serde_json::Map<String, Value>, k: &str| manage::ms_of(r, k);
+        assert_eq!(ms(&row("a#1"), "paused_since"), Some(T0 + 10 * MIN));
+        assert_eq!(ms(&row("a#1"), "killed"), Some(T0 + 70 * MIN));
+        // An open wait ends where the clock stopped.
+        assert_eq!(ms(&row("a#2"), "paused_since"), Some(T0 + 10 * MIN));
+        assert_eq!(row("a#2").get("waiting_since"), None);
+        assert_eq!(row("a#2")["wait_s"], json!(120));
+        assert_eq!(ms(&row("a#3"), "paused_since"), Some(T0 + 4 * MIN));
+        assert_eq!(row("a#3").get("killed"), None);
+        assert_eq!(row("a#4").get("killed"), None);
+        assert_eq!(row("a#5").get("killed"), None);
+        assert_eq!(ms(&row("a#6"), "paused_since"), Some(T0 + 12 * MIN));
+        // Another writer's feed is left as it is.
+        let other = json!({"version": 1, "writer": "someone", "rows": [
+            {"key": "b#1", "stage": "running", "started": t(0)}]});
+        manage::write(&crate::feed::feed_path(&dir, "s2"), &other).unwrap();
+        assert!(kill_rows(&dir, "s2", T0, T0 + MIN).is_empty());
+        assert!(kill_rows(&dir, "s3", T0, T0 + MIN).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sleep kills nothing: its processes lived on (its span comes off
+    /// the clocks through `sleeps.jsonl`).
+    #[test]
+    fn a_sleep_kills_no_row() {
+        let dir = temp("sleepkill");
+        call(&dir, &at(0, 0, "b1", 10), Call::Tool, &[]);
+        let said = check(
+            &dir,
+            "s1",
+            &at(60, 1, "b1", 10),
+            Call::Tool,
+            |_| false,
+            |_| panic!("a sleep kills nothing"),
+            &world(),
+        )
+        .unwrap();
+        assert!(said.starts_with("Giverny: the computer slept"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -782,7 +893,7 @@ mod tests {
                 &blind(0),
                 Call::Tool,
                 |_| false,
-                Vec::new,
+                |_| Vec::new(),
                 &world()
             ),
             None
