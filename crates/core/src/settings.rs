@@ -278,6 +278,7 @@ pub const SETTINGS: &[SettingDef] = &[
                 "synthwave",
                 "workbench",
                 "riso",
+                "red-rock",
             ],
         },
     },

@@ -9,7 +9,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 |---|---|---|
 | `font.family` | `""` | Preferred monospace family; empty auto-detects. Hebrew comes from the bundled Cascadia Mono unless this family has Hebrew of its own. Takes effect on restart. |
 | `font.size` | `13.0` | Point size of the terminal grid. |
-| `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin, catppuccin-mauve, rouen, phosphor, abyss, synthwave, workbench, riso. |
+| `theme.name` | `"monet-dark"` | Colour theme for the grid and the chrome around it. One of: monet-dark, monet-light, ink, tokyo-night, gruvbox, nord, catppuccin, catppuccin-mauve, rouen, phosphor, abyss, synthwave, workbench, riso, red-rock. |
 | `window.opacity` | `1.0` | How solid the window's background is; below 1.0 the desktop shows through. Takes effect on restart. |
 | `titles.strip_host_prefix` | `true` | Drop the `user@host:` your shell puts in front of every title. |
 | `titles.shorten_paths` | `false` | Abbreviate every directory but the last: ~/Dev/bobo becomes ~/D/bobo. |
