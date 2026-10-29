@@ -18,6 +18,81 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
     pub update: UpdateConfig,
+    pub management_panel: ManagementPanelConfig,
+}
+
+/// `[management_panel]`: the rest of Settings → Management panel. The pane's
+/// own switch is `claude.management_panel`. Every default is the behaviour
+/// from before these keys existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagementPanelConfig {
+    /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
+    /// newest [`Self::done_last`]).
+    pub done_rows: String,
+    /// How many Done rows `done_rows = "last"` keeps.
+    pub done_last: u32,
+    /// One switch per pane column.
+    pub columns: PaneColumns,
+}
+
+impl Default for ManagementPanelConfig {
+    fn default() -> Self {
+        ManagementPanelConfig {
+            done_rows: "all".into(),
+            done_last: 5,
+            columns: PaneColumns::default(),
+        }
+    }
+}
+
+/// Which Done rows the management panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneRows {
+    All,
+    Hide,
+    /// The newest this many.
+    Last(usize),
+}
+
+impl ManagementPanelConfig {
+    /// `done_rows` and `done_last` as one value; an unknown word shows all.
+    pub fn done(&self) -> DoneRows {
+        match self.done_rows.trim().to_ascii_lowercase().as_str() {
+            "hide" | "none" => DoneRows::Hide,
+            "last" => DoneRows::Last(self.done_last as usize),
+            _ => DoneRows::All,
+        }
+    }
+}
+
+/// `[management_panel.columns]`: the pane's columns, every one on by
+/// default. A column switched off takes no width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneColumns {
+    pub stage: bool,
+    pub id: bool,
+    pub title: bool,
+    /// The worker's CPU and memory now, and its peak once it is done.
+    pub usage: bool,
+    pub elapsed: bool,
+    pub now: bool,
+    pub tokens: bool,
+}
+
+impl Default for PaneColumns {
+    fn default() -> Self {
+        PaneColumns {
+            stage: true,
+            id: true,
+            title: true,
+            usage: true,
+            elapsed: true,
+            now: true,
+            tokens: true,
+        }
+    }
 }
 
 /// Automatically discovered Codex integration. Authentication stays in Codex.
@@ -45,7 +120,7 @@ impl Default for CodexConfig {
 }
 
 /// How Claude Code itself is launched in a tab.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
     /// Start every session in auto mode, by setting `permissions.defaultMode`
@@ -56,6 +131,20 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
+    /// Show the tab's subagents in a table under the terminal. On by
+    /// default.
+    pub management_panel: bool,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        ClaudeConfig {
+            auto_mode: false,
+            skip_resume_summary: false,
+            resume_after_limit: false,
+            management_panel: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -945,6 +1034,42 @@ mod tests {
         let cfg = load(&dir);
         assert_eq!(cfg.font.size, 13.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_management_panel_is_on_unless_switched_off() {
+        assert!(Config::default().claude.management_panel);
+        let (cfg, unknown) = parse("[claude]\nauto_mode = true\n").unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert!(cfg.claude.management_panel);
+        let (cfg, _) = parse("[claude]\nmanagement_panel = false\n").unwrap();
+        assert!(!cfg.claude.management_panel);
+    }
+
+    #[test]
+    fn the_management_panel_table_reads_its_rows_and_columns() {
+        let cfg = Config::default().management_panel;
+        assert_eq!(cfg.done(), DoneRows::All);
+        assert!(cfg.columns.usage && cfg.columns.tokens);
+        let text = "[management_panel]\ndone_rows = \"last\"\ndone_last = 3\n\
+                    [management_panel.columns]\nusage = false\n";
+        let (cfg, unknown) = parse(text).unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        let pane = cfg.management_panel;
+        assert_eq!(pane.done(), DoneRows::Last(3));
+        assert!(!pane.columns.usage, "switched off");
+        assert!(pane.columns.title, "the rest stay on");
+        for (word, done) in [
+            ("hide", DoneRows::Hide),
+            ("None", DoneRows::Hide),
+            ("?", DoneRows::All),
+        ] {
+            let pane = ManagementPanelConfig {
+                done_rows: word.into(),
+                ..ManagementPanelConfig::default()
+            };
+            assert_eq!(pane.done(), done, "{word}");
+        }
     }
 
     #[test]

@@ -1677,6 +1677,41 @@ impl ClaudeWatch {
         }
     }
 
+    /// Follow the `claude.management_panel` setting in every account: on
+    /// installs `subagentStatusLine` (`giverny relay --subagent-line`), which
+    /// feeds the pane and hides Claude Code's own subagent panel; off removes
+    /// it, and Claude Code draws its panel natively again. Called at startup
+    /// too, so an account added since, or a moved binary, is brought in line.
+    /// An account with a `subagentStatusLine` of its own is left alone.
+    ///
+    /// Claude Code watches its settings files, so this reaches running
+    /// sessions without a restart.
+    ///
+    /// The setting is on by default, so it is not consent by itself: the line
+    /// is written only into an account that already holds our hooks
+    /// ([`hooks::partly_installed_in`]) — installing them is the consent, as
+    /// it is for the live-usage statusline. Every other account is left
+    /// byte-identical. Off removes only what is ours, wherever it is. A side
+    /// instance writes nothing.
+    pub fn set_management_panel(&mut self, enable: bool) {
+        if self.leave_accounts {
+            return;
+        }
+        for p in &self.profiles {
+            let settings = p.config_dir.join("settings.json");
+            let enable = enable && hooks::partly_installed_in(&settings);
+            match hooks::set_subagent_line(&settings, enable) {
+                Ok(true) => tracing::info!(
+                    "subagentStatusLine {} for {}",
+                    if enable { "installed" } else { "removed" },
+                    p.name
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
+            }
+        }
+    }
+
     /// Do all profiles have the live-usage statusline?
     pub fn statusline_on(&self) -> bool {
         !self.accounts.is_empty() && self.accounts.iter().all(|a| a.statusline_on)
@@ -3871,8 +3906,63 @@ mod tests {
         assert!(w.set_statusline(true).is_err());
         w.set_auto_mode(true);
         w.ensure_auto_mode();
+        w.set_management_panel(true);
+        w.set_management_panel(false);
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hooks that point at some other Giverny and a subagent line of its
+    /// own: a side instance leaves both as they are, and the installed
+    /// instance, asked the same, takes its line back off.
+    #[test]
+    fn a_side_instance_leaves_the_subagent_line_alone() {
+        let (dir, profile) = scratch_account("side-line");
+        let settings = dir.join("settings.json");
+        let before = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/elsewhere/giverny relay"}]}]},"subagentStatusLine":{"type":"command","command":"/elsewhere/giverny relay --subagent-line"}}"#;
+        std::fs::write(&settings, before).unwrap();
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![profile];
+        w.leave_accounts = true;
+        w.set_management_panel(true);
+        w.set_management_panel(false);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+
+        w.leave_accounts = false;
+        w.set_management_panel(false);
+        assert!(!hooks::subagent_line_installed_in(&settings));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pane is on by default, so the setting alone is not consent: an
+    /// account without our hooks is left byte-identical, and one with them
+    /// gets the pane's line, which goes again when the pane goes off.
+    #[test]
+    fn the_pane_writes_only_where_the_hooks_are() {
+        let (plain_dir, plain) = scratch_account("pane-plain");
+        let (hooked_dir, hooked) = scratch_account("pane-hooked");
+        let plain_settings = plain_dir.join("settings.json");
+        let hooked_settings = hooked_dir.join("settings.json");
+        let text = "{\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&plain_settings, text).unwrap();
+        std::fs::write(&hooked_settings, text).unwrap();
+        hooks::install_into(&hooked_settings).unwrap();
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![plain, hooked];
+        w.set_management_panel(true);
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(
+            !plain_dir.join("settings.json.giverny-bak").exists(),
+            "no backup for a write that never happened"
+        );
+        assert!(hooks::subagent_line_installed_in(&hooked_settings));
+
+        w.set_management_panel(false);
+        assert_eq!(std::fs::read_to_string(&plain_settings).unwrap(), text);
+        assert!(!hooks::subagent_line_installed_in(&hooked_settings));
+        let _ = std::fs::remove_dir_all(&plain_dir);
+        let _ = std::fs::remove_dir_all(&hooked_dir);
     }
 
     /// Sessions running when hooks are first installed never loaded them:

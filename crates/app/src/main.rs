@@ -494,7 +494,9 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      taskbar icon on Wayland)\n  \
      giverny codex-hooks install [--enable] | remove\n                     install or remove Codex observer hooks\n  \
      giverny relay      (internal) agent hook entrypoint\n  \
-     giverny statusline (internal) Claude Code statusline entrypoint\n\n\
+     giverny statusline (internal) Claude Code statusline entrypoint\n  \
+     giverny relay --subagent-line\n                     \
+     (internal) Claude Code subagentStatusLine entrypoint\n\n\
      FLAGS:\n  -V, --version  print the version\n  \
      -h, --help     print this help";
 
@@ -514,7 +516,17 @@ fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            if std::env::args().nth(2).as_deref() == Some(giverny_claude::hooks::SUBAGENT_LINE_FLAG)
+            {
+                let cfg = config::load(paths.base());
+                giverny_claude::hooks::run_subagent_line(
+                    &paths.hook_spool(),
+                    cfg.claude.management_panel,
+                );
+            } else {
+                giverny_claude::hooks::run_relay(&paths.hook_spool());
+            }
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -1288,11 +1300,13 @@ fn accounts_readable(parsed: &config::Parsed) -> bool {
     !parsed.invalid_under("claude")
 }
 
-/// Bring every account in line with the config at startup: auto mode.
+/// Bring every account in line with the config at startup: auto mode, and
+/// the management panel's subagent line.
 ///
 /// Not when the config could not be parsed, or its `[claude]` values could
 /// not (`config_read` false). The app then runs on defaults there, and
-/// following those would rewrite accounts against what the user configured.
+/// following those would rewrite accounts against what the user configured:
+/// turn the management panel's subagent line on where it was turned off.
 /// Once the file parses again, the hot reload applies what it says. Hook
 /// paths and the status line read nothing from the config, so
 /// [`claude_watch::ClaudeWatch::new`] brings those up to date either way.
@@ -1310,6 +1324,7 @@ fn set_up_accounts(
     if cfg.claude.auto_mode {
         claude.ensure_auto_mode();
     }
+    claude.set_management_panel(cfg.claude.management_panel);
 }
 
 /// Environment every tab's shell inherits, so `claude` behaves the way the
@@ -2006,10 +2021,16 @@ impl App {
                 self.queue_resume(id, ctx);
                 self.focus_terminal = true;
             }
-            Action::InstallHooks => match self.claude.install_hooks() {
-                Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
-                Err(e) => tracing::error!("hook install: {e}"),
-            },
+            Action::InstallHooks => {
+                match self.claude.install_hooks() {
+                    Ok(n) => tracing::info!("hooks installed into {n} profile(s)"),
+                    Err(e) => tracing::error!("hook install: {e}"),
+                }
+                // The hooks are the consent the management panel's line
+                // waits for.
+                self.claude
+                    .set_management_panel(self.cfg.claude.management_panel);
+            }
             Action::CodexHooks(target, enable) => self.codex.install_hooks(&target, enable),
             Action::RefreshCodexUsage => self.codex.refresh(true, ctx),
             Action::ConfirmCodexResume(id) => {
@@ -3053,6 +3074,10 @@ impl App {
         }
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
+        }
+        if cfg.claude.management_panel != self.cfg.claude.management_panel {
+            self.claude
+                .set_management_panel(cfg.claude.management_panel);
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
