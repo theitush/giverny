@@ -511,7 +511,8 @@ fn main() -> eframe::Result {
     // Subcommands that never open a window.
     match std::env::args().nth(1).as_deref() {
         Some("relay") => {
-            giverny_claude::hooks::run_relay(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            giverny_claude::hooks::run_relay(&paths.hook_spool(), paths.base());
             return Ok(());
         }
         Some("codex-hooks") => {
@@ -522,7 +523,8 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("statusline") => {
-            giverny_claude::hooks::run_statusline(&Paths::default_dirs().hook_spool());
+            let paths = Paths::default_dirs();
+            giverny_claude::hooks::run_statusline(&paths.hook_spool(), paths.base());
             return Ok(());
         }
         Some("welcome") => {
@@ -1286,6 +1288,27 @@ fn set_up_accounts(
     }
 }
 
+/// Follow `claude.name_sessions`: the hooks and the status line read it as a
+/// file under Giverny's config directory, so turning it on reaches sessions
+/// already running at their next prompt.
+fn follow_name_sessions(paths: &Paths, on: bool) {
+    match giverny_claude::names::set_on(paths.base(), on) {
+        Ok(true) => tracing::info!("session names {}", if on { "on" } else { "off" }),
+        Ok(false) => {}
+        Err(err) => tracing::warn!("session names setting not written: {err}"),
+    }
+}
+
+/// Leave the chrome's accent beside the socket, where each tab's status line
+/// takes the colour its session's name is drawn in.
+fn record_accent(chrome: &chrome::Chrome) {
+    let c = chrome.accent;
+    let path = giverny_claude::hooks::statusline_accent_path();
+    if let Err(err) = giverny_claude::hooks::write_statusline_accent(&path, [c.r(), c.g(), c.b()]) {
+        tracing::debug!("accent: {}: {err}", path.display());
+    }
+}
+
 /// Environment every tab's shell inherits, so `claude` behaves the way the
 /// settings screen says however it is started — typed, resumed, or attached.
 fn claude_env(claude: &config::ClaudeConfig) -> Vec<(String, String)> {
@@ -1527,6 +1550,7 @@ impl App {
         shared.opacity = opacity_for(see_through, &cfg);
         let chrome = chrome::Chrome::from_theme(&theme_for(&cfg.theme.name));
         chrome.apply(&cc.egui_ctx, &theme_for(&cfg.theme.name), shared.opacity);
+        record_accent(&chrome);
 
         let mut cfg_mtime = config_mtime(&paths);
         let restored = state::load(&paths);
@@ -1742,6 +1766,9 @@ impl App {
         #[cfg(unix)]
         shut_down_on_signal(cc.egui_ctx.clone(), app.terminating.clone());
         set_up_accounts(&mut app.claude, &app.cfg, config_read);
+        if config_read {
+            follow_name_sessions(&app.paths, app.cfg.claude.name_sessions);
+        }
         if app.ws.tabs.is_empty() {
             let cat = app.ws.categories[0].id;
             app.apply(
@@ -2321,13 +2348,12 @@ impl App {
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
-        let profile_dir = self
-            .ws
-            .tab(id)
-            .and_then(|t| self.ws.category(t.category))
-            .and_then(|c| c.profile_dir.clone());
+        let category = self.ws.tab(id).and_then(|t| self.ws.category(t.category));
+        let profile_dir = category.and_then(|c| c.profile_dir.clone());
+        // The surname a session born in this tab takes.
+        let category = category.map(|c| c.name.clone());
         let was_in = self.ws.tab(id).and_then(|t| t.cwd.clone());
-        let mut shape = self.tab_shape(profile_dir, was_in.as_deref());
+        let mut shape = self.tab_shape(profile_dir, category, was_in.as_deref());
         if let Some(saved) = self.ws.tab(id).and_then(|t| t.agent_session.as_ref())
             && let Some(distro) = &saved.wsl_distro
         {
@@ -3008,6 +3034,7 @@ impl App {
         // The chrome is themed too, so the rail does not stay Monet-blue
         // around a Gruvbox grid.
         self.chrome = chrome::Chrome::from_theme(&theme);
+        record_accent(&self.chrome);
         self.chrome.apply(ctx, &theme, self.shared.opacity);
     }
 
@@ -3024,6 +3051,9 @@ impl App {
         }
         if cfg.claude.auto_mode != self.cfg.claude.auto_mode {
             self.claude.set_auto_mode(cfg.claude.auto_mode);
+        }
+        if cfg.claude.name_sessions != self.cfg.claude.name_sessions {
+            follow_name_sessions(&self.paths, cfg.claude.name_sessions);
         }
         let opacity = opacity_for(self.see_through, &cfg);
         if opacity != self.shared.opacity {
@@ -3686,8 +3716,19 @@ impl App {
     /// environment does not reach a process in a distribution at all unless
     /// `%WSLENV%` lists it, which is how the tab identity the hooks report
     /// gets there.
-    fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
+    fn tab_shape(
+        &self,
+        profile_dir: Option<PathBuf>,
+        category: Option<String>,
+        was_in: Option<&Path>,
+    ) -> TabShape {
         let mut env = self.claude_env();
+        // The category the tab sits in as its shell starts: a session born
+        // there is named after it. Not a path, so it crosses into a
+        // distribution as it is.
+        if let Some(name) = category.filter(|n| !n.trim().is_empty()) {
+            env.push((giverny_claude::names::CATEGORY_ENV.into(), name));
+        }
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an

@@ -563,6 +563,22 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
+        key: "claude.name_sessions",
+        label: "name every session",
+        section: Section::Claude,
+        doc: "Give every Claude session in a tab a name at its start, shown on its status line.",
+        note: &[
+            "A first name drawn from a list, never one another running session",
+            "has, and a surname from where it was born: the tab's category, else",
+            "its repo — `Opus 4.5 (Rotem Giverny)`. The session is told its name",
+            "before its first turn and keeps it when resumed, so several sessions",
+            "at work can be told apart, and can sign what they do.",
+            "Needs Giverny's hooks; the name shows with the live-usage status line.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: false },
+    },
+    SettingDef {
         key: "usage.refresh_minutes",
         label: "usage refresh",
         section: Section::Claude,

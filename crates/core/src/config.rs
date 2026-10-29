@@ -56,6 +56,9 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
+    /// Give every Claude session in a tab a name at its start, shown on its
+    /// status line.
+    pub name_sessions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

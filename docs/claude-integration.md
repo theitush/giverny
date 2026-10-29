@@ -45,6 +45,17 @@ cd "<transcript cwd>" && CLAUDE_CONFIG_DIR="<dir>" command claude --resume <id>
 
 `claude --resume` only finds a conversation from the directory it ran in — using the tab's current directory fails once you've `cd`'d. `command` bypasses shell wrapper functions named `claude`. If the session is already live elsewhere, resume is skipped: two writers interleave into one transcript.
 
+## Session names
+
+With `claude.name_sessions` on (off by default), every Claude session in a tab gets a name at its start, and the status line shows it beside the model: `Opus 4.5 (Rotem Giverny)`. The `SessionStart` hook's `giverny relay` draws it and replies with it as `additionalContext`, so the session knows its name before its first turn:
+
+- **First name**: drawn from a built-in list, never one a live session holds (live = its process is in the `sessions/<pid>.json` registry of any account). Drawing happens under a lock in the names directory, so two sessions starting at once never draw the same one.
+- **Surname**: the rail category the tab sits in, first letter capitalised (`giverny` → `Giverny`), taken from the saved workspace or, failing that, `$GIVERNY_CATEGORY`, which each tab's shell is given at spawn. A tab in no category takes the repo of the session's working directory (a worktree counts as its main checkout).
+- **Kept**: a name is fixed at birth, so moving or renaming the tab later renames nobody. `/clear` is a new session and gets a new name; a compaction keeps it, and so does a resume: the name is also recorded under the conversation's root (the first turn's `uuid`, which Claude Code carries over when it gives a resumed session a new id).
+- **Stored** as `~/.config/giverny/names/<session>.json` and `names/roots/<root>.json`. The setting itself is the file `names/on`, which the hooks and the status line check, so turning it on reaches sessions already running: one started with it off is named on its next prompt.
+
+Subagents, background jobs and sessions outside Giverny are never named. The name shows only where the live-usage statusline is installed.
+
 ## Accounts
 
 An account is a `CLAUDE_CONFIG_DIR`. Giverny finds them, in order: `~/.claude`; `$CLAUDE_CONFIG_DIR`; a shallow scan of `~` and `~/.config` for `claude*` directories that contain an identity file or a session registry; `$CCTOP_CONFIG_DIRS` if you happen to keep one; and `behavior.extra_profile_dirs` from the config.

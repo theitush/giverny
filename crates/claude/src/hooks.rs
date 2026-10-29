@@ -145,7 +145,10 @@ pub fn socket_path() -> PathBuf {
 
 /// The `giverny relay` entrypoint. Fast, silent, always exits successfully —
 /// a relay failure must never disturb the Claude session that ran the hook.
-pub fn run_relay(spool: &Path) {
+/// The one thing it may print is a session's name, at its start or its
+/// first prompt ([`crate::names::reply`]), with `claude.name_sessions` on; `base` is
+/// Giverny's config directory, where names are kept.
+pub fn run_relay(spool: &Path, base: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
     // Sessions outside Giverny tabs have no tab identity — nothing to relay
@@ -192,6 +195,11 @@ pub fn run_relay(spool: &Path) {
         event,
     };
     deliver(&msg, spool);
+    if msg.provider == "claude"
+        && let Some(reply) = crate::names::reply(&msg.event, base, crate::names::in_tab())
+    {
+        println!("{reply}");
+    }
 }
 
 /// Which account this session runs under.
@@ -659,8 +667,9 @@ pub const STATUSLINE_EVENT: &str = "GivernyStatusLine";
 /// The `giverny statusline` entrypoint: Claude Code runs this after every
 /// assistant message and displays our stdout. We forward the payload's
 /// official `rate_limits` to the app (fresh usage without any API call) and
-/// print a compact line back.
-pub fn run_statusline(spool: &Path) {
+/// print a compact line back. `base` is Giverny's config directory, where
+/// session names are kept ([`crate::names`]).
+pub fn run_statusline(spool: &Path, base: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
     let payload: serde_json::Value =
@@ -697,12 +706,19 @@ pub fn run_statusline(spool: &Path) {
             .map(|v| v.round() as i64)
     };
     let mut parts: Vec<String> = Vec::new();
+    let transcript = transcript_of(&payload);
     if let Some(model) = payload
         .get("model")
         .and_then(|m| m.get("display_name"))
         .and_then(|d| d.as_str())
     {
-        parts.push(model.to_string());
+        let name = payload
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .and_then(|s| crate::names::shown(base, s, transcript.as_deref()));
+        parts.push(model_segment(model, name.as_deref(), || {
+            accent_sgr(&statusline_accent_path())
+        }));
     }
     if let Some(p) = pct("five_hour") {
         parts.push(format!("5h {p}%"));
@@ -710,7 +726,6 @@ pub fn run_statusline(spool: &Path) {
     if let Some(p) = pct("seven_day") {
         parts.push(format!("wk {p}%"));
     }
-    let transcript = transcript_of(&payload);
     parts.extend(statusline_tokens(&payload, transcript.as_deref()));
     let now_ms = jiff::Timestamp::now().as_millisecond();
     parts.extend(cache_cold_segment(&payload, transcript.as_deref(), now_ms));
@@ -756,6 +771,50 @@ fn cache_cold_segment(
 /// SGR red and reset, around the status line's alarm segments.
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+
+/// The model, with the session's name beside it in the accent colour when
+/// it has one ([`crate::names`]): `Opus 4.5 (Rotem Giverny)`.
+fn model_segment(model: &str, name: Option<&str>, accent: impl FnOnce() -> String) -> String {
+    match name {
+        Some(name) => format!("{model} {}({name}){RESET}", accent()),
+        None => model.to_string(),
+    }
+}
+
+/// Where the app leaves its accent colour for the status line: beside the
+/// socket.
+pub fn statusline_accent_path() -> PathBuf {
+    socket_path().with_extension("accent")
+}
+
+/// Record the app's accent colour (`#rrggbb`) for the status line to draw a
+/// session's name in; the app writes it at start and on every theme change.
+pub fn write_statusline_accent(path: &Path, rgb: [u8; 3]) -> std::io::Result<()> {
+    let [r, g, b] = rgb;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("accent.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("#{r:02x}{g:02x}{b:02x}\n"))?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The SGR escape for the accent recorded at `path` (24-bit), else the
+/// terminal's bright cyan (no Giverny running, or one that has not recorded
+/// its accent yet).
+fn accent_sgr(path: &Path) -> String {
+    let rgb = std::fs::read_to_string(path).ok().and_then(|s| {
+        let hex = s.trim().strip_prefix('#')?;
+        let v = u32::from_str_radix(hex, 16)
+            .ok()
+            .filter(|_| hex.len() == 6)?;
+        Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+    });
+    match rgb {
+        Some([r, g, b]) => format!("\x1b[38;2;{r};{g};{b}m"),
+        None => "\x1b[96m".to_string(),
+    }
+}
 
 /// `session: <n> (+<compacted>)`, `subagents: <n>` and `total: <n>` for the
 /// status line (giverny#22, giverny#95): this conversation's own tokens, every subagent's
@@ -1155,6 +1214,23 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_carries_the_sessions_name_in_the_accent() {
+        assert_eq!(model_segment("Opus 4.5", None, || panic!()), "Opus 4.5");
+        assert_eq!(
+            model_segment("Opus 4.5", Some("Rotem Giverny"), || "<a>".into()),
+            "Opus 4.5 <a>(Rotem Giverny)\x1b[0m"
+        );
+        let dir = std::env::temp_dir().join(format!("giverny-accent-{}", std::process::id()));
+        let path = dir.join("giverny.accent");
+        assert_eq!(accent_sgr(&path), "\x1b[96m", "none recorded");
+        write_statusline_accent(&path, [0x12, 0xab, 0xff]).unwrap();
+        assert_eq!(accent_sgr(&path), "\x1b[38;2;18;171;255m");
+        std::fs::write(&path, "#12ab").unwrap();
+        assert_eq!(accent_sgr(&path), "\x1b[96m", "not a colour");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A short socket path of its own: a long one does not fit `sun_path`.
     #[cfg(unix)]

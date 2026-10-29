@@ -7,6 +7,7 @@
 
 pub mod hooks;
 pub mod jobs;
+pub mod names;
 pub mod profiles;
 pub mod registry;
 pub mod tokens;
