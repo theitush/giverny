@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- New theme **red-rock**, from Mark Badolato's iTerm2-Color-Schemes
+  collection: pastels on terracotta, a dark theme whose background is a colour
+  rather than a tint of black.
+
 ## v1.7.2 — 2026-10-18
 
 - Clearer rail status marks: idle agents use a filled dot, and the calm busy

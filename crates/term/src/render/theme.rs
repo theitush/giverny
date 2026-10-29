@@ -280,6 +280,21 @@ impl Theme {
         )
     }
 
+    /// Pastels on terracotta: the ground is the colour, not a tint of black.
+    /// Red Rock by Mark Badolato, from iTerm2-Color-Schemes (MIT).
+    pub fn red_rock() -> Self {
+        Theme::from_hex(
+            0x672a20,
+            0xfff0dc,
+            0xf7bd55,
+            0x672a20,
+            [
+                0xd9c7bb, 0xffa18b, 0x91d7a7, 0xf5d06f, 0x94c9ee, 0xe7a9d3, 0x87ddd7, 0xfff0dc,
+                0xe6d5ca, 0xffb5a1, 0xaae1ba, 0xffe08e, 0xb0d8f3, 0xefc0de, 0xa7e8e2, 0xfffaf2,
+            ],
+        )
+    }
+
     /// Monet's Rouen Cathedral series — one façade in more than thirty
     /// lights — as a theme that follows the clock. `hour` is local time,
     /// 0.0 to 24.0; the light between two of these is a blend of both, so the
@@ -406,6 +421,7 @@ impl Theme {
         "synthwave",
         "workbench",
         "riso",
+        "red-rock",
     ];
 
     /// Look up a built-in theme by config name.
@@ -425,6 +441,7 @@ impl Theme {
             "synthwave" => Theme::synthwave(),
             "workbench" => Theme::workbench(),
             "riso" => Theme::riso(),
+            "red-rock" => Theme::red_rock(),
             _ => Theme::monet_dark(),
         }
     }
@@ -562,6 +579,7 @@ mod tests {
         assert!(!Theme::by_name("monet-dark").is_light());
         assert!(Theme::by_name("monet-light").is_light());
         assert!(!Theme::by_name("ink").is_light());
+        assert!(!Theme::by_name("red-rock").is_light());
         assert!(
             !Theme::by_name("nonsense").is_light(),
             "unknown names fall back to the default dark theme"
