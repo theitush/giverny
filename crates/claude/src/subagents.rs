@@ -1123,6 +1123,9 @@ impl crate::feed::LiveAgent for SubagentRow {
     fn ended_ms(&self) -> Option<u64> {
         self.ended_ms
     }
+    fn last_sign_ms(&self) -> Option<u64> {
+        self.last_turn_ms.max(self.started_ms)
+    }
     fn parent_id(&self) -> Option<&str> {
         self.parent_id.as_deref()
     }

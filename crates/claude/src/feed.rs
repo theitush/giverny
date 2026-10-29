@@ -110,6 +110,10 @@ pub struct FeedRow {
     /// it. Its clock is stopped at `paused_since`, the last sign of life,
     /// until its manager revives it (`resume`), and NOW reads `killed`.
     pub killed_ms: Option<u64>,
+    /// `giverny manage`: when the row's session last went off with its
+    /// worker (giverny#489), kept past the revive: a worker not seen at
+    /// work since died then ([`died_with_session`]).
+    pub went_off_ms: Option<u64>,
     /// Estimated total duration, in seconds, from `started`.
     pub eta_s: Option<u64>,
     /// How late (`+`) or early (`-`) a Done row landed against `eta_s`, when
@@ -505,6 +509,7 @@ fn parse_row(v: &Value) -> Option<FeedRow> {
         paused_s: u64_field(v, "paused_s"),
         paused_since_ms: millis_field(v, "paused_since"),
         killed_ms: millis_field(v, "killed"),
+        went_off_ms: millis_field(v, "went_off"),
         eta_s: u64_field(v, "eta_s"),
         eta_delta_s: i64_field(v, "eta_delta_s"),
         left_s: u64_field(v, "left_s"),
@@ -743,10 +748,23 @@ pub trait LiveAgent {
     fn ended_ms(&self) -> Option<u64> {
         None
     }
+    /// When it was last seen at work: its latest turn, else its start.
+    fn last_sign_ms(&self) -> Option<u64> {
+        self.started_ms()
+    }
     /// The agent that spawned it, when another agent did (giverny#464).
     fn parent_id(&self) -> Option<&str> {
         None
     }
+}
+
+/// Did worker `l` of feed row `f` die with its session (giverny#489): the
+/// row is killed, or went off since the worker was last seen at work. A
+/// tracker restored over a restart may still list such a worker running.
+pub fn died_with_session<L: LiveAgent>(f: &FeedRow, l: &L) -> bool {
+    f.killed_ms.is_some()
+        || f.went_off_ms
+            .is_some_and(|off| l.last_sign_ms().is_none_or(|t| t <= off))
 }
 
 /// Does `text` name `key` as a whole word? `demo#82` is named by
@@ -1179,7 +1197,7 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
             let live = match f.agent_id.as_deref().and_then(find_live) {
                 Some(held)
                     if f.stage() == Stage::Running
-                        && (!held.running() || f.killed_ms.is_some()) =>
+                        && (!held.running() || died_with_session(f, held)) =>
                 {
                     successor(f, held).or(Some(held))
                 }

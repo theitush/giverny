@@ -1980,11 +1980,16 @@ fn still_finishing(row: &PaneRow<'_, SubagentRow>) -> bool {
 /// the manager session went off (giverny#489). Its clock stands stopped
 /// where the session last showed life until its manager revives it
 /// (`resume`): it reads [`KILLED`].
+///
+/// A row its manager resumed still holding that worker reads it too, its
+/// clock running: the worker is dead, though a tracker restored over the
+/// restart may still list it running.
 fn killed(row: &PaneRow<'_, SubagentRow>) -> bool {
-    row.stage == Stage::Running
-        && row
-            .feed
-            .is_some_and(|f| f.killed_ms.is_some() && f.paused_since_ms.is_some())
+    let Some(f) = row.feed.filter(|_| row.stage == Stage::Running) else {
+        return false;
+    };
+    (f.killed_ms.is_some() && f.paused_since_ms.is_some())
+        || row.live.is_some_and(|l| feed::died_with_session(f, l))
 }
 
 /// A cell is `"` when its row is the same worker as the row above
@@ -2713,14 +2718,18 @@ pub const KILLED: &str = "killed";
 /// A killed row's hover: when it went off, and that only its manager
 /// restarts it.
 fn killed_why(row: &PaneRow<'_, SubagentRow>, now_ms: u64, tz: &jiff::tz::TimeZone) -> String {
-    let off = row
-        .feed
-        .and_then(|f| f.paused_since_ms)
+    let f = row.feed;
+    let off = f
+        .and_then(|f| f.went_off_ms.or(f.paused_since_ms))
         .map(|p| format!(" at {}", clock_at(p, now_ms, tz)))
         .unwrap_or_default();
+    let clock = if row.paused_since_ms().is_some() {
+        "its clock stopped there until its manager revives it (a fresh worker, then resume)"
+    } else {
+        "resumed with no worker: a fresh one whose description names the task takes the row"
+    };
     format!(
-        "killed: Giverny, WSL or its manager session went off{off}, and its worker with it; \
-         its clock stopped there until its manager revives it (a fresh worker, then resume)"
+        "killed: Giverny, WSL or its manager session went off{off}, and its worker with it; {clock}"
     )
 }
 
@@ -8058,6 +8067,33 @@ mod tests {
         assert_eq!(t.lines[0].click.agent_id.as_deref(), Some("a2"));
         assert_eq!(t.lines[0].now, KILLED);
         assert_eq!(t.lines[0].elapsed, "10:00");
+        // Resumed still holding the dead worker, its tracker restored
+        // running over the restart: its clock runs, and NOW says its
+        // worker is dead; a fresh worker naming the task takes the row.
+        let resumed = feed(&format!(
+            r#"{{"writer":"giverny/manage","rows":[{{"key":"g#1","stage":"running","agent_id":"a1",
+                "eta_s":1800,"started":{},"went_off":{T0}}}]}}"#,
+            T0 + 50 * MIN,
+        ));
+        let t = build_at(
+            Some(&resumed),
+            &stale,
+            T0 + 65 * MIN,
+            &utc(&[], None),
+            &Logs::new(),
+        );
+        assert_eq!(t.lines[0].now, KILLED);
+        assert_eq!(t.lines[0].stage, Stage::Running);
+        let t = build_at(
+            Some(&resumed),
+            &fresh,
+            T0 + 70 * MIN,
+            &utc(&[], None),
+            &Logs::new(),
+        );
+        assert_eq!(t.lines.len(), 1);
+        assert_eq!(t.lines[0].click.agent_id.as_deref(), Some("a2"));
+        assert_eq!(t.lines[0].now, "Reading");
     }
 
     /// A `giverny manage` feed moves `started` only as a pause closes: its
