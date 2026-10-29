@@ -52,7 +52,6 @@
 //! A row with none of these still answers the click, with a page saying
 //! what is missing, rather than doing nothing.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -760,6 +759,11 @@ impl Stuck {
 pub enum Tick {
     /// Write this key to the parent's pty.
     Send(Keystroke),
+    /// Write this key so many times (more than one), in one write: Claude
+    /// Code reads each of the keys in it (2.1.312: three `←` and a letter
+    /// in one write land as four keys), so a known number of steps along
+    /// the strip costs one redraw, not one per step (giverny#495).
+    Repeat(Keystroke, u8),
     /// Nothing yet; look again next frame.
     Wait,
     /// The foreground key is sent: the worker's view is open.
@@ -767,8 +771,18 @@ pub enum Tick {
     Stuck(Stuck),
 }
 
-/// The gap between two keys: each must be its own write.
-pub const KEY_GAP: Duration = Duration::from_millis(40);
+/// `key` pressed `n` times (at least once), as one write.
+fn press(key: Keystroke, n: usize) -> Tick {
+    match u8::try_from(n.max(1)).unwrap_or(u8::MAX) {
+        1 => Tick::Send(key),
+        n => Tick::Repeat(key, n),
+    }
+}
+
+/// The least gap between two writes of keys. Every key after the first
+/// waits for the screen to show the last one's effect anyway; this only
+/// keeps two writes out of one frame.
+pub const KEY_GAP: Duration = Duration::from_millis(16);
 /// How long a key's effect is waited for before the screen is read afresh.
 pub const SETTLE: Duration = Duration::from_millis(700);
 /// How long a worker's view must hold still, prompt drawn but cursor not in
@@ -776,7 +790,8 @@ pub const SETTLE: Duration = Duration::from_millis(700);
 /// Claude Code draws the frame and puts its cursor back in one write, so
 /// this only has to outlast a frame split across reads; the full [`SETTLE`]
 /// here cost every open ~0.7 s whenever a background shell was running.
-pub const FOCUS_CALM: Duration = Duration::from_millis(150);
+/// The same calm as a final screen's ([`SETTLE_CALM`]).
+pub const FOCUS_CALM: Duration = Duration::from_millis(60);
 /// The whole attach, start to finish.
 pub const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -798,13 +813,16 @@ pub struct Attach {
     id: Option<String>,
     /// ↓ has been sent out of the prompt.
     opened: bool,
-    /// Enter on the worker is queued.
+    /// Enter on the worker has gone.
     finishing: bool,
-    queue: VecDeque<Keystroke>,
     last_key: Option<Instant>,
-    /// After the queue drains, wait until the view differs from this one,
-    /// or the instant passes.
+    /// After a key, wait until the view differs from this one, or the
+    /// instant passes.
     settle: Option<(Instant, View)>,
+    /// The strip row the last steps were to bring the selection to: a
+    /// screen with it short of there is one the keys have not all reached
+    /// yet, and is waited out like an unchanged one.
+    expect: Option<usize>,
     deadline: Instant,
 }
 
@@ -817,9 +835,9 @@ impl Attach {
             id: None,
             opened: false,
             finishing: false,
-            queue: VecDeque::new(),
             last_key: None,
             settle: None,
+            expect: None,
             deadline: now + DEADLINE,
         }
     }
@@ -852,35 +870,22 @@ impl Attach {
             || self.aliases.iter().any(|a| label_matches(label, a))
     }
 
-    fn push(&mut self, keys: &[Keystroke], view: View, now: Instant) -> Tick {
-        self.queue.extend(keys.iter().copied());
+    /// `key`, `n` times in one write; the next look waits for the view
+    /// to change from `view`.
+    fn push(&mut self, key: Keystroke, n: usize, view: View, now: Instant) -> Tick {
+        self.expect = None;
+        self.last_key = Some(now);
         self.settle = Some((now + SETTLE, view));
-        self.send_next(now)
-    }
-
-    fn send_next(&mut self, now: Instant) -> Tick {
-        if self.last_key.is_some_and(|t| now < t + KEY_GAP) {
-            return Tick::Wait;
-        }
-        match self.queue.pop_front() {
-            Some(k) => {
-                self.last_key = Some(now);
-                if let Some((until, _)) = &mut self.settle {
-                    *until = now + SETTLE;
-                }
-                Tick::Send(k)
-            }
-            None => Tick::Wait,
-        }
+        press(key, n)
     }
 
     /// One frame: `screen` and `undimmed` are the parent's screen now.
     pub fn tick(&mut self, now: Instant, screen: &str, undimmed: &str) -> Tick {
-        if !self.queue.is_empty() {
-            return self.send_next(now);
-        }
         if self.finishing {
             return Tick::Done;
+        }
+        if self.last_key.is_some_and(|t| now < t + KEY_GAP) {
+            return Tick::Wait;
         }
         if now >= self.deadline {
             return Tick::Stuck(Stuck::TimedOut);
@@ -897,7 +902,13 @@ impl Attach {
             };
         }
         if let Some((until, before)) = &self.settle {
-            if view == *before && now < *until {
+            let short = match (&view, self.expect) {
+                (View::Strip(items), Some(row)) => {
+                    items.iter().position(|it| it.selected) != Some(row)
+                }
+                _ => false,
+            };
+            if (view == *before || short) && now < *until {
                 return Tick::Wait;
             }
             self.settle = None;
@@ -935,6 +946,9 @@ impl Attach {
                 let Some(at) = items.iter().position(|it| it.selected) else {
                     return Tick::Wait;
                 };
+                // Every step to the row in one write; Enter only once the
+                // screen shows the selection on it.
+                let steps = target.abs_diff(at);
                 let key = match target.cmp(&at) {
                     std::cmp::Ordering::Equal => {
                         self.finishing = true;
@@ -943,7 +957,11 @@ impl Attach {
                     std::cmp::Ordering::Greater => cc_keys::NEXT,
                     std::cmp::Ordering::Less => cc_keys::PREVIOUS,
                 };
-                self.push(&[key], view, now)
+                let tick = self.push(key, steps.max(1), view, now);
+                if steps > 0 {
+                    self.expect = Some(target);
+                }
+                tick
             }
             View::Prompt { .. } => {
                 self.opened = true;
@@ -951,8 +969,7 @@ impl Attach {
                 // into the strip. A Down too many only moves the strip's
                 // selection, which the next look corrects.
                 let downs = prompt_rows(screen) + 1;
-                let keys = vec![cc_keys::NEXT; downs];
-                self.push(&keys, view, now)
+                self.push(cc_keys::NEXT, downs, view, now)
             }
             View::List(_) | View::Detail(_) | View::Other => Tick::Stuck(Stuck::NoPrompt),
         }
@@ -1086,6 +1103,13 @@ pub struct Walk {
     /// The screen, and since when it has looked like that.
     calm: Option<(Instant, Held)>,
     ups: u8,
+    /// When the last ↑s up the strip went, and the row they were to bring
+    /// the selection to (`None`: out of the strip). A screen still short
+    /// of that is waited out, up to [`SETTLE`]: Claude Code redraws the
+    /// strip on its own (a busy worker's row), and an ↑ sent on such a
+    /// screen for a row the last ones already took could go past the
+    /// strip's top and recall the prompt's history.
+    ups_to: Option<(Instant, Option<usize>)>,
     /// In the worker's view with the focus off the strip: its rows may go.
     off_strip: bool,
     deadline: Instant,
@@ -1127,6 +1151,7 @@ impl Walk {
             hold: None,
             calm: None,
             ups: 0,
+            ups_to: None,
             off_strip: false,
             deadline: now + WALK_DEADLINE,
         }
@@ -1174,8 +1199,14 @@ impl Walk {
     }
 
     fn key(&mut self, k: Keystroke, seen: Seen, now: Instant) -> Tick {
+        self.keys(k, 1, seen, now)
+    }
+
+    /// `k`, `n` times in one write; the next look waits for the screen to
+    /// change from `seen`.
+    fn keys(&mut self, k: Keystroke, n: usize, seen: Seen, now: Instant) -> Tick {
         self.hold = Some((now, seen));
-        Tick::Send(k)
+        press(k, n)
     }
 
     /// The view on screen is the goal's.
@@ -1284,10 +1315,24 @@ impl Walk {
                 match &view {
                     // The strip still has the focus: ↑ walks the selection
                     // up it, and past its top out of it. It never changes
-                    // the view — only Enter does.
-                    View::Strip(_) if self.ups < MAX_UPS => {
-                        self.ups += 1;
-                        self.key(cc_keys::PREVIOUS, seen, now)
+                    // the view — only Enter does. Every row above the
+                    // selection goes in one write, up to `main`; the ↑ out
+                    // of the strip goes on its own, once the screen shows
+                    // the selection on `main`, so no ↑ is ever sent past
+                    // the strip on a guess: two too many there would
+                    // recall the prompt's history.
+                    View::Strip(items) if self.ups < MAX_UPS => {
+                        let at = items.iter().position(|it| it.selected).unwrap_or(0);
+                        if let Some((sent, to)) = self.ups_to
+                            && to.is_none_or(|to| at > to)
+                            && now < sent + SETTLE
+                        {
+                            return Tick::Wait;
+                        }
+                        let n = at.clamp(1, usize::from(MAX_UPS - self.ups));
+                        self.ups += n as u8;
+                        self.ups_to = Some((now, at.checked_sub(n)));
+                        self.keys(cc_keys::PREVIOUS, n, seen, now)
                     }
                     View::Prompt { .. } if !self.off_strip && viewing_worker(screen) => {
                         self.off_strip = true;
@@ -1388,6 +1433,8 @@ pub fn one_line(text: &str) -> String {
 pub enum Put {
     /// Write this key to the manager's pty.
     Key(Keystroke),
+    /// Write this key so many times, in one write ([`Tick::Repeat`]).
+    Keys(Keystroke, u8),
     /// Write this text to the manager's pty, as typed.
     Text(String),
     Wait,
@@ -1413,6 +1460,11 @@ fn box_text(screen: &str, undimmed: &str) -> Option<String> {
 /// How much of the line's start must show in the manager's prompt before
 /// Enter goes: enough to know the text landed there and nowhere else.
 const READ_BACK: usize = 24;
+
+/// How long a line typed at the manager's prompt sits there, read back,
+/// before its Enter goes: the 40 ms the line has always had, kept when the
+/// walk's own gap between keys went down (giverny#495).
+const TEXT_TO_ENTER: Duration = Duration::from_millis(40);
 
 /// Claude Code's stand-in for a long paste in its prompt box: the text is
 /// all there, drawn as `[Pasted text #1 +N lines]`.
@@ -1464,6 +1516,7 @@ impl Forward {
         match &mut self.phase {
             Step::Home(walk) => match walk.tick(now, look) {
                 Tick::Send(k) => Put::Key(k),
+                Tick::Repeat(k, n) => Put::Keys(k, n),
                 Tick::Wait => Put::Wait,
                 Tick::Done => {
                     self.go(Step::Type, now);
@@ -1488,7 +1541,7 @@ impl Forward {
                     .collect();
                 let shown = box_text(look.screen, look.undimmed)
                     .is_some_and(|t| t.contains(&want) || t.contains(PASTED));
-                if shown && waited >= KEY_GAP {
+                if shown && waited >= TEXT_TO_ENTER {
                     self.go(Step::Entered, now);
                     return Put::Key(Keystroke::Enter);
                 }
@@ -1525,22 +1578,22 @@ pub const SETTLE_MAX: Duration = Duration::from_millis(2500);
 
 /// After a [`Walk`] lands: waits for the screen to be the view's final
 /// one, so the terminal can go from the view before to it in one frame.
-/// Into a worker's view with the management panel on, final is
-/// the strip's agent rows gone again (only its `main` row stays, and that
-/// is not drawn); back on main, it is main's prompt.
+/// Into a worker's view, final is that view: the strip's agent rows the
+/// walk had drawn may still be under it, but they are not drawn
+/// ([`row_marks`]), and the relay's answer that takes them away changes
+/// nothing above them, so it is not waited for (giverny#495); back on
+/// main, it is main's prompt.
 #[derive(Debug, Clone)]
 pub struct Settle {
     main: bool,
-    pane_on: bool,
     since: Instant,
     good_since: Option<Instant>,
 }
 
 impl Settle {
-    pub fn new(goal: &Goal, pane_on: bool, now: Instant) -> Settle {
+    pub fn new(goal: &Goal, now: Instant) -> Settle {
         Settle {
             main: matches!(goal, Goal::Main),
-            pane_on,
             since: now,
             good_since: None,
         }
@@ -1551,7 +1604,7 @@ impl Settle {
         if self.main {
             !viewing_worker(screen)
         } else {
-            viewing_worker(screen) && (!self.pane_on || strip_agents(screen).is_empty())
+            viewing_worker(screen)
         }
     }
 
@@ -1669,6 +1722,14 @@ impl Nudge {
     pub fn is_narrow(&self) -> bool {
         self.narrowed.is_some()
     }
+
+    /// Claude Code's next relay run is due with no more help: the width
+    /// has gone back since the last [`Nudge::ask`], or went back so
+    /// shortly before it that the run it set off reads the ask. Past this
+    /// the ask is answered whether or not anyone keeps nudging.
+    pub fn answer_due(&self) -> bool {
+        self.narrowed.is_none() && self.last.is_some()
+    }
 }
 
 // ------------------------------------------------------------ marks ----
@@ -1701,6 +1762,18 @@ pub fn row_marks(screen: &str) -> giverny_term::widget::RowMarks {
     };
     if !viewing_worker(screen) {
         return marks;
+    }
+    // Nor are the strip's agent rows under a worker's view: the relay
+    // draws them only for a walk, which shows the view before its answer
+    // takes them away again (giverny#495).
+    if let Some(at) = rows.iter().rposition(|r| main_row(r).is_some()) {
+        let agents = rows[at + 1..]
+            .iter()
+            .take_while(|r| !r.trim().is_empty())
+            .count();
+        marks
+            .hidden
+            .extend((at + 1..at + 1 + agents).filter_map(as_row));
     }
     marks.escape = matches!(
         read_view(screen, screen),
@@ -2322,17 +2395,18 @@ mod tests {
         let mut t = Instant::now();
         let mut a = Attach::new("theta worker", t);
         let prompt = at_prompt("");
-        // ↓ out of the prompt box (one row) and past the shells pill.
-        assert_eq!(drive(&mut a, &mut t, &prompt), Tick::Send(Keystroke::Down));
-        assert_eq!(drive(&mut a, &mut t, &prompt), Tick::Send(Keystroke::Down));
-        // The strip has the focus on `main`; the worker is two rows down.
+        // ↓ out of the prompt box (one row) and past the shells pill, in
+        // one write.
+        assert_eq!(
+            drive(&mut a, &mut t, &prompt),
+            Tick::Repeat(Keystroke::Down, 2)
+        );
+        // The strip has the focus on `main`; the worker is two rows down:
+        // both steps in one write, and Enter once the screen shows the
+        // selection there.
         assert_eq!(
             drive(&mut a, &mut t, &in_strip(0)),
-            Tick::Send(Keystroke::Down)
-        );
-        assert_eq!(
-            drive(&mut a, &mut t, &in_strip(1)),
-            Tick::Send(Keystroke::Down)
+            Tick::Repeat(Keystroke::Down, 2)
         );
         assert_eq!(
             drive(&mut a, &mut t, &in_strip(2)),
@@ -2360,6 +2434,7 @@ mod tests {
         loop {
             match drive(&mut a, &mut t, &draft) {
                 Tick::Send(Keystroke::Down) => downs += 1,
+                Tick::Repeat(Keystroke::Down, n) => downs += n,
                 other => {
                     assert_eq!(other, Tick::Stuck(Stuck::NotListed));
                     break;
@@ -2376,21 +2451,42 @@ mod tests {
         let mut t = Instant::now();
         let mut a = Attach::new("theta worker", t);
         a.opened = true;
-        assert_eq!(a.tick(t, &in_strip(0), ""), Tick::Send(Keystroke::Down));
-        // Same screen: the Down has not landed yet, so no second Down.
+        assert_eq!(
+            a.tick(t, &in_strip(0), ""),
+            Tick::Repeat(Keystroke::Down, 2)
+        );
+        // Same screen: the Downs have not landed yet, so nothing more.
         t += Duration::from_millis(100);
         assert_eq!(a.tick(t, &in_strip(0), ""), Tick::Wait);
-        // Keys go out at least KEY_GAP apart.
-        let mut b = Attach::new("x", t);
-        let prompt = at_prompt("");
-        assert_eq!(b.tick(t, &prompt, &prompt), Tick::Send(Keystroke::Down));
+        // One of them drawn: the other is still on its way, not sent again.
+        assert_eq!(a.tick(t, &in_strip(1), ""), Tick::Wait);
+        // Both: Enter.
+        assert_eq!(a.tick(t, &in_strip(2), ""), Tick::Send(Keystroke::Enter));
+        // A screen that stays short of the row is read for what it is
+        // once SETTLE has gone by: the step that did not land goes again.
+        let mut b = Attach::new("theta worker", t);
+        b.opened = true;
         assert_eq!(
-            b.tick(t + Duration::from_millis(5), &prompt, &prompt),
+            b.tick(t, &in_strip(0), ""),
+            Tick::Repeat(Keystroke::Down, 2)
+        );
+        assert_eq!(b.tick(t + KEY_GAP, &in_strip(1), ""), Tick::Wait);
+        assert_eq!(
+            b.tick(t + SETTLE, &in_strip(1), ""),
+            Tick::Send(Keystroke::Down)
+        );
+        // Writes go out at least KEY_GAP apart, even on a screen that
+        // changed at once.
+        let mut c = Attach::new("eta worker", t);
+        c.opened = true;
+        assert_eq!(c.tick(t, &in_strip(0), ""), Tick::Send(Keystroke::Down));
+        assert_eq!(
+            c.tick(t + Duration::from_millis(5), &in_strip(1), ""),
             Tick::Wait
         );
         assert_eq!(
-            b.tick(t + KEY_GAP, &prompt, &prompt),
-            Tick::Send(Keystroke::Down)
+            c.tick(t + KEY_GAP, &in_strip(1), ""),
+            Tick::Send(Keystroke::Enter)
         );
     }
 
@@ -2419,8 +2515,10 @@ mod tests {
         // ↓ went out and no strip came: no agent to view.
         let mut d = Attach::new("eta worker", t);
         let bare = prompt_screen("");
-        assert_eq!(drive(&mut d, &mut t, &bare), Tick::Send(Keystroke::Down));
-        assert_eq!(drive(&mut d, &mut t, &bare), Tick::Send(Keystroke::Down));
+        assert_eq!(
+            drive(&mut d, &mut t, &bare),
+            Tick::Repeat(Keystroke::Down, 2)
+        );
         assert_eq!(drive(&mut d, &mut t, &bare), Tick::Stuck(Stuck::NotListed));
     }
 
@@ -2601,6 +2699,13 @@ mod tests {
             (screen, undimmed, cursor)
         }
 
+        /// `k` `n` times, as one write: Claude Code takes each in turn.
+        fn keys(&mut self, k: Keystroke, n: u8) {
+            for _ in 0..n {
+                self.key(k);
+            }
+        }
+
         fn key(&mut self, k: Keystroke) {
             self.keys += 1;
             self.settle();
@@ -2661,6 +2766,7 @@ mod tests {
             };
             match w.tick(t, look) {
                 Tick::Send(k) => fake.key(k),
+                Tick::Repeat(k, n) => fake.keys(k, n),
                 Tick::Wait => {}
                 other => return other,
             }
@@ -2723,15 +2829,22 @@ mod tests {
                     undimmed: &undimmed,
                     cursor,
                 };
-                match w.tick(t, look) {
-                    Tick::Send(k) => {
-                        assert!(
-                            !(k == Keystroke::Up
-                                && !w.wants_strip()
-                                && fake.focus == Focus::Prompt),
-                            "an ↑ went to the prompt"
-                        );
-                        fake.key(k);
+                let tick = w.tick(t, look);
+                match tick {
+                    Tick::Send(k) | Tick::Repeat(k, _) => {
+                        let n = match tick {
+                            Tick::Repeat(_, n) => n,
+                            _ => 1,
+                        };
+                        for _ in 0..n {
+                            assert!(
+                                !(k == Keystroke::Up
+                                    && !w.wants_strip()
+                                    && fake.focus == Focus::Prompt),
+                                "an ↑ went to the prompt"
+                            );
+                            fake.key(k);
+                        }
                     }
                     Tick::Wait => {}
                     other => break other,
@@ -2749,39 +2862,30 @@ mod tests {
     }
 
     #[test]
-    fn settle_waits_for_the_strips_rows_to_go_then_for_calm() {
+    fn settle_takes_the_view_with_the_strips_rows_still_under_it() {
         let t = Instant::now();
         let goal = Goal::Worker {
             description: "eta worker".into(),
             aliases: vec![],
             agent_id: None,
         };
-        let mut s = Settle::new(&goal, true, t);
-        // In the view, the strip still showing its agent rows.
-        assert!(!s.done(t, WORKER_VIEW_STRIP));
-        assert!(!s.done(t + SETTLE_CALM * 3, WORKER_VIEW_STRIP));
-        // The relay hid them: only `main` is left.
-        let hidden: String = WORKER_VIEW_STRIP
-            .lines()
-            .filter(|l| !l.contains("general-purpose  "))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let at = t + Duration::from_millis(400);
-        assert!(!s.done(at, &hidden), "not before it holds");
-        assert!(s.done(at + SETTLE_CALM, &hidden));
-        // With the pane off the strip is Claude Code's: the view is enough.
-        let mut off = Settle::new(&goal, false, t);
-        assert!(!off.done(t, WORKER_VIEW_STRIP));
-        assert!(off.done(t + SETTLE_CALM, WORKER_VIEW_STRIP));
+        // In the view, the strip still showing its agent rows: they are
+        // not drawn (`row_marks`), so the view is final once it holds.
+        let mut s = Settle::new(&goal, t);
+        assert!(!s.done(t, WORKER_VIEW_STRIP), "not before it holds");
+        assert!(s.done(t + SETTLE_CALM, WORKER_VIEW_STRIP));
+        // Not on main's screen.
+        let mut main = Settle::new(&goal, t);
+        assert!(!main.done(t, &at_prompt("")));
+        assert!(!main.done(t + SETTLE_CALM, &at_prompt("")));
         // Never longer than SETTLE_MAX.
-        let mut late = Settle::new(&goal, true, t);
-        assert!(late.done(t + SETTLE_MAX, WORKER_VIEW_STRIP));
+        assert!(main.done(t + SETTLE_MAX, &at_prompt("")));
     }
 
     #[test]
     fn settle_home_is_main_on_screen() {
         let t = Instant::now();
-        let mut s = Settle::new(&Goal::Main, true, t);
+        let mut s = Settle::new(&Goal::Main, t);
         assert!(!s.done(t, WORKER_VIEW_STRIP));
         assert!(!s.done(t, &at_prompt("")));
         assert!(s.done(t + SETTLE_CALM, &at_prompt("")));
@@ -3029,6 +3133,78 @@ mod tests {
     }
 
     #[test]
+    fn a_long_strip_is_walked_in_few_writes_and_never_past_its_top() {
+        // Six workers: the steps to a row, and the ↑s back up the strip,
+        // go a write at a time, not a key at a time (giverny#495), and
+        // the focus still ends in the prompt with nothing recalled.
+        const NAMES: [&str; 6] = ["w1", "w2", "w3", "w4", "w5", "w6"];
+        for shells in [true, false] {
+            for (i, name) in NAMES.iter().enumerate() {
+                let mut fake = Fake::new();
+                fake.shells = shells;
+                fake.tagged = true;
+                fake.agents = NAMES.iter().map(|n| (*n, *n)).collect();
+                let v = i + 1;
+                let mut w = Walk::open(*name, vec![], Instant::now()).by_id(fake_id(v));
+                let mut writes = 0;
+                let mut t = Instant::now();
+                let done = loop {
+                    fake.asked = w.wants_strip();
+                    let (screen, undimmed, cursor) = fake.look();
+                    let look = Look {
+                        screen: &screen,
+                        undimmed: &undimmed,
+                        cursor,
+                    };
+                    match w.tick(t, look) {
+                        Tick::Send(k) => {
+                            writes += 1;
+                            fake.key(k);
+                        }
+                        Tick::Repeat(k, n) => {
+                            writes += 1;
+                            fake.keys(k, n);
+                        }
+                        Tick::Wait => {}
+                        other => break other,
+                    }
+                    t += Duration::from_millis(20);
+                };
+                assert_eq!(done, Tick::Done, "{name}, shells {shells}");
+                assert_eq!(fake.view, v, "on {name}'s view");
+                assert_clean(&fake);
+                // Into the strip, to the row, Enter; up to `main`, out of
+                // the strip, the pill.
+                assert!(writes <= 6, "{name}, shells {shells}: {writes} writes");
+            }
+        }
+    }
+
+    #[test]
+    fn no_up_goes_on_a_redraw_its_last_one_has_not_reached() {
+        let t = Instant::now();
+        let mut w = Walk::open("eta worker", vec![], t);
+        w.phase = Phase::Focus { pill_up: false };
+        fn look(s: &str) -> Look<'_> {
+            Look {
+                screen: s,
+                undimmed: s,
+                cursor: None,
+            }
+        }
+        // On `main`, the strip focused: one ↑ leaves it.
+        let on_main = WORKER_VIEW_STRIP;
+        assert_eq!(w.tick(t, look(on_main)), Tick::Send(Keystroke::Up));
+        // Claude Code redraws a busy row's clock before the ↑ lands: the
+        // strip is still focused on `main`, and a second ↑ would recall
+        // the prompt's history once the first lands.
+        let ticked = on_main.replace("8s · ↓", "9s · ↓");
+        assert_eq!(w.tick(t + KEY_GAP * 2, look(&ticked)), Tick::Wait);
+        // Past SETTLE the screen is taken at its word: that ↑ was lost.
+        assert_eq!(w.tick(t + SETTLE, look(&ticked)), Tick::Send(Keystroke::Up));
+    }
+
+    #[test]
     fn a_walk_never_types_over_a_dialog() {
         let mut fake = Fake::new();
         fake.permission = true;
@@ -3081,6 +3257,7 @@ mod tests {
             };
             match f.tick(t, look) {
                 Put::Key(k) => fake.key(k),
+                Put::Keys(k, n) => fake.keys(k, n),
                 Put::Text(text) => fake.type_text(&text),
                 Put::Wait => {}
                 other => return other,
@@ -3260,8 +3437,13 @@ mod tests {
     fn marks_hide_main_and_put_the_way_back_where_it_was() {
         let marks = row_marks(WORKER_VIEW_STRIP);
         let rows: Vec<&str> = WORKER_VIEW_STRIP.lines().collect();
-        assert_eq!(marks.hidden, vec![7], "the `❯ ◯ main` row");
+        assert_eq!(
+            marks.hidden,
+            vec![7, 8, 9],
+            "the `❯ ◯ main` row and the agent rows under it (giverny#495)"
+        );
         assert!(rows[7].contains("◯ main"));
+        assert!(rows[9].contains("theta worker"));
         let (row, used) = marks.button.expect("a worker's view has the button");
         assert_eq!((row, used), (7, 0), "on the hidden `main` row");
         assert_eq!(marks.button_left, Some(2), "at the dot, under the text");
@@ -3364,6 +3546,10 @@ mod tests {
                     Tick::Send(k) => {
                         sent.push(format!("{k:?}"));
                         send(&keystroke_bytes(k, enc));
+                    }
+                    Tick::Repeat(k, n) => {
+                        sent.push(format!("{k:?} x{n}"));
+                        send(&keystroke_bytes(k, enc).repeat(usize::from(n)));
                     }
                     Tick::Wait => {}
                     other => {
@@ -3501,6 +3687,10 @@ mod tests {
                     Tick::Send(k) => {
                         log.push(format!("{:?} {k:?}", started.elapsed()));
                         send(&keystroke_bytes(k, enc));
+                    }
+                    Tick::Repeat(k, n) => {
+                        log.push(format!("{:?} {k:?} x{n}", started.elapsed()));
+                        send(&keystroke_bytes(k, enc).repeat(usize::from(n)));
                     }
                     Tick::Wait => {}
                     other => break other,
