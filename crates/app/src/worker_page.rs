@@ -899,6 +899,10 @@ mod tests {
         let plain: Vec<String> = out.iter().map(|l| strip(l)).collect();
         assert!(plain.iter().any(|l| l.contains("⎿  Not sent: a draft")));
         assert!(plain.iter().any(|l| l.starts_with("❯ sayhi")));
+        // A blank row between why and the back button's row.
+        let (out, button) = p.lines(60, 5);
+        assert!(strip(&out[button - 2]).contains("Not sent"), "{out:?}");
+        assert_eq!(strip(&out[button - 1]), "");
         // Esc clears a line first, then goes back.
         let k = keys_of(&ctx, &mut p, vec![key(Key::Escape)]);
         assert!(!k.back);
