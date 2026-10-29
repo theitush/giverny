@@ -1051,7 +1051,9 @@ pub fn refusal(what: &str, o: &Owner, verb: &str, w: &dyn World) -> String {
 /// The machine as it is: `/proc`, Giverny's feeds and Claude Code's
 /// registry. Read lazily: only what a reach asks for.
 pub struct System {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     feeds: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     config_dirs: std::cell::OnceCell<Vec<PathBuf>>,
 }
 
@@ -1063,11 +1065,13 @@ impl System {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn config_dirs(&self) -> &[PathBuf] {
         self.config_dirs
             .get_or_init(|| crate::registry::ambient_config_dirs(None))
     }
 
+    #[cfg(target_os = "linux")]
     fn ledger(&self) -> PathBuf {
         crate::resources::ledger_path(&self.feeds)
     }

@@ -94,9 +94,16 @@ fn read_loop(last: &Mutex<Option<Arc<Reading>>>, ctx: &egui::Context) {
     // On a steady beat, whatever a pass costs.
     let mut next = std::time::Instant::now();
     loop {
-        if let Some(r) = sampler.sample(app, &runs_dir) {
-            *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(r));
-            ctx.request_repaint();
+        match sampler.sample(app, &runs_dir) {
+            Some(r) => {
+                *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(r));
+                ctx.request_repaint();
+            }
+            // Nothing to read here and no caps to hold: no figures, no
+            // thread. macOS reads nothing either but holds the caps each
+            // pass ([`giverny_claude::user_cap`]), so its loop goes on.
+            None if cfg!(not(any(target_os = "linux", target_os = "macos"))) => return,
+            None => {}
         }
         next += EVERY;
         let now = std::time::Instant::now();

@@ -283,6 +283,13 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
     out
 }
 
+/// Whether this build installs the plugin at all. Its launchers
+/// (`bin/giverny-manage`, `bin/giverny-eta`, `bin/giverny-hook`) are
+/// `#!/bin/sh` scripts, which native-Windows Claude Code cannot run; there
+/// the plugin is neither written nor named in any account, and what an older
+/// build wrote is taken back as the switch's off does.
+pub const SUPPORTED: bool = cfg!(unix);
+
 /// Where the manage skill sits in the marketplace.
 pub const SKILL_PATH: &str = "plugins/giverny/skills/manage/SKILL.md";
 

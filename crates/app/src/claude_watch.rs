@@ -553,17 +553,20 @@ pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 /// Is this a side instance that must leave every account's Claude config
 /// alone?
 ///
-/// Each account's `settings.json` names one Giverny binary for its hooks,
-/// status lines and plugin, and every Giverny adopts the accounts it finds:
-/// it points those entries at *its own* executable and follows *its own*
-/// `management_panel` setting. A second Giverny started to test a build — even
-/// with a config and runtime dir of its own — therefore re-points the live
-/// instance's sessions at the test binary, or strips the subagent line and
-/// the plugin (and `plugins/known_marketplaces.json`) out from under it.
+/// Each account's `settings.json` names Giverny's link for its hooks,
+/// status lines and plugin, and every Giverny points that link at itself
+/// and adopts the accounts it finds, following *its own* `management_panel`
+/// setting. A second Giverny started to test a build — even with a config
+/// and runtime dir of its own — therefore re-points every session's hooks at
+/// the test binary, which `cargo clean` can then delete out from under them,
+/// or strips the subagent line and the plugin (and
+/// `plugins/known_marketplaces.json`) out from under the live instance.
 ///
-/// `GIVERNY_NO_ACCOUNT_SETUP=1` turns all of that off: hooks, status lines,
-/// auto mode, the subagent line and the plugin are read but never written,
-/// at startup or from the UI. Set and not empty or `0` counts as on.
+/// `GIVERNY_NO_ACCOUNT_SETUP=1` turns all of that off: the link, hooks,
+/// status lines, auto mode, the subagent line and the plugin are read but
+/// never written, at startup or from the UI. Set and not empty or `0` counts
+/// as on. This is the one switch: everything that asks whether this is a
+/// side instance asks it here, through [`side_instance`].
 ///
 /// An explicit switch rather than a guess: a test build differs from the
 /// installed one only in its path, which is exactly what a real reinstall
@@ -571,6 +574,12 @@ pub const NO_ACCOUNT_SETUP_ENV: &str = "GIVERNY_NO_ACCOUNT_SETUP";
 /// exists to follow that.
 pub fn leaves_accounts_alone(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Is this Giverny a side instance? [`leaves_accounts_alone`] of
+/// [`NO_ACCOUNT_SETUP_ENV`] as this process was started with.
+pub fn side_instance() -> bool {
+    leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref())
 }
 
 /// What a write refused by a side instance reports, for the UI's log line.
@@ -889,8 +898,7 @@ impl ClaudeWatch {
             }
         };
 
-        let leave_accounts =
-            leaves_accounts_alone(std::env::var_os(NO_ACCOUNT_SETUP_ENV).as_deref());
+        let leave_accounts = side_instance();
         if leave_accounts {
             tracing::info!("{LEFT_ALONE}");
         } else {
@@ -2251,7 +2259,8 @@ impl ClaudeWatch {
     /// The same switch carries the `giverny` plugin: on, its
     /// marketplace is written under `base` (Giverny's config dir) and each
     /// account's `settings.json` gains the two keys that load it; off, the
-    /// keys go and so does the directory. `skill` is
+    /// keys go and so does the directory. Off Unix the plugin is always
+    /// off ([`giverny_claude::plugin::SUPPORTED`]). `skill` is
     /// `management_panel.manage_skill`: off, the plugin is written without
     /// its manage skill. `names` is `management_panel.ask_names`
     /// (giverny#343): on (with the pane), `<feeds>/names/on` tells the
@@ -2278,7 +2287,9 @@ impl ClaudeWatch {
             Err(err) => tracing::warn!("session names switch not written: {err}"),
         }
         let dir = giverny_claude::plugin::marketplace_dir(base);
-        if enable {
+        // Unix only: its launchers are shell scripts.
+        let plugin = enable && giverny_claude::plugin::SUPPORTED;
+        if plugin {
             match giverny_claude::plugin::sync(
                 &dir,
                 &giverny_claude::plugin::exe_candidates(),
@@ -2301,17 +2312,18 @@ impl ClaudeWatch {
                 Ok(false) => {}
                 Err(err) => tracing::info!("subagentStatusLine skipped for {}: {err}", p.name),
             }
-            match giverny_claude::plugin::set_plugin(&settings, &dir, enable) {
+            let keys = enable && giverny_claude::plugin::SUPPORTED;
+            match giverny_claude::plugin::set_plugin(&settings, &dir, keys) {
                 Ok(true) => tracing::info!(
                     "giverny plugin {} for {}",
-                    if enable { "enabled" } else { "removed" },
+                    if keys { "enabled" } else { "removed" },
                     p.name
                 ),
                 Ok(false) => {}
                 Err(err) => tracing::info!("giverny plugin skipped for {}: {err}", p.name),
             }
         }
-        if !enable {
+        if !plugin {
             match giverny_claude::plugin::remove_dir(&dir) {
                 Ok(true) => tracing::info!("giverny plugin removed from {}", dir.display()),
                 Ok(false) => {}
@@ -5288,9 +5300,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The plugin's launchers are shell scripts: on Unix the pane brings the
+    /// plugin, elsewhere it brings only the subagent line, and takes back a
+    /// plugin an older build wrote.
+    #[test]
+    fn the_plugin_comes_only_where_its_launchers_run() {
+        let root = std::env::temp_dir().join(format!(
+            "giverny-pane-platform-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let base = root.join("giverny");
+        let dir = root.join("acct");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        hooks::install_into(&settings).unwrap();
+        // What an older build wrote, whatever this platform is.
+        let market = giverny_claude::plugin::marketplace_dir(&base);
+        giverny_claude::plugin::sync(&market, &["/x/giverny".into()], true).unwrap();
+        giverny_claude::plugin::set_plugin(&settings, &market, true).unwrap();
+
+        let mut w = ClaudeWatch::for_tests();
+        w.profiles = vec![Profile {
+            name: "acct".into(),
+            config_dir: dir,
+            email: None,
+            account_uuid: None,
+        }];
+        w.leave_accounts = false;
+        w.feeds = root.join("feeds");
+        w.set_management_panel(true, true, false, &base);
+        let on = giverny_claude::plugin::SUPPORTED;
+        assert!(hooks::subagent_line_installed_in(&settings));
+        assert_eq!(giverny_claude::plugin::installed_in(&settings), on);
+        assert_eq!(market.exists(), on);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The pane is on by default, so the setting alone is not consent: an
     /// account without our hooks is left byte-identical, and one with them
-    /// gets the pane's keys, which go again when the pane goes off.
+    /// gets the pane's keys, which go again when the pane goes off. Unix
+    /// only: elsewhere there is no plugin to write.
+    #[cfg(unix)]
     #[test]
     fn the_pane_writes_only_where_the_hooks_are() {
         let root = std::env::temp_dir().join(format!(

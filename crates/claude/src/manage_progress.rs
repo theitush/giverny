@@ -549,7 +549,7 @@ impl WatchLock {
     fn take(feed_dir: &Path, session: &str) -> Result<WatchLock, Option<u32>> {
         let path = watch_lock_path(feed_dir, session);
         let _ = std::fs::create_dir_all(path.parent().unwrap_or(feed_dir));
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -563,12 +563,12 @@ impl WatchLock {
             // SAFETY: a valid open descriptor; LOCK_NB never blocks.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let mut s = String::new();
-                let _ = file.read_to_string(&mut s);
+                let _ = (&file).read_to_string(&mut s);
                 return Err(s.trim().parse().ok());
             }
             let _ = file.set_len(0);
-            let _ = file.seek(std::io::SeekFrom::Start(0));
-            let _ = write!(file, "{}", std::process::id());
+            let _ = (&file).seek(std::io::SeekFrom::Start(0));
+            let _ = write!(&file, "{}", std::process::id());
         }
         Ok(WatchLock { _file: file })
     }
