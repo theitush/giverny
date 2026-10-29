@@ -29,6 +29,11 @@
 //! off is named on its next prompt instead ([`first_prompt`]).
 //! `<base>/names/asked/<session>` marks the sessions told, so each is told
 //! once per start.
+//!
+//! **`/resume` shows it.** A named session's custom title is kept
+//! `<Name> · <the text the picker would show without it>` ([`keep_title`]),
+//! one appended transcript line at a time; a title the person gave is left
+//! alone.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1125,6 +1130,147 @@ pub fn reply(payload: &Value, base: &Path, in_tab: bool) -> Option<String> {
     Some(hook_reply(event, &context))
 }
 
+/// How much of a transcript's end is read for its titles: what Claude Code
+/// reads for a `/resume` row (64 KiB on 2.1.312), so a title of ours it
+/// would no longer see there is one we no longer see either, and append
+/// again.
+const TITLE_TAIL: u64 = 64 * 1024;
+
+/// The most characters of the session's own text a title carries; the
+/// picker cuts a row to the terminal's width anyway.
+const TITLE_TEXT: usize = 120;
+
+/// Between the name and the session's own text in its title.
+pub const TITLE_SEP: &str = " · ";
+
+/// What a transcript's tail says about its title: the last line of each
+/// kind Claude Code writes.
+#[derive(Debug, Default, PartialEq)]
+struct Titles {
+    /// The last `custom-title` (`/rename`, `--name`, or ours).
+    custom: Option<String>,
+    /// An `agent-name` line: the session was started with `--name`.
+    agent: bool,
+    /// The last `ai-title`, Claude Code's own title for it.
+    ai: Option<String>,
+    /// The last `summary` (older transcripts).
+    summary: Option<String>,
+    /// The last `last-prompt`.
+    prompt: Option<String>,
+}
+
+/// The title lines in a transcript's `tail`. Its first line may be cut and
+/// is then skipped, as any line that does not parse.
+fn titles_in(tail: &str) -> Titles {
+    let mut t = Titles::default();
+    let field = |line: &str, key: &str| -> Option<String> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        v.get(key).and_then(Value::as_str).map(String::from)
+    };
+    for line in tail.lines() {
+        let Some(kind) = line
+            .strip_prefix("{\"type\":\"")
+            .and_then(|r| r.split('"').next())
+        else {
+            continue;
+        };
+        match kind {
+            "custom-title" => t.custom = field(line, "customTitle").or(t.custom),
+            "agent-name" => t.agent = true,
+            "ai-title" => t.ai = field(line, "aiTitle").or(t.ai),
+            "summary" => t.summary = field(line, "summary").or(t.summary),
+            "last-prompt" => t.prompt = field(line, "lastPrompt").or(t.prompt),
+            _ => {}
+        }
+    }
+    t
+}
+
+/// The text Claude Code's `/resume` picker shows for a session with no
+/// custom title: its AI title, else a summary, else its last prompt (2.1.312
+/// picks `agentName || customTitle || aiTitle || summary || prompt`, the
+/// prompt read from the tail's `last-prompt`). On one line, cut to
+/// [`TITLE_TEXT`] characters.
+fn usual_text(t: &Titles) -> Option<String> {
+    let text = [&t.ai, &t.summary, &t.prompt]
+        .into_iter()
+        .flatten()
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .find(|s| !s.is_empty())?;
+    Some(if text.chars().count() > TITLE_TEXT {
+        text.chars().take(TITLE_TEXT - 1).collect::<String>() + "…"
+    } else {
+        text
+    })
+}
+
+/// The custom title a session named `name` should be given, from its
+/// transcript's `tail`, or none when it needs no new one: its
+/// name and the text the picker would show without it,
+/// `Rotem Giverny · Fix the login redirect`, so a `/resume` row says whose
+/// it is and still what it was. None when that is the title already, when
+/// there is no text yet (a session with no prompt is not listed), and when
+/// the title is the person's: a `custom-title` not starting with the name
+/// (`/rename`, `claude --name`) or an `agent-name` (`--name`) is left alone.
+pub fn title_for(name: &str, tail: &str) -> Option<String> {
+    let t = titles_in(tail);
+    let ours = format!("{name}{TITLE_SEP}");
+    if t.agent || t.custom.as_deref().is_some_and(|c| !c.starts_with(&ours)) {
+        return None;
+    }
+    let title = format!("{ours}{}", usual_text(&t)?);
+    (t.custom.as_deref() != Some(title.as_str())).then_some(title)
+}
+
+/// The last [`TITLE_TAIL`] bytes of `transcript`, or none when it does not
+/// end a line: Claude Code is writing one, and a line of ours now would be
+/// glued to it.
+fn transcript_tail(transcript: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TITLE_TAIL)))
+        .ok()?;
+    let mut buf = Vec::new();
+    file.take(TITLE_TAIL).read_to_end(&mut buf).ok()?;
+    (buf.last() == Some(&b'\n')).then(|| String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Keep a named session's custom title its name and its usual text
+/// ([`title_for`]), from the relay's `SessionStart`, `Stop` and `SessionEnd`
+/// hooks: the text appears with the first prompt, Claude Code's AI title can
+/// move later, and what Claude Code writes after a turn's `Stop` (the first
+/// turn's prompt snapshot is ~90 KB) can push the title out of the
+/// [`TITLE_TAIL`] the picker reads, so it is appended again at the end. One
+/// `custom-title` line appended to the transcript, in one `O_APPEND` write,
+/// as `/rename` writes it; the file is never rewritten. The running session
+/// does not take it up (2.1.312); a resumed one loads it as its title and
+/// re-appends it itself. Only for a session with a name, never a
+/// subagent's. Returns the title written.
+pub fn keep_title(base: &Path, payload: &Value) -> Option<String> {
+    use std::io::Write;
+    if payload.get("agent_id").is_some() {
+        return None;
+    }
+    let session = session_of(payload)?;
+    let transcript = transcript_of(payload)?;
+    let name = find(base, session, Some(&transcript))?;
+    let title = title_for(&name, &transcript_tail(&transcript)?)?;
+    let line = format!(
+        "{{\"type\":\"custom-title\",\"customTitle\":{},\"sessionId\":{}}}\n",
+        Value::from(title.as_str()),
+        Value::from(session)
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .ok()?;
+    file.write_all(line.as_bytes())
+        .inspect_err(|e| eprintln!("giverny hook: titling {session}: {e}"))
+        .ok()?;
+    Some(title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1585,6 +1731,143 @@ mod tests {
         .unwrap();
         assert_eq!(conversation_root(&t).as_deref(), Some("root-9"));
         assert_eq!(conversation_root(&base.join("none.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A transcript line of `kind` carrying `key: value`, as Claude Code
+    /// writes it.
+    fn meta(kind: &str, key: &str, value: &str) -> String {
+        format!(
+            "{{\"type\":\"{kind}\",\"{key}\":{},\"sessionId\":\"s\"}}\n",
+            Value::from(value)
+        )
+    }
+
+    #[test]
+    fn a_named_session_is_titled_its_name_and_its_usual_text() {
+        // The AI title first, as the picker shows it.
+        let mut tail = "{\"type\":\"user\",\"message\":{}}\n".to_string();
+        tail += &meta("last-prompt", "lastPrompt", "fix the  login\nredirect");
+        assert_eq!(
+            title_for("Rotem Giverny", &tail).as_deref(),
+            Some("Rotem Giverny · fix the login redirect"),
+            "no AI title yet: the last prompt, on one line"
+        );
+        tail += &meta("ai-title", "aiTitle", "Login redirect fix");
+        assert_eq!(
+            title_for("Rotem Giverny", &tail).as_deref(),
+            Some("Rotem Giverny · Login redirect fix")
+        );
+        // A summary stands in for a missing AI title, before the prompt.
+        let old =
+            meta("summary", "summary", "Old summary") + &meta("last-prompt", "lastPrompt", "hi");
+        assert_eq!(
+            title_for("Rotem Giverny", &old).as_deref(),
+            Some("Rotem Giverny · Old summary")
+        );
+    }
+
+    #[test]
+    fn a_title_already_right_is_not_written_again_and_follows_the_text() {
+        let mut tail = meta("ai-title", "aiTitle", "Login redirect fix");
+        tail += &meta(
+            "custom-title",
+            "customTitle",
+            "Rotem Giverny · Login redirect fix",
+        );
+        assert_eq!(title_for("Rotem Giverny", &tail), None);
+        // Claude Code's title moved: ours follows it.
+        tail += &meta("ai-title", "aiTitle", "Auth flow rework");
+        assert_eq!(
+            title_for("Rotem Giverny", &tail).as_deref(),
+            Some("Rotem Giverny · Auth flow rework")
+        );
+        // An AI title over a title of ours: still ours to keep.
+        let mut later = meta("custom-title", "customTitle", "Rotem Giverny · hi");
+        later += &meta("last-prompt", "lastPrompt", "and the tests");
+        assert_eq!(
+            title_for("Rotem Giverny", &later).as_deref(),
+            Some("Rotem Giverny · and the tests")
+        );
+    }
+
+    #[test]
+    fn a_title_the_person_gave_is_left_alone() {
+        let text = meta("ai-title", "aiTitle", "Login redirect fix");
+        // `/rename`.
+        let renamed = text.clone() + &meta("custom-title", "customTitle", "auth work");
+        assert_eq!(title_for("Rotem Giverny", &renamed), None);
+        // `/rename` over a title of ours: the last one counts.
+        let over = meta(
+            "custom-title",
+            "customTitle",
+            "Rotem Giverny · Login redirect fix",
+        ) + &renamed;
+        assert_eq!(title_for("Rotem Giverny", &over), None);
+        // `claude --name`, which writes an agent name too.
+        let named = text.clone()
+            + &meta("custom-title", "customTitle", "g297-send")
+            + &meta("agent-name", "agentName", "g297-send");
+        assert_eq!(title_for("Rotem Giverny", &named), None);
+        // Someone else's name is not ours either.
+        let other = text
+            + &meta(
+                "custom-title",
+                "customTitle",
+                "Fenn Giverny · Login redirect fix",
+            );
+        assert_eq!(title_for("Rotem Giverny", &other), None);
+    }
+
+    #[test]
+    fn no_text_no_title_and_a_long_one_is_cut() {
+        assert_eq!(title_for("Rotem Giverny", ""), None);
+        let blank = meta("last-prompt", "lastPrompt", "  \n ");
+        assert_eq!(title_for("Rotem Giverny", &blank), None);
+        // A cut first line and lines that are not titles are skipped.
+        let cut = "itle\",\"aiTitle\":\"half\"}\n".to_string()
+            + "{\"type\":\"assistant\",\"aiTitle\":\"not one\"}\n";
+        assert_eq!(title_for("Rotem Giverny", &cut), None);
+        let long = meta("ai-title", "aiTitle", &"word ".repeat(60));
+        let title = title_for("Rotem Giverny", &long).unwrap();
+        let text = title.strip_prefix("Rotem Giverny · ").unwrap();
+        assert_eq!(text.chars().count(), TITLE_TEXT);
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn keep_title_appends_one_line_and_only_for_a_named_session() {
+        let base = scratch("title");
+        std::fs::create_dir_all(&base).unwrap();
+        let transcript = base.join("s1.jsonl");
+        let before = "{\"type\":\"user\",\"message\":{}}\n".to_string()
+            + &meta("ai-title", "aiTitle", "Login \"redirect\" fix");
+        std::fs::write(&transcript, &before).unwrap();
+        let payload = |session: &str| json!({"session_id": session, "transcript_path": transcript, "hook_event_name": "Stop"});
+        // No name, no title.
+        assert_eq!(keep_title(&base, &payload("s1")), None);
+        give(&base, "s1", "Rotem Giverny", None);
+        // A subagent's payload is never titled.
+        let mut sub = payload("s1");
+        sub["agent_id"] = json!("a1");
+        assert_eq!(keep_title(&base, &sub), None);
+        assert_eq!(
+            keep_title(&base, &payload("s1")).as_deref(),
+            Some("Rotem Giverny · Login \"redirect\" fix")
+        );
+        let after = std::fs::read_to_string(&transcript).unwrap();
+        let added = after
+            .strip_prefix(before.as_str())
+            .expect("appended, not rewritten");
+        assert_eq!(
+            added,
+            "{\"type\":\"custom-title\",\"customTitle\":\"Rotem Giverny · Login \\\"redirect\\\" fix\",\"sessionId\":\"s1\"}\n"
+        );
+        // Right already: nothing more.
+        assert_eq!(keep_title(&base, &payload("s1")), None);
+        // A transcript mid-line is left for the next call.
+        std::fs::write(&transcript, before.clone() + "{\"type\":\"ai-title\",\"aiT").unwrap();
+        assert_eq!(keep_title(&base, &payload("s1")), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

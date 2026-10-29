@@ -147,7 +147,8 @@ pub fn socket_path() -> PathBuf {
 /// a relay failure must never disturb the Claude session that ran the hook.
 /// The one thing it may print is a session's name, at its start or its
 /// first prompt ([`crate::names::reply`]), with `claude.name_sessions` on; `base` is
-/// Giverny's config directory, where names are kept.
+/// Giverny's config directory, where names are kept. With it on, a named
+/// session's `/resume` title is kept too ([`crate::names::keep_title`]).
 pub fn run_relay(spool: &Path, base: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
@@ -195,10 +196,21 @@ pub fn run_relay(spool: &Path, base: &Path) {
         event,
     };
     deliver(&msg, spool);
-    if msg.provider == "claude"
-        && let Some(reply) = crate::names::reply(&msg.event, base, crate::names::in_tab())
-    {
+    if msg.provider != "claude" {
+        return;
+    }
+    if let Some(reply) = crate::names::reply(&msg.event, base, crate::names::in_tab()) {
         println!("{reply}");
+    }
+    // A named session's `/resume` row: its name and its text, at its start
+    // (a resume), after each turn, and at its end, should what came after
+    // its last turn have pushed the title out of what the picker reads.
+    if matches!(
+        msg.hook_event(),
+        Some("SessionStart" | "Stop" | "SessionEnd")
+    ) && crate::names::is_on(base)
+    {
+        crate::names::keep_title(base, &msg.event);
     }
 }
 
