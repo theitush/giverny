@@ -1501,8 +1501,18 @@ impl Tracker {
                 if !known && row.started_ms.is_none() {
                     row.started_ms = first_line_ms(&agent_transcript(dir, &id));
                 }
+                // A worker woken by a message is listed afresh with its
+                // start moved to the message, minutes before its first
+                // turn after it: that listing is newer than the notice
+                // too (giverny#485). Its last turn alone would land it
+                // here and revive it at the next live list, every few
+                // seconds, until it next wrote.
+                let alive = match (row.last_turn_ms, row.started_ms) {
+                    (Some(t), Some(s)) => Some(t.max(s)),
+                    (t, s) => t.or(s),
+                };
                 if let Some(c) = completion
-                    && is_finished(c, row.last_turn_ms)
+                    && is_finished(c, alive)
                 {
                     row.mark_done(c.outcome, c.at_ms);
                     row.summary = c.summary.clone();
@@ -2188,6 +2198,42 @@ mod tests {
         let a1 = t.get("a1").unwrap();
         assert_eq!(a1.stage, Stage::Running);
         assert_eq!(a1.activity.as_deref(), Some("Edit: /f"));
+    }
+
+    /// giverny#485, from the Inbar manager session: worker `a3a7…` reports
+    /// `970-r4` (last turn 14:12:13.1, notice 14:12:13.9), is messaged its
+    /// next task at 14:12:46 and listed afresh from then, and writes its
+    /// next turn only at 14:21:11. Between the two it stays Running at every
+    /// refresh and live list, never Done until its next notice.
+    #[test]
+    fn a_worker_woken_by_a_message_stays_running_before_its_next_turn() {
+        let (config, subs, parent) = layout("woken", "s1");
+        let id = "a3a763225618d8c13";
+        let path = agent_transcript(&subs, id);
+        std::fs::write(&path, assistant_line(T0, None) + "\n").unwrap();
+        append(&parent, &notification_lines(id, "completed", T0 + 765));
+        let mut t = Tracker::new(Some(config));
+        t.apply_live(&live("s1", &[(id, "completed", T0 - 300_000)]), T0 + 2_000);
+        t.refresh();
+        assert_eq!(t.get(id).unwrap().stage, Stage::Done, "its report");
+
+        let woken = T0 + 33_700;
+        for k in 0..100u64 {
+            let now = woken + 1_000 + k * 5_000;
+            t.apply_live(&live("s1", &[(id, "running", woken)]), now);
+            t.refresh();
+            let row = t.get(id).unwrap();
+            assert_eq!(row.stage, Stage::Running, "{k}: {row:?}");
+            assert_eq!(row.ended_ms, None);
+        }
+        append(&path, &(assistant_line(T0 + 538_300, None) + "\n"));
+        t.refresh();
+        assert_eq!(t.get(id).unwrap().stage, Stage::Running);
+        append(&parent, &notification_lines(id, "completed", T0 + 900_000));
+        t.refresh();
+        let row = t.get(id).unwrap();
+        assert_eq!(row.stage, Stage::Done, "its next report lands it");
+        assert_eq!(row.ended_ms, Some(T0 + 900_030));
     }
 
     #[test]

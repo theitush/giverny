@@ -1738,11 +1738,12 @@ fn fold_why(f: &Fold) -> String {
     }
 }
 
-/// The pane's rows, as it places them at `now_ms`: the feed with the
-/// hand-offs its workers' transcripts tell of, merged with the live rows,
-/// and the Running rows nobody works on moved to Next up ([`benched`]):
-/// every row, drawn or not ([`Drawn`] says which are). `f` gets the feed
-/// it was merged from.
+/// The pane's rows, as it places them at `now_ms`: the feed merged with
+/// the live rows, and the Running rows nobody works on moved to Next up
+/// ([`benched`]): every row, drawn or not ([`Drawn`] says which are). A
+/// row is a worker's only by the feed (`start <task> --agent <worker>`) or
+/// the worker's spawn: no message to a worker hands it a row
+/// (giverny#485). `f` gets the feed it was merged from.
 fn with_rows<T>(
     feed: Option<&Feed>,
     live: &[SubagentRow],
@@ -1751,8 +1752,6 @@ fn with_rows<T>(
     f: impl FnOnce(Option<&Feed>, Vec<PaneRow<'_, SubagentRow>>) -> T,
 ) -> T {
     let log = |id: &str| logs.get(id);
-    let handed = feed::with_handoffs(feed, live, log);
-    let feed = handed.as_ref().or(feed);
     let mut rows = feed::merge_with(feed, live, log);
     bench(&mut rows, now_ms);
     f(feed, rows)
@@ -5552,8 +5551,9 @@ mod tests {
     }
 
     /// A worker's run as a feed writer recorded it: acme#613
-    /// landed late with no span, acme#614 started eight minutes after the
-    /// message, and both rows carried the worker's whole count.
+    /// landed late with no span, acme#614 handed on by `start --agent`, and
+    /// both rows carried the worker's whole count. The dispatcher's
+    /// messages, a hand-off in words among them, move nothing (giverny#485).
     #[test]
     fn a_worker_handed_its_next_task_has_a_row_clock_and_count_per_task() {
         let lines = [
@@ -5585,11 +5585,12 @@ mod tests {
         let ids: Vec<&str> = t.lines.iter().map(|l| l.id.as_str()).collect();
         assert_eq!(ids, ["acme#614", "acme#616", "acme#613"]);
         let (run, next, done) = (&t.lines[0], &t.lines[1], &t.lines[2]);
-        // Running: timed from the message, but its count is the worker's
-        // whole live context, what it works with now (giverny#319).
+        // Running: timed from its `start`, never from a message, and its
+        // count is the worker's whole live context, what it works with now
+        // (giverny#319).
         assert_eq!(run.stage, Stage::Running);
-        assert_eq!(run.elapsed, "30:00");
-        assert_eq!(run.eta, "~30m");
+        assert_eq!(run.elapsed, "22:00");
+        assert_eq!(run.eta, "~38m");
         assert_eq!(run.tokens, "156.3k", "the worker's context, not 11k");
         // Queued behind it on the same worker.
         assert_eq!(next.stage, Stage::Planned);
@@ -5597,8 +5598,8 @@ mod tests {
         assert_eq!(next.tokens, "", "nothing spent on a task before it starts");
         // Done: from the spawn to the hand-off, and only what it added.
         assert_eq!(done.stage, Stage::Done);
-        assert_eq!(done.elapsed, "30:00");
-        assert_eq!(done.eta, "(+10m)");
+        assert_eq!(done.elapsed, "37:53");
+        assert_eq!(done.eta, "(+18m)");
         assert_eq!(done.now, "Review — ita");
         assert_eq!(
             done.tokens,
@@ -5613,8 +5614,8 @@ mod tests {
             );
         }
 
-        // The next task is sent and nobody runs `start`: the queued row is
-        // the worker's from the message, and acme#614 is Done there.
+        // The next task is sent and nobody runs `start`: nothing moves.
+        // The queued row waits, and acme#614 runs on.
         let more = [sent(
             T0 - 10 * MIN,
             "New task for you: acme#616, the legend.",
@@ -5637,9 +5638,9 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#616", "10:00", "156.3k"),
-                (Stage::Done, "acme#614", "20:00", "11k"),
-                (Stage::Done, "acme#613", "30:00", "28k"),
+                (Stage::Running, "acme#614", "22:00", "156.3k"),
+                (Stage::Planned, "acme#616", "", ""),
+                (Stage::Done, "acme#613", "37:53", "28k"),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5698,22 +5699,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// giverny#217, the inbar manager session: a plain `start` and the task handed
-    /// over in the dispatcher's own words, with no `New task for you`. The
-    /// row with no worker is the worker's from the message, and each task
-    /// counts its own tokens once done — the next one named only as "a
-    /// review round on #613".
+    /// giverny#485: no message hands a row to a worker, in any words. A
+    /// plain `start` left acme#614 with no worker; the dispatcher's
+    /// message giving it to the idle worker of acme#613, and one naming a
+    /// task the feed lacks as new, move nothing and add no row. Forty
+    /// minutes on, acme#614 still has no worker: Next up, `no worker yet`.
     #[test]
-    fn a_task_handed_by_message_in_any_words_counts_its_own_tokens() {
+    fn a_message_hands_no_row_to_a_worker() {
         let lines = [
             reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
             sent(
                 T0 - 40 * MIN + 13_000,
                 "#613 verified and landed in Review — thanks. Next you hold acme#614 and nothing else.",
             ),
-            reply("m2", T0 - 35 * MIN, 5_000, 20_000, 2_000),
+            sent(T0 - 30 * MIN, "New task for you: acme#615, the legend."),
+            reply("m2", T0 - 25 * MIN, 5_000, 20_000, 2_000),
         ];
-        let (dir, rows, logs) = reused_worker("plain-start", &lines, true);
+        let (dir, rows, logs) = reused_worker("no-message-path", &lines, true);
         let f = feed(&format!(
             r#"{{"session":"s","rows":[
               {{"key":"acme#614","stage":"running","started":{s614}}},
@@ -5722,51 +5724,16 @@ mod tests {
             s613 = T0 - 60 * MIN,
             s614 = T0 - 40 * MIN,
         ));
-        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
-        let got: Vec<(Stage, &str, &str, Option<&str>)> = t
-            .lines
-            .iter()
-            .map(|l| {
-                (
-                    l.stage,
-                    l.id.as_str(),
-                    l.tokens.as_str(),
-                    l.click.agent_id.as_deref(),
-                )
-            })
-            .collect();
-        let (k21, k7) = (fmt_tokens(21_000), fmt_tokens(7_000));
-        assert_eq!(
-            got,
-            [
-                (Stage::Running, "acme#614", "156.3k", Some("w")),
-                (Stage::Done, "acme#613", k21.as_str(), Some("w")),
-            ]
+        let t = build_with(
+            Some(&f),
+            &rows,
+            T0,
+            &Clock::plain(),
+            &logs,
+            DoneRows::All,
+            Drawn::Manager,
+            &HashSet::new(),
         );
-
-        // acme#614 landed (the manager session linked it), a round of #613 started
-        // with no worker, and the message names only #614 and #613.
-        let more = [
-            sent(
-                T0 - 20 * MIN + 7_000,
-                "#614 verified and landed in Review. Now a review round on #613.",
-            ),
-            reply("m3", T0 - 10 * MIN, 3_000, 25_000, 500),
-        ];
-        let (dir2, rows, logs) =
-            reused_worker("plain-round", &[&lines[..], &more[..]].concat(), true);
-        let f = feed(&format!(
-            r#"{{"session":"s","rows":[
-              {{"key":"acme#613-r1","stage":"running","started":{r1}}},
-              {{"key":"acme#614","stage":"done","agent_id":"w","started":{s614},"ended":{e614}}},
-              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{s614}}}
-            ]}}"#,
-            s613 = T0 - 60 * MIN,
-            s614 = T0 - 40 * MIN,
-            e614 = T0 - 25 * MIN,
-            r1 = T0 - 20 * MIN,
-        ));
-        let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         let got: Vec<(Stage, &str, &str, Option<&str>)> = t
             .lines
             .iter()
@@ -5774,7 +5741,7 @@ mod tests {
                 (
                     l.stage,
                     l.id.as_str(),
-                    l.tokens.as_str(),
+                    l.now.as_str(),
                     l.click.agent_id.as_deref(),
                 )
             })
@@ -5782,75 +5749,112 @@ mod tests {
         assert_eq!(
             got,
             [
-                (Stage::Running, "acme#613-r1", "156.3k", Some("w")),
-                (Stage::Done, "acme#614", k7.as_str(), Some("w")),
-                (Stage::Done, "acme#613", k21.as_str(), Some("w")),
+                (Stage::Planned, "acme#614", NO_WORKER_YET, None),
+                (Stage::Done, "acme#613", "", Some("w")),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// No feed at all: the dispatcher sent `New task for you: …` twice and
-    /// recorded nothing. Each task still gets its row, the earlier ones Done
-    /// with their own span, and the Done counts add up to what the worker
-    /// added before its current task, each turn once.
+    /// giverny#485, Amir Inbar's pane: worker `a3a7…` reported `970-r4` at
+    /// 14:12:13, was handed `970-r5` (`start 970-r5 --agent`) at 14:12:26,
+    /// messaged it at 14:12:46 and listed afresh from then, and wrote its
+    /// next turn only at 14:21:11. At every pass in between — a live list,
+    /// a refresh, a table, every five seconds — `970-r5` is Running, its
+    /// worker on it, and no "no worker" chore is due. The pane used to flip
+    /// it to Next up (`no worker yet`) and back on alternate passes.
     #[test]
-    fn hand_offs_nobody_recorded_are_read_from_the_transcript() {
-        let lines = [
-            reply("m1", T0 - 55 * MIN, 10_000, 0, 1_000),
-            sent(
-                T0 - 45 * MIN,
-                "One more thing on acme#613: keep the old axis.",
-            ),
-            reply("m2", T0 - 44 * MIN, 2_000, 10_000, 500),
-            sent(T0 - 40 * MIN, "New task for you: acme#614, same template."),
-            reply("m3", T0 - 30 * MIN, 4_000, 12_000, 600),
-            reply("m3", T0 - 30 * MIN, 4_000, 12_000, 900),
-            sent(T0 - 20 * MIN, "Next task: acme#616 (the legend)."),
-            reply("m4", T0 - 10 * MIN, 3_000, 16_000, 700),
-        ];
-        let (dir, rows, logs) = reused_worker("derived", &lines, true);
-        let t = build_at(None, &rows, T0, &Clock::plain(), &logs);
-        let got: Vec<(Stage, &str, &str, &str, &str)> = t
-            .lines
-            .iter()
-            .map(|l| {
-                (
-                    l.stage,
-                    l.id.as_str(),
-                    l.elapsed.as_str(),
-                    l.now.as_str(),
-                    l.tokens.as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                (Stage::Running, "acme#616", "20:00", "", "156.3k"),
-                (Stage::Done, "acme#614", "20:00", "→ acme#616", "4.9k"),
-                (Stage::Done, "acme#613", "20:00", "→ acme#614", "13.5k"),
-            ]
+    fn a_row_handed_to_a_woken_worker_stays_running() {
+        let ms = |hms: &str| {
+            format!("2026-10-22T{hms}Z")
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond() as u64
+        };
+        let id = "a3a763225618d8c13";
+        let config = std::env::temp_dir().join(format!("giverny-pane-485-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config.join("projects/-w/s/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let transcript = subs.join(format!("agent-{id}.jsonl"));
+        let turn = |at: u64| {
+            serde_json::json!({"type": "assistant", "timestamp": ts(at),
+                "message": {"id": format!("msg_{at}"), "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 2, "cache_read_input_tokens": 100_000,
+                        "output_tokens": 10},
+                    "content": [{"type": "tool_use", "name": "Bash",
+                        "input": {"command": "ls"}}]}})
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&transcript, turn(ms("14:12:13.106"))).unwrap();
+        std::fs::write(
+            subs.join(format!("agent-{id}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"970-r4: drop P&L caption, close 970"}"#,
+        )
+        .unwrap();
+        let notice = format!(
+            "<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n\
+             <summary>Agent finished</summary>\n</task-notification>"
         );
-        assert!(
-            t.lines[0].no_eta,
-            "a hand-off nobody recorded has no estimate"
-        );
-        assert!(t.lines[0].title.starts_with("Next task: acme#616"));
-        assert_eq!(
-            logs["w"].added(0, Some(T0 - 20 * MIN)),
-            11_000 + 2_500 + 4_900
-        );
-
-        // Once the worker has finished, its last task is Done too, with the rest.
-        let (dir2, rows, logs) = reused_worker("derived-done", &lines, false);
-        let t = build_at(None, &rows, T0, &Clock::plain(), &logs);
-        let last = t.lines.iter().find(|l| l.id == "acme#616").unwrap();
-        assert_eq!((last.stage, last.elapsed.as_str()), (Stage::Done, "15:00"));
-        assert_eq!(last.tokens, "3.7k");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::write(
+            config.join("projects/-w/s.jsonl"),
+            serde_json::json!({"type": "user", "timestamp": ts(ms("14:12:13.865")),
+                "message": {"role": "user", "content": notice}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        // The feed as the manager wrote it, in the shape of Amir's.
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"970-r4","stage":"done","agent_id":"{id}","started":{r4},"ended":{r5},
+                "eta_s":300,"landing":"Done","title":"CLEANUP: drop the P&L chart caption"}},
+              {{"key":"970-r5","stage":"running","agent_id":"{id}","started":{r5},
+                "planned":{planned},"eta_s":1443,
+                "lease":{{"id":"s:970-r5","state":"granted","ram_mb":1024,"granted_at":{r5}}},
+                "title":"FEATURE: Ofer/reference chips and a market-SD band"}}
+            ]}}"#,
+            r4 = ms("14:07:10"),
+            r5 = ms("14:12:26"),
+            planned = ms("14:09:01"),
+        ));
+        let snap = |status: &str, start: u64| {
+            LiveSnapshot::parse(&format!(
+                r#"{{"session_id":"s","tasks":[{{"id":"{id}","status":"{status}",
+                    "description":"970-r4: drop P&L caption, close 970",
+                    "startTime":{start},"tokenCount":107770}}]}}"#
+            ))
+        };
+        let mut tr = Tracker::new(Some(config.clone()));
+        tr.apply_live(&snap("completed", ms("14:07:15")), ms("14:12:15"));
+        tr.refresh();
+        let woken = ms("14:12:46.846");
+        let mut at = woken + 1_000;
+        while at < ms("14:21:11") {
+            tr.apply_live(&snap("running", woken), at);
+            tr.refresh();
+            let mut logs = Logs::new();
+            poll_logs(&mut logs, tr.rows());
+            let t = build_with(
+                Some(&f),
+                tr.rows(),
+                at,
+                &Clock::plain(),
+                &logs,
+                DoneRows::All,
+                Drawn::Manager,
+                &HashSet::new(),
+            );
+            let r5 = t.lines.iter().find(|l| l.id == "970-r5").unwrap();
+            assert_eq!(r5.stage, Stage::Running, "at {}: {r5:?}", ts(at));
+            assert_eq!(r5.click.agent_id.as_deref(), Some(id));
+            assert_ne!(r5.now, NO_WORKER_YET);
+            let due = chores(Drawn::Manager, Some(&f), tr.rows(), &logs, &NO_SHELLS, at);
+            assert_eq!(due, [], "at {}", ts(at));
+            at += 5_000;
+        }
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// giverny#258, giverny#310: what the pane draws for a Running row that
@@ -6078,8 +6082,9 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Handed by message before `start` was run: the message is the
-        // hand-off, and a worker that ended after it finished this task.
+        // A message before `start` was run hands nothing (giverny#485):
+        // `start --agent` at T0 - 2m is the hand-off, so the worker's end at
+        // T0 - 5m ended its task before, and it is still to pick this up.
         let mut lines = vec![
             reply("m1", T0 - 59 * MIN, 20_000, 0, 1_000),
             reply("m2", T0 - 30 * MIN, 5_000, 20_000, 2_000),
@@ -6097,8 +6102,7 @@ mod tests {
             s614 = T0 - 2 * MIN,
         ));
         let got = chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].since, T0 - 5 * MIN);
+        assert_eq!(got, [], "not finished by the message's turns");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6479,8 +6483,17 @@ mod tests {
         std::fs::write(&other, reply("o1", T0 - 5 * MIN, 30_000, 0, 10) + "\n").unwrap();
         let subs = [dir.join("agent-w.jsonl"), other];
         let before = tokens::session_subagents_total(Some(50_000), 0, &subs);
-        let one = build_at(None, &rows, T0, &Clock::plain(), &Logs::new());
-        let split = build_at(None, &rows, T0, &Clock::plain(), &logs);
+        // `start acme#614 --agent w` at the hand-off.
+        let f = feed(&format!(
+            r#"{{"session":"s","rows":[
+              {{"key":"acme#614","stage":"running","agent_id":"w","started":{s614}}},
+              {{"key":"acme#613","stage":"done","agent_id":"w","started":{s613},"ended":{s614}}}
+            ]}}"#,
+            s613 = T0 - 60 * MIN,
+            s614 = T0 - 40 * MIN,
+        ));
+        let one = build_at(None, &rows, T0, &Clock::plain(), &logs);
+        let split = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
         assert_eq!(one.lines.len(), 1);
         assert_eq!(split.lines.len(), 2, "a row per task");
         let after = tokens::session_subagents_total(Some(50_000), 0, &subs);
