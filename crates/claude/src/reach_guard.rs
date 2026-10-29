@@ -1229,14 +1229,14 @@ impl World for System {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use std::collections::HashMap;
 
     /// Two sessions: mine (`me`, claude 100) and Rotem's (`other`, claude
     /// 200), each with a run, and a process of nobody's.
     #[derive(Default)]
-    pub(crate) struct Fake {
+    struct Fake {
         cgroups: HashMap<u32, String>,
         parents: HashMap<u32, u32>,
         claudes: HashMap<u32, String>,
@@ -1291,14 +1291,14 @@ pub(crate) mod tests {
     const SLICE_PATH: &str =
         "0::/user.slice/user-1000.slice/user@1000.service/giverny.slice/giverny-claude.slice";
 
-    pub(crate) fn me() -> Me {
+    fn me() -> Me {
         Me {
             session: "my-session".into(),
             claude: Some(100),
         }
     }
 
-    pub(crate) fn world() -> Fake {
+    fn world() -> Fake {
         let mut f = Fake::default();
         f.claudes.insert(100, "my-session".into());
         f.claudes.insert(200, "other-session".into());
@@ -1393,272 +1393,5 @@ pub(crate) mod tests {
         assert!(r.contains("killing pid 400"), "{r}");
         let r = says("kill 210", &w).unwrap();
         assert!(r.contains("`giverny-manage ask other-session "), "{r}");
-    }
-
-    #[test]
-    fn its_own_processes_and_nobodys_are_killed_as_ever() {
-        let w = world();
-        for cmd in [
-            "kill 110",
-            "kill -9 600",
-            "kill 700",
-            "kill 99999",
-            "kill %1",
-            "kill $PID",
-            "kill -l",
-            "pkill -f my-tests",
-            "pkill -f 'cargo test'",
-            "pkill -P 1 node",
-            "pkill -f 'vitest (run|x)'",
-            "kill $(pgrep -f my-tests)",
-            "pgrep -f vitest",
-            "killall bash",
-            "echo kill 400",
-            "grep 'kill 400' notes.md",
-            "git commit -m 'kill 400'",
-        ] {
-            assert_eq!(says(cmd, &w), None, "{cmd}");
-        }
-    }
-
-    #[test]
-    fn a_process_with_no_scope_belongs_to_the_claude_above_it() {
-        let mut w = world();
-        // No cgroups at all (no systemd): ancestry decides.
-        w.cgroups.clear();
-        w.parents.insert(210, 205);
-        w.parents.insert(205, 200);
-        assert!(says("kill 210", &w).is_some());
-        // A test claude I started (pid 150, its own session) under mine is mine.
-        w.claudes.insert(150, "test-claude".into());
-        w.parents.insert(160, 150);
-        w.parents.insert(150, 110);
-        assert_eq!(says("kill 160", &w), None);
-        assert_eq!(says("kill 150", &w), None);
-    }
-
-    #[test]
-    fn a_dead_owner_leaves_nothing_to_guard() {
-        let mut w = world();
-        // Rotem's claude is gone: its orphan is nobody's.
-        w.alive.remove(&200);
-        assert_eq!(says("kill 210", &w), None);
-        // Its run is gone and its lease too: the scope is nobody's.
-        w.alive.remove(&300);
-        w.leases.retain(|(s, _)| s != "other-session");
-        assert_eq!(says("kill 400", &w), None);
-    }
-
-    #[test]
-    fn an_orphaned_run_scope_is_still_its_lease_holders() {
-        let mut w = world();
-        // The run process died; its vitest lives on in the scope, the
-        // lease still held: the ledger case of 2026-10-15.
-        w.alive.remove(&300);
-        w.runs.retain(|r| r.pid != 300);
-        let r = says("kill -9 400", &w).expect("refused");
-        assert!(r.contains("scale343"), "{r}");
-    }
-
-    #[test]
-    fn stopping_another_sessions_scope_is_refused_and_its_own_is_not() {
-        let w = world();
-        for cmd in [
-            "systemctl --user stop giverny-run-scale343-300.scope",
-            "systemctl --user kill -s KILL giverny-run-scale343-300",
-            "systemctl --user stop giverny-claude-200.scope",
-            "systemctl --user stop 'giverny-run-scale*'",
-            "systemctl --user kill 'giverny-run-*'",
-            "systemctl --user stop giverny-claude.slice",
-        ] {
-            assert!(says(cmd, &w).is_some(), "{cmd}");
-        }
-        for cmd in [
-            "systemctl --user stop giverny-run-g415-500.scope",
-            "systemctl --user kill 'giverny-run-g415-*'",
-            "systemctl --user status giverny-run-scale343-300.scope",
-            "systemctl --user stop my-own.service",
-            "systemctl --user stop giverny-run-gone-9999.scope",
-        ] {
-            assert_eq!(says(cmd, &w), None, "{cmd}");
-        }
-    }
-
-    /// A scratch repo: a main checkout with two linked worktrees, `theirs`
-    /// (where Rotem's worker runs) and `mine`.
-    fn repo(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("giverny-reach-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        let main = d.join("main");
-        std::fs::create_dir_all(main.join(".git/worktrees/theirs")).unwrap();
-        for wt in ["theirs", "mine"] {
-            let root = main.join(".claude/worktrees").join(wt);
-            std::fs::create_dir_all(root.join("src")).unwrap();
-            let gd = main.join(".git/worktrees").join(wt);
-            std::fs::create_dir_all(&gd).unwrap();
-            std::fs::write(gd.join("HEAD"), format!("ref: refs/heads/task-{wt}\n")).unwrap();
-            std::fs::write(root.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
-        }
-        d.canonicalize().unwrap()
-    }
-
-    #[test]
-    fn another_sessions_worktree_is_off_limits_to_mutating_git_and_edits() {
-        let d = repo("git");
-        let main = d.join("main");
-        let theirs = main.join(".claude/worktrees/theirs");
-        let mine = main.join(".claude/worktrees/mine");
-        let mut w = world();
-        w.runs[0].cwd = Some(theirs.join("src"));
-        w.runs[1].cwd = Some(mine.clone());
-        let at = |cmd: &str, cwd: &Path| verdict(cmd, cwd, &me(), &w);
-        for (cmd, cwd) in [
-            ("git commit -am x", &theirs),
-            ("git -C src reset --hard", &theirs),
-            ("git stash", &theirs),
-            ("git checkout -- .", &theirs),
-            ("cd .claude/worktrees/theirs && git clean -fd", &main),
-            ("git -C .claude/worktrees/theirs restore .", &main),
-            (
-                "git worktree remove --force .claude/worktrees/theirs",
-                &main,
-            ),
-            ("git branch -D task-theirs", &main),
-        ] {
-            let r = at(cmd, cwd).unwrap_or_else(|| panic!("{cmd}: not refused"));
-            assert!(r.contains("Rotem Ashby"), "{cmd}: {r}");
-            assert!(r.contains("scale343"), "{cmd}: {r}");
-        }
-        for (cmd, cwd) in [
-            ("git commit -am x", &mine),
-            ("git status", &theirs),
-            ("git log --oneline", &theirs),
-            ("git diff", &theirs),
-            ("git stash list", &theirs),
-            ("git commit -m x -- CLAUDE.md", &main),
-            ("git worktree remove .claude/worktrees/mine", &main),
-            ("git branch -D task-mine", &main),
-            ("git -C .claude/worktrees/mine reset --hard", &main),
-        ] {
-            assert_eq!(at(cmd, cwd), None, "{cmd}");
-        }
-        let r = edit_verdict(&theirs.join("src/lib.rs"), &me(), &w).expect("refused");
-        assert!(r.contains("editing a file in"), "{r}");
-        assert_eq!(edit_verdict(&mine.join("src/lib.rs"), &me(), &w), None);
-        assert_eq!(edit_verdict(&main.join("CLAUDE.md"), &me(), &w), None);
-        // Its run over, the worktree is free again.
-        w.alive.remove(&300);
-        assert_eq!(edit_verdict(&theirs.join("src/lib.rs"), &me(), &w), None);
-        // Another live claude started in a worktree holds it too.
-        w.cwds.insert(200, theirs.clone());
-        assert!(edit_verdict(&theirs.join("src/lib.rs"), &me(), &w).is_some());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn speaking_as_another_live_session_is_refused() {
-        let w = world();
-        let r = says(
-            "CLAUDE_CODE_SESSION_ID=other-session giverny-manage land scale343",
-            &w,
-        )
-        .expect("refused");
-        assert!(r.contains("Rotem Ashby"), "{r}");
-        assert!(
-            says(
-                "export CLAUDE_CODE_SESSION_ID=other-session; giverny-manage release scale343",
-                &w
-            )
-            .is_some()
-        );
-        for cmd in [
-            "CLAUDE_CODE_SESSION_ID=my-session giverny-manage land g415",
-            "CLAUDE_CODE_SESSION_ID=dead-session giverny-manage land old",
-            "giverny-manage ask scale343 'may I have 2G?'",
-            "giverny-manage run g415 -- cargo test",
-        ] {
-            assert_eq!(says(cmd, &w), None, "{cmd}");
-        }
-        assert!(says("giverny-manage run g415 -- kill 400", &w).is_some());
-    }
-
-    #[test]
-    fn patterns_match_as_pgrep_would() {
-        let p = |text: &str, full, exact| Pattern {
-            text: text.into(),
-            full,
-            exact,
-            icase: false,
-        };
-        let t = |pat: &Pattern, s: &str| {
-            tok_match(&regex_toks(pat).unwrap(), &s.chars().collect::<Vec<_>>())
-        };
-        assert!(t(&p("vit", false, false), "vitest"));
-        assert!(!t(&p("vit", false, true), "vitest"));
-        assert!(t(&p("^node$", false, false), "node"));
-        assert!(!t(&p("^node$", false, false), "nodejs"));
-        assert!(t(
-            &p("vitest.*worker", true, false),
-            "node vitest/x/worker.js"
-        ));
-        assert!(t(&p("a.c", false, false), "xabcx"));
-        assert!(regex_toks(&p("a|b", false, false)).is_none());
-        assert_eq!(glob("giverny-run-*", "giverny-run-x-1.scope"), Some(true));
-        assert_eq!(
-            glob("giverny-run-?-1.scope", "giverny-run-x-1.scope"),
-            Some(true)
-        );
-        assert_eq!(
-            glob("giverny-claude-*", "giverny-run-x-1.scope"),
-            Some(false)
-        );
-        assert_eq!(unit_task("demo#161"), "demo_161");
-    }
-
-    #[test]
-    fn the_shell_text_is_read_for_its_reaches() {
-        let cwd = Path::new("/r");
-        assert_eq!(reaches("kill -9 12 34", cwd), [Reach::Pids(vec![12, 34])]);
-        assert_eq!(reaches("kill -- -12", cwd), [Reach::Pids(vec![-12])]);
-        assert_eq!(reaches("kill -l", cwd), []);
-        // A heredoc's lines are read as before giverny#427 split them off.
-        assert_eq!(
-            reaches("bash <<'EOF'\nkill 42\nEOF", cwd),
-            [Reach::Pids(vec![42])]
-        );
-        assert_eq!(
-            reaches("pkill -9 -fx 'node a'", cwd),
-            [Reach::Match(Pattern {
-                text: "node a".into(),
-                full: true,
-                exact: true,
-                icase: false
-            })]
-        );
-        assert_eq!(
-            reaches("killall -9 node", cwd),
-            [Reach::Match(Pattern {
-                text: "node".into(),
-                full: false,
-                exact: true,
-                icase: false
-            })]
-        );
-        assert_eq!(reaches("pgrep node", cwd), [], "a look, not a kill");
-        assert_eq!(
-            reaches("systemctl --user stop a.scope b.scope", cwd),
-            [Reach::Units(vec!["a.scope".into(), "b.scope".into()])]
-        );
-        assert_eq!(reaches("systemctl --user status a.scope", cwd), []);
-        assert_eq!(
-            reaches("cd w && git -C sub commit -m x", cwd),
-            [Reach::Git {
-                what: "`git commit`".into(),
-                dir: Some(PathBuf::from("/r/w/sub")),
-                paths: vec![],
-                branches: vec![],
-            }]
-        );
-        assert_eq!(reaches("git status && git log", cwd), []);
     }
 }

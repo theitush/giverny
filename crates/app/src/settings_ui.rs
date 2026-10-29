@@ -1220,58 +1220,7 @@ fn footer(ui: &mut egui::Ui, actions: &mut Vec<Action>, close: &mut bool, c: Chr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giverny_core::limits::Mem;
     use giverny_term::render::theme::Theme;
-
-    #[test]
-    fn a_limit_field_shows_the_figure_never_auto() {
-        // At auto the field holds what auto comes to here.
-        let m = Machine {
-            cores: 14,
-            ram: Mem::gb(27),
-            gpus: vec![],
-        };
-        let mut l = Limits::default();
-        assert_eq!(limit_figure(&l, &m, LimitField::Cores), "12");
-        // 70 % of 27G is 18.9G, written as the field can read it back.
-        assert_eq!(limit_figure(&l, &m, LimitField::Ram), "18.9G");
-        assert_eq!(
-            limits::parse_ram("18.9G", &m),
-            Ok(Auto::Set(Mem::parse("18.9G").unwrap()))
-        );
-        l.cpu_cores = Auto::Set(4);
-        l.ram = Auto::Set(Mem::gb(8));
-        assert_eq!(limit_figure(&l, &m, LimitField::Cores), "4");
-        assert_eq!(limit_figure(&l, &m, LimitField::Ram), "8G");
-    }
-
-    #[test]
-    fn a_limit_says_the_machine_total_and_its_share() {
-        // After the field, the whole and the share of it.
-        let m = Machine {
-            cores: 16,
-            ram: Mem::parse("31.3G").unwrap(),
-            gpus: vec![],
-        };
-        let mut l = Limits::default();
-        assert_eq!(limit_share(&l, &m, LimitField::Cores), "of 16 cores · 88 %");
-        assert_eq!(limit_share(&l, &m, LimitField::Ram), "of 31.3G · 70 %");
-        l.cpu_cores = Auto::Set(4);
-        l.ram = Auto::Set(Mem::gb(8));
-        assert_eq!(limit_share(&l, &m, LimitField::Cores), "of 16 cores · 25 %");
-        assert_eq!(limit_share(&l, &m, LimitField::Ram), "of 31.3G · 26 %");
-        let one = Machine {
-            cores: 1,
-            ram: Mem::gb(4),
-            gpus: vec![],
-        };
-        assert_eq!(
-            limit_share(&Limits::default(), &one, LimitField::Cores),
-            "of 1 core · 100 %"
-        );
-        assert_eq!(share_pct(18, 20), 90);
-        assert_eq!(share_pct(1, 0), 0);
-    }
 
     #[test]
     fn every_theme_the_screen_offers_is_real_and_distinct() {

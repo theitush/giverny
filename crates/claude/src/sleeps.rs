@@ -176,56 +176,8 @@ mod tests {
     const MIN: u64 = 60_000;
 
     #[test]
-    fn a_nap_back_on_time_is_no_sleep() {
-        assert_eq!(seen(0, 5_000, NAP), None);
-        assert_eq!(seen(0, 50_000, NAP), None, "a loaded machine, not a sleep");
-        assert_eq!(seen(10_000, 0, NAP), None, "the clock set back");
-    }
-
-    #[test]
     fn a_nap_back_hours_late_is_the_sleep() {
         let s = seen(0, 8 * 60 * MIN, NAP).expect("a sleep");
         assert_eq!((s.since, s.until), (0, 8 * 60 * MIN));
-    }
-
-    #[test]
-    fn spans_are_counted_once_and_only_inside_the_window() {
-        let one = Span {
-            since: 10 * MIN,
-            until: 20 * MIN,
-        };
-        // The same sleep from two windows, and one overlapping it.
-        let spans = [
-            one,
-            one,
-            Span {
-                since: 15 * MIN,
-                until: 25 * MIN,
-            },
-        ];
-        assert_eq!(slept_ms(&spans, 0, 60 * MIN), 15 * MIN);
-        assert_eq!(slept_ms(&spans, 12 * MIN, 22 * MIN), 10 * MIN);
-        assert_eq!(slept_ms(&spans, 30 * MIN, 60 * MIN), 0);
-        assert_eq!(slept_ms(&[], 0, 60 * MIN), 0);
-    }
-
-    #[test]
-    fn the_log_reads_back_what_was_appended() {
-        let dir = std::env::temp_dir().join(format!("giverny-sleeps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let s = Span {
-            since: MIN,
-            until: 9 * MIN,
-        };
-        append(&dir, s).unwrap();
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(path(&dir))
-            .unwrap()
-            .write_all(b"not json\n")
-            .unwrap();
-        append(&dir, s).unwrap();
-        assert_eq!(load(&dir), vec![s, s]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

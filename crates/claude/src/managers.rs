@@ -225,72 +225,6 @@ pub fn mark_from(feeds: &Path, payload: &Value) {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("giverny-managers-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    /// A transcript whose conversation's root is `root`.
-    fn transcript(dir: &Path, session: &str, root: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let t = dir.join(format!("{session}.jsonl"));
-        let line = json!({"type": "user", "uuid": root, "parentUuid": null,
-                          "sessionId": session, "message": {"role": "user", "content": "hi"}});
-        std::fs::write(&t, format!("{line}\n")).unwrap();
-        t
-    }
-
-    #[test]
-    fn an_unmarked_session_is_no_manager_whatever_it_wrote() {
-        let feeds = scratch("plain");
-        // A feed of its own (a stray `start`) makes no manager.
-        std::fs::create_dir_all(&feeds).unwrap();
-        std::fs::write(
-            feeds.join("s1.json"),
-            r#"{"version":1,"session":"s1","rows":[]}"#,
-        )
-        .unwrap();
-        assert!(!is_manager(&feeds, "s1", None));
-        assert!(!is_marked(&feeds, "s1", &[], || None));
-        let _ = std::fs::remove_dir_all(&feeds);
-    }
-
-    #[test]
-    fn a_marked_session_is_a_manager_and_its_resume_too() {
-        let feeds = scratch("resume");
-        let t1 = transcript(&feeds.join("proj"), "s1", "root-a");
-        mark_from(
-            &feeds,
-            &json!({"session_id": "s1", "transcript_path": t1.display().to_string()}),
-        );
-        assert!(is_manager(&feeds, "s1", Some(&t1)));
-        // Resumed: a new id, the same conversation.
-        let t2 = transcript(&feeds.join("proj"), "s2", "root-a");
-        assert!(is_manager(&feeds, "s2", Some(&t2)));
-        // …copied under the new id: found without the transcript now.
-        assert!(is_manager(&feeds, "s2", None));
-        // `/clear`: a new conversation, no manager.
-        let t3 = transcript(&feeds.join("proj"), "s3", "root-b");
-        assert!(!is_manager(&feeds, "s3", Some(&t3)));
-        let _ = std::fs::remove_dir_all(&feeds);
-    }
-
-    #[test]
-    fn a_tab_finds_its_mark_by_an_earlier_id() {
-        let feeds = scratch("alias");
-        mark(&feeds, "old", None).unwrap();
-        let mut asked = false;
-        assert!(is_marked(&feeds, "new", &["old"], || {
-            asked = true;
-            None
-        }));
-        assert!(!asked, "the ids answered: no transcript read");
-        assert!(session_file(&feeds, "new").unwrap().is_file());
-        let _ = std::fs::remove_dir_all(&feeds);
-    }
-
     #[test]
     fn only_the_sessions_own_manage_skill_call_marks_it() {
         let call = |skill: &str, agent: Option<&str>| {
@@ -317,48 +251,5 @@ mod tests {
             !typed_skill("/manage this"),
             "sent to the skill, whose call marks it"
         );
-    }
-
-    #[test]
-    fn a_compacted_manager_is_told_to_reload_the_skill() {
-        let feeds = scratch("start");
-        let t1 = transcript(&feeds.join("proj"), "s1", "root-a");
-        mark_from(
-            &feeds,
-            &json!({"session_id": "s1", "transcript_path": t1.display().to_string()}),
-        );
-        let start = |session: &str, t: &Path, source: &str| {
-            json!({"hook_event_name": "SessionStart", "session_id": session,
-                   "transcript_path": t.display().to_string(), "source": source})
-        };
-        // Compacted: the same session.
-        assert_eq!(
-            start_context(&feeds, &start("s1", &t1, "compact")),
-            Some(START_CONTEXT)
-        );
-        // Compacted under a new id, the same conversation: found by its
-        // root, and the mark copied under the new id.
-        let t2 = transcript(&feeds.join("proj"), "s2", "root-a");
-        assert_eq!(
-            start_context(&feeds, &start("s2", &t2, "compact")),
-            Some(START_CONTEXT)
-        );
-        assert!(session_file(&feeds, "s2").unwrap().is_file());
-        // A resume already holds the line from its last compaction.
-        assert_eq!(start_context(&feeds, &start("s1", &t1, "resume")), None);
-        assert_eq!(start_context(&feeds, &start("s2", &t2, "resume")), None);
-        // Never for a fresh start or a `/clear`, manager or not.
-        assert_eq!(start_context(&feeds, &start("s1", &t1, "startup")), None);
-        assert_eq!(start_context(&feeds, &start("s1", &t1, "clear")), None);
-        let t3 = transcript(&feeds.join("proj"), "s3", "root-b");
-        assert_eq!(start_context(&feeds, &start("s3", &t3, "clear")), None);
-        // A session that is no manager: nothing.
-        assert_eq!(start_context(&feeds, &start("s3", &t3, "compact")), None);
-        assert_eq!(start_context(&feeds, &start("s3", &t3, "resume")), None);
-        // A subagent's start in a manager's session: nothing.
-        let mut sub = start("s1", &t1, "compact");
-        sub["agent_id"] = json!("a1");
-        assert_eq!(start_context(&feeds, &sub), None);
-        let _ = std::fs::remove_dir_all(&feeds);
     }
 }

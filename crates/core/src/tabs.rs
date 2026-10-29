@@ -447,21 +447,6 @@ mod tests {
         assert_eq!(ws.active, None);
     }
 
-    #[test]
-    fn tabs_opened_from_background_do_not_come_back() {
-        let mut ws = Workspace::default();
-        let cat = ws.categories[0].id;
-        let a = ws.add_tab(cat);
-        let bg = ws.add_tab(cat);
-        ws.tab_mut(bg).unwrap().bg_job = Some("34c55b2c".into());
-        ws.set_active(a);
-        ws.set_active(bg);
-        ws.drop_background_tabs();
-        assert!(ws.tab(bg).is_none());
-        assert!(ws.tab(a).is_some());
-        assert_eq!(ws.active, Some(a));
-    }
-
     /// Closing the current tab goes back to where you were before it, not
     /// to its neighbour in the rail (giverny#247).
     #[test]

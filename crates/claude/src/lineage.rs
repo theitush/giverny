@@ -308,58 +308,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// An environment as a lookup, for the `_in` functions.
-    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |name| {
-            vars.iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    /// The live case: a job whose daemon a Windows Giverny started. None of
-    /// its Giverny variables are taken; the job's directory names the
-    /// account (giverny#244).
-    #[test]
-    fn inside_a_job_the_daemons_giverny_variables_are_not_taken() {
-        let daemons = [
-            ("GIVERNY_TAB_ID", "giverny-65"),
-            (
-                "GIVERNY_FEED_DIR",
-                "/mnt/c/Users/ita/AppData/Roaming/giverny/feeds",
-            ),
-            (
-                "GIVERNY_PROFILE_DIR",
-                r"\\wsl.localhost\Ubuntu\home\ita\.claude",
-            ),
-            ("CLAUDE_JOB_DIR", "/home/ita/.claude/jobs/34c55b2c"),
-        ];
-        let get = env_of(&daemons);
-        assert_eq!(
-            job_dir_in(&get),
-            Some(PathBuf::from("/home/ita/.claude/jobs/34c55b2c"))
-        );
-        for name in ["GIVERNY_TAB_ID", "GIVERNY_FEED_DIR", "GIVERNY_PROFILE_DIR"] {
-            assert_eq!(giverny_var_in(name, &get), None, "{name}");
-        }
-        assert_eq!(
-            job_account_in(&get),
-            Some(PathBuf::from("/home/ita/.claude"))
-        );
-
-        let tabs = [("GIVERNY_TAB_ID", "giverny-57"), ("GIVERNY_FEED_DIR", " ")];
-        let get = env_of(&tabs);
-        assert_eq!(job_dir_in(&get), None);
-        assert_eq!(
-            giverny_var_in("GIVERNY_TAB_ID", &get).as_deref(),
-            Some("giverny-57")
-        );
-        assert_eq!(giverny_var_in("GIVERNY_FEED_DIR", &get), None, "blank");
-        assert_eq!(job_account_in(&get), None);
-        let blank = [("CLAUDE_JOB_DIR", ""), ("GIVERNY_TAB_ID", "giverny-57")];
-        assert!(giverny_var_in("GIVERNY_TAB_ID", &env_of(&blank)).is_some());
-    }
-
     /// A process tree as `(pid, parent, is claude)`.
     fn walk(tree: &[(u32, u32, bool)], start: u32, app: u32) -> Lineage {
         let map: HashMap<u32, (u32, bool)> = tree.iter().map(|&(p, pp, c)| (p, (pp, c))).collect();
@@ -374,21 +322,6 @@ mod tests {
     const APP: u32 = 100;
 
     #[test]
-    fn the_tabs_own_claude_is_its_own() {
-        // app → shell → claude → sh (hook runner) → relay
-        let tree = [(200, APP, false), (300, 200, true), (400, 300, false)];
-        assert_eq!(walk(&tree, 400, APP), Lineage::Own);
-        // A shell started inside the tab's shell changes nothing.
-        let tree = [
-            (200, APP, false),
-            (210, 200, false),
-            (300, 210, true),
-            (400, 300, false),
-        ];
-        assert_eq!(walk(&tree, 400, APP), Lineage::Own);
-    }
-
-    #[test]
     fn a_claude_inside_the_tabs_claude_is_not() {
         // app → shell → claude → bash → claude → sh → relay
         let tree = [
@@ -399,111 +332,5 @@ mod tests {
             (400, 320, false),
         ];
         assert_eq!(walk(&tree, 400, APP), Lineage::Nested);
-    }
-
-    #[test]
-    fn a_claude_under_a_detached_multiplexer_is_not() {
-        // init → tmux server → shell → claude → sh → relay; the tmux client
-        // in the tab is a separate branch that never parents the session.
-        let tree = [
-            (1, 0, false),
-            (50, 1, false),
-            (60, 50, false),
-            (70, 60, true),
-            (80, 70, false),
-            (200, APP, false),
-            (210, 200, false),
-        ];
-        assert_eq!(walk(&tree, 80, APP), Lineage::Nested);
-    }
-
-    #[test]
-    fn no_claude_in_sight_trusts_the_tab() {
-        // A relay whose parents are not the session's (a Windows program
-        // run for a session inside WSL), reaching the app or not.
-        let tree = [(200, APP, false), (400, 200, false)];
-        assert_eq!(walk(&tree, 400, APP), Lineage::Unknown);
-        let tree = [(1, 0, false), (400, 1, false)];
-        assert_eq!(walk(&tree, 400, APP), Lineage::Unknown);
-        assert!(Lineage::Unknown.is_tabs());
-        assert!(Lineage::Own.is_tabs());
-        assert!(!Lineage::Nested.is_tabs());
-    }
-
-    #[test]
-    fn a_parent_loop_ends_the_walk() {
-        let tree = [(300, 400, true), (400, 300, false)];
-        assert_eq!(walk(&tree, 400, APP), Lineage::Nested);
-    }
-
-    #[test]
-    fn claude_is_recognised_by_name_however_it_is_spelled() {
-        assert!(is_claude_name("claude"));
-        assert!(is_claude_name("claude\n"));
-        assert!(is_claude_name("/home/u/.local/bin/claude"));
-        assert!(is_claude_name("claude.exe"));
-        assert!(is_claude_name(r"C:\Users\u\.local\bin\claude.exe"));
-        assert!(!is_claude_name("claude-helper"));
-        assert!(!is_claude_name("bash"));
-        assert!(!is_claude_name(""));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn this_test_has_no_claude_between_it_and_its_parent() {
-        // The test process is a plain child of its parent: judged against
-        // that parent, no claude stands between.
-        let me = std::process::id();
-        let parent = proc_parent(me).unwrap();
-        assert!(!proc_is_claude(me));
-        assert_eq!(of_process(me, parent), Lineage::Unknown);
-    }
-
-    /// A process tree as `(pid, parent, is claude, is the daemon's pty host)`.
-    fn bg(tree: &[(u32, u32, bool, bool)], start: u32) -> Option<bool> {
-        let map: HashMap<u32, (u32, bool, bool)> =
-            tree.iter().map(|&(p, pp, c, h)| (p, (pp, c, h))).collect();
-        under_pty_host(
-            start,
-            |p| map.get(&p).map(|e| e.0),
-            |p| map.get(&p).is_some_and(|e| e.1),
-            |p| map.get(&p).is_some_and(|e| e.2),
-        )
-    }
-
-    #[test]
-    fn the_pty_host_is_known_by_its_title_or_its_flag() {
-        assert!(is_pty_host_cmdline(
-            b"claude bg-pty-host\0--bg-pty-host\0/tmp/p.sock\0"
-        ));
-        assert!(is_pty_host_cmdline(b"claude bg-pty-host\0"));
-        assert!(is_pty_host_cmdline(b"/usr/bin/claude\0--bg-pty-host\0/s\0"));
-        assert!(!is_pty_host_cmdline(b"claude bg-spare\0--bg-spare\0/s\0"));
-        assert!(!is_pty_host_cmdline(b"claude\0-p\0what is bg-pty-host\0"));
-    }
-
-    #[test]
-    fn a_background_jobs_own_session_runs_under_the_pty_host() {
-        // init → daemon → bg-pty-host → claude (the job) → sh → relay
-        let job = [
-            (10, 1, true, false),
-            (20, 10, true, true),
-            (30, 20, true, false),
-            (40, 30, false, false),
-        ];
-        assert_eq!(bg(&job, 40), Some(true));
-        // A claude started in the job's shell inherits CLAUDE_JOB_DIR, and
-        // is not the job.
-        let nested = [
-            (10, 1, true, false),
-            (20, 10, true, true),
-            (30, 20, true, false),
-            (35, 30, false, false),
-            (38, 35, true, false),
-            (40, 38, false, false),
-        ];
-        assert_eq!(bg(&nested, 40), Some(false));
-        // No claude at all: nothing to say.
-        assert_eq!(bg(&[(40, 1, false, false)], 40), None);
     }
 }

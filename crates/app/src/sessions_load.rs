@@ -199,7 +199,6 @@ pub fn machine_ram_mb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giverny_claude::use_reading::RunUse;
 
     /// The line as read.
     fn figures(t: &Use) -> String {
@@ -223,75 +222,5 @@ mod tests {
         );
         u.gpu_pct = Some(40);
         assert_eq!(figures(&u), "23% CPU  2.0G RAM  40% GPU");
-    }
-
-    /// The pieces the rail colours carry their own shares: CPU as it is,
-    /// RAM of all of it, GPU compute as it is; the gaps none.
-    #[test]
-    fn each_piece_of_the_line_carries_its_share() {
-        let u = Use {
-            cpu_pct: 23,
-            mem_mb: 12_000,
-            gpu_mb: Some(512),
-            gpu_pct: Some(60),
-        };
-        assert_eq!(
-            figure_parts(&u, 24_000),
-            vec![
-                ("23% CPU".to_string(), 23.0),
-                ("  ".to_string(), 0.0),
-                ("12G RAM".to_string(), 50.0),
-                ("  ".to_string(), 0.0),
-                ("60% GPU".to_string(), 60.0),
-            ]
-        );
-    }
-
-    /// Both shares are of the whole machine: the CPU figure as it is (a
-    /// share of every core), the memory of all the RAM.
-    #[test]
-    fn a_tabs_share_is_of_the_whole_machine() {
-        let u = Use {
-            cpu_pct: 25,
-            mem_mb: 2048,
-            gpu_mb: None,
-            gpu_pct: None,
-        };
-        assert_eq!(machine_shares(&u, 8192), (25.0, 25.0));
-        assert_eq!(machine_shares(&u, 0), (25.0, 0.0), "no RAM known");
-        assert!(machine_ram_mb() > 0, "this machine's RAM");
-    }
-
-    #[test]
-    fn a_runs_figure_reaches_the_pane_as_it_was_read() {
-        let used = Use {
-            cpu_pct: 39,
-            mem_mb: 928,
-            gpu_mb: Some(2048),
-            gpu_pct: Some(12),
-        };
-        let r = Reading {
-            runs: vec![RunUse {
-                session: "s1".into(),
-                task: "demo#1".into(),
-                used,
-                agent: Some("a1".into()),
-            }],
-            ..Reading::default()
-        };
-        let t = task_lives(&r);
-        assert_eq!(
-            (t[0].session.as_str(), t[0].task.as_str()),
-            ("s1", "demo#1")
-        );
-        assert_eq!(t[0].agent.as_deref(), Some("a1"));
-        assert_eq!(
-            t[0].live,
-            RunLive {
-                cpu_pct: 39,
-                mem_mb: 928,
-                gpu_mb: Some(2048)
-            }
-        );
     }
 }

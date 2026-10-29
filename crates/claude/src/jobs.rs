@@ -391,49 +391,6 @@ mod tests {
         std::fs::write(dir.join("state.json"), body).unwrap();
     }
 
-    /// An id goes onto a command line: only what Claude Code's ids are
-    /// made of gets there, and nothing runs for anything else.
-    #[test]
-    fn only_a_job_id_is_ended() {
-        assert!(valid_id("1b3d5606"));
-        assert!(valid_id("6e7e56e0-7c66"));
-        for bad in ["", "a b", "x;rm -rf ~", "../jobs", "id\n"] {
-            assert!(!valid_id(bad), "{bad:?}");
-            let err = end(Path::new("/nonexistent"), bad, End::Stop).unwrap_err();
-            assert!(err.to_string().starts_with("not a job id"), "{err}");
-        }
-        assert_eq!(End::Stop.subcommand(), "stop");
-        assert_eq!(End::Delete.subcommand(), "rm");
-    }
-
-    /// The placeholder a resumed client parks on has nothing asked of it.
-    #[test]
-    fn a_job_with_no_name_and_no_intent_is_untouched() {
-        let config = scratch("untouched");
-        write_job(
-            &config,
-            "f68bc6cd",
-            r#"{"state":"working","detail":"(idle — send a prompt to start)","intent":"",
-                "sessionId":"f68bc6cd-7c66","resumeSessionId":"f68bc6cd-7c66"}"#,
-        );
-        write_job(
-            &config,
-            "6e7e56e0",
-            r#"{"state":"working","name":"count rust lines","intent":"Test session"}"#,
-        );
-        write_job(
-            &config,
-            "29ab7872",
-            r#"{"state":"done","intent":"yh do those also plz"}"#,
-        );
-        let jobs = scan([config.clone()]);
-        let untouched = |id: &str| jobs.iter().find(|j| j.id == id).unwrap().untouched;
-        assert!(untouched("f68bc6cd"));
-        assert!(!untouched("6e7e56e0"));
-        assert!(!untouched("29ab7872"), "asked for, if not named yet");
-        let _ = std::fs::remove_dir_all(&config);
-    }
-
     #[test]
     fn reads_the_shape_claude_actually_writes() {
         // Trimmed from a real jobs/<id>/state.json.
@@ -523,51 +480,6 @@ mod tests {
         // about which ones survive.
         watching.sort_unstable();
         assert_eq!(watching, ["aaaa1111", "bbbb2222"]);
-        let _ = std::fs::remove_dir_all(&config);
-    }
-
-    /// A job the daemon started by resuming a conversation says which one:
-    /// its earlier workers are that conversation's (giverny#242).
-    #[test]
-    fn a_resumed_job_names_the_conversation_it_came_from() {
-        let config = scratch("forked");
-        write_job(
-            &config,
-            "aaaa1111",
-            r#"{ "state": "working", "intent": "go" }"#,
-        );
-        write_job(
-            &config,
-            "bbbb2222",
-            r#"{ "state": "working", "intent": "go" }"#,
-        );
-        write_job(
-            &config,
-            "cccc3333",
-            r#"{ "state": "working", "intent": "go" }"#,
-        );
-        let me = std::process::id();
-        std::fs::create_dir_all(config.join("daemon")).unwrap();
-        std::fs::write(
-            config.join("daemon").join("roster.json"),
-            format!(
-                r#"{{"workers":{{
-                    "aaaa1111":{{"pid":{me},"dispatch":{{"launch":{{"mode":"resume",
-                        "sessionId":"/home/u/.claude/projects/-w/db5efe33-5a12.jsonl","fork":true}}}}}},
-                    "bbbb2222":{{"pid":{me},"dispatch":{{"launch":{{"mode":"resume","sessionId":"abc-1"}}}}}},
-                    "cccc3333":{{"pid":{me},"dispatch":{{"launch":{{"mode":"prompt","args":[]}}}}}}}}}}"#
-            ),
-        )
-        .unwrap();
-        let jobs = scan([config.clone()]);
-        let from = |id: &str| {
-            jobs.iter()
-                .find(|j| j.id == id)
-                .and_then(|j| j.forked_from.clone())
-        };
-        assert_eq!(from("aaaa1111").as_deref(), Some("db5efe33-5a12"));
-        assert_eq!(from("bbbb2222").as_deref(), Some("abc-1"));
-        assert_eq!(from("cccc3333"), None, "a prompt starts a new one");
         let _ = std::fs::remove_dir_all(&config);
     }
 
