@@ -13,7 +13,7 @@
 //! giverny#358), and the plugin's
 //! `UserPromptSubmit` hook, which sends a prompt that asks to manage to the
 //! `giverny:manage` skill ([`crate::manage_trigger`]), and the `SessionStart`
-//! hook that, with names on, asks a tab's session to name itself
+//! hook that, with names on, gives a tab's session its name
 //! ([`crate::names`]), and puts a tab's claude under its cap before its
 //! first command ([`crate::tab_cap::on_session_start`], giverny#270)
 //! — or, for a session whose start ran no such name hook, its
