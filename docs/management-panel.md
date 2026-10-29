@@ -417,6 +417,7 @@ Claude Code runs that command at least every five seconds while a session has li
 - **A plain `run` shows no live use.** Without a systemd scope there is no cgroup to read, so the pane's use column stays empty while the command runs; its peak and CPU time appear once it ends.
 - **An `ask` waits for its manager's next own tool call.** A manager blocked in a long tool call (waiting on its workers, say) does not see it until that call returns.
 - **An `ask` is addressed by session id.** One sent to a session that has since been re-id'd (`/clear`, a compaction) never arrives.
+- **The `giverny` plugin is Unix-only.** Its launchers (`giverny-manage`, `giverny-eta`, `giverny-hook`) are `#!/bin/sh` scripts, which native-Windows Claude Code cannot run, so a Windows build writes no plugin directory and no `extraKnownMarketplaces`/`enabledPlugins` keys, and takes back the ones an older build wrote. The panel's live rows (the subagent line) still work there; the manage skill, its hooks, ETAs and `/giverny:clear-done` do not. A Claude inside WSL gets them from a Giverny built for Linux.
 - **A held lease does not grow.** `claim` only shrinks one in place; to grow it, release it and claim again, which gives up its place in the queue.
 
 ## Versioning

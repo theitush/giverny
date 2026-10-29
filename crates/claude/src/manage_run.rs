@@ -1063,7 +1063,7 @@ fn spawn_wait<G, S: Stop>(
     c: &mut Command,
     what: &str,
     ignore_signals: bool,
-    mut stop: Option<&mut S>,
+    stop: Option<&mut S>,
     watch: impl FnOnce(u32) -> G,
 ) -> Result<(Waited, G), String> {
     let t0 = Instant::now();
@@ -1071,6 +1071,7 @@ fn spawn_wait<G, S: Stop>(
     let watching = watch(child.id());
     #[cfg(unix)]
     {
+        let mut stop = stop;
         let _ = &mut child;
         // SIGINT is the scope stopper's when there is one; SIGQUIT is left
         // to the command either way.

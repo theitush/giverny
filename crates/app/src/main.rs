@@ -918,9 +918,19 @@ const SECOND_WINDOW_ENV: &str = "GIVERNY_SECOND_WINDOW";
 #[cfg(unix)]
 fn defer_to_running() -> bool {
     use giverny_claude::hooks::{self, Running};
-    if let Some(var) = [SECOND_WINDOW_ENV, claude_watch::NO_ACCOUNT_SETUP_ENV]
-        .into_iter()
-        .find(|var| std::env::var_os(var).is_some())
+    // The side-instance switch as the accounts read it: `=0` is off.
+    if let Some(var) = [
+        (
+            SECOND_WINDOW_ENV,
+            std::env::var_os(SECOND_WINDOW_ENV).is_some(),
+        ),
+        (
+            claude_watch::NO_ACCOUNT_SETUP_ENV,
+            claude_watch::side_instance(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(var, set)| set.then_some(var))
     {
         tracing::info!("{var} is set: opening a window whatever else runs");
         return false;
@@ -2111,15 +2121,14 @@ impl App {
         // second window, or a side instance trying out a build, must not end
         // the msrdc the first one's window lives in, nor end it twice.
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-        let wslg_watchdog = (claude.relay_listening()
-            && std::env::var_os(claude_watch::NO_ACCOUNT_SETUP_ENV).is_none())
-        .then(|| {
-            let ctx = cc.egui_ctx.clone();
-            wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
-                ctx.request_repaint()
+        let wslg_watchdog = (claude.relay_listening() && !claude_watch::side_instance())
+            .then(|| {
+                let ctx = cc.egui_ctx.clone();
+                wslg_watchdog::start(wslg_watchdog::record_path(paths.base()), move || {
+                    ctx.request_repaint()
+                })
             })
-        })
-        .flatten();
+            .flatten();
         let codex = codex_watch::CodexWatch::new(
             &cfg.codex,
             Some(paths.base().join("state/codex-usage.json")),

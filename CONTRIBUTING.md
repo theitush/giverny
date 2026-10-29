@@ -19,7 +19,7 @@ Every Giverny adopts the Claude accounts it finds: it points each account's hook
 GIVERNY_NO_ACCOUNT_SETUP=1 XDG_CONFIG_HOME=/tmp/gv-config XDG_RUNTIME_DIR=/tmp/gv-run cargo run
 ```
 
-With it set, Giverny still reads every account but writes nothing into its `settings.json` or `plugins/known_marketplaces.json`, at startup or from the UI (install hooks, the statusline and auto-mode toggles, the management panel switch).
+With it set, Giverny still reads every account but writes nothing into its `settings.json` or `plugins/known_marketplaces.json`, at startup or from the UI (install hooks, the statusline and auto-mode toggles, the management panel switch), and leaves the `giverny` link and the plugin directory where the installed Giverny put them. `GIVERNY_NO_ACCOUNT_SETUP=0` (or empty) is off.
 
 ## Before opening a PR
 

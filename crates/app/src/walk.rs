@@ -32,14 +32,14 @@ pub fn still_held(ctrl: bool, focused: bool) -> bool {
     ctrl && focused
 }
 
-/// What a tab the walk is passing over shows in place of its terminal: the
-/// tail of its saved scrollback, as text. Read once per tab per walk.
 /// What a walk's preview says of the tab it passes over.
 pub const WALKING: &str = "not started · starts when Ctrl is released";
 
 /// What a stopped tab on screen says (giverny#474).
 pub const STOPPED: &str = "stopped · click to start";
 
+/// What a tab the walk is passing over shows in place of its terminal: the
+/// tail of its saved scrollback, as text. Read once per tab per walk.
 pub struct Preview {
     pub tab: TabId,
     lines: Vec<String>,
