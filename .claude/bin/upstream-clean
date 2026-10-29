@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Clean a PR branch of this fork's own references before it goes upstream (giverny#504).
+
+A branch cut from upstream/main picks up our scaffolding and our habits on the
+way: `(giverny#123)` after half the comments, Ita's name, coo's paths. y0av's
+repo has no use for them. This finds them in the lines the branch *adds*
+against upstream/main only; a ref upstream's copy of the file already has
+(its own `giverny#22` in hooks.rs) is upstream's and never touched.
+
+  upstream-clean [--fix] [--context] [<branch>]
+      <branch>   defaults to HEAD of the worktree you run it in
+      --fix      rewrites the mechanical refs in the branch's worktree (this
+                 one if its HEAD is <branch>, else the one that has <branch>
+                 checked out); never commits. The rest are listed, file:line,
+                 for a hand edit.
+      --context  also lists the softer mentions (Ita, /home/ita, sibling
+                 repos, .claude/worktrees), mostly test data; counted always.
+
+Exit 2 when the branch touches CLAUDE.md, .claude/ or mirror-sync.yml; 1 while
+any ref is left (or, without --fix, fixable); 0 when clean.
+
+Mechanical, in comment lines (.rs `//`, `#` in .toml/.sh/.yml/.py) and any
+line of a .md, a run of consecutive added lines read as one text:
+  foo (giverny#1).              -> foo.
+  foo (giverny#1, giverny#2)    -> foo      (a `#N` beside them is ours too)
+  foo bar                       -> foo bar.
+  (giverny#1).                     (the ref wrapped onto a line of its own)
+  giverny#7: a row is           -> A row is
+  (giverny#7; no cgroups)       -> (no cgroups)
+  ([`x`], giverny#7)            -> ([`x`])
+  (a; giverny#7; b)             -> (a; b)
+Left for a hand edit: a ref inside a sentence (`giverny#7's`, `before
+giverny#7`), any in code or a string, one whose removal would empty a line.
+"""
+import os
+import re
+import subprocess
+import sys
+
+UPSTREAM = "upstream/main"
+SCAFFOLD = re.compile(r"(^|/)CLAUDE\.md$|^\.claude/|^\.github/workflows/mirror-sync\.yml$")
+# Refs that name this fork's world: always to go.
+REF = re.compile(
+    r"giverny#\d+|theitush/|/home/ita/coo|\bcoo/(tools|mirror|templates)\b"
+    r"|\btools/(board|sign)\b|coo-board|\bcoo\b"
+)
+# Softer mentions: worth a look, mostly test data.
+CONTEXT = re.compile(
+    r"\bIta\b|/home/ita\b|\.claude/worktrees"
+    r"|\b(poly|[Ii]nbar|yajna|ToLaD|WeatherBaseline|lead-machine)\b"
+)
+
+ITEM = r"(?:giverny#\d+|#\d+)"
+# What follows a removed ref on its line: its punctuation, and whether text does.
+AFTER = r"(?P<p>[.,;:]?)(?P<sp>[ \t]*)(?P<more>(?=\S))?"
+# A group of nothing but refs, with the space (or line break) before it.
+PURE_GROUP = re.compile(r"\s*\((?P<body>" + ITEM + r"(?:\s*[,;]\s*" + ITEM + r")*)\)" + AFTER)
+# `giverny#7: text` / `giverny#7, giverny#8: text` opening a line.
+LEAD = re.compile(r"^(?P<refs>giverny#\d+(?:,\s*giverny#\d+)*):\s+(?P<c>\S)", re.M)
+# `(giverny#7; rest` / `(giverny#7: rest` / `(giverny#7, rest of 3+ words`.
+PAREN_HEAD = re.compile(r"\((?P<ref>giverny#\d+)(?P<sep>[;:,])\s+(?=(?P<rest>[^)]*))")
+# `(text, giverny#7)` / `(text; giverny#7, giverny#8)`.
+PAREN_TAIL = re.compile(r"(?<=[^(\s])(?P<refs>\s*[,;]\s*giverny#\d+(?:\s*[,;]\s*" + ITEM + r")*)\)" + AFTER)
+# `(a; giverny#7; b)` / `(a, giverny#7, b)`.
+PAREN_MID = re.compile(r"(?<=\S)(?P<sep>[;,])[ \t]*(?P<ref>giverny#\d+)(?=(?P=sep)[ \t]+(?!#\d))")
+HASH_COMMENT = (".toml", ".sh", ".yml", ".yaml", ".py")
+
+
+def git(*args, cwd=None):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def die(msg, code=2):
+    print(f"upstream-clean: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def added_lines(branch):
+    """{path: [(new line number, text)]} for every line the branch adds."""
+    out = git("diff", "-U0", "--no-color", "--no-ext-diff", f"{UPSTREAM}...{branch}")
+    files, path, ln = {}, None, 0
+    for line in out.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif line.startswith("@@"):
+            ln = int(re.match(r"@@ -\S+ \+(\d+)", line).group(1))
+        elif line.startswith("+") and path:
+            files.setdefault(path, []).append((ln, line[1:]))
+            ln += 1
+    return files
+
+
+def upstream_tokens(path):
+    """Ref-like tokens upstream's copy of the file already has: those are upstream's."""
+    try:
+        text = git("show", f"{UPSTREAM}:{path}")
+    except subprocess.CalledProcessError:
+        return set()
+    return set(re.findall(r"giverny#\d+|(?<![\w#])#\d+", text))
+
+
+def comment_split(path, text):
+    """(prefix, prose) of a line whose prose may be rewritten, else None."""
+    if path.endswith(".md"):
+        m = re.match(r"^(\s*(?:[-*>]\s+)?)(.*)$", text)
+    elif path.endswith(".rs"):
+        m = re.match(r"^(\s*//[/!]?\s*)(.*)$", text)
+    elif path.endswith(HASH_COMMENT):
+        m = re.match(r"^(\s*#+\s*)(.*)$", text)
+    else:
+        return None
+    return (m.group(1), m.group(2)) if m else None
+
+
+def blocks(path, lines):
+    """Runs of consecutive added prose lines: [(first line number, [(prefix, prose)])].
+    A run breaks at a gap, a code line, a blank comment line, or a new list item."""
+    out, cur, last = [], None, None
+    for n, t in lines:
+        split = comment_split(path, t)
+        if not split or not split[1].strip():
+            cur = None
+            continue
+        prefix = split[0]
+        same = cur and last == n - 1 and (
+            prefix == cur[1][-1][0] or (path.endswith(".md") and not re.search(r"[-*>]", prefix))
+        )
+        if not same:
+            cur = (n, [])
+            out.append(cur)
+        cur[1].append(split)
+        last = n
+    return out
+
+
+def drop(m, keep=""):
+    """Replace a matched ref with `keep`. When the ref had wrapped onto the next
+    line and text follows it there, its punctuation goes up and the text stays
+    on its line: `window\n(giverny#3). Each` -> `window.\nEach`, not one long line."""
+    removed = m.string[m.start() : m.start("p")]
+    if "\n" in removed and m.group("more") is not None:
+        return keep + m.group("p") + "\n"
+    return keep + m.group("p") + m.group("sp")
+
+
+def fix_text(s, theirs):
+    """Rewrite the mechanical refs in a run of prose joined by newlines."""
+
+    def pure(m):
+        toks = re.findall(ITEM, m.group("body"))
+        if not any(t.startswith("giverny#") for t in toks) or any(t in theirs for t in toks):
+            return m.group(0)
+        return drop(m)
+
+    def lead(m):
+        if any(r in theirs for r in re.findall(r"giverny#\d+", m.group("refs"))):
+            return m.group(0)
+        return m.group("c").upper()
+
+    def head(m):
+        rest = m.group("rest")
+        if m.group("ref") in theirs or re.search(r"#\d", rest):
+            return m.group(0)
+        if m.group("sep") == "," and len(rest.split()) < 3:
+            return m.group(0)
+        # `(giverny#3,\nfoo` -> `\n(foo`: the paren moves down, the line stays.
+        return "\n(" if "\n" in m.group(0) else "("
+
+    s = LEAD.sub(lead, s)
+    s = PURE_GROUP.sub(pure, s)
+    s = PAREN_HEAD.sub(head, s)
+    s = PAREN_MID.sub(lambda m: m.group(0) if m.group("ref") in theirs else "", s)
+    s = PAREN_TAIL.sub(
+        lambda m: m.group(0) if set(re.findall(ITEM, m.group("refs"))) & theirs else drop(m, ")"),
+        s,
+    )
+    return s
+
+
+def worktree_for(branch):
+    """The checked-out worktree whose HEAD is `branch`, for --fix."""
+    want = git("rev-parse", branch).strip()
+    if git("rev-parse", "HEAD").strip() == want:
+        return git("rev-parse", "--show-toplevel").strip()
+    wt = None
+    for line in git("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            wt = line[9:]
+        elif line == f"branch refs/heads/{branch}" and git("rev-parse", "HEAD", cwd=wt).strip() == want:
+            return wt
+    die(f"--fix: no worktree has {branch} checked out at its tip; run it in one")
+
+
+def scan(path, lines, theirs):
+    """(found, fixed, edits, hand) for one file. edits: [(first, count, new lines)]."""
+    texts = dict(lines)
+    refs = {n: [r.group(0) for r in REF.finditer(t) if r.group(0) not in theirs] for n, t in lines}
+    found = sum(len(v) for v in refs.values())
+    edits, done = [], set()
+    for first, run in blocks(path, lines):
+        span = range(first, first + len(run))
+        if not any(refs[n] for n in span):
+            continue
+        new = fix_text("\n".join(p for _, p in run), theirs).split("\n")
+        # A line left as nothing but punctuation was a ref wrapped onto its
+        # own line: the punctuation goes back to the line before it.
+        merged = []
+        for p in new:
+            if merged and not p.strip(" \t.,;:"):
+                merged[-1] = merged[-1].rstrip() + p.strip()
+            else:
+                merged.append(p)
+        if not merged or any(not p.strip(" \t.,;:") for p in merged):
+            continue  # it would empty a line: by hand
+        prefixes = [p for p, _ in run]
+        if len(merged) != len(run) and len(set(prefixes)) > 1:
+            continue  # lines merged under differing prefixes: by hand
+        out = [prefixes[i] + p for i, p in enumerate(merged)]
+        # `foo (giverny#1, giverny#2)` across a break leaves the opener's line ending in space.
+        out = [o.rstrip() for o in out]
+        old = [texts[n] for n in span]
+        if out != old:
+            left = set(r.group(0) for o in out for r in REF.finditer(o))
+            edits.append((first, len(run), out))
+            for n in span:
+                done.update((n, r) for r in refs[n] if r not in left)
+    fixed = len(done)
+    hand = []
+    for n, t in lines:
+        rest = [r for r in refs[n] if (n, r) not in done]
+        if rest:
+            kind = "comment" if comment_split(path, t) else "code"
+            hand.append((n, kind, t.strip()))
+    return found, fixed, edits, hand
+
+
+def refs_on(lines, n):
+    return any(REF.search(t) for m, t in lines if m == n)
+
+
+def main(argv):
+    fix = "--fix" in argv
+    show_context = "--context" in argv
+    rest = [a for a in argv if a not in ("--fix", "--context")]
+    if any(a.startswith("-") for a in rest) or len(rest) > 1:
+        die("usage: upstream-clean [--fix] [--context] [<branch>]")
+    branch = rest[0] if rest else "HEAD"
+    try:
+        git("rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}")
+    except subprocess.CalledProcessError:
+        die(f"no such branch: {branch}")
+
+    changed = git("diff", "--name-only", f"{UPSTREAM}...{branch}").split()
+    scaffold = [p for p in changed if SCAFFOLD.search(p)]
+    for p in scaffold:
+        print(f"SCAFFOLDING {p}: our file, must not reach upstream")
+
+    files = added_lines(branch)
+    wt = worktree_for(branch) if fix else None
+    if wt and files:
+        dirty = git("status", "--porcelain", "--", *files, cwd=wt).strip()
+        if dirty:
+            die(f"--fix: uncommitted changes in files to rewrite:\n{dirty}")
+
+    found = fixed = nlines = 0
+    hand, context, touched = [], [], 0
+    for path, lines in files.items():
+        context += [f"{path}:{n}: {t.strip()}" for n, t in lines if CONTEXT.search(t)]
+        if not any(REF.search(t) for _, t in lines):
+            continue
+        f, x, edits, h = scan(path, lines, upstream_tokens(path))
+        found, fixed = found + f, fixed + x
+        nlines += sum(1 for first, c, out in edits for n in range(first, first + c) if refs_on(lines, n))
+        touched += bool(edits)
+        gone = []  # (end, lines removed) of each edit, for numbers after --fix
+        if fix and edits:
+            full = os.path.join(wt, path)
+            with open(full, encoding="utf-8") as fh:
+                body = fh.read().split("\n")
+            for first, count, out in sorted(edits, reverse=True):
+                old = [t for n, t in lines if first <= n < first + count]
+                if body[first - 1 : first - 1 + count] != old:
+                    die(f"--fix: {path}:{first} is not what the branch committed; stopping")
+                body[first - 1 : first - 1 + count] = out
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(body))
+            gone = [(first + count, count - len(out)) for first, count, out in edits]
+        for n, kind, t in h:
+            n -= sum(d for end, d in gone if end <= n)
+            hand.append(f"{path}:{n}: [{kind}] {t}")
+
+    if hand:
+        print(f"\nFor a hand edit ({len(hand)} lines):")
+        print("\n".join(hand))
+    if show_context and context:
+        print(f"\nContext mentions ({len(context)} lines; look, most are test data):")
+        print("\n".join(context))
+
+    verb = "fixed" if fix else "fixable with --fix"
+    print(
+        f"\n{branch} vs {UPSTREAM}: {len(changed)} files changed, {len(scaffold)} scaffolding; "
+        f"{found} fork refs in added lines: {fixed} {verb} ({nlines} lines in {touched} files), "
+        f"{found - fixed} left on {len(hand)} lines for a hand edit; "
+        f"{len(context)} context mentions" + ("" if show_context else " (--context lists them)")
+    )
+    if scaffold:
+        return 2
+    return 1 if hand or (fixed and not fix) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
