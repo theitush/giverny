@@ -487,6 +487,8 @@ const USAGE: &str = "giverny — a native terminal built around Claude Code\n\n\
      giverny welcome [from-version]\n                     \
      print the welcome screen\n  \
      giverny update     check for a newer release\n  \
+     giverny transcript [--follow] <agent jsonl>\n                     \
+     print a worker's transcript, readable (and follow it)\n  \
      giverny install-desktop [--remove]\n                     \
      install the desktop entry + icons (needed for the\n                     \
      taskbar icon on Wayland)\n  \
@@ -541,6 +543,25 @@ fn main() -> eframe::Result {
         }
         Some("doctor") => {
             doctor();
+            return Ok(());
+        }
+        // A worker's transcript, readable and live: what a Done row of the
+        // management panel opens.
+        Some("transcript") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+            let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+                eprintln!("usage: giverny transcript [--follow] <agent-<id>.jsonl>");
+                std::process::exit(2);
+            };
+            let stdout = std::io::stdout();
+            if let Err(err) =
+                giverny_claude::transcript::follow(Path::new(path), follow, &mut stdout.lock())
+                && err.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                eprintln!("giverny transcript: {path}: {err}");
+                std::process::exit(1);
+            }
             return Ok(());
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
