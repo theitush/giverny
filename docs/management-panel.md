@@ -326,10 +326,16 @@ Durations everywhere in the pane are written the way the ETA column writes them:
 A click on a **Running** row whose worker is mid-turn opens Claude Code's own view of that worker in the tab. Every other row opens Giverny's **worker page** in the same place (giverny#477): a worker whose turn has ended (finished, or asleep on a background shell of its own), a **Done** row and a **Next up** row. Claude Code keeps no view of those, so Giverny draws one as Claude Code would, and it takes the tab the way the running view does:
 
 - It fills the terminal's area, in the terminal's own grid, font, colours and worker background, with the worker's prompt on its grey band and each entry under it.
-- Claude Code's prompt box follows, dimmed and saying `read-only`: nothing can be typed to such a worker, and no key reaches the shell under the page.
+- Claude Code's prompt box follows, its rules in the worker's colour and the task's name on the top one. No key reaches the shell under the page.
+- **Typing in that box goes to the manager** (giverny#483). Claude Code cannot be typed to about such a worker, but its manager can wake it (`SendMessage`), or start a Next up task. On Enter, Giverny puts one plain line at the manager's prompt and submits it: `Send this to g477's worker (agent <id>): <text>` for a worker whose turn ended (finished, asleep, or Done), or `Start g483 now, adding this to its brief: <text>` for a Next up row. The text is only what the user typed; nothing else is ever sent, and nothing is sent without their Enter. The manage skill tells the manager what each line means and that it is the user's.
+  - The line is typed only into the manager's main prompt, and only when that prompt is empty. A tab on a worker's view is walked back to main first, and the line is read back off the screen before Enter goes. **A draft of the user's in the manager's prompt is never typed into**: the line is refused, put back in the page's box, and the page says why under it. A busy manager queues the line as Claude Code queues anything typed during its turn.
+  - Once the line is in, the page says so and waits. When the worker it named runs again (or, for a Next up row, the task's worker has started), the page gives way and the tab walks into that worker's own Claude Code view, as a click on a Running row does. It does so only while the page is still up in the tab in view; left, the wait ends, and the row is Running again by itself.
+  - A landed task is put back in Running by the manager's `giverny-manage start <task> --agent <its worker's id>`; the time it sat landed is left out of its working time. A Running row whose worker had finished is Running again as soon as the worker is, with no command.
+  - Esc clears a line in the box; on an empty box it goes back.
+- A page with nobody to send to (a note, a worker Claude Code still lists) keeps the box dimmed and `read-only`.
 - The same header sits over it as over a running worker's view: the task's name alone (`g477`, never the description after it), the row's facts and a Done row's Review line.
 - The same "back to manager" button sits under the prompt box. It, Esc, or a second click on the row goes back to the terminal.
-- The wheel, PgUp/PgDn and Home/End scroll it, and a drag selects and copies. A worker still writing is followed as it grows, a Done one opens at its end, and a Next up row's brief, drawn as the worker's prompt, opens at its top.
+- The wheel, PgUp/PgDn and Home/End (with the box empty) scroll it, and a drag selects and copies. A worker still writing is followed as it grows, a Done one opens at its end, and a Next up row's brief, drawn as the worker's prompt, opens at its top.
 
 ## The Review line
 

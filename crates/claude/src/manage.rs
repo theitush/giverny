@@ -50,7 +50,10 @@ usage: giverny manage <command> [args] [--session <id>]
                               the task's worker is starting now (Running);
                               --agent hands it to a worker that already holds
                               another task, refused for one carrying over 100k
-                              context unless --heavy-ok
+                              context unless --heavy-ok; on a landed task,
+                              --agent <its own worker> reopens it once that
+                              worker is woken (the time since it landed is
+                              left out)
   eta   <task> <dur left> [--gut <dur>] [--note N]
                               [--why wait|blocked|scope|load|ready]
                               [--title T] [--agent <id>] [--repo R]
@@ -576,6 +579,34 @@ fn close_pause(row: &mut Map<String, Value>, now: u64) {
     }
     let total = u64_of(row, "paused_s").unwrap_or(0) + span / 1000;
     row.insert("paused_s".into(), json!(total));
+}
+
+/// `start <task> --agent <id>` on a landed row whose worker is `id`: the
+/// worker was woken (giverny#483: the user typed to it from its page, and
+/// the manager passed it on), so its row is Running again. The span since
+/// it landed is a pause, not work: its clock carries on from where it
+/// stopped, and the landing, review and end go.
+fn reopen(row: &mut Map<String, Value>, key: &str, agent: &str, f: &Flags, now: u64) -> String {
+    let ended = ms_of(row, "ended").unwrap_or(now);
+    let off = now.saturating_sub(ended);
+    if !row.contains_key("paused_since") {
+        row.insert("paused_since".into(), json!(stamp(ended)));
+    }
+    close_pause(row, now);
+    for k in ["ended", "landing", "review"] {
+        row.remove(k);
+    }
+    row.insert("stage".into(), json!("running"));
+    if let Some(eta) = f.eta_s {
+        row.insert("eta_s".into(), json!(eta));
+        row.insert("eta_at".into(), json!(stamp(now)));
+    }
+    set_str(row, "note", &f.note);
+    format!(
+        "reopened {key}: its worker {agent} runs again; the {} since it landed is left out \
+         of its time",
+        feed::fmt_span((off / 1000) as i64)
+    )
 }
 
 /// Is this `--why` the worker saying it is waiting rather than working?
@@ -1225,7 +1256,16 @@ pub fn apply(
         }
         Cmd::Start(_) => {
             if stage == Some(feed::Stage::Done) {
-                return Err(format!("`{key}` has landed already"));
+                let i = at.ok_or_else(missing)?;
+                let row = rows[i].as_object_mut().ok_or("row is not an object")?;
+                let held_by = row.get("agent_id").and_then(Value::as_str);
+                return match f.agent.as_deref() {
+                    Some(agent) if held_by == Some(agent) => Ok(reopen(row, &key, agent, f, now)),
+                    _ => Err(format!(
+                        "`{key}` has landed already. Its worker woken again (SendMessage) \
+                         reopens it with `start {key} --agent <that worker's id>`"
+                    )),
+                };
             }
             let i = at.unwrap_or_else(|| {
                 rows.push(json!({ "key": key }));
@@ -3678,6 +3718,39 @@ mod tests {
             feed::Stage::Running,
             "another worker's task runs on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// giverny#483: a landed task's worker woken from its page is Running
+    /// again by its own worker's `start --agent`; the time it lay landed is
+    /// not work. Any other start of a landed task is still refused.
+    #[test]
+    fn starting_a_landed_task_with_its_own_worker_reopens_it() {
+        let dir = scratch("reopen");
+        run(&dir, "start g9 --eta 30 --agent w1", T0).unwrap();
+        run(&dir, "land g9 --review \"ita — look\"", T0 + 20 * MIN).unwrap();
+        let e = run(&dir, "start g9", T0 + 50 * MIN).unwrap_err();
+        assert!(e.contains("landed already"), "{e}");
+        let e = run(&dir, "start g9 --agent w2", T0 + 50 * MIN).unwrap_err();
+        assert!(e.contains("--agent <that worker's id>"), "{e}");
+        let said = run(&dir, "start g9 --agent w1", T0 + 50 * MIN).unwrap();
+        assert!(said.starts_with("reopened g9"), "{said}");
+        assert!(said.contains("30m"), "{said}");
+        let f = read_feed(&dir);
+        let r = f.rows.iter().find(|r| r.key == "g9").unwrap();
+        assert_eq!(r.stage(), feed::Stage::Running);
+        assert_eq!(r.agent_id.as_deref(), Some("w1"));
+        // Twenty minutes worked so far: the clock starts thirty later.
+        assert_eq!(r.started_ms, Some(T0 + 30 * MIN));
+        assert_eq!(r.paused_s, Some(30 * 60));
+        assert_eq!(r.ended_ms, None);
+        assert_eq!(r.landing, None);
+        assert_eq!(r.review, None);
+        // And it lands again as any task does.
+        run(&dir, "land g9", T0 + 60 * MIN).unwrap();
+        let f = read_feed(&dir);
+        let r = f.rows.iter().find(|r| r.key == "g9").unwrap();
+        assert_eq!(r.stage(), feed::Stage::Done);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
