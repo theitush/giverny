@@ -18,7 +18,7 @@
 //! **A reboot or a restart stops a manager's clocks** (giverny#489): every
 //! Running row of the session lost its worker with it, so each not paused
 //! already is stopped where the session last showed life (the record's last
-//! call) and reads `killed` ([`manage::kill_running`]); the manager hears
+//! call, or a worker's last write if later) and reads `killed` ([`manage::kill_running`]); the manager hears
 //! which, and revives each (a fresh or handed-over worker, then `resume`).
 //! Giverny restarts no clock itself. A sleep kills nothing: its frozen span
 //! comes off every clock through [`crate::sleeps`].
@@ -435,7 +435,7 @@ pub fn kill_rows(feed_dir: &Path, session: &str, last_ms: u64, now_ms: u64) -> V
     if manage::writer_of(&doc) != Some(manage::WRITER) {
         return Vec::new();
     }
-    let killed = manage::kill_running(&mut doc, last_ms, now_ms);
+    let killed = manage::kill_running_in(&mut doc, session, last_ms, now_ms);
     if !killed.is_empty() {
         let _ = manage::write(&file, &doc);
     }
@@ -787,7 +787,7 @@ mod tests {
              "paused_since": t(4), "paused_s": 0},
             {"key": "a#4", "stage": "done", "agent_id": "w4", "started": t(0), "ended": t(3)},
             {"key": "a#5", "stage": "planned"},
-            // Its build ran past the last hook call: its clock stops there.
+            // Its build ran past the last hook call.
             {"key": "a#6", "stage": "running", "agent_id": "w6", "started": t(0),
              "usage": {"last_at": t(12)}}]});
         let file = crate::feed::feed_path(&dir, "s1");
@@ -830,12 +830,14 @@ mod tests {
                 .clone()
         };
         let ms = |r: &serde_json::Map<String, Value>, k: &str| manage::ms_of(r, k);
-        assert_eq!(ms(&row("a#1"), "paused_since"), Some(T0 + 10 * MIN));
+        // The session's last sign of life is a#6's run at +12, past its
+        // last hook call at +10: every clock stops there.
+        assert_eq!(ms(&row("a#1"), "paused_since"), Some(T0 + 12 * MIN));
         assert_eq!(ms(&row("a#1"), "killed"), Some(T0 + 70 * MIN));
         // An open wait ends where the clock stopped.
-        assert_eq!(ms(&row("a#2"), "paused_since"), Some(T0 + 10 * MIN));
+        assert_eq!(ms(&row("a#2"), "paused_since"), Some(T0 + 12 * MIN));
         assert_eq!(row("a#2").get("waiting_since"), None);
-        assert_eq!(row("a#2")["wait_s"], json!(120));
+        assert_eq!(row("a#2")["wait_s"], json!(240));
         assert_eq!(ms(&row("a#3"), "paused_since"), Some(T0 + 4 * MIN));
         assert_eq!(row("a#3").get("killed"), None);
         assert_eq!(row("a#4").get("killed"), None);

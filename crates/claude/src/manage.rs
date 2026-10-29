@@ -613,29 +613,48 @@ fn reopen(row: &mut Map<String, Value>, key: &str, agent: &str, f: &Flags, now: 
 
 /// Giverny, WSL or this manager session went off and every worker of the
 /// session went with it (giverny#489, told by [`crate::away`]): each Running
-/// row not paused already has its clock stopped at the last sign of life,
-/// `last_ms` (or its own last measured run, if later), and reads `killed`.
-/// The stop is an open pause, so the off span and the time until a revive
-/// are left out of its running time, its countdown and the history, as a
+/// row not paused already has its clock stopped where the session last
+/// showed life, and reads `killed`. That is the latest of `last_ms` (its
+/// last hook call), a Running row's worker's transcript last written
+/// (`written`, by agent id) and a Running row's last measured run: its
+/// workers died with it, so the latest of them is when it went off. The
+/// stop is an open pause, so the off span and the time until a revive are
+/// left out of the row's running time, its countdown and the history, as a
 /// pause is; only its manager closes it, with `resume` (or `start --agent`,
 /// `land`). Returns the keys killed.
-pub fn kill_running(doc: &mut Value, last_ms: u64, now: u64) -> Vec<String> {
+pub fn kill_running(
+    doc: &mut Value,
+    last_ms: u64,
+    now: u64,
+    written: impl Fn(&str) -> Option<u64>,
+) -> Vec<String> {
     let Ok(rows) = rows_mut(doc) else {
         return Vec::new();
     };
+    let live = |r: &Map<String, Value>| {
+        stage_of(r) == Some(feed::Stage::Running) && !r.contains_key("paused_since")
+    };
+    let off = rows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|r| live(r))
+        .flat_map(|r| {
+            let ran = r
+                .get("usage")
+                .and_then(Value::as_object)
+                .and_then(|u| ms_of(u, "last_at"));
+            let wrote = r.get("agent_id").and_then(Value::as_str).and_then(&written);
+            [ran, wrote]
+        })
+        .flatten()
+        .fold(last_ms, u64::max)
+        .min(now);
     let mut killed = Vec::new();
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-        if stage_of(row) != Some(feed::Stage::Running) || row.contains_key("paused_since") {
+        if !live(row) {
             continue;
         }
-        let ran = row
-            .get("usage")
-            .and_then(Value::as_object)
-            .and_then(|u| ms_of(u, "last_at"));
-        let since = last_ms
-            .max(ran.unwrap_or(0))
-            .max(ms_of(row, "started").unwrap_or(0))
-            .min(now);
+        let since = off.max(ms_of(row, "started").unwrap_or(0)).min(now);
         // An open wait ends where the clock stops: counted once, as off.
         close_wait(row, since);
         row.insert("paused_since".into(), json!(stamp(since)));
@@ -646,6 +665,24 @@ pub fn kill_running(doc: &mut Value, last_ms: u64, now: u64) -> Vec<String> {
         }
     }
     killed
+}
+
+/// [`kill_running`] on `session`'s feed `doc`, its workers' transcripts
+/// looked up under the session's ids (now and before a re-id) in the Claude
+/// config dir this process runs in.
+pub fn kill_running_in(doc: &mut Value, session: &str, last_ms: u64, now: u64) -> Vec<String> {
+    let mut sessions = vec![session.to_string()];
+    sessions.extend(
+        doc.get("aliases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(String::from),
+    );
+    kill_running(doc, last_ms, now, |agent| {
+        last_written(None, &sessions, agent)
+    })
 }
 
 /// Is this `--why` the worker saying it is waiting rather than working?
@@ -5005,17 +5042,19 @@ mod tests {
         run(&dir, "start demo#8 --eta 60 --agent w1", T0).unwrap();
         let file = feed::feed_path(&dir, "s1");
         let mut doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        // Its worker last wrote at +12, after the session's last hook call.
+        let wrote = |a: &str| (a == "w1").then_some(T0 + 12 * MIN);
         assert_eq!(
-            kill_running(&mut doc, T0 + 10 * MIN, T0 + 60 * MIN),
+            kill_running(&mut doc, T0 + 10 * MIN, T0 + 60 * MIN, wrote),
             vec!["demo#8"]
         );
         // A second look kills nothing more: the row is stopped already.
-        assert!(kill_running(&mut doc, T0 + 70 * MIN, T0 + 80 * MIN).is_empty());
+        assert!(kill_running(&mut doc, T0 + 70 * MIN, T0 + 80 * MIN, wrote).is_empty());
         write(&file, &doc).unwrap();
         run(&dir, "pause demo#8", T0 + 90 * MIN).unwrap();
         let r = read_feed(&dir).rows[0].clone();
         assert_eq!(r.killed_ms, None);
-        assert_eq!(r.paused_since_ms, Some(T0 + 10 * MIN));
+        assert_eq!(r.paused_since_ms, Some(T0 + 12 * MIN));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
