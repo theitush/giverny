@@ -516,6 +516,7 @@ fn stat_of(pid: u32) -> Option<(u32, u64)> {
 }
 
 /// `claude`, whatever path or `.exe` it was run by.
+#[cfg(target_os = "linux")]
 fn is_claude_name(name: &str) -> bool {
     let name = name.trim();
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
@@ -856,6 +857,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn claude_is_named_by_its_program_whatever_its_path() {
         assert!(is_claude_name("claude\n"));
