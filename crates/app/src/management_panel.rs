@@ -414,6 +414,7 @@ impl Views {
             // nothing drawn has nothing to be told (giverny#357).
             let opens = feed::opens(!tracker.is_empty(), view.manager);
             let drawn = Drawn::of(view.manager);
+            let mut still: Vec<String> = Vec::new();
             let due = match view.feed_now.as_ref().filter(|_| opens) {
                 Some(f) => {
                     let cleared = tracker.done_cleared_ms.map(|c| f.without_done_by(c));
@@ -427,14 +428,18 @@ impl Views {
                         with_ledger(f, &sessions, l)
                     });
                     let f = leased.as_ref().unwrap_or(f);
-                    due_chores(
+                    let due = due_chores(
                         drawn,
                         f,
                         tracker.rows(),
                         &view.logs,
                         view.shells.live(),
                         now,
-                    )
+                    );
+                    if due.iter().any(|c| c.kind == manage_chores::Kind::NowPaused) {
+                        still = finishing(drawn, f, tracker.rows(), &view.logs, now);
+                    }
+                    due
                 }
                 None => Vec::new(),
             };
@@ -445,7 +450,7 @@ impl Views {
             if same {
                 continue;
             }
-            match manage_chores::publish(&dir, &session, &due) {
+            match manage_chores::publish_with(&dir, &session, &due, &still) {
                 Ok(()) => view.chores = Some((session, due)),
                 Err(e) => tracing::warn!("management panel: chores not kept: {e}"),
             }
@@ -1889,10 +1894,18 @@ pub fn chores(
                             since,
                             how: None,
                         }),
+                        // Ended after the pause began: it stopped for it, and
+                        // the task is now really paused, told at once
+                        // (giverny#486).
                         Some(Unworked::Finished { how, ended_ms }) if paused => {
+                            let kind = if stopped_for_pause(row, ended_ms) {
+                                manage_chores::Kind::NowPaused
+                            } else {
+                                manage_chores::Kind::LandPaused
+                            };
                             ended_ms.map(|since| Chore {
                                 key,
-                                kind: manage_chores::Kind::LandPaused,
+                                kind,
                                 since,
                                 how: Some(how.to_string()),
                             })
@@ -1916,6 +1929,42 @@ pub fn chores(
         }
         out
     })
+}
+
+/// Whether a paused row's worker ended its turn (`ended_ms`) after the
+/// pause began: it stopped for the pause, and the task is now really
+/// paused (giverny#486), rather than its work done before it.
+fn stopped_for_pause(row: &PaneRow<'_, SubagentRow>, ended_ms: Option<u64>) -> bool {
+    match (row.feed.and_then(|f| f.paused_since_ms), ended_ms) {
+        (Some(p), Some(e)) => e >= p,
+        _ => false,
+    }
+}
+
+/// The keys of the paused rows whose workers are still working
+/// (giverny#486): Running in the pane, drawn as [`PAUSED_FINISHING`]. What
+/// tells a manager whether every task it paused has stopped.
+pub fn finishing(
+    drawn: Drawn,
+    feed: &Feed,
+    live: &[SubagentRow],
+    logs: &Logs,
+    now_ms: u64,
+) -> Vec<String> {
+    with_rows(Some(feed), live, logs, now_ms, |_, rows| {
+        rows.iter()
+            .filter(|r| drawn.keeps(r) && still_finishing(r))
+            .filter_map(|r| r.feed.map(|f| f.key.clone()))
+            .collect()
+    })
+}
+
+/// A Running row its manager paused whose worker is still at work: only its
+/// clock is paused (giverny#486).
+fn still_finishing(row: &PaneRow<'_, SubagentRow>) -> bool {
+    row.stage == Stage::Running
+        && row.feed.is_some_and(|f| f.paused_since_ms.is_some())
+        && row.live.is_some_and(|l| l.running())
 }
 
 /// A cell is `"` when its row is the same worker as the row above
@@ -2149,6 +2198,9 @@ fn format_row(
         // The limit next: a row the writer paused for it says why.
         Stage::Running => match (limit, paused) {
             (Some(limit), _) => limit_note(limit, now_ms, &clock.tz),
+            // Paused, its worker still at work: not paused until it ends
+            // its turn (giverny#486).
+            (None, Some(_)) if still_finishing(row) => PAUSED_FINISHING.to_string(),
             (None, Some(p)) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
             (None, None) if stopped.is_some() => stopped.map(|(_, why)| why).unwrap_or_default(),
             // Its worker ended its turn: when, and the wait it marked, so
@@ -2174,7 +2226,13 @@ fn format_row(
         // and waiting to be landed.
         Stage::Planned => {
             match benched_pause.filter(|_| wait.as_ref().is_none_or(|w| w.held.is_none())) {
-                Some(_) if matches!(unworked(row, now_ms), Some(Unworked::Finished { .. })) => {
+                // Its worker ended its turn before the pause: work done.
+                // After it, it stopped for the pause (giverny#486).
+                Some(_)
+                    if matches!(unworked(row, now_ms),
+                        Some(Unworked::Finished { ended_ms, .. })
+                            if !stopped_for_pause(row, ended_ms)) =>
+                {
                     PAUSED_FINISHED.to_string()
                 }
                 Some(p) => format!("paused since {}", clock_at(p, now_ms, &clock.tz)),
@@ -2256,7 +2314,19 @@ fn format_row(
                         )
                     })
                 })
-                .or_else(|| paused.map(|p| paused_why(&clock_at(p, now_ms, &clock.tz), note)));
+                .or_else(|| {
+                    paused.map(|p| {
+                        let since = clock_at(p, now_ms, &clock.tz);
+                        if still_finishing(row) {
+                            format!(
+                                "paused since {since}, its worker still finishing its turn: \
+                                 only its clock is paused until it stops"
+                            )
+                        } else {
+                            paused_why(&since, note)
+                        }
+                    })
+                });
             // The worker's open wait, in full: NOW cuts it (giverny#471).
             let waited = waiting
                 .filter(|_| paused.is_none())
@@ -2601,6 +2671,11 @@ pub const NO_WORKER_YET: &str = "no worker yet";
 /// resume ([`chores`]). About as wide as the `paused since 15:10` it takes
 /// the place of.
 pub const PAUSED_FINISHED: &str = "paused · worker finished";
+
+/// NOW of a paused Running row whose worker still works (giverny#486): only
+/// its clock is paused, and it stays under Running until the worker ends
+/// its turn; then it moves to Next up, `paused since …`.
+pub const PAUSED_FINISHING: &str = "paused · worker still finishing";
 
 /// The overlay header's facts, from the row's own cells before any ditto.
 /// `vs` names what a Done row's ± was measured against (giverny#402):
@@ -6217,7 +6292,9 @@ mod tests {
                 "paused_since":{p}}}
             ]}}"#,
             s = T0 - 60 * MIN,
-            p = T0 - 10 * MIN,
+            // Paused after its worker ended (T0 - 5m): one that stops
+            // during the pause stopped for it (giverny#486).
+            p = T0 - 2 * MIN,
         ));
         let (dir, rows, logs) = reused_worker("334-paused", &lines, false);
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
@@ -6275,25 +6352,47 @@ mod tests {
             since: T0 - 5 * MIN,
             how: Some("finished".into()),
         };
+        // Paused while it worked, it stopped for the pause: Next up,
+        // `paused since …`, and the manager told at once that the task is
+        // now really paused (giverny#486).
+        let now_paused = Chore {
+            kind: manage_chores::Kind::NowPaused,
+            ..land.clone()
+        };
         for p in [T0 - 10 * MIN, T0 - 2 * MIN] {
             let f = paused_at(p);
+            let during = p < T0 - 5 * MIN;
+            let chore = if during { &now_paused } else { &land };
             let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
-            assert_eq!(
-                (t.lines[0].stage, t.lines[0].now.as_str(), t.lines[0].flag),
-                (Stage::Planned, PAUSED_FINISHED, false)
-            );
+            if during {
+                assert_eq!(t.lines[0].stage, Stage::Planned);
+                assert!(
+                    t.lines[0].now.starts_with("paused since "),
+                    "{:?}",
+                    t.lines[0]
+                );
+            } else {
+                assert_eq!(
+                    (t.lines[0].stage, t.lines[0].now.as_str(), t.lines[0].flag),
+                    (Stage::Planned, PAUSED_FINISHED, false)
+                );
+            }
             assert_eq!(
                 chores(Drawn::Manager, Some(&f), &rows, &logs, &NO_SHELLS, T0),
-                std::slice::from_ref(&land)
+                std::slice::from_ref(chore)
             );
             assert_eq!(
                 due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0 - 3 * MIN),
-                [],
-                "in its grace"
+                if during {
+                    vec![now_paused.clone()]
+                } else {
+                    vec![]
+                },
+                "in its grace, unless stopped for the pause"
             );
             assert_eq!(
                 due_chores(Drawn::Manager, &f, &rows, &logs, &NO_SHELLS, T0),
-                std::slice::from_ref(&land)
+                std::slice::from_ref(chore)
             );
             // Told once: told of this finish — paused, or Running before
             // the pause — it is no chore any more.
@@ -6320,7 +6419,8 @@ mod tests {
             t.lines[0].now
         );
         // A worker still at work under the paused row: no chore, and the
-        // row says only since when it is paused.
+        // row stays Running, saying its worker is still finishing
+        // (giverny#486); it is the one the manager hears is not paused yet.
         let (dir2, rows, logs) = reused_worker("379-working", &lines, true);
         let f = paused_at(T0 - 10 * MIN);
         assert_eq!(
@@ -6328,10 +6428,13 @@ mod tests {
             []
         );
         let t = build_at(Some(&f), &rows, T0, &Clock::plain(), &logs);
-        assert!(
-            t.lines[0].now.starts_with("paused since "),
-            "{:?}",
-            t.lines[0]
+        assert_eq!(
+            (t.lines[0].stage, t.lines[0].now.as_str()),
+            (Stage::Running, PAUSED_FINISHING)
+        );
+        assert_eq!(
+            finishing(Drawn::Manager, &f, &rows, &logs, T0),
+            ["acme#613".to_string()]
         );
         for d in [dir, dir2] {
             let _ = std::fs::remove_dir_all(&d);
@@ -7795,7 +7898,9 @@ mod tests {
             let t = build_at(Some(&f), &rows, now, &utc(&[], None), &Logs::new());
             assert_eq!(t.lines[0].elapsed, "10:00", "{now}");
             assert_eq!(t.lines[0].eta, "~20m");
-            assert_eq!(t.lines[0].now, "paused since 14:13");
+            // Its worker still at work: only the clock is paused
+            // (giverny#486).
+            assert_eq!(t.lines[0].now, PAUSED_FINISHING);
         }
         // The writer paused it for a limit: its `started` already
         // leaves the wait out, so the pane's own hold must not take it off
