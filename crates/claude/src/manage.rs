@@ -660,6 +660,8 @@ pub fn kill_running(
         row.insert("paused_since".into(), json!(stamp(since)));
         row.entry("paused_s").or_insert(json!(0));
         row.insert("killed".into(), json!(stamp(now)));
+        // Kept past the revive: a worker silent since died then.
+        row.insert("went_off".into(), json!(stamp(since)));
         if let Some(k) = row.get("key").and_then(Value::as_str) {
             killed.push(k.to_string());
         }
@@ -1361,6 +1363,7 @@ pub fn apply(
                     "paused_since",
                     "paused_s",
                     "killed",
+                    "went_off",
                     "spawned",
                     "waiting_since",
                     "wait_s",
@@ -2324,6 +2327,11 @@ fn still_runs(
         {
             let sessions = continuation::ids(doc);
             let state = worker_state(cfg, &sessions, &agent);
+            // Killed with its session (giverny#489): nothing of it runs,
+            // however recently it wrote.
+            if died_with_session(doc, task, state).is_some() {
+                return None;
+            }
             let asleep: Vec<crate::bg_shells::Shell> = shells
                 .iter()
                 .map(|l| l.shell.clone())
@@ -2349,6 +2357,21 @@ fn still_runs(
         working,
         runs,
         shells,
+    }
+}
+
+/// When row `task`'s worker died with its session (giverny#489): the row
+/// went off then (`went_off`, kept past its revive) and the worker, in
+/// `state`, has not written since. `None` for a worker that lives.
+fn died_with_session(doc: &Value, task: &str, state: WorkerState) -> Option<u64> {
+    let rows = doc.get("rows").and_then(Value::as_array)?;
+    let row = rows.get(find(rows, task)?)?.as_object()?;
+    let off = ms_of(row, "went_off")?;
+    match state {
+        WorkerState::Working { last_ms: Some(t) } | WorkerState::Ended { at_ms: t } if t > off => {
+            None
+        }
+        _ => Some(off),
     }
 }
 
@@ -2889,12 +2912,14 @@ fn run_feed(
                     }
                     _ => Vec::new(),
                 };
+                let killed = state.and_then(|st| died_with_session(&doc, key, st));
                 msg.push_str(&resume_note(
                     key,
                     agent.as_deref(),
                     state,
                     row_wait(&doc, key),
                     &asleep,
+                    killed,
                     now,
                 ));
             }
@@ -2986,16 +3011,26 @@ fn row_wait(doc: &Value, key: &str) -> Option<(u64, Option<String>)> {
 /// that none holds it; and a wait it marked that is still open. A worker
 /// that ended its turn with background shells of its own still running
 /// (`asleep`) is asleep: Claude Code wakes it when one ends (giverny#476).
+/// One `killed` with its session at that instant (giverny#489) is dead.
 pub fn resume_note(
     key: &str,
     agent: Option<&str>,
     state: Option<WorkerState>,
     wait: Option<(u64, Option<String>)>,
     asleep: &[crate::bg_shells::Shell],
+    killed: Option<u64>,
     now: u64,
 ) -> String {
     let ago = |t: u64| feed::fmt_span((now.saturating_sub(t) / 1000) as i64);
     let mut out = match (agent, state) {
+        // Killed with its session (giverny#489), whatever it last wrote.
+        (Some(a), _) if killed.is_some() => format!(
+            "\n  its worker {a} was killed with this session {} ago and works no more: a \
+             fresh worker whose description names {key} takes the row in the pane, and \
+             `giverny-manage start {key} --agent <its id>` records it; else spawn one with a \
+             brief, or hand {key} to an idle one the same way. Giverny wakes nothing.",
+            ago(killed.unwrap_or(now))
+        ),
         (Some(a), Some(WorkerState::Ended { at_ms })) if !asleep.is_empty() => format!(
             "\n  its worker {a} ended its turn {} ago and is asleep, {}: Claude Code wakes \
              it when {} ends. Nothing to wake; if it should not wait, stop the shell (below) \
@@ -4340,6 +4375,7 @@ mod tests {
             }),
             Some((T0 - 13 * MIN, Some("machine time".into()))),
             &[],
+            None,
             T0,
         );
         assert_eq!(
@@ -4358,13 +4394,16 @@ mod tests {
             }),
             None,
             &[],
+            None,
             T0,
         );
         assert_eq!(
             working,
             "\n  its worker ad22 is working (last wrote 1m ago)"
         );
-        assert!(resume_note("170", None, None, None, &[], T0).contains("no worker holds 170"));
+        assert!(
+            resume_note("170", None, None, None, &[], None, T0).contains("no worker holds 170")
+        );
         // Ended with its own deploy still running: asleep, and Claude Code
         // wakes it (giverny#476).
         let deploy = crate::bg_shells::Shell {
@@ -4384,6 +4423,7 @@ mod tests {
             }),
             None,
             std::slice::from_ref(&deploy),
+            None,
             T0,
         );
         assert_eq!(
@@ -5016,7 +5056,11 @@ mod tests {
         let shown = run(&dir, "show", back + 60 * MIN).unwrap();
         assert!(shown.contains("20m elapsed, ~40m left, killed"), "{shown}");
         // Revived: a fresh worker, then resume. The clock runs from there.
-        run(&dir, "resume demo#7", back + 90 * MIN).unwrap();
+        let said = run(&dir, "resume demo#7", back + 90 * MIN).unwrap();
+        assert!(
+            said.contains("its worker w1 was killed with this session 9h10m ago"),
+            "{said}"
+        );
         let r = read_feed(&dir).rows[0].clone();
         assert_eq!(r.killed_ms, None);
         assert_eq!(r.paused_since_ms, None);
@@ -5032,6 +5076,30 @@ mod tests {
         );
         assert_eq!(h[0].paused_s, (back + 90 * MIN - (T0 + 20 * MIN)) / 1000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worker silent since its row went off died with its session: no
+    /// `land` waits on it, and `resume` says so; one that wrote since (a
+    /// fresh worker the row was handed to) lives (giverny#489).
+    #[test]
+    fn a_worker_silent_since_its_row_went_off_is_dead() {
+        let off = T0 + 10 * MIN;
+        let doc = json!({"rows": [
+            {"key": "a", "stage": "running", "agent_id": "w1", "went_off": stamp(off)},
+            {"key": "b", "stage": "running", "agent_id": "w2"}]});
+        let working = |t: u64| WorkerState::Working { last_ms: Some(t) };
+        assert_eq!(died_with_session(&doc, "a", working(off - MIN)), Some(off));
+        assert_eq!(
+            died_with_session(&doc, "a", WorkerState::Working { last_ms: None }),
+            Some(off)
+        );
+        assert_eq!(died_with_session(&doc, "a", working(off + MIN)), None);
+        assert_eq!(
+            died_with_session(&doc, "a", WorkerState::Ended { at_ms: off + MIN }),
+            None
+        );
+        assert_eq!(died_with_session(&doc, "b", working(off - MIN)), None);
+        assert_eq!(died_with_session(&doc, "c", working(off - MIN)), None);
     }
 
     /// A killed row its manager pauses is set aside: paused, no longer
