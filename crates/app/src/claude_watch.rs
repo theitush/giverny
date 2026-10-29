@@ -59,6 +59,11 @@ pub struct ClaudeTab {
     /// started mid-turn, whatever the last turn left for a `/compact`. The
     /// compaction's `SessionStart` puts it back (giverny#408).
     before_compact: Option<ClaudeState>,
+    /// The last turn ended on an API error: a `StopFailure` in place of the
+    /// `Stop` (rate limit, overload, a model not found, …), which the rail
+    /// marks with a ✕ instead of the tick (giverny#488). Anything after it
+    /// that says the session works again, or a turn ending well, clears it.
+    failed: bool,
     /// The user's prompts in this session, oldest first, in full (at most
     /// [`PROMPT_HISTORY`]): from the `UserPromptSubmit` hook, and read back
     /// from the transcript for a session adopted mid-way or resumed.
@@ -1183,6 +1188,7 @@ impl ClaudeWatch {
                 if let Some(was) = entry.before_compact.take() {
                     entry.state = was;
                 }
+                entry.failed = false;
                 entry.set_session(
                     msg.session_id().map(str::to_string),
                     &mut self.prompts_asked,
@@ -1199,6 +1205,7 @@ impl ClaudeWatch {
             }
             Some("SessionStart") => {
                 entry.state = ClaudeState::Idle;
+                entry.failed = false;
                 entry.clear_agents();
                 entry.ended.clear();
                 entry.before_compact = None;
@@ -1219,6 +1226,7 @@ impl ClaudeWatch {
             Some("UserPromptSubmit") => {
                 if !stale {
                     entry.state = ClaudeState::Busy;
+                    entry.failed = false;
                     // A compaction cancelled with Esc says nothing more.
                     entry.before_compact = None;
                     // A turn is running: what it leaves behind without an
@@ -1285,6 +1293,7 @@ impl ClaudeWatch {
                 }
                 if !stale {
                     entry.state = ClaudeState::Busy;
+                    entry.failed = false;
                 }
             }
             // A subagent compacting its own context is its work, as its
@@ -1296,12 +1305,14 @@ impl ClaudeWatch {
             Some("PreCompact") => {
                 entry.before_compact.get_or_insert(entry.state);
                 entry.state = ClaudeState::Busy;
+                entry.failed = false;
             }
             // A `Stop` older than what the session has said since ended a
             // turn that is not the one running now.
             Some("Stop") if stale => {}
             Some("Stop") => {
                 entry.before_compact = None;
+                entry.failed = false;
                 entry.state = if is_active {
                     ClaudeState::Idle
                 } else {
@@ -1320,6 +1331,20 @@ impl ClaudeWatch {
                 }
                 entry.agents_unnamed = unnamed;
                 entry.sync_agents();
+            }
+            // The turn ended on an API error, in place of its `Stop`
+            // (giverny#488): over all the same, unseen or not, and marked
+            // as failed. Its payload lists no background work, so what the
+            // last `Stop` left running is left as it is.
+            Some("StopFailure") if stale => {}
+            Some("StopFailure") => {
+                entry.before_compact = None;
+                entry.failed = true;
+                entry.state = if is_active {
+                    ClaudeState::Idle
+                } else {
+                    ClaudeState::DoneUnseen
+                };
             }
             Some("Notification") if stale => {}
             Some("Notification") => {
@@ -1355,6 +1380,7 @@ impl ClaudeWatch {
             Some("SessionEnd") => {
                 self.agents.session_ended(tab_id);
                 entry.state = ClaudeState::None;
+                entry.failed = false;
                 entry.clear_agents();
                 entry.ended.clear();
                 entry.before_compact = None;
@@ -2467,6 +2493,11 @@ impl ClaudeWatch {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
 
+    /// Whether this tab's last turn ended on an API error (giverny#488).
+    pub fn turn_failed(&self, tab: TabId) -> bool {
+        self.tabs.get(&tab).is_some_and(|t| t.failed)
+    }
+
     /// The prompt to pin above this tab: its last one, while Claude runs.
     pub fn prompt_of(&self, tab: TabId) -> Option<&str> {
         self.prompts_of(tab)?.last().map(String::as_str)
@@ -2809,6 +2840,35 @@ mod tests {
             ClaudeState::Idle,
             "viewing clears the marker"
         );
+    }
+
+    /// A turn that died on an API error ends the turn as a `Stop` does,
+    /// marked failed; the next turn clears the mark, and one ending well
+    /// leaves none (giverny#488).
+    #[test]
+    fn a_stop_failure_ends_the_turn_as_failed() {
+        let mut w = ClaudeWatch::for_tests();
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        let failure = hook("StopFailure", r#","error":"model_not_found""#);
+        feed(&mut w, &failure, Some(TabId(1)));
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(w.turn_failed(TAB));
+
+        // Looked at, it is idle; still the turn that failed.
+        w.mark_viewed(TAB);
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle);
+
+        // The next turn is not the one that failed.
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        assert!(!w.turn_failed(TAB));
+        feed(&mut w, &failure, Some(TAB));
+        assert_eq!(w.state_of(TAB), ClaudeState::Idle, "seen as it failed");
+        assert!(w.turn_failed(TAB));
+        feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
+        feed(&mut w, &hook("Stop", ""), Some(TabId(1)));
+        assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
+        assert!(!w.turn_failed(TAB), "a turn that ended well");
     }
 
     #[test]
