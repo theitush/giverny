@@ -1358,6 +1358,11 @@ impl Tracker {
                         row.activity = t.label.clone();
                     }
                 }
+                // Claude Code lists a finished task for a while after: it
+                // ended when first listed so (or when its notification
+                // says), not on every list since (giverny#486: a moving end
+                // re-told its manager the task was now really paused).
+                Some(o) if row.stage == Stage::Done && row.outcome == Some(o) => {}
                 Some(o) => row.mark_done(o, now_ms),
             }
         }
@@ -2006,6 +2011,10 @@ mod tests {
         // a1 lists as completed: Done.
         t.apply_live(&live("s1", &[("a1", "completed", T0)]), T0 + 70_000);
         assert_eq!(t.get("a1").unwrap().outcome, Some(Outcome::Completed));
+        // Listed so again a tick later, it still ended when first listed
+        // (giverny#486).
+        t.apply_live(&live("s1", &[("a1", "completed", T0)]), T0 + 72_000);
+        assert_eq!(t.get("a1").unwrap().ended_ms, Some(T0 + 70_000));
 
         // An empty list does not evict Done rows — nothing ages out.
         t.apply_live(&live("s1", &[]), T0 + 10_000_000);

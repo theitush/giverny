@@ -2014,16 +2014,20 @@ pub fn run_in_code(
             return Err(e);
         }
     };
-    // A pause stops the clock only: what still runs for the task is named
-    // for the manager to stop or keep (giverny#471). Giverny stops nothing.
+    // A pause stops the clock only: what still runs for the task — its
+    // worker mid-turn, its `run` commands (giverny#471), its worker's
+    // background shells (giverny#472) — is named for the manager to stop or
+    // keep, and the task is not paused until all of it stops; or it says
+    // nothing of the task runs (giverny#486). Giverny stops nothing.
     if let Cmd::Pause(task) = cmd {
-        let runs = crate::run_live::task_runs(&crate::run_live::runs_dir(&ledger), session, task);
-        msg.push_str(&still_running(task, &runs, now));
+        let still = task_still_runs(dir, &ledger, session, task, flags, now);
+        let head = format!("paused {task}");
+        let rest = msg.strip_prefix(&head).unwrap_or(&msg).to_string();
+        msg = format!("{}{rest}", pause_report(task, &still, now));
     }
-    // Pause and resume name the background shells the task's worker left
-    // running too, with how to stop each (giverny#472). Giverny stops
-    // nothing.
-    if let Cmd::Pause(task) | Cmd::Resume(task) = cmd {
+    // Resume names the background shells the task's worker left running,
+    // with how to stop each (giverny#472). Giverny stops nothing.
+    if let Cmd::Resume(task) = cmd {
         let live = crate::bg_shells::task_shells(dir, session, task, &crate::bg_shells::System);
         msg.push_str(&crate::bg_shells::still_running(task, &live, now));
     }
@@ -2069,12 +2073,49 @@ fn still_running(task: &str, runs: &[crate::run_live::LiveRun], now: u64) -> Str
         )
     };
     let mut out = format!(
-        "\n  only its clock: {what} for {task}, and Giverny stops nothing. Have the worker \
-         finish or stop {it} at a safe point, or stop {it} yourself:"
+        "\n  {what} for {task}, and Giverny stops nothing. Have the worker finish or stop \
+         {it} at a safe point, or stop {it} yourself:"
     );
     for line in run_lines(runs, now) {
         out.push_str(&format!("\n    {line}"));
     }
+    out
+}
+
+/// What `pause` says (giverny#486): that nothing of `task` runs, so it is
+/// paused; or that only its clock is, with its worker still mid-turn, its
+/// `run` commands and its worker's shells each named, and that the task is
+/// not paused until they stop. A manager that told the user "paused" on a
+/// bare `paused g483` left workers running for minutes under that word.
+pub fn pause_report(task: &str, s: &StillRuns, now: u64) -> String {
+    if s.is_empty() {
+        return format!("paused {task}: nothing of {task} runs");
+    }
+    let mut out = match &s.working {
+        Some((agent, t)) => {
+            let ago = match now.saturating_sub(*t) / 1000 {
+                n @ 0..60 => format!("{n}s"),
+                n => feed::fmt_span(n as i64),
+            };
+            format!(
+                "paused {task}'s clock; its worker {agent} is still working (last wrote {ago} \
+                 ago), so {task} is not paused until it ends its turn: tell the user it is \
+                 paused only then. Giverny tells you when it stops, and stops nothing"
+            )
+        }
+        None => {
+            let mut out = format!(
+                "paused {task}'s clock; what is named below still runs for it, so {task} is \
+                 not paused until that stops: tell the user it is paused only then"
+            );
+            if let Some(w) = &s.worker {
+                out.push_str(&format!("\n  {w}"));
+            }
+            out
+        }
+    };
+    out.push_str(&still_running(task, &s.runs, now));
+    out.push_str(&crate::bg_shells::still_running(task, &s.shells, now));
     out
 }
 
@@ -2094,6 +2135,9 @@ pub const WORKER_QUIET_MS: u64 = 15 * 60 * 1000;
 pub struct StillRuns {
     /// The line for its worker, when it is mid-turn or asleep.
     pub worker: Option<String>,
+    /// Its worker and when it last wrote, when it is mid-turn (giverny#486:
+    /// `pause` says the task is not paused until it ends its turn).
+    pub working: Option<(String, u64)>,
     pub runs: Vec<crate::run_live::LiveRun>,
     pub shells: Vec<crate::bg_shells::Live>,
 }
@@ -2203,11 +2247,24 @@ fn still_runs(
                 .map(|l| l.shell.clone())
                 .filter(|s| s.agent == agent)
                 .collect();
-            worker_line(&agent, state, &asleep, now)
+            let mid_turn = match state {
+                WorkerState::Working { last_ms: Some(t) }
+                    if now.saturating_sub(t) < WORKER_QUIET_MS =>
+                {
+                    Some((agent.clone(), t))
+                }
+                _ => None,
+            };
+            worker_line(&agent, state, &asleep, now).map(|l| (l, mid_turn))
         }
     });
+    let (worker, working) = match worker {
+        Some((l, w)) => (Some(l), w),
+        None => (None, None),
+    };
     StillRuns {
         worker,
+        working,
         runs,
         shells,
     }
@@ -3856,19 +3913,26 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "paused a\n  only its clock: 1 `giverny-manage run` command still runs for a, \
-                 and Giverny stops nothing. Have the worker finish or stop it at a safe point, \
-                 or stop it yourself:\n    `sleep 300`, 8m in, pid {me}: `kill {me}` stops it \
-                 and all it started"
+                "paused a's clock; what is named below still runs for it, so a is not paused \
+                 until that stops: tell the user it is paused only then\n  1 `giverny-manage \
+                 run` command still runs for a, and Giverny stops nothing. Have the worker \
+                 finish or stop it at a safe point, or stop it yourself:\n    `sleep 300`, 8m \
+                 in, pid {me}: `kill {me}` stops it and all it started"
             )
         );
         assert!(crate::run_live::alive(me), "nothing was stopped");
         assert_eq!(read_feed(&dir).rows[0].paused_since_ms, Some(T0 + 10 * MIN));
         // Another task's run is not b's.
-        assert_eq!(run(&dir, "pause b", T0 + 10 * MIN).unwrap(), "paused b");
+        assert_eq!(
+            run(&dir, "pause b", T0 + 10 * MIN).unwrap(),
+            "paused b: nothing of b runs"
+        );
         drop(live);
         run(&dir, "resume a", T0 + 11 * MIN).unwrap();
-        assert_eq!(run(&dir, "pause a", T0 + 12 * MIN).unwrap(), "paused a");
+        assert_eq!(
+            run(&dir, "pause a", T0 + 12 * MIN).unwrap(),
+            "paused a: nothing of a runs"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3916,8 +3980,9 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "paused a\n  1 background shell its worker started still runs for a (Giverny \
-                 stops nothing):\n    `sleep 30` (shell bpause1), 9m in: `TaskStop bpause1` \
+                "paused a's clock; what is named below still runs for it, so a is not paused \
+                 until that stops: tell the user it is paused only then\n  1 background shell \
+                 its worker started still runs for a (Giverny stops nothing):\n    `sleep 30` (shell bpause1), 9m in: `TaskStop bpause1` \
                  from this session stops it, or `pkill -s {pid}` (its shell, pid {pid}, and all \
                  it started)"
             )
@@ -3932,7 +3997,10 @@ mod tests {
         // SAFETY: a signal to the group the test's own child leads.
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         let _ = child.wait();
-        assert_eq!(run(&dir, "pause a", T0 + 12 * MIN).unwrap(), "paused a");
+        assert_eq!(
+            run(&dir, "pause a", T0 + 12 * MIN).unwrap(),
+            "paused a: nothing of a runs"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4065,6 +4133,46 @@ mod tests {
         assert_eq!(
             run(&dir, "land a", T0 + 12 * MIN).unwrap(),
             "landed a: Done"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pause` on a task whose worker is mid-turn says only its clock is
+    /// paused, and that the task is not until the worker ends its turn;
+    /// once its finish notice is in, a pause says nothing of it runs
+    /// (giverny#486).
+    #[test]
+    fn a_pause_says_the_task_is_not_paused_while_its_worker_works() {
+        let dir = scratch("pause-worker");
+        let cfg = dir.join("claude");
+        let proj = cfg.join("projects/-srv-x");
+        let sub = proj.join("s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let transcript = proj.join("s1.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        std::fs::write(sub.join("agent-w1.jsonl"), "{}\n").unwrap();
+        let now = now_ms();
+        let go = |line: &str, at: u64| {
+            let (cmd, mut flags) = parse_args(&args(line))?;
+            flags.claude_dir = Some(cfg.clone());
+            run_in(&dir, "s1", &cmd, &flags, at)
+        };
+        go("start g483 --eta 30 --agent w1", now - 20 * MIN).unwrap();
+        assert_eq!(
+            go("pause g483", now + 20_000).unwrap(),
+            "paused g483's clock; its worker w1 is still working (last wrote 20s ago), so \
+             g483 is not paused until it ends its turn: tell the user it is paused only then. \
+             Giverny tells you when it stops, and stops nothing"
+        );
+        assert!(read_feed(&dir).rows[0].paused_since_ms.is_some());
+        go("resume g483", now + 30_000).unwrap();
+        let notice = json!({"type": "user", "timestamp": now + 40_000,
+            "message": {"content": "<task-notification><task-id>w1</task-id>\
+                <status>completed</status></task-notification>"}});
+        std::fs::write(&transcript, format!("{notice}\n")).unwrap();
+        assert_eq!(
+            go("pause g483", now + 50_000).unwrap(),
+            "paused g483: nothing of g483 runs"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
