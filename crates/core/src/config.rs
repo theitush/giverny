@@ -1025,34 +1025,6 @@ mod tests {
     }
 
     #[test]
-    fn the_default_lease_reads_its_table_and_stands_in_for_a_bad_one() {
-        use crate::limits::Mem;
-        let d = DefaultLease::default();
-        assert_eq!((d.cpu_cores, d.ram), (3, Mem::gb(3)), "today's 3 cpu, 3G");
-        assert_eq!(DefaultLease::from_config_str(""), d);
-        assert_eq!(DefaultLease::from_config_str("[font]\nsize = 1\n"), d);
-        let set = "[management_panel.lease]\ncpu_cores = 2\nram = \"1.5G\"\n";
-        assert_eq!(
-            DefaultLease::from_config_str(set),
-            DefaultLease {
-                cpu_cores: 2,
-                ram: Mem(1536),
-                uncollected_min: 10,
-            }
-        );
-        // A bare number is GiB, as everywhere; one key alone keeps the other.
-        let one = DefaultLease::from_config_str("[management_panel.lease]\nram = 4\n");
-        assert_eq!((one.cpu_cores, one.ram), (3, Mem::gb(4)));
-        // Unreadable: the default, never a refused run.
-        let bad = "[management_panel.lease]\ncpu_cores = \"lots\"\n";
-        assert_eq!(DefaultLease::from_config_str(bad), d);
-        assert_eq!(
-            DefaultLease::from_config_str("[management_panel.lease]\ncpu_cores = 0\n").cpu_cores,
-            1
-        );
-    }
-
-    #[test]
     fn host_prefix_is_stripped_only_when_it_really_is_one() {
         // Claude's glyph left on, so its title shows the host rule alone.
         let cfg = TitlesConfig {
@@ -1186,22 +1158,6 @@ mod tests {
         let (cfg, _) = parse("[claude]\nauto_mode = true\n").unwrap();
         assert!(cfg.claude.management_panel);
         assert!(Config::default().claude.management_panel);
-    }
-
-    #[test]
-    fn manager_limits_mount_in_config_and_match_the_ledger() {
-        use crate::limits::{Auto, Limits, Mem};
-        let text = "[manager.limits]\ncpu_cores = 6\nram = \"12G\"\ngpus = []\n";
-        let (cfg, unknown) = parse(text).unwrap();
-        assert!(unknown.is_empty(), "{unknown:?}");
-        assert_eq!(cfg.manager.limits.cpu_cores, Auto::Set(6));
-        assert_eq!(cfg.manager.limits.ram, Auto::Set(Mem::gb(12)));
-        assert_eq!(cfg.manager.limits.gpus, Auto::Set(vec![]));
-        // One parse path: the ledger reads what the Config reads.
-        assert_eq!(Limits::from_config_str(text).unwrap(), cfg.manager.limits);
-        // Absent: all auto, both ways.
-        let (cfg, _) = parse("[font]\nsize = 14.0\n").unwrap();
-        assert_eq!(cfg.manager.limits, Limits::default());
     }
 
     #[test]

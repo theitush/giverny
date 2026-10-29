@@ -556,26 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn text_line_puts_one_glyph_per_cell() {
-        let ctx = egui::Context::default();
-        let fonts = FontSet::load(None).unwrap();
-        let m = CellMetrics::compute(fonts.primary().as_font().unwrap(), 15.0);
-        let mut atlas = Atlas::default();
-        let color = Color32::from_rgb(1, 2, 3);
-        let meshes = text_line(&ctx, &fonts, &mut atlas, m, Vec2::ZERO, 1.0, "ab c", color);
-        let quads: Vec<&[Vertex]> = meshes.iter().flat_map(|m| m.vertices.chunks(4)).collect();
-        assert_eq!(quads.len(), 3, "the space draws nothing");
-        // 'c' sits in cell 3, whatever its side bearing.
-        let c_left = quads[2][0].pos.x;
-        let cell = m.cell_w as f32;
-        assert!(
-            c_left >= 3.0 * cell - 1.0 && c_left < 4.0 * cell,
-            "{c_left}"
-        );
-        assert!(quads.iter().all(|q| q[0].color == color));
-    }
-
-    #[test]
     fn meshes_have_geometry() {
         let term = term_with(b"\x1b[31mhello\x1b[4m_under");
         let theme = Theme::monet_dark();

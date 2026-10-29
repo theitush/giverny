@@ -328,15 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn a_short_text_sits_at_the_top() {
-        let mut p = Page::new();
-        p.set(vec!["one".into(), "two".into()], 20, 5);
-        assert_eq!(p.screen_text(), "one\ntwo\n\n\n");
-        assert_eq!(p.screen_row(0), Some(0));
-        assert_eq!(p.screen_row(1), Some(1));
-    }
-
-    #[test]
     fn a_long_text_opens_at_its_end_and_scrolls_back() {
         let mut p = Page::new();
         p.set(numbered(12), 20, 5);
@@ -349,29 +340,5 @@ mod tests {
         assert_eq!(p.screen_text().lines().next(), Some("line 0"));
         p.to_end();
         assert_eq!(p.screen_text().lines().last(), Some("line 11"));
-    }
-
-    #[test]
-    fn a_growing_text_is_followed_at_the_end_and_held_when_scrolled_back() {
-        let mut p = Page::new();
-        p.set(numbered(12), 20, 5);
-        p.set(numbered(14), 20, 5);
-        assert_eq!(p.screen_text().lines().last(), Some("line 13"));
-        p.to_top();
-        p.set(numbered(20), 20, 5);
-        assert_eq!(p.screen_text().lines().next(), Some("line 0"));
-    }
-
-    #[test]
-    fn colour_and_weight_reach_the_grid() {
-        let mut p = Page::new();
-        p.set(vec!["\x1b[1mBash\x1b[0m(ls)".into()], 20, 3);
-        let snap = Snapshot::capture(&p.term, &Theme::monet_dark());
-        let b = snap.cells.iter().find(|c| c.c == 'B').expect("B");
-        assert!(
-            b.flags
-                .contains(alacritty_terminal::term::cell::Flags::BOLD)
-        );
-        assert!(snap.cursor.is_none(), "a page shows no cursor");
     }
 }

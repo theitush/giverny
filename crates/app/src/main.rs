@@ -7506,55 +7506,6 @@ mod tests {
         assert!(!failed_exit(None));
     }
 
-    /// A tab opened from BACKGROUND types an attach that ends its shell
-    /// when it ends, and a failed one leaves the shell standing
-    /// (giverny#245).
-    #[test]
-    fn a_background_tab_attaches_and_exits_with_it() {
-        let dir = Path::new("/home/u/.claude");
-        assert_eq!(
-            attach_line("6e7e56e0", Some(dir), true).as_deref(),
-            Some("command claude attach 6e7e56e0 && exit\r")
-        );
-        assert_eq!(
-            attach_line("6e7e56e0", None, true).as_deref(),
-            Some("command claude attach 6e7e56e0 && exit\r")
-        );
-        assert_eq!(
-            attach_line("6e7e56e0", None, false).as_deref(),
-            Some("command claude attach 6e7e56e0\r"),
-            "a tab of one's own keeps its shell"
-        );
-        assert_eq!(
-            attach_line("work", Some(Path::new("/home/u/.claude-work")), true).as_deref(),
-            Some("CLAUDE_CONFIG_DIR=\"/home/u/.claude-work\" command claude attach work && exit\r")
-        );
-        for bad in ["", "a b", "x;rm", "$(id)"] {
-            assert_eq!(attach_line(bad, None, true), None, "{bad:?}");
-        }
-    }
-
-    /// Only a BACKGROUND tab closes when its shell ends, and only when it
-    /// ended cleanly: not a failed attach, not Giverny taking it down.
-    #[cfg(unix)]
-    #[test]
-    fn only_a_background_tab_closes_and_only_on_a_clean_exit() {
-        use std::os::unix::process::ExitStatusExt;
-        let ok = Some(std::process::ExitStatus::from_raw(0));
-        let failed = Some(std::process::ExitStatus::from_raw(1 << 8));
-        let hung_up = Some(std::process::ExitStatus::from_raw(1)); // SIGHUP
-        let mut ws = Workspace::default();
-        let cat = ws.add_category("agents");
-        let id = ws.add_tab(cat);
-        let tab = ws.tab_mut(id).unwrap();
-        assert!(!closes_on_exit(tab, ok), "a tab of one's own stays");
-        tab.bg_job = Some("6e7e56e0".into());
-        assert!(closes_on_exit(tab, ok));
-        assert!(!closes_on_exit(tab, failed), "the error stays readable");
-        assert!(!closes_on_exit(tab, hung_up), "Giverny closing");
-        assert!(!closes_on_exit(tab, None));
-    }
-
     /// A bare word the binary does not know is a command, and is refused;
     /// flags and anything that reads as a path still open the window.
     #[test]

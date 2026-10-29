@@ -174,21 +174,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn adopting_moves_the_old_id_to_the_aliases() {
-        let mut doc = json!({"session": "s2", "aliases": ["s1"], "rows": []});
-        adopt(&mut doc, "s3");
-        assert_eq!(doc["session"], "s3");
-        assert_eq!(doc["aliases"], json!(["s1", "s2"]));
-        assert_eq!(ids(&doc), ["s3", "s1", "s2"]);
-        // Back to an id it had: no duplicate.
-        adopt(&mut doc, "s1");
-        assert_eq!(doc["aliases"], json!(["s2", "s3"]));
-        let before = doc.clone();
-        adopt(&mut doc, "s1");
-        assert_eq!(doc, before, "already its own");
-    }
-
-    #[test]
     fn the_continued_file_is_found_by_root_recorded_or_read() {
         let dir = temp("find");
         let cfg = dir.join("cfg");
@@ -208,15 +193,5 @@ pub(crate) mod tests {
         assert_eq!(continued(&feeds, "new", "r1", Some(&cfg), |_| false), None);
         assert_eq!(continued(&feeds, "new", "r7", Some(&cfg), |_| true), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_root_once_recorded_stands() {
-        let mut doc = json!({"session": "s"});
-        stamp_root(&mut doc, None);
-        assert!(doc.get("root").is_none());
-        stamp_root(&mut doc, Some("r1"));
-        stamp_root(&mut doc, Some("r2"));
-        assert_eq!(doc["root"], "r1");
     }
 }

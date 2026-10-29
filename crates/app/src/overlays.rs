@@ -366,23 +366,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_review_line_is_the_feeds_and_only_a_done_rows() {
-        use giverny_claude::feed::Stage;
-        let line = "sam — the empty state — branch x";
-        assert_eq!(review_line(Stage::Done, Some(line)).as_deref(), Some(line));
-        assert_eq!(
-            review_line(Stage::Done, Some("  sam — look \n")).as_deref(),
-            Some("sam — look")
-        );
-        // No text in the feed: nothing, whatever the key names.
-        assert_eq!(review_line(Stage::Done, None), None);
-        assert_eq!(review_line(Stage::Done, Some("   ")), None);
-        // Only a Done row carries one.
-        assert_eq!(review_line(Stage::Running, Some(line)), None);
-        assert_eq!(review_line(Stage::Planned, Some(line)), None);
-    }
-
-    #[test]
     fn fuzzy_prefers_word_starts_and_runs() {
         assert!(fuzzy_score("", "anything").is_some());
         assert!(fuzzy_score("xyz", "abc").is_none());

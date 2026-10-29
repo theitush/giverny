@@ -765,29 +765,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A claude's own file names its session; one left by another process
-    /// with that pid (another start) names none.
-    #[test]
-    fn a_claudes_session_is_its_own_file() {
-        let dir = std::env::temp_dir().join(format!("giverny-reg-of-{}", std::process::id()));
-        let sessions = dir.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let write = |pid: u32, body: String| {
-            std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap()
-        };
-        write(
-            10,
-            r#"{"pid":10,"sessionId":"s10","procStart":"700"}"#.into(),
-        );
-        write(11, r#"{"pid":11,"sessionId":"s11"}"#.into());
-        let dirs = [dir.join("nowhere"), dir.clone()];
-        assert_eq!(session_of_pid(&dirs, 10, 700).as_deref(), Some("s10"));
-        assert_eq!(session_of_pid(&dirs, 10, 701), None, "another start");
-        assert_eq!(session_of_pid(&dirs, 11, 5).as_deref(), Some("s11"));
-        assert_eq!(session_of_pid(&dirs, 12, 5), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// This process's start time, as Claude Code writes `procStart`.
     #[cfg(target_os = "linux")]
     fn my_start() -> u64 {

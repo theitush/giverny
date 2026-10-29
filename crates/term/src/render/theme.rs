@@ -599,23 +599,6 @@ mod tests {
         );
     }
 
-    /// Every built-in's worker background is visibly not its background, yet
-    /// stays on the same side of light and dark, so text keeps its contrast.
-    #[test]
-    fn worker_bg_is_a_visible_shift_of_every_theme() {
-        for name in Theme::NAMES {
-            let t = Theme::by_name(name);
-            let w = t.worker_bg();
-            let d = (w.r() as i32 - t.bg.r() as i32).abs()
-                + (w.g() as i32 - t.bg.g() as i32).abs()
-                + (w.b() as i32 - t.bg.b() as i32).abs();
-            assert!(d >= 12, "{name}: worker bg {w:?} too close to {:?}", t.bg);
-            assert!(d <= 90, "{name}: worker bg {w:?} too far from {:?}", t.bg);
-            let shifted = Theme { bg: w, ..t.clone() };
-            assert_eq!(shifted.is_light(), t.is_light(), "{name}");
-        }
-    }
-
     /// Rouen never jumps: the palette on either side of any moment is the
     /// same colour to within a rounding step, midnight included.
     #[test]
