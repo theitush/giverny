@@ -1476,6 +1476,10 @@ struct AttachJob {
     nudge: agent_open::Nudge,
     /// The walk's phase last frame, for the timing log.
     phase: &'static str,
+    /// When each phase began, from [`Self::started`], and the keys typed:
+    /// the timing line a finished walk logs (giverny#495).
+    times: Vec<(&'static str, Duration)>,
+    keys: usize,
     /// The relay has been told it may hide the strip's rows again, and
     /// the nudge set on bringing that forward.
     hide_asked: bool,
@@ -1495,8 +1499,30 @@ impl AttachJob {
             settle: None,
             nudge,
             phase: "start",
+            times: vec![("start", Duration::ZERO)],
+            keys: 0,
             hide_asked: false,
         }
+    }
+
+    /// The walk's phases with how long each took, and the keys it typed:
+    /// `start 18ms, strip 330ms, attach 140ms, landing 61ms, focus 120ms,
+    /// settle 70ms; 9 keys`. A phase is named for what it waits on: `strip`
+    /// for Claude Code's strip to be drawn, `attach` for the steps to the
+    /// row and its Enter, `landing` for the view, `focus` for its prompt,
+    /// `settle` for the final screen, after which the picture is let go.
+    fn timing(&self) -> String {
+        let end = self.started.elapsed();
+        let parts: Vec<String> = self
+            .times
+            .iter()
+            .enumerate()
+            .map(|(i, &(phase, at))| {
+                let next = self.times.get(i + 1).map_or(end, |t| t.1);
+                format!("{phase} {:.0?}", next.saturating_sub(at))
+            })
+            .collect();
+        format!("{}; {} keys", parts.join(", "), self.keys)
     }
 
     /// Whether the tab's picture is still held.
@@ -4984,8 +5010,7 @@ impl App {
             && to_worker
             && match &job.settle {
                 None if !job.hide_asked && job.driver.entering() => true,
-                None => job.hide_asked && !agent_open::strip_agents(&screen).is_empty(),
-                Some(settle) => !settle.is_final(&screen),
+                _ => job.hide_asked && !agent_open::strip_agents(&screen).is_empty(),
             };
         let at = job.started.elapsed();
         match job.nudge.tick(now, waiting) {
@@ -5001,7 +5026,14 @@ impl App {
         }
         let mut finished = false;
         if let Some(settle) = &mut job.settle {
-            finished = !job.nudge.is_narrow() && settle.done(now, &screen);
+            // The view is shown with the strip's rows still under it (not
+            // drawn, `row_marks`), once the relay's run that takes them
+            // away is on its way: the pty's width back, and a run due
+            // after the ask was withdrawn. Nothing has to stay to see it
+            // through (giverny#495).
+            finished = !job.nudge.is_narrow()
+                && (!waiting || job.nudge.answer_due())
+                && settle.done(now, &screen);
         } else {
             let undimmed = session.screen_text_undimmed();
             let look = agent_open::Look {
@@ -5014,6 +5046,7 @@ impl App {
             if phase != job.phase {
                 tracing::debug!("walk +{at:?}: {} -> {phase}", job.phase);
                 job.phase = phase;
+                job.times.push((phase, at));
             }
             // The focus is off the strip: the relay may hide its rows now
             // (`sync_strip_asks`, this frame), while the walk finishes.
@@ -5023,18 +5056,24 @@ impl App {
                 job.nudge.ask(now);
             }
             match tick {
-                Tick::Send(key) => {
-                    tracing::debug!("walk +{at:?}: key {key:?}");
+                Tick::Send(key) | Tick::Repeat(key, _) => {
+                    let n = match tick {
+                        Tick::Repeat(_, n) => n,
+                        _ => 1,
+                    };
+                    tracing::debug!("walk +{at:?}: key {key:?} x{n}");
+                    job.keys += usize::from(n);
                     let mode = session.mode();
                     let bytes = agent_open::keystroke_bytes(key, |k, m| {
                         giverny_term::input::encode_key(k, m, mode)
                     });
-                    session.write(bytes);
+                    session.write(bytes.repeat(usize::from(n)));
                 }
                 Tick::Wait => {}
                 Tick::Done => {
                     tracing::debug!("walk +{at:?}: done, settling");
-                    job.settle = Some(agent_open::Settle::new(&job.driver.goal, pane_on, now));
+                    job.times.push(("settle", at));
+                    job.settle = Some(agent_open::Settle::new(&job.driver.goal, now));
                     if !job.hide_asked {
                         job.hide_asked = true;
                         job.nudge.ask(now);
@@ -5067,9 +5106,10 @@ impl App {
         if finished {
             let tab = job.tab;
             tracing::info!(
-                "management panel: walk to {} shown after {:?}",
+                "management panel: walk to {} shown after {:?} ({})",
                 job.driver.target(),
-                job.started.elapsed()
+                job.started.elapsed(),
+                job.timing()
             );
             self.attach = None;
             self.release_picture(tab);
@@ -5804,13 +5844,17 @@ impl App {
         };
         let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
         match put {
-            Put::Key(key) => {
+            Put::Key(key) | Put::Keys(key, _) => {
+                let n = match put {
+                    Put::Keys(_, n) => n,
+                    _ => 1,
+                };
                 if let Some(session) = session {
                     let mode = session.mode();
                     let bytes = agent_open::keystroke_bytes(key, |k, m| {
                         giverny_term::input::encode_key(k, m, mode)
                     });
-                    session.write(bytes);
+                    session.write(bytes.repeat(usize::from(n)));
                 }
             }
             Put::Text(text) => {
