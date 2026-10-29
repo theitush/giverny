@@ -17,8 +17,8 @@ this skill only says how to run it and keep the pane true.
 
 ## 1. Plan
 
-Your name: when Giverny asks its sessions to name themselves (a setting,
-off by default), you got one at the session's start; keep it.
+Your name: when Giverny names every session (a setting, off by default),
+you got one at the session's start; keep it.
 `giverny-manage name` prints it (and gives you one if you have none yet). If
 the project signs its tasks, sign your umbrella task with that full name, and
 introduce yourself with it once, in your first message to the user. When

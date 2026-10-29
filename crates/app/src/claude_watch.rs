@@ -2229,8 +2229,8 @@ impl ClaudeWatch {
     /// `management_panel.manage_skill`: off, the plugin is written without
     /// its manage skill. `names` is `management_panel.ask_names`
     /// (giverny#343): on (with the pane), `<feeds>/names/on` tells the
-    /// plugin's hooks to ask each tab's session to name itself and the status
-    /// line to show the name; off, neither. The plugin's hooks are the same
+    /// plugin's hooks to give each tab's session a name and the status line
+    /// to show it; off, neither. The plugin's hooks are the same
     /// either way, as Claude Code loads them only when a claude starts
     /// (giverny#356).
     ///
