@@ -941,6 +941,10 @@ pub enum Action {
     /// The rail's `stop` / `stop all`: end what these tabs run and keep the
     /// tabs, asking first when more than an idle prompt would die.
     StopTabs(Vec<TabId>),
+    /// The pause button beside a tab's ×: stop it as [`Action::StopTabs`]
+    /// does, without the confirm — the button is the user's own click on
+    /// what is running.
+    StopTabNow(TabId),
     /// The stop confirm's answer: stop them (`true`), or leave them be.
     ConfirmStop(bool),
 }
@@ -2011,6 +2015,11 @@ impl App {
                     self.stop_tabs(&tabs);
                 } else {
                     self.stop_confirm = Some(StopConfirm { tabs, lines });
+                }
+            }
+            Action::StopTabNow(id) => {
+                if self.stoppable(id) {
+                    self.stop_tabs(&[id]);
                 }
             }
             Action::ConfirmStop(yes) => {
