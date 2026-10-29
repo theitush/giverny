@@ -143,6 +143,18 @@ pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("giverny-{uid}.sock"))
 }
 
+/// The tab this hook speaks for (`$GIVERNY_TAB_ID`), or `None` when there
+/// is none to tell: outside Giverny, or in a session that only inherited a
+/// tab's identity — a claude started inside the tab's claude, or under a
+/// multiplexer the tab launched — whose hooks would move the tab's state
+/// and its resume target ([`crate::lineage`]).
+pub fn tab_of_this_process() -> Option<String> {
+    let tab = std::env::var("GIVERNY_TAB_ID")
+        .ok()
+        .filter(|t| !t.trim().is_empty())?;
+    crate::lineage::of_this_process().is_tabs().then_some(tab)
+}
+
 /// The `giverny relay` entrypoint. Fast, silent, always exits successfully —
 /// a relay failure must never disturb the Claude session that ran the hook.
 pub fn run_relay(spool: &Path) {
@@ -151,7 +163,7 @@ pub fn run_relay(spool: &Path) {
     // Sessions outside Giverny tabs have no tab identity — nothing to relay
     // (and nothing worth spooling; the stdin read above keeps claude's
     // pipe-write happy before we bail).
-    let Ok(tab_id) = std::env::var("GIVERNY_TAB_ID") else {
+    let Some(tab_id) = tab_of_this_process() else {
         return;
     };
     let event: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);

@@ -8,6 +8,7 @@
 
 pub mod hooks;
 pub mod jobs;
+pub mod lineage;
 pub mod profiles;
 pub mod registry;
 pub mod session_use;

@@ -152,26 +152,6 @@ pub fn parse_stat(pid: u32, stat: &str, page_kb: u64) -> Option<Proc> {
     })
 }
 
-/// Is a process name Claude Code's? `claude`, by its short name or its
-/// `argv[0]`'s last part.
-pub fn is_claude_name(name: &str) -> bool {
-    let name = name.trim();
-    name.rsplit('/').next().unwrap_or(name) == "claude"
-}
-
-/// Whether `pid` is a Claude Code process: its short name (`comm`) or its
-/// `argv[0]` is `claude`.
-#[cfg(target_os = "linux")]
-pub(crate) fn proc_is_claude(pid: u32) -> bool {
-    if std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| is_claude_name(&c)) {
-        return true;
-    }
-    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
-        let argv0 = cmd.split(|b| *b == 0).next().unwrap_or_default();
-        is_claude_name(&String::from_utf8_lossy(argv0))
-    })
-}
-
 /// The `Pss:` line of a `/proc/<pid>/smaps_rollup`, KiB.
 pub fn parse_pss(smaps_rollup: &str) -> Option<u64> {
     smaps_rollup
@@ -302,14 +282,6 @@ mod tests {
         assert_eq!(got.mem_kb, 2048 * 4);
         assert_eq!(got.start, 12345);
         assert_eq!(parse_stat(1, "garbage", 4), None);
-    }
-
-    #[test]
-    fn claude_is_told_by_its_name() {
-        assert!(is_claude_name("claude\n"));
-        assert!(is_claude_name("/home/u/.local/bin/claude"));
-        assert!(!is_claude_name("node"));
-        assert!(!is_claude_name("claude-code-helper"));
     }
 
     #[test]

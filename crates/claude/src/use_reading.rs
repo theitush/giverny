@@ -310,7 +310,7 @@ impl Sampler {
             procs,
         };
         self.prev = Some((seen(&table.procs), now));
-        Some(table.reading(su::now_ms(), app, su::proc_is_claude))
+        Some(table.reading(su::now_ms(), app, crate::lineage::proc_is_claude))
     }
 
     #[cfg(not(target_os = "linux"))]
