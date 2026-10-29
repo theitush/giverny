@@ -226,6 +226,7 @@ fn safe(session: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+#[cfg(test)]
 fn read(path: &Path) -> Vec<Chore> {
     read_all(path).0
 }
