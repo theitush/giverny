@@ -445,8 +445,8 @@ struct GroupData {
     /// A tab in it shows the tick, alone or as a badge: something finished
     /// there while you were elsewhere.
     unseen: bool,
-    /// One of those finishes failed: the header's tick is a ✕, so bad news
-    /// under it is not passed off as good (giverny#488).
+    /// Every one of those finishes failed: the header's tick is a ✕
+    /// (giverny#488). One tick among them and the header ticks.
     failed: bool,
     rows: Vec<RowData>,
 }
@@ -625,10 +625,12 @@ fn ticks(rows: &[RowData]) -> bool {
     rows.iter().any(shows_finish)
 }
 
-/// Whether a group's tick is a ✕ (giverny#488): a row under it wears the
-/// ✕, alone or as its badge.
+/// Whether a group's tick is a ✕ (giverny#488): every row under it that
+/// wears an unseen finish wears the ✕. One tick among them wins: good news
+/// under the header is not hidden behind bad.
 fn fails(rows: &[RowData]) -> bool {
-    rows.iter().any(|r| r.failed && shows_finish(r))
+    let mut shown = rows.iter().filter(|r| shows_finish(r)).peekable();
+    shown.peek().is_some() && shown.all(|r| r.failed)
 }
 
 /// Whether `row` wears its unseen finish, the tick or the ✕, alone or as
@@ -3498,7 +3500,7 @@ mod tests {
 
     /// A finish that failed is marked by the tick's own rules, as a ✕
     /// (giverny#488): alone while unseen, as the badge beside what runs
-    /// after it, gone once seen; the header's tick a ✕ when a row's is.
+    /// after it, gone once seen.
     #[test]
     fn a_failed_finish_wears_the_cross_by_the_ticks_rules() {
         let failed = |r: RowData| RowData { failed: true, ..r };
@@ -3522,12 +3524,41 @@ mod tests {
         assert_eq!(Mark::of(&seen()), Mark::Idle);
         assert!(!ticks(&[seen()]));
         assert_eq!(Mark::of(&seen_shell()), Mark::Prompt);
-        // The header: a ✕ when a row wears one, a tick otherwise.
-        assert!(fails(&[row(ClaudeState::DoneUnseen), turn()]));
-        assert!(fails(&[row(ClaudeState::Idle), again]));
-        assert!(!fails(&[row(ClaudeState::DoneUnseen), seen()]));
-        assert!(!fails(&[seen_shell()]));
         assert!(ticks(&[turn()]));
+    }
+
+    /// A header wears the ✕ only when every unseen finish under it failed;
+    /// one tick among them wins, and the header ticks (giverny#488).
+    #[test]
+    fn a_header_crosses_only_when_every_finish_under_it_failed() {
+        let failed = |r: RowData| RowData { failed: true, ..r };
+        let turn = || failed(row(ClaudeState::DoneUnseen));
+        let shell = || {
+            failed(RowData {
+                unseen: true,
+                ..row(ClaudeState::None)
+            })
+        };
+        let again = || {
+            failed(RowData {
+                unseen: true,
+                ..row(ClaudeState::Busy)
+            })
+        };
+        let good = || row(ClaudeState::DoneUnseen);
+        // Every finish failed, alone or as a badge: the ✕. Rows with no
+        // finish to show, or one already seen, have no say.
+        assert!(fails(&[turn()]));
+        assert!(fails(&[turn(), shell(), again()]));
+        assert!(fails(&[row(ClaudeState::Idle), again()]));
+        assert!(fails(&[failed(row(ClaudeState::Idle)), turn()]));
+        // One finish went well: the tick wins, whichever the order.
+        assert!(!fails(&[good(), turn()]));
+        assert!(!fails(&[turn(), shell(), good()]));
+        assert!(!fails(&[again(), good()]));
+        // Nothing unseen: no ✕ (and no tick).
+        assert!(!fails(&[]));
+        assert!(!fails(&[failed(row(ClaudeState::Idle))]));
     }
 
     /// The ✕ is the tick's strokes, size and colour (giverny#488): two
