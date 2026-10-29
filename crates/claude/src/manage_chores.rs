@@ -163,6 +163,9 @@ impl Chore {
             Kind::Start => row.start_nudged_ms,
             Kind::Worker => row.worker_nudged_ms,
         };
+        if self.kind == Kind::NowPaused {
+            return told_this_pause(stamp, row.paused_since_ms);
+        }
         stamp == Some(self.since)
     }
 
@@ -219,6 +222,12 @@ pub fn path(feed_dir: &Path, session: &str) -> PathBuf {
 }
 
 /// A session id safe to name a file by.
+/// A task now really paused is told once a pause (giverny#486): its stamp
+/// is an end at or after the pause began, whatever end is read later.
+fn told_this_pause(stamp: Option<u64>, paused_since: Option<u64>) -> bool {
+    stamp.zip(paused_since).is_some_and(|(s, p)| s >= p)
+}
+
 fn safe(session: &str) -> bool {
     !session.is_empty()
         && session
@@ -353,7 +362,18 @@ fn stamp(
                 && c.kind.stands_in(manage::stage_of(r))
         });
         let Some(row) = row else { continue };
-        if manage::u64_of(row, c.kind.field()) == Some(c.since) {
+        let stamp = manage::u64_of(row, c.kind.field());
+        let told = if c.kind == Kind::NowPaused {
+            let paused = row
+                .get("paused_since")
+                .and_then(Value::as_str)
+                .and_then(|s| s.trim().parse::<jiff::Timestamp>().ok())
+                .map(|t| t.as_millisecond().max(0) as u64);
+            told_this_pause(stamp, paused)
+        } else {
+            stamp == Some(c.since)
+        };
+        if told {
             continue; // told already
         }
         if c.kind == Kind::Start && row.contains_key("held") {
@@ -711,6 +731,12 @@ mod tests {
             feed::read(&f).unwrap().rows[0].land_nudged_ms,
             Some(T0 + 2 * MIN)
         );
+        // Its end read again later (Claude Code lists it finished a while):
+        // told once a pause, not again.
+        let again = now_paused("g483", T0 + 2 * MIN + 5_000);
+        assert!(again.told(&feed::read(&f).unwrap().rows[0]));
+        publish_with(&dir, "s1", &[again], &[]).unwrap();
+        assert_eq!(deliver(&dir, "s1", T0 + 2 * MIN + 20_000), None);
         // The other two stop on one poll: the line says all have.
         publish_with(
             &dir,
