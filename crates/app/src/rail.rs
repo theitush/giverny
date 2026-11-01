@@ -1866,14 +1866,12 @@ impl Mark {
 /// leaves it (giverny#490).
 const PAUSE_W: f32 = 18.0;
 
-/// Whether a row shows the pause button on hover (giverny#490): something
-/// runs in it — a live Claude or Codex, whatever it left running, or a
-/// shell running a command. Never an idle shell, an exited one, or a tab
-/// not started.
+/// Whether a row shows the pause button on hover (giverny#490): its shell
+/// is live — started and not exited, an idle one at its prompt included,
+/// so a click can end it and keep the tab. Never an exited shell or a tab
+/// not started: nothing runs there to stop.
 fn pausable(row: &RowData) -> bool {
-    row.started
-        && !row.exited
-        && (row.claude != ClaudeState::None || row.agents || row.command || row.running)
+    row.started && !row.exited
 }
 
 /// Whether a Claude tab's row shows the breathing square under its mark
@@ -2074,8 +2072,8 @@ fn tab_row(
         }
     }
 
-    // The pause button left of the close (giverny#490): on a hovered row
-    // with something running, and a title with no figures to keep it clear
+    // The pause button left of the close (giverny#490): on a hovered live
+    // row, idle shell included, and a title with no figures to keep it clear
     // stops short of it.
     let pause = hovered && pausable(row) && app.stoppable(row.id);
 
