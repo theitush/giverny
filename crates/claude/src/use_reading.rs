@@ -31,7 +31,7 @@
 //! Claude Code's status line shows none of it (giverny#384): the app draws
 //! every figure from its newest pass.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,13 @@ pub struct Reading {
     /// under them), by agent id; part of its session's.
     #[serde(default)]
     pub agents: BTreeMap<String, Use>,
+    /// The tabs, by their shell's pid, whose claude runs a command now:
+    /// it has a child that is Claude Code's Bash wrapper
+    /// ([`crate::worker_pids::eval_command`]) — a Bash call in front, mid
+    /// turn, or a background shell, the session's own or a worker's. What
+    /// the rail's square under a Claude tab's mark says (giverny#510).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub commands: BTreeSet<u32>,
 }
 
 /// What one pass knows about every process, and the GPU.
@@ -149,6 +156,10 @@ impl Table {
     /// (giverny#453). A run whose session has no claude here counts in the
     /// total alone. Each set is a set, so a run that is under its claude is
     /// counted once.
+    ///
+    /// `commands` are the Bash wrappers running under the claudes
+    /// ([`Reading::commands`]), each credited to its tab.
+    #[allow(clippy::too_many_arguments)]
     pub fn reading(
         &self,
         at_ms: u64,
@@ -157,6 +168,7 @@ impl Table {
         runs: &[(String, String, HashSet<u32>)],
         agents: &HashMap<String, HashSet<u32>>,
         claude_of: &HashMap<String, u32>,
+        commands: &HashSet<u32>,
     ) -> Reading {
         let tree = subtree(&self.procs, app);
         let mut claudes: BTreeMap<u32, HashSet<u32>> = tree
@@ -217,6 +229,10 @@ impl Table {
             agents: agents
                 .iter()
                 .map(|(id, pids)| (id.clone(), self.use_of(pids)))
+                .collect(),
+            commands: commands
+                .iter()
+                .filter_map(|pid| tab_of.get(pid).copied())
                 .collect(),
         }
     }
@@ -386,6 +402,10 @@ pub struct Sampler {
     pmon_child: Option<std::process::Child>,
     pmon_at: Option<std::time::Instant>,
     workers: crate::worker_pids::Attributor,
+    /// Whether each child of a claude is Claude Code's Bash wrapper, by
+    /// `(pid, start)`: asked once each ([`Sampler::commands`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    wrappers: HashMap<(u32, u64), bool>,
     /// Puts each tab's claude under its cap ([`crate::tab_cap`]); only the
     /// app's own sampler ([`Sampler::capping_tabs`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -479,6 +499,7 @@ impl Sampler {
             .workers
             .attribute(&table.procs, &claudes, &crate::worker_pids::Machine);
         let claude_of = self.claude_of(&table.procs, &claudes, &runs);
+        let commands = self.commands(&table.procs, &claudes);
         Some(table.reading(
             su::now_ms(),
             app,
@@ -486,7 +507,32 @@ impl Sampler {
             &runs,
             &agents,
             &claude_of,
+            &commands,
         ))
+    }
+
+    /// The commands the claudes run now ([`Reading::commands`]): each
+    /// child of a claude in `claudes` that is Claude Code's Bash wrapper,
+    /// a Bash call in front or a background shell alike. Its command line
+    /// is read once, when it is first seen; a child still a claude (forked,
+    /// not yet exec'd) is not judged until it is something else.
+    #[cfg(target_os = "linux")]
+    fn commands(&mut self, procs: &[Proc], claudes: &HashSet<u32>) -> HashSet<u32> {
+        use crate::worker_pids::{Machine, Source, eval_command};
+        let alive: HashSet<(u32, u64)> = procs.iter().map(|p| (p.pid, p.start)).collect();
+        self.wrappers.retain(|k, _| alive.contains(k));
+        procs
+            .iter()
+            .filter(|p| claudes.contains(&p.ppid) && !claudes.contains(&p.pid))
+            .filter(|p| {
+                *self.wrappers.entry((p.pid, p.start)).or_insert_with(|| {
+                    Machine
+                        .wrapper_script(p.pid)
+                        .is_some_and(|s| eval_command(&s).is_some())
+                })
+            })
+            .map(|p| p.pid)
+            .collect()
     }
 
     /// Each running run's session's claude, among `claudes`: the claude

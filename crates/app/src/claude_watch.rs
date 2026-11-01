@@ -30,7 +30,8 @@ pub struct ClaudeTab {
     /// Short account name (profile) this tab's Claude runs under.
     pub account: Option<String>,
     /// A background shell is alive in this session while the agent itself is
-    /// at its prompt. Not a working state — marked, never animated.
+    /// at its prompt. Not a working state: one of the commands the rail's
+    /// square under the mark stands for (giverny#510).
     pub background: bool,
     /// Work this session delegated — subagents, a workflow, teammates, a
     /// cloud session — still runs: the agent is free to talk while its
@@ -108,13 +109,6 @@ fn cap_history(prompts: &mut Vec<String>) {
 }
 
 impl ClaudeTab {
-    /// Something this session started still works while the agent waits at
-    /// its prompt: a background shell or delegated work. What the rail's
-    /// three-dot wave says (giverny#352, giverny#363).
-    pub fn working_in_background(&self) -> bool {
-        self.background || self.agents
-    }
-
     /// `agents` from what still runs.
     fn sync_agents(&mut self) {
         self.agents = self.agents_unnamed || !self.subagents.is_empty();
@@ -2710,7 +2704,7 @@ mod tests {
     fn a_compaction_breathes_and_gives_the_tab_back() {
         let mut w = ClaudeWatch::for_tests();
         let compact = || hook("SessionStart", r#","source":"compact""#);
-        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].agents;
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
         let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
@@ -3609,7 +3603,7 @@ mod tests {
             w.merge_scan(&shells, None, &mut WatchEffects::default());
         };
         let agent = r#","background_tasks":[{"id":"a1","type":"subagent","status":"running"}]"#;
-        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].agents;
 
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
@@ -3648,13 +3642,14 @@ mod tests {
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
         assert!(!waves(&w));
 
-        // A background shell running: the wave, whoever's it is. It is no
-        // word that the worker ended: one waiting on a shell of its own
+        // A background shell running, whoever's it is: the square
+        // (giverny#510), and the worker's wave on. It is no word that the
+        // worker ended: one waiting on a shell of its own
         // makes the registry say `shell` while it lives (giverny#467).
         feed(&mut w, &hook("Stop", agent), Some(TAB));
         scan(&mut w, "shell");
         assert!(w.tabs[&TAB].agents, "the worker may be waiting on it");
-        assert!(waves(&w));
+        assert!(w.tabs[&TAB].background);
         scan(&mut w, "idle");
         assert!(!waves(&w));
 
@@ -3694,7 +3689,7 @@ mod tests {
             "PostToolUse",
             r#","agent_id":"a58ff8469ff4515c6","tool_name":"Bash""#,
         );
-        let waves = |w: &ClaudeWatch| w.tabs[&TAB].working_in_background();
+        let waves = |w: &ClaudeWatch| w.tabs[&TAB].agents;
 
         // Unseen: the turn ends with a worker running, out of sight.
         let mut w = ClaudeWatch::for_tests();
@@ -3728,17 +3723,22 @@ mod tests {
         assert_eq!(w.state_of(TAB), ClaudeState::Idle);
         assert!(!waves(&w), "the ring");
 
-        // A background shell holds the tick back the same (giverny#352).
+        // A background shell (giverny#352) is no wave: the turn ticks, the
+        // rail's square under the tick says the shell runs (giverny#510).
         let mut w = ClaudeWatch::for_tests();
         feed(&mut w, &hook("SessionStart", ""), Some(TAB));
         feed(&mut w, &hook("UserPromptSubmit", ""), Some(TAB));
         feed(&mut w, &hook("Stop", r#","background_tasks":[]"#), None);
         scan(&mut w, "shell");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
-        assert!(waves(&w), "the shell runs: the wave");
+        assert!(!waves(&w), "the shell runs: no wave");
+        assert!(w.tabs[&TAB].background, "the shell runs: the square");
         scan(&mut w, "idle");
         assert_eq!(w.state_of(TAB), ClaudeState::DoneUnseen);
-        assert!(!waves(&w), "the shell is gone: the tick");
+        assert!(
+            !w.tabs[&TAB].background,
+            "the shell is gone: the tick alone"
+        );
     }
 
     #[test]

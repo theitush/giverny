@@ -310,7 +310,7 @@ fn square_breath(p: &egui::Painter, at: Pos2, breath: f32, color: Color32) {
     square_band(p, at, outer, hole, color);
 }
 
-/// How lit each of a background shell's three dots is, 0 (dim) to 1 (the
+/// How lit each of the subagents' wave's three dots is, 0 (dim) to 1 (the
 /// tab's colour), as a colour travels through them left to right: one lap
 /// every 3.75 s, slower than the calm mark's 3 s breath and the amber flag's
 /// 2 s, so "something hums along" never falls into step with "working" or
@@ -336,7 +336,7 @@ fn shell_wave(time: Option<f64>) -> [f32; 3] {
     })
 }
 
-/// A Claude tab's background shell at `at`: three small dots, a colour
+/// A Claude tab's subagents at work, at `at`: three small dots, a colour
 /// moving through them from a faded `color` up to the full one, kept moving
 /// while `rect` is on screen. All in the tab's category colour, like every
 /// other mark (giverny#361): the wave's motion says "humming", the colour
@@ -395,10 +395,14 @@ struct RowData {
     resumes_claude: bool,
     color: Color32,
     claude: ClaudeState,
-    /// Something Claude started still works — a background shell, or
-    /// subagents it handed work to (giverny#363) — while Claude itself waits
-    /// at its prompt, free to talk.
-    background: bool,
+    /// Subagents Claude handed work to still work (giverny#363): the
+    /// three-dot wave while Claude itself waits at its prompt, free to talk.
+    /// Only them: a command it runs is [`RowData::command`] (giverny#510).
+    agents: bool,
+    /// Claude runs a command — a Bash call in front, mid turn, or a
+    /// background shell (giverny#352), its own or a worker's: the breathing
+    /// square under its mark (giverny#510).
+    command: bool,
     /// A plain shell with a command in front: seen by the foreground poll,
     /// or between the shell's OSC 133 `C` and `D` (giverny#388).
     running: bool,
@@ -557,7 +561,20 @@ fn row_data(
                 .is_some(),
         color,
         claude: app.agent_state(t.id),
-        background: ct.is_some_and(|c| c.working_in_background()),
+        agents: ct.is_some_and(|c| c.agents),
+        // Seen by the sampler's pass (a child of the tab's claude that is
+        // Claude Code's Bash wrapper, up to a second late), or a background
+        // shell the session's registry entry reports.
+        command: ct.is_some_and(|c| c.background)
+            || app
+                .rt
+                .get(&t.id)
+                .and_then(|rt| rt.session.as_ref()?.child_pid)
+                .is_some_and(|shell| {
+                    app.use_now
+                        .as_ref()
+                        .is_some_and(|r| r.commands.contains(&shell))
+                }),
         running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
         unseen: app.unseen_done.contains_key(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
@@ -579,9 +596,10 @@ fn row_data(
 /// Counts a header carries: how many, how many working, how many want you.
 ///
 /// Working is every tab whose mark says something runs — the agent itself
-/// ([`Mark::Busy`]), what it left humming at its prompt ([`Mark::Wave`]:
-/// subagents, a background shell, seen or unseen), or a plain shell running
-/// a command ([`Mark::Running`], giverny#462). Counting only the busy
+/// ([`Mark::Busy`]), the subagents it left humming at its prompt
+/// ([`Mark::Wave`], seen or unseen), a command it runs (the square under
+/// its mark, [`runs_command`], giverny#510), or a plain shell running a
+/// command ([`Mark::Running`], giverny#462). Counting only the busy
 /// state let the header's breathing dot go still while a tab still showed
 /// the wave (giverny#383); it should stop only once nothing in the group
 /// runs, collapsed or not. A tab not started this run has nothing running,
@@ -590,7 +608,9 @@ fn tallies(rows: &[RowData]) -> (usize, usize, usize) {
     (
         rows.len(),
         rows.iter()
-            .filter(|r| matches!(Mark::of(r), Mark::Busy | Mark::Wave | Mark::Running))
+            .filter(|r| {
+                matches!(Mark::of(r), Mark::Busy | Mark::Wave | Mark::Running) || runs_command(r)
+            })
             .count(),
         rows.iter()
             .filter(|r| r.claude == ClaudeState::NeedsYou)
@@ -1724,10 +1744,13 @@ fn square_band(p: &egui::Painter, at: Pos2, outer: f32, hole: f32, color: Color3
 ///
 /// The tick says "finished while you were elsewhere", for both. Alone it is
 /// the whole mark: nothing runs after the finish you have not seen. When
-/// something does — the agent working again, its subagents or background
-/// shell humming on, a shell's next command — that is the mark, and the
-/// tick rides beside it as a badge ([`Mark::badged`]) until you look
-/// (giverny#388).
+/// something does — the agent working again, its subagents humming on, a
+/// shell's next command — that is the mark, and the tick rides beside it as
+/// a badge ([`Mark::badged`]) until you look (giverny#388).
+///
+/// A command a Claude tab's agent runs is no mark of its own but rides
+/// under it, on the second line: the shell's breathing square
+/// ([`runs_command`], giverny#510), whatever the mark above says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
     /// Claude working: the spinner, or with `rail.calm_busy` the idle dot
@@ -1737,20 +1760,22 @@ enum Mark {
     /// badge too: what you owe it matters more than what you missed.
     Flag,
     /// Something finished while you were elsewhere, and nothing runs after
-    /// it: the tick. A Claude turn that ended with its subagents or a
-    /// background shell still running is not done yet, seen or unseen, so
-    /// it wears [`Mark::Wave`] until they end (giverny#381), with the tick
-    /// beside it while unseen (giverny#388). A shell whose command ended
-    /// on another tab ticks the same.
+    /// it: the tick. A Claude turn that ended with its subagents still
+    /// running is not done yet, seen or unseen, so it wears [`Mark::Wave`]
+    /// until they end (giverny#381), with the tick beside it while unseen
+    /// (giverny#388); one that ended with only a background shell running
+    /// ticks, the square under it (giverny#510). A shell whose command
+    /// ended on another tab ticks the same.
     Tick,
     /// Claude idle at its prompt, seen: a small filled dot in the
     /// category's colour, the size of a not-started Claude tab's gray one
     /// (giverny#462).
     Idle,
-    /// Claude at its prompt, free to talk, while something it started
-    /// hums on — a background shell (giverny#352) or its subagents
-    /// (giverny#363): the three-dot wave, whether or not you have seen the
-    /// turn that left them running (giverny#381). The agent itself working,
+    /// Claude at its prompt, free to talk, while subagents it handed work
+    /// to hum on (giverny#363): the three-dot wave, whether or not you have
+    /// seen the turn that left them running (giverny#381). Subagents only:
+    /// a background shell (giverny#352) is the square under the mark now
+    /// (giverny#510). The agent itself working,
     /// which it cannot talk through, is [`Mark::Busy`], and wins; it asking
     /// for you is [`Mark::Flag`], and wins too.
     Wave,
@@ -1797,11 +1822,11 @@ impl Mark {
         let mark = match row.claude {
             ClaudeState::Busy => Mark::Busy,
             ClaudeState::NeedsYou => Mark::Flag,
-            // Unseen or not, a turn whose work still runs is not done: the
-            // wave says so, the state staying `DoneUnseen` until you look
-            // (giverny#381, the manager's tab ticked while its worker
+            // Unseen or not, a turn whose subagents still run is not done:
+            // the wave says so, the state staying `DoneUnseen` until you
+            // look (giverny#381, the manager's tab ticked while its worker
             // built), and the tick waits beside it ([`Mark::badged`]).
-            ClaudeState::DoneUnseen | ClaudeState::Idle if row.background => Mark::Wave,
+            ClaudeState::DoneUnseen | ClaudeState::Idle if row.agents => Mark::Wave,
             ClaudeState::DoneUnseen => Mark::Tick,
             ClaudeState::Idle => Mark::Idle,
             ClaudeState::None if row.exited => Mark::Exited,
@@ -1846,7 +1871,17 @@ const PAUSE_W: f32 = 18.0;
 /// shell running a command. Never an idle shell, an exited one, or a tab
 /// not started.
 fn pausable(row: &RowData) -> bool {
-    row.started && !row.exited && (row.claude != ClaudeState::None || row.background || row.running)
+    row.started
+        && !row.exited
+        && (row.claude != ClaudeState::None || row.agents || row.command || row.running)
+}
+
+/// Whether a Claude tab's row shows the breathing square under its mark
+/// (giverny#510): its agent runs a command, in front or in the background.
+/// A live Claude tab only — a plain shell's own square is its mark, a tab
+/// not started or exited runs nothing.
+fn runs_command(row: &RowData) -> bool {
+    row.command && row.started && !row.exited && row.claude != ClaudeState::None
 }
 
 /// The pause glyph, two upright strokes the size of the close's × beside
@@ -1955,12 +1990,12 @@ fn tab_row(
         // Still: finished, nothing owed. The flag above is the one that
         // wants something; the two differ in shape and movement.
         Mark::Tick => tick(&p, dot, row.failed, color),
-        // A background shell or its subagents keep running while Claude
-        // waits at its prompt. Worth showing — it is why a directory is
-        // still churning — but it is not the agent working: it can take a
-        // message. So no spinner and no flag: a slow colour drifting
-        // through three small dots, the hum of something left running
-        // (#352, #363). Off, they hold still and faded.
+        // Its subagents keep running while Claude waits at its prompt.
+        // Worth showing — it is why a directory is still churning — but it
+        // is not the agent working: it can take a message. So no spinner
+        // and no flag: a slow colour drifting through three small dots, the
+        // hum of something left running (#363). Off, they hold still and
+        // faded.
         Mark::Wave => shell_dots(ui, &p, rect, dot, color),
         Mark::Idle => {
             p.circle_filled(dot, DOT_R, color);
@@ -1988,6 +2023,13 @@ fn tab_row(
     // and the title never moves as the badge comes and goes.
     if mark.badged(row) {
         badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
+    }
+    // A command the agent runs (giverny#510), a Bash call mid-turn or a
+    // background shell: a plain shell's breathing square, on the second
+    // line under the mark, left of the path, whatever the mark says.
+    if runs_command(row) {
+        let under = Pos2::new(dot.x, rect.min.y + 29.0);
+        breathing_square(ui, &p, rect, under, row.color);
     }
 
     // Inline rename?
@@ -3492,7 +3534,7 @@ mod tests {
         assert!(!ticks(&[exited]));
     }
 
-    /// A row in `claude` state, started, live, in no background shell.
+    /// A row in `claude` state, started, live, no subagents, no command.
     fn row(claude: ClaudeState) -> RowData {
         RowData {
             id: TabId(1),
@@ -3505,7 +3547,8 @@ mod tests {
             resumes_claude: false,
             color: Color32::RED,
             claude,
-            background: false,
+            agents: false,
+            command: false,
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
             failed: false,
@@ -3522,7 +3565,7 @@ mod tests {
         assert_eq!(Mark::of(&row(ClaudeState::DoneUnseen)), Mark::Tick);
         assert_eq!(Mark::of(&row(ClaudeState::Idle)), Mark::Idle);
         let humming = RowData {
-            background: true,
+            agents: true,
             ..row(ClaudeState::Idle)
         };
         assert_eq!(Mark::of(&humming), Mark::Wave);
@@ -3553,7 +3596,7 @@ mod tests {
             tab.state = state;
             tab.agents = agents;
             Mark::of(&RowData {
-                background: tab.working_in_background(),
+                agents: tab.agents,
                 ..row(state)
             })
         };
@@ -3566,15 +3609,56 @@ mod tests {
         // they end, the tick (giverny#381).
         assert_eq!(mark(ClaudeState::DoneUnseen, true), Mark::Wave);
         assert_eq!(mark(ClaudeState::DoneUnseen, false), Mark::Tick);
-        // A background shell (giverny#352) holds the tick back the same.
+        // A command it runs — a background shell (giverny#352), a Bash
+        // call — is no wave: the mark is what the agent is, the square
+        // under it says the command runs (giverny#510).
         let shell = |state| {
-            Mark::of(&RowData {
-                background: true,
+            let row = RowData {
+                command: true,
                 ..row(state)
-            })
+            };
+            (Mark::of(&row), runs_command(&row))
         };
-        assert_eq!(shell(ClaudeState::DoneUnseen), Mark::Wave);
-        assert_eq!(shell(ClaudeState::Idle), Mark::Wave);
+        assert_eq!(shell(ClaudeState::DoneUnseen), (Mark::Tick, true));
+        assert_eq!(shell(ClaudeState::Idle), (Mark::Idle, true));
+        assert_eq!(shell(ClaudeState::Busy), (Mark::Busy, true));
+    }
+
+    /// The square under the mark is a live Claude tab's alone
+    /// (giverny#510): with subagents too it rides under their wave; a plain
+    /// shell's command is its own mark, and a tab not started or exited
+    /// runs nothing.
+    #[test]
+    fn a_command_the_agent_runs_is_the_square_under_its_mark() {
+        let both = RowData {
+            agents: true,
+            command: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert_eq!((Mark::of(&both), runs_command(&both)), (Mark::Wave, true));
+        let quiet = row(ClaudeState::Idle);
+        assert!(!runs_command(&quiet), "nothing runs: no square");
+        let shell = RowData {
+            command: true,
+            running: true,
+            ..row(ClaudeState::None)
+        };
+        assert_eq!(
+            (Mark::of(&shell), runs_command(&shell)),
+            (Mark::Running, false)
+        );
+        let pending = RowData {
+            command: true,
+            started: false,
+            ..row(ClaudeState::Idle)
+        };
+        assert!(!runs_command(&pending));
+        let exited = RowData {
+            command: true,
+            exited: true,
+            ..row(ClaudeState::Idle)
+        };
+        assert!(!runs_command(&exited));
     }
 
     /// A turn that ended unseen keeps its tick as a badge beside what runs
@@ -3589,13 +3673,13 @@ mod tests {
         };
         // Its workers still running: the wave, the tick beside it.
         let humming = RowData {
-            background: true,
+            agents: true,
             ..row(ClaudeState::DoneUnseen)
         };
         assert_eq!(marked(humming), (Mark::Wave, true));
         // Seen, the wave alone.
         let seen = RowData {
-            background: true,
+            agents: true,
             ..row(ClaudeState::Idle)
         };
         assert_eq!(marked(seen), (Mark::Wave, false));
@@ -3960,15 +4044,23 @@ mod tests {
     }
 
     /// A header counts a tab showing the wave as working, so its breathing
-    /// dot and count stay while only the tab's subagents or background shell
-    /// run (giverny#383), and a plain shell running a command (giverny#462);
+    /// dot and count stay while only the tab's subagents run (giverny#383),
+    /// one whose agent runs a command, the square under its mark
+    /// (giverny#510), and a plain shell running a command (giverny#462);
     /// the tick, the idle dot and a shell at its prompt are not working.
     #[test]
     fn a_header_counts_a_waving_tab_as_working() {
         let humming = |state| RowData {
-            background: true,
+            agents: true,
             ..row(state)
         };
+        let commanding = |state| RowData {
+            command: true,
+            ..row(state)
+        };
+        // A background shell left running, seen or not (giverny#510).
+        assert_eq!(tallies(&[commanding(ClaudeState::Idle)]), (1, 1, 0));
+        assert_eq!(tallies(&[commanding(ClaudeState::DoneUnseen)]), (1, 1, 0));
         assert_eq!(tallies(&[humming(ClaudeState::Idle)]), (1, 1, 0));
         // Unseen with its work still running is the wave too (giverny#381).
         assert_eq!(tallies(&[humming(ClaudeState::DoneUnseen)]), (1, 1, 0));
