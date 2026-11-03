@@ -46,6 +46,9 @@ pub struct ManagementPanelConfig {
     pub columns: PaneColumns,
     /// What a task gets when nothing says otherwise.
     pub lease: DefaultLease,
+    /// The worker page's prompt box: a line typed there goes to the tab's
+    /// manager. Off, the box is read-only.
+    pub prompt_box: bool,
 }
 
 impl Default for ManagementPanelConfig {
@@ -57,6 +60,7 @@ impl Default for ManagementPanelConfig {
             done_last: 5,
             columns: PaneColumns::default(),
             lease: DefaultLease::default(),
+            prompt_box: true,
         }
     }
 }

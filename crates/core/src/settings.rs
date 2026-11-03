@@ -702,6 +702,20 @@ pub const SETTINGS: &[SettingDef] = &[
         needs_restart: false,
         kind: Kind::Bool { default: false },
     },
+    SettingDef {
+        key: "management_panel.prompt_box",
+        label: "worker page prompt box",
+        section: Section::ManagementPanel,
+        doc: "A line typed in a worker page's prompt box goes to the tab's manager, which passes it on.",
+        note: &[
+            "The line is pasted at the prompt of the tab's own Claude Code,",
+            "naming the worker, and submitted. It is not sent while Claude",
+            "Code waits on a permission, a question or a plan approval. Off,",
+            "the box is read-only.",
+        ],
+        needs_restart: false,
+        kind: Kind::Bool { default: true },
+    },
     // The columns, in the order the management panel draws them: Settings shows
     // their switches in this order, and the pane's test
     // `the_settings_list_the_columns_in_the_panes_order` keeps the two in step.

@@ -152,9 +152,8 @@ struct View {
     /// debug `drag` command aims at.
     rows_at: Vec<egui::Rect>,
     cell_w: f32,
-    /// The rows' clicks as drawn last frame: what a line sent from a Next
-    /// up row's page watches for its worker (`row_keyed`), and what the
-    /// debug `hover` command finds a row by.
+    /// The rows' clicks as drawn last frame: what the debug `hover` command
+    /// finds a row by.
     clicks: Vec<RowClick>,
     /// The pointer over the rows last frame: `Some(None)` on the pane but
     /// not on a worker's row, `Some(Some(row))` on that row.
@@ -476,12 +475,6 @@ impl Views {
     /// `Some(Some(row))` on a row.
     pub fn take_hover(&mut self, tab: TabId) -> Option<Option<RowClick>> {
         self.tabs.get_mut(&tab)?.hover.take()
-    }
-
-    /// The row of `tab`'s pane with feed key `key`, as drawn last frame.
-    pub fn row_keyed(&self, tab: TabId, key: &str) -> Option<&RowClick> {
-        let v = self.tabs.get(&tab)?;
-        v.clicks.iter().find(|c| !key.is_empty() && c.key == key)
     }
 
     /// Debug builds: the row of `tab`'s pane that `pick` names (its feed

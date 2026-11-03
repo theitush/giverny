@@ -24,7 +24,10 @@
 //! A tool call's `●` is green once its result is back, red when the result
 //! is an error, grey while it runs ([`settle`]). Thinking, attachments and
 //! bookkeeping lines are left out, and so is the reply to a worker's
-//! `SubagentHandback`: its report is shown as what the worker said.
+//! `SubagentHandback`: its report is shown as what the worker said. A line
+//! sent to the worker after its prompt is drawn as a prompt, in whichever
+//! shape it landed ([`Render::line`]). One still on its way is the page's to
+//! draw, in the same shape and dimmed ([`echo_rows`]).
 //!
 //! Two views use it: the worker page a row of the management panel opens, which
 //! keeps a prompt whole, and `giverny transcript [--follow]`, which folds it
@@ -50,6 +53,22 @@ use serde_json::Value;
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+
+/// What Claude Code wraps a line in when it lands in a worker's turn as a
+/// `user` record: its parent's (`SendMessage`), then one typed in the
+/// worker's own view (Claude Code 2.1.317).
+const SENT_WRAPPERS: [(&str, &str); 2] = [
+    (
+        "The coordinator sent a message while you were working:\n",
+        "\n\nAddress this before completing your current task.",
+    ),
+    (
+        "The user sent a new message while you were working:\n",
+        "\n\nThis is how Claude Code surfaces messages the user sends mid-turn \u{2014} within \
+         the running turn, often alongside the next tool result, rather than as a separate \
+         conversation turn. Address the message above as you continue this turn.",
+    ),
+];
 
 /// Lines of a tool result shown before it is folded: Claude Code's three.
 const RESULT_LINES: usize = 3;
@@ -135,6 +154,8 @@ pub enum Tone {
     Error,
     /// A prompt's text: drawn on the prompt band.
     Prompt,
+    /// A line sent and not yet in the transcript: a prompt, dimmed.
+    Echo,
     /// The `●` before what the worker said.
     Said,
     /// The `●` before a tool call.
@@ -182,9 +203,10 @@ impl Row {
         self.spans.iter().map(|s| s.text.as_str()).collect()
     }
 
-    /// Whether the row is part of a prompt, drawn on its band.
-    pub fn is_prompt(&self) -> bool {
-        self.spans.first().is_some_and(|s| s.tone == Tone::Prompt)
+    /// The row's tone when it is part of a prompt, drawn on its band.
+    pub fn band(&self) -> Option<Tone> {
+        let tone = self.spans.first()?.tone;
+        matches!(tone, Tone::Prompt | Tone::Echo).then_some(tone)
     }
 
     /// The row as a terminal line, its clock (if it has one) after it.
@@ -211,6 +233,7 @@ fn ansi(tone: Tone) -> &'static str {
         Tone::Dim | Tone::Bullet(Call::Running) => DIM,
         Tone::Error | Tone::Bullet(Call::Failed) => "\x1b[38;2;255;107;128m",
         Tone::Prompt => "\x1b[48;2;55;55;55m",
+        Tone::Echo => "\x1b[2m\x1b[48;2;55;55;55m",
         Tone::Bullet(Call::Done) => "\x1b[38;2;78;186;101m",
     }
 }
@@ -511,6 +534,16 @@ pub fn prompt_rows(text: &str, keep: Option<usize>) -> Vec<Row> {
     out
 }
 
+/// `text` as [`prompt_rows`] draws it, dimmed: a line sent to the worker that
+/// has not reached its transcript yet.
+pub fn echo_rows(text: &str) -> Vec<Row> {
+    let mut rows = prompt_rows(text, None);
+    for s in rows.iter_mut().flat_map(|r| r.spans.iter_mut()) {
+        s.tone = Tone::Echo;
+    }
+    rows
+}
+
 /// One line of a reply, its `` `code` `` and `**bold**` picked out.
 fn inline(line: &str) -> Vec<Span> {
     let mut out = Vec::new();
@@ -634,6 +667,7 @@ fn result_rows(text: &str, keep: usize, error: bool) -> Vec<Row> {
 pub struct Render {
     fold: Fold,
     hidden: HashSet<String>,
+    sent_lines: usize,
 }
 
 impl Render {
@@ -641,7 +675,13 @@ impl Render {
         Render {
             fold,
             hidden: HashSet::new(),
+            sent_lines: 0,
         }
+    }
+
+    /// How many lines someone sent the worker it has rendered so far.
+    pub fn sent_lines(&self) -> usize {
+        self.sent_lines
     }
 
     /// Render one JSONL line as rows. Unknown or uninteresting lines
@@ -700,11 +740,16 @@ impl Render {
                 }
             }
             Some("user") => match v.pointer("/message/content") {
+                // A meta record is Claude Code talking to the worker, and
+                // is left out, unless it carries a line someone sent: how a
+                // message reaches a worker that `SendMessage` wakes.
                 Some(Value::String(s)) => {
-                    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
-                        return out;
+                    if v.get("isMeta").and_then(Value::as_bool) != Some(true) {
+                        entry(prompt_rows(s, self.fold.prompt_lines), &mut out);
+                    } else if sent(&v) {
+                        self.sent_lines += 1;
+                        entry(prompt_rows(unwrapped(s), self.fold.prompt_lines), &mut out);
                     }
-                    entry(prompt_rows(s, self.fold.prompt_lines), &mut out);
                 }
                 Some(Value::Array(parts)) => {
                     let summary = v.get("toolUseResult").and_then(file_summary);
@@ -735,17 +780,18 @@ impl Render {
                 }
                 _ => {}
             },
-            // A message typed to a running worker in its own view (the view
-            // Open in Claude Code puts the tab on) is not a `user`
-            // line: it lands as a queued command attachment, origin human, when
-            // the worker takes it.
+            // A message to a running worker is not a `user` line: it lands as
+            // a queued command attachment when the worker takes it, origin
+            // human when typed in its own view (the view Open in Claude Code
+            // puts the tab on), coordinator when its parent sent it
+            // (`SendMessage`).
             Some("attachment") => {
                 let att = v.get("attachment").unwrap_or(&Value::Null);
-                let human = att.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
                 if att.get("type").and_then(Value::as_str) == Some("queued_command")
-                    && human
+                    && sent(att)
                     && let Some(text) = att.get("prompt").and_then(Value::as_str)
                 {
+                    self.sent_lines += 1;
                     entry(prompt_rows(text, self.fold.prompt_lines), &mut out);
                 }
             }
@@ -753,6 +799,24 @@ impl Render {
         }
         out
     }
+}
+
+/// A record whose origin says a person typed it or the worker's parent sent
+/// it.
+fn sent(record: &Value) -> bool {
+    matches!(
+        record.pointer("/origin/kind").and_then(Value::as_str),
+        Some("human" | "coordinator")
+    )
+}
+
+/// The line inside Claude Code's wrapper. Text in no wrapper it is known to
+/// use is returned whole, so a change of its words loses nothing.
+fn unwrapped(text: &str) -> &str {
+    SENT_WRAPPERS
+        .iter()
+        .find_map(|(head, tail)| text.strip_prefix(head)?.strip_suffix(tail))
+        .unwrap_or(text)
 }
 
 /// Render one JSONL line on its own (no memory of the lines before it).
@@ -973,6 +1037,115 @@ mod tests {
                 "  Ran seq 1 40.",
             ]
         );
+    }
+
+    /// A line passed on by the worker's parent (`SendMessage`) while the
+    /// worker runs lands as a queued command, as one typed in its view does
+    /// (Claude Code 2.1.317). Other queued commands stay out.
+    #[test]
+    fn a_message_queued_for_a_running_worker_is_its_prompt() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Sleep, then report."}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"PING-ONE","origin":{"kind":"coordinator"},"isMeta":true}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"typed in its view","origin":{"kind":"human"}}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"a task notification","origin":{"kind":"task-notification"}}}"#,
+        ];
+        assert_eq!(
+            view(&lines),
+            vec![
+                "❯ Sleep, then report.",
+                "",
+                "❯ PING-ONE",
+                "",
+                "❯ typed in its view",
+            ]
+        );
+    }
+
+    /// A worker `SendMessage` wakes after its turn ended gets the line as a
+    /// meta `user` record instead, in Claude Code's words (Claude Code
+    /// 2.1.317). The page shows the line alone, and every other meta record
+    /// stays out.
+    #[test]
+    fn a_message_that_wakes_a_finished_worker_is_its_prompt() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Count, then report."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\ntestingggggggggggggg\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\nfirst\n\nsecond\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"human"},"message":{"role":"user","content":"The user sent a new message while you were working:\ntyped in its view\n\nThis is how Claude Code surfaces messages the user sends mid-turn \u2014 within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn."}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>\nx\n</system-reminder>"}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"task-notification"},"message":{"role":"user","content":"[SYSTEM NOTIFICATION - NOT USER INPUT] a task ended"}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"peer"},"message":{"role":"user","content":"Another Claude session sent a message"}}"#,
+        ];
+        assert_eq!(
+            view(&lines),
+            vec![
+                "❯ Count, then report.",
+                "",
+                "❯ testingggggggggggggg",
+                "",
+                "❯ first",
+                "  ",
+                "  second",
+                "",
+                "❯ typed in its view",
+            ]
+        );
+    }
+
+    /// Both shapes count; a worker's first prompt and other records don't.
+    #[test]
+    fn it_counts_the_lines_sent_to_a_worker() {
+        let mut r = Render::new(Fold::OVERLAY);
+        for l in [
+            r#"{"type":"user","message":{"role":"user","content":"Count, then report."}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"a task notification","origin":{"kind":"task-notification"}}}"#,
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"peer"},"message":{"role":"user","content":"Another Claude session sent a message"}}"#,
+        ] {
+            r.line(l);
+        }
+        assert_eq!(r.sent_lines(), 0);
+        r.line(
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"PING","origin":{"kind":"coordinator"}}}"#,
+        );
+        r.line(
+            r#"{"type":"user","isMeta":true,"origin":{"kind":"human"},"message":{"role":"user","content":"hello"}}"#,
+        );
+        assert_eq!(r.sent_lines(), 2);
+    }
+
+    /// The shape of the prompt it stands in for, in its own tone, so the real
+    /// row takes its place with nothing moving.
+    #[test]
+    fn an_echo_is_a_prompt_dimmed() {
+        let echo = echo_rows("first\n\nsecond");
+        let prompt = prompt_rows("first\n\nsecond", None);
+        assert_eq!(
+            echo.iter().map(Row::plain).collect::<Vec<_>>(),
+            prompt.iter().map(Row::plain).collect::<Vec<_>>()
+        );
+        assert!(echo[0].starts);
+        assert!(echo.iter().all(|r| r.band() == Some(Tone::Echo)));
+        assert!(prompt.iter().all(|r| r.band() == Some(Tone::Prompt)));
+        let on = Style { color: true };
+        assert!(
+            echo[0]
+                .to_ansi(on)
+                .starts_with("\x1b[2m\x1b[48;2;55;55;55m")
+        );
+    }
+
+    /// Words Claude Code may change to: the line is shown with them rather
+    /// than lost.
+    #[test]
+    fn a_sent_line_in_an_unknown_wrapper_is_shown_whole() {
+        for text in [
+            "The coordinator now says:\nhello",
+            "The coordinator sent a message while you were working:\nhello",
+            "hello\n\nAddress this before completing your current task.",
+        ] {
+            assert_eq!(unwrapped(text), text);
+        }
     }
 
     #[test]

@@ -219,14 +219,15 @@ When you spawn one:
   is **asleep**, not ended: Claude Code wakes it when that shell ends, so
   there is nothing to wake or land; stop the shell only if the work should
   not go on.
-- **Lines the user typed in a worker's view.** In Giverny the user can open a
-  row and type in its prompt box. Claude Code keeps no view of a worker whose
-  turn ended, and a Next up task has no worker yet, so Giverny puts that line
-  at your prompt, in one of two shapes. The text after the colon is the
-  user's own words, typed by them. Act on it as you would on anything they
-  ask you directly:
+- **Lines the user typed in a worker's page.** In Giverny the user can open a
+  row and type in its prompt box. Claude Code has no way in to a subagent from
+  outside but your SendMessage, and a Next up task has no worker yet, so
+  Giverny puts that line at your prompt, in one of two shapes. The text after
+  the colon is the user's own words, typed by them, line breaks and all. Act
+  on it as you would on anything they ask you directly:
   - `Send this to <task>'s worker (agent <id>): <text>`: SendMessage that
-    agent the text as written, adding nothing. That wakes it. If its task
+    agent the text as written, adding nothing. A running worker takes it at
+    its next tool call; one whose turn ended is woken by it. If its task
     has landed, run `giverny-manage start <task> --agent <id>` first: it puts
     the row back in Running, and the time it sat landed is not counted. A
     task that is Running but finished needs no command. When the worker
@@ -237,8 +238,8 @@ When you spawn one:
     If its lane is not free, or it waits `--after` another task, tell the
     user and ask before you go ahead anyway.
 
-  Giverny takes the user's tab into the worker's view once it runs. Do not
-  tell them that, or re-type their line back to them.
+  The user stays on the worker's page, which shows their line and the
+  worker's reply as they land. Do not re-type their line back to them.
 - A task you decide not to do comes out of the plan: `giverny-manage drop <task>`.
   Like `land`, `drop` refuses it while anything of it still runs (section 4).
 - A worker that reports an OOM needs a bigger lease: `giverny-manage release

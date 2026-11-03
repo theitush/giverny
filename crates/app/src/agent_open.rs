@@ -27,20 +27,19 @@
 //!   Code draws a worker's own view (`giverny_claude::transcript`;
 //!   `giverny transcript` renders it the same way): a Running one live,
 //!   following it as it grows; a Done one opened at its end, on the final
-//!   report. Nothing is typed into Claude Code.
+//!   report, and followed from there: a line from its box can wake it.
 //! * While a tab shows a worker's view, Esc and the terminal's "back to
 //!   manager" button walk it back to the main view ([`Walk::home`]),
 //!   and the strip's own `main` row is not drawn
 //!   ([`row_marks`]).
 //! * Claude Code keeps no view of a worker whose turn ended (it leaves the
 //!   agent strip and `/tasks`, and its transcript is not a resumable
-//!   session): the one way back in is the parent's `SendMessage`. So the
-//!   page of such a worker (a finished, asleep or Done row's) has a prompt
-//!   box, and a line typed there goes to the manager's prompt as one plain
-//!   line naming the worker ([`Ask`], put there by [`Forward`]); the
-//!   manager passes it on. Nothing is typed but what the user typed: the
-//!   old **Revive**, which typed a canned line for them, is gone
-//!   (giverny#61, giverny#483).
+//!   session): the one way back in is the parent's `SendMessage`. So a
+//!   worker's page has a prompt box, and a line typed there goes to the
+//!   manager's prompt, naming the worker ([`Ask`], put there by
+//!   `send_line`); the manager passes it on. Nothing is typed but what the
+//!   user typed: the old **Revive**, which typed a canned line for them, is
+//!   gone (giverny#61, giverny#483).
 //! * **Planned** shows the row's brief on the same page, drawn as the
 //!   worker's prompt; without one, its task, title and note as that prompt,
 //!   and how a dispatcher adds a brief. Its box asks the manager to start
@@ -698,14 +697,6 @@ pub enum Stuck {
     /// Enter opened a view, but another worker's (its prompt's rule says
     /// which).
     WrongView(String),
-    /// The manager's prompt holds a draft of the user's: a line forwarded
-    /// to it is not typed into that (giverny#483).
-    Draft,
-    /// The forwarded line never showed in the manager's prompt.
-    NotTyped,
-    /// The forwarded line is in the manager's prompt, but Enter did not
-    /// send it.
-    NotSent,
 }
 
 impl Stuck {
@@ -740,16 +731,6 @@ impl Stuck {
                  what they are doing, and two looked alike. Press Esc to go back to the \
                  manager."
             ),
-            Stuck::Draft => "Not sent: the manager's prompt holds a draft of yours, and this \
-                             line would have been typed into it. Send or clear that draft, \
-                             then press Enter here again."
-                .to_string(),
-            Stuck::NotTyped => "Not sent: the line never showed in the manager's prompt. Look \
-                                at the manager's tab, then press Enter here again."
-                .to_string(),
-            Stuck::NotSent => "The line is in the manager's prompt, but Enter did not send it. \
-                               Go back to the manager and press Enter there."
-                .to_string(),
         }
     }
 }
@@ -1360,27 +1341,24 @@ impl Walk {
     }
 }
 
-// ----------------------------------------------------------- forward ----
+// --------------------------------------------------------------- ask ----
 
-/// What a line typed in a worker page's box asks the manager to do
-/// (giverny#483). Claude Code keeps no view of a worker whose turn ended,
-/// so there is nothing to type to it; the one way back in is its
-/// manager's `SendMessage`, and a Next up row's way in is its manager's
-/// start. So the line goes to the manager, said in the user's words.
+/// What a line typed in a worker page's box asks the tab's manager to do
+/// (giverny#483). Claude Code has no way in to a subagent from outside but
+/// its parent's `SendMessage`, and a Next up row has no worker yet, so the
+/// line goes to the manager, said in the user's words (`send_line`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ask {
-    /// Wake a worker whose turn ended (finished, asleep or landed) with
-    /// the user's line.
-    Revive { task: String, agent_id: String },
+    /// Pass the line on to a worker: a running one takes it at its next
+    /// tool call, one whose turn ended is woken with it.
+    Send { task: String, agent_id: String },
     /// Start a Next up task now, the user's line added to its brief.
     Start { task: String },
 }
 
 impl Ask {
-    /// The page's row's ask: a worker that ended its turn (a Running row's
-    /// finished or asleep one, or a Done row's) is woken, a Next up row is
-    /// started. `task` is the task's name as the page gives it. `None` for
-    /// a row with neither: a worker still mid-turn, a row with no worker.
+    /// The ask of the row a page shows; `task` is the task's name as the
+    /// page gives it. `None` for a row with no worker to send to.
     pub fn of(click: &RowClick, task: &str) -> Option<Ask> {
         let task = task.trim().to_string();
         match click.stage {
@@ -1390,180 +1368,41 @@ impl Ask {
                     .map_or(task, str::to_string);
                 (!key.is_empty()).then_some(Ask::Start { task: key })
             }
-            Stage::Running if !click.finished => None,
-            Stage::Running | Stage::Done => Some(Ask::Revive {
+            Stage::Running | Stage::Done => Some(Ask::Send {
                 task,
                 agent_id: agent_id(click)?.to_string(),
             }),
         }
     }
 
-    /// The line the manager is given: one plain line in which the only
-    /// words that are not the user's say whose they are and where they go.
+    /// The line the manager is given: the user's text after a few words
+    /// saying where it goes, as `docs/management-panel.md` spells them.
     pub fn line(&self, text: &str) -> String {
-        let text = one_line(text);
+        let text = text.trim();
         match self {
-            Ask::Revive { task, agent_id } if task.is_empty() => {
+            Ask::Send { task, agent_id } if task.is_empty() => {
                 format!("Send this to the worker (agent {agent_id}): {text}")
             }
-            Ask::Revive { task, agent_id } => {
+            Ask::Send { task, agent_id } => {
                 format!("Send this to {task}'s worker (agent {agent_id}): {text}")
             }
             Ask::Start { task } => format!("Start {task} now, adding this to its brief: {text}"),
         }
     }
 
-    /// The page's box's placeholder, drawn dim and never sent.
-    pub fn placeholder(&self) -> String {
+    /// The box's placeholder, drawn dim and never sent.
+    pub fn placeholder(&self) -> &'static str {
         match self {
-            Ask::Revive { .. } => "Message this worker — its manager passes it on".to_string(),
-            Ask::Start { .. } => "Start it now — its manager adds this to its brief".to_string(),
-        }
-    }
-}
-
-/// `text` as one line: a line break would submit the manager's prompt
-/// half-way, so each run of whitespace is one space.
-pub fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// What a [`Forward`] wants done this frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Put {
-    /// Write this key to the manager's pty.
-    Key(Keystroke),
-    /// Write this key so many times, in one write ([`Tick::Repeat`]).
-    Keys(Keystroke, u8),
-    /// Write this text to the manager's pty, as typed.
-    Text(String),
-    Wait,
-    /// The line is submitted: Claude Code took it, or queued it behind the
-    /// manager's turn.
-    Done,
-    Stuck(Stuck),
-}
-
-/// The text of the prompt box on `screen`, every whitespace removed: a
-/// long line wraps in the box, and the wrap is not the line's.
-fn box_text(screen: &str, undimmed: &str) -> Option<String> {
-    let b = prompt_box(screen, undimmed)?;
-    let rows: Vec<&str> = undimmed.lines().collect();
-    let text: String = rows
-        .get(b.rows.clone())?
-        .iter()
-        .map(|r| r.trim_start().trim_start_matches(cc_keys::PROMPT))
-        .collect();
-    Some(text.chars().filter(|c| !c.is_whitespace()).collect())
-}
-
-/// How much of the line's start must show in the manager's prompt before
-/// Enter goes: enough to know the text landed there and nowhere else.
-const READ_BACK: usize = 24;
-
-/// How long a line typed at the manager's prompt sits there, read back,
-/// before its Enter goes: the 40 ms the line has always had, kept when the
-/// walk's own gap between keys went down (giverny#495).
-const TEXT_TO_ENTER: Duration = Duration::from_millis(40);
-
-/// Claude Code's stand-in for a long paste in its prompt box: the text is
-/// all there, drawn as `[Pasted text #1 +N lines]`.
-const PASTED: &str = "[Pastedtext";
-
-/// Puts one line at the manager's prompt and submits it (giverny#483), so
-/// a line typed in a worker page reaches the session that can act on it.
-/// It walks the tab back to the main view first if it is on a worker's
-/// ([`Walk::home`], which leaves the keyboard in the main prompt), types
-/// the line only into an empty prompt, reads it back off the screen, and
-/// then presses Enter. A draft of the user's in the manager's prompt is
-/// left alone: the line is refused ([`Stuck::Draft`]) rather than typed
-/// into it. A busy manager takes the line as Claude Code takes any typed
-/// while it works: queued for after its turn.
-#[derive(Debug, Clone)]
-pub struct Forward {
-    pub line: String,
-    phase: Step,
-    since: Instant,
-}
-
-#[derive(Debug, Clone)]
-enum Step {
-    Home(Box<Walk>),
-    Type,
-    /// The text went: waiting to see it in the prompt.
-    Typed,
-    /// Enter went: waiting for the prompt to empty.
-    Entered,
-}
-
-impl Forward {
-    pub fn new(line: impl Into<String>, now: Instant) -> Forward {
-        Forward {
-            line: line.into(),
-            phase: Step::Home(Box::new(Walk::home(now))),
-            since: now,
+            Ask::Send { .. } => "Message this worker. Its manager passes it on.",
+            Ask::Start { .. } => "Start this task now. Its manager adds this to its brief.",
         }
     }
 
-    fn go(&mut self, phase: Step, now: Instant) {
-        self.phase = phase;
-        self.since = now;
-    }
-
-    /// One frame.
-    pub fn tick(&mut self, now: Instant, look: Look) -> Put {
-        let waited = now.duration_since(self.since);
-        match &mut self.phase {
-            Step::Home(walk) => match walk.tick(now, look) {
-                Tick::Send(k) => Put::Key(k),
-                Tick::Repeat(k, n) => Put::Keys(k, n),
-                Tick::Wait => Put::Wait,
-                Tick::Done => {
-                    self.go(Step::Type, now);
-                    self.tick(now, look)
-                }
-                Tick::Stuck(why) => Put::Stuck(why),
-            },
-            Step::Type => match read_view(look.screen, look.undimmed) {
-                View::Prompt { draft: true } => Put::Stuck(Stuck::Draft),
-                View::Prompt { draft: false } if !viewing_worker(look.screen) => {
-                    self.go(Step::Typed, now);
-                    Put::Text(self.line.clone())
-                }
-                _ => Put::Stuck(Stuck::NoPrompt),
-            },
-            Step::Typed => {
-                let want: String = self
-                    .line
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .take(READ_BACK)
-                    .collect();
-                let shown = box_text(look.screen, look.undimmed)
-                    .is_some_and(|t| t.contains(&want) || t.contains(PASTED));
-                if shown && waited >= TEXT_TO_ENTER {
-                    self.go(Step::Entered, now);
-                    return Put::Key(Keystroke::Enter);
-                }
-                if waited >= STEP_WAIT {
-                    Put::Stuck(Stuck::NotTyped)
-                } else {
-                    Put::Wait
-                }
-            }
-            Step::Entered => {
-                let empty = matches!(
-                    read_view(look.screen, look.undimmed),
-                    View::Prompt { draft: false }
-                );
-                if empty {
-                    Put::Done
-                } else if waited >= STEP_WAIT {
-                    Put::Stuck(Stuck::NotSent)
-                } else {
-                    Put::Wait
-                }
-            }
+    /// What the box says once the manager has the line.
+    pub fn sent(&self) -> &'static str {
+        match self {
+            Ask::Send { .. } => "Sent to the manager, to pass on to this worker.",
+            Ask::Start { .. } => "Sent to the manager, to start this task with it.",
         }
     }
 }
@@ -2024,4 +1863,85 @@ mod tests {
     // the strip and back-to-main work (main view, a worker's view, the strip focused or
     // not, the shells pill focused, the management panel's relay hiding rows)
     // and answers keys the way that one did.
+
+    // ------------------------------------------------------- ask ----
+
+    fn ask_click(stage: Stage, key: &str, agent: Option<&str>) -> RowClick {
+        RowClick {
+            stage,
+            key: key.into(),
+            agent_id: agent.map(str::to_string),
+            finished: false,
+            asleep: false,
+            name: "fix the build".into(),
+            transcript: None,
+            open: None,
+            brief: None,
+            note: None,
+            review: None,
+            facts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_row_with_a_worker_takes_a_line() {
+        for stage in [Stage::Running, Stage::Done] {
+            let ask = Ask::of(&ask_click(stage, "acme#1", Some("a1b2")), "acme#1").unwrap();
+            assert_eq!(
+                ask.line("  go on\nwith the tests "),
+                "Send this to acme#1's worker (agent a1b2): go on\nwith the tests"
+            );
+        }
+        let mut finished = ask_click(Stage::Running, "", Some("a1b2"));
+        finished.finished = true;
+        assert_eq!(
+            Ask::of(&finished, "").unwrap().line("hi"),
+            "Send this to the worker (agent a1b2): hi"
+        );
+        assert_eq!(
+            Ask::of(&ask_click(Stage::Running, "acme#1", None), "acme#1"),
+            None
+        );
+        assert_eq!(Ask::of(&ask_click(Stage::Done, "", Some("")), "x"), None);
+    }
+
+    #[test]
+    fn a_next_up_row_is_started() {
+        let ask = Ask::of(&ask_click(Stage::Planned, "acme#2", None), "acme#2 · title").unwrap();
+        assert_eq!(
+            ask.line("use the old API"),
+            "Start acme#2 now, adding this to its brief: use the old API"
+        );
+        let ask = Ask::of(&ask_click(Stage::Planned, "", None), "a task").unwrap();
+        assert_eq!(
+            ask,
+            Ask::Start {
+                task: "a task".into()
+            }
+        );
+        assert_eq!(Ask::of(&ask_click(Stage::Planned, "", None), " "), None);
+    }
+
+    #[test]
+    fn a_rows_transcript_is_watched_whatever_its_stage() {
+        let path = PathBuf::from("/tmp/agent-a1b2.jsonl");
+        let mut finished = ask_click(Stage::Running, "acme#1", Some("a1b2"));
+        finished.finished = true;
+        for (mut row, live) in [
+            (ask_click(Stage::Running, "acme#1", Some("a1b2")), true),
+            (ask_click(Stage::Done, "acme#1", Some("a1b2")), false),
+            (finished, false),
+        ] {
+            row.transcript = Some(path.clone());
+            let Plan::Watch {
+                transcript,
+                live: l,
+                ..
+            } = plan(&row)
+            else {
+                panic!("a transcript is watched");
+            };
+            assert_eq!((transcript, l), (path.clone(), live));
+        }
+    }
 }
