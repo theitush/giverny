@@ -73,6 +73,11 @@ pub struct ClaudeTab {
     /// reached Giverny. Kept until a transcript read is sure to have it or
     /// sure not to. See [`ClaudeWatch::apply_found_prompts`].
     heard: Vec<Heard>,
+    /// The newest prompts `UserPromptSubmit` carried, whoever sent them, as
+    /// sent (at most [`SUBMITS_KEPT`]), and how many it has carried in all:
+    /// what a line the app put at the prompt is seen to arrive by.
+    submitted: Vec<String>,
+    submits: u64,
     last_hook: Option<Instant>,
     /// When `last_hook` was heard, by the wall clock (ms since the epoch):
     /// what a registry entry's `statusUpdatedAt` is told apart by, older
@@ -101,6 +106,9 @@ const SEAM: Duration = Duration::from_secs(1);
 
 /// How many of a session's prompts a tab keeps.
 pub const PROMPT_HISTORY: usize = 200;
+
+/// How many submitted prompts a tab keeps for [`ClaudeWatch::submits`].
+const SUBMITS_KEPT: usize = 8;
 
 /// Keep only the newest [`PROMPT_HISTORY`] prompts.
 fn cap_history(prompts: &mut Vec<String>) {
@@ -1234,6 +1242,12 @@ impl ClaudeWatch {
                     // A turn is running: what it leaves behind without an
                     // id, its `Stop` says.
                     entry.agents_unnamed = false;
+                }
+                if let Some(prompt) = msg.prompt() {
+                    entry.submitted.push(prompt.to_string());
+                    let over = entry.submitted.len().saturating_sub(SUBMITS_KEPT);
+                    entry.submitted.drain(..over);
+                    entry.submits += 1;
                 }
                 // A turn Claude Code starts to say a task ended.
                 for id in msg.prompt().map(hooks::ended_tasks).unwrap_or_default() {
@@ -2499,6 +2513,27 @@ impl ClaudeWatch {
         self.tabs.get(&tab).map(|t| t.state).unwrap_or_default()
     }
 
+    /// Giverny's hooks have reported on this tab's session.
+    pub fn hooked(&self, tab: TabId) -> bool {
+        self.tabs.get(&tab).is_some_and(|t| t.last_hook.is_some())
+    }
+
+    /// A compaction runs in this tab's session: `PreCompact` came, and the
+    /// `SessionStart` that ends it has not.
+    pub fn compacting(&self, tab: TabId) -> bool {
+        self.tabs
+            .get(&tab)
+            .is_some_and(|t| t.before_compact.is_some())
+    }
+
+    /// How many prompts `UserPromptSubmit` has carried in this tab, and the
+    /// newest of them, oldest first.
+    pub fn submits(&self, tab: TabId) -> (u64, &[String]) {
+        self.tabs
+            .get(&tab)
+            .map_or((0, &[][..]), |t| (t.submits, &t.submitted[..]))
+    }
+
     /// Whether this tab's last turn ended on an API error (giverny#488).
     pub fn turn_failed(&self, tab: TabId) -> bool {
         self.tabs.get(&tab).is_some_and(|t| t.failed)
@@ -2695,6 +2730,62 @@ mod tests {
         let mut fx = WatchEffects::default();
         w.handle_msg(m, active, "tab", &mut fx);
         fx
+    }
+
+    /// What a worker page's line is confirmed by: every prompt the hook
+    /// carries, counted, whoever sent it, and whether a compaction holds the
+    /// prompt.
+    #[test]
+    fn submits_are_counted_and_a_compaction_is_known() {
+        let mut w = ClaudeWatch::for_tests();
+        assert!(!w.hooked(TAB));
+        assert_eq!(w.submits(TAB), (0, &[][..]));
+        feed(&mut w, &hook("SessionStart", ""), Some(TAB));
+        assert!(w.hooked(TAB));
+        feed(
+            &mut w,
+            &hook("UserPromptSubmit", r#","prompt":"one\ntwo""#),
+            Some(TAB),
+        );
+        feed(
+            &mut w,
+            &hook(
+                "UserPromptSubmit",
+                r#","prompt":"<task-notification>x</task-notification>""#,
+            ),
+            Some(TAB),
+        );
+        let (n, recent) = w.submits(TAB);
+        assert_eq!(n, 2);
+        assert_eq!(
+            recent,
+            ["one\ntwo", "<task-notification>x</task-notification>"]
+        );
+        for i in 0..20 {
+            feed(
+                &mut w,
+                &hook("UserPromptSubmit", &format!(r#","prompt":"p{i}""#)),
+                Some(TAB),
+            );
+        }
+        let (n, recent) = w.submits(TAB);
+        assert_eq!(n, 22);
+        assert_eq!(recent.len(), SUBMITS_KEPT);
+        assert_eq!(recent.last().map(String::as_str), Some("p19"));
+
+        assert!(!w.compacting(TAB));
+        feed(
+            &mut w,
+            &hook("PreCompact", r#","trigger":"manual""#),
+            Some(TAB),
+        );
+        assert!(w.compacting(TAB));
+        feed(
+            &mut w,
+            &hook("SessionStart", r#","source":"compact""#),
+            Some(TAB),
+        );
+        assert!(!w.compacting(TAB));
     }
 
     /// A `/compact` is work the rail shows, and once it is done the tab is

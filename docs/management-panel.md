@@ -327,19 +327,36 @@ Durations everywhere in the pane are written the way the ETA column writes them:
 
 ## What a click on a row opens
 
-A click on a **Running** row whose worker is mid-turn opens Claude Code's own view of that worker in the tab. Every other row opens Giverny's **worker page** in the same place (giverny#477): a worker whose turn has ended (finished, or asleep on a background shell of its own), a **Done** row and a **Next up** row. Claude Code keeps no view of those, so Giverny draws one as Claude Code would, and it takes the tab the way the running view does:
+A click on a **Running** row whose worker is mid-turn opens Claude Code's own view of that worker in the tab. Every other row opens Giverny's **worker page** in the same place (giverny#477): a worker whose turn has ended (finished, or asleep on a background shell of its own), a **Done** row and a **Next up** row, and a Running row's worker when the walk to its view cannot start. Claude Code keeps no view of those, so Giverny draws one as Claude Code would, and it takes the tab the way the running view does:
 
 - It fills the terminal's area, in the terminal's own grid, font, colours and worker background, with the worker's prompt on its grey band and each entry under it.
-- Claude Code's prompt box follows, its rules in the worker's colour and the task's name on the top one. No key reaches the shell under the page.
-- **Typing in that box goes to the manager** (giverny#483). Claude Code cannot be typed to about such a worker, but its manager can wake it (`SendMessage`), or start a Next up task. On Enter, Giverny puts one plain line at the manager's prompt and submits it: `Send this to g477's worker (agent <id>): <text>` for a worker whose turn ended (finished, asleep, or Done), or `Start g483 now, adding this to its brief: <text>` for a Next up row. The text is only what the user typed; nothing else is ever sent, and nothing is sent without their Enter. The manage skill tells the manager what each line means and that it is the user's.
-  - The line is typed only into the manager's main prompt, and only when that prompt is empty. A tab on a worker's view is walked back to main first, and the line is read back off the screen before Enter goes. **A draft of the user's in the manager's prompt is never typed into**: the line is refused, put back in the page's box, and the page says why under it. A busy manager queues the line as Claude Code queues anything typed during its turn.
-  - Once the line is in, the page says so and waits. When the worker it named runs again (or, for a Next up row, the task's worker has started), the page gives way and the tab walks into that worker's own Claude Code view, as a click on a Running row does. It does so only while the page is still up in the tab in view; left, the wait ends, and the row is Running again by itself.
-  - A landed task is put back in Running by the manager's `giverny-manage start <task> --agent <its worker's id>`; the time it sat landed is left out of its working time. A Running row whose worker had finished is Running again as soon as the worker is, with no command.
-  - Esc clears a line in the box; on an empty box it goes back.
-- A page with nobody to send to (a note, a worker Claude Code still lists) keeps the box dimmed and `read-only`.
+- Claude Code's prompt box follows, its rules in the worker's colour and the task's name on the top one. A line typed there goes to the tab's manager (see **Lines from the worker page**). A page with nobody to send to (a note), or with `management_panel.prompt_box` off, keeps the box dimmed and `read-only`. Nothing typed on the page reaches the shell under it.
 - The same header sits over it as over a running worker's view: the task's name alone (`g477`, never the description after it), the row's facts and a Done row's Review line.
-- The same "back to manager" button sits under the prompt box. It, Esc, or a second click on the row goes back to the terminal.
-- The wheel, PgUp/PgDn and Home/End (with the box empty) scroll it, and a drag selects and copies. A worker still writing is followed as it grows, a Done one opens at its end, and a Next up row's brief, drawn as the worker's prompt, opens at its top.
+- The same "back to manager" button sits under the prompt box. It, Esc (on an empty box; on a line Esc clears it first), or a second click on the row goes back to the terminal.
+- A worker's page opens at the end of its transcript, on the worker's report once it has one, and follows the transcript as it grows. A **Done** one's does too: a line from the prompt box can wake the worker, and its reply lands there. A Next up row's brief, drawn as the worker's prompt, opens at its top.
+- The wheel, ↑/↓ and PgUp/PgDn scroll it, and a drag selects and copies. Space and Home/End scroll too while the box takes no line; while it does, they edit it (Home/End scroll with the box empty).
+
+### Lines from the worker page
+
+Claude Code has no way to type to a subagent from outside: the only way in is its parent's `SendMessage`. So a line typed in the worker page's prompt box goes to the tab's own Claude Code, the manager, as one plain line naming the worker, and the manager passes it on (giverny#483, giverny#520). The manage skill tells the manager what each line means and that it is the user's. These are the lines:
+
+- `Send this to <key>'s worker (agent <agent id>): <text>`, from a Running or Done row's page. A running worker takes the message at its next tool call; one whose turn has ended is woken with it. With no key, `Send this to the worker (agent <agent id>): <text>`.
+- `Start <key> now, adding this to its brief: <text>`, from a Next up row's page.
+
+`<text>` is what the person typed, line breaks kept (Shift+Enter makes one), and it goes only on their Enter. Nothing else is ever sent. The box is on by default wherever the pane is; `management_panel.prompt_box = false` makes it read-only.
+
+**On the page.** A line reaches the worker's transcript only after the manager's turn, seconds later or more, and the tab stays on the page throughout. So a line sent to a worker shows on its page at once, in a prompt's shape and dimmed, after the transcript's rows, with no words added. Each `coordinator` or `human` line that lands in the transcript takes the place of the oldest such line, first in, first out, within one look at the file (300 ms). The text is not compared, as the manager may change it. A line that ends "not sent" leaves the page and stays in the box; one "queued behind compaction" stays. A Next up row has no transcript, so its line shows nothing on the page. These lines belong to the page and go when it closes; the real line still shows once it lands. A line the manager never passes on stays dim until then.
+
+**How it is sent.** The line is pasted at the manager's prompt and submitted, so the manager reads it as the person's own typing, not as another session's message.
+
+- **When.** Only while the hooks say Claude Code runs in the tab and the tab's terminal has bracketed paste on. The session's `sessions/<pid>.json` is read at send time: while its `status` is `waiting` (a permission, a question or a plan approval is up), the Enter would answer it, so the box says "Not sent: the manager is waiting on a question in its tab" and keeps the text. With no hooks reporting on the session, it refuses too.
+- **Where.** A paste on a worker's own view would go to that worker, so a tab left on one by a click on a Running row is walked back to the manager first, as the "back to manager" button does; a walk under way finishes first. That walk reads the screen, and it is the only thing here that does. The send itself reads nothing off the screen. A draft of the user's in the manager's prompt is therefore not seen: the line joins it and they go as one prompt, and the box then says "not sent", since no prompt carried the line alone.
+- **What.** Control characters are stripped: ESC, the C0 controls but tab and line break, DEL and C1. A tab becomes four spaces. The text is split into bracketed pastes of at most 800 UTF-16 units and 2 line breaks each, all in one write, then Enter. Claude Code folds a longer paste into `[Pasted text #N]`, which reaches the model as pasted material rather than typing. A busy manager takes it as Claude Code takes anything typed during its turn.
+- **Confirm.** The line counts as delivered once a `UserPromptSubmit` from that session carries it (compared word for word, paste tags off). Until then the box says "sending…"; with none within five seconds it says "not sent" and keeps the text. While the session compacts (`PreCompact` seen, the compaction's `SessionStart` not yet), Claude Code holds the line until it ends, so the box says "queued behind compaction" and waits.
+
+A landed task is put back in Running by the manager's `giverny-manage start <task> --agent <its worker's id>`; the time it sat landed is left out of its working time. A Running row whose worker had finished is Running again as soon as the worker is, with no command.
+
+The box writes nothing into Claude Code's settings; it uses the hooks the relay already installs.
 
 ## The Review line
 

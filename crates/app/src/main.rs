@@ -17,6 +17,7 @@ mod overlays;
 mod paste_image;
 mod prompt_bar;
 mod rail;
+mod send_line;
 mod sessions_load;
 mod settings_ui;
 mod splash;
@@ -1042,8 +1043,8 @@ pub enum Action {
     /// shows: the tab's terminal again.
     ClosePage(TabId),
     /// A line typed in the prompt box of the worker page a tab shows, with
-    /// Enter: it goes to the tab's manager (giverny#483).
-    ForwardLine(TabId, String),
+    /// Enter: it goes to the tab's manager (giverny#483, `send_line`).
+    SendLine(TabId, String),
     /// Esc, or the terminal's "back to manager" button, in a tab
     /// showing a worker's view: walk its Claude Code back to the main view.
     BackToMain(TabId),
@@ -1428,14 +1429,12 @@ pub struct App {
     /// A Running management-panel row being attached: keys typed into its parent
     /// tab's Claude Code, one per frame, to open the worker's view.
     attach: Option<AttachJob>,
-    /// A line typed in a worker page's box, being put at its manager's
-    /// prompt (giverny#483).
-    forward: Option<ForwardJob>,
-    /// A line went to the manager from a worker page: what it asked for —
-    /// the worker running again, or the Next up task's worker started — is
-    /// waited for while the page stays up, and the tab then walked into
-    /// that worker's view.
-    awaiting: Option<Awaiting>,
+    /// A line from a worker page's box, written to its manager's prompt
+    /// and waited for (`send_line`).
+    sending: Option<send_line::Pending>,
+    /// A line from a worker page's box, held while its tab is walked home
+    /// from a worker's view, where a paste would go to that worker.
+    homing: Option<Homing>,
     /// Tabs whose relay is asked to leave Claude Code's agent strip drawn
     /// (`hooks::show_strip`), and when the ask was last written: the
     /// strip is the keyboard path into a worker's view, which the management
@@ -1546,20 +1545,14 @@ impl AttachJob {
     }
 }
 
-/// A line from a worker page's box on its way to the manager's prompt.
-struct ForwardJob {
+/// A line held until its tab is off a worker's view (`App::process_homing`).
+struct Homing {
     tab: TabId,
-    /// What was typed, put back in the box if it cannot be sent.
+    /// The page's row: the line goes only while that page is up.
+    row: Option<management_panel::RowClick>,
     text: String,
-    driver: agent_open::Forward,
-}
-
-/// What a line sent from a worker page waits for.
-struct Awaiting {
-    tab: TabId,
-    ask: agent_open::Ask,
-    /// The page's row.
-    row: management_panel::RowClick,
+    /// The walk home was started, not just waited for.
+    walked: bool,
 }
 
 /// A Running row's open started on the hover: which tab's
@@ -2209,8 +2202,8 @@ impl App {
             session_rect: None,
             worker_tabs: HashSet::new(),
             attach: None,
-            forward: None,
-            awaiting: None,
+            sending: None,
+            homing: None,
             strip_asks: HashMap::new(),
             hover: None,
             hover_watch: None,
@@ -2427,7 +2420,7 @@ impl App {
             }
             Action::AgentRowClicked(tab, click) => self.open_agent_row(ctx, tab, &click),
             Action::ClosePage(tab) => self.close_page(tab),
-            Action::ForwardLine(tab, text) => self.forward_line(ctx, tab, text),
+            Action::SendLine(tab, text) => self.send_line(ctx, tab, &text),
             Action::BackToMain(tab) => self.back_to_main(ctx, tab),
             Action::ToggleRepoCollapse(repo) => {
                 let folded = &mut self.layout.collapsed_repos;
@@ -5347,7 +5340,7 @@ impl App {
     /// * `type <text>` — the text, written to the active tab (`\r` in it: Enter);
     /// * `text <text>` — the text as the keyboard types it into the window:
     ///   into a worker page's box when one is up;
-    /// * `key <enter|up|down>` — that key press, as typed;
+    /// * `key <enter|shift-enter|up|down>` — that key press, as typed;
     /// * `dump <file>` — the active tab's screen text into the file;
     /// * `drag <row> <col> <row> <col>` — a pointer drag over the active
     ///   tab's management panel, cell to cell; the same cell twice
@@ -5511,16 +5504,21 @@ impl App {
                 "text" => feed(vec![egui::Event::Text(arg.to_string())]),
                 "key" => {
                     let key = match arg {
-                        "enter" => egui::Key::Enter,
+                        "enter" | "shift-enter" => egui::Key::Enter,
                         "up" => egui::Key::ArrowUp,
                         _ => egui::Key::ArrowDown,
+                    };
+                    let modifiers = if arg == "shift-enter" {
+                        egui::Modifiers::SHIFT
+                    } else {
+                        egui::Modifiers::NONE
                     };
                     let ev = |pressed| egui::Event::Key {
                         key,
                         physical_key: None,
                         pressed,
                         repeat: false,
-                        modifiers: egui::Modifiers::NONE,
+                        modifiers,
                     };
                     feed(vec![ev(true)]);
                     feed(vec![ev(false)]);
@@ -5787,193 +5785,221 @@ impl App {
         if self.ws.active != Some(parent) {
             self.apply(ctx, Action::Select(parent));
         }
-        // A worker whose turn ended, or a Next up row: what is typed in the
-        // page's box goes to the manager (giverny#483).
-        let ask = agent_open::Ask::of(click, &name);
+        // What is typed in the page's box goes to the tab's manager
+        // (giverny#483).
+        let ask =
+            agent_open::Ask::of(click, &name).filter(|_| self.cfg.management_panel.prompt_box);
         self.brief = Some(page.of_row(click.clone(), name).with_input(ask));
     }
 
-    /// A line typed in `tab`'s worker page goes to the tab's manager: put
-    /// at its Claude Code's prompt, as typed there, and submitted
-    /// (`agent_open::Forward`). Only the user's own line is ever sent.
-    fn forward_line(&mut self, ctx: &egui::Context, tab: TabId, text: String) {
+    /// What the app knows about `tab` when a line is to be pasted at its
+    /// manager's prompt.
+    fn send_facts(&self, tab: TabId) -> send_line::Facts {
+        let session = self
+            .claude
+            .tabs
+            .get(&tab)
+            .and_then(|c| c.session_id.as_deref());
+        // Read now: a permission or a question that came up a moment ago is
+        // in the registry before it is drawn, and long before its
+        // notification.
+        let registry = session.and_then(|sid| {
+            let dirs = self.claude.profiles.iter().map(|p| p.config_dir.clone());
+            giverny_claude::registry::scan(dirs)
+                .into_iter()
+                .find(|s| s.entry.session_id == sid)
+                .map(|s| s.entry.waiting())
+        });
+        let term = self.rt.get(&tab).and_then(|rt| rt.session.as_ref());
+        send_line::Facts {
+            hooked: self.claude.hooked(tab),
+            running: self.claude.state_of(tab) != claude_watch::ClaudeState::None,
+            registry,
+            bracketed: term.is_some_and(|t| t.bracketed_paste()),
+            in_flight: self.sending.is_some(),
+        }
+    }
+
+    /// `tab`'s Claude Code is on a worker's view, or on its way somewhere: a
+    /// paste now would not reach the manager's prompt. This fork's walks are
+    /// what can leave a tab so, and reading it is their code.
+    fn off_main(&self, tab: TabId) -> bool {
+        self.attach.as_ref().is_some_and(|j| j.tab == tab)
+            || self
+                .rt
+                .get(&tab)
+                .and_then(|rt| rt.session.as_ref())
+                .is_some_and(|t| agent_open::viewing_worker(&t.screen_text()))
+    }
+
+    /// The Enter in `tab`'s worker page: the line goes to the tab's manager,
+    /// pasted at its Claude Code's prompt and submitted, when nothing there
+    /// would take the Enter for something else (`send_line`). A tab on a
+    /// worker's view is walked home first.
+    fn send_line(&mut self, ctx: &egui::Context, tab: TabId, text: &str) {
         use worker_page::Sending;
-        let live = self.tab_is_live(tab);
-        let busy = self.forward.is_some();
+        let mut facts = self.send_facts(tab);
+        facts.in_flight |= self.homing.is_some();
+        let off_main = self.off_main(tab);
+        let Some(page) = self.brief.as_mut().filter(|p| p.tab == tab) else {
+            return;
+        };
+        if let Some(why) = send_line::refusal(&facts) {
+            tracing::info!("worker page: line not sent: {why}");
+            page.set_sending(Sending::Refused(why.to_string()));
+            return;
+        }
+        if off_main {
+            tracing::info!("worker page: line waits for tab {tab:?} to walk home");
+            page.set_sending(Sending::Going);
+            self.homing = Some(Homing {
+                tab,
+                row: page.row.clone(),
+                text: text.to_string(),
+                walked: false,
+            });
+            ctx.request_repaint();
+            return;
+        }
+        self.write_line(ctx, tab, text);
+    }
+
+    /// Paste the line at `tab`'s manager's prompt, once more checking the
+    /// gate: this may be a moment after the Enter.
+    fn write_line(&mut self, ctx: &egui::Context, tab: TabId, text: &str) {
+        use worker_page::Sending;
+        let facts = self.send_facts(tab);
+        let submits = self.claude.submits(tab).0;
+        let term = self.rt.get(&tab).and_then(|rt| rt.session.as_ref());
         let Some(page) = self.brief.as_mut().filter(|p| p.tab == tab) else {
             return;
         };
         let Some(ask) = page.ask().cloned() else {
             return;
         };
-        if busy || !live {
-            let why = if busy {
-                "Not sent: another line is still on its way to a manager. Press Enter again in                  a moment."
-            } else {
-                "Not sent: this tab's manager has no live terminal to type into."
-            };
-            page.set_sending(Sending::Refused(why.into()), Some(&text));
+        if let Some(why) = send_line::refusal(&facts) {
+            tracing::info!("worker page: line not sent: {why}");
+            page.set_sending(Sending::Refused(why.to_string()));
             return;
         }
-        let line = ask.line(&text);
-        tracing::info!("management panel: forwarding to the manager: {line}");
-        self.forward = Some(ForwardJob {
+        let Some(term) = term else {
+            return;
+        };
+        let line = ask.line(text);
+        tracing::info!("worker page: line sent to the manager in tab {tab:?}");
+        // The user's own words, typed by them in the page.
+        term.note_user_input();
+        term.write(send_line::encode(&line));
+        self.sending = Some(send_line::Pending::new(
             tab,
-            text,
-            driver: agent_open::Forward::new(line, Instant::now()),
-        });
+            page.row.clone(),
+            &line,
+            submits,
+            Instant::now(),
+        ));
+        page.echo(text);
+        page.set_sending(Sending::Going);
         ctx.request_repaint();
     }
 
-    /// One frame of a forward: read the manager's screen, maybe type into
-    /// it. A walk in that tab goes first.
-    fn process_forward(&mut self, ctx: &egui::Context) {
-        use agent_open::Put;
+    /// One frame of a line waiting for its tab to come home: the walk first,
+    /// and the paste once it is done. A line whose page has closed goes with
+    /// it, unsent. A walk that stops short replaces the page and says why.
+    fn process_homing(&mut self, ctx: &egui::Context) {
         use worker_page::Sending;
-        let Some(job) = &mut self.forward else {
+        let Some(job) = &self.homing else {
             return;
         };
-        if self.attach.as_ref().is_some_and(|a| a.tab == job.tab) {
+        let (tab, walked) = (job.tab, job.walked);
+        let up = self.brief.as_ref().is_some_and(|p| {
+            p.tab == tab
+                && match (&p.row, &job.row) {
+                    (Some(a), Some(b)) => a.same_row(b),
+                    (a, b) => a.is_none() && b.is_none(),
+                }
+        });
+        if !up {
+            self.homing = None;
+            return;
+        }
+        if self.attach.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
-        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
-        let put = match session {
-            Some(session) => {
-                let screen = session.screen_text();
-                let undimmed = session.screen_text_undimmed();
-                let look = agent_open::Look {
-                    screen: &screen,
-                    undimmed: &undimmed,
-                    cursor: session.cursor_row(),
-                };
-                job.driver.tick(Instant::now(), look)
+        if !self.off_main(tab) {
+            if let Some(job) = self.homing.take() {
+                self.write_line(ctx, tab, &job.text);
             }
-            None => Put::Stuck(agent_open::Stuck::NoPrompt),
-        };
-        let session = self.rt.get(&job.tab).and_then(|rt| rt.session.as_ref());
-        match put {
-            Put::Key(key) | Put::Keys(key, _) => {
-                let n = match put {
-                    Put::Keys(_, n) => n,
-                    _ => 1,
-                };
-                if let Some(session) = session {
-                    let mode = session.mode();
-                    let bytes = agent_open::keystroke_bytes(key, |k, m| {
-                        giverny_term::input::encode_key(k, m, mode)
-                    });
-                    session.write(bytes.repeat(usize::from(n)));
-                }
-            }
-            Put::Text(text) => {
-                if let Some(session) = session {
-                    // The user's own words, typed by them in the page.
-                    session.note_user_input();
-                    session.write(text.into_bytes());
-                }
-            }
-            Put::Wait => {}
-            Put::Done | Put::Stuck(_) => {
-                let job = self.forward.take().expect("checked above");
-                let page = self
-                    .brief
-                    .as_mut()
-                    .filter(|p| p.tab == job.tab && p.ask().is_some());
-                let (Some(page), done) = (page, put == Put::Done) else {
-                    return;
-                };
-                let ask = page.ask().cloned().expect("filtered");
-                if done {
-                    tracing::info!("management panel: the manager has the line");
-                    let what = match &ask {
-                        agent_open::Ask::Revive { .. } => {
-                            "Sent to the manager, to pass on to this worker. The tab goes to                              the worker's view once it runs again."
-                        }
-                        agent_open::Ask::Start { .. } => {
-                            "Sent to the manager, to start this task with it. The tab goes to                              the worker's view once it runs."
-                        }
-                    };
-                    page.set_sending(Sending::Sent(what.into()), None);
-                    if let Some(row) = page.row.clone() {
-                        self.awaiting = Some(Awaiting {
-                            tab: job.tab,
-                            ask,
-                            row,
-                        });
-                    }
-                } else if let Put::Stuck(why) = put {
-                    tracing::info!("management panel: forward stopped: {why:?}");
-                    let why = why.explain("main");
-                    page.set_sending(Sending::Refused(why), Some(&job.text));
-                }
-                ctx.request_repaint();
-                return;
-            }
+            return;
         }
-        ctx.request_repaint_after(Duration::from_millis(16));
+        if !walked {
+            self.back_to_main(ctx, tab);
+            if let Some(job) = &mut self.homing {
+                job.walked = true;
+            }
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+        self.homing = None;
+        if let Some(page) = self.brief.as_mut() {
+            tracing::info!("worker page: tab {tab:?} did not come home");
+            page.set_sending(Sending::Refused(
+                "Not sent: this tab's Claude Code is on a worker's view, and Giverny could not \
+                 walk it back to the manager."
+                    .to_string(),
+            ));
+        }
     }
 
-    /// One frame of a sent line's wait: once the worker it asked for runs
-    /// (woken, or the Next up task's started), the page gives way and the
-    /// tab walks into that worker's view, as a click on its Running row
-    /// would. Only while the page is still up, on the tab in view: a page
-    /// left, or another tab, is not walked away from under the user.
-    fn process_awaiting(&mut self, ctx: &egui::Context) {
-        let Some(a) = &self.awaiting else {
+    /// Whether the line in flight has reached its manager: its page says
+    /// so, if it is still up.
+    fn process_sending(&mut self, ctx: &egui::Context) {
+        use send_line::Step;
+        use worker_page::Sending;
+        let Some(pending) = self.sending.as_mut() else {
             return;
         };
-        let still = self
-            .brief
-            .as_ref()
-            .and_then(|p| p.row.as_ref().filter(|_| p.tab == a.tab))
-            .is_some_and(|r| r.same_row(&a.row));
-        if !still {
-            self.awaiting = None;
-            return;
-        }
-        ctx.request_repaint_after(Duration::from_millis(250));
-        if self.ws.active != Some(a.tab) || self.attach.is_some() || self.forward.is_some() {
-            return;
-        }
-        let tab = a.tab;
-        let row = match &a.ask {
-            agent_open::Ask::Revive { agent_id, .. } => {
-                let mut row = a.row.clone();
-                row.agent_id = Some(agent_id.clone());
-                Some(row)
+        let (count, recent) = self.claude.submits(pending.tab);
+        let new = usize::try_from(count.saturating_sub(pending.submits))
+            .unwrap_or(usize::MAX)
+            .min(recent.len());
+        let prompts = recent[recent.len() - new..].iter().map(String::as_str);
+        let compacting = self.claude.compacting(pending.tab);
+        let step = pending.step(Instant::now(), prompts, compacting);
+        let page = self.brief.as_mut().filter(|p| {
+            p.tab == pending.tab
+                && match (&p.row, &pending.row) {
+                    (Some(a), Some(b)) => a.same_row(b),
+                    (a, b) => a.is_none() && b.is_none(),
+                }
+        });
+        let state = match step {
+            Step::Sending => Sending::Going,
+            Step::Compacting => Sending::Compacting,
+            Step::Delivered => {
+                tracing::info!("worker page: the manager has the line");
+                let what = page.as_ref().and_then(|p| p.ask()).map(|a| a.sent());
+                Sending::Sent(what.unwrap_or("Sent to the manager.").to_string())
             }
-            agent_open::Ask::Start { task } => self
-                .agent_views
-                .row_keyed(tab, task)
-                .filter(|r| r.stage == giverny_claude::feed::Stage::Running && !r.finished)
-                .cloned(),
+            Step::NotSent => {
+                tracing::info!("worker page: no prompt carried the line");
+                Sending::Refused(
+                    "Not sent: the manager's Claude Code never said it got the line. Look at \
+                     its tab before sending it again."
+                        .to_string(),
+                )
+            }
         };
-        let Some(mut row) = row else {
-            return;
-        };
-        let Some(id) = row.agent_id.clone().filter(|i| !i.is_empty()) else {
-            return;
-        };
-        let running = self
-            .claude
-            .agents
-            .tracker(tab)
-            .and_then(|t| t.get(&id))
-            .is_some_and(|r| r.running());
-        if !running {
-            return;
+        if matches!(step, Step::Delivered | Step::NotSent) {
+            self.sending = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
-        tracing::info!("management panel: {id} runs again: into its view");
-        self.awaiting = None;
-        row.stage = giverny_claude::feed::Stage::Running;
-        row.finished = false;
-        row.asleep = false;
-        self.close_page(tab);
-        let title = agent_open::title_of(&row);
-        if !self.start_attach(ctx, tab, &title, &id, &row) {
-            let plan = agent_open::plan(&row);
-            self.carry_out_open(ctx, tab, plan, &row);
+        if let Some(page) = page {
+            if step == Step::NotSent {
+                page.drop_echo();
+            }
+            page.set_sending(state);
         }
     }
 
@@ -6233,8 +6259,8 @@ impl eframe::App for App {
         self.deliver_pasted_images();
         self.process_pending(&ctx);
         self.process_attach(&ctx);
-        self.process_forward(&ctx);
-        self.process_awaiting(&ctx);
+        self.process_homing(&ctx);
+        self.process_sending(&ctx);
         self.process_hover(&ctx);
         self.sync_strip_asks();
         #[cfg(debug_assertions)]

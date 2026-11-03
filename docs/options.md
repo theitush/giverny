@@ -40,6 +40,7 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `usage.refresh_minutes` | `10` | Ask Claude Code to refresh an account once its numbers are this old. 0 never asks. |
 | `management_panel.manage_skill` | `true` | Ship the /giverny:manage skill with the plugin the management panel installs. |
 | `management_panel.ask_names` | `false` | Give every Claude session in a Giverny tab a name at its start; the full name shows on its status line. |
+| `management_panel.prompt_box` | `true` | A line typed in a worker page's prompt box goes to the tab's manager, which passes it on. |
 | `management_panel.columns.stage` | `true` | STAGE: Running, Next up or Done. |
 | `management_panel.columns.id` | `true` | The task's id (a feed row's key, a subagent's name). |
 | `management_panel.columns.title` | `true` | The task's title, or a subagent's description: the column that takes the room left. |
