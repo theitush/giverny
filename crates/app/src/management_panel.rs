@@ -4142,6 +4142,111 @@ mod tests {
         assert_eq!(t.lines[2].now, "Review — ita");
     }
 
+    /// A task handed to a fresh worker (giverny#513): the first worker is a
+    /// Done row of its own, with its own time and tokens, and the task's row
+    /// counts only the worker on it now.
+    #[test]
+    fn a_replaced_worker_is_a_done_row_of_its_own() {
+        let snap = |first: &str| {
+            format!(
+                r#"{{"session_id":"s","tasks":[
+                  {{"id":"a1","status":"{first}","description":"Work acme#5",
+                    "startTime":1789998800000,"tokenCount":40000}},
+                  {{"id":"a2","status":"running","description":"Work acme#5 again",
+                    "startTime":1789999400000,"tokenCount":7000}}]}}"#
+            )
+        };
+        let mut t = Tracker::new(None);
+        t.apply_live(&LiveSnapshot::parse(&snap("running")), T0 - 700_000);
+        t.apply_live(&LiveSnapshot::parse(&snap("completed")), T0 - 600_000);
+        let rows = t.rows().to_vec();
+        // The row moved to the fresh worker (`start acme#5 --agent a2`).
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five","agent_id":"a2",
+               "started":1789998800000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let got: Vec<(&str, Stage, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.title.as_str(), l.stage, l.tokens.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("FEATURE: five", Stage::Running, "7k"),
+                ("Work acme#5", Stage::Done, "40k"),
+            ]
+        );
+        // Its own clock: spawned 20m before now, finished 10m before.
+        assert_eq!(t.lines[1].elapsed, "10:00");
+
+        // The row still names the first worker, which has finished, and the
+        // fresh one is found by its description (giverny#287): the same.
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five","agent_id":"a1",
+               "started":1789998800000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let got: Vec<(Stage, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.stage, l.tokens.as_str()))
+            .collect();
+        assert_eq!(got, [(Stage::Running, "7k"), (Stage::Done, "40k")]);
+    }
+
+    /// A worker killed with its session (giverny#489) that a tracker
+    /// restored over the restart still lists running, replaced by a fresh
+    /// one: a Done row of its own too, ended where it was last seen.
+    #[test]
+    fn a_killed_replaced_worker_is_a_done_row_of_its_own() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[
+              {"id":"a1","status":"running","description":"Work acme#5",
+               "startTime":1789998800000,"tokenCount":40000},
+              {"id":"a2","status":"running","description":"Work acme#5 again",
+               "startTime":1789999400000,"tokenCount":7000}]}"#,
+        );
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five","agent_id":"a2",
+               "started":1789998800000,"eta_s":3600,"went_off":1789999000000}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        let got: Vec<(Stage, &str)> = t
+            .lines
+            .iter()
+            .map(|l| (l.stage, l.tokens.as_str()))
+            .collect();
+        assert_eq!(got, [(Stage::Running, "7k"), (Stage::Done, "40k")]);
+    }
+
+    /// A running worker that names a task is that task's worker: never a
+    /// row of its own beside it.
+    #[test]
+    fn a_running_worker_naming_a_task_is_not_drawn_twice() {
+        let rows = live(
+            r#"{"session_id":"s","tasks":[
+              {"id":"a1","status":"running","description":"Work acme#5",
+               "startTime":1789999400000,"tokenCount":1000}]}"#,
+        );
+        let f = feed(
+            r#"{"version":1,"session":"s","rows":[
+              {"key":"acme#5","stage":"running","title":"FEATURE: five",
+               "started":1789999400000,"eta_s":3600}
+            ]}"#,
+        );
+        let t = build(Some(&f), &rows, T0);
+        assert_eq!(t.lines.len(), 1);
+        assert_eq!(t.lines[0].tokens, "1k");
+    }
+
     // ------------------------------------------- one worker, tasks in turn ----
 
     // ------------------------------------------------- resources ----

@@ -1135,8 +1135,10 @@ pub fn opens(has_agents: bool, manager: bool) -> bool {
 ///   a Running one at once.
 /// - A live row that no feed row carries, and whose description names no
 ///   feed key, is a row of its own, Running or Done by its own state, after
-///   the feed's rows of that stage. One that names a key is that row's
-///   worker and is never drawn twice.
+///   the feed's rows of that stage. A running one that names a key is that
+///   row's worker and is never drawn twice; a finished (or killed) one that
+///   names a key and no row carries is a worker replaced on that task, a
+///   Done row of its own (giverny#513).
 /// - Rows are grouped Running, Planned, Done; order within Running and
 ///   Planned is kept, Done is newest landed first (undated rows last).
 /// - A row whose worker is the one directly above it is a ditto.
@@ -1218,23 +1220,36 @@ pub fn merge_with<'a, 'w, L: LiveAgent>(
         let carried = out
             .iter()
             .any(|r| r.live.is_some_and(|c| c.agent_id() == l.agent_id()));
-        let named = carried
-            || feed_rows
-                .iter()
-                .any(|f| f.agent_id.as_deref() == Some(l.agent_id()) || names(l, &f.key));
-        if !named {
-            out.push(PaneRow {
-                stage: if l.running() {
-                    Stage::Running
-                } else {
-                    Stage::Done
-                },
-                feed: None,
-                live: Some(l),
-                worker_ms: spawned_at(l, log(l.agent_id())),
-                ..PaneRow::bare()
-            });
+        if carried {
+            continue;
         }
+        let tasks: Vec<&FeedRow> = feed_rows
+            .iter()
+            .filter(|f| f.agent_id.as_deref() == Some(l.agent_id()) || names(l, &f.key))
+            .collect();
+        // A worker that names a task but no row carries was replaced on
+        // it: a fresh worker took the task over (giverny#513). Finished,
+        // or killed with its session (giverny#489: it may still read
+        // running, its end then where it was last seen at work), it is a
+        // Done row of its own, with its own time and tokens, so the task's
+        // row counts only its new worker and nothing is lost. A running
+        // one is that row's worker and is never drawn twice.
+        let killed = l.running() && tasks.iter().any(|f| died_with_session(f, l));
+        if !tasks.is_empty() && l.running() && !killed {
+            continue;
+        }
+        out.push(PaneRow {
+            stage: if l.running() && !killed {
+                Stage::Running
+            } else {
+                Stage::Done
+            },
+            feed: None,
+            live: Some(l),
+            next_ms: if killed { l.last_sign_ms() } else { None },
+            worker_ms: spawned_at(l, log(l.agent_id())),
+            ..PaneRow::bare()
+        });
     }
     queue(&mut out, &log);
     // Running and Next up keep feed order, then live order. Done is newest
