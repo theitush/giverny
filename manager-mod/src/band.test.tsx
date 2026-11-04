@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import type { DisplayRow, Model, Section } from '../types'
 
-import { columns, counts, etaWords, gauge, moreWords, plan, rowSegs, splitTitle } from './band'
+import { columns, counts, gauge, moreWords, plan, rowSegs, splitTitle } from './band'
 import { cells, cut, cutMiddle } from './cells'
 import { INK, markOf } from './theme'
 
@@ -62,17 +62,43 @@ test('with nothing to show the engine draws the band', async ($, on) => {
   await ui.unmount()
 })
 
+test('a survey holds the band: it yields, and a turn in progress changes no row', async ($, on) => {
+  engine(on, FEED, [])
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const survey = await $.ui.mount({ ...BAND, props: { ...BAND.props, hasSurvey: true }, surface: 'terminal' })
+  expect((await survey.find({ type: 'Text' }))?.text).toBe('engine')
+  await survey.unmount()
+})
+
 const row = (over: Partial<DisplayRow> & { key: string; section: Section }): DisplayRow => ({
   id: over.key,
+  own: over.section,
   title: `BUG: area(#1): ${over.key} the thing itself`,
+  head: '',
+  depth: 0,
   elapsed: '',
   left: '',
   over: false,
+  noEta: false,
   what: '',
+  flag: false,
+  tokens: '',
+  oom: false,
+  why: [],
+  facts: [],
+  lease: '',
+  finished: false,
+  asleep: false,
   ...over,
 })
-const model = (rows: DisplayRow[]): Model => ({
+const model = (rows: DisplayRow[], footer?: string): Model => ({
   rows,
+  footer,
+  nested: rows.some(r => r.fold !== undefined),
   running: rows.filter(r => r.section === 'running').length,
   next: rows.filter(r => r.section === 'next').length,
   done: rows.filter(r => r.section === 'done').length,
@@ -80,10 +106,10 @@ const model = (rows: DisplayRow[]): Model => ({
 const busy = (running: number, next: number, done: number) =>
   model([
     ...Array.from({ length: running }, (_, i) =>
-      row({ key: `r${i}`, section: 'running', elapsed: '14m', left: i === 1 ? 'over by 15m' : '~16m left', over: i === 1, what: 'building the test' }),
+      row({ key: `r${i}`, section: 'running', elapsed: '14m', left: i === 1 ? '-~15m' : '~16m', over: i === 1, what: 'building the test' }),
     ),
     ...Array.from({ length: next }, (_, i) => row({ key: `n${i}`, section: 'next', left: '~25m', what: i === 0 ? 'after r0' : '' })),
-    ...Array.from({ length: done }, (_, i) => row({ key: `d${i}`, section: 'done', elapsed: '48m', left: 'est 50m', what: i === done - 1 ? 'Review — ita' : 'Done' })),
+    ...Array.from({ length: done }, (_, i) => row({ key: `d${i}`, section: 'done', elapsed: '48m', left: '(-2m)', what: i === done - 1 ? 'Review — ita' : 'Done' })),
   ])
 const text = (r: DisplayRow, c: ReturnType<typeof columns>) => rowSegs(r, c).map(s => s.text).join('')
 
@@ -93,7 +119,7 @@ test('at every width a row fits, and its times stay in one column', async () => 
     const c = columns(rows, width)
     const lines = rows.map(r => text(r, c))
     for (const l of lines) expect(cells(l) <= width).toBe(true)
-    const at = lines.slice(0, 3).map(l => l.indexOf('~16m') === -1 ? l.indexOf('+15m') : l.indexOf('~16m'))
+    const at = lines.slice(0, 3).map(l => l.indexOf('~16m') === -1 ? l.indexOf('-~15m') : l.indexOf('~16m'))
     expect(new Set(at).size).toBe(1)
   }
 })
@@ -111,17 +137,17 @@ test('narrowing loses the gauge, then NOW, then the clock; the key and the ETA l
 
 test('a title drops its type and area on every row or on none', async () => {
   const rows = [
-    row({ key: 'a', section: 'running', title: 'BUG: auth(#12): a long title that will not fit in a narrow table at all', left: '~1m left', elapsed: '1m' }),
+    row({ key: 'a', section: 'running', title: 'BUG: auth(#12): a long title that will not fit in a narrow table at all', left: '~1m', elapsed: '1m' }),
     row({ key: 'b', section: 'next', title: 'RUN: short', left: '~1m' }),
   ]
-  expect(splitTitle('BUG: auth(#12): the race')).toEqual({ head: 'BUG: auth(#12): ', body: 'the race' })
-  expect(splitTitle('plain: words')).toEqual({ head: 'plain: ', body: 'words' })
-  expect(splitTitle('no head here').head).toBe('')
+  expect(splitTitle('BUG: auth(#12): the race')).toEqual({ tag: 'BUG: auth(#12): ', body: 'the race' })
+  expect(splitTitle('plain: words')).toEqual({ tag: 'plain: ', body: 'words' })
+  expect(splitTitle('no tag here').tag).toBe('')
   const wide = columns(rows, 170)
-  expect(wide.heads).toBe(true)
+  expect(wide.tags).toBe(true)
   expect(text(rows[1]!, wide).includes('RUN: short')).toBe(true)
   const tight = columns(rows, 60)
-  expect(tight.heads).toBe(false)
+  expect(tight.tags).toBe(false)
   expect(text(rows[1]!, tight).includes('RUN:')).toBe(false)
   expect(text(rows[0]!, tight).includes('a long title')).toBe(true)
 })
@@ -134,17 +160,17 @@ test('with no NOW column a waiting row still says why, and a Done row what it to
   const clockless = c
   expect(clockless.elapsed).toBe(0)
   expect(text(rows[2]!, clockless).includes('48m')).toBe(true)
-  expect(text(rows[2]!, clockless).includes('est')).toBe(false)
+  expect(text(rows[2]!, clockless).includes('(-2m)')).toBe(false)
 })
 
 test('the plan gives up Done and Next up before any running row, keeping what wants a look', async () => {
   const m = busy(3, 7, 5)
   const roomy = plan(m, 20)
-  expect([roomy.running.length, roomy.next.length, roomy.done.length]).toEqual([3, 6, 4])
+  expect([roomy.running.length, roomy.next.length, roomy.done.length]).toEqual([3, 7, 5])
   expect(roomy.airy).toBe(true)
-  expect(plan(m, 17).airy).toBe(false)
-  // The newest four are d0..d3; d4 is the only one to review, and it stays.
-  expect(roomy.done.map(r => r.key)).toEqual(['d0', 'd1', 'd2', 'd4'])
+  expect(plan(m, 16).airy).toBe(false)
+  // At three Done rows d0..d2 would be the newest; d4 is the only one to review, and it stays.
+  expect(plan(m, 14).done.map(r => r.key)).toEqual(['d0', 'd1', 'd4'])
   const short = plan(m, 7)
   expect(short.running.length).toBe(3)
   expect(short.next.length + short.done.length).toBe(1)
@@ -158,6 +184,40 @@ test('more running than rows keeps the one past its estimate, in order, with a +
   expect(p.running.map(r => r.key)).toEqual(['r0', 'r1'])
   expect(p.summaries).toBe(false)
   expect(plan(busy(9, 2, 2), 3).running.map(r => r.key)).toEqual(['r1'])
+})
+
+test('a footer shows when rows have left it room, and a nested row never without its parent', async () => {
+  const m = busy(1, 0, 1)
+  expect(plan(model(m.rows, 'a footer'), 20).footer).toBe(true)
+  expect(plan(model(m.rows, 'a footer'), 3).footer).toBe(false)
+  expect(plan(m, 20).footer).toBe(false)
+  const parent = row({ key: 'p', section: 'running', left: '~1m', elapsed: '1m', head: '▾ ', fold: { id: 'p', folded: false, under: 2, running: 1, note: '', shortNote: '' } })
+  const kids = ['a', 'b'].map(key => row({ key, section: 'running', depth: 1, head: '   └ ' }))
+  const late = row({ key: 'late', section: 'running', left: '-~1m', elapsed: '9m', over: true })
+  const p = plan(model([parent, ...kids, late]), 4)
+  expect(p.running.map(r => r.key)).toEqual(['p', 'late'])
+})
+
+test('a nested row is drawn behind its head, its parent carries the toggle, and it goes by its own stage', async () => {
+  const parent = row({ key: 'p', section: 'running', left: '~1m', elapsed: '1m', head: '▸ ', fold: { id: 'p', folded: true, under: 6, running: 2, note: '+6, 2 running', shortNote: '+6' } })
+  const kid = row({ key: 'k', section: 'running', own: 'done', depth: 1, head: '   └ ', title: 'helper', what: 'done' })
+  const rows = [parent, kid]
+  const c = columns(rows, 170)
+  const segs = rowSegs(parent, c, 170)
+  expect(segs.find(s => s.toggle)?.text).toBe('▸ ')
+  expect(text(parent, c).includes('+6, 2 running')).toBe(true)
+  expect(rowSegs(parent, columns(rows, 80), 80).map(s => s.text).join('').includes('+6, 2')).toBe(false)
+  expect(markOf(kid).glyph).toBe('✓')
+  expect(text(kid, c).includes('   └ helper')).toBe(true)
+})
+
+test('a flag and an OOM say so in NOW, in ink', async () => {
+  const stopped = row({ key: 's', section: 'running', left: '~1m', elapsed: '1m', flag: true, what: 'stopped: no network' })
+  const c = columns([stopped], 170)
+  expect(rowSegs(stopped, c, 170).find(s => s.text.includes('stopped:'))?.color).toBe(INK.behind)
+  const oom = row({ key: 'o', section: 'running', left: '~1m', elapsed: '1m', oom: true, what: 'Bash: cargo' })
+  const seg = rowSegs(oom, columns([oom], 170), 170).find(s => s.text.includes('OOM'))
+  expect(seg?.color).toBe(INK.failed)
 })
 
 test('two rows or fewer is the one-line form', async () => {
@@ -175,11 +235,16 @@ test('the counts say in words what fits, by marks what does not, and call out wh
 
 test('a mark says what a row is in one cell', async () => {
   const mark = (over: Partial<DisplayRow> & { section: Section }) => markOf(row({ key: 'k', ...over }))
-  expect(mark({ section: 'running', left: '~1m left' }).color).toBe(INK.moving)
-  expect(mark({ section: 'running', left: 'over by 3m', over: true }).color).toBe(INK.behind)
-  expect(mark({ section: 'running', left: 'paused' }).glyph).toBe('‖')
-  expect(mark({ section: 'running', what: 'asleep · wrangler deploy (30m) · wakes when it ends' }).glyph).toBe('◌')
-  expect(mark({ section: 'running', what: 'killed 3m ago' }).color).toBe(INK.failed)
+  expect(mark({ section: 'running', left: '~1m' }).color).toBe(INK.moving)
+  expect(mark({ section: 'running', left: '-~3m', over: true }).color).toBe(INK.behind)
+  expect(mark({ section: 'running', what: 'paused since 14:02' }).glyph).toBe('‖')
+  expect(mark({ section: 'running', what: 'paused · worker still finishing' }).glyph).toBe('‖')
+  expect(mark({ section: 'running', what: 'week limit → 18:00' }).glyph).toBe('‖')
+  expect(mark({ section: 'running', asleep: true, what: 'asleep · wrangler deploy (30m) · wakes when it ends' }).glyph).toBe('◌')
+  expect(mark({ section: 'running', finished: true, what: 'turn ended 14:02' }).glyph).toBe('◌')
+  expect(mark({ section: 'running', what: 'killed' }).color).toBe(INK.failed)
+  expect(mark({ section: 'running', flag: true, what: 'stopped: no network' }).color).toBe(INK.behind)
+  expect(mark({ section: 'running', oom: true }).color).toBe(INK.failed)
   expect(mark({ section: 'next' }).glyph).toBe('○')
   expect(mark({ section: 'next', what: 'after x' }).glyph).toBe('◌')
   expect(mark({ section: 'next', what: 'held: a quiet machine' }).glyph).toBe('‖')
@@ -189,22 +254,21 @@ test('a mark says what a row is in one cell', async () => {
 })
 
 test('the gauge fills with the clock and notches the estimate once past it', async () => {
-  const r = (elapsed: string, left: string) => row({ key: 'k', section: 'running', elapsed, left })
-  expect(gauge(r('15m', '~15m left'), 10)).toEqual({ done: 5 })
-  expect(gauge(r('<1m', '~30m left'), 10)).toEqual({ done: 1 })
-  expect(gauge(r('40m', 'over by 20m'), 10)).toEqual({ done: 10, notch: 5 })
-  expect(gauge(r('1h15', 'over by 1h'), 10)?.notch).toBe(2)
+  const r = (elapsed: string, left: string) => row({ key: 'k', section: 'running', elapsed, left, over: left.startsWith('-') })
+  expect(gauge(r('15m', '~15m'), 10)).toEqual({ done: 5 })
+  expect(gauge(r('0m', '~30m'), 10)).toEqual({ done: 1 })
+  expect(gauge(r('40m', '-~20m'), 10)).toEqual({ done: 10, notch: 5 })
+  expect(gauge(r('1h15m', '-~1h'), 10)?.notch).toBe(2)
   expect(gauge(r('5m', 'no ETA'), 10)).toBe(undefined)
+  expect(gauge(r('"', '"'), 10)).toBe(undefined)
   expect(gauge(row({ key: 'k', section: 'next', left: '~5m' }), 10)).toBe(undefined)
-  expect(etaWords('~8m left')).toBe('~8m')
-  expect(etaWords('over by 3m')).toBe('+3m')
 })
 
 test('truncation keeps what tells rows apart', async () => {
   expect(cut('abcdef', 4)).toBe('abc…')
   expect(cut('宽字符宽字符', 5)).toBe('宽字…')
   expect(cells('宽x')).toBe(3)
-  expect(cutMiddle('task-522-manager-mod', 12)).toBe('task-5…r-mod'.length === 12 ? 'task-5…r-mod' : '')
+  expect(cutMiddle('task-522-manager-mod', 12)).toBe('task-5…r-mod')
   expect(moreWords(busy(0, 2, 0).rows, true, 'next', 80)).toBe('+2  n0, n1')
   expect(moreWords(busy(0, 2, 0).rows, false, 'next', 80)).toBe('2 next  n0, n1')
 })
