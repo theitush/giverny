@@ -112,6 +112,19 @@ impl ManagementLive {
         self.waiting.remove(&tab);
     }
 
+    /// `tab` was stopped from the rail: its session is down, as
+    /// [`ManagementLive::session_ended`] has it, and the workers that ran in
+    /// it ended with it, so its Running rows are Done, stopped. No live list
+    /// comes again to say so: Claude Code sends one only while workers run.
+    pub fn stopped(&mut self, tab: TabId) {
+        self.session_ended(tab);
+        if let Some(t) = self.trackers.get_mut(&tab)
+            && t.end_running(now_ms()) > 0
+        {
+            self.dirty = true;
+        }
+    }
+
     /// A manager's clear-done message in `tab` (`hooks::CLEAR_DONE_EVENT`):
     /// drop its Done rows (and hide the feed's that landed by then), keeping
     /// what runs. `at_ms` is when the clear was asked for, else now.
@@ -372,5 +385,19 @@ mod tests {
         let t = live.tracker(TAB).unwrap();
         assert_eq!(t.rows().len(), 2);
         assert!(!t.get("a2").unwrap().running());
+    }
+
+    #[test]
+    fn a_stopped_tab_has_no_running_rows_and_no_pane() {
+        let mut live = ManagementLive::in_memory();
+        live.session_started(TAB, Some("resume"), Some("s1"), Some("/nowhere".into()));
+        live.apply_live(TAB, None, &tick_json("s1", &["a1"]));
+        assert!(live.shown(TAB).is_some());
+
+        live.stopped(TAB);
+        assert!(live.shown(TAB).is_none());
+        let row = live.tracker(TAB).unwrap().get("a1").unwrap();
+        assert!(!row.running());
+        assert!(row.ended_ms.is_some());
     }
 }

@@ -3814,7 +3814,7 @@ impl App {
         self.fg_running.remove(&id);
         self.osc_running.remove(&id);
         self.fg_since.remove(&id);
-        self.claude.tabs.remove(&id);
+        self.claude.stopped(id);
         self.codex.tabs.remove(&id);
         if self.ws.active == Some(id) {
             self.held = Some(id);

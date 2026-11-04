@@ -1213,6 +1213,23 @@ impl Tracker {
         before - self.rows.len()
     }
 
+    /// The session these rows belong to was stopped from its tab: its
+    /// workers died with it, so every Running row is Done as of `now_ms`,
+    /// `Stopped`. Returns how many were.
+    pub fn end_running(&mut self, now_ms: u64) -> usize {
+        let mut ended = 0;
+        for r in &mut self.rows {
+            if r.stage == Stage::Running {
+                r.mark_done(Outcome::Stopped, now_ms);
+                ended += 1;
+            }
+        }
+        if ended > 0 {
+            self.sort();
+        }
+        ended
+    }
+
     /// Has anything worth keeping over a restart: rows, or a clear that has
     /// to keep holding.
     pub fn worth_saving(&self) -> bool {
