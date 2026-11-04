@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
-import type { Model, Page } from '../types'
+import type { Model, Page, WorkerView } from '../types'
 
 // What a drawing reads. The validator wants an atom used in the file that declares it, so every
 // read and write goes through a function here (a declaration: past an import the validator
@@ -20,9 +20,15 @@ const NO_PAGE: Page | null = null
 const page = atom({ plugin: 'manager', key: 'page' } as const, NO_PAGE, { shape: 'page-2' })
 /** Whether a page is on, which every row of the transcript reads: it changes only as one opens or closes. */
 const paged = atom({ plugin: 'manager', key: 'paged' } as const, false)
+/** The id of the placed row that draws the open page, which the others read so as to draw nothing. */
+const NO_ROW: string | null = null
+const pageRow = atom({ plugin: 'manager', key: 'pageRow' } as const, NO_ROW, { shape: 'page-row-1' })
 /** The rows the person set the band to, under its rule; null: it follows its rows. */
 const NOT_SET: number | null = null
 const size = atom({ plugin: 'manager', key: 'size' } as const, NOT_SET, { shape: 'size-1' })
+/** What a press on a worker's row opens in fullscreen. */
+const PAGE_VIEW: WorkerView = 'page'
+const workerView = atom({ plugin: 'manager', key: 'workerView' } as const, PAGE_VIEW, { shape: 'worker-view-1' })
 /** The band's first row on show, when it shows fewer than it has. */
 const top = atom({ plugin: 'manager', key: 'top' } as const, 0)
 
@@ -73,11 +79,23 @@ export function readPaged($: EngineInterface) {
 export function writePaged($: EngineInterface, value: boolean) {
   return update($, paged, () => value)
 }
+export function readPageRow($: EngineInterface): Promise<string | null> {
+  return read($, pageRow)
+}
+export function writePageRow($: EngineInterface, value: string | null) {
+  return update($, pageRow, () => value)
+}
 export function readSize($: EngineInterface): Promise<number | null> {
   return read($, size)
 }
 export function writeSize($: EngineInterface, value: number | null) {
   return update($, size, () => value)
+}
+export function readWorkerView($: EngineInterface): Promise<WorkerView> {
+  return read($, workerView)
+}
+export function writeWorkerView($: EngineInterface, value: WorkerView) {
+  return update($, workerView, () => value)
 }
 export function readTop($: EngineInterface) {
   return read($, top)

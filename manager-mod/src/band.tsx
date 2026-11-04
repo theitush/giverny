@@ -8,9 +8,9 @@ import type { GripPost } from './grip-client'
 import { cells, cellsIn, cut, cutExact, padEnd, padStart } from './cells'
 import { gb } from './lease'
 import { redrawSoon } from './poll'
-import { readHidden, readPage, readSaid, readSize, readTop, readView, toggleFold, writeSize, writeTop } from './state'
+import { readHidden, readPage, readSaid, readSize, readTop, readView, readWorkerView, toggleFold, writeSize, writeTop } from './state'
 import { type Chrome, chromeOf, HOVER_TINT, loadInk, STAGE, STAGE_INK, tint, VIEWED_TINT } from './theme'
-import { backWords, drawBox, goBack, openRow } from './worker'
+import { backWords, drawBox, goBack, openRow, pagesWorkers } from './worker'
 
 // The band is a copy of Giverny's management panel, cell by cell as far as a terminal grid allows:
 // crates/app/src/management_panel.rs `Cols`, `fit_title`, `usage_cell`, `usage_inks` and
@@ -362,9 +362,10 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const table = layout(model.rows, Math.max(40, cols), on)
 
   // The rows the worker's view takes under the prompt are the rows kept here when it is shut: the
-  // site's room falls by as many as the tree gives back, so the window is the same either way.
+  // site's room falls by as many as the tree gives back, so the window is the same either way. Where
+  // a worker's row opens the page, that view does not come, and there is nothing to keep.
   const hasWorkers = model.rows.some(r => r.workerId !== undefined)
-  const keeps = !viewing && hasWorkers
+  const keeps = !viewing && hasWorkers && !pagesWorkers(await readWorkerView($), e.viewport)
   const boxRows = page?.ask && page.place === 'pane' ? 1 + (page.status !== '' ? 1 : 0) : 0
   const footerRows = model.footer ? 1 : 0
   const room = e.props.maxRows - RULE_ROWS - boxRows - (keeps ? RESERVED : 0)

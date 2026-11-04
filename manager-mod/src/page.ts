@@ -6,7 +6,7 @@ import { describeToolUse } from './transcript'
 // or from its transcript file where the session cannot read it (a worker of an earlier run).
 // As crates/claude/src/transcript.rs draws it: the prompt, the words, one line per tool call.
 
-type Use = { tool: string; input: Record<string, unknown>; isError?: true; text?: string }
+type Use = { tool: string; input: Record<string, unknown>; isError?: boolean; text?: string }
 type Message = { role: 'user' | 'assistant'; text: string; toolUses: readonly Use[] }
 
 /** The room a page's texts have: a tree draws its first 100,000 characters and cuts the rest. */
@@ -17,6 +17,21 @@ const WRAPPERS: [string, RegExp][] = [
   ['The coordinator sent a message while you were working:\n', /\n\nAddress this before completing your current task\.$/],
   ['The user sent a new message while you were working:\n', /\n\nThis is how Claude Code surfaces messages the user sends mid-turn[^]*$/],
 ]
+
+const RESULT_MAX = 110
+
+/**
+ * A tool's result in one line: its first line with words on it, and how many more it has. As Claude
+ * Code's own row shows one folded; the whole text stays in the worker's transcript.
+ */
+export function shortResult(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined
+  const lines = text.split('\n').filter(l => l.trim() !== '')
+  if (lines.length === 0) return '(no output)'
+  const first = lines[0]!.trim()
+  const head = [...first].length > RESULT_MAX ? `${[...first].slice(0, RESULT_MAX - 1).join('')}…` : first
+  return lines.length > 1 ? `${head}  (+${lines.length - 1} lines)` : head
+}
 
 /** The line inside Claude Code's wrapper; text in no wrapper it knows is whole. */
 export function unwrapped(text: string): string {
@@ -46,29 +61,58 @@ export function entriesOf(messages: readonly Message[]): PageEntry[] {
         out.push({ kind: 'text', text: said })
         continue
       }
-      out.push({ kind: 'tool', text: describeToolUse({ name: use.tool, input: use.input }), isError: use.isError })
+      const result = shortResult(use.text)
+      out.push({ kind: 'tool', text: describeToolUse({ name: use.tool, input: use.input }), ...(use.isError ? { isError: true as const } : {}), ...(result === undefined ? {} : { result }) })
     }
   }
   return out
 }
 
+type FileBlock = { type?: unknown; text?: unknown; name?: unknown; id?: unknown; input?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown }
+
+/** A tool result's text in a transcript file, a string or text blocks. */
+function resultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return (content as { text?: unknown }[]).flatMap(b => (typeof b.text === 'string' ? [b.text] : [])).join('\n')
+}
+
 /** The same from a transcript file: a line that does not parse (one being written) is skipped. */
 export function entriesOfFile(jsonl: string): PageEntry[] {
   const messages: Message[] = []
+  const uses = new Map<string, Use>()
   for (const line of jsonl.split('\n')) {
-    if (!line.includes('"message"')) continue
-    let v: { type?: unknown; isMeta?: unknown; origin?: { kind?: unknown }; message?: { content?: unknown } }
+    const queued = line.includes('"queued_command"')
+    if (!queued && !line.includes('"message"')) continue
+    let v: { type?: unknown; isMeta?: unknown; origin?: { kind?: unknown }; message?: { content?: unknown }; attachment?: { type?: unknown; prompt?: unknown } }
     try {
       v = JSON.parse(line) as typeof v
     } catch {
       continue
     }
+    // A line that reached a worker in the middle of its turn is kept as an attachment, in its place.
+    if (v.type === 'attachment' && v.attachment?.type === 'queued_command' && typeof v.attachment.prompt === 'string') {
+      messages.push({ role: 'user', text: v.attachment.prompt, toolUses: [] })
+      continue
+    }
     if (v.type !== 'user' && v.type !== 'assistant') continue
     if (v.isMeta === true && v.origin?.kind !== 'human' && v.origin?.kind !== 'coordinator') continue
     const content = v.message?.content
-    const blocks = (Array.isArray(content) ? content : []) as { type?: unknown; text?: unknown; name?: unknown; input?: unknown }[]
+    const blocks = (Array.isArray(content) ? content : []) as FileBlock[]
     const text = typeof content === 'string' ? content : blocks.flatMap(b => (b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n')
-    const toolUses = blocks.flatMap(b => (b.type === 'tool_use' && typeof b.name === 'string' ? [{ tool: b.name, input: (b.input ?? {}) as Record<string, unknown> }] : []))
+    const toolUses: Use[] = []
+    for (const b of blocks) {
+      if (b.type === 'tool_use' && typeof b.name === 'string') {
+        const use: Use = { tool: b.name, input: (b.input ?? {}) as Record<string, unknown> }
+        toolUses.push(use)
+        if (typeof b.id === 'string') uses.set(b.id, use)
+      } else if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
+        const use = uses.get(b.tool_use_id)
+        if (!use) continue
+        use.text = resultText(b.content)
+        if (b.is_error === true) use.isError = true
+      }
+    }
     messages.push({ role: v.type, text, toolUses })
   }
   return entriesOf(messages)
@@ -90,6 +134,16 @@ export function pageRows(entries: readonly PageEntry[], columns: number): number
   const HEADER = 5
   const across = Math.max(1, columns - 2)
   return entries.reduce((rows, e) => rows + 1 + (e.kind === 'tool' ? 1 : e.text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / across)), 0)), HEADER)
+}
+
+/**
+ * What a working worker is at, for the page's last line: `what` where the row has something to say
+ * beyond its last tool call (a limit, a pause, a wait), else the call with no result yet, else thinking.
+ */
+export function doing(entries: readonly PageEntry[], what: string): string {
+  if (what !== '' && what !== '"' && !entries.some(e => e.kind === 'tool' && e.text === what)) return what
+  const last = entries[entries.length - 1]
+  return last?.kind === 'tool' && last.result === undefined ? last.text : 'Thinking'
 }
 
 /** A Next up row's page with no brief: what it has, then how a brief is added. */

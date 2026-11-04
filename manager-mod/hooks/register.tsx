@@ -4,7 +4,8 @@ import { barMoved, dragged, drawBand, loadSize, ownWindow, scrolled, sizeCommand
 import { answerMerge, hintWithoutAgents, insideGivernyTab, letManagerThrough } from '../src/giverny'
 import { clearDone, startPolling } from '../src/poll'
 import { readPaged, toggleHidden } from '../src/state'
-import { drawPage, drawPageRow, goBack, hiddenRow, noteScroll, PAGE_ROW, pageClosed, pageLine, PANE, startFollowing, TRANSCRIPT_ROWS } from '../src/worker'
+import { configuredView, drawPage, drawPageRow, goBack, hiddenRow, loadView, noteScroll, ownDropWords, PAGE_ROW, pageClosed, pageLine, PANE, startFollowing, TRANSCRIPT_ROWS, viewCommand } from '../src/worker'
+import type { WorkerView } from '../types'
 
 // Wiring only: what each event runs lives in src/. Inside a Giverny tab every hook passes.
 
@@ -15,15 +16,16 @@ const BAR = 'bar'
 let begun = false
 let beginSoon = false
 
-async function begin($: EngineInterface, wantUse: boolean): Promise<void> {
+async function begin($: EngineInterface, wantUse: boolean, configured: WorkerView): Promise<void> {
   if (begun) return
   begun = true
   try {
     await $.command.register({
       name: 'manager',
-      description: 'Show or hide the manager band: Running, Next up and Done from this session; `/manager back` leaves a worker for the manager; `/manager clear-done` clears its Done rows; `/manager size <rows>` or `auto` sets its height',
+      description: 'Show or hide the manager band: Running, Next up and Done from this session; `/manager back` leaves a worker for the manager; `/manager clear-done` clears its Done rows; `/manager size <rows>` or `auto` sets its height; `/manager view page|claude` sets what a worker\'s row opens',
     })
     await loadSize($)
+    await loadView($, configured)
     await startPolling($, wantUse)
     startFollowing($)
   } catch (err) {
@@ -35,10 +37,11 @@ async function begin($: EngineInterface, wantUse: boolean): Promise<void> {
 
 export const register: Register = (on, options) => {
   const switches = switchesOf(options)
+  const configured = configuredView(options)
 
   on('session.start', async ($, e, next) => {
     if (await insideGivernyTab($)) return next(e)
-    await begin($, switches.usage)
+    await begin($, switches.usage, configured)
     return next(e)
   })
 
@@ -50,6 +53,8 @@ export const register: Register = (on, options) => {
     }
     const size = /^size(?:\s+(.*))?$/.exec(e.args.trim())
     if (size) return { text: await sizeCommand($, (size[1] ?? '').trim()) }
+    const view = /^view(?:\s+(.*))?$/.exec(e.args.trim())
+    if (view) return { text: await viewCommand($, (view[1] ?? '').trim()) }
     const isHidden = await toggleHidden($)
     return { text: isHidden ? 'Manager band hidden.' : 'Manager band shown.' }
   })
@@ -67,7 +72,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPage($, e))
 
   // A page takes the transcript's place in fullscreen: a row of its own, and every other row drawn as nothing.
-  on('ui.render', { component: 'Placed' }, ($, e, next) => (e.props.id === PAGE_ROW ? drawPageRow($, e) : next(e)))
+  on('ui.render', { component: 'Placed' }, ($, e, next) => (e.props.id.startsWith(PAGE_ROW) ? drawPageRow($, e) : next(e)))
   for (const component of TRANSCRIPT_ROWS) {
     on('ui.render', { component }, async ($, e, next) => ((await readPaged($)) ? hiddenRow($, e) : next(e)))
   }
@@ -77,6 +82,8 @@ export const register: Register = (on, options) => {
     if (line === undefined) return next(e)
     return 'drop' in line ? line : next({ ...e, text: line.text })
   })
+
+  on('session.append', { door: 'notice' }, (_$, e, next) => next(ownDropWords(e)))
 
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await pageClosed($)
@@ -96,7 +103,7 @@ export const register: Register = (on, options) => {
       beginSoon = true
       $.clock.after(AFTER_RELOAD_MS, () => {
         beginSoon = false
-        return begin($, switches.usage).catch(() => {})
+        return begin($, switches.usage, configured).catch(() => {})
       })
     }
     return (await drawBand($, e, switches)) ?? next(e)

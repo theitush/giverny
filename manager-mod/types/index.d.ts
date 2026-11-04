@@ -305,7 +305,10 @@ export type Model = {
 }
 
 /** One entry of a worker's page, as Claude Code's view of a worker draws it. */
-export type PageEntry = { kind: 'prompt' | 'text' | 'tool'; text: string; isError?: true }
+export type PageEntry = { kind: 'prompt' | 'text' | 'tool'; text: string; isError?: true; /** A tool's result in one line; absent until it has one. */ result?: string }
+
+/** What a press on a worker's row opens in fullscreen: the plugin's own page, or Claude Code's view of it. */
+export type WorkerView = 'page' | 'claude'
 
 /** The page a press opened (src/worker.tsx): undefined with none open. `row`: in the transcript's place, fullscreen; `pane`: docked, on the main screen. */
 export type Page = {
@@ -328,6 +331,8 @@ export type Page = {
   draft: string
   /** The box's generation: a new one holds `draft`, not what was typed. */
   box: number
+  /** When its worker last wrote to its transcript, as far as is known: what the activity line counts from. */
+  movedMs?: number
 }
 
 declare module 'claude-code' {
@@ -340,7 +345,9 @@ declare module 'claude-code' {
       cleared: Shaped<{ atMs?: number; agents: string[] }>
       page: Shaped<Page | null>
       paged: boolean
+      pageRow: Shaped<string | null>
       size: Shaped<number | null>
+      workerView: Shaped<WorkerView>
       top: number
     }
   }

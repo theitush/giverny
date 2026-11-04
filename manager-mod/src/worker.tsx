@@ -1,24 +1,30 @@
-import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, SiteView, UiScrollInput } from 'claude-code'
+import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, SessionAppendInput, SiteView, UiScrollInput } from 'claude-code'
 
-import type { DisplayRow, Model, Page, PageEntry } from '../types'
+import type { DisplayRow, Model, Page, PageEntry, WorkerView } from '../types'
 
 import { cells } from './cells'
-import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine } from './page'
-import { changePage, readPage, readPaged, readView, say, writePage, writePaged } from './state'
+import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine } from './page'
+import { changePage, readPage, readPageRow, readWorkerView, readView, say, writePage, writePaged, writePageRow, writeWorkerView } from './state'
 
-// What a press on a row opens. A worker Claude Code still lists opens in Claude Code's own view
-// of it, `$.ui.view`, whose prompt is that worker's; every other row opens a page, as Giverny's
-// worker page does (docs/management-panel.md, What a click on a row opens). In fullscreen the page
-// takes the transcript's place, so it reads as that view does: a placed row draws it and every
-// other row of the transcript draws nothing while it is open. On the main screen, where what is
-// drawn cannot be taken back, it is a pane.
+// What a press on a row opens: a page, as Giverny's worker page is (docs/management-panel.md, What a
+// click on a row opens). In fullscreen the page takes the transcript's place: a placed row draws it
+// and every other row of the transcript draws nothing while it is open, so nothing else on the
+// screen moves. With `worker_view` at `claude`, or on the main screen, where what is drawn cannot be
+// taken back, a worker Claude Code still lists opens in its own view of it, `$.ui.view`, whose prompt
+// is that worker's and which adds `○ main` under the prompt; there, every other row's page is a pane.
 
 export const PANE = 'worker'
 export const PAGE_ROW = 'manager-page'
 /** What a transcript is made of, all a hook can draw: the logo is not among them, and stays above a page as above a view. */
 export const TRANSCRIPT_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'ToolProgress', 'CommandOutput', 'Spinner', 'TurnDuration', 'InfoNotice'] as const
 const FOLLOW_MS = 1000
+const STORE_VIEW = 'worker-view'
+/** What the manifest said when `/manager view` last spoke: a change in /config beats that word. */
+const STORE_VIEW_CONFIG = 'worker-view-config'
 const LAID_OUT_MS = [150, 450]
+/** Long enough for the engine to have put a dropped line back in the box and kept its row. */
+const AFTER_DROP_MS = 30
+const DROP_WORDS = 'Prompt dropped by a hook'
 // Claude Code's own prompt band, as it draws one in a worker's view.
 const PROMPT_BG = 'ansi256(237)'
 
@@ -26,13 +32,51 @@ const PROMPT_BG = 'ansi256(237)'
 let pinned = false
 let reading = false
 let fileMs: number | undefined
+/** The reason of the drop just answered, until its row comes. */
+let dropped: string | undefined
 
-/** A press on a row: its worker's view, or its page; on what is open, back to the manager. */
+const isWorkerView = (v: unknown): v is WorkerView => v === 'page' || v === 'claude'
+
+/** The manifest's field: anything but `claude` is the page. */
+export const configuredView = (options: Readonly<Record<string, unknown>>): WorkerView => (options.worker_view === 'claude' ? 'claude' : 'page')
+
+/** The word `/manager view` left, unless /config has changed since. A store that cannot be read: the manifest's. */
+export async function loadView($: EngineInterface, configured: WorkerView): Promise<void> {
+  try {
+    if ((await $.store.get(STORE_VIEW_CONFIG)) !== configured) {
+      await $.store.delete(STORE_VIEW)
+      await $.store.set(STORE_VIEW_CONFIG, configured)
+    }
+    const kept = await $.store.get(STORE_VIEW)
+    await writeWorkerView($, isWorkerView(kept) ? kept : configured)
+  } catch {
+    await writeWorkerView($, configured)
+  }
+}
+
+/** Whether a worker's row opens the page here, not Claude Code's view: the band then keeps no rows for that view. */
+export function pagesWorkers(mode: WorkerView, screen: RenderViewport | undefined): boolean {
+  return mode === 'page' && screen?.isFullscreen === true
+}
+
+/** `/manager view page|claude`, as said back. What is open goes, so the band and the screen agree at once. */
+export async function viewCommand($: EngineInterface, arg: string): Promise<string> {
+  const now = await readWorkerView($)
+  if (!isWorkerView(arg)) return `Usage: /manager view page|claude. Now ${now}.`
+  await writeWorkerView($, arg)
+  await $.store.set(STORE_VIEW, arg)
+  if (arg !== now) await goBack($)
+  return arg === 'page'
+    ? "A worker's row opens the plugin's page in fullscreen: no row or prompt moves."
+    : "A worker's row opens Claude Code's own view: 2 rows are kept under the table for what it adds under the prompt."
+}
+
+/** A press on a row: its page, or its worker's view; on what is open, back to the manager. */
 export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView | undefined, band: string, screen: RenderViewport | undefined): Promise<void> {
   const page = await readPage($)
   const onIt = page?.rowId === r.id || (r.workerId !== undefined && view?.agentId === r.workerId)
   if (onIt) return goBack($, view)
-  if (r.workerId !== undefined) {
+  if (r.workerId !== undefined && !pagesWorkers(await readWorkerView($), screen)) {
     const shown = await $.ui.view({ agentId: r.workerId })
     if (shown.deny === undefined) {
       if (page) await closePage($)
@@ -60,16 +104,26 @@ export async function goBack($: EngineInterface, view?: SiteView): Promise<void>
   await say($, '')
 }
 
+/**
+ * A row of its own at the transcript's end for a page: under what has come since the last. A row
+ * Claude Code adds under the page while it is open stays there until the next.
+ */
+async function placeRow($: EngineInterface) {
+  const id = `${PAGE_ROW}-${await $.clock.now()}`
+  return { id, ...(await $.ui.place({ id })) }
+}
+
 async function openPage($: EngineInterface, r: DisplayRow, band: string, screen: RenderViewport | undefined): Promise<void> {
   const ask = r.own === 'next' ? ('start' as const) : r.workerId !== undefined ? ('worker' as const) : undefined
-  const placed = screen?.isFullscreen === true ? await $.ui.place({ id: PAGE_ROW }) : undefined
-  const page: Page = { place: placed?.isPlaced ? 'row' : 'pane', band, rowId: r.id, row: r, entries: await firstEntries($, r), ask, pending: [], prompts: 0, status: '', draft: '', box: 0 }
-  page.prompts = page.entries.filter(e => e.kind === 'prompt').length
-  await writePage($, page)
+  const placed = screen?.isFullscreen === true ? await placeRow($) : undefined
   pinned = false
   fileMs = undefined
+  const page: Page = { place: placed?.isPlaced ? 'row' : 'pane', band, rowId: r.id, row: r, entries: await firstEntries($, r), ask, pending: [], prompts: 0, status: '', draft: '', box: 0, movedMs: fileMs ?? (await $.clock.now()) }
+  page.prompts = page.entries.filter(e => e.kind === 'prompt').length
+  await writePage($, page)
   await say($, '')
   if (placed?.isPlaced) {
+    await writePageRow($, placed.id)
     await writePaged($, true)
     // A brief too long for the screen opens at its top. That takes the transcript off its end, which
     // it finds again at the next prompt or a scroll to the bottom. All else is at its end already,
@@ -123,19 +177,30 @@ async function firstEntries($: EngineInterface, r: DisplayRow): Promise<PageEntr
   return out
 }
 
-/** A worker's entries: what the session holds of it, else its transcript file. */
+/** A worker's entries: its transcript file, else what the session holds of it. */
 async function readEntries($: EngineInterface, r: DisplayRow): Promise<PageEntry[] | undefined> {
-  if (r.workerId !== undefined) {
-    const found = await $.session.messages({ agentId: r.workerId })
-    if (!('deny' in found)) return entriesOf(found)
+  // The file first, read only when it moved: it alone has the lines that reached a worker in the
+  // middle of its turn, and a long transcript read once a second is a cost of its own.
+  const mtimeMs = await transcriptMs($, r)
+  if (mtimeMs !== undefined) {
+    if (mtimeMs === fileMs) return undefined
+    try {
+      const text = await $.fs.read(r.transcript!)
+      fileMs = mtimeMs
+      return entriesOfFile(text)
+    } catch {
+      // What the session holds of it, then.
+    }
   }
+  if (r.workerId === undefined) return undefined
+  const found = await $.session.messages({ agentId: r.workerId })
+  return 'deny' in found ? undefined : entriesOf(found)
+}
+
+async function transcriptMs($: EngineInterface, r: DisplayRow): Promise<number | undefined> {
   if (r.transcript === undefined) return undefined
   try {
-    const { mtimeMs } = await $.fs.stat(r.transcript)
-    if (mtimeMs === fileMs) return undefined
-    const text = await $.fs.read(r.transcript)
-    fileMs = mtimeMs
-    return entriesOfFile(text)
+    return (await $.fs.stat(r.transcript)).mtimeMs
   } catch {
     return undefined
   }
@@ -159,6 +224,9 @@ async function toBox($: EngineInterface, band: string, key: string): Promise<voi
   }
 }
 
+/** What a page draws of its row, and what the page needs to find its worker. */
+const shownOfRow = (r: DisplayRow) => JSON.stringify([r.key, r.title, r.review, r.own, r.what, r.finished, r.workerId, r.transcript, r.own === 'running' ? [] : r.facts])
+
 /** Keeps an open page on its transcript. Costs nothing while none is open. */
 export function startFollowing($: EngineInterface): void {
   $.clock.every(FOLLOW_MS, () => followPage($))
@@ -170,12 +238,17 @@ async function followPage($: EngineInterface): Promise<void> {
   if (!page || page.row.own === 'next') return
   reading = true
   try {
-    const entries = await readEntries($, page.row)
+    // The model's row for what the page draws of it. The model changes every poll as its clocks tick,
+    // so only a change a page shows reaches the page and redraws its long tree.
+    const row = (await readView($)).rows.find(one => one.id === page.rowId) ?? page.row
+    if (shownOfRow(row) !== shownOfRow(page.row)) await changePage($, now => ({ ...now, row }))
+    const entries = await readEntries($, row)
     if (!entries || JSON.stringify(entries) === JSON.stringify(page.entries)) return
+    const movedMs = await $.clock.now()
     await changePage($, now => {
       const pending = pendingAfter(now.pending, now.prompts, entries)
       const prompts = pending.length < now.pending.length ? entries.filter(e => e.kind === 'prompt').length : now.prompts
-      return { ...now, entries, pending, prompts }
+      return { ...now, entries, pending, prompts, movedMs }
     })
     if (!pinned && page.place === 'pane') await toEnd($)
   } catch {
@@ -200,6 +273,7 @@ async function closePage($: EngineInterface): Promise<void> {
   const page = await readPage($)
   await writePage($, undefined)
   await writePaged($, false)
+  await writePageRow($, null)
   if (page?.place === 'pane') await $.ui.close({ id: PANE })
 }
 
@@ -241,19 +315,51 @@ export async function pageLine($: EngineInterface, e: PromptSubmitInput): Promis
   if (e.command !== undefined || e.isMeta === true || e.origin?.kind !== 'composer') return undefined
   const page = await readPage($)
   if (page?.place !== 'row') return undefined
-  if (page.ask === undefined) return { drop: 'This page is read-only: press 0 to go back to the manager first.' }
+  if (page.ask === undefined) return ownDrop($, e, 'This page is read-only: press 0 to go back to the manager first.', false)
   if (page.ask === 'start') {
     await say($, 'Sent to the manager, to start this task with it.')
     return { text: startLine(page.row.key, e.text) }
   }
   const { sent, status } = await deliver($, page, e.text)
-  await say($, status)
-  if (sent) {
-    await changePage($, now => ({ ...now, pending: [...now.pending, e.text] }))
-    await $.prompt.fill({ text: '' })
-  }
-  // A drop keeps the draft, for a line that did not go; Claude Code says so in the transcript.
-  return { drop: status }
+  await changePage($, now => ({ ...now, status, pending: sent ? [...now.pending, e.text] : now.pending }))
+  return ownDrop($, e, status, sent, sent ? `Sent to ${page.row.key || page.row.title || 'this worker'}: ${e.text}` : undefined)
+}
+
+/**
+ * A plugin takes a line from the prompt only by dropping it. Over a running turn of the manager's,
+ * Claude Code says so for a moment in its notification line, `Prompt dropped by a hook: <reason>`,
+ * out of any hook's reach. With none running it keeps a row saying that in the manager's transcript,
+ * which no hook can remove and which reads `(no content)` with no words: ownDropWords gives it
+ * what happened, and the page goes back under it. Either way the line comes back to the box after
+ * this answers: taken out once it has if it went, and left there to try again if not.
+ */
+async function ownDrop($: EngineInterface, e: PromptSubmitInput, status: string, sent: boolean, record?: string): Promise<{ drop: string }> {
+  const oneLine = (text: string) => text.split(/\s*\n\s*/).join(' ')
+  const said = oneLine(status)
+  const reason = oneLine(record ?? status)
+  dropped = e.turnId === undefined ? reason : undefined
+  await say($, said)
+  $.clock.after(AFTER_DROP_MS, async () => {
+    if (sent) await $.prompt.fill({ text: '' }).catch(() => {})
+    if (e.turnId === undefined) await underDrop($).catch(() => {})
+  })
+  return { drop: reason }
+}
+
+async function underDrop($: EngineInterface): Promise<void> {
+  if ((await readPage($))?.place !== 'row') return
+  const placed = await placeRow($)
+  if (placed.isPlaced) await writePageRow($, placed.id)
+}
+
+/** The row Claude Code keeps for a drop of ours, in the words of what happened. */
+export function ownDropWords(e: SessionAppendInput): SessionAppendInput {
+  if (dropped === undefined || e.message.type !== 'system') return e
+  const words = dropped
+  const text = JSON.stringify(e.message.content)
+  if (!text.includes(DROP_WORDS) || !text.includes(JSON.stringify(words).slice(1, -1))) return e
+  dropped = undefined
+  return { ...e, message: { ...e.message, content: [{ type: 'text', text: words }] } } as SessionAppendInput
 }
 
 /** A transcript's row while a page is in its place. */
@@ -262,18 +368,17 @@ export function hiddenRow($: EngineInterface, e: RenderInput) {
   return <Box display="none" />
 }
 
-/** The placed row, which stands in the transcript for good and is only ever the open page. */
+/** A placed row, which stands in the transcript for good: the open page's, or nothing. */
 export async function drawPageRow($: EngineInterface, e: RenderInput<'Placed'>) {
-  return (await readPaged($)) ? drawPage($, e) : hiddenRow($, e)
+  return (await readPageRow($)) === e.props.id ? drawPage($, e) : hiddenRow($, e)
 }
 
 /** The page's tree. */
 export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | RenderInput<'Placed'>) {
-  const { Box, Text, Button, Markdown } = $.ui.resolve(e)
+  const { Box, Text, Button, Markdown, Client } = $.ui.resolve(e)
   const page = await readPage($)
   if (!page) return <Text dimColor>Nothing open.</Text>
-  const model = await readView($)
-  const r = model.rows.find(one => one.id === page.rowId) ?? page.row
+  const r = page.row
   const { shown, left } = inRoom(page.entries)
   const entry = (one: PageEntry) => {
     if (one.kind === 'prompt') {
@@ -283,7 +388,14 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | Rend
         </Box>
       )
     }
-    if (one.kind === 'tool') return <Text color={one.isError ? 'red' : undefined} dimColor={!one.isError} wrap="truncate">{`  ${one.text}`}</Text>
+    if (one.kind === 'tool') {
+      return (
+        <Box flexDirection="column">
+          <Text color={one.isError && one.result === undefined ? 'red' : undefined} dimColor={!one.isError || one.result !== undefined} wrap="truncate">{`  ${one.text}`}</Text>
+          {one.result !== undefined && <Text color={one.isError ? 'red' : undefined} dimColor={!one.isError} wrap="truncate">{`  ⎿ ${one.result}`}</Text>}
+        </Box>
+      )
+    }
     return (
       <Box flexDirection="row">
         <Text>{'● '}</Text>
@@ -294,7 +406,7 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | Rend
     )
   }
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column" gap={1} paddingTop={page.place === 'row' ? 1 : 0}>
       <Box flexDirection="column">
         <Box flexDirection="row" gap={2}>
           <Text bold>{r.key || r.title}</Text>
@@ -305,7 +417,8 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | Rend
           )}
         </Box>
         {r.key !== '' && r.title !== r.key && <Text dimColor>{r.title}</Text>}
-        {r.facts.length > 0 && <Text dimColor>{r.facts.join(' · ')}</Text>}
+        {/* A running row's facts tick with its clocks: its row in the band, right there, has them. */}
+        {r.own !== 'running' && r.facts.length > 0 && <Text dimColor>{r.facts.join(' · ')}</Text>}
         {r.review !== undefined && <Text color="yellow">{`Review: ${r.review}`}</Text>}
       </Box>
       {left > 0 && <Text dimColor>{`${left} earlier entries are not drawn: a pane draws so much text.`}</Text>}
@@ -314,6 +427,10 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | Rend
         <Text dimColor wrap="wrap">{`❯ ${line}`}</Text>
       ))}
       {page.ask === undefined && <Text dimColor>read-only</Text>}
+      {page.place === 'row' && page.status.startsWith('Not sent') && <Text color="red" wrap="wrap">{page.status}</Text>}
+      {r.own === 'running' && r.workerId !== undefined && !r.finished && (
+        <Client key={`doing-${page.movedMs ?? 0}`} module="./doing-client.tsx" props={{ words: doing(page.entries, r.what), since: Math.max(0, Math.floor(((await $.clock.now()) - (page.movedMs ?? 0)) / 1000)), ink: 'ansi256(32)' }} width={Math.max(1, (e.viewport?.columns ?? 80) - 2)} height={1} />
+      )}
     </Box>
   )
 }
