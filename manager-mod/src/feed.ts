@@ -1,6 +1,6 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { Feed, FeedRow, Stage } from '../types'
+import type { AgentRow, Feed, FeedLease, FeedRow, FeedUsage, Stage } from '../types'
 
 // This session's feed, read only when its file changed: one `stat` a poll otherwise.
 // The format is docs/management-panel.md; parse() is crates/claude/src/feed.rs's forgiving
@@ -23,8 +23,8 @@ const STAGES: Record<string, Stage> = {
   completed: 'done',
   landed: 'done',
 }
-const TIMES = ['started', 'ended', 'spawned', 'paused_since', 'killed', 'went_off', 'left_at', 'eta_at', 'waiting_since', 'planned', 'unheld'] as const
-const COUNTS = ['paused_s', 'eta_s', 'eta_first_s', 'left_s', 'wait_s', 'reest_s', 'reest_at_s', 'tokens', 'task_tokens'] as const
+const TIMES = ['started', 'ended', 'spawned', 'paused_since', 'killed', 'went_off', 'left_at', 'eta_at', 'waiting_since', 'planned', 'unheld', 'land_nudged', 'start_nudged', 'worker_nudged'] as const
+const COUNTS = ['paused_s', 'eta_s', 'eta_first_s', 'left_s', 'wait_s', 'reest_s', 'reest_at_s', 'eta_guess_s', 'tokens', 'task_tokens'] as const
 const TEXTS = ['title', 'agent_id', 'repo', 'landing', 'group', 'brief', 'open', 'note', 'review', 'after', 'held'] as const
 
 const text = (v: unknown): string | undefined => {
@@ -50,6 +50,79 @@ const time = (v: unknown): number | undefined => {
   return Number.isNaN(n) ? undefined : n
 }
 
+const texts = (v: unknown) => (Array.isArray(v) ? v.flatMap(s => text(s) ?? []) : [])
+
+function parseLease(v: unknown): FeedLease | undefined {
+  if (typeof v !== 'object' || v === null) return undefined
+  const l = v as Record<string, unknown>
+  const state = typeof l.state === 'string' ? l.state.trim().toLowerCase() : ''
+  if (state !== 'granted' && state !== 'smaller' && state !== 'queued') return undefined
+  return {
+    state,
+    id: text(l.id),
+    ram_mb: count(l.ram_mb) ?? 0,
+    gpus: Array.isArray(l.gpus) ? l.gpus.flatMap(g => count(g) ?? []) : [],
+    vram_mb: count(l.vram_mb) ?? 0,
+    slots: texts(l.slots),
+    granted_ms: time(l.granted_at),
+    wanted_ram_mb: count(l.wanted_ram_mb),
+    position: count(l.position),
+    behind: text(l.behind),
+    short: texts(l.short),
+    uncollected: l.uncollected === true,
+    lapsed: l.lapsed === true,
+  }
+}
+
+const OOM_EXIT = 137
+
+function parseUsage(v: unknown): FeedUsage | undefined {
+  if (typeof v !== 'object' || v === null) return undefined
+  const u = v as Record<string, unknown>
+  const open = typeof u.oom_open === 'boolean' ? u.oom_open : (count(u.oom_kills) ?? 0) > 0 && whole(u.last_exit) === OOM_EXIT
+  return {
+    ...(u as FeedUsage),
+    runs: count(u.runs),
+    peak_mb: count(u.peak_mb),
+    cpu_s: count(u.cpu_s),
+    wall_s: count(u.wall_s),
+    oom_kills: count(u.oom_kills),
+    cap_ram_mb: count(u.cap_ram_mb),
+    oom_open: open,
+  }
+}
+
+function parseDevAgent(v: unknown): AgentRow | undefined {
+  if (typeof v !== 'object' || v === null) return undefined
+  const a = v as Record<string, unknown>
+  const id = text(a.id)
+  if (!id) return undefined
+  return {
+    id,
+    description: text(a.description) ?? '',
+    status: text(a.status) ?? 'running',
+    parentId: text(a.parentId),
+    name: text(a.name),
+    startedMs: time(a.started),
+    endedMs: time(a.ended),
+    lastTurnMs: time(a.last_turn),
+    tokens: count(a.tokens),
+    activity: text(a.activity),
+    stops: Array.isArray(a.stops)
+      ? a.stops.flatMap(s => {
+          const fromMs = time((s as { from?: unknown }).from)
+          return fromMs === undefined ? [] : [{ fromMs, toMs: time((s as { to?: unknown }).to), reason: text((s as { reason?: unknown }).reason) ?? 'API error' }]
+        })
+      : undefined,
+    shells: Array.isArray(a.shells)
+      ? a.shells.map(s => {
+          const raw = s as { id?: unknown; cmd?: unknown; started?: unknown }
+          return { id: text(raw.id) ?? '', cmd: text(raw.cmd) ?? '', startedMs: time(raw.started) ?? 0 }
+        })
+      : undefined,
+  }
+}
+
 function parseRow(v: unknown): FeedRow | undefined {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
   const raw = v as Record<string, unknown>
@@ -62,8 +135,8 @@ function parseRow(v: unknown): FeedRow | undefined {
   for (const f of TEXTS) row[f] = text(raw[f])
   row.eta_delta_s = whole(raw.eta_delta_s)
   row.follows_worker = raw.follows_worker === true || undefined
-  if (typeof raw.lease === 'object' && raw.lease !== null) row.lease = raw.lease
-  if (typeof raw.usage === 'object' && raw.usage !== null) row.usage = raw.usage
+  row.lease = parseLease(raw.lease)
+  row.usage = parseUsage(raw.usage)
   return row as FeedRow
 }
 
@@ -86,6 +159,7 @@ export function parse(source: string): Feed | undefined {
     aliases: Array.isArray(raw.aliases) ? raw.aliases.flatMap(a => text(a) ?? []) : [],
     footer: typeof footer === 'object' && footer !== null ? text((footer as { text?: unknown }).text) : text(footer),
     rows: Array.isArray(raw.rows) ? raw.rows.flatMap(r => parseRow(r) ?? []) : [],
+    dev_agents: Array.isArray(raw.dev_agents) ? raw.dev_agents.flatMap(a => parseDevAgent(a) ?? []) : undefined,
   }
 }
 
@@ -145,7 +219,8 @@ async function follow($: EngineInterface, w: FeedWatch, path: string): Promise<b
   w.stamp = stamp(found)
   try {
     // Torn or refused: the last good read stays on screen.
-    w.feed = parse(await $.fs.read(path)) ?? w.feed
+    const read = parse(await $.fs.read(path))
+    if (read) w.feed = { ...read, writtenMs: found.mtimeMs }
   } catch {
     // Gone or being replaced: the next poll sees it.
   }
@@ -172,7 +247,7 @@ async function search($: EngineInterface, w: FeedWatch, dir: string, session: st
     if (feed && namesSession(feed, session)) {
       w.path = `${dir}/${f.name}`
       w.stamp = stamp(f)
-      w.feed = feed
+      w.feed = { ...feed, writtenMs: f.mtimeMs }
       return
     }
     w.notOurs.set(f.name, stamp(f))
