@@ -54,7 +54,7 @@ Only one such command runs per session, and one in `~/.claude/settings.json` bea
 
 ## Columns
 
-The band is a copy of Giverny's management panel: the same columns in the same order and widths (stage, id and title, elapsed, ETA, NOW, tokens, use), no headings, the whole row in its stage's colour,. Each column has a switch in `/config` (`column_stage`, `column_id`, `column_title`, `column_elapsed`, `column_eta`, `column_now`, `column_tokens`, `column_usage`, all on), which applies at once: a column off takes no width and the rest close up. As the terminal narrows, the title gives way and the rest runs off the right, as the panel's does.
+The band is a copy of Giverny's management panel: the same columns in the same order and widths (stage, id and title, elapsed, ETA, NOW, tokens, use), no headings, the whole row in its stage's colour. Each column has a switch in `/config` (`column_stage`, `column_id`, `column_title`, `column_elapsed`, `column_eta`, `column_now`, `column_tokens`, `column_usage`, all on), which applies at once: a column off takes no width and the rest close up. As the terminal narrows, the title gives way and the rest runs off the right, as the panel's does.
 
 **Height.** Drag the rule along the band's top, as the top edge of the panel, or type `/manager size <rows>`; `/manager size auto` gives it back to its rows. The height is kept across sessions. Never set, the band is as tall as its rows. The most it can be is what Claude Code gives the band, which caps the bottom of the screen at half the terminal, the prompt included: with workers about, 15 rows under the rule at 170x48 and 29 at 193x77, two more with none. Nothing lets a plugin past that.
 
