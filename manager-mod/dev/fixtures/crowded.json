@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "writer": "giverny/manage",
+  "rows": [
+    { "key": "task-522-manager-mod-look", "stage": "running", "title": "FEATURE: manager-mod(#522): make the band something a person would want to keep open all day long", "started": "@-14m", "eta_s": 1800, "note": "rendering the capture to a PNG off screen, then reading it" },
+    { "key": "giverny#478", "stage": "running", "title": "BUG: land(#478): refuse a task with anything still running", "started": "@-125m", "eta_s": 3600, "note": "overran: the shells" },
+    { "key": "no-eta", "stage": "running", "title": "RUN: nobody gave this one a figure", "started": "@-3m" },
+    { "key": "r4", "stage": "running", "title": "plain words with no type at all", "started": "@-1m", "eta_s": 300 },
+    { "key": "r5", "stage": "running", "title": "RESEARCH: בדיקה of a right-to-left title", "started": "@-9m", "eta_s": 900 },
+    { "key": "r6", "stage": "running", "title": "FEATURE: 宽字符 wide characters in a title", "started": "@-20m", "paused_since": "@-2m", "eta_s": 2400 },
+    { "key": "n1", "stage": "planned", "title": "FEATURE: one", "eta_s": 600, "after": "giverny#478" },
+    { "key": "n2", "stage": "planned", "title": "FEATURE: two", "eta_s": 600 },
+    { "key": "n3", "stage": "planned", "title": "FEATURE: three", "eta_s": 600, "held": "until Ita has looked at the first one and said what he thinks of it" },
+    { "key": "n4", "stage": "planned", "title": "FEATURE: four", "eta_s": 600 },
+    { "key": "n5", "stage": "planned", "title": "FEATURE: five", "eta_s": 600 },
+    { "key": "n6", "stage": "planned", "title": "FEATURE: six", "eta_s": 600 },
+    { "key": "n7", "stage": "planned", "title": "FEATURE: seven", "eta_s": 600 },
+    { "key": "d1", "stage": "done", "title": "BUG: a", "started": "@-90m", "ended": "@-55m", "eta_first_s": 1500, "landing": "Done" },
+    { "key": "d2", "stage": "done", "title": "BUG: b", "started": "@-90m", "ended": "@-50m", "eta_first_s": 1500, "landing": "Blocked" },
+    { "key": "d3", "stage": "done", "title": "BUG: c", "started": "@-90m", "ended": "@-45m", "eta_first_s": 1500, "landing": "Review — ita" },
+    { "key": "d4", "stage": "done", "title": "BUG: d", "started": "@-90m", "ended": "@-40m", "eta_first_s": 1500, "landing": "Done" },
+    { "key": "d5", "stage": "done", "title": "BUG: e", "started": "@-90m", "ended": "@-35m", "eta_first_s": 1500, "landing": "Done" }
+  ]
+}
