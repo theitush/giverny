@@ -6,6 +6,7 @@ mod claude_watch;
 mod codex_watch;
 mod desktop;
 mod icon;
+mod job_end;
 mod keymap;
 mod management_live;
 mod management_panel;
@@ -948,6 +949,9 @@ pub enum Action {
     /// Attach a tab to a background agent: its directory, its account, its
     /// conversation.
     AttachJob(Box<giverny_claude::jobs::Job>),
+    /// Stop or delete a background job: `claude stop`/`claude rm` under
+    /// its account, off the UI thread.
+    EndJob(String, giverny_claude::jobs::End),
     /// Group the rail by categories, or by repository.
     SetRailView(giverny_core::state::RailView),
     /// Fold a repository's group away. The empty path is the "no repo" group.
@@ -1231,6 +1235,8 @@ pub struct App {
     pub update: Option<update::Available>,
     update_rx: Option<crossbeam_channel::Receiver<Option<update::Available>>>,
     pub update_dismissed: bool,
+    /// Background jobs being stopped or deleted from the rail.
+    pub job_ends: job_end::JobEnds,
     /// The installer replaces the binary under the running process; these say
     /// when to offer the restart that picks it up.
     exe_mtime: Option<std::time::SystemTime>,
@@ -1766,6 +1772,7 @@ impl App {
             update_rx,
             welcome,
             update_dismissed: false,
+            job_ends: job_end::JobEnds::default(),
             exe_mtime: update::binary_mtime(),
             update_job: None,
             update_installed: false,
@@ -2161,6 +2168,14 @@ impl App {
                 }
                 self.spawn_session(ctx, id, None);
                 self.apply(ctx, Action::ResumeSpecific(id, sid, job.config_dir.clone()));
+            }
+            Action::EndJob(id, how) => {
+                // The job's own account, as the scan found it.
+                let Some(dir) = self.claude.job(&id).map(|j| j.config_dir.clone()) else {
+                    tracing::warn!("job {id}: no account to {} it under", how.verb());
+                    return;
+                };
+                self.job_ends.start(ctx, id, dir, how);
             }
             Action::EditConfig => {
                 let editor = std::env::var("VISUAL")
@@ -4332,6 +4347,8 @@ impl eframe::App for App {
         }
 
         let effects = self.claude.tick(&shell_pids, self.ws.active, &titles);
+        let claude = &self.claude;
+        self.job_ends.poll(|id| claude.job(id).is_some());
         for msg in effects.codex {
             let Some(id) = claude_watch::ClaudeWatch::tab_id_of(&msg) else {
                 continue;
