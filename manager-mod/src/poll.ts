@@ -3,6 +3,7 @@ import type { EngineInterface } from 'claude-code'
 import type { AgentRow, FeedRow } from '../types'
 
 import { feedDir, newWatch, pollFeed } from './feed'
+import { givernyHookOn } from './giverny'
 import { newLive, readAgents, readAround } from './live'
 import { buildModel, clearable, dueChores } from './model'
 import { readCleared, readFolded, writeCleared, writeView } from './state'
@@ -66,7 +67,8 @@ export async function startPolling($: EngineInterface): Promise<void> {
       if (now - choresAt >= CHORES_MS && around.manager && feed?.writer === 'giverny/manage') {
         choresAt = now
         const due = dueChores(feed, agents, now, full)
-        const text = due.chores.length === 0 ? '' : JSON.stringify(due.finishing.length === 0 ? { chores: due.chores } : due)
+        // With no Giverny hook to read it, the file would only be litter.
+        const text = due.chores.length === 0 || !(await givernyHookOn($)) ? '' : JSON.stringify(due.finishing.length === 0 ? { chores: due.chores } : due)
         if (text !== choresWritten) choresWritten = await publishChores($, session, text)
       }
     } finally {
@@ -112,7 +114,8 @@ export async function clearDone($: EngineInterface): Promise<string> {
     const r = await $.process.run([command, 'clear-done'], { env: { CLAUDE_CODE_SESSION_ID: session } })
     said = `${r.stdout}${r.stderr}`.trim()
   } catch (e) {
-    said = `giverny-manage did not run: ${e instanceof Error ? e.message : String(e)}`
+    // No Giverny here: there is no feed of its to clear, and the band hides the rest below.
+    said = /not found|ENOENT/.test(String(e)) ? '' : `giverny-manage did not run: ${e instanceof Error ? e.message : String(e)}`
   }
   // Another writer's feed keeps its Done rows, and Claude Code still lists finished workers:
   // the band hides what landed by now, and they do not come back.

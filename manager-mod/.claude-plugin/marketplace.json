@@ -1,0 +1,5 @@
+{
+  "name": "manager",
+  "owner": { "name": "theitush" },
+  "plugins": [{ "name": "manager", "source": "./", "description": "A manager session's Running, Next up and Done as a band above the prompt" }]
+}

@@ -3,6 +3,7 @@ import type { EngineInterface } from 'claude-code'
 import type { AgentEta, AgentRow, Around, DoneRows, Feed, Hold, Ledger, Shell, Span } from '../types'
 
 import { feedDir } from './feed'
+import { givernyHookOn } from './giverny'
 import { parseLedger } from './lease'
 import { isRunning } from './model'
 import { spent, track } from './time'
@@ -331,7 +332,13 @@ async function readRuns($: EngineInterface, w: LiveWatch, ledgerDir: string, ses
   return keys
 }
 
-async function readManager($: EngineInterface, w: LiveWatch, dir: string, sessions: string[], now: number): Promise<boolean> {
+/**
+ * Giverny's hook marks a session when the manage skill runs, and with that hook on nothing else
+ * does (a stray row of a session's own is no manager, giverny#357). With no such hook nothing
+ * could ever mark it, so there a Next up row does: planning is what a manager does, and a plain
+ * session that only spawns workers has none. Once a manager, always one for this conversation.
+ */
+async function readManager($: EngineInterface, w: LiveWatch, dir: string, feed: Feed | undefined, sessions: string[], now: number): Promise<boolean> {
   if (w.manager || now - w.markReadAt < MARK_READ_MS) return w.manager
   w.markReadAt = now
   for (const s of sessions) {
@@ -343,7 +350,8 @@ async function readManager($: EngineInterface, w: LiveWatch, dir: string, sessio
       // Not under this id.
     }
   }
-  return false
+  if (feed?.rows.some(r => r.stage === 'planned') && !(await givernyHookOn($))) w.manager = true
+  return w.manager
 }
 
 async function readLimit($: EngineInterface, w: LiveWatch, now: number): Promise<void> {
@@ -372,7 +380,7 @@ export async function readAround($: EngineInterface, w: LiveWatch, session: stri
   const toml = await textOf($, w, `${config}/giverny/config.toml`, SLOW_READ_MS, now)
   await readLimit($, w, now)
   return {
-    manager: await readManager($, w, dir, sessions, now),
+    manager: await readManager($, w, dir, feed, sessions, now),
     sessions,
     ledger,
     runs: await readRuns($, w, ledgerDir, sessions, now),
