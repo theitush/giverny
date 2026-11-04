@@ -2,5 +2,15 @@
   "name": "manager",
   "version": "0.1.0",
   "description": "A manager session's Running, Next up and Done, from its giverny-manage feed and its live subagents, as a band above the prompt in plain Claude Code",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "column_stage": { "type": "boolean", "title": "Column: stage", "description": "The band's mark for how a row stands", "default": true },
+    "column_id": { "type": "boolean", "title": "Column: id", "description": "A row's task id", "default": true },
+    "column_title": { "type": "boolean", "title": "Column: title", "description": "A row's title", "default": true },
+    "column_elapsed": { "type": "boolean", "title": "Column: elapsed", "description": "How long a row has run", "default": true },
+    "column_eta": { "type": "boolean", "title": "Column: ETA", "description": "A row's estimate, and the gauge that draws it", "default": true },
+    "column_now": { "type": "boolean", "title": "Column: now", "description": "What a row does, what it waits for, how it landed", "default": true },
+    "column_tokens": { "type": "boolean", "title": "Column: tokens", "description": "The context of a row's worker", "default": true },
+    "column_usage": { "type": "boolean", "title": "Column: use", "description": "A row's CPU as a share of the machine and its memory. Off, nothing reads the processes", "default": true }
+  }
 }

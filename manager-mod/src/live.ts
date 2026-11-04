@@ -1,11 +1,12 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { AgentEta, AgentRow, Around, DoneRows, Feed, Hold, Ledger, Shell, Span } from '../types'
+import type { AgentEta, AgentRow, Around, DoneRows, Feed, Hold, Ledger, RunFile, Shell, Span } from '../types'
 
 import { feedDir } from './feed'
 import { givernyHookOn } from './giverny'
 import { parseLedger } from './lease'
 import { isRunning } from './model'
+import { newUseWatch, readUse, type UseWatch } from './stats'
 import { spent, track } from './time'
 import { firstStamp, foldTranscript, mergeStops } from './transcript'
 
@@ -36,6 +37,8 @@ type AgentFacts = {
   model?: string
   stops: AgentRow['stops']
   transcript?: string
+  /** Its Bash commands in flight or in the background. */
+  commands: string[]
 }
 /** A background shell: the processes holding its output file when first looked at, or ended. */
 type ShellState = { pids: [number, string][] } | 'ended'
@@ -49,8 +52,9 @@ export type LiveWatch = {
   holds: Hold[]
   manager: boolean
   markReadAt: number
-  runs: string[]
+  runs: RunFile[]
   runsReadAt: number
+  use: UseWatch
   usageReadAt: number
   limit?: Around['limit']
   subagentDirs: Map<string, string>
@@ -67,6 +71,7 @@ export const newLive = (): LiveWatch => ({
   markReadAt: 0,
   runs: [],
   runsReadAt: 0,
+  use: newUseWatch(),
   usageReadAt: 0,
   subagentDirs: new Map(),
   session: '',
@@ -137,7 +142,7 @@ async function factsOf($: EngineInterface, w: LiveWatch, dirs: string[], id: str
       known.readAt = now
       return known
     }
-    const facts: AgentFacts = known ?? { stamp, readAt: now, firstRead: false, stops: [], transcript: path }
+    const facts: AgentFacts = known ?? { stamp, readAt: now, firstRead: false, stops: [], transcript: path, commands: [] }
     facts.stamp = stamp
     facts.readAt = now
     try {
@@ -154,6 +159,7 @@ async function factsOf($: EngineInterface, w: LiveWatch, dirs: string[], id: str
       facts.activity = found.activity ?? facts.activity
       facts.model = found.model ?? facts.model
       facts.stops = mergeStops(facts.stops ?? [], found.stops)
+      facts.commands = found.commands
     } catch {
       // Keep what the last read found.
     }
@@ -312,24 +318,24 @@ async function readShells($: EngineInterface, w: LiveWatch, dir: string, session
   return out
 }
 
-/** The keys with a `giverny-manage run` of this session going. */
-async function readRuns($: EngineInterface, w: LiveWatch, ledgerDir: string, sessions: string[], now: number): Promise<string[]> {
+/** The `giverny-manage run`s of this session going. */
+async function readRuns($: EngineInterface, w: LiveWatch, ledgerDir: string, sessions: string[], now: number): Promise<RunFile[]> {
   if (now - w.runsReadAt < RUNS_READ_MS) return w.runs
   w.runsReadAt = now
-  const keys: string[] = []
+  const runs: RunFile[] = []
   try {
     for (const f of await $.fs.list(`${ledgerDir}/runs`)) {
       if (!f.name.endsWith('.live')) continue
-      const raw = JSON.parse(await $.fs.read(`${ledgerDir}/runs/${f.name}`)) as { task?: unknown; session?: unknown; pid?: unknown }
+      const raw = JSON.parse(await $.fs.read(`${ledgerDir}/runs/${f.name}`)) as { task?: unknown; session?: unknown; pid?: unknown; stats?: unknown }
       if (typeof raw.task !== 'string' || typeof raw.session !== 'string' || !sessions.includes(raw.session)) continue
       // One left by a killed `run` is skipped.
-      if (await $.fs.exists(`/proc/${String(raw.pid)}`)) keys.push(raw.task)
+      if (await $.fs.exists(`/proc/${String(raw.pid)}`)) runs.push({ task: raw.task, session: raw.session, pid: Number(raw.pid), stats: typeof raw.stats === 'string' ? raw.stats : '' })
     }
   } catch {
     return w.runs
   }
-  w.runs = keys
-  return keys
+  w.runs = runs
+  return runs
 }
 
 /**
@@ -367,7 +373,7 @@ async function readLimit($: EngineInterface, w: LiveWatch, now: number): Promise
 }
 
 /** Everything but the folds and the clear-done, which are the band's own state. */
-export async function readAround($: EngineInterface, w: LiveWatch, session: string, feed: Feed | undefined, agents: AgentRow[], now: number): Promise<Omit<Around, 'folded' | 'dismissed'>> {
+export async function readAround($: EngineInterface, w: LiveWatch, session: string, feed: Feed | undefined, agents: AgentRow[], now: number, wantUse: boolean): Promise<Omit<Around, 'folded' | 'dismissed'>> {
   const dir = await feedDir($)
   const sessions = [...new Set([session, ...(feed?.session ? [feed.session] : []), ...(feed?.aliases ?? [])])]
   const ledgerFile = (await $.env.get('GIVERNY_LEDGER')) || `${dir}/resources/ledger.json`
@@ -379,16 +385,19 @@ export async function readAround($: EngineInterface, w: LiveWatch, session: stri
   const sleeps = await textOf($, w, `${dir}/sleeps.jsonl`, SLOW_READ_MS, now)
   const toml = await textOf($, w, `${config}/giverny/config.toml`, SLOW_READ_MS, now)
   await readLimit($, w, now)
+  const runs = await readRuns($, w, ledgerDir, sessions, now)
+  const calls = new Map(agents.flatMap(a => (w.agents.get(a.id)?.commands.length ? [[a.id, w.agents.get(a.id)!.commands] as const] : [])))
   return {
     manager: await readManager($, w, dir, feed, sessions, now),
     sessions,
     ledger,
-    runs: await readRuns($, w, ledgerDir, sessions, now),
+    runs: runs.map(r => r.task),
     etas: etas === undefined ? {} : parseEtas(etas),
     shells: await readShells($, w, dir, session, agents, now),
     sleeps: sleeps === undefined ? [] : parseSleeps(sleeps),
     holds: w.holds,
     limit: w.limit,
     doneRows: toml === undefined ? 'all' : parseDoneRows(toml),
+    use: wantUse ? await readUse($, w.use, runs, calls, agents.some(isRunning), now) : undefined,
   }
 }

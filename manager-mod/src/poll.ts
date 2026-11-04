@@ -6,7 +6,7 @@ import { feedDir, newWatch, pollFeed } from './feed'
 import { givernyHookOn } from './giverny'
 import { newLive, readAgents, readAround } from './live'
 import { buildModel, clearable, dueChores } from './model'
-import { readCleared, readFolded, writeCleared, writeView } from './state'
+import { readCleared, readFolded, readHidden, writeCleared, writeView } from './state'
 import { minuteOf } from './time'
 
 const POLL_MS = 2000
@@ -16,13 +16,18 @@ const EMPTY = JSON.stringify(buildModel(undefined, [], 0))
 /** Polls now, for a change the person just made. */
 let pollNow: () => Promise<void> = async () => {}
 let finishedAgents: () => string[] = () => []
+let polling = false
 
 /**
  * Keeps `view` current. A poll costs a few `stat`s and `$.agent.list()`; the clocks count from
  * the start of the minute, so nothing differs between minutes unless the feed or a worker
  * does, and a `view` that does not differ is not written, so the band is not redrawn.
  */
-export async function startPolling($: EngineInterface): Promise<void> {
+export async function startPolling($: EngineInterface, wantUse = true): Promise<void> {
+  // A reload drops the timers and leaves no `session.start` to set them again (register.tsx), and
+  // the module's own state goes with them; so this holds for one load.
+  if (polling) return
+  polling = true
   const watch = newWatch()
   const live = newLive()
   const dev = Boolean(await $.env.get('MANAGER_MOD_DEV'))
@@ -51,13 +56,15 @@ export async function startPolling($: EngineInterface): Promise<void> {
         }
         return
       }
-      const around = await readAround($, live, session, feed, agents, now)
+      // Figures nothing draws cost nothing: the column off, or the band hidden.
+      const around = await readAround($, live, session, feed, agents, now, wantUse && !(await readHidden($)))
       const shells = { ...around.shells }
       for (const a of dev ? (feed?.dev_agents ?? []) : []) {
         if (a.shells) shells[a.id] = a.shells
       }
       const cleared = await readCleared($)
       const full = { ...around, shells, folded: await readFolded($), clearedMs: cleared.atMs, dismissed: cleared.agents }
+      if (dev && feed?.dev_use) full.use = { tasks: Object.fromEntries(Object.entries(feed.dev_use).map(([key, use]) => [key, { use }])), workers: {}, ramMb: 32768 }
       const model = buildModel(feed, agents, minuteOf(now), full)
       const drawn = JSON.stringify(model)
       if (drawn !== shown) {

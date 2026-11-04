@@ -1,7 +1,8 @@
-import type { AgentRow, Around, DisplayRow, DoneRows, Feed, FeedRow, Model, RowFold, Section, Shell, Stage, Stop } from '../types'
+import type { AgentRow, Around, DisplayRow, DoneRows, Feed, FeedRow, Model, RowFold, RowUse, Section, Shell, Stage, Stop } from '../types'
 
 import { GRANTED_WAITING, leaseFact, queuedNote, queuedWhy, usageFact, withLedger } from './lease'
 import { gist, named } from './shell-name'
+import { loadOf, memShare, plusUse } from './stats'
 import { clockAt, countdown, fmtDelta, fmtSpan, fmtTokens, offMs } from './time'
 
 // Feed rows and live agents into what the band draws: plain data, no `$`.
@@ -797,6 +798,7 @@ function formatRow(r: PaneRow, now: number, written: number | undefined, a: Arou
     what,
     flag: flag !== undefined,
     tokens,
+    use: useCell(r, a),
     oom,
     why,
     facts,
@@ -825,6 +827,21 @@ function dittos(rows: PaneRow[], lines: DisplayRow[]): void {
     if (mine.what && mine.what === above.what) line.what = '"'
     if (mine.tokens && mine.tokens === above.tokens) line.tokens = '"'
   })
+}
+
+/** The use cell: its worker's commands and its runs, once each; a Done row's peak. */
+function useCell(r: PaneRow, a: Around): RowUse | undefined {
+  if (r.stage === 'done') {
+    const peak = r.feed?.usage?.peak_mb
+    return peak ? { memMb: peak, cpuLoad: 'light', memLoad: 'light' } : undefined
+  }
+  if (r.stage !== 'running') return undefined
+  const agent = agentIdOf(r)
+  const worker = agent === undefined ? undefined : a.use?.workers[agent]
+  const run = r.feed === undefined ? undefined : a.use?.tasks[r.feed.key]
+  const sum = worker && run && run.agent !== agent ? plusUse(worker, run.use) : (worker ?? run?.use)
+  if (!sum || (sum.cpuPct === 0 && sum.memMb === 0)) return undefined
+  return { cpuPct: sum.cpuPct, memMb: sum.memMb, cpuLoad: loadOf(sum.cpuPct), memLoad: loadOf(memShare(sum.memMb, a.use?.ramMb)) }
 }
 
 const NOTHING: Around = { manager: false, sessions: [], runs: [], etas: {}, shells: {}, sleeps: [], holds: [], doneRows: 'all', folded: [], dismissed: [] }

@@ -52,6 +52,14 @@ It turns an **ask** into an **allow** only when both hold:
 
 Only one such command runs per session, and one in `~/.claude/settings.json` beats one in a plugin's own settings. So the plugin answers Claude Code's read of the merged settings (`settings.read`), and no file is changed.
 
+## Columns
+
+The rows draw a mark, id, title, the ETA's gauge, elapsed, ETA, NOW, tokens and use. Each has a switch in `/config` (`column_stage`, `column_id`, `column_title`, `column_elapsed`, `column_eta`, `column_now`, `column_tokens`, `column_usage`, all on), which applies at once: a column off takes no width and the rest close up. The gauge goes with the ETA. As the terminal narrows, tokens go first, then the word `CPU`, then the use, then the rest as before.
+
+**Use** is what a Running row's commands use now: its worker's Bash commands, with all they started, and its `giverny-manage run` scopes. CPU is a share of the whole machine, every core busy being 100%, and memory is proportional sets, shared pages split. A figure over 20% of the machine turns amber, over 50% red. A Done row shows its peak memory. A command the session itself runs, or one two workers have in flight at once, belongs to no row. Linux only, as it reads `/proc`.
+
+The plugin reads every process's `stat` every 4 seconds while a worker or a run is going, and nothing while none is, the band is hidden or the column is off. GPU memory is not shown.
+
 ## Known limits
 
 - A new worker can show in Claude's list for a moment before it is hidden.

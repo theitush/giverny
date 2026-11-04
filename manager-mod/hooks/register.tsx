@@ -1,21 +1,41 @@
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import { drawBand } from '../src/band'
+import { drawBand, switchesOf } from '../src/band'
 import { answerMerge, hintWithoutAgents, insideGivernyTab, letManagerThrough } from '../src/giverny'
 import { clearDone, startPolling } from '../src/poll'
 import { toggleHidden } from '../src/state'
 import { drawPage, goBack, noteScroll, PANE, pageClosed, startFollowing } from '../src/worker'
 
 // Wiring only: what each event runs lives in src/. Inside a Giverny tab every hook passes.
-export const register: Register = on => {
-  on('session.start', async ($, e, next) => {
-    if (await insideGivernyTab($)) return next(e)
+
+const AFTER_RELOAD_MS = 1000
+
+let begun = false
+let beginSoon = false
+
+async function begin($: EngineInterface, wantUse: boolean): Promise<void> {
+  if (begun) return
+  begun = true
+  try {
     await $.command.register({
       name: 'manager',
       description: 'Show or hide the manager band: Running, Next up and Done from this session; `/manager back` leaves a worker for the manager; `/manager clear-done` clears its Done rows',
     })
-    await startPolling($)
+    await startPolling($, wantUse)
     startFollowing($)
+  } catch (err) {
+    // Before the session binds: `session.start`, or the next drawing, begins it.
+    begun = false
+    throw err
+  }
+}
+
+export const register: Register = (on, options) => {
+  const switches = switchesOf(options)
+
+  on('session.start', async ($, e, next) => {
+    if (await insideGivernyTab($)) return next(e)
+    await begin($, switches.usage)
     return next(e)
   })
 
@@ -51,7 +71,19 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => (await drawBand($, e)) ?? next(e))
+  // A change in the config menu reloads this module, which drops the timers, and no `session.start`
+  // comes after it: the first drawing after a load starts them again. Not from the drawing itself,
+  // which may change no state: from a timer, once it has settled.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!begun && !beginSoon && !(await insideGivernyTab($))) {
+      beginSoon = true
+      $.clock.after(AFTER_RELOAD_MS, () => {
+        beginSoon = false
+        return begin($, switches.usage).catch(() => {})
+      })
+    }
+    return (await drawBand($, e, switches)) ?? next(e)
+  })
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const hint = hintWithoutAgents(e.props.hint)

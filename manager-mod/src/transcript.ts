@@ -11,6 +11,8 @@ export type TranscriptFacts = {
   activity?: string
   model?: string
   stops: Stop[]
+  /** Its Bash commands with no result yet, or sent to the background. */
+  commands: string[]
 }
 
 const ACTIVITY_ARGS = ['description', 'command', 'file_path', 'path', 'pattern', 'url', 'query', 'skill', 'to', 'prompt']
@@ -70,12 +72,16 @@ function contextTokens(u: Record<string, unknown>): number {
 
 /** The facts in `text`, a transcript or its tail: a first line cut in half is skipped. */
 export function foldTranscript(text: string): TranscriptFacts {
-  const facts: TranscriptFacts = { stops: [] }
+  const facts: TranscriptFacts = { stops: [], commands: [] }
+  const calls: { id: string; command: string; background: boolean }[] = []
+  const answered = new Set<string>()
   for (const line of text.split('\n')) {
     if (line === '') continue
     const quick = /"timestamp":"([^"]+)"/.exec(line)?.[1]
     const at = stamp(quick)
     if (at !== undefined) facts.lastMs = at
+    // Unparsed: a result can be long, and a quote inside one is escaped so it matches nothing here.
+    for (const m of line.matchAll(/"tool_use_id":"([^"]+)"/g)) answered.add(m[1]!)
     if (!line.includes('"assistant"')) continue
     let v: { type?: unknown; timestamp?: unknown; isApiErrorMessage?: unknown; error?: unknown; message?: Record<string, unknown> }
     try {
@@ -102,8 +108,14 @@ export function foldTranscript(text: string): TranscriptFacts {
     if (Array.isArray(msg.content)) {
       const use = [...msg.content].reverse().find(c => (c as { type?: unknown }).type === 'tool_use')
       if (use) facts.activity = describeToolUse(use as never)
+      for (const c of msg.content as { type?: unknown; name?: unknown; id?: unknown; input?: { command?: unknown; run_in_background?: unknown } }[]) {
+        if (c.type === 'tool_use' && c.name === 'Bash' && typeof c.id === 'string' && typeof c.input?.command === 'string') {
+          calls.push({ id: c.id, command: c.input.command, background: c.input.run_in_background === true })
+        }
+      }
     }
   }
+  facts.commands = calls.filter(c => c.background || !answered.has(c.id)).map(c => c.command)
   return facts
 }
 

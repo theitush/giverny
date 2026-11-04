@@ -1,6 +1,6 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { AgentRow, Feed, FeedLease, FeedRow, FeedUsage, Stage } from '../types'
+import type { AgentRow, Feed, FeedLease, FeedRow, FeedUsage, Stage, Use } from '../types'
 
 // This session's feed, read only when its file changed: one `stat` a poll otherwise.
 // The format is docs/management-panel.md; parse() is crates/claude/src/feed.rs's forgiving
@@ -160,6 +160,7 @@ export function parse(source: string): Feed | undefined {
     footer: typeof footer === 'object' && footer !== null ? text((footer as { text?: unknown }).text) : text(footer),
     rows: Array.isArray(raw.rows) ? raw.rows.flatMap(r => parseRow(r) ?? []) : [],
     dev_agents: Array.isArray(raw.dev_agents) ? raw.dev_agents.flatMap(a => parseDevAgent(a) ?? []) : undefined,
+    dev_use: typeof raw.dev_use === 'object' && raw.dev_use !== null ? (raw.dev_use as Record<string, Use>) : undefined,
   }
 }
 

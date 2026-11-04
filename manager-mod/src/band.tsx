@@ -1,8 +1,9 @@
 import type { Color, EngineInterface, RenderInput } from 'claude-code'
 
-import type { DisplayRow, Model, Section } from '../types'
+import type { DisplayRow, Load, Model, Section } from '../types'
 
 import { cells, cut, cutMiddle, padEnd, padStart } from './cells'
+import { gb } from './lease'
 import { redrawSoon } from './poll'
 import { readHidden, readPage, readSaid, readView, toggleFold } from './state'
 import { GAUGE, INK, type Mark, markOf, SECTION_MARK, wantsEye } from './theme'
@@ -23,8 +24,29 @@ const SCREEN_SHARE = 0.4
 const INLINE_MIN = 28
 const ALL = Number.MAX_SAFE_INTEGER
 
-/** Widths in cells, 0 for a column not drawn. `tags`: titles keep their `BUG: area:`. */
-export type Cols = { key: number; title: number; tags: boolean; gauge: number; elapsed: number; eta: number; now: number }
+/**
+ * Widths in cells, 0 for a column not drawn. `tags`: titles keep their `BUG: area:`. `use`: as wide
+ * as USE_WIDE says `% CPU`, as wide as USE_NARROW only `%`. `mark`: the gutter is drawn.
+ */
+export type Cols = { mark: boolean; key: number; title: number; tags: boolean; gauge: number; elapsed: number; eta: number; now: number; tokens: number; use: number }
+
+/** `[management_panel.columns]` of the doc, the manifest's `userConfig`. The gauge goes with the ETA it draws. */
+export type Switches = { stage: boolean; id: boolean; title: boolean; elapsed: boolean; eta: boolean; now: boolean; tokens: boolean; usage: boolean }
+export const ALL_ON: Switches = { stage: true, id: true, title: true, elapsed: true, eta: true, now: true, tokens: true, usage: true }
+
+/** The manifest's fields into switches; a field not there is on. */
+export function switchesOf(options: Readonly<Record<string, unknown>>): Switches {
+  const on = (name: keyof Switches) => options[`column_${name}`] !== false
+  return { stage: on('stage'), id: on('id'), title: on('title'), elapsed: on('elapsed'), eta: on('eta'), now: on('now'), tokens: on('tokens'), usage: on('usage') }
+}
+
+/** `100% CPU  4.2G` and `100%  4.2G`. */
+const USE_WIDE = 14
+const USE_NARROW = 10
+/** What the title and NOW keep before a column of figures comes in: those go first. */
+const TITLE_KEEPS = 20
+const NOW_KEEPS = 44
+const GAUGE_FROM = 104
 
 /** `12m`, `1h3m`, `1d3h12m`, `~8m`, `-~8m`, in minutes; undefined when it is not a span. */
 export function minutes(words: string): number | undefined {
@@ -63,24 +85,42 @@ export function splitTitle(title: string): { tag: string; body: string } {
 /** A row's fold note for this width: what its folded rows are. */
 const foldNote = (r: DisplayRow, width: number) => (r.fold ? (width < 100 ? r.fold.shortNote : r.fold.note) : '')
 
+/** The figures' widths that fit in `room` with the title and NOW still at ease: tokens go first, then the `CPU`, then the figures. */
+function figures(rows: DisplayRow[], room: number, on: Switches): { tokens: number; use: number } {
+  const wantTokens = on.tokens ? Math.max(0, ...rows.map(r => cells(r.tokens))) : 0
+  const wantUse = on.usage && rows.some(r => r.use !== undefined)
+  const keeps = (on.title ? TITLE_KEEPS : 0) + (on.now ? NOW_KEEPS : 0)
+  const cost = (w: number) => (w ? w + GAP : 0)
+  const tries = wantUse
+    ? [[wantTokens, USE_WIDE], [wantTokens, USE_NARROW], [0, USE_WIDE], [0, USE_NARROW]]
+    : [[wantTokens, 0]]
+  const fit = tries.find(([t, u]) => room - cost(t!) - cost(u!) >= keeps)
+  return fit ? { tokens: fit[0]!, use: fit[1]! } : { tokens: 0, use: 0 }
+}
+
 /**
- * The columns for these rows in `width` cells. Times keep their place at any width; the title gives
- * way first, then the gauge, then NOW, then the elapsed clock. Spare room stays at the right, so the
- * eye never has to cross a gap to get from a title to its times.
+ * The columns for these rows in `width` cells. Times keep their place at any width; tokens and use
+ * give way first, then the title, the gauge, NOW and the elapsed clock. Spare room stays
+ * at the right, so the eye never has to cross a gap to get from a title to its times. A column
+ * switched off takes no width and the rest close up.
  */
-export function columns(rows: DisplayRow[], width: number): Cols {
+export function columns(rows: DisplayRow[], width: number, on: Switches = ALL_ON): Cols {
   const longest = (of: (r: DisplayRow) => string) => Math.max(0, ...rows.map(r => cells(of(r))))
-  const key = Math.min(width < 70 ? 10 : 16, longest(r => r.key))
-  const elapsed = width < 64 ? 0 : Math.max(3, longest(r => r.elapsed))
-  const eta = Math.max(4, longest(r => etaCell(r, elapsed > 0)))
-  const fixed = GUTTER + (key ? key + GAP : 0) + (elapsed ? elapsed + GAP : 0) + eta
+  const key = on.id ? Math.min(width < 70 ? 10 : 16, longest(r => r.key)) : 0
+  const elapsed = !on.elapsed || width < 64 ? 0 : Math.max(3, longest(r => r.elapsed))
+  const eta = on.eta ? Math.max(4, longest(r => etaCell(r, elapsed > 0))) : 0
+  const fixed = (on.stage ? GUTTER : 0) + (key ? key + GAP : 0) + (elapsed ? elapsed + GAP : 0) + eta
   const room = width - fixed - GAP
-  const hasGauge = rows.some(r => gauge(r, 8) !== undefined)
-  const gaugeW = !hasGauge ? 0 : width >= 130 ? 14 : width >= 104 ? 8 : 0
+  const hasGauge = on.eta && rows.some(r => gauge(r, 8) !== undefined)
+  const gaugeW = !hasGauge ? 0 : width >= 130 ? 14 : width >= GAUGE_FROM ? 8 : 0
   const afterGauge = room - (gaugeW ? gaugeW + GAP : 0)
-  const wantNow = longest(nowWords)
-  const now = wantNow > 0 && afterGauge >= 44 ? Math.min(wantNow, Math.max(16, Math.floor(afterGauge * 0.42))) : 0
-  const titleRoom = Math.max(0, afterGauge - (now ? now + GAP : 0))
+  // The figures come in only where the gauge has its place: they go before it.
+  const { tokens, use } = width >= GAUGE_FROM ? figures(rows, afterGauge, on) : { tokens: 0, use: 0 }
+  const afterFigures = afterGauge - (tokens ? tokens + GAP : 0) - (use ? use + GAP : 0)
+  const wantNow = on.now ? longest(nowWords) : 0
+  const share = on.title ? Math.max(16, Math.floor(afterFigures * 0.42)) : afterFigures
+  const now = wantNow > 0 && afterFigures >= NOW_KEEPS ? Math.min(wantNow, share) : 0
+  const titleRoom = on.title ? Math.max(0, afterFigures - (now ? now + GAP : 0)) : 0
   // With no NOW column a waiting row's reason shares the title's cell, so the cell counts it.
   const beside = (r: DisplayRow) => {
     const reason = now === 0 && r.section === 'next' && r.what ? cells(r.what) + GAP : 0
@@ -91,7 +131,26 @@ export function columns(rows: DisplayRow[], width: number): Cols {
   // Types and areas stay on every row or on none: a column that drops them row by row reads as noise.
   const tags = want(r => r.title) <= titleRoom
   const title = Math.min(titleRoom, want(r => (tags ? r.title : splitTitle(r.title).body)))
-  return { key, title, tags, gauge: gaugeW, elapsed, eta, now }
+  return { mark: on.stage, key, title, tags, gauge: gaugeW, elapsed, eta, now, tokens, use }
+}
+
+/** A figure wants a look by its weight on the whole machine; light, it stays dim. */
+const LOAD_INK: Record<Load, Color | undefined> = { light: undefined, busy: INK.behind, heavy: INK.failed }
+
+/** The use cell, exactly `width` cells, for `width` USE_WIDE or USE_NARROW: `  14% CPU  4.2G`, a Done row's peak alone. */
+export function useSegs(u: NonNullable<DisplayRow['use']>, width: number): Seg[] {
+  const unit = width >= USE_WIDE ? '% CPU' : '%'
+  const ink = (load: Load): Omit<Seg, 'text'> => {
+    const color = LOAD_INK[load]
+    return color ? { color, dim: false } : { dim: true }
+  }
+  const memory = padStart(gb(u.memMb), width - 3 - unit.length - GAP)
+  if (u.cpuPct === undefined) return [{ text: ' '.repeat(width - cells(memory)), dim: true }, { text: memory, dim: true }]
+  return [
+    { text: padStart(`${u.cpuPct}${unit}`, 3 + unit.length), ...ink(u.cpuLoad) },
+    { text: ' '.repeat(GAP), dim: true },
+    { text: memory, ...ink(u.memLoad) },
+  ]
 }
 
 const wantsLook = (r: DisplayRow) => r.over || r.flag || r.oom || wantsEye(r) || markOf(r).color === INK.failed
@@ -154,28 +213,30 @@ export type Seg = { text: string; color?: Color; dim?: boolean; bold?: boolean; 
 export function rowSegs(r: DisplayRow, c: Cols, width = 200): Seg[] {
   const mark: Mark = markOf(r)
   const quiet = r.own !== 'running' || mark.dim === true
-  const segs: Seg[] = [{ text: mark.glyph, color: mark.color, dim: mark.dim }, { text: ' ' }]
+  const segs: Seg[] = c.mark ? [{ text: mark.glyph, color: mark.color, dim: mark.dim }, { text: ' ' }] : []
   const push = (text: string, style: Omit<Seg, 'text'> = {}) => segs.push({ dim: quiet, ...style, text })
 
   if (c.key) push(padEnd(cutMiddle(r.key, c.key), c.key + GAP), { bold: r.own === 'running' && !quiet })
 
-  if (r.head) push(r.head, { dim: true, toggle: r.fold !== undefined })
-  const left = c.title - cells(r.head)
-  // With no NOW column a waiting row says why in its title's cell; the wait is what it is about.
-  const inline = c.now === 0 && r.section === 'next' && c.title >= INLINE_MIN ? r.what : ''
-  const inlineW = Math.min(cells(inline), Math.floor(left / 2))
-  const note = foldNote(r, width)
-  const noteW = note ? cells(note) + GAP : 0
-  const titleW = left - (inlineW ? inlineW + GAP : 0) - noteW
-  const whole = splitTitle(r.title)
-  const tag = c.tags ? whole.tag : ''
-  const body = cut(whole.body, titleW - cells(tag))
-  if (tag) push(tag, { dim: true })
-  push(body)
-  if (note) push(`${' '.repeat(GAP)}${note}`, { dim: true })
-  push(' '.repeat(Math.max(0, titleW - cells(tag) - cells(body))))
-  if (inlineW) push(`${' '.repeat(GAP)}${cut(inline, inlineW)}`, { dim: true })
-  push(' '.repeat(GAP))
+  if (c.title > 0) {
+    if (r.head) push(r.head, { dim: true, toggle: r.fold !== undefined })
+    const left = c.title - cells(r.head)
+    // With no NOW column a waiting row says why in its title's cell; the wait is what it is about.
+    const inline = c.now === 0 && r.section === 'next' && c.title >= INLINE_MIN ? r.what : ''
+    const inlineW = Math.min(cells(inline), Math.floor(left / 2))
+    const note = foldNote(r, width)
+    const noteW = note ? cells(note) + GAP : 0
+    const titleW = left - (inlineW ? inlineW + GAP : 0) - noteW
+    const whole = splitTitle(r.title)
+    const tag = c.tags ? whole.tag : ''
+    const body = cut(whole.body, titleW - cells(tag))
+    if (tag) push(tag, { dim: true })
+    push(body)
+    if (note) push(`${' '.repeat(GAP)}${note}`, { dim: true })
+    push(' '.repeat(Math.max(0, titleW - cells(tag) - cells(body))))
+    if (inlineW) push(`${' '.repeat(GAP)}${cut(inline, inlineW)}`, { dim: true })
+    push(' '.repeat(GAP))
+  }
 
   if (c.gauge) {
     const g = gauge(r, c.gauge)
@@ -196,14 +257,25 @@ export function rowSegs(r: DisplayRow, c: Cols, width = 200): Seg[] {
   }
 
   if (c.elapsed) push(padStart(r.elapsed, c.elapsed) + ' '.repeat(GAP), { dim: true })
-  const eta = padEnd(etaCell(r, c.elapsed > 0), c.eta)
-  if (r.over && !quiet) push(eta, { color: INK.behind, dim: false })
-  else push(eta, { dim: quiet || r.noEta })
+  if (c.eta) {
+    const eta = padEnd(etaCell(r, c.elapsed > 0), c.eta)
+    if (r.over && !quiet) push(eta, { color: INK.behind, dim: false })
+    else push(eta, { dim: quiet || r.noEta })
+  }
 
+  // A row with no figures lends NOW their cells: `queued for 3G behind demo#12` is longer than NOW.
+  const lendsTokens = c.now > 0 && c.tokens > 0 && r.tokens === ''
+  const lendsUse = c.now > 0 && c.use > 0 && !r.use && (lendsTokens || c.tokens === 0)
   if (c.now) {
     const words = nowWords(r)
     const ink = wantsEye(r) ? INK.eye : mark.color === INK.failed ? INK.failed : mark.glyph === '‖' && mark.color ? mark.color : undefined
-    push(`${' '.repeat(GAP)}${cut(words, c.now)}`, ink ? { color: ink, dim: false } : { dim: true })
+    const nowW = c.now + (lendsTokens ? c.tokens + GAP : 0) + (lendsUse ? c.use + GAP : 0)
+    push(`${' '.repeat(GAP)}${padEnd(cut(words, nowW), nowW)}`, ink ? { color: ink, dim: false } : { dim: true })
+  }
+  if (c.tokens && !lendsTokens) push(`${' '.repeat(GAP)}${padStart(r.tokens, c.tokens)}`, { dim: true })
+  if (c.use && !lendsUse) {
+    push(' '.repeat(GAP))
+    if (r.use) segs.push(...useSegs(r.use, c.use))
   }
   // A row ends on its last word, so a narrow terminal can never wrap on padding.
   while (segs.length > 0 && segs[segs.length - 1]!.text.trim() === '') segs.pop()
@@ -242,7 +314,7 @@ export function counts(model: Model, room: number): { text: string; color?: Colo
 }
 
 /** The band's tree, or undefined with nothing to show. */
-export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
+export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>, on: Switches = ALL_ON) {
   const model = await readView($)
   const words = await readSaid($)
   const page = await readPage($)
@@ -302,7 +374,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const tally = counts(model, width - beside)
   const spare = width - beside - countsWidth(tally)
   const saying = words && spare >= 12 ? <Text dimColor>{cut(words, Math.min(50, spare))}</Text> : undefined
-  const c = columns([...shown.running, ...shown.next, ...shown.done], width)
+  const c = columns([...shown.running, ...shown.next, ...shown.done], width, on)
 
   const row = (r: DisplayRow) => {
     const segs = rowSegs(r, c, width)

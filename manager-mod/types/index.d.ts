@@ -98,6 +98,8 @@ export type Feed = {
   writtenMs?: number
   /** Off-screen tests only (dev/look.sh sets MANAGER_MOD_DEV): stand-in workers. */
   dev_agents?: AgentRow[]
+  /** Off-screen tests only: stand-in figures for the use column, by row key. */
+  dev_use?: Record<string, Use>
 }
 
 export type LedgerLease = {
@@ -168,6 +170,24 @@ export type Hold = { sinceMs: number; untilMs?: number; reopensMs?: number }
 /** The window used up: `5h`, `7d`, and when it reopens. */
 export type Limit = { window?: string; reopensMs?: number }
 
+/** One set of processes' use: CPU as a share of the whole machine, memory as proportional sets. */
+export type Use = { cpuPct: number; memMb: number }
+
+/** How heavy a figure is on the machine: light under 20 %, busy to 50 %, heavy over it. */
+export type Load = 'light' | 'busy' | 'heavy'
+
+/** One `giverny-manage run` going: its `.live` file beside the ledger. */
+export type RunFile = { task: string; session: string; pid: number; stats: string }
+
+/** One pass over the processes (src/stats.ts). */
+export type UseReading = {
+  /** By row key: its runs' processes, and the worker they are under, whose figure holds them too. */
+  tasks: Record<string, { use: Use; agent?: string }>
+  /** By agent id: the Bash commands it started, with all under them. */
+  workers: Record<string, Use>
+  ramMb?: number
+}
+
 /** `management_panel.done_rows`: all, none, or the newest N. */
 export type DoneRows = 'all' | 'hide' | number
 
@@ -194,6 +214,8 @@ export type Around = {
   clearedMs?: number
   /** And the finished workers it cleared. */
   dismissed: string[]
+  /** The use column's figures; absent with the column switched off. */
+  use?: UseReading
 }
 
 export type Section = 'running' | 'next' | 'done'
@@ -211,6 +233,9 @@ export type RowFold = {
   /** `+6`, for a narrow row. */
   shortNote: string
 }
+
+/** The use cell: a Running row's figures now, each with its weight on the machine; a Done row's peak alone. */
+export type RowUse = { cpuPct?: number; memMb: number; cpuLoad: Load; memLoad: Load }
 
 /** One line of the band: all it draws, as text, with the worker a press opens. */
 export type DisplayRow = {
@@ -242,6 +267,8 @@ export type DisplayRow = {
   flag: boolean
   /** TOKENS, as text; on a ditto, `"`. */
   tokens: string
+  /** USE: nothing on a Next up row, on a row with nothing going, or on one that measured nothing. */
+  use?: RowUse
   /** A `giverny-manage run` of it was killed by its memory cap, and that is still news. */
   oom: boolean
   /** The hover: the whole title first, then where the row is and why. */

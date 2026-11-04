@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import type { DisplayRow, Model, Section } from '../types'
 
-import { columns, counts, gauge, moreWords, plan, rowSegs, splitTitle } from './band'
+import { ALL_ON, columns, counts, gauge, moreWords, plan, rowSegs, splitTitle, switchesOf } from './band'
 import { cells, cut, cutMiddle } from './cells'
 import { INK, markOf } from './theme'
 
@@ -137,6 +137,91 @@ test('narrowing loses the gauge, then NOW, then the clock; the key and the ETA l
   const narrow = columns(rows, 50)
   expect([narrow.gauge, narrow.now, narrow.elapsed]).toEqual([0, 0, 0])
   expect(narrow.key > 0 && narrow.eta > 0).toBe(true)
+})
+
+const figured = (mem = 4300) =>
+  model([
+    row({ key: 'r0', section: 'running', elapsed: '14m', left: '~16m', what: 'building the test', tokens: '42.1k', use: { cpuPct: 14, memMb: mem, cpuLoad: 'light', memLoad: 'light' } }),
+    row({ key: 'r1', section: 'running', elapsed: '41m', left: '-~15m', over: true, what: 'linking', tokens: '118.4k', use: { cpuPct: 62, memMb: 22000, cpuLoad: 'heavy', memLoad: 'busy' } }),
+    row({ key: 'n0', section: 'next', left: '~25m', what: 'queued for 3G behind a-long-task-name-indeed-and-more-of-it' }),
+    row({ key: 'd0', section: 'done', elapsed: '48m', left: '(-2m)', what: 'Done', tokens: '88k', use: { memMb: 2150, cpuLoad: 'light', memLoad: 'light' } }),
+  ]).rows
+
+test('tokens and use give way before NOW and the clock, tokens first, and a row still fits', async () => {
+  const rows = figured()
+  const wide = columns(rows, 170)
+  expect([wide.tokens > 0, wide.use]).toEqual([true, 14])
+  const steps = [170, 150, 140, 130, 120, 110, 104, 100, 90, 80, 64, 50].map(w => ({ w, c: columns(rows, w) }))
+  for (const { w, c } of steps) for (const r of rows) expect(cells(text(r, c)) <= w).toBe(true)
+  // Tokens go before the use, the use before the gauge, NOW and the clock.
+  expect(steps.every(({ c }) => c.tokens === 0 || c.use > 0)).toBe(true)
+  expect(steps.every(({ c }) => c.use === 0 || (c.now > 0 && c.elapsed > 0 && (c.gauge > 0 || !gauge(rows[0]!, 8))))).toBe(true)
+  const narrow = columns(rows, 100)
+  expect([narrow.tokens, narrow.use, narrow.now > 0, narrow.elapsed > 0]).toEqual([0, 0, true, true])
+})
+
+test('figures line up down the column; only a heavy one takes ink, and a Done row’s peak sits under the memory', async () => {
+  const rows = figured()
+  const c = columns(rows, 170)
+  const [a, b, , d] = rows.map(r => text(r, c))
+  expect(a!.endsWith('14% CPU  4.2G')).toBe(true)
+  expect(b!.endsWith('62% CPU   21G')).toBe(true)
+  expect(d!.endsWith('2.1G')).toBe(true)
+  expect(a!.indexOf('4.2G')).toBe(d!.indexOf('2.1G'))
+  expect(a!.indexOf('42.1k') + 5).toBe(b!.indexOf('118.4k') + 6)
+  const ink = (r: DisplayRow, word: RegExp) => rowSegs(r, c).find(s => word.test(s.text))
+  expect(ink(rows[0]!, /14%/)?.dim).toBe(true)
+  expect(ink(rows[1]!, /62%/)?.color).toBe(INK.failed)
+  expect(ink(rows[1]!, /21G/)?.color).toBe(INK.behind)
+  // Narrower, the figures stay and `CPU` goes.
+  const short = { ...c, use: 10 }
+  expect(text(rows[0]!, short).endsWith('14%  4.2G')).toBe(true)
+  expect(text(rows[3]!, short).endsWith('2.1G')).toBe(true)
+  expect(text(rows[0]!, short).indexOf('4.2G')).toBe(text(rows[3]!, short).indexOf('2.1G'))
+})
+
+test('a row with no figures lends NOW their cells', async () => {
+  const rows = figured()
+  const c = columns(rows, 170)
+  const waiting = text(rows[2]!, c)
+  expect(waiting.includes('queued for 3G behind a-long-task-name-indeed-and-more-of-it')).toBe(true)
+  expect(cells(waiting) <= 170).toBe(true)
+})
+
+test('a column switched off takes no width and the rest close up', async () => {
+  const rows = figured()
+  const off = (name: keyof typeof ALL_ON) => columns(rows, 170, { ...ALL_ON, [name]: false })
+  expect(off('tokens').tokens).toBe(0)
+  expect(off('usage').use).toBe(0)
+  expect(off('now').now).toBe(0)
+  expect(off('elapsed').elapsed).toBe(0)
+  expect([off('eta').eta, off('eta').gauge]).toEqual([0, 0])
+  expect(off('id').key).toBe(0)
+  expect(off('title').title).toBe(0)
+  expect(text(rows[0]!, off('tokens')).includes('42.1k')).toBe(false)
+  expect(text(rows[0]!, off('stage')).startsWith('r0')).toBe(true)
+  expect(text(rows[0]!, off('id')).startsWith('● r0')).toBe(false)
+  const none = columns(rows, 170, { stage: false, id: true, title: false, elapsed: false, eta: true, now: false, tokens: false, usage: false })
+  expect(text(rows[0]!, none)).toBe('r0  ━━━━━━━───────  ~16m')
+  // Everything off still draws, and draws nothing.
+  const blank = columns(rows, 170, { stage: false, id: false, title: false, elapsed: false, eta: false, now: false, tokens: false, usage: false })
+  expect(text(rows[0]!, blank)).toBe('')
+})
+
+test('a switch in the manifest reaches the band', { options: { column_title: false, column_elapsed: false } }, async ($, on) => {
+  engine(on, FEED, [{ id: 'w1', description: 'build: fix it', type: 'general-purpose', status: 'running' }])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^1 running$/ })) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /the build/ })) === undefined).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /^build/ })) !== undefined).toBe(true)
+  await ui.unmount()
+})
+
+test('the manifest’s fields are the switches, a missing one on', async () => {
+  expect(switchesOf({})).toEqual(ALL_ON)
+  expect(switchesOf({ column_usage: false, column_id: true }).usage).toBe(false)
+  expect(switchesOf({ column_usage: false, column_id: true }).id).toBe(true)
 })
 
 test('a title drops its type and area on every row or on none', async () => {
