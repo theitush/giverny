@@ -7,9 +7,8 @@ import { givernyHookOn } from './giverny'
 import { newLive, readAgents, readAround } from './live'
 import { buildModel, clearable, dueChores } from './model'
 import { readCleared, readFolded, readHidden, writeCleared, writeView } from './state'
-import { minuteOf } from './time'
 
-const POLL_MS = 2000
+const POLL_MS = 1000
 const CHORES_MS = 10_000
 const EMPTY = JSON.stringify(buildModel(undefined, [], 0))
 
@@ -19,9 +18,9 @@ let finishedAgents: () => string[] = () => []
 let polling = false
 
 /**
- * Keeps `view` current. A poll costs a few `stat`s and `$.agent.list()`; the clocks count from
- * the start of the minute, so nothing differs between minutes unless the feed or a worker
- * does, and a `view` that does not differ is not written, so the band is not redrawn.
+ * Keeps `view` current. A poll costs a few `stat`s and `$.agent.list()`. ELAPSED is a stopwatch,
+ * as the panel's, so a Running row redraws the band each second; with none running a `view` that
+ * does not differ is not written, so the band is not redrawn.
  */
 export async function startPolling($: EngineInterface, wantUse = true): Promise<void> {
   // A reload drops the timers and leaves no `session.start` to set them again (register.tsx), and
@@ -65,7 +64,7 @@ export async function startPolling($: EngineInterface, wantUse = true): Promise<
       const cleared = await readCleared($)
       const full = { ...around, shells, folded: await readFolded($), clearedMs: cleared.atMs, dismissed: cleared.agents }
       if (dev && feed?.dev_use) full.use = { tasks: Object.fromEntries(Object.entries(feed.dev_use).map(([key, use]) => [key, { use }])), workers: {}, ramMb: 32768 }
-      const model = buildModel(feed, agents, minuteOf(now), full)
+      const model = buildModel(feed, agents, now, full)
       const drawn = JSON.stringify(model)
       if (drawn !== shown) {
         shown = drawn

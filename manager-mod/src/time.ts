@@ -16,6 +16,14 @@ export function fmtSpan(seconds: number): string {
   return secs < 0 && mins !== 0 ? `-${body}` : body
 }
 
+/** ELAPSED: `9:40`, `1:05:00`. */
+export function stopwatch(seconds: number): string {
+  const secs = Math.max(0, Math.trunc(seconds))
+  const [h, m, s] = [Math.floor(secs / 3600), Math.floor((secs % 3600) / 60), secs % 60]
+  const two = (n: number) => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`
+}
+
 /** A Done row's ETA cell: `(+5m)` late, `(-1h20m)` early, `(±0m)` on the minute. */
 export function fmtDelta(seconds: number): string {
   const s = fmtSpan(seconds)

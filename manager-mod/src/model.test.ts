@@ -5,7 +5,7 @@ import type { AgentRow, Around, DisplayRow, Feed, FeedLease, FeedRow, Hold, Ledg
 import { leaseFact, parseLedger, queuedNote, usageFact, withLedger } from './lease'
 import { buildModel, clearable, dueChores, join, namesKey } from './model'
 import { gist, named } from './shell-name'
-import { clockAt, countdown, fmtDelta, fmtSpan, fmtTokens, minuteOf, offMs, spent, track } from './time'
+import { clockAt, countdown, fmtDelta, fmtSpan, fmtTokens, minuteOf, offMs, spent, stopwatch, track } from './time'
 
 // Local noon, so a clock reads the same whatever zone the machine is in.
 const NOW = new Date(2026, 10, 4, 12, 0, 0).getTime()
@@ -59,7 +59,7 @@ test('a fresh worker naming the task takes over from one that ended, or died wit
   )
   expect(of(k.rows, 'a').workerId).toBe('new')
   expect(of(k.rows, 'old').section).toBe('done')
-  expect(of(k.rows, 'old').elapsed).toBe('20m')
+  expect(of(k.rows, 'old').elapsed).toBe('20:00')
 })
 
 test('a worker no row carries is drawn on its own, once', async () => {
@@ -68,8 +68,8 @@ test('a worker no row carries is drawn on its own, once', async () => {
   // A plain session with no feed row at all: its workers show, Running and Done.
   const m = buildModel(undefined, [worker('w2', 'look around', 3), { ...agent('w4', 'spent', 'completed'), startedMs: AGO(9), endedMs: AGO(1) }], NOW)
   expect(m.rows.map(r => [r.section, r.key, r.title, r.elapsed, r.left, r.what, r.workerId])).toEqual([
-    ['running', '', 'look around', '3m', 'no ETA', '', 'w2'],
-    ['done', '', 'spent', '8m', '', 'done', 'w4'],
+    ['running', '', 'look around', '3:00', 'no ETA', '', 'w2'],
+    ['done', '', 'spent', '8:00', '', 'done', 'w4'],
   ])
   expect(of(m.rows, 'w2').facts[1]).toBe('no ETA — add one: giverny-eta w2 <min>')
 })
@@ -97,14 +97,14 @@ test('rule 1: a feed row no worker stands behind draws only in a manager, and on
 test('rule 2: the clock is the worker start, moved on by its pauses, unless the row began far from it', async () => {
   const at = (r: FeedRow, w: AgentRow) => of(build([r], [w]).rows, r.key).elapsed
   // A writer stamps a little before the spawn: the worker's start wins.
-  expect(at(row({ key: 'a', started: AGO(12), agent_id: 'w' }), worker('w', 'x', 10))).toBe('10m')
+  expect(at(row({ key: 'a', started: AGO(12), agent_id: 'w' }), worker('w', 'x', 10))).toBe('10:00')
   // Its pauses move the worker's start on by as much as they moved `started`.
-  expect(at(row({ key: 'a', started: AGO(8), spawned: AGO(12), agent_id: 'w' }), worker('w', 'x', 10))).toBe('6m')
-  expect(at(row({ key: 'a', started: AGO(8), paused_s: 240, agent_id: 'w' }), worker('w', 'x', 10))).toBe('6m')
+  expect(at(row({ key: 'a', started: AGO(8), spawned: AGO(12), agent_id: 'w' }), worker('w', 'x', 10))).toBe('6:00')
+  expect(at(row({ key: 'a', started: AGO(8), paused_s: 240, agent_id: 'w' }), worker('w', 'x', 10))).toBe('6:00')
   // A later task of the same worker keeps its own clock.
-  expect(at(row({ key: 'a', started: AGO(10), agent_id: 'w' }), worker('w', 'x', 60))).toBe('10m')
+  expect(at(row({ key: 'a', started: AGO(10), agent_id: 'w' }), worker('w', 'x', 60))).toBe('10:00')
   // A fresh worker taking a task begun long before it counts from `started`.
-  expect(at(row({ key: 'a', started: AGO(60), agent_id: 'w' }), worker('w', 'a: again', 1))).toBe('1h')
+  expect(at(row({ key: 'a', started: AGO(60), agent_id: 'w' }), worker('w', 'a: again', 1))).toBe('1:00:00')
   // Tokens: the worker's over the feed's; a Next up row has none.
   const m = build([row({ key: 'a', tokens: 5, agent_id: 'w' }), row({ key: 'n', stage: 'planned', tokens: 7 })], [worker('w', 'x', 1, { tokens: 13500 })])
   expect([of(m.rows, 'a').tokens, of(m.rows, 'n').tokens]).toEqual(['13.5k', ''])
@@ -131,9 +131,9 @@ test('rule 6: the same worker directly above draws its cells as a ditto, and row
     [worker('w', 'a b', 10, { tokens: 900, activity: 'Bash: ls' }), worker('x', 'c', 10, { tokens: 900, activity: 'Bash: ls' })],
   )
   expect(m.rows.map(r => [r.id, r.elapsed, r.left, r.what, r.tokens])).toEqual([
-    ['a', '10m', '~50m', 'Bash: ls', '900'],
+    ['a', '10:00', '~50m', 'Bash: ls', '900'],
     ['b', '"', '"', '"', '"'],
-    ['c', '10m', '~50m', 'Bash: ls', '900'],
+    ['c', '10:00', '~50m', 'Bash: ls', '900'],
   ])
 })
 
@@ -147,8 +147,8 @@ test('rule 7: tasks in turn close the one before, and a later Planned row waits 
     [worker('w', 'one: the first', 60, { tokens: 77000 })],
   )
   const [one, two, three] = [of(m.rows, 'one'), of(m.rows, 'two'), of(m.rows, 'three')]
-  expect([one.section, one.what, one.elapsed, one.left, one.tokens, one.landedMs]).toEqual(['done', '→ two', '40m', '(+10m)', '', AGO(20)])
-  expect([two.section, two.elapsed, two.left, two.tokens]).toEqual(['running', '20m', '~40m', '77k'])
+  expect([one.section, one.what, one.elapsed, one.left, one.tokens, one.landedMs]).toEqual(['done', '→ two', '40:00', '(+10m)', '', AGO(20)])
+  expect([two.section, two.elapsed, two.left, two.tokens]).toEqual(['running', '20:00', '~40m', '77k'])
   expect([three.section, three.what, three.why[0]]).toEqual(['next', 'after two', 'after two — starts when its worker is done with that'])
   // A count frozen when it landed is drawn in its place.
   const frozen = build([row({ key: 'one', agent_id: 'w', stage: 'done', started: AGO(60), ended: AGO(20), task_tokens: 1234 }), row({ key: 'two', agent_id: 'w', started: AGO(20) })], [worker('w', 'one', 60)])
@@ -194,7 +194,7 @@ test('rule 9: a Running row nobody works on is drawn under Next up, saying why',
   // A failed worker's row keeps Running, its end in NOW.
   const failed = { ...agent('w', 'a: x', 'failed'), startedMs: AGO(30), endedMs: AGO(20) }
   const f = build([row({ key: 'a', agent_id: 'w', started: AGO(30), eta_s: 3600 })], [failed])
-  expect([of(f.rows, 'a').section, of(f.rows, 'a').what, of(f.rows, 'a').elapsed]).toEqual(['running', 'stopped: failed', '10m'])
+  expect([of(f.rows, 'a').section, of(f.rows, 'a').what, of(f.rows, 'a').elapsed]).toEqual(['running', 'stopped: failed', '10:00'])
 })
 
 test('rule 9: what the rows ask of the manager, once due and not yet told', async () => {
@@ -255,11 +255,11 @@ test('the words of a Running row: paused, killed, asleep, stopped, a limit, over
   expect(one({ started: AGO(30), eta_s: 3600 }, w).what).toBe('Bash: cargo test')
   // Paused with its worker still at work: only the clock.
   const p = one({ started: AGO(30), eta_s: 3600, paused_since: AGO(10) }, w)
-  expect([p.what, p.elapsed, p.left]).toEqual(['paused · worker still finishing', '20m', '~40m'])
+  expect([p.what, p.elapsed, p.left]).toEqual(['paused · worker still finishing', '20:00', '~40m'])
   expect(p.why[2]).toBe(`paused since ${hm(10)}, its worker still finishing its turn: only its clock is paused until it stops`)
   // Killed with its session: stopped where it went off.
   const k = one({ started: AGO(30), eta_s: 3600, paused_since: AGO(10), killed: AGO(5), went_off: AGO(10) }, { ...w, lastTurnMs: AGO(11) })
-  expect([k.section, k.what, k.elapsed, k.left]).toEqual(['running', 'killed', '20m', '~40m'])
+  expect([k.section, k.what, k.elapsed, k.left]).toEqual(['running', 'killed', '20:00', '~40m'])
   expect(k.why[2]).toBe(`killed: Giverny, WSL or its manager session went off at ${hm(10)}, and its worker with it; its clock stopped there until its manager revives it (a fresh worker, then resume)`)
   // Asleep on a shell of its own.
   const sleeping = { ...agent('w', 'a: x', 'completed'), startedMs: AGO(30), endedMs: AGO(8) }
@@ -272,20 +272,20 @@ test('the words of a Running row: paused, killed, asleep, stopped, a limit, over
   // Stopped on an API error: the clocks hold, the warning is the person's.
   const stopped = { ...w, stops: [{ fromMs: AGO(10), reason: 'no network' }] }
   const st = one({ started: AGO(30), eta_s: 3600 }, stopped)
-  expect([st.what, st.elapsed, st.left]).toEqual(['stopped: no network', '20m', '~40m'])
+  expect([st.what, st.elapsed, st.left]).toEqual(['stopped: no network', '20:00', '~40m'])
   // Continued: the stopped span stays off the clock.
   const on = one({ started: AGO(30), eta_s: 3600 }, { ...w, stops: [{ fromMs: AGO(20), toMs: AGO(10), reason: 'no network' }] })
-  expect([on.what, on.elapsed, on.left]).toEqual(['Bash: cargo test', '20m', '~40m'])
+  expect([on.what, on.elapsed, on.left]).toEqual(['Bash: cargo test', '20:00', '~40m'])
   // Out of a usage limit: both clocks held, and the row says until when.
   const reopens = NOW + 3600_000
   const lim = one({ started: AGO(30), eta_s: 3600 }, w, { limit: { window: '5h', reopensMs: reopens }, holds: [{ sinceMs: AGO(10) }] })
-  expect([lim.what, lim.elapsed, lim.left]).toEqual([`5h limit → ${clockAt(reopens, NOW)}`, '20m', '~40m'])
+  expect([lim.what, lim.elapsed, lim.left]).toEqual([`5h limit → ${clockAt(reopens, NOW)}`, '20:00', '~40m'])
   // A sleep comes off every clock, and off a hold's span only once.
   const off = one({ started: AGO(30), eta_s: 3600 }, w, { sleeps: [{ since: AGO(20), until: AGO(10) }], holds: [{ sinceMs: AGO(15), untilMs: AGO(5) }] })
-  expect([off.elapsed, off.left]).toEqual(['15m', '~45m'])
+  expect([off.elapsed, off.left]).toEqual(['15:00', '~45m'])
   // A row that carries its pauses: the pane's own hold is not taken off again.
   const carried = one({ started: AGO(30), eta_s: 3600, paused_s: 60 }, w, { holds: [{ sinceMs: AGO(15), untilMs: AGO(5) }] })
-  expect(carried.elapsed).toBe('29m')
+  expect(carried.elapsed).toBe('29:00')
   // Overdue.
   const late = one({ started: AGO(30), eta_s: 600 }, w)
   expect([late.left, late.over]).toEqual(['-~20m', true])
@@ -298,9 +298,9 @@ test('the words of a Running row: paused, killed, asleep, stopped, a limit, over
 test("a writer that pauses by moving started holds its row at the file's write time", async () => {
   const f: Feed = { aliases: [], writer: 'someone', writtenMs: AGO(4), rows: [row({ key: 'a', started: AGO(20), paused_since: AGO(10), usage: { runs: 1 } })] }
   const run = { manager: true, runs: ['a'] }
-  expect(of(buildModel(f, [], NOW, run).rows, 'a').elapsed).toBe('16m')
+  expect(of(buildModel(f, [], NOW, run).rows, 'a').elapsed).toBe('16:00')
   const own: Feed = { ...f, writer: 'giverny/manage' }
-  expect(of(buildModel(own, [], NOW, run).rows, 'a').elapsed).toBe('10m')
+  expect(of(buildModel(own, [], NOW, run).rows, 'a').elapsed).toBe('10:00')
 })
 
 test('agent ETAs: a worker with no row counts down from its own figure, and lands against its first', async () => {
@@ -312,7 +312,7 @@ test('agent ETAs: a worker with no row counts down from its own figure, and land
   // A Done row: the work since its first figure, against that figure.
   const done = buildModel(undefined, [{ ...agent('w', 'Explore', 'completed'), startedMs: AGO(20), endedMs: AGO(1) }], NOW, { etas })
   expect(of(done.rows, 'w').left).toBe('(+2m)')
-  expect(of(done.rows, 'w').facts).toEqual(['done', 'took 19m', '(+2m) vs estimate 5m'])
+  expect(of(done.rows, 'w').facts).toEqual(['done', 'took 19:00', '(+2m) vs estimate 5m'])
   // A feed row that holds the worker wins: its key, its estimate.
   const held = build([row({ key: 'k', agent_id: 'w', started: AGO(10), eta_s: 3600 })], [worker('w', 'x', 10)], { manager: true, etas })
   expect(of(held.rows, 'k').left).toBe('~50m')
@@ -338,7 +338,7 @@ test("the Done row's ETA cell, and what it was measured against", async () => {
   // Its waits and what the machine slept through are not work.
   expect(done({ eta_s: 1800, wait_s: 300 }).left).toBe('(-5m)')
   const asleep = of(build([row({ key: 'd', stage: 'done', started: AGO(40), ended: AGO(10), eta_s: 1800, usage: { runs: 1 } })], [], { manager: true, sleeps: [{ since: AGO(20), until: AGO(15) }] }).rows, 'd')
-  expect([asleep.left, asleep.elapsed]).toEqual(['(-5m)', '25m'])
+  expect([asleep.left, asleep.elapsed]).toEqual(['(-5m)', '25:00'])
   // No estimate, no end: blank.
   expect(done({}).left).toBe('')
   expect(done({ ended: undefined, eta_s: 60 }).left).toBe('')
@@ -348,11 +348,11 @@ test('the Review line, and a Done row in full', async () => {
   const d = of(build([row({ key: 'd', stage: 'done', started: AGO(40), ended: AGO(10), eta_s: 1800, landing: 'Review — ita', review: 'ita — the ranking — branch search', usage: { runs: 2, peak_mb: 2150, cpu_s: 45, cap_ram_mb: 3072, oom_kills: 1, oom_open: false }, brief: '/b.md', open: 'claude --resume x' })]).rows, 'd')
   expect(d.review).toBe('ita — the ranking — branch search')
   expect(d.what).toBe('Review — ita')
-  expect(d.why).toEqual(['Done: Review — ita; took 30m, on its estimate 30m', 'awaiting review: ita — the ranking — branch search'])
-  expect(d.facts).toEqual(['Review — ita', 'took 30m', '(±0m) vs estimate 30m', 'peak 2.1G of 3G, 45s CPU, OOM-killed x1 earlier'])
+  expect(d.why).toEqual(['Done: Review — ita; took 30:00, on its estimate 30m', 'awaiting review: ita — the ranking — branch search'])
+  expect(d.facts).toEqual(['Review — ita', 'took 30:00', '(±0m) vs estimate 30m', 'peak 2.1G of 3G, 45s CPU, OOM-killed x1 earlier'])
   expect([d.brief, d.open, d.oom]).toEqual(['/b.md', 'claude --resume x', false])
   const noReview = of(build([row({ key: 'd', stage: 'done', started: AGO(40), ended: AGO(10), landing: 'Done', usage: { runs: 1 } })]).rows, 'd')
-  expect(noReview.why).toEqual(['Done; took 30m, no estimate'])
+  expect(noReview.why).toEqual(['Done; took 30:00, no estimate'])
 })
 
 test('which Done rows show: done_rows, and clear-done hiding what landed before it', async () => {
@@ -440,6 +440,7 @@ test('a row with a run going stays Running with no worker, and an OOM still news
 })
 
 test('the panel writes durations as its ETA column does', async () => {
+  expect([0, 70, 580, 3900, 36_000].map(stopwatch)).toEqual(['0:00', '1:10', '9:40', '1:05:00', '10:00:00'])
   expect([0, 29, 30, 300, 3780, 3600, 98_000].map(fmtSpan)).toEqual(['0m', '0m', '1m', '5m', '1h3m', '1h', '1d3h13m'])
   expect(fmtSpan(-300)).toBe('-5m')
   expect([300, -4800, 0, 10].map(fmtDelta)).toEqual(['(+5m)', '(-1h20m)', '(±0m)', '(±0m)'])

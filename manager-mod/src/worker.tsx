@@ -2,6 +2,7 @@ import type { EngineInterface, RenderInput, SiteView, UiScrollInput } from 'clau
 
 import type { DisplayRow, Model, Page, PageEntry } from '../types'
 
+import { cells } from './cells'
 import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pendingAfter } from './page'
 import { changePage, readPage, readView, say, writePage } from './state'
 
@@ -40,7 +41,7 @@ export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView 
 /**
  * The band's back button (a bare 0 at the empty prompt presses it), the page's, `/manager back`.
  * Esc is not this in a worker's view: Claude Code's Esc at that prompt stops the worker, and a
- * plugin cannot take that key, so the band says so.
+ * plugin cannot take that key, so the band says so (backWords).
  */
 export async function goBack($: EngineInterface, view?: SiteView): Promise<void> {
   if (await readPage($)) await closePage($)
@@ -275,11 +276,16 @@ export async function drawBox($: EngineInterface, e: RenderInput<'AbovePrompt'>)
   )
 }
 
-/** The line the band adds over a worker's own view: the page's header, for the view. */
-export function viewedWords(model: Model, view: SiteView | undefined): string {
-  if (view?.agentId === undefined) return ''
-  const r = model.rows.find(one => one.workerId === view.agentId)
-  const name = r ? r.key || r.title : 'this worker'
-  const warn = r?.own === 'running' ? ['esc at the prompt stops this worker'] : []
-  return [`viewing ${name}`, ...warn, ...(r?.facts ?? []), ...(r?.review !== undefined ? [`Review: ${r.review}`] : [])].join(' · ')
+/**
+ * What the back button's row says beside it, in `room` cells: the other ways back, and that Esc
+ * stops a running worker, which a plugin cannot change: no key reaches it in a worker's view.
+ */
+export function backWords(model: Model, view: SiteView | undefined, page: Page | undefined, room: number, said = ''): string {
+  const r = view?.agentId !== undefined ? model.rows.find(one => one.workerId === view.agentId) : undefined
+  const stops = view?.agentId !== undefined && r?.own === 'running'
+  const tries = stops
+    ? ['or press 0 at the empty prompt, or click its row again  ·  Esc at the prompt stops this worker', 'or press 0, or click its row again  ·  Esc stops this worker', 'or press 0  ·  Esc stops this worker', 'Esc stops it']
+    : ['or press 0 at the empty prompt, or click its row again', 'or press 0, or click its row again', 'or press 0']
+  const fit = tries.find(t => cells(t) <= room) ?? ''
+  return said ? [said, fit].filter(Boolean).join('  ·  ') : fit
 }

@@ -1,64 +1,56 @@
-import type { Color } from 'claude-code'
+import type { Load, Section } from '../types'
 
-import type { DisplayRow } from '../types'
+// The colours of Giverny's panel, by its own names, as raw hex so the band reads as the panel
+// whatever Claude Code's theme is. crates/app/src/management_panel.rs RUNNING, PLANNED, DONE;
+// crates/term/src/render/theme.rs and chrome.rs for the rest, which the panel takes from its
+// theme: `ink`, Ita's, on a dark terminal, and `monet-light` on a light one.
 
-import { KILLED } from './model'
+/** The three stage tints, the 256-colour codes 38;5;32, 38;5;67 and 38;5;28: they read on dark and light alike. */
+export const STAGE: Record<Section, string> = { running: '#0087d7', next: '#5f87af', done: '#008700' }
 
-// What the band's colours and marks mean, in one place. Every colour is a theme key, so the band
-// follows the person's theme, light, dark or ansi, and no raw colour can go unreadable on one.
-// Five inks, each one meaning: anything not worth a person's attention is dim, and has no ink.
+/**
+ * The same three as what is painted: the codes themselves. A hex goes out rounded on a terminal of
+ * 256 colours (tmux's default: `#0087d7` came out as 38;5;38, a cyan), and the codes are the panel's.
+ */
+export const STAGE_INK: Record<Section, string> = { running: 'ansi256(32)', next: 'ansi256(67)', done: 'ansi256(28)' }
 
-export const INK = {
-  /** Under way, inside its estimate. */
-  moving: 'ide',
-  /** Past its estimate, or something the person should know. */
-  behind: 'warning',
-  /** Landed. */
-  landed: 'success',
-  /** Landed, and waits for a person's eye. */
-  eye: 'merged',
-  /** Stopped for good, blocked or killed: it will not get better by itself. */
-  failed: 'error',
-} as const satisfies Record<string, Color>
-
-/** A row's mark: one cell, in the gutter Claude's own bullets use. */
-export type Mark = { glyph: string; color?: Color; dim?: boolean }
-
-const MOVING: Mark = { glyph: '●', color: INK.moving }
-const BEHIND: Mark = { glyph: '●', color: INK.behind }
-const STILL: Mark = { glyph: '‖', dim: true }
-const STUCK: Mark = { glyph: '‖', color: INK.behind }
-const IDLE: Mark = { glyph: '◌', dim: true }
-const READY: Mark = { glyph: '○', dim: true }
-const LANDED: Mark = { glyph: '✓', color: INK.landed }
-const EYE: Mark = { glyph: '◆', color: INK.eye }
-const FAILED: Mark = { glyph: '×', color: INK.failed }
-
-const begins = (s: string, words: string[]) => words.some(w => s.toLowerCase().startsWith(w))
-
-/** Does this Done row wait for a person? Its landing says so (`Review — ita`). */
-export const wantsEye = (r: DisplayRow) => r.own === 'done' && (r.review !== undefined || begins(r.what, ['review']))
-
-/** The mark says in one cell what the row's words say; it goes by the row's own stage, not its place. */
-export function markOf(r: DisplayRow): Mark {
-  const what = r.what
-  if (r.own === 'running') {
-    if (r.oom || what === KILLED) return FAILED
-    if (r.flag || begins(what, ['stopped'])) return STUCK
-    if (begins(what, ['paused']) || / limit( →|$)/.test(what)) return STILL
-    if (r.asleep || r.finished) return IDLE
-    return r.over ? BEHIND : MOVING
-  }
-  if (r.own === 'next') {
-    if (begins(what, ['held', 'paused'])) return STILL
-    return what === '' ? READY : IDLE
-  }
-  if (wantsEye(r)) return EYE
-  if (r.oom || begins(what, ['blocked', 'killed', 'stopped', 'failed', 'cancelled'])) return FAILED
-  return LANDED
+export type Chrome = {
+  /** What the terminal is painted in: under a tinted row, and on the back button's words. */
+  bg: string
+  /** A missing ETA, the footer, what is said beside the back button. */
+  dim: string
+  /** A flagged NOW, an OOM, a busy figure. */
+  amber: string
+  /** A heavy figure. */
+  poppy: string
+  /** The back button's fill. */
+  accent: string
+  /** The rule along the table's top, where egui draws the panel's separator. */
+  rule: string
+  /** A row's hover, as egui's tooltip: its window's fill and its text. */
+  tip: string
+  tipInk: string
 }
 
-/** A section's mark where no row stands for it: the header's short form, a section's summary line. */
-export const SECTION_MARK = { running: MOVING, next: READY, done: LANDED } as const
+export const DARK: Chrome = { bg: '#0b0b0c', dim: '#838384', amber: '#f0dc9a', poppy: '#e8897a', accent: '#96d2d2', rule: '#3c3c3c', tip: '#1b1b1b', tipInk: '#a0a0a0' }
+export const LIGHT: Chrome = { bg: '#f7f4ec', dim: '#7f8180', amber: '#9a7418', poppy: '#a8412f', accent: '#2c7d7d', rule: '#bebebe', tip: '#f8f8f8', tipInk: '#505050' }
 
-export const GAUGE = { full: '━', empty: '─', notch: '╋' } as const
+/** Claude Code's `theme` setting into the panel's chrome. `auto` cannot be told: dark. */
+export const chromeOf = (theme: unknown): Chrome => (typeof theme === 'string' && theme.includes('light') ? LIGHT : DARK)
+
+/** How strongly the row on view is lit, and a row under the pointer: VIEWED_TINT and row_tint. */
+export const VIEWED_TINT = 0.26
+export const HOVER_TINT = 0.1
+
+const channels = (hex: string) => [1, 3, 5].map(at => parseInt(hex.slice(at, at + 2), 16))
+
+/** A colour at `alpha` over `bg`, as egui paints `gamma_multiply`: a terminal cell has no alpha. */
+export function tint(color: string, bg: string, alpha: number): string {
+  const under = channels(bg)
+  return `#${channels(color)
+    .map((c, i) => Math.round(c * alpha + under[i]! * (1 - alpha)).toString(16).padStart(2, '0'))
+    .join('')}`
+}
+
+/** A figure by its weight on the machine, as `Load::color`: light keeps its row's colour. */
+export const loadInk = (load: Load, row: string, c: Chrome) => (load === 'heavy' ? c.poppy : load === 'busy' ? c.amber : row)

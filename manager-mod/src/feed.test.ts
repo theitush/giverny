@@ -60,7 +60,7 @@ const row = (key: string, stage = 'running') => ({ key, stage, started: 40_000, 
 test('the feed is read and the band written only when something shows differently', async ($, on) => {
   const clock = base(on)
   let stamp = file(1, 10)
-  let body = JSON.stringify({ rows: [row('first')] })
+  let body = JSON.stringify({ rows: [row('first', 'planned')] })
   let reads = 0
   let writes = 0
   on('fs.stat', () => ({ value: stamp }))
@@ -75,22 +75,19 @@ test('the feed is read and the band written only when something shows differentl
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   expect([reads, writes]).toEqual([1, 1])
 
-  // Polls with nothing new: no read and no write, up to the turn of the minute.
-  await clock.advance(10_000)
+  // Polls with nothing new and no stopwatch going: no read and no write.
+  await clock.advance(20_000)
   expect([reads, writes]).toEqual([1, 1])
-  // The minute turns: the clocks move, the file is not read again.
-  await clock.advance(10_000)
-  expect([reads, writes]).toEqual([1, 2])
 
   // The file is rewritten with the same rows: read, not redrawn.
   stamp = file(2, 10)
   await clock.advance(2000)
-  expect([reads, writes]).toEqual([2, 2])
+  expect([reads, writes]).toEqual([2, 1])
 
   stamp = file(3, 20)
-  body = JSON.stringify({ rows: [row('second')] })
+  body = JSON.stringify({ rows: [row('second', 'planned')] })
   await clock.advance(2000)
-  expect([reads, writes]).toEqual([3, 3])
+  expect([reads, writes]).toEqual([3, 2])
   const ui = await $.ui.mount(BAND)
   expect((await ui.find({ type: 'Text', text: /second/ })) !== undefined).toBe(true)
 

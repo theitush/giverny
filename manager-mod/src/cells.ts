@@ -33,3 +33,22 @@ export function cutMiddle(s: string, n: number): string {
 
 export const padEnd = (s: string, n: number) => s + ' '.repeat(Math.max(0, n - cells(s)))
 export const padStart = (s: string, n: number) => ' '.repeat(Math.max(0, n - cells(s))) + s
+
+/** The start of `s`, at most `n` cells of it, the last an ellipsis if anything was cut; as the panel cuts, spaces kept. */
+export function cutExact(s: string, n: number): string {
+  if (n <= 0) return ''
+  if (cells(s) <= n) return s
+  let out = ''
+  let used = 0
+  for (const g of graphemes(s)) {
+    if (used + cellsOf(g) > n - 1) break
+    out += g
+    used += cellsOf(g)
+  }
+  return `${out}…`
+}
+
+/** `s` as one entry a cell; a wide grapheme's second cell is ''. */
+export function cellsIn(s: string): string[] {
+  return graphemes(s).flatMap(g => (cellsOf(g) === 2 ? [g, ''] : cellsOf(g) === 1 ? [g] : []))
+}

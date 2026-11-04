@@ -3,7 +3,7 @@ import type { AgentRow, Around, DisplayRow, DoneRows, Feed, FeedRow, Model, RowF
 import { GRANTED_WAITING, leaseFact, queuedNote, queuedWhy, usageFact, withLedger } from './lease'
 import { gist, named } from './shell-name'
 import { loadOf, memShare, plusUse } from './stats'
-import { clockAt, countdown, fmtDelta, fmtSpan, fmtTokens, offMs } from './time'
+import { clockAt, countdown, fmtDelta, fmtSpan, fmtTokens, offMs, stopwatch } from './time'
 
 // Feed rows and live agents into what the band draws: plain data, no `$`.
 // docs/management-panel.md **Merge with the live rows**, as crates/claude/src/feed.rs
@@ -655,11 +655,11 @@ function formatRow(r: PaneRow, now: number, written: number | undefined, a: Arou
   const workS = rowStart !== undefined && stop !== undefined ? workSince(rowStart, stop) : undefined
 
   let elapsed = ''
-  if (r.stage === 'running' && workS !== undefined) elapsed = fmtSpan(workS)
+  if (r.stage === 'running' && workS !== undefined) elapsed = stopwatch(workS)
   if (r.stage === 'done') {
     const end = endedOf(r)
     if (rowStart !== undefined && end !== undefined) {
-      elapsed = fmtSpan(Math.floor(Math.max(0, end - rowStart - stoppedMs(l, rowStart, end) - sleptMs(rowStart, end)) / 1000))
+      elapsed = stopwatch(Math.floor(Math.max(0, end - rowStart - stoppedMs(l, rowStart, end) - sleptMs(rowStart, end)) / 1000))
     }
   }
 
