@@ -4,8 +4,9 @@ import type { DisplayRow, Model, Section } from '../types'
 
 import { cells, cut, cutMiddle, padEnd, padStart } from './cells'
 import { redrawSoon } from './poll'
-import { readHidden, readSaid, readView, say, toggleFold } from './state'
+import { readHidden, readPage, readSaid, readView, toggleFold } from './state'
 import { GAUGE, INK, type Mark, markOf, SECTION_MARK, wantsEye } from './theme'
+import { drawBox, goBack, openRow, viewedWords } from './worker'
 
 // The band: a table in Claude's own gutter. The mark sits where Claude's bullets sit, the key where
 // its text starts, and the eye reads down one column of marks to see how things stand. Nothing is
@@ -244,21 +245,16 @@ export function counts(model: Model, room: number): { text: string; color?: Colo
 export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
   const model = await readView($)
   const words = await readSaid($)
+  const page = await readPage($)
+  const box = await drawBox($, e)
   if (e.props.hasSurvey || (await readHidden($)) || model.rows.length === 0) return undefined
   const { Box, Text, Button } = $.ui.resolve(e)
   const width = Math.max(20, e.props.bodyColumns)
   const screen = e.viewport?.rows
   const budget = Math.min(e.props.maxRows, screen ? Math.max(3, Math.floor(screen * SCREEN_SHARE)) : e.props.maxRows)
-  const shown = plan(model, budget)
+  // The box and the viewed line take rows of their own before the table.
+  const shown = plan(model, budget - (box ? 3 : 0) - (e.props.view?.agentId ? 1 : 0))
 
-  const open = async (id: string, title: string) => {
-    const r = await $.ui.view({ agentId: id })
-    await say($, r.deny ? `open refused: ${r.deny}` : `viewing: ${title}`)
-  }
-  const back = async () => {
-    const r = await $.ui.view({})
-    await say($, r.deny ? `back refused: ${r.deny}` : '')
-  }
   const fold = async (id: string) => {
     await toggleFold($, id)
     await redrawSoon()
@@ -268,12 +264,12 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   // across turns, so a row stays where the eye left it and where the pointer is about to press.
   const name = e.props.isWorking ? <Text color="claude" bold>Manager</Text> : <Text bold>Manager</Text>
   const backWords = width < 80 ? 'back' : 'back to the manager'
-  const backButton = e.props.view?.agentId && (
-    <Button key="back" hotkey="b" plain onPress={back}>
+  const backButton = (e.props.view?.agentId || page) && (
+    <Button key="back" hotkey="0" plain onPress={() => goBack($, e.props.view)}>
       {backWords}
     </Button>
   )
-  const beside = cells('Manager') + GAP + (backButton ? cells(`b: ${backWords}`) + GAP : 0)
+  const beside = cells('Manager') + GAP + (backButton ? cells(`0: ${backWords}`) + GAP : 0)
   const countsWidth = (parts: { text: string }[]) => parts.reduce((n, p) => n + cells(p.text) + GAP, 0)
   const tallied = (parts: { text: string; color?: Color }[]) =>
     parts.map(p => <Text color={p.color} dimColor={!p.color}>{p.text}</Text>)
@@ -292,13 +288,10 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
         {tallied(tally)}
         {named.map(r => {
           const label = <Text color={r.over ? INK.behind : undefined} dimColor={!r.over}>{chip(r)}</Text>
-          const worker = r.workerId
-          return worker ? (
-            <Button key={`row-${r.id}`} plain onPress={() => open(worker, r.title)}>
+          return (
+            <Button key={`row-${r.id}`} plain onPress={() => openRow($, r, e.props.view, e.requestId)}>
               {label}
             </Button>
-          ) : (
-            label
           )
         })}
         {backButton}
@@ -314,15 +307,11 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const row = (r: DisplayRow) => {
     const segs = rowSegs(r, c, width)
     const drawn = (list: Seg[]) => list.map(s => <Text color={s.color} dimColor={s.dim} bold={s.bold}>{s.text}</Text>)
-    const worker = r.workerId
-    const pressed = (list: Seg[], key: string) =>
-      worker ? (
-        <Button key={key} plain onPress={() => open(worker, r.title)}>
-          {drawn(list)}
-        </Button>
-      ) : (
-        <Text wrap="truncate">{drawn(list)}</Text>
-      )
+    const pressed = (list: Seg[], key: string) => (
+      <Button key={key} plain onPress={() => openRow($, r, e.props.view, e.requestId)}>
+        {drawn(list)}
+      </Button>
+    )
     const toggleAt = segs.findIndex(s => s.toggle)
     const toggler = r.fold
     if (toggler && toggleAt >= 0) {
@@ -364,6 +353,8 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
         {backButton}
         {saying}
       </Box>
+      {box}
+      {e.props.view?.agentId && <Text dimColor wrap="truncate">{viewedWords(model, e.props.view)}</Text>}
       {section('running', shown.running, 'running', true)}
       {section('next', shown.next, 'next', model.running === 0)}
       {section('done', shown.done, 'done', model.running === 0 && model.next === 0)}

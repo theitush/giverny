@@ -277,6 +277,31 @@ export type Model = {
   nested: boolean
 }
 
+/** One entry of a worker's page, as Claude Code's view of a worker draws it. */
+export type PageEntry = { kind: 'prompt' | 'text' | 'tool'; text: string; isError?: true }
+
+/** The page a press opened in the pane (src/worker.tsx): undefined with none open. */
+export type Page = {
+  /** The band's site: the box is drawn there. */
+  band: string
+  rowId: string
+  /** The row as it was pressed: the model's own wins while it still has one. */
+  row: DisplayRow
+  entries: PageEntry[]
+  /** Who a line typed there goes to; undefined: read-only. */
+  ask?: 'worker' | 'start'
+  /** Lines sent and not yet in the transcript, drawn dim after its entries. */
+  pending: string[]
+  /** How many prompts the transcript held when the first of `pending` went. */
+  prompts: number
+  /** Under the box: where the last line went, or why it did not. */
+  status: string
+  /** What the box holds: a line that was not sent. */
+  draft: string
+  /** The box's generation: a new one holds `draft`, not what was typed. */
+  box: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     manager: {
@@ -285,6 +310,7 @@ declare module 'claude-code' {
       said: string
       folded: Shaped<string[]>
       cleared: Shaped<{ atMs?: number; agents: string[] }>
+      page: Shaped<Page | null>
     }
   }
 }

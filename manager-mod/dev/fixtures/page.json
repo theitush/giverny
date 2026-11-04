@@ -1,0 +1,6 @@
+{"version":1,"writer":"giverny/manage","rows":[
+ {"key":"brief","stage":"planned","title":"FEATURE: a task with a brief","eta_s":600,"brief":"/home/ita/giverny/.claude/briefs/mgr-worker.md"},
+ {"key":"nobrief","stage":"planned","title":"FEATURE: a task with none","eta_s":600,"note":"waiting on the design"},
+ {"key":"gone","stage":"done","title":"CLEANUP: landed long ago","started":"@-40m","ended":"@-20m","eta_s":1500,"landing":"Done","review":"ita — look at it — branch x","usage":{"runs":1},"agent_id":"nobody"},
+ {"key":"runs","stage":"running","title":"RUN: a build with no worker","started":"@-5m","eta_s":900,"open":"claude --resume abc","agent_id":"nobody2"}
+]}

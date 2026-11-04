@@ -40,13 +40,17 @@ function engine(on: On, feed: string | undefined, agents: AgentInfo[], marked = 
 
 test('the band draws a feed, a row with a worker being the way to it', async ($, on) => {
   engine(on, FEED, [{ id: 'w1', description: 'build: fix it', type: 'general-purpose', status: 'running' }])
-  on('ui.view', () => ({ value: {} }))
+  const asked: unknown[] = []
+  on('ui.view', (_, e) => {
+    asked.push(e)
+    return { value: {} }
+  })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /^1 running$/ })) !== undefined).toBe(true)
   expect((await ui.find({ key: 'row-build' })) !== undefined).toBe(true)
   await ui.press({ key: 'row-build' })
-  expect((await ui.find({ type: 'Text', text: /viewing: BUG: the build/ })) !== undefined).toBe(true)
+  expect(asked).toEqual([{ agentId: 'w1' }])
   await ui.unmount()
 })
 
@@ -307,4 +311,46 @@ test('a plain session with workers and no plan is no manager: a row with no work
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /1 running/ })) !== undefined).toBe(true)
   expect(await ui.find({ type: 'Text', text: /a note to itself/ })).toBe(undefined)
+})
+
+const PANE_SITE = {
+  plugin: 'manager',
+  component: 'Pane',
+  requestId: 'worker',
+  surface: 'terminal',
+  props: { title: 'w', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+} as const
+
+test('a worker Claude Code no longer lists opens a page, and a line typed there reaches the worker', async ($, on) => {
+  engine(on, FEED, [{ id: 'w1', description: 'build: fix it', type: 'general-purpose', status: 'completed' }])
+  on('ui.view', () => ({ value: { deny: 'no agent under that id' } }))
+  const opened: unknown[] = []
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => ({ value: undefined }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Fix the build', toolUses: [] }, { role: 'assistant', text: 'It builds.', toolUses: [] }] }))
+  const sent: unknown[] = []
+  on('session.send', (_, e) => {
+    sent.push([e.to, e.text])
+    return { isDelivered: true }
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await band.press({ key: 'row-build' })
+  expect(opened).toEqual(['worker'])
+  const page = await $.ui.mount(PANE_SITE)
+  expect((await page.find({ type: 'Markdown', text: /It builds/ })) !== undefined).toBe(true)
+  await band.input({ key: 'say-0', text: 'stop after this file' })
+  expect(sent).toEqual([['w1', 'stop after this file']])
+  expect((await band.find({ type: 'Text', text: /Sent to this worker/ })) !== undefined).toBe(true)
+  expect((await page.find({ type: 'Text', text: /stop after this file/ })) !== undefined).toBe(true)
+  // A second press goes back; the box goes with the page, and a third opens it again.
+  await band.press({ key: 'row-build' })
+  expect(await band.find({ key: 'say-1' })).toBe(undefined)
+  await band.press({ key: 'row-build' })
+  expect(opened).toEqual(['worker', 'worker'])
+  await page.unmount()
+  await band.unmount()
 })

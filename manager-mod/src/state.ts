@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
-import type { Model } from '../types'
+import type { Model, Page } from '../types'
 
 // What a drawing reads. The validator wants an atom used in the file that declares it, so every
 // read and write goes through a function here (a declaration: past an import the validator
@@ -16,6 +16,8 @@ const NONE: string[] = []
 const folded = atom({ plugin: 'manager', key: 'folded' } as const, NONE, { shape: 'folded-1' })
 const NOT_CLEARED: { atMs?: number; agents: string[] } = { agents: [] }
 const cleared = atom({ plugin: 'manager', key: 'cleared' } as const, NOT_CLEARED, { shape: 'cleared-1' })
+const NO_PAGE: Page | null = null
+const page = atom({ plugin: 'manager', key: 'page' } as const, NO_PAGE, { shape: 'page-1' })
 
 export function readView($: EngineInterface) {
   return read($, view)
@@ -47,4 +49,14 @@ export function readCleared($: EngineInterface) {
 }
 export function writeCleared($: EngineInterface, value: { atMs: number; agents: string[] }) {
   return update($, cleared, () => value)
+}
+export function readPage($: EngineInterface): Promise<Page | null> {
+  return read($, page)
+}
+export function writePage($: EngineInterface, value: Page | undefined) {
+  return update($, page, () => value ?? null)
+}
+/** A change to the open page, on what it holds by then: a line and a look at the file can cross. */
+export function changePage($: EngineInterface, change: (now: Page) => Page) {
+  return update($, page, now => (now ? change(now) : now))
 }

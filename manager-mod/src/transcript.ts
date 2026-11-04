@@ -49,7 +49,7 @@ export function stopReason(line: { error?: unknown; message?: { content?: unknow
   return 'API error'
 }
 
-function describeToolUse(use: { name?: unknown; input?: unknown }): string {
+export function describeToolUse(use: { name?: unknown; input?: unknown }): string {
   const name = typeof use.name === 'string' ? use.name : 'tool'
   const input = (typeof use.input === 'object' && use.input !== null ? use.input : {}) as Record<string, unknown>
   const arg = ACTIVITY_ARGS.map(k => input[k]).find((v): v is string => typeof v === 'string')
