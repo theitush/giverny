@@ -226,7 +226,9 @@ test('a switch in the manifest reaches the band', { options: { column_title: fal
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Running/ })) !== undefined).toBe(true)
-  expect((await ui.find({ type: 'Text', text: /the build/ })) === undefined).toBe(true)
+  // The row has no title and no clock; only its hover reads the title, as the panel's.
+  const line = await ui.find({ type: 'Text', text: /^Running +build/ })
+  expect(line !== undefined && !/the build|\d:\d\d/.test(line.text ?? '')).toBe(true)
   await ui.unmount()
 })
 

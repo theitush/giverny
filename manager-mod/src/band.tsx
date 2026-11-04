@@ -194,13 +194,21 @@ export function tipLines(r: DisplayRow, room: number): string[] {
   return [r.title || r.key, ...r.why].filter(l => l !== '').map(l => cut(l, room))
 }
 
-/** Claude Code's `theme` setting, for the panel's chrome; a read that fails is a dark terminal. */
+const THEME_EVERY_MS = 30_000
+let theme: { chrome: Chrome; atMs: number } | undefined
+
+/** Claude Code's `theme` setting, for the panel's chrome, looked at now and then: a band redraws as its clock ticks. A read that fails is a dark terminal. */
 async function readChrome($: EngineInterface): Promise<Chrome> {
+  const now = await $.clock.now()
+  if (theme && now - theme.atMs < THEME_EVERY_MS) return theme.chrome
+  let chrome = chromeOf(undefined)
   try {
-    return chromeOf(await $.settings.read({ key: 'theme' }))
+    chrome = chromeOf(await $.settings.read({ key: 'theme' }))
   } catch {
-    return chromeOf(undefined)
+    // Dark.
   }
+  theme = { chrome, atMs: now }
+  return chrome
 }
 
 /** The band's tree, or undefined with nothing to show. */

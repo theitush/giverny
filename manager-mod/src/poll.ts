@@ -8,7 +8,7 @@ import { newLive, readAgents, readAround } from './live'
 import { buildModel, clearable, dueChores } from './model'
 import { readCleared, readFolded, readHidden, writeCleared, writeView } from './state'
 
-const POLL_MS = 1000
+const POLL_MS = 2000
 const CHORES_MS = 10_000
 const EMPTY = JSON.stringify(buildModel(undefined, [], 0))
 
@@ -19,8 +19,9 @@ let polling = false
 
 /**
  * Keeps `view` current. A poll costs a few `stat`s and `$.agent.list()`. ELAPSED is a stopwatch,
- * as the panel's, so a Running row redraws the band each second; with none running a `view` that
- * does not differ is not written, so the band is not redrawn.
+ * as the panel's, so a Running row redraws the band each poll (the panel's ticks each second; a
+ * redraw here costs a real share of a core, so every two); with none running a `view` that does
+ * not differ is not written, so the band is not redrawn.
  */
 export async function startPolling($: EngineInterface, wantUse = true): Promise<void> {
   // A reload drops the timers and leaves no `session.start` to set them again (register.tsx), and
