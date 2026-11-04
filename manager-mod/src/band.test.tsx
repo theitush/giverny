@@ -17,14 +17,14 @@ const FEED = JSON.stringify({
   ],
 })
 
-function engine(on: On, feed: string | undefined, agents: AgentInfo[]) {
+function engine(on: On, feed: string | undefined, agents: AgentInfo[], marked = true) {
   mock.clock(on, { now: NOW })
   mock.env(on, { GIVERNY_FEED_DIR: '/feeds' })
   on('command.register', () => ({ value: { command: 'manager' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ME }))
-  on('fs.stat', () => {
-    if (feed === undefined) throw new Error('missing')
+  on('fs.stat', (_, e) => {
+    if (feed === undefined || (!marked && e.path.includes('/managers/'))) throw new Error('missing')
     return { value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false } }
   })
   on('fs.list', () => ({ value: [] }))
@@ -54,4 +54,40 @@ test('with nothing to show the engine draws the band', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('engine')
   await ui.unmount()
+})
+
+const PLANNED = JSON.stringify({ writer: 'giverny/manage', rows: [{ key: 'later', stage: 'planned', title: 'FEATURE: later', eta_s: 600 }] })
+const WORKED = JSON.stringify({
+  writer: 'giverny/manage',
+  rows: [
+    { key: 'w', stage: 'running', title: 'BUG: worked', started: '2026-11-04T09:50:00Z', eta_s: 600, agent_id: 'w1' },
+    { key: 'stray', stage: 'running', title: 'BUG: a note to itself', started: '2026-11-04T09:50:00Z', eta_s: 600, usage: { runs: 1 } },
+  ],
+})
+
+/** No mark on disk, and Giverny's plugin on or off. */
+function unmarked(on: On, feed: string, agents: AgentInfo[], enabledPlugins: Record<string, boolean>) {
+  engine(on, feed, agents, false)
+  on('settings.read', () => ({ value: { enabledPlugins } }) as never)
+}
+
+test('with no Giverny hook a planned row makes a manager, and its Next up draws', async ($, on) => {
+  unmarked(on, PLANNED, [], {})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /0 running · 1 next · 0 done/ })) !== undefined).toBe(true)
+})
+
+test('with Giverny’s hook on only its mark makes a manager, whatever was planned', async ($, on) => {
+  unmarked(on, PLANNED, [], { 'giverny@giverny': true })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await expect($.ui.mount({ ...BAND, surface: 'terminal' })).rejects.toThrow(/no implementation for ui.render/)
+})
+
+test('a plain session with workers and no plan is no manager: a row with no worker stays off', async ($, on) => {
+  unmarked(on, WORKED, [{ id: 'w1', description: 'w: worked', type: 'general-purpose', status: 'running' }], {})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /1 running · 0 next · 0 done/ })) !== undefined).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /a note to itself/ })).toBe(undefined)
 })

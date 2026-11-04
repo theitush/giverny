@@ -12,8 +12,8 @@
 #   LOOK_KEYS="C-x Tab Enter"   tmux send-keys words, one at a time, before the capture
 #   LOOK_HEIGHT=48              the terminal's rows
 #   LOOK_ARGS="--flag value"    more claude arguments (no spaces inside one)
-#   LOOK_SETTINGS='{...}'       passed as --settings; by default the plugin's own settings.json,
-#                               since a subagentStatusLine in ~/.claude/settings.json beats a plugin's
+#   LOOK_SETTINGS='{...}'       passed as --settings; by default none, so the plugin has to win over
+#                               ~/.claude/settings.json by itself, as it does for a real user
 #   LOOK_PLUGIN=<dir>           another copy of the plugin
 #   LOOK_PROMPT="..."           typed and sent, which spends tokens: for a live worker, on haiku
 #   LOOK_WAIT=30                seconds to wait after the prompt
@@ -55,7 +55,7 @@ printf '%s\n' "$body" >"$feed.tmp" && mv "$feed.tmp" "$feed"
 
 cmd=(env -u GIVERNY_TAB_ID -u GIVERNY_PID -u GIVERNY_NONCE -u GIVERNY_CATEGORY -u GIVERNY_FEED_DIR -u CLAUDE_CODE_SESSION_ID MANAGER_MOD_DEV=1 "GIVERNY_LEDGER=${LOOK_LEDGER:-/nonexistent/ledger.json}"
   claude --model haiku --session-id "$id" --plugin-dir "$mod")
-cmd+=(--settings "${LOOK_SETTINGS:-$(cat "$mod/settings.json")}")
+[ -z "${LOOK_SETTINGS:-}" ] || cmd+=(--settings "$LOOK_SETTINGS")
 # shellcheck disable=SC2206
 cmd+=(${LOOK_ARGS:-})
 tmux -L "$sock" -f /dev/null new-session -d -x "$width" -y "${LOOK_HEIGHT:-48}" -c /home/ita/giverny "$(printf '%q ' "${cmd[@]}")"
