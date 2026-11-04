@@ -220,7 +220,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const view = e.props.view
   const viewing = view?.agentId !== undefined
   if (e.props.hasSurvey || (await readHidden($)) || (model.rows.length === 0 && !viewing && !page)) return undefined
-  const { Box, Text, Button } = $.ui.resolve(e)
+  const { Box, Text, Button, Client } = $.ui.resolve(e)
   const chrome = await readChrome($)
   const width = Math.max(20, e.props.bodyColumns)
   const cols = Math.max(1, width - INSET)
@@ -240,10 +240,8 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
     const at = i + 1
     const fits = at + 1 + lines.length <= model.rows.length + 1 + (model.footer ? 1 : 0)
     return (
-      <Box position="absolute" top={fits ? at + 1 : Math.max(0, at - lines.length)} left={INSET} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }} flexDirection="column" backgroundColor={chrome.tip}>
-        {lines.map(l => (
-          <Text color={chrome.tipInk}>{` ${l} `}</Text>
-        ))}
+      <Box position="absolute" top={2} left={INSET} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }} flexDirection="column" backgroundColor={chrome.tip}>
+        <Client key={`tip-${r.id}`} module="./tip-client.tsx" props={{ lines }} width={80} height={2} />
       </Box>
     )
   }
