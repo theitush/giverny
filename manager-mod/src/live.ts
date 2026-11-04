@@ -59,6 +59,8 @@ export type LiveWatch = {
   limit?: Around['limit']
   subagentDirs: Map<string, string>
   session: string
+  /** The sessions whose finished workers have been read back from their folders. */
+  restored: Set<string>
 }
 
 export const newLive = (): LiveWatch => ({
@@ -75,6 +77,7 @@ export const newLive = (): LiveWatch => ({
   usageReadAt: 0,
   subagentDirs: new Map(),
   session: '',
+  restored: new Set(),
 })
 
 const safeWord = (s: string) => /^[\w-]+$/.test(s)
@@ -169,6 +172,45 @@ async function factsOf($: EngineInterface, w: LiveWatch, dirs: string[], id: str
   return known
 }
 
+/**
+ * A session's workers from their folder: `seen` goes with a reload of this module or a new process,
+ * and `$.agent.list()` has forgotten the ones finished a while back, so a Done row would lose its
+ * worker and drop off the band. Those still listed get their status from the list right after.
+ */
+async function restoreSeen($: EngineInterface, w: LiveWatch, dir: string, now: number): Promise<void> {
+  let entries: { name: string }[]
+  try {
+    entries = await $.fs.list(dir)
+  } catch {
+    return
+  }
+  for (const { name } of entries) {
+    const id = /^agent-(.+)\.meta\.json$/.exec(name)?.[1]
+    if (id === undefined || w.seen.has(id)) continue
+    try {
+      const meta = JSON.parse(await $.fs.read(`${dir}/${name}`)) as { description?: unknown; parentAgentId?: unknown; name?: unknown }
+      if (typeof meta.description !== 'string') continue
+      const facts = await factsOf($, w, [dir], id, now)
+      w.seen.set(id, {
+        id,
+        description: meta.description,
+        status: 'completed',
+        parentId: typeof meta.parentAgentId === 'string' ? meta.parentAgentId : undefined,
+        name: typeof meta.name === 'string' ? meta.name : undefined,
+        startedMs: facts?.startedMs,
+        endedMs: facts?.lastMs ?? now,
+        lastTurnMs: facts?.lastTurnMs,
+        tokens: facts?.tokens,
+        model: facts?.model,
+        stops: facts?.stops,
+        transcript: facts?.transcript,
+      })
+    } catch {
+      // A torn or missing file: that worker stays off, as it was.
+    }
+  }
+}
+
 /** `$.agent.list()` with its transcript's facts, and the finished ones it has since forgotten. */
 export async function readAgents($: EngineInterface, w: LiveWatch, sessions: string[], now: number): Promise<AgentRow[]> {
   // A `/clear` or a `/resume` into another conversation shows that one's workers instead; a
@@ -178,6 +220,11 @@ export async function readAgents($: EngineInterface, w: LiveWatch, sessions: str
   const listed = await $.agent.list()
   const dirs: string[] = []
   for (const s of sessions) dirs.push(await subagentsDir($, w, s))
+  for (const [i, s] of sessions.entries()) {
+    if (w.restored.has(s) || !dirs[i]) continue
+    w.restored.add(s)
+    await restoreSeen($, w, dirs[i], now)
+  }
   for (const a of listed) {
     const facts = await factsOf($, w, dirs, a.id, now)
     const running = isRunning({ id: a.id, description: a.description, status: a.status })

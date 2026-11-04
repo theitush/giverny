@@ -142,3 +142,30 @@ test('an alias finds the file a re-id left behind, and the session stays on it',
   expect((await ui.find({ type: 'Text', text: /kept/ })) !== undefined).toBe(true)
   await ui.unmount()
 })
+
+test('a Done row keeps its worker after a reload, read back from its folder once, when Claude Code has forgotten it', async ($, on) => {
+  base(on)
+  let lists = 0
+  // No `usage` and no lease: only a worker keeps this row on the band.
+  const feed = JSON.stringify({ rows: [{ key: 'landed', stage: 'done', started: 40_000, ended: 90_000, eta_s: 600, agent_id: 'gone' }] })
+  on('session.cwd', () => ({ value: '/w' }))
+  on('fs.stat', (_, e) => {
+    if (e.path.endsWith('.jsonl')) throw new Error('no transcript')
+    return { value: file(1, feed.length) }
+  })
+  on('fs.list', (_, e) => {
+    if (!e.path?.endsWith('/subagents')) return { value: [] }
+    lists += 1
+    return { value: ['agent-gone.meta.json', 'agent-gone.jsonl', 'agent-torn.meta.json'].map(name => ({ name, kind: 'file' })) }
+  })
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('agent-gone.meta.json')) return { value: JSON.stringify({ description: 'landed: it went well' }) }
+    if (e.path.endsWith('agent-torn.meta.json')) return { value: '{"desc' }
+    return { value: feed }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Text', text: /landed/ })) !== undefined).toBe(true)
+  expect(lists).toBe(1)
+  await ui.unmount()
+})
