@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, shortResult, startLine, unwrapped } from './page'
+import { doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, shortResult, briefNote, briefWith, startLine, unwrapped } from './page'
 
 const user = (text: string) => ({ role: 'user' as const, text, toolUses: [] })
 
@@ -98,5 +98,8 @@ test('a page tells a short one from a long one by its wrapped lines', () => {
   const brief = (n: number) => [{ kind: 'prompt' as const, text: 'x'.repeat(n) }]
   expect(pageRows(brief(10), 100)).toBe(7)
   expect(pageRows(brief(490), 100)).toBe(11)
-  expect(startLine('k', 'now')).toBe('Start k now, adding this to its brief: now')
+  expect(startLine('k')).toBe('Start k now.')
+  expect(briefWith('Do it.\n\n', 'use the old API')).toBe('Do it.\n\nThe user adds: use the old API\n')
+  expect(briefNote('k', 'b.md', 'use the old API')).toContain("task k's brief, in b.md: use the old API")
+  expect(briefNote('k', undefined, 'x')).toContain('it has no brief file')
 })

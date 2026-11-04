@@ -163,10 +163,17 @@ export function noBrief(key: string, title: string, note: string | undefined): s
 
 /** What the box says it does, by who a line goes to. */
 export const askLine = (ask: 'worker' | 'start') =>
-  ask === 'worker' ? 'Message this worker.' : 'Start this task now. Its manager adds this to its brief.'
+  ask === 'worker' ? 'Message this worker.' : "Add to this task's brief. Its worker reads it when the task starts."
 
-/** The line a Next up row's page gives the manager, as Giverny's box does. */
-export const startLine = (key: string, text: string) => `Start ${key} now, adding this to its brief: ${text}`
+/** What the start button on a Next up row's page gives the manager, who claims and spawns. */
+export const startLine = (key: string) => `Start ${key} now.`
+
+/** A brief with the person's line at its end, in the words the manage skill gives a worker. */
+export const briefWith = (brief: string, text: string) => `${brief.trimEnd()}\n\nThe user adds: ${text}\n`
+
+/** What the manager reads at its next turn of a line added to a Next up row: no turn is spent on it. */
+export const briefNote = (key: string, file: string | undefined, text: string) =>
+  `The user added this to task ${key}'s brief${file === undefined ? ' (it has no brief file)' : `, in ${file}`}: ${text}\n\nTheir words go to its worker when you start it, as theirs (\`The user adds: ...\`). This does not start the task or change when it starts.`
 
 /**
  * The lines sent and not yet in the transcript: each prompt that lands takes the place of the

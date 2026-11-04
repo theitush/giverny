@@ -10,7 +10,7 @@ import { gb } from './lease'
 import { redrawSoon } from './poll'
 import { readHidden, readPage, readSaid, readSize, readTop, readView, readWorkerView, toggleFold, writeSize, writeTop } from './state'
 import { type Chrome, chromeOf, holdsHex, HOVER_TINT, loadInk, rowFill, STAGE_INK, VIEWED_TINT } from './theme'
-import { backWords, drawBox, goBack, openRow, pagesWorkers } from './worker'
+import { backWords, drawBox, goBack, openRow, pagesWorkers, startFromPage } from './worker'
 
 // The band is a copy of Giverny's management panel, cell by cell as far as a terminal grid allows:
 // crates/app/src/management_panel.rs `Cols`, `fit_title`, `usage_cell`, `usage_inks` and
@@ -452,13 +452,22 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const pillW = cells(`0:  ${label} `)
   const saying = cut(open ? '' : words, width - INSET - GAP)
   const ruleW = Math.max(0, width - (saying ? GAP + cells(saying) + GAP : 0))
-  const backWordsNow = backWords(model, view, page ?? undefined, width - INSET - pillW - GAP, words, e.props.isWorking)
+  const startsHere = page?.place === 'row' && page.ask === 'start'
+  const startText = ' ▶ start now '
+  const backWordsNow = backWords(model, view, page ?? undefined, width - INSET - pillW - GAP - (startsHere ? GAP + cells(startText) : 0), words, e.props.isWorking)
   const back = open && (
     <Box flexDirection="row">
       <Text>{' '.repeat(INSET)}</Text>
       <Button key="back" hotkey="0" plain onPress={() => goBack($, view)}>
         <Text color={chrome.bg} backgroundColor={chrome.accent}>{` ${label} `}</Text>
       </Button>
+      {startsHere && <Text>{' '.repeat(GAP)}</Text>}
+      {/* No hotkey: a digit typed at the prompt would start a task. */}
+      {startsHere && (
+        <Button key="start-now" plain onPress={() => startFromPage($, view)}>
+          <Text color={chrome.bg} backgroundColor={STAGE_INK.next}>{startText}</Text>
+        </Button>
+      )}
       {backWordsNow !== '' && <Text color={chrome.dim}>{`${' '.repeat(GAP)}${backWordsNow}`}</Text>}
     </Box>
   )

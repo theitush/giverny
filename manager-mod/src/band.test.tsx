@@ -288,7 +288,7 @@ test('the words beside the back button fit their room, and only warn of Esc over
   expect(over('w1', 3)).toBe('')
   // On a page: where a typed line goes, and Esc only while the manager's turn runs.
   const onPage = (ask: Page['ask'], working: boolean) => backWords(m, {}, { place: 'row', ask } as Page, 200, '', working)
-  expect(onPage('start', false)).toBe('a line at the prompt starts this task  ·  or press 0 at the empty prompt, or click its row again')
+  expect(onPage('start', false)).toBe("a line at the prompt joins this task's brief  ·  or press 0 at the empty prompt, or click its row again")
   expect(onPage('worker', true).includes("Esc at the prompt stops the manager's turn")).toBe(true)
   expect(onPage(undefined, false).startsWith('read-only')).toBe(true)
 })
@@ -438,7 +438,7 @@ test('in fullscreen a row with no view takes the transcript\'s place, and the ba
   const page = await $.ui.mount({ plugin: 'manager', component: 'Placed', surface: 'terminal', requestId: 'placed', viewport: FULL, props: { id: placed[0]!, plugin: 'manager' } })
   expect((await page.find({ type: 'Text', text: /FEATURE: after it/ })) !== undefined).toBe(true)
   expect((await band.find({ key: 'back' })) !== undefined).toBe(true)
-  expect((await band.find({ type: 'Text', text: /a line at the prompt starts this task/ })) !== undefined).toBe(true)
+  expect((await band.find({ type: 'Text', text: /a line at the prompt joins this task's brief/ })) !== undefined).toBe(true)
   // A second press goes back: the page draws nothing again.
   await band.press({ key: 'row-next' })
   expect(await page.find({ type: 'Text', text: /FEATURE: after it/ })).toBe(undefined)

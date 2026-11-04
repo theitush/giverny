@@ -3,7 +3,7 @@ import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, S
 import type { DisplayRow, Model, Page, PageEntry, WorkerView } from '../types'
 
 import { cells, cut } from './cells'
-import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, startLine } from './page'
+import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, briefNote, briefWith, startLine } from './page'
 import { changePage, readPage, readPageRow, readWorkerView, readView, say, writePage, writePaged, writePageRow, writeWorkerView } from './state'
 
 // What a press on a row opens: a page, as Giverny's worker page is (docs/management-panel.md, What a
@@ -161,6 +161,9 @@ async function reveal($: EngineInterface, requestId: string): Promise<void> {
   }
 }
 
+/** The lines added to a Next up row with no brief file to hold them, for its page. */
+const added = new Map<string, string[]>()
+
 async function firstEntries($: EngineInterface, r: DisplayRow): Promise<PageEntry[]> {
   if (r.own === 'next' && r.brief !== undefined) {
     try {
@@ -169,7 +172,7 @@ async function firstEntries($: EngineInterface, r: DisplayRow): Promise<PageEntr
       return [{ kind: 'tool', text: `Its brief ${r.brief} cannot be read: ${e instanceof Error ? e.message : String(e)}`, isError: true }]
     }
   }
-  if (r.own === 'next') return [{ kind: 'prompt', text: noBrief(r.key, r.title, r.note) }]
+  if (r.own === 'next') return [{ kind: 'prompt', text: noBrief(r.key, r.title, r.note) }, ...(added.get(r.id) ?? []).map(text => ({ kind: 'prompt' as const, text: `The user adds: ${text}` }))]
   const read = await readEntries($, r)
   if (read && read.length > 0) return read
   const lines = [r.key && `Task: ${r.key}`, r.title !== r.key ? r.title : '', r.note ?? ''].filter(Boolean).join('\n\n')
@@ -274,18 +277,51 @@ async function closePage($: EngineInterface): Promise<void> {
   if (page?.place === 'pane') await $.ui.close({ id: PANE })
 }
 
-/** A line for the row's worker, or for a Next up row, the manager: the person's line only. What it came to, and whether it went. */
+/** A Next up row as it stands now: the page holds it as it was when it opened. */
+async function stillNext($: EngineInterface, page: Page): Promise<boolean> {
+  return (await readView($)).rows.find(one => one.id === page.rowId)?.own === 'next'
+}
+
+/**
+ * A line typed on a Next up row: nobody is there to read it yet, so it joins the row's brief, and the
+ * manager reads that at its next turn, as it may have the worker's prompt ready. No turn goes on it.
+ */
+async function addToBrief($: EngineInterface, page: Page, text: string): Promise<{ sent: boolean; status: string }> {
+  const r = page.row
+  try {
+    if (!(await stillNext($, page))) return { sent: false, status: 'Not sent: this task has left Next up. Go back and open its row.' }
+    if (r.brief !== undefined) await $.fs.write(r.brief, briefWith(await $.fs.read(r.brief), text))
+    else added.set(r.id, [...(added.get(r.id) ?? []), text])
+    const told = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: briefNote(r.key || r.title, r.brief, text) }] } })
+    const entries = await firstEntries($, r)
+    await changePage($, now => ({ ...now, entries }))
+    return 'deny' in told && told.deny !== undefined
+      ? { sent: true, status: `Added to this task's brief. The manager was not told: ${told.deny}` }
+      : { sent: true, status: "Added to this task's brief." }
+  } catch (e) {
+    return { sent: false, status: `Not sent: ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+/** The start button on a Next up row's page: the manager claims and spawns, so it is asked, and the page gives way to it. */
+export async function startFromPage($: EngineInterface, view?: SiteView): Promise<void> {
+  const page = await readPage($)
+  if (page?.ask !== 'start') return
+  if (!(await stillNext($, page))) {
+    await changePage($, now => ({ ...now, status: 'Not sent: this task has left Next up. Go back and open its row.' }))
+    return
+  }
+  await goBack($, view)
+  await $.prompt.submit({ text: startLine(page.row.key), asUser: true })
+}
+
+/** A line for the row's worker, or for a Next up row, its brief: the person's line only. What it came to, and whether it went. */
 async function deliver($: EngineInterface, page: Page, text: string): Promise<{ sent: boolean; status: string }> {
   if (page.ask === 'worker' && page.row.workerId !== undefined) {
     const r = await $.session.send({ to: { agentId: page.row.workerId }, text })
     return { sent: r.isDelivered, status: r.isDelivered ? 'Sent to this worker.' : `Not sent: ${r.reason}` }
   }
-  try {
-    await $.prompt.submit({ text: startLine(page.row.key, text), asUser: true })
-    return { sent: true, status: 'Sent to the manager, to start this task with it.' }
-  } catch (e) {
-    return { sent: false, status: `Not sent: ${e instanceof Error ? e.message : String(e)}` }
-  }
+  return addToBrief($, page, text)
 }
 
 /** The box's Enter, in a pane's page. */
@@ -313,13 +349,10 @@ export async function pageLine($: EngineInterface, e: PromptSubmitInput): Promis
   const page = await readPage($)
   if (page?.place !== 'row') return undefined
   if (page.ask === undefined) return ownDrop($, e, 'This page is read-only: press 0 to go back to the manager first.', false)
-  if (page.ask === 'start') {
-    await say($, 'Sent to the manager, to start this task with it.')
-    return { text: startLine(page.row.key, e.text) }
-  }
   const { sent, status } = await deliver($, page, e.text)
-  await changePage($, now => ({ ...now, status, pending: sent ? [...now.pending, e.text] : now.pending }))
-  return ownDrop($, e, status, sent, sent ? `Sent to ${page.row.key || page.row.title || 'this worker'}: ${e.text}` : undefined)
+  await changePage($, now => ({ ...now, status, pending: sent && page.ask === 'worker' ? [...now.pending, e.text] : now.pending }))
+  const name = page.row.key || page.row.title || 'this worker'
+  return ownDrop($, e, status, sent, sent ? (page.ask === 'start' ? `Added to ${name}'s brief: ${e.text}` : `Sent to ${name}: ${e.text}`) : undefined)
 }
 
 /**
@@ -411,6 +444,11 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | Rend
               back to the manager
             </Button>
           )}
+          {page.place === 'pane' && page.ask === 'start' && (
+            <Button key="start-now" plain onPress={() => startFromPage($)}>
+              start now
+            </Button>
+          )}
         </Box>
         {r.key !== '' && r.title !== r.key && <Text dimColor>{r.title}</Text>}
         {/* A running row's facts tick with its clocks: its row in the band, right there, has them. */}
@@ -465,7 +503,7 @@ export async function drawBox($: EngineInterface, e: RenderInput<'AbovePrompt'>)
 export function backWords(model: Model, view: SiteView | undefined, page: Page | undefined, room: number, said = '', working = false): string {
   const r = view?.agentId !== undefined ? model.rows.find(one => one.workerId === view.agentId) : undefined
   const esc = view?.agentId !== undefined ? (r?.own === 'running' ? 'this worker' : undefined) : page?.place === 'row' && working ? "the manager's turn" : undefined
-  const line = page?.place !== 'row' ? '' : page.ask === 'start' ? 'a line at the prompt starts this task' : page.ask === 'worker' ? 'a line at the prompt goes to this worker' : 'read-only'
+  const line = page?.place !== 'row' ? '' : page.ask === 'start' ? "a line at the prompt joins this task's brief" : page.ask === 'worker' ? 'a line at the prompt goes to this worker' : 'read-only'
   const ways = ['or press 0 at the empty prompt, or click its row again', 'or press 0, or click its row again', 'or press 0']
   const tries = ways.flatMap(way => [
     [line, way, esc && `Esc at the prompt stops ${esc}`],
