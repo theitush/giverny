@@ -2,7 +2,8 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { DisplayRow, Section } from '../types'
 
-import { readHidden, readSaid, readView, say } from './state'
+import { readHidden, readPage, readSaid, readView } from './state'
+import { drawBox, goBack, openRow, viewedWords } from './worker'
 
 // Draws the display rows above the prompt, as the #521 prototype did. A running row is the
 // way to its worker: there is no separate line of buttons.
@@ -30,19 +31,13 @@ export function line(r: DisplayRow, keyW: number, width: number): string {
 export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
   const model = await readView($)
   const words = await readSaid($)
+  const page = await readPage($)
+  const box = await drawBox($, e)
   if (e.props.hasSurvey || (await readHidden($)) || model.rows.length === 0) return undefined
   const { Box, Text, Button } = $.ui.resolve(e)
   const width = Math.max(40, e.props.bodyColumns)
   const keyW = Math.min(12, Math.max(4, ...model.rows.map(r => r.key.length)))
 
-  const open = async (id: string, title: string) => {
-    const r = await $.ui.view({ agentId: id })
-    await say($, r.deny ? `open refused: ${r.deny}` : `viewing: ${title}`)
-  }
-  const back = async () => {
-    const r = await $.ui.view({})
-    await say($, r.deny ? `back refused: ${r.deny}` : '')
-  }
   const group = (section: Section, shown: number) =>
     model.rows
       .filter(r => r.section === section)
@@ -53,15 +48,11 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
           <Text color={COLOR[section]} bold={!dim && i === 0} dimColor={dim}>{(i === 0 ? LABEL[section] : '').padEnd(8)}</Text>,
           <Text color={r.over ? 'red' : undefined} dimColor={dim}>{` ${line(r, keyW, width)}`}</Text>,
         ]
-        const worker = r.workerId
-        if (worker) {
-          return (
-            <Button key={`row-${r.id}`} plain onPress={() => open(worker, r.title)}>
-              {parts}
-            </Button>
-          )
-        }
-        return <Text wrap="truncate">{parts}</Text>
+        return (
+          <Button key={`row-${r.id}`} plain onPress={() => openRow($, r, e.props.view, e.requestId)}>
+            {parts}
+          </Button>
+        )
       })
 
   return (
@@ -69,13 +60,15 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
       <Box flexDirection="row" gap={2}>
         <Text bold>Manager</Text>
         <Text dimColor>{`${model.running} running · ${model.next} next · ${model.done} done`}</Text>
-        {e.props.view?.agentId && (
-          <Button key="back" hotkey="b" plain onPress={back}>
+        {(e.props.view?.agentId || page) && (
+          <Button key="back" hotkey="0" plain onPress={() => goBack($, e.props.view)}>
             back to the manager
           </Button>
         )}
         {words && <Text dimColor>{cut(words, 50)}</Text>}
       </Box>
+      {box}
+      {e.props.view?.agentId && <Text dimColor wrap="truncate">{viewedWords(model, e.props.view)}</Text>}
       {group('running', model.running)}
       {group('next', NEXT_SHOWN)}
       {model.next > NEXT_SHOWN && <Text dimColor>{`         +${model.next - NEXT_SHOWN} more next up`}</Text>}
