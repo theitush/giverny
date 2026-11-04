@@ -54,7 +54,8 @@ function base(on: On) {
   return mock.clock(on, { now: 100_000 })
 }
 
-const row = (key: string, stage = 'running') => ({ key, stage, started: 40_000, eta_s: 600 })
+// `usage`: a row of its own commands, drawn with no worker behind it (rule 1).
+const row = (key: string, stage = 'running') => ({ key, stage, started: 40_000, eta_s: 600, usage: { runs: 1 } })
 
 test('the feed is read and the band written only when something shows differently', async ($, on) => {
   const clock = base(on)
@@ -63,8 +64,8 @@ test('the feed is read and the band written only when something shows differentl
   let reads = 0
   let writes = 0
   on('fs.stat', () => ({ value: stamp }))
-  on('fs.read', () => {
-    reads += 1
+  on('fs.read', (_, e) => {
+    if (e.path === `${DIR}/${ME}.json`) reads += 1
     return { value: body }
   })
   on('state.set', { plugin: 'manager', key: 'view' }, (_, e, next) => {
@@ -131,7 +132,8 @@ test('an alias finds the file a re-id left behind, and the session stays on it',
     if (e.path === `${DIR}/${ME}.json`) throw new Error('missing')
     return { value: file(1, 10) }
   })
-  on('fs.list', () => {
+  on('fs.list', (_, e) => {
+    if (e.path !== DIR) return { value: [] }
     listed += 1
     return { value: [{ name: 'first.json', ...file(1, 10) }] }
   })

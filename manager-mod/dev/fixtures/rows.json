@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "writer": "giverny/manage",
+  "dev_agents": [
+    { "id": "w-work", "description": "work: at it", "status": "running", "started": "@-14m", "activity": "Bash: cargo test -p auth", "tokens": 42100 },
+    { "id": "w-paused", "description": "pausing: x", "status": "running", "started": "@-20m", "activity": "Read: a.rs", "tokens": 9800 },
+    { "id": "w-dead", "description": "dead: x", "status": "running", "started": "@-40m", "last_turn": "@-31m" },
+    { "id": "w-sleep", "description": "sleeper: x", "status": "completed", "started": "@-40m", "ended": "@-9m", "shells": [{ "id": "bjj5", "cmd": "cd ~/poly; T=1; npx wrangler deploy > $T/d.log 2>&1; echo $?", "started": "@-30m" }] },
+    { "id": "w-stop", "description": "stopped: x", "status": "running", "started": "@-25m", "stops": [{ "from": "@-5m", "reason": "no network" }] },
+    { "id": "w-ended", "description": "ended: x", "status": "completed", "started": "@-25m", "ended": "@-4m" },
+    { "id": "w-late", "description": "late: x", "status": "running", "started": "@-41m", "activity": "Edit: sweeper.rs", "tokens": 118400 },
+    { "id": "w-two", "description": "twin-a twin-b", "status": "running", "started": "@-8m", "activity": "Grep: foo", "tokens": 5000 },
+    { "id": "n-1", "description": "Triage group A", "status": "running", "parentId": "w-late", "started": "@-3m", "tokens": 1200 },
+    { "id": "n-2", "description": "Triage group B", "status": "completed", "parentId": "w-late", "started": "@-3m", "ended": "@-1m", "tokens": 900 },
+    { "id": "w-plain", "description": "Explore the code", "status": "running", "started": "@-2m", "activity": "Glob: **/*.rs" },
+    { "id": "w-done", "description": "Plain helper", "status": "completed", "started": "@-30m", "ended": "@-28m" },
+    { "id": "w-land", "description": "land: x", "status": "completed", "started": "@-60m", "ended": "@-30m", "tokens": 31000 }
+  ],
+  "rows": [
+    { "key": "work", "stage": "running", "title": "FEATURE: at work", "started": "@-14m", "eta_s": 1800 },
+    { "key": "pausing", "stage": "running", "title": "paused, its worker still at it", "started": "@-20m", "paused_since": "@-5m", "eta_s": 1800 },
+    { "key": "dead", "stage": "running", "title": "killed with its session", "started": "@-40m", "paused_since": "@-30m", "killed": "@-2m", "went_off": "@-30m", "eta_s": 3600 },
+    { "key": "sleeper", "stage": "running", "title": "asleep on its own shell", "started": "@-40m", "waiting_since": "@-9m", "note": "the deploy", "eta_s": 3600 },
+    { "key": "stopped", "stage": "running", "title": "stopped on an API error", "started": "@-25m", "eta_s": 3600 },
+    { "key": "ended", "stage": "running", "title": "its worker ended, nobody landed it", "started": "@-25m", "waiting_since": "@-5m", "note": "machine time", "eta_s": 1800 },
+    { "key": "late", "stage": "running", "title": "past its estimate", "started": "@-41m", "eta_s": 1500 },
+    { "key": "twin-a", "stage": "running", "title": "a worker holding two tasks", "eta_s": 1800, "started": "@-8m" },
+    { "key": "twin-b", "stage": "running", "title": "dittoed", "eta_s": 1800, "started": "@-8m" },
+    { "key": "build", "stage": "running", "title": "a build row, no worker, a lease", "started": "@-1m", "lease": { "state": "granted", "ram_mb": 3072, "slots": ["cargo:/x"] }, "usage": { "runs": 1, "oom_kills": 1, "oom_open": true } },
+    { "key": "free", "stage": "planned", "title": "nothing to wait for", "eta_s": 600, "planned": "@-1m" },
+    { "key": "queued", "stage": "planned", "title": "queued in the ledger's copy", "eta_s": 2400, "lease": { "state": "queued", "ram_mb": 8192, "position": 2, "behind": "late", "short": ["ram"] } },
+    { "key": "afterit", "stage": "planned", "title": "after another", "eta_s": 900, "after": "free" },
+    { "key": "held", "stage": "planned", "title": "held by its manager", "eta_s": 900, "held": "a quiet machine" },
+    { "key": "nobody", "stage": "running", "title": "started, no worker came", "started": "@-9m", "eta_s": 600 },
+    { "key": "land", "stage": "done", "title": "landed", "started": "@-60m", "ended": "@-30m", "eta_first_s": 1500, "landing": "Review — ita", "review": "ita — the ranking — branch search", "agent_id": "w-land" }
+  ],
+  "footer": "a footer from the feed"
+}

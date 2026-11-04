@@ -17,6 +17,13 @@
 #   LOOK_PLUGIN=<dir>           another copy of the plugin
 #   LOOK_PROMPT="..."           typed and sent, which spends tokens: for a live worker, on haiku
 #   LOOK_WAIT=30                seconds to wait after the prompt
+#   LOOK_NO_MANAGER=1           no manager mark: only rows with a worker draw
+#   LOOK_LEDGER=<file>          the machine ledger to read; by default none, so a row's own copy
+#                               of its lease stands, as the real ledger knows nothing of a fixture
+#
+# A fixture's "dev_agents" stand in for live workers (id, description, status, started, ended,
+# last_turn, activity, tokens, parentId, name, stops, shells), so a row keeps its worker with no
+# tokens spent: MANAGER_MOD_DEV is set here, and the plugin reads them only then.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 mod=${LOOK_PLUGIN:-$(dirname "$here")}
@@ -25,12 +32,13 @@ width=${2:-170}
 sock=mgr-look-$$
 id=$(cat /proc/sys/kernel/random/uuid)
 feed=${XDG_CONFIG_HOME:-$HOME/.config}/giverny/feeds/$id.json
+mark=$(dirname "$feed")/managers/$id.json
 before=$(sha256sum "$HOME/.claude/settings.json")
 
 cleanup() {
   tmux -L "$sock" kill-server 2>/dev/null
   giverny-manage clear --session "$id" >/dev/null 2>&1
-  rm -f "$feed"
+  rm -f "$feed" "$mark" "$(dirname "$feed")/chores/$id.json"
   rm -rf "$HOME/.claude/projects/-home-ita-giverny/$id" "$HOME/.claude/projects/-home-ita-giverny/$id.jsonl"
   [ "$before" = "$(sha256sum "$HOME/.claude/settings.json")" ] || echo "look.sh: ~/.claude/settings.json CHANGED" >&2
 }
@@ -42,8 +50,10 @@ for ago in $(grep -o '"@-[0-9]*m"' "$fixture" | tr -d '"' | sort -u); do
   body=${body//\"$ago\"/\"$(date -u -d "${ago#@}in" +%FT%TZ)\"}
 done
 printf '%s\n' "$body" >"$feed.tmp" && mv "$feed.tmp" "$feed"
+# A manager session, as the manage skill's hook would mark it: LOOK_NO_MANAGER=1 for a plain one.
+[ -n "${LOOK_NO_MANAGER:-}" ] || printf '{"session":"%s"}\n' "$id" >"$mark"
 
-cmd=(env -u GIVERNY_TAB_ID -u GIVERNY_PID -u GIVERNY_NONCE -u GIVERNY_CATEGORY -u GIVERNY_FEED_DIR -u CLAUDE_CODE_SESSION_ID
+cmd=(env -u GIVERNY_TAB_ID -u GIVERNY_PID -u GIVERNY_NONCE -u GIVERNY_CATEGORY -u GIVERNY_FEED_DIR -u CLAUDE_CODE_SESSION_ID MANAGER_MOD_DEV=1 "GIVERNY_LEDGER=${LOOK_LEDGER:-/nonexistent/ledger.json}"
   claude --model haiku --session-id "$id" --plugin-dir "$mod")
 cmd+=(--settings "${LOOK_SETTINGS:-$(cat "$mod/settings.json")}")
 # shellcheck disable=SC2206
