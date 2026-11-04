@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import type { DisplayRow, Model, Section } from '../types'
 
-import { ALL_ON, cutRuns, fitTitle, foldX, layout, rowRuns, rowText, switchesOf, usageCell } from './band'
+import { ALL_ON, bandWindow, cutRuns, fitTitle, foldX, layout, rowRuns, rowText, switchesOf, tipLines, usageCell } from './band'
 import { cells, cut, cutExact, cutMiddle } from './cells'
 import { DARK, LIGHT, STAGE, STAGE_INK, tint, VIEWED_TINT, chromeOf } from './theme'
 import { backWords } from './worker'
@@ -243,7 +243,7 @@ test('there is no gauge, no mark, no count line and no heading: the tree is a ru
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /[●○◌‖✓◆×━╋]|\d running|\d next|STAGE|Manager/ })).toBe(undefined)
-  expect((await ui.find({ type: 'Text', text: /^─+$/ })) !== undefined).toBe(true)
+  expect((await ui.find({ key: 'grip' })) !== undefined).toBe(true)
   await ui.unmount()
 })
 
@@ -379,4 +379,91 @@ test('a worker Claude Code no longer lists opens a page, and a line typed there 
   expect(opened).toEqual(['worker', 'worker'])
   await page.unmount()
   await band.unmount()
+})
+
+test('a band never set follows its rows; set, it holds its height, a window over them when shorter', () => {
+  expect(bandWindow(9, 0, null, 15, 0)).toEqual({ top: 0, shown: 9, blank: 0, area: 9, own: false })
+  // Taller than the site: the engine's to scroll, as it was.
+  expect(bandWindow(30, 0, null, 15, 7)).toEqual({ top: 0, shown: 30, blank: 0, area: 15, own: false })
+  expect(bandWindow(30, 0, 99, 15, 7)).toEqual({ top: 0, shown: 30, blank: 0, area: 15, own: false })
+  // Taller than its rows: the room stays, under them.
+  expect(bandWindow(3, 1, 8, 15, 0)).toEqual({ top: 0, shown: 3, blank: 4, area: 8, own: false })
+  expect(bandWindow(9, 0, 4, 15, 2)).toEqual({ top: 2, shown: 4, blank: 0, area: 4, own: true })
+  expect(bandWindow(9, 0, 4, 15, 20).top).toBe(5)
+  // The footer is one of the rows it was set to.
+  expect(bandWindow(9, 1, 4, 15, 0)).toEqual({ top: 0, shown: 3, blank: 0, area: 4, own: true })
+})
+
+const tipRow = { key: 'k', title: 'a title of twenty ch', why: ['why one', 'why two is longer than that'] } as unknown as DisplayRow
+
+test('a hover says the title and its why, whole while the rows hold it, and cut only at the end of the last', () => {
+  expect(tipLines(tipRow, 100, 1)).toEqual(['a title of twenty ch  ·  why one  ·  why two is longer than that'])
+  expect(tipLines(tipRow, 40, 2)).toEqual(['a title of twenty ch  ·  why one', 'why two is longer than that'])
+  expect(tipLines(tipRow, 40, 1)[0]).toBe(cut('a title of twenty ch  ·  why one  ·  why two is longer than that', 40))
+  expect(tipLines({ ...tipRow, title: '', why: [] }, 40, 2)).toEqual(['k'])
+  // One part longer than a line runs on to the next.
+  expect(tipLines({ ...tipRow, title: 'x'.repeat(50), why: [] }, 40, 2)).toEqual(['x'.repeat(40), 'x'.repeat(10)])
+})
+
+const ROWS = JSON.stringify({ rows: Array.from({ length: 9 }, (_, i) => ({ key: `t${i}`, stage: 'planned', title: `title ${i}`, eta_s: 600 })) })
+const rowsShown = async (ui: { find: (q: { type: 'Text'; text: RegExp }) => Promise<unknown> }) => {
+  const shown: number[] = []
+  for (let i = 0; i < 9; i++) if ((await ui.find({ type: 'Text', text: new RegExp(`t${i} title ${i}`) })) !== undefined) shown.push(i)
+  return shown
+}
+
+test('dragging the rule sets the height kept across sessions; a press with no move leaves it following its rows', async ($, on) => {
+  engine(on, ROWS, [])
+  const kept: Record<string, unknown> = {}
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', (_, e) => {
+    kept[e.key] = e.value
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await rowsShown(ui)).length).toBe(9)
+  await ui.pointer({ type: 'down', x: 3, y: 0, button: 'left', in: 'grip' })
+  await ui.pointer({ type: 'up', x: 3, y: 0, button: 'left', in: 'grip' })
+  expect(kept['band-rows']).toBe(undefined)
+  await ui.pointer({ type: 'down', x: 3, y: 0, button: 'left', in: 'grip' })
+  await ui.pointer({ type: 'move', x: 3, y: 5, button: 'left', in: 'grip' })
+  expect(await rowsShown(ui)).toEqual([0, 1, 2, 3])
+  // The rule is at the pointer by now, so its row against the rule's is none.
+  await ui.pointer({ type: 'up', x: 3, y: 0, button: 'left', in: 'grip' })
+  expect(kept['band-rows']).toBe(4)
+  // Shorter than its rows: the bar is the mouse's way along them, and its end is the last row.
+  await ui.pointer({ type: 'down', x: 0, y: 3, button: 'left', in: 'bar' })
+  expect(await rowsShown(ui)).toEqual([5, 6, 7, 8])
+  await ui.unmount()
+})
+
+test('a height kept from before is read at the start, and a smaller one holds at the fewest', async ($, on) => {
+  engine(on, ROWS, [])
+  mock.store(on, { 'band-rows': 1 })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await rowsShown(ui)).toEqual([0, 1])
+  await ui.unmount()
+})
+
+test('the hover text waits for egui\'s half a second, and leaving the row starts it over', async ($, on) => {
+  engine(on, ROWS, [])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const tip = 'tip-t0'
+  const showing = async () => (await ui.find({ type: 'Text', text: /title 0 +· /, in: tip })) !== undefined
+  await ui.resize({ columns: 100, rows: 1, in: tip })
+  await ui.advance(400)
+  expect(await showing()).toBe(false)
+  await ui.resize({ columns: 0, rows: 0, in: tip })
+  await ui.advance(400)
+  await ui.resize({ columns: 100, rows: 1, in: tip })
+  await ui.advance(400)
+  expect(await showing()).toBe(false)
+  await ui.advance(100)
+  expect(await showing()).toBe(true)
+  await ui.resize({ columns: 0, rows: 0, in: tip })
+  expect(await showing()).toBe(false)
+  await ui.unmount()
 })
