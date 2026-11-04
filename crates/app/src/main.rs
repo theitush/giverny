@@ -17,6 +17,7 @@ mod prompt_bar;
 mod rail;
 mod row_open;
 mod send_line;
+mod sessions_load;
 mod settings_ui;
 mod splash;
 mod tab_stop;
@@ -1276,6 +1277,10 @@ pub struct App {
     capture: Option<capture::Capture>,
     /// Last scrollback written per live tab.
     snapshots: HashMap<TabId, Snapshot>,
+    /// This frame's use reading, the sampler's newest
+    /// (`sessions_load::latest`): taken once a frame so the tab rows and the
+    /// total line draw the same one.
+    pub use_now: Option<Arc<giverny_claude::use_reading::Reading>>,
     /// Whether this process is on its way out on purpose, which is the
     /// difference between a clean shutdown and a crash in the state file.
     closing: bool,
@@ -1599,6 +1604,8 @@ impl App {
             })
             .expect("font discovery");
         shared.install_ui_fonts(&cc.egui_ctx);
+        // What Giverny runs, read once a second for the rail's figures.
+        sessions_load::start(&cc.egui_ctx);
         giverny_term::pace::set_cheap_frames(draws_on_gpu(cc));
         let see_through = see_through && translucency::confirm(cc);
         shared.opacity = opacity_for(see_through, &cfg);
@@ -1810,6 +1817,7 @@ impl App {
             keys_overlay: None,
             capture: capture::Capture::from_env(),
             snapshots: HashMap::new(),
+            use_now: None,
             closing: false,
             terminating: Arc::new(AtomicBool::new(false)),
             layout,
@@ -4631,6 +4639,10 @@ impl eframe::App for App {
                     titlebar::show(ui, &title, &self.chrome, &mut self.maximize)
                 });
         }
+
+        // The use figures this frame draws, read before the rail so its tab
+        // rows and its total line show the same reading.
+        self.use_now = sessions_load::latest(ui.ctx());
 
         egui::Panel::left("rail")
             .resizable(true)
