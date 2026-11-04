@@ -1,9 +1,9 @@
 import type { AgentInfo, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import type { DisplayRow, Model, Section } from '../types'
+import type { DisplayRow, Model, Page, Section } from '../types'
 
-import { ALL_ON, bandWindow, cutRuns, fitTitle, foldX, layout, rowRuns, rowText, switchesOf, tipLines, usageCell } from './band'
+import { ALL_ON, bandWindow, cutRuns, fitTitle, foldX, layout, rowRuns, rowText, switchesOf, tipLines, tipPlace, usageCell } from './band'
 import { cells, cut, cutExact, cutMiddle } from './cells'
 import { DARK, LIGHT, STAGE, STAGE_INK, tint, VIEWED_TINT, chromeOf } from './theme'
 import { backWords } from './worker'
@@ -285,6 +285,11 @@ test('the words beside the back button fit their room, and only warn of Esc over
   expect(over('w2', 200).includes('Esc')).toBe(false)
   expect(over('w2', 200)).toBe('or press 0 at the empty prompt, or click its row again')
   expect(over('w1', 3)).toBe('')
+  // On a page: where a typed line goes, and Esc only while the manager's turn runs.
+  const onPage = (ask: Page['ask'], working: boolean) => backWords(m, {}, { place: 'row', ask } as Page, 200, '', working)
+  expect(onPage('start', false)).toBe('a line at the prompt starts this task  ·  or press 0 at the empty prompt, or click its row again')
+  expect(onPage('worker', true).includes("Esc at the prompt stops the manager's turn")).toBe(true)
+  expect(onPage(undefined, false).startsWith('read-only')).toBe(true)
 })
 
 test('the dark and light chrome both read', async () => {
@@ -396,13 +401,45 @@ test('a band never set follows its rows; set, it holds its height, a window over
 
 const tipRow = { key: 'k', title: 'a title of twenty ch', why: ['why one', 'why two is longer than that'] } as unknown as DisplayRow
 
-test('a hover says the title and its why, whole while the rows hold it, and cut only at the end of the last', () => {
-  expect(tipLines(tipRow, 100, 1)).toEqual(['a title of twenty ch  ·  why one  ·  why two is longer than that'])
-  expect(tipLines(tipRow, 40, 2)).toEqual(['a title of twenty ch  ·  why one', 'why two is longer than that'])
-  expect(tipLines(tipRow, 40, 1)[0]).toBe(cut('a title of twenty ch  ·  why one  ·  why two is longer than that', 40))
+test('a hover says its title and each why on a line of its own, wrapped at a space, and cut only past the lines it has', () => {
+  expect(tipLines(tipRow, 100, 9)).toEqual(['a title of twenty ch', 'why one', 'why two is longer than that'])
+  expect(tipLines(tipRow, 10, 9).slice(0, 3)).toEqual(['a title of', 'twenty ch', 'why one'])
+  expect(tipLines(tipRow, 100, 2)).toEqual(['a title of twenty ch', cut('why one why two is longer than that', 100)])
   expect(tipLines({ ...tipRow, title: '', why: [] }, 40, 2)).toEqual(['k'])
-  // One part longer than a line runs on to the next.
+  // A word longer than a line runs on to the next.
   expect(tipLines({ ...tipRow, title: 'x'.repeat(50), why: [] }, 40, 2)).toEqual(['x'.repeat(40), 'x'.repeat(10)])
+})
+
+test('a tooltip goes under its row, over it where the band would clip it, and never on the row', () => {
+  expect(tipPlace(3, 5, 0, 20)).toEqual({ y: 4, room: 5 })
+  expect(tipPlace(15, 5, 0, 20)).toEqual({ y: 10, room: 5 })
+  // Neither side holds it: the side with more room, as much as fits.
+  expect(tipPlace(2, 5, 0, 7)).toEqual({ y: 3, room: 4 })
+  expect(tipPlace(4, 6, 0, 7)).toEqual({ y: 0, room: 4 })
+})
+
+const FULL = { columns: 170, rows: 48, isFullscreen: true }
+
+test('in fullscreen a row with no view takes the transcript\'s place, and the back row stands over a whole rule', async ($, on) => {
+  engine(on, FEED, [])
+  on('ui.place', () => ({ value: { isPlaced: true, requestId: 'placed' } }))
+  on('ui.open', () => {
+    throw new Error('no pane in fullscreen')
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: FULL })
+  expect(await band.find({ key: 'back' })).toBe(undefined)
+  await band.press({ key: 'row-next' })
+  const page = await $.ui.mount({ plugin: 'manager', component: 'Placed', surface: 'terminal', requestId: 'placed', viewport: FULL, props: { id: 'manager-page', plugin: 'manager' } })
+  expect((await page.find({ type: 'Text', text: /FEATURE: after it/ })) !== undefined).toBe(true)
+  expect((await band.find({ key: 'back' })) !== undefined).toBe(true)
+  expect((await band.find({ type: 'Text', text: /a line at the prompt starts this task/ })) !== undefined).toBe(true)
+  // A second press goes back: the page draws nothing again.
+  await band.press({ key: 'row-next' })
+  expect(await page.find({ type: 'Text', text: /FEATURE: after it/ })).toBe(undefined)
+  expect(await band.find({ key: 'back' })).toBe(undefined)
+  await page.unmount()
+  await band.unmount()
 })
 
 const ROWS = JSON.stringify({ rows: Array.from({ length: 9 }, (_, i) => ({ key: `t${i}`, stage: 'planned', title: `title ${i}`, eta_s: 600 })) })
@@ -452,7 +489,7 @@ test('the hover text waits for egui\'s half a second, and leaving the row starts
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   const tip = 'tip-t0'
-  const showing = async () => (await ui.find({ type: 'Text', text: /title 0 +· /, in: tip })) !== undefined
+  const showing = async () => (await ui.find({ type: 'Text', text: /title 0/, in: tip })) !== undefined
   await ui.resize({ columns: 100, rows: 1, in: tip })
   await ui.advance(400)
   expect(await showing()).toBe(false)

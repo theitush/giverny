@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { entriesOf, entriesOfFile, inRoom, noBrief, pendingAfter, unwrapped } from './page'
+import { entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine, unwrapped } from './page'
 
 const user = (text: string) => ({ role: 'user' as const, text, toolUses: [] })
 
@@ -54,4 +54,11 @@ test('each prompt that lands takes the place of the oldest line sent, whatever i
 
 test('a Next up row with no brief says what it has and how to add one', () => {
   expect(noBrief('g12', 'FEATURE: x', 'after the design')).toContain('Task: g12\n\nFEATURE: x\n\nafter the design\n\nNo brief was given')
+})
+
+test('a page tells a short one from a long one by its wrapped lines', () => {
+  const brief = (n: number) => [{ kind: 'prompt' as const, text: 'x'.repeat(n) }]
+  expect(pageRows(brief(10), 100)).toBe(7)
+  expect(pageRows(brief(490), 100)).toBe(11)
+  expect(startLine('k', 'now')).toBe('Start k now, adding this to its brief: now')
 })

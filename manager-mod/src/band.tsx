@@ -354,7 +354,6 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const box = await drawBox($, e)
   const view = e.props.view
   const viewing = view?.agentId !== undefined
-  const fullscreen = e.viewport?.isFullscreen === true
   if (e.props.hasSurvey || (await readHidden($)) || (model.rows.length === 0 && !viewing && !page)) return undefined
   const { Box, Text, Button, Client } = $.ui.resolve(e)
   const chrome = await readChrome($)
@@ -401,7 +400,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
     const runs = rowRuns(r, table, chrome, cols)
     const drawn = (list: Run[]) => list.map(s => <Text color={s.ink} backgroundColor={bg}>{s.text}</Text>)
     const pressed = (list: Run[], key: string) => (
-      <Button key={key} plain hover={{ scope: `row-${r.id}`, inverse: false }} onPress={() => openRow($, r, view, e.requestId, fullscreen)}>
+      <Button key={key} plain hover={{ scope: `row-${r.id}`, inverse: false }} onPress={() => openRow($, r, view, e.requestId, e.viewport)}>
         {drawn(list)}
       </Button>
     )

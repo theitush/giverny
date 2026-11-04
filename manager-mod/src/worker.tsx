@@ -1,9 +1,9 @@
-import type { EngineInterface, PromptSubmitInput, RenderInput, SiteView, UiScrollInput } from 'claude-code'
+import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, SiteView, UiScrollInput } from 'claude-code'
 
 import type { DisplayRow, Model, Page, PageEntry } from '../types'
 
 import { cells } from './cells'
-import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pendingAfter, startLine } from './page'
+import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine } from './page'
 import { changePage, readPage, readPaged, readView, say, writePage, writePaged } from './state'
 
 // What a press on a row opens. A worker Claude Code still lists opens in Claude Code's own view
@@ -18,6 +18,7 @@ export const PAGE_ROW = 'manager-page'
 /** What a transcript is made of, all a hook can draw: the logo is not among them, and stays above a page as above a view. */
 export const TRANSCRIPT_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'ToolProgress', 'CommandOutput', 'Spinner', 'TurnDuration', 'InfoNotice'] as const
 const FOLLOW_MS = 1000
+const LAID_OUT_MS = [150, 450]
 // Claude Code's own prompt band, as it draws one in a worker's view.
 const PROMPT_BG = 'ansi256(237)'
 
@@ -27,7 +28,7 @@ let reading = false
 let fileMs: number | undefined
 
 /** A press on a row: its worker's view, or its page; on what is open, back to the manager. */
-export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView | undefined, band: string, fullscreen: boolean): Promise<void> {
+export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView | undefined, band: string, screen: RenderViewport | undefined): Promise<void> {
   const page = await readPage($)
   const onIt = page?.rowId === r.id || (r.workerId !== undefined && view?.agentId === r.workerId)
   if (onIt) return goBack($, view)
@@ -41,7 +42,7 @@ export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView 
   }
   // A page beside a worker's view would leave the prompt talking to that worker.
   if (view?.agentId !== undefined) await $.ui.view({})
-  await openPage($, r, band, fullscreen)
+  await openPage($, r, band, screen)
 }
 
 /**
@@ -59,9 +60,9 @@ export async function goBack($: EngineInterface, view?: SiteView): Promise<void>
   await say($, '')
 }
 
-async function openPage($: EngineInterface, r: DisplayRow, band: string, fullscreen: boolean): Promise<void> {
+async function openPage($: EngineInterface, r: DisplayRow, band: string, screen: RenderViewport | undefined): Promise<void> {
   const ask = r.own === 'next' ? ('start' as const) : r.workerId !== undefined ? ('worker' as const) : undefined
-  const placed = fullscreen ? await $.ui.place({ id: PAGE_ROW }) : undefined
+  const placed = screen?.isFullscreen === true ? await $.ui.place({ id: PAGE_ROW }) : undefined
   const page: Page = { place: placed?.isPlaced ? 'row' : 'pane', band, rowId: r.id, row: r, entries: await firstEntries($, r), ask, pending: [], prompts: 0, status: '', draft: '', box: 0 }
   page.prompts = page.entries.filter(e => e.kind === 'prompt').length
   await writePage($, page)
@@ -70,8 +71,10 @@ async function openPage($: EngineInterface, r: DisplayRow, band: string, fullscr
   await say($, '')
   if (placed?.isPlaced) {
     await writePaged($, true)
-    // A brief opens at its top; a transcript follows its end, the engine's own way, by being at the end.
-    if (r.own === 'next') await reveal($, placed.requestId)
+    // A brief too long for the screen opens at its top. That takes the transcript off its end, which
+    // it finds again at the next prompt or a scroll to the bottom. All else is at its end already,
+    // and a transcript follows its end the engine's own way.
+    if (r.own === 'next' && pageRows(page.entries, screen?.columns ?? 0) >= (screen?.rows ?? 0)) await reveal($, placed.requestId)
     return
   }
   const opened = await $.ui.open({ id: PANE, title: r.key || r.title, focus: true, closeOnEscape: true })
@@ -85,10 +88,17 @@ async function openPage($: EngineInterface, r: DisplayRow, band: string, fullscr
   if (r.own !== 'next') await toEnd($)
 }
 
-/** The page's first line at the top of the transcript's window. A nicety: else it stays where it is. */
+/**
+ * The page's first line at the top of the transcript's window, once the row has been laid out at
+ * its height, which takes longer the longer the transcript; still within the press, as the
+ * transcript moves only for the person's own input. A nicety: else it stays where it is.
+ */
 async function reveal($: EngineInterface, requestId: string): Promise<void> {
   try {
-    await $.ui.scroll({ to: { requestId }, block: 'start' })
+    for (const ms of LAID_OUT_MS) {
+      await $.clock.sleep(ms)
+      await $.ui.scroll({ to: { requestId }, block: 'start' })
+    }
   } catch {
     // Left where it is.
   }
@@ -238,7 +248,11 @@ export async function pageLine($: EngineInterface, e: PromptSubmitInput): Promis
   }
   const { sent, status } = await deliver($, page, e.text)
   await say($, status)
-  if (sent) await changePage($, now => ({ ...now, pending: [...now.pending, e.text] }))
+  if (sent) {
+    await changePage($, now => ({ ...now, pending: [...now.pending, e.text] }))
+    await $.prompt.fill({ text: '' })
+  }
+  // A drop keeps the draft, for a line that did not go; Claude Code says so in the transcript.
   return { drop: status }
 }
 
@@ -250,8 +264,7 @@ export function hiddenRow($: EngineInterface, e: RenderInput) {
 
 /** The placed row, which stands in the transcript for good and is only ever the open page. */
 export async function drawPageRow($: EngineInterface, e: RenderInput<'Placed'>) {
-  if (await readPaged($)) return drawPage($, e)
-  return hiddenRow($, e)
+  return (await readPaged($)) ? drawPage($, e) : hiddenRow($, e)
 }
 
 /** The page's tree. */

@@ -339,6 +339,7 @@ declare module 'claude-code' {
       folded: Shaped<string[]>
       cleared: Shaped<{ atMs?: number; agents: string[] }>
       page: Shaped<Page | null>
+      paged: boolean
       size: Shaped<number | null>
       top: number
     }

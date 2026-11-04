@@ -85,6 +85,13 @@ export function inRoom(entries: readonly PageEntry[], room = ROOM): { shown: Pag
   return { shown: entries.slice(from), left: from }
 }
 
+/** About how tall a page draws at `columns`, its header and gaps with it: enough to tell a short page from a long one. */
+export function pageRows(entries: readonly PageEntry[], columns: number): number {
+  const HEADER = 5
+  const across = Math.max(1, columns - 2)
+  return entries.reduce((rows, e) => rows + 1 + (e.kind === 'tool' ? 1 : e.text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / across)), 0)), HEADER)
+}
+
 /** A Next up row's page with no brief: what it has, then how a brief is added. */
 export function noBrief(key: string, title: string, note: string | undefined): string {
   const parts = [key && `Task: ${key}`, title !== key ? title : '', note?.trim() ?? ''].filter(Boolean)
