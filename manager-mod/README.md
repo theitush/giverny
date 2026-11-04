@@ -16,7 +16,7 @@ Or type `/plugin install manager --marketplace /path/to/manager-mod` at the prom
 
 Installing from GitHub by `<owner>/<repo>` needs `.claude-plugin/marketplace.json` at the root of the repository. Here it sits in this folder, so that line works only once the plugin has a repository of its own.
 
-Nothing else to set up. `/manager` shows or hides the band, and `/manager clear-done` clears its Done rows.
+Nothing else to set up. `/manager` shows or hides the band, `/manager clear-done` clears its Done rows, and `/manager size <rows>` or `/manager size auto` sets its height.
 
 ## What it needs
 
@@ -54,7 +54,13 @@ Only one such command runs per session, and one in `~/.claude/settings.json` bea
 
 ## Columns
 
-The band is a copy of Giverny's management panel: the same columns in the same order and widths (stage, id and title, elapsed, ETA, NOW, tokens, use), no headings, the whole row in its stage's colour, and its hover reading its whole title and why it is where it is. Each column has a switch in `/config` (`column_stage`, `column_id`, `column_title`, `column_elapsed`, `column_eta`, `column_now`, `column_tokens`, `column_usage`, all on), which applies at once: a column off takes no width and the rest close up. As the terminal narrows, the title gives way and the rest runs off the right, as the panel's does. A table taller than the band scrolls.
+The band is a copy of Giverny's management panel: the same columns in the same order and widths (stage, id and title, elapsed, ETA, NOW, tokens, use), no headings, the whole row in its stage's colour,. Each column has a switch in `/config` (`column_stage`, `column_id`, `column_title`, `column_elapsed`, `column_eta`, `column_now`, `column_tokens`, `column_usage`, all on), which applies at once: a column off takes no width and the rest close up. As the terminal narrows, the title gives way and the rest runs off the right, as the panel's does.
+
+**Height.** Drag the rule along the band's top, as the top edge of the panel, or type `/manager size <rows>`; `/manager size auto` gives it back to its rows. The height is kept across sessions. Never set, the band is as tall as its rows. The most it can be is what Claude Code gives the band, which caps the bottom of the screen at half the terminal, the prompt included: with workers about, 15 rows under the rule at 170x48 and 29 at 193x77, two more with none. Nothing lets a plugin past that.
+
+**Scrolling.** A table taller than all that room scrolls under the wheel, with Claude Code's own `n more` line. Set shorter than its rows, the band is a window of its own with the panel's scroll bar beside it. Claude Code gives the band the wheel only when it is taller than the room, so a shorter band does not hear the wheel, which goes on scrolling the transcript. There the bar does it, or Ctrl+X Tab and then PageUp and PageDown, a window's worth each; Home and End do the same, as they cannot be told from those.
+
+**Hover.** Half a second after the pointer comes onto a row, egui's own wait, its whole title and why it is where it is show, and moving off the row starts that over. A move along one row does not. The text covers no row: it goes in the two rows kept under the table, or on the rule when those are not there (over a worker's view, with no worker, or with the table taller than the room), where it has one line and is cut at the end. In a table the engine has scrolled down, the rule is gone and the first row on show takes it.
 
 A press on a row opens its worker, and the row stays lit. The rows do not move: Claude Code adds `○ main` and a blank under the prompt over a worker's view, which a plugin cannot stop, so the band keeps two blank rows under the table for them, and the prompt goes up two lines instead. To get back, press the `↺ back to manager` button on the rule above the table, press 0 at the empty prompt, or press the row again. Esc at the prompt stops a running worker, and a plugin cannot change that.
 

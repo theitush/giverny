@@ -249,9 +249,6 @@ export function bandWindow(rows: number, footer: number, chosen: number | null, 
 /** As the last drawing left them: what a drag and the wheel are clamped to. */
 const drawn = { room: 0, lastTop: 0, top: 0, shown: 0, own: false }
 
-/** The most rows the band can hold under its rule now. */
-export const roomNow = () => drawn.room
-
 /** A height as asked for into one the band keeps: what is whole, and at least the fewest. */
 const sane = (n: number) => Math.max(MIN_ROWS, Math.round(n))
 
