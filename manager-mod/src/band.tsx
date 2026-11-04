@@ -9,7 +9,7 @@ import { cells, cellsIn, cut, cutExact, padEnd, padStart } from './cells'
 import { gb } from './lease'
 import { redrawSoon } from './poll'
 import { readHidden, readPage, readSaid, readSize, readTop, readView, readWorkerView, toggleFold, writeSize, writeTop } from './state'
-import { type Chrome, chromeOf, HOVER_TINT, loadInk, STAGE, STAGE_INK, tint, VIEWED_TINT } from './theme'
+import { type Chrome, chromeOf, holdsHex, HOVER_TINT, loadInk, rowFill, STAGE_INK, VIEWED_TINT } from './theme'
 import { backWords, drawBox, goBack, openRow, pagesWorkers } from './worker'
 
 // The band is a copy of Giverny's management panel, cell by cell as far as a terminal grid allows:
@@ -332,6 +332,21 @@ export async function barMoved($: EngineInterface, data: unknown): Promise<void>
 const THEME_EVERY_MS = 30_000
 let theme: { chrome: Chrome; atMs: number } | undefined
 
+let hexHolds: boolean | undefined
+
+/** Whether this terminal gets a hex as it is: its environment doesn't change while Claude Code runs. */
+async function readHexHolds($: EngineInterface): Promise<boolean> {
+  hexHolds ??= holdsHex({
+    colorTerm: await $.env.get('COLORTERM'),
+    term: await $.env.get('TERM'),
+    termProgram: await $.env.get('TERM_PROGRAM'),
+    tmux: await $.env.get('TMUX'),
+    tmuxTrueColour: await $.env.get('CLAUDE_CODE_TMUX_TRUECOLOR'),
+    forceColor: await $.env.get('FORCE_COLOR'),
+  })
+  return hexHolds
+}
+
 /** Claude Code's `theme` setting, for the panel's chrome, looked at now and then: a band redraws as its clock ticks. A read that fails is a dark terminal. */
 async function readChrome($: EngineInterface): Promise<Chrome> {
   const now = await $.clock.now()
@@ -357,6 +372,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   if (e.props.hasSurvey || (await readHidden($)) || (model.rows.length === 0 && !viewing && !page)) return undefined
   const { Box, Text, Button, Client } = $.ui.resolve(e)
   const chrome = await readChrome($)
+  const hex = await readHexHolds($)
   const width = Math.max(20, e.props.bodyColumns)
   const cols = Math.max(1, width - INSET)
   const table = layout(model.rows, Math.max(40, cols), on)
@@ -397,7 +413,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const row = (r: DisplayRow) => {
     const ink = STAGE_INK[r.own]
     const lit = page?.rowId === r.id || (viewing && r.workerId === view?.agentId)
-    const bg = lit ? tint(STAGE[r.own], chrome.bg, VIEWED_TINT) : undefined
+    const bg = lit ? rowFill(r.own, chrome, VIEWED_TINT, hex) : undefined
     const runs = rowRuns(r, table, chrome, cols)
     const drawn = (list: Run[]) => list.map(s => <Text color={s.ink} backgroundColor={bg}>{s.text}</Text>)
     const pressed = (list: Run[], key: string) => (
@@ -422,7 +438,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
       ]
     }
     return (
-      <Box key={`box-${r.id}`} flexDirection="row" hover={{ scope: `row-${r.id}`, ...(lit ? {} : { backgroundColor: tint(STAGE[r.own], chrome.bg, HOVER_TINT) }) }}>
+      <Box key={`box-${r.id}`} flexDirection="row" hover={{ scope: `row-${r.id}`, ...(lit ? {} : { backgroundColor: rowFill(r.own, chrome, HOVER_TINT, hex) }) }}>
         {/* The bar at the left edge of the row on view, in the margin, clear of the text. */}
         <Text color={ink}>{lit ? ' ▌' : '  '}</Text>
         {cellsOfRow}
@@ -490,7 +506,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
             <Client
               key="bar"
               module="./bar-client.tsx"
-              props={{ rows: win.shown, thumb, at: thumbAt, ink: chrome.rule, lit: chrome.accent }}
+              props={{ rows: win.shown, thumb, at: thumbAt, ink: chrome.dim, track: chrome.rule, lit: chrome.accent }}
               width={1}
               height={win.shown}
             />

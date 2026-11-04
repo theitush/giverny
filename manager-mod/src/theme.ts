@@ -54,5 +54,31 @@ export function tint(color: string, bg: string, alpha: number): string {
     .join('')}`
 }
 
+/** What the terminal is told about itself, as Claude Code picks its colour depth from it. */
+export type ColourEnv = { colorTerm?: string; term?: string; termProgram?: string; tmux?: string; tmuxTrueColour?: string; forceColor?: string }
+
+/**
+ * Whether a hex reaches the terminal as it is. Otherwise Claude Code rounds it to the 256-colour
+ * cube, as Windows Terminal under WSL gets with no COLORTERM: a row's hover `#0a170b` goes out as
+ * code 16, pure black, and `#0a1720` as code 17, a saturated blue. Says no when unsure, as a grey
+ * from the ramp looks right at either depth and a tint looks wrong at the lower one.
+ */
+export function holdsHex(env: ColourEnv): boolean {
+  if (env.forceColor !== undefined && env.forceColor !== '3') return false
+  if (env.tmux && !env.tmuxTrueColour) return false
+  if (env.forceColor === '3' || env.colorTerm === 'truecolor' || env.colorTerm === '24bit') return true
+  return ['alacritty', 'contour', 'foot', 'ghostty', 'rio', 'wezterm', 'xterm-ghostty', 'xterm-kitty'].includes(env.term ?? '') || env.termProgram === 'vscode'
+}
+
+/**
+ * A row's fill: the panel's tint of its stage where a hex holds. Where it doesn't, the cube has no
+ * colour that dark, so the nearest in brightness from the grey ramp, one for every stage.
+ */
+export function rowFill(stage: Section, c: Chrome, alpha: number, hex: boolean): string {
+  if (hex) return tint(STAGE[stage], c.bg, alpha)
+  const lit = alpha >= VIEWED_TINT
+  return c === LIGHT ? (lit ? 'ansi256(252)' : 'ansi256(254)') : lit ? 'ansi256(236)' : 'ansi256(234)'
+}
+
 /** A figure by its weight on the machine, as `Load::color`: light keeps its row's colour. */
 export const loadInk = (load: Load, row: string, c: Chrome) => (load === 'heavy' ? c.poppy : load === 'busy' ? c.amber : row)

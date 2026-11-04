@@ -5,7 +5,7 @@ import type { DisplayRow, Model, Page, Section } from '../types'
 
 import { ALL_ON, bandWindow, cutRuns, fitTitle, foldX, layout, rowRuns, rowText, switchesOf, tipLines, tipPlace, usageCell } from './band'
 import { cells, cut, cutExact, cutMiddle } from './cells'
-import { DARK, LIGHT, STAGE, STAGE_INK, tint, VIEWED_TINT, chromeOf } from './theme'
+import { DARK, holdsHex, HOVER_TINT, LIGHT, rowFill, STAGE, STAGE_INK, tint, VIEWED_TINT, chromeOf } from './theme'
 import { backWords } from './worker'
 
 const BAND = {
@@ -269,7 +269,7 @@ test('while a worker is on view its row is lit, the way back has words, and the 
   expect((await ui.find({ type: 'Text', text: /Esc at the prompt stops this worker/ })) !== undefined).toBe(true)
   expect((await ui.find({ type: 'Text', text: /▌/ })) !== undefined).toBe(true)
   const lit = await ui.find({ type: 'Text', text: /the build/ })
-  expect((lit?.props as { backgroundColor?: string }).backgroundColor).toBe(tint(STAGE.running, DARK.bg, VIEWED_TINT))
+  expect((lit?.props as { backgroundColor?: string }).backgroundColor).toBe(rowFill('running', DARK, VIEWED_TINT, false))
   await ui.press({ key: 'back' })
   expect(asked).toEqual([{}])
   await ui.press({ key: 'row-build' })
@@ -592,4 +592,19 @@ test('the hover text waits for egui\'s half a second, and leaving the row starts
   await ui.resize({ columns: 0, rows: 0, in: tip })
   expect(await showing()).toBe(false)
   await ui.unmount()
+})
+
+test('a row is tinted only where a hex reaches the terminal unrounded', () => {
+  // Windows Terminal under WSL: Claude Code runs at 256 colours, where a tint rounds to black or blue.
+  expect(holdsHex({ term: 'xterm-256color' })).toBe(false)
+  expect(holdsHex({ term: 'xterm-256color', colorTerm: 'truecolor' })).toBe(true)
+  expect(holdsHex({ term: 'xterm-kitty' })).toBe(true)
+  expect(holdsHex({ term: 'screen', colorTerm: 'truecolor', tmux: '/tmp/s' })).toBe(false)
+  expect(holdsHex({ term: 'screen', colorTerm: 'truecolor', tmux: '/tmp/s', tmuxTrueColour: '1' })).toBe(true)
+  expect(holdsHex({ colorTerm: 'truecolor', forceColor: '2' })).toBe(false)
+  expect(rowFill('done', DARK, HOVER_TINT, true)).toBe(tint(STAGE.done, DARK.bg, HOVER_TINT))
+  expect(rowFill('done', DARK, HOVER_TINT, false)).toBe('ansi256(234)')
+  expect(rowFill('running', DARK, HOVER_TINT, false)).toBe('ansi256(234)')
+  expect(rowFill('running', DARK, VIEWED_TINT, false)).toBe('ansi256(236)')
+  expect(rowFill('next', LIGHT, HOVER_TINT, false)).toBe('ansi256(254)')
 })
