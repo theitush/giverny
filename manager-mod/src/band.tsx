@@ -194,32 +194,48 @@ export function cutRuns(runs: Run[], at: number): [Run[], Run[]] {
 }
 
 /**
- * A row's hover, `Line::tip`, its whole title (its id with none), then why it is where it is, laid
- * into `lines` lines of `room` cells: a part stays whole while it fits, and what still does not fit
- * is cut at the end of the last line.
+ * A row's hover, `Line::tip`: its whole title (its id with none), then each reason it is where it
+ * is on a line of its own, wrapped at `room` cells. Past `lines` lines, the last is cut at its end.
  */
 export function tipLines(r: DisplayRow, room: number, lines: number): string[] {
   const out: string[] = []
-  let line = ''
   for (const part of [r.title || r.key, ...r.why].filter(l => l !== '')) {
-    let rest = line === '' ? part : `${line}${SEP}${part}`
-    if (line !== '' && cells(rest) > room && out.length < lines - 1) {
-      out.push(line)
-      rest = part
-    }
-    while (cells(rest) > room && out.length < lines - 1) {
+    let rest = part
+    while (cells(rest) > room) {
+      // At the last space that fits, as a tooltip wraps; a word longer than the line is cut.
       const gs = cellsIn(rest)
-      out.push(gs.slice(0, room).join(''))
-      rest = gs.slice(room).join('')
+      const space = gs.lastIndexOf(' ', room)
+      const at = space > 0 ? space : room
+      out.push(gs.slice(0, at).join(''))
+      rest = gs.slice(space > 0 ? at + 1 : at).join('')
     }
-    line = rest
+    out.push(rest)
   }
-  return line === '' ? out : [...out, cut(line, room)]
+  if (out.length <= lines) return out
+  return [...out.slice(0, lines - 1), cut(out.slice(lines - 1).join(' '), room)]
+}
+
+/**
+ * Where a row's tooltip goes among `[top, bottom)`, what the band shows: under the row at `rowY` as
+ * Giverny's, over it where that would be clipped, on whichever side has more room if neither holds
+ * `tall` rows, and never on the row itself, which it would take the pointer from.
+ */
+export function tipPlace(rowY: number, tall: number, top: number, bottom: number): { y: number; room: number } {
+  const under = bottom - rowY - 1
+  const over = rowY - top
+  if (under >= tall || under >= over) return { y: rowY + 1, room: Math.min(under, tall) }
+  const room = Math.min(over, tall)
+  return { y: rowY - room, room }
 }
 
 /** The fewest rows the person can size the band to, under its rule. */
 export const MIN_ROWS = 2
 const RULE_ROWS = 1
+/** A tooltip's width at most, in cells of text: egui's `tooltip_width` of 500 points at the panel's font. */
+const TIP_ROOM = 72
+/** What its edge and padding take: a row each side, and two cells. */
+const TIP_EDGE_ROWS = 2
+const TIP_EDGE_CELLS = 4
 /** The scroll bar stands in the cells the engine keeps right of the band, under its `[-]`. */
 const BAR_GAP = 2
 
@@ -338,6 +354,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const box = await drawBox($, e)
   const view = e.props.view
   const viewing = view?.agentId !== undefined
+  const fullscreen = e.viewport?.isFullscreen === true
   if (e.props.hasSurvey || (await readHidden($)) || (model.rows.length === 0 && !viewing && !page)) return undefined
   const { Box, Text, Button, Client } = $.ui.resolve(e)
   const chrome = await readChrome($)
@@ -349,17 +366,25 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   // site's room falls by as many as the tree gives back, so the window is the same either way.
   const hasWorkers = model.rows.some(r => r.workerId !== undefined)
   const keeps = !viewing && hasWorkers
-  const boxRows = page?.ask ? 1 + (page.status !== '' ? 1 : 0) : 0
+  const boxRows = page?.ask && page.place === 'pane' ? 1 + (page.status !== '' ? 1 : 0) : 0
   const footerRows = model.footer ? 1 : 0
   const room = e.props.maxRows - RULE_ROWS - boxRows - (keeps ? RESERVED : 0)
-  const win = bandWindow(model.rows.length, footerRows, await readSize($), room, await readTop($))
+  const open = viewing || Boolean(page)
+  const chosen = await readSize($)
+  const top = await readTop($)
+  const asked = bandWindow(model.rows.length, footerRows, chosen, room, top)
+  // The back row grows the band upward, so the rule and the rows stay on their screen lines. A band
+  // with no row left to grow into keeps them there too: the back row stands under the table, in the
+  // reserved rows where there are any, else in the place of the window's last row.
+  const under0 = open && footerRows + asked.shown + asked.blank >= room
+  const shorter = under0 && !keeps
+  const win = shorter ? bandWindow(model.rows.length, footerRows, Math.max(MIN_ROWS, room - 1), room, top) : asked
+  const backRows = open && !under0 ? 1 : 0
   drawn.room = room
   drawn.top = win.top
   drawn.shown = win.shown
   drawn.lastTop = model.rows.length - win.shown
   drawn.own = win.own
-  // Those rows are on screen only with the tree no taller than the site.
-  const under = keeps && footerRows + win.shown + win.blank <= room
   const onRow = model.rows.slice(win.top, win.top + win.shown)
   const thumb = Math.max(1, Math.round((win.shown * win.shown) / Math.max(1, model.rows.length)))
   const thumbAt = drawn.lastTop > 0 ? Math.round((win.top / drawn.lastTop) * (win.shown - thumb)) : 0
@@ -376,7 +401,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
     const runs = rowRuns(r, table, chrome, cols)
     const drawn = (list: Run[]) => list.map(s => <Text color={s.ink} backgroundColor={bg}>{s.text}</Text>)
     const pressed = (list: Run[], key: string) => (
-      <Button key={key} plain onPress={() => openRow($, r, view, e.requestId)}>
+      <Button key={key} plain hover={{ scope: `row-${r.id}`, inverse: false }} onPress={() => openRow($, r, view, e.requestId, fullscreen)}>
         {drawn(list)}
       </Button>
     )
@@ -390,7 +415,7 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
       const [glyph, after] = cutRuns(rest, 2)
       cellsOfRow = [
         pressed(before, `row-${r.id}`),
-        <Button key={`fold-${r.id}`} plain onPress={() => fold(toggler.id)}>
+        <Button key={`fold-${r.id}`} plain hover={{ scope: `row-${r.id}`, inverse: false }} onPress={() => fold(toggler.id)}>
           {drawn(glyph)}
         </Button>,
         pressed(after, `rest-${r.id}`),
@@ -405,49 +430,56 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
     )
   }
 
-  // The panel's separator, and on it, always here, the way back while a worker is on screen.
-  const open = viewing || Boolean(page)
+  // The panel's separator, edge to edge, and a row of its own for the way back while a worker is on
+  // screen: the rule keeps its whole line, for the eye and the drag.
   const label = width < 40 ? '↺ back' : width < 60 ? '↺ manager' : '↺ back to manager'
   const pillW = cells(`0:  ${label} `)
-  const said = open ? '' : words
-  const saying = open ? backWords(model, view, page, width - INSET - pillW - GAP - GAP - (words ? cells(words) + GAP : 0), words) : cut(said, width - INSET - GAP)
-  const used = open ? INSET + pillW + (saying ? GAP + cells(saying) + GAP : GAP) : saying ? GAP + cells(saying) + GAP : 0
-  const ruleW = Math.max(0, width - used)
+  const saying = cut(open ? '' : words, width - INSET - GAP)
+  const ruleW = Math.max(0, width - (saying ? GAP + cells(saying) + GAP : 0))
+  const backWordsNow = backWords(model, view, page ?? undefined, width - INSET - pillW - GAP, words, e.props.isWorking)
+  const back = open && (
+    <Box flexDirection="row">
+      <Text>{' '.repeat(INSET)}</Text>
+      <Button key="back" hotkey="0" plain onPress={() => goBack($, view)}>
+        <Text color={chrome.bg} backgroundColor={chrome.accent}>{` ${label} `}</Text>
+      </Button>
+      {backWordsNow !== '' && <Text color={chrome.dim}>{`${' '.repeat(GAP)}${backWordsNow}`}</Text>}
+    </Box>
+  )
+  const rule = (
+    <Box flexDirection="row">
+      {saying !== '' && <Text color={chrome.dim}>{`${' '.repeat(GAP)}${saying}${' '.repeat(GAP)}`}</Text>}
+      <Client key="grip" module="./grip-client.tsx" props={{ width: ruleW, rows: win.area, ink: chrome.rule, lit: chrome.accent }} width={ruleW} height={RULE_ROWS} />
+    </Box>
+  )
 
-  // Every row's hover reads its whole title and why it is where it is, `Line::tip`, once the
-  // pointer has rested (src/tip-client.tsx), and it covers no row: in the rows kept under the table
-  // when they are there, else on the rule. It shows by the row's hover group and moves nothing.
-  // Scrolled by the engine the rule goes with the rows and no row is free: the first one on show
-  // takes it, the one place this covers a row.
-  const tipAt = under ? INSET : open ? INSET + pillW + GAP : INSET
-  const tipTop = under ? 0 : e.props.scroll.offset
-  const tipRoom = Math.max(1, width - tipAt - 2)
-  const tip = (r: DisplayRow) => {
-    const lines = tipLines(r, tipRoom, under ? RESERVED : RULE_ROWS)
+  // Every row's hover reads its whole title and why it is where it is, `Line::tip`, once the pointer
+  // has rested (src/tip-client.tsx), a tooltip at the row's left edge: under the row, or over it
+  // where the band would clip it. A hover has no pointer to go by, so it cannot follow its column.
+  // It shows by the row's hover group, out of the flow, and moves nothing.
+  const head = boxRows + backRows
+  const below = shorter ? 1 : 0
+  const treeRows = head + RULE_ROWS + footerRows + win.shown + win.blank + below + (keeps ? RESERVED : 0)
+  const seenTop = e.props.scroll.offset
+  const seenBottom = treeRows > e.props.maxRows ? seenTop + e.props.scroll.bodyRows : treeRows
+  const tipRoom = Math.max(1, Math.min(TIP_ROOM, width - INSET - TIP_EDGE_CELLS))
+  const tip = (r: DisplayRow, i: number) => {
+    const whole = tipLines(r, tipRoom, Number.MAX_SAFE_INTEGER)
+    const { y, room } = tipPlace(head + RULE_ROWS + i, whole.length + TIP_EDGE_ROWS, seenTop, seenBottom)
+    // In a band too short for its edge the words go bare.
+    const edged = room > TIP_EDGE_ROWS
+    const lines = tipLines(r, tipRoom, Math.max(1, edged ? room - TIP_EDGE_ROWS : room))
     return (
-      <Box key={`hint-${r.id}`} position="absolute" top={tipTop} left={tipAt} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }}>
-        <Client key={`tip-${r.id}`} module="./tip-client.tsx" props={{ lines, ink: chrome.tipInk, fill: chrome.tip }} width={tipRoom + 2} height={lines.length} />
+      <Box key={`hint-${r.id}`} position="absolute" top={y} left={INSET} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }}>
+        <Client key={`tip-${r.id}`} module="./tip-client.tsx" props={{ lines, ink: chrome.tipInk, fill: chrome.tip, edge: edged ? chrome.edge : null }} />
       </Box>
     )
   }
-  const rule = (
-    <Box flexDirection="row">
-      {open && <Text>{' '.repeat(INSET)}</Text>}
-      {open && (
-        <Button key="back" hotkey="0" plain onPress={() => goBack($, view)}>
-          <Text color={chrome.bg} backgroundColor={chrome.accent}>{` ${label} `}</Text>
-        </Button>
-      )}
-      {saying !== '' && <Text color={chrome.dim}>{`${' '.repeat(GAP)}${saying}${' '.repeat(GAP)}`}</Text>}
-      {open && saying === '' && <Text>{' '.repeat(GAP)}</Text>}
-      <Client key="grip" module="./grip-client.tsx" props={{ width: ruleW, rows: win.area, ink: chrome.rule, lit: chrome.accent }} width={ruleW} height={RULE_ROWS} />
-      {!under && onRow.map(tip)}
-    </Box>
-  )
 
   return (
     <Box flexDirection="column">
       {box}
+      {backRows > 0 && back}
       <Box flexDirection="column">
         {rule}
         {onRow.map(row)}
@@ -465,9 +497,11 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
           </Box>
         )}
       </Box>
+      {shorter && back}
       {/* Claude Code's own rows under the prompt come over a worker's view and push the band up by
           as many: this room gives way to them, so the table stays on its screen lines. */}
-      {keeps && <Box height={RESERVED}>{under && onRow.map(tip)}</Box>}
+      {keeps && <Box height={RESERVED} flexDirection="column">{under0 && back}</Box>}
+      {onRow.map(tip)}
     </Box>
   )
 }

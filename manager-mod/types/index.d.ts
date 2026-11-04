@@ -307,8 +307,9 @@ export type Model = {
 /** One entry of a worker's page, as Claude Code's view of a worker draws it. */
 export type PageEntry = { kind: 'prompt' | 'text' | 'tool'; text: string; isError?: true }
 
-/** The page a press opened in the pane (src/worker.tsx): undefined with none open. */
+/** The page a press opened (src/worker.tsx): undefined with none open. `row`: in the transcript's place, fullscreen; `pane`: docked, on the main screen. */
 export type Page = {
+  place: 'row' | 'pane'
   /** The band's site: the box is drawn there. */
   band: string
   rowId: string

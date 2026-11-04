@@ -1,16 +1,22 @@
-import type { EngineInterface, RenderInput, SiteView, UiScrollInput } from 'claude-code'
+import type { EngineInterface, PromptSubmitInput, RenderInput, SiteView, UiScrollInput } from 'claude-code'
 
 import type { DisplayRow, Model, Page, PageEntry } from '../types'
 
 import { cells } from './cells'
-import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pendingAfter } from './page'
-import { changePage, readPage, readView, say, writePage } from './state'
+import { askLine, entriesOf, entriesOfFile, inRoom, noBrief, pendingAfter, startLine } from './page'
+import { changePage, readPage, readPaged, readView, say, writePage, writePaged } from './state'
 
 // What a press on a row opens. A worker Claude Code still lists opens in Claude Code's own view
-// of it, `$.ui.view`, whose prompt is that worker's; every other row opens a page in a pane, as
-// Giverny's worker page does (docs/management-panel.md, What a click on a row opens).
+// of it, `$.ui.view`, whose prompt is that worker's; every other row opens a page, as Giverny's
+// worker page does (docs/management-panel.md, What a click on a row opens). In fullscreen the page
+// takes the transcript's place, so it reads as that view does: a placed row draws it and every
+// other row of the transcript draws nothing while it is open. On the main screen, where what is
+// drawn cannot be taken back, it is a pane.
 
 export const PANE = 'worker'
+export const PAGE_ROW = 'manager-page'
+/** What a transcript is made of, all a hook can draw: the logo is not among them, and stays above a page as above a view. */
+export const TRANSCRIPT_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'ToolProgress', 'CommandOutput', 'Spinner', 'TurnDuration', 'InfoNotice'] as const
 const FOLLOW_MS = 1000
 // Claude Code's own prompt band, as it draws one in a worker's view.
 const PROMPT_BG = 'ansi256(237)'
@@ -21,7 +27,7 @@ let reading = false
 let fileMs: number | undefined
 
 /** A press on a row: its worker's view, or its page; on what is open, back to the manager. */
-export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView | undefined, band: string): Promise<void> {
+export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView | undefined, band: string, fullscreen: boolean): Promise<void> {
   const page = await readPage($)
   const onIt = page?.rowId === r.id || (r.workerId !== undefined && view?.agentId === r.workerId)
   if (onIt) return goBack($, view)
@@ -35,7 +41,7 @@ export async function openRow($: EngineInterface, r: DisplayRow, view: SiteView 
   }
   // A page beside a worker's view would leave the prompt talking to that worker.
   if (view?.agentId !== undefined) await $.ui.view({})
-  await openPage($, r, band)
+  await openPage($, r, band, fullscreen)
 }
 
 /**
@@ -53,24 +59,39 @@ export async function goBack($: EngineInterface, view?: SiteView): Promise<void>
   await say($, '')
 }
 
-async function openPage($: EngineInterface, r: DisplayRow, band: string): Promise<void> {
+async function openPage($: EngineInterface, r: DisplayRow, band: string, fullscreen: boolean): Promise<void> {
   const ask = r.own === 'next' ? ('start' as const) : r.workerId !== undefined ? ('worker' as const) : undefined
-  const page: Page = { band, rowId: r.id, row: r, entries: await firstEntries($, r), ask, pending: [], prompts: 0, status: '', draft: '', box: 0 }
+  const placed = fullscreen ? await $.ui.place({ id: PAGE_ROW }) : undefined
+  const page: Page = { place: placed?.isPlaced ? 'row' : 'pane', band, rowId: r.id, row: r, entries: await firstEntries($, r), ask, pending: [], prompts: 0, status: '', draft: '', box: 0 }
   page.prompts = page.entries.filter(e => e.kind === 'prompt').length
   await writePage($, page)
   pinned = false
   fileMs = undefined
+  await say($, '')
+  if (placed?.isPlaced) {
+    await writePaged($, true)
+    // A brief opens at its top; a transcript follows its end, the engine's own way, by being at the end.
+    if (r.own === 'next') await reveal($, placed.requestId)
+    return
+  }
   const opened = await $.ui.open({ id: PANE, title: r.key || r.title, focus: true, closeOnEscape: true })
   if (!opened.isPlaced) {
     await say($, `no room for the page: ${opened.reason}`)
     return
   }
-  await say($, '')
   // A press leaves the keys with the band, and a site that holds none is refused them, so the
   // line for the worker is typed in the band, where they already are.
   if (ask) await toBox($, band, 'say-0')
-  // A brief opens at its top, a transcript on its end.
   if (r.own !== 'next') await toEnd($)
+}
+
+/** The page's first line at the top of the transcript's window. A nicety: else it stays where it is. */
+async function reveal($: EngineInterface, requestId: string): Promise<void> {
+  try {
+    await $.ui.scroll({ to: { requestId }, block: 'start' })
+  } catch {
+    // Left where it is.
+  }
 }
 
 async function firstEntries($: EngineInterface, r: DisplayRow): Promise<PageEntry[]> {
@@ -146,7 +167,7 @@ async function followPage($: EngineInterface): Promise<void> {
       const prompts = pending.length < now.pending.length ? entries.filter(e => e.kind === 'prompt').length : now.prompts
       return { ...now, entries, pending, prompts }
     })
-    if (!pinned) await toEnd($)
+    if (!pinned && page.place === 'pane') await toEnd($)
   } catch {
     // The next look tries again: a worker's transcript comes and goes as it is written.
   } finally {
@@ -166,29 +187,30 @@ export async function pageClosed($: EngineInterface): Promise<void> {
 }
 
 async function closePage($: EngineInterface): Promise<void> {
+  const page = await readPage($)
   await writePage($, undefined)
-  await $.ui.close({ id: PANE })
+  await writePaged($, false)
+  if (page?.place === 'pane') await $.ui.close({ id: PANE })
 }
 
-/** The box's Enter: to the worker, or for a Next up row, to the manager. The person's line only. */
-async function send($: EngineInterface, page: Page, text: string): Promise<void> {
-  if (text.trim() === '') return
-  const key = page.row.key
-  let status: string
-  let sent = true
+/** A line for the row's worker, or for a Next up row, the manager: the person's line only. What it came to, and whether it went. */
+async function deliver($: EngineInterface, page: Page, text: string): Promise<{ sent: boolean; status: string }> {
   if (page.ask === 'worker' && page.row.workerId !== undefined) {
     const r = await $.session.send({ to: { agentId: page.row.workerId }, text })
-    sent = r.isDelivered
-    status = r.isDelivered ? 'Sent to this worker.' : `Not sent: ${r.reason}`
-  } else {
-    try {
-      await $.prompt.submit({ text: `Start ${key} now, adding this to its brief: ${text}`, asUser: true })
-      status = 'Sent to the manager, to start this task with it.'
-    } catch (e) {
-      sent = false
-      status = `Not sent: ${e instanceof Error ? e.message : String(e)}`
-    }
+    return { sent: r.isDelivered, status: r.isDelivered ? 'Sent to this worker.' : `Not sent: ${r.reason}` }
   }
+  try {
+    await $.prompt.submit({ text: startLine(page.row.key, text), asUser: true })
+    return { sent: true, status: 'Sent to the manager, to start this task with it.' }
+  } catch (e) {
+    return { sent: false, status: `Not sent: ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+/** The box's Enter, in a pane's page. */
+async function send($: EngineInterface, page: Page, text: string): Promise<void> {
+  if (text.trim() === '') return
+  const { sent, status } = await deliver($, page, text)
   const box = page.box + 1
   await changePage($, now => ({
     ...now,
@@ -201,8 +223,39 @@ async function send($: EngineInterface, page: Page, text: string): Promise<void>
   if (!pinned) await toEnd($)
 }
 
+/**
+ * The prompt's Enter on a page in the transcript's place: the person's own line goes where the
+ * page says, as a worker's view sends it to that worker. Undefined: not this page's to take.
+ */
+export async function pageLine($: EngineInterface, e: PromptSubmitInput): Promise<{ text: string } | { drop: string } | undefined> {
+  if (e.command !== undefined || e.isMeta === true || e.origin?.kind !== 'composer') return undefined
+  const page = await readPage($)
+  if (page?.place !== 'row') return undefined
+  if (page.ask === undefined) return { drop: 'This page is read-only: press 0 to go back to the manager first.' }
+  if (page.ask === 'start') {
+    await say($, 'Sent to the manager, to start this task with it.')
+    return { text: startLine(page.row.key, e.text) }
+  }
+  const { sent, status } = await deliver($, page, e.text)
+  await say($, status)
+  if (sent) await changePage($, now => ({ ...now, pending: [...now.pending, e.text] }))
+  return { drop: status }
+}
+
+/** A transcript's row while a page is in its place. */
+export function hiddenRow($: EngineInterface, e: RenderInput) {
+  const { Box } = $.ui.resolve(e)
+  return <Box display="none" />
+}
+
+/** The placed row, which stands in the transcript for good and is only ever the open page. */
+export async function drawPageRow($: EngineInterface, e: RenderInput<'Placed'>) {
+  if (await readPaged($)) return drawPage($, e)
+  return hiddenRow($, e)
+}
+
 /** The page's tree. */
-export async function drawPage($: EngineInterface, e: RenderInput<'Pane'>) {
+export async function drawPage($: EngineInterface, e: RenderInput<'Pane'> | RenderInput<'Placed'>) {
   const { Box, Text, Button, Markdown } = $.ui.resolve(e)
   const page = await readPage($)
   if (!page) return <Text dimColor>Nothing open.</Text>
@@ -232,9 +285,11 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'>) {
       <Box flexDirection="column">
         <Box flexDirection="row" gap={2}>
           <Text bold>{r.key || r.title}</Text>
-          <Button key="back" hotkey="0" plain onPress={() => goBack($)}>
-            back to the manager
-          </Button>
+          {page.place === 'pane' && (
+            <Button key="back" hotkey="0" plain onPress={() => goBack($)}>
+              back to the manager
+            </Button>
+          )}
         </Box>
         {r.key !== '' && r.title !== r.key && <Text dimColor>{r.title}</Text>}
         {r.facts.length > 0 && <Text dimColor>{r.facts.join(' · ')}</Text>}
@@ -253,7 +308,7 @@ export async function drawPage($: EngineInterface, e: RenderInput<'Pane'>) {
 /** The page's box, drawn in the band: what is typed in it goes to the row's worker or manager. */
 export async function drawBox($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
   const page = await readPage($)
-  if (!page?.ask) return undefined
+  if (!page?.ask || page.place !== 'pane') return undefined
   const { Box, Text, Input } = $.ui.resolve(e)
   const ask = page.ask
   const bad = page.status.startsWith('Not sent')
@@ -277,15 +332,21 @@ export async function drawBox($: EngineInterface, e: RenderInput<'AbovePrompt'>)
 }
 
 /**
- * What the back button's row says beside it, in `room` cells: the other ways back, and that Esc
- * stops a running worker, which a plugin cannot change: no key reaches it in a worker's view.
+ * What the row of the back button says beside it, in `room` cells: where a line typed on a page
+ * goes, the other ways back, and what Esc stops: a running worker in its view, the manager's turn
+ * on a page. A plugin cannot change that, as no key reaches it.
  */
-export function backWords(model: Model, view: SiteView | undefined, page: Page | undefined, room: number, said = ''): string {
+export function backWords(model: Model, view: SiteView | undefined, page: Page | undefined, room: number, said = '', working = false): string {
   const r = view?.agentId !== undefined ? model.rows.find(one => one.workerId === view.agentId) : undefined
-  const stops = view?.agentId !== undefined && r?.own === 'running'
-  const tries = stops
-    ? ['or press 0 at the empty prompt, or click its row again  ·  Esc at the prompt stops this worker', 'or press 0, or click its row again  ·  Esc stops this worker', 'or press 0  ·  Esc stops this worker', 'Esc stops it']
-    : ['or press 0 at the empty prompt, or click its row again', 'or press 0, or click its row again', 'or press 0']
-  const fit = tries.find(t => cells(t) <= room) ?? ''
+  const esc = view?.agentId !== undefined ? (r?.own === 'running' ? 'this worker' : undefined) : page?.place === 'row' && working ? "the manager's turn" : undefined
+  const line = page?.place !== 'row' ? '' : page.ask === 'start' ? 'a line at the prompt starts this task' : page.ask === 'worker' ? 'a line at the prompt goes to this worker' : 'read-only'
+  const ways = ['or press 0 at the empty prompt, or click its row again', 'or press 0, or click its row again', 'or press 0']
+  const tries = ways.flatMap(way => [
+    [line, way, esc && `Esc at the prompt stops ${esc}`],
+    [line, way, esc && `Esc stops ${esc}`],
+  ]).concat([[way0(line), 'or press 0', esc && `Esc stops ${esc}`], ['or press 0', esc && 'Esc stops it'], [esc ? 'Esc stops it' : 'or press 0']])
+  const fit = tries.map(t => t.filter(Boolean).join('  ·  ')).find(t => cells(t) <= room - (said ? cells(said) + 5 : 0)) ?? ''
   return said ? [said, fit].filter(Boolean).join('  ·  ') : fit
 }
+
+const way0 = (line: string) => (line === 'read-only' ? line : '')

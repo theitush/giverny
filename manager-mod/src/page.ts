@@ -96,6 +96,9 @@ export function noBrief(key: string, title: string, note: string | undefined): s
 export const askLine = (ask: 'worker' | 'start') =>
   ask === 'worker' ? 'Message this worker.' : 'Start this task now. Its manager adds this to its brief.'
 
+/** The line a Next up row's page gives the manager, as Giverny's box does. */
+export const startLine = (key: string, text: string) => `Start ${key} now, adding this to its brief: ${text}`
+
 /**
  * The lines sent and not yet in the transcript: each prompt that lands takes the place of the
  * oldest, first in first out, the text not compared, as the manager may change it.

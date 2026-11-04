@@ -27,13 +27,15 @@ export type Chrome = {
   accent: string
   /** The rule along the table's top, where egui draws the panel's separator. */
   rule: string
+  /** A hover tooltip's edge, as egui's window stroke. */
+  edge: string
   /** A row's hover, as egui's tooltip: its window's fill and its text. */
   tip: string
   tipInk: string
 }
 
-export const DARK: Chrome = { bg: '#0b0b0c', dim: '#838384', amber: '#f0dc9a', poppy: '#e8897a', accent: '#96d2d2', rule: '#3c3c3c', tip: '#1b1b1b', tipInk: '#a0a0a0' }
-export const LIGHT: Chrome = { bg: '#f7f4ec', dim: '#7f8180', amber: '#9a7418', poppy: '#a8412f', accent: '#2c7d7d', rule: '#bebebe', tip: '#f8f8f8', tipInk: '#505050' }
+export const DARK: Chrome = { bg: '#0b0b0c', dim: '#838384', amber: '#f0dc9a', poppy: '#e8897a', accent: '#96d2d2', rule: '#3c3c3c', edge: '#3c3c3c', tip: '#1b1b1b', tipInk: '#a0a0a0' }
+export const LIGHT: Chrome = { bg: '#f7f4ec', dim: '#7f8180', amber: '#9a7418', poppy: '#a8412f', accent: '#2c7d7d', rule: '#bebebe', edge: '#bebebe', tip: '#f8f8f8', tipInk: '#505050' }
 
 /** Claude Code's `theme` setting into the panel's chrome. `auto` cannot be told: dark. */
 export const chromeOf = (theme: unknown): Chrome => (typeof theme === 'string' && theme.includes('light') ? LIGHT : DARK)

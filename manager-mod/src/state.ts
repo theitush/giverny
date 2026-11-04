@@ -17,7 +17,9 @@ const folded = atom({ plugin: 'manager', key: 'folded' } as const, NONE, { shape
 const NOT_CLEARED: { atMs?: number; agents: string[] } = { agents: [] }
 const cleared = atom({ plugin: 'manager', key: 'cleared' } as const, NOT_CLEARED, { shape: 'cleared-1' })
 const NO_PAGE: Page | null = null
-const page = atom({ plugin: 'manager', key: 'page' } as const, NO_PAGE, { shape: 'page-1' })
+const page = atom({ plugin: 'manager', key: 'page' } as const, NO_PAGE, { shape: 'page-2' })
+/** Whether a page is on, which every row of the transcript reads: it changes only as one opens or closes. */
+const paged = atom({ plugin: 'manager', key: 'paged' } as const, false)
 /** The rows the person set the band to, under its rule; null: it follows its rows. */
 const NOT_SET: number | null = null
 const size = atom({ plugin: 'manager', key: 'size' } as const, NOT_SET, { shape: 'size-1' })
@@ -64,6 +66,12 @@ export function writePage($: EngineInterface, value: Page | undefined) {
 /** A change to the open page, on what it holds by then: a line and a look at the file can cross. */
 export function changePage($: EngineInterface, change: (now: Page) => Page) {
   return update($, page, now => (now ? change(now) : now))
+}
+export function readPaged($: EngineInterface) {
+  return read($, paged)
+}
+export function writePaged($: EngineInterface, value: boolean) {
+  return update($, paged, () => value)
 }
 export function readSize($: EngineInterface): Promise<number | null> {
   return read($, size)

@@ -3,8 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 import { barMoved, dragged, drawBand, loadSize, ownWindow, scrolled, sizeCommand, switchesOf } from '../src/band'
 import { answerMerge, hintWithoutAgents, insideGivernyTab, letManagerThrough } from '../src/giverny'
 import { clearDone, startPolling } from '../src/poll'
-import { toggleHidden } from '../src/state'
-import { drawPage, goBack, noteScroll, PANE, pageClosed, startFollowing } from '../src/worker'
+import { readPaged, toggleHidden } from '../src/state'
+import { drawPage, drawPageRow, goBack, hiddenRow, noteScroll, PAGE_ROW, pageClosed, pageLine, PANE, startFollowing, TRANSCRIPT_ROWS } from '../src/worker'
 
 // Wiring only: what each event runs lives in src/. Inside a Giverny tab every hook passes.
 
@@ -65,6 +65,18 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => drawPage($, e))
+
+  // A page takes the transcript's place in fullscreen: a row of its own, and every other row drawn as nothing.
+  on('ui.render', { component: 'Placed' }, ($, e, next) => (e.props.id === PAGE_ROW ? drawPageRow($, e) : next(e)))
+  for (const component of TRANSCRIPT_ROWS) {
+    on('ui.render', { component }, async ($, e, next) => ((await readPaged($)) ? hiddenRow($, e) : next(e)))
+  }
+
+  on('prompt.submit', async ($, e, next) => {
+    const line = await pageLine($, e)
+    if (line === undefined) return next(e)
+    return 'drop' in line ? line : next({ ...e, text: line.text })
+  })
 
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await pageClosed($)
