@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine, unwrapped } from './page'
+import { doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, shortResult, startLine, unwrapped } from './page'
 
 const user = (text: string) => ({ role: 'user' as const, text, toolUses: [] })
 
@@ -37,6 +37,44 @@ test('a transcript file reads the same, and a line being written is skipped', ()
     '{"type":"assistant","message":{"role":"assist',
   ].join('\n')
   expect(entriesOfFile(file).map(e => e.text)).toEqual(['Do it', 'faster', 'Done', 'Read: /a'])
+})
+
+test('a line that reached a worker in the middle of its turn stands in its place, and a tool call has its result in a line', () => {
+  const file = [
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'cargo test' } }] } }),
+    JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: 'say banana', origin: { kind: 'coordinator' }, isMeta: true } }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'first\nsecond\n\nthird', is_error: true }] } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: '/a' } }] } }),
+  ].join('\n')
+  expect(entriesOfFile(file)).toEqual([
+    { kind: 'tool', text: 'Bash: cargo test', isError: true, result: 'first  (+2 lines)' },
+    { kind: 'prompt', text: 'say banana' },
+    { kind: 'tool', text: 'Read: /a' },
+  ])
+})
+
+test('a result in one line: its first with words, cut, and how many more', () => {
+  expect(shortResult(undefined)).toBe(undefined)
+  expect(shortResult('')).toBe('(no output)')
+  expect(shortResult('\n  one\n')).toBe('one')
+  expect([...shortResult('x'.repeat(500))!].length).toBe(110)
+})
+
+test('what a worker is at: the call with no result, else thinking, else what its row says beyond its calls', () => {
+  const going = [{ kind: 'tool' as const, text: 'Bash: a', result: 'ok' }, { kind: 'tool' as const, text: 'Bash: b' }]
+  expect(doing(going, 'Bash: a')).toBe('Bash: b')
+  expect(doing(going, 'Bash: b')).toBe('Bash: b')
+  expect(doing([{ kind: 'tool', text: 'Bash: a', result: 'ok' }], 'Bash: a')).toBe('Thinking')
+  expect(doing([{ kind: 'text', text: 'Now then' }], '')).toBe('Thinking')
+  expect(doing(going, 'usage limit → 14:30')).toBe('usage limit → 14:30')
+  expect(doing(going, '"')).toBe('Bash: b')
+})
+
+test('the row Claude Code keeps for a drop of ours says what happened; any other stands', () => {
+  const row = [{ type: 'text', text: 'Prompt dropped by a hook: Sent to k: go' }]
+  expect(ownDropBlocks(row, 'Sent to k: go')).toEqual([{ type: 'text', text: 'Sent to k: go' }])
+  expect(ownDropBlocks(row, 'something else')).toBe(undefined)
+  expect(ownDropBlocks([{ type: 'text', text: 'Sent to k: go' }], 'Sent to k: go')).toBe(undefined)
 })
 
 test('a long transcript keeps its newest entries and says how many it left out', () => {

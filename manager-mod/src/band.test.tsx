@@ -1,4 +1,4 @@
-import type { AgentInfo, On } from 'claude-code'
+import type { AgentInfo, EngineInterface, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { DisplayRow, Model, Page, Section } from '../types'
@@ -25,18 +25,19 @@ const FEED = JSON.stringify({
 })
 
 function engine(on: On, feed: string | undefined, agents: AgentInfo[], marked = true) {
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
   mock.env(on, { GIVERNY_FEED_DIR: '/feeds' })
   on('command.register', () => ({ value: { command: 'manager' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ME }))
   on('fs.stat', (_, e) => {
-    if (feed === undefined || (!marked && e.path.includes('/managers/'))) throw new Error('missing')
+    if (feed === undefined || (!marked && e.path.includes('/managers/')) || e.path.endsWith('.jsonl')) throw new Error('missing')
     return { value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false } }
   })
   on('fs.list', () => ({ value: [] }))
   on('fs.read', () => ({ value: feed ?? '' }))
   on('agent.list', () => ({ value: agents }))
+  return clock
 }
 
 test('the band draws a feed, a row with a worker being the way to it', async ($, on) => {
@@ -422,7 +423,11 @@ const FULL = { columns: 170, rows: 48, isFullscreen: true }
 
 test('in fullscreen a row with no view takes the transcript\'s place, and the back row stands over a whole rule', async ($, on) => {
   engine(on, FEED, [])
-  on('ui.place', () => ({ value: { isPlaced: true, requestId: 'placed' } }))
+  const placed: string[] = []
+  on('ui.place', (_, e) => {
+    placed.push(e.id)
+    return { value: { isPlaced: true, requestId: 'placed' } }
+  })
   on('ui.open', () => {
     throw new Error('no pane in fullscreen')
   })
@@ -430,7 +435,7 @@ test('in fullscreen a row with no view takes the transcript\'s place, and the ba
   const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: FULL })
   expect(await band.find({ key: 'back' })).toBe(undefined)
   await band.press({ key: 'row-next' })
-  const page = await $.ui.mount({ plugin: 'manager', component: 'Placed', surface: 'terminal', requestId: 'placed', viewport: FULL, props: { id: 'manager-page', plugin: 'manager' } })
+  const page = await $.ui.mount({ plugin: 'manager', component: 'Placed', surface: 'terminal', requestId: 'placed', viewport: FULL, props: { id: placed[0]!, plugin: 'manager' } })
   expect((await page.find({ type: 'Text', text: /FEATURE: after it/ })) !== undefined).toBe(true)
   expect((await band.find({ key: 'back' })) !== undefined).toBe(true)
   expect((await band.find({ type: 'Text', text: /a line at the prompt starts this task/ })) !== undefined).toBe(true)
@@ -439,6 +444,90 @@ test('in fullscreen a row with no view takes the transcript\'s place, and the ba
   expect(await page.find({ type: 'Text', text: /FEATURE: after it/ })).toBe(undefined)
   expect(await band.find({ key: 'back' })).toBe(undefined)
   await page.unmount()
+  await band.unmount()
+})
+
+/** A session in fullscreen with a running worker, and what the press and the prompt asked of the engine. */
+async function onWorker($: EngineInterface, on: On) {
+  const clock = engine(on, FEED, [{ id: 'w1', description: 'build: fix it', type: 'general-purpose', status: 'running' }])
+  const asked = { clock, views: [] as unknown[], placed: [] as string[], sent: [] as string[], fills: [] as string[], stored: {} as Record<string, unknown> }
+  on('ui.view', (_, e) => {
+    asked.views.push(e)
+    return { value: {} }
+  })
+  on('ui.place', (_, e) => {
+    asked.placed.push(e.id)
+    return { value: { isPlaced: true, requestId: `placed-${asked.placed.length}` } }
+  })
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Fix the build', toolUses: [] }, { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', input: { command: 'cargo test' }, text: 'ok\nfine', isError: false }, { tool: 'Bash', input: { command: 'cargo build' } }] }] }))
+  on('session.send', (_, e) => {
+    asked.sent.push(e.text)
+    return { isDelivered: true }
+  })
+  on('prompt.fill', (_, e) => {
+    asked.fills.push(e.text)
+    return { isFilled: true }
+  })
+  on('store.get', (_, e) => ({ value: asked.stored[e.key] }))
+  on('store.set', (_, e) => {
+    asked.stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    delete asked.stored[e.key]
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  return asked
+}
+
+test('in fullscreen a worker\'s row opens the page, not Claude Code\'s view, with no rows kept for what that view adds', async ($, on) => {
+  const asked = await onWorker($, on)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: FULL })
+  await band.press({ key: 'row-build' })
+  expect(asked.views).toEqual([])
+  expect(asked.placed.length).toBe(1)
+  const page = await $.ui.mount({ plugin: 'manager', component: 'Placed', surface: 'terminal', requestId: 'placed-1', viewport: FULL, props: { id: asked.placed[0]!, plugin: 'manager' } })
+  // Prompt, a tool call with its result in a line, the call still going, and what it is at.
+  expect((await page.find({ type: 'Text', text: /❯ Fix the build/ })) !== undefined).toBe(true)
+  expect((await page.find({ type: 'Text', text: /Bash: cargo test/ })) !== undefined).toBe(true)
+  expect((await page.find({ type: 'Text', text: /⎿ ok {2}\(\+1 lines\)/ })) !== undefined).toBe(true)
+  const doing = await page.find({ key: 'doing-' + /* the clock's now */ NOW })
+  expect(doing !== undefined && (doing.props as { props: { words: string } }).props.words).toBe('Bash: cargo build')
+  // The band tells what a line does and warns of no worker's Esc.
+  expect((await band.find({ type: 'Text', text: /a line at the prompt goes to this worker/ })) !== undefined).toBe(true)
+  expect(await band.find({ type: 'Text', text: /stops this worker/ })).toBe(undefined)
+  await page.unmount()
+  await band.unmount()
+})
+
+test('with the switch at claude a worker\'s row is today\'s: its view, the two rows kept', { options: { worker_view: 'claude' } }, async ($, on) => {
+  const asked = await onWorker($, on)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: FULL })
+  await band.press({ key: 'row-build' })
+  expect(asked.views).toEqual([{ agentId: 'w1' }])
+  expect(asked.placed).toEqual([])
+  await band.unmount()
+})
+
+test('off fullscreen a worker\'s row opens its view whatever the switch says', async ($, on) => {
+  const asked = await onWorker($, on)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await band.press({ key: 'row-build' })
+  expect(asked.views).toEqual([{ agentId: 'w1' }])
+  await band.unmount()
+})
+
+test('/manager view takes effect at once and is kept; a change in /config beats the word it left', { options: { worker_view: 'page' } }, async ($, on) => {
+  const asked = await onWorker($, on)
+  expect(asked.stored['worker-view-config']).toBe('page')
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: FULL })
+  expect((await $.command.run({ command: 'manager', args: 'view sideways' } as never)).text).toContain('Usage: /manager view page|claude. Now page.')
+  expect((await $.command.run({ command: 'manager', args: 'view claude' } as never)).text).toContain("Claude Code's own view")
+  expect(asked.stored['worker-view']).toBe('claude')
+  await band.press({ key: 'row-build' })
+  expect(asked.views.at(-1)).toEqual({ agentId: 'w1' })
+  expect(asked.placed).toEqual([])
   await band.unmount()
 })
 

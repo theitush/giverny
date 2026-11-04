@@ -146,6 +146,14 @@ export function doing(entries: readonly PageEntry[], what: string): string {
   return last?.kind === 'tool' && last.result === undefined ? last.text : 'Thinking'
 }
 
+const DROP_WORDS = 'Prompt dropped by a hook: '
+
+/** The blocks of the row Claude Code keeps for the drop with this reason, in the reason's words; undefined: not that row. */
+export function ownDropBlocks(content: unknown, reason: string): { type: 'text'; text: string }[] | undefined {
+  const blocks = Array.isArray(content) ? (content as { text?: unknown }[]) : []
+  return blocks.some(b => b.text === `${DROP_WORDS}${reason}`) ? [{ type: 'text', text: reason }] : undefined
+}
+
 /** A Next up row's page with no brief: what it has, then how a brief is added. */
 export function noBrief(key: string, title: string, note: string | undefined): string {
   const parts = [key && `Task: ${key}`, title !== key ? title : '', note?.trim() ?? ''].filter(Boolean)

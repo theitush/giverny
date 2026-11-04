@@ -108,6 +108,7 @@ function parseDevAgent(v: unknown): AgentRow | undefined {
     lastTurnMs: time(a.last_turn),
     tokens: count(a.tokens),
     activity: text(a.activity),
+    transcript: text(a.transcript),
     stops: Array.isArray(a.stops)
       ? a.stops.flatMap(s => {
           const fromMs = time((s as { from?: unknown }).from)

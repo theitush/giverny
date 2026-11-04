@@ -3,7 +3,7 @@ import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, S
 import type { DisplayRow, Model, Page, PageEntry, WorkerView } from '../types'
 
 import { cells } from './cells'
-import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, pageRows, pendingAfter, startLine } from './page'
+import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, startLine } from './page'
 import { changePage, readPage, readPageRow, readWorkerView, readView, say, writePage, writePaged, writePageRow, writeWorkerView } from './state'
 
 // What a press on a row opens: a page, as Giverny's worker page is (docs/management-panel.md, What a
@@ -18,13 +18,15 @@ export const PAGE_ROW = 'manager-page'
 /** What a transcript is made of, all a hook can draw: the logo is not among them, and stays above a page as above a view. */
 export const TRANSCRIPT_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'ToolProgress', 'CommandOutput', 'Spinner', 'TurnDuration', 'InfoNotice'] as const
 const FOLLOW_MS = 1000
+/** What `$.fs.read` takes, and what is read of a file longer than that. */
+const READ_MOST = 4 * 1024 * 1024
+const TAIL_BYTES = 2 * 1024 * 1024
 const STORE_VIEW = 'worker-view'
 /** What the manifest said when `/manager view` last spoke: a change in /config beats that word. */
 const STORE_VIEW_CONFIG = 'worker-view-config'
 const LAID_OUT_MS = [150, 450]
 /** Long enough for the engine to have put a dropped line back in the box and kept its row. */
 const AFTER_DROP_MS = 30
-const DROP_WORDS = 'Prompt dropped by a hook'
 // Claude Code's own prompt band, as it draws one in a worker's view.
 const PROMPT_BG = 'ansi256(237)'
 
@@ -181,13 +183,16 @@ async function firstEntries($: EngineInterface, r: DisplayRow): Promise<PageEntr
 async function readEntries($: EngineInterface, r: DisplayRow): Promise<PageEntry[] | undefined> {
   // The file first, read only when it moved: it alone has the lines that reached a worker in the
   // middle of its turn, and a long transcript read once a second is a cost of its own.
-  const mtimeMs = await transcriptMs($, r)
-  if (mtimeMs !== undefined) {
-    if (mtimeMs === fileMs) return undefined
+  if (r.transcript !== undefined) {
     try {
-      const text = await $.fs.read(r.transcript!)
+      const { mtimeMs, size } = await $.fs.stat(r.transcript)
+      if (mtimeMs === fileMs) return undefined
+      const whole = size <= READ_MOST
+      // `$.fs.read` refuses a file past 4 MiB. A page draws far less than this tail holds.
+      const text = whole ? await $.fs.read(r.transcript) : (await $.process.run(['tail', '-c', String(TAIL_BYTES), r.transcript])).stdout
       fileMs = mtimeMs
-      return entriesOfFile(text)
+      const entries = entriesOfFile(text)
+      return whole ? entries : [{ kind: 'tool', text: `The start of its transcript is not drawn: ${Math.round(size / 1048576)} MB in all, at ${r.transcript}` }, ...entries]
     } catch {
       // What the session holds of it, then.
     }
@@ -195,15 +200,6 @@ async function readEntries($: EngineInterface, r: DisplayRow): Promise<PageEntry
   if (r.workerId === undefined) return undefined
   const found = await $.session.messages({ agentId: r.workerId })
   return 'deny' in found ? undefined : entriesOf(found)
-}
-
-async function transcriptMs($: EngineInterface, r: DisplayRow): Promise<number | undefined> {
-  if (r.transcript === undefined) return undefined
-  try {
-    return (await $.fs.stat(r.transcript)).mtimeMs
-  } catch {
-    return undefined
-  }
 }
 
 /** Scrolling is a nicety: a page that cannot move is still the page. */
@@ -355,11 +351,10 @@ async function underDrop($: EngineInterface): Promise<void> {
 /** The row Claude Code keeps for a drop of ours, in the words of what happened. */
 export function ownDropWords(e: SessionAppendInput): SessionAppendInput {
   if (dropped === undefined || e.message.type !== 'system') return e
-  const words = dropped
-  const text = JSON.stringify(e.message.content)
-  if (!text.includes(DROP_WORDS) || !text.includes(JSON.stringify(words).slice(1, -1))) return e
+  const content = ownDropBlocks(e.message.content, dropped)
+  if (!content) return e
   dropped = undefined
-  return { ...e, message: { ...e.message, content: [{ type: 'text', text: words }] } } as SessionAppendInput
+  return { ...e, message: { ...e.message, content } } as SessionAppendInput
 }
 
 /** A transcript's row while a page is in its place. */
