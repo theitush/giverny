@@ -3581,7 +3581,7 @@ impl App {
     /// the unseen-finish badge alike. A look at a tab that wore the tick
     /// flashes its management panel's rows that landed since the last one.
     fn mark_seen(&mut self, id: TabId) {
-        let ticked = self.unseen_done.contains(&id)
+        let ticked = self.unseen_done.contains_key(&id)
             || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
         if ticked {
             self.agent_views.flash_new_done(id);
