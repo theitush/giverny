@@ -7,11 +7,15 @@ import type { Model } from '../types'
 // read and write goes through a function here (a declaration: past an import the validator
 // follows `$` only into `function name($)`). A write redraws the readers; reading while
 // drawing subscribes the drawing. Add a value here, in types/index.d.ts, and an accessor.
-const EMPTY: Model = { rows: [], running: 0, next: 0, done: 0 }
+const EMPTY: Model = { rows: [], running: 0, next: 0, done: 0, nested: false }
 
-const view = atom({ plugin: 'manager', key: 'view' } as const, EMPTY, { shape: 'view-1' })
+const view = atom({ plugin: 'manager', key: 'view' } as const, EMPTY, { shape: 'view-2' })
 const hidden = atom({ plugin: 'manager', key: 'hidden' } as const, false)
 const said = atom({ plugin: 'manager', key: 'said' } as const, '')
+const NONE: string[] = []
+const folded = atom({ plugin: 'manager', key: 'folded' } as const, NONE, { shape: 'folded-1' })
+const NOT_CLEARED: { atMs?: number; agents: string[] } = { agents: [] }
+const cleared = atom({ plugin: 'manager', key: 'cleared' } as const, NOT_CLEARED, { shape: 'cleared-1' })
 
 export function readView($: EngineInterface) {
   return read($, view)
@@ -30,4 +34,17 @@ export function readSaid($: EngineInterface) {
 }
 export function say($: EngineInterface, words: string) {
   return update($, said, () => words)
+}
+export function readFolded($: EngineInterface) {
+  return read($, folded)
+}
+/** Fold or show the agents under a row (DisplayRow.fold.id). */
+export function toggleFold($: EngineInterface, id: string) {
+  return update($, folded, now => (now.includes(id) ? now.filter(f => f !== id) : [...now, id]))
+}
+export function readCleared($: EngineInterface) {
+  return read($, cleared)
+}
+export function writeCleared($: EngineInterface, value: { atMs: number; agents: string[] }) {
+  return update($, cleared, () => value)
 }
