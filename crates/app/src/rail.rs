@@ -404,6 +404,10 @@ struct RowData {
     /// Code or not), from the reading the total line shows; `None` for a
     /// tab with no shell running.
     used: Option<Use>,
+    /// That unseen finish failed: a turn that died on an API error, a
+    /// command that exited non-zero. The tick is a ✕ then, alone or as the
+    /// badge, by the same rules.
+    failed: bool,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -435,6 +439,9 @@ struct GroupData {
     /// A tab in it shows the tick, alone or as a badge: something finished
     /// there while you were elsewhere.
     unseen: bool,
+    /// Every one of those finishes failed: the header's tick is a ✕. One
+    /// tick among them and the header ticks.
+    failed: bool,
     rows: Vec<RowData>,
 }
 
@@ -520,7 +527,7 @@ fn row_data(
         claude: app.agent_state(t.id),
         background: ct.is_some_and(|c| c.working_in_background()),
         running: app.fg_running.get(&t.id) == Some(&true) || app.osc_running.contains(&t.id),
-        unseen: app.unseen_done.contains(&t.id)
+        unseen: app.unseen_done.contains_key(&t.id)
             || ct.is_some_and(|c| c.state == ClaudeState::DoneUnseen),
         // Off (`rail.tab_figures`), a row has no figures, so nothing
         // reserves room for them and no group sums them.
@@ -530,6 +537,10 @@ fn row_data(
             .filter(|_| app.cfg.rail.tab_figures)
             .and_then(|rt| rt.session.as_ref()?.child_pid)
             .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
+        failed: match app.unseen_done.get(&t.id) {
+            Some(&failed) => failed,
+            None => app.claude.turn_failed(t.id),
+        },
     }
 }
 
@@ -579,10 +590,22 @@ fn summed<'a>(uses: impl IntoIterator<Item = &'a Use>) -> Option<Use> {
 /// Asked of the rows' marks, so the header ticks exactly when a row under
 /// it does — not for a tab not started this run, nor an exited shell.
 fn ticks(rows: &[RowData]) -> bool {
-    rows.iter().any(|r| {
-        let mark = Mark::of(r);
-        mark == Mark::Tick || mark.badged(r)
-    })
+    rows.iter().any(shows_finish)
+}
+
+/// Whether a group's tick is a ✕: every row under it that wears an unseen
+/// finish wears the ✕. One tick among them wins: good news under the header
+/// is not hidden behind bad.
+fn fails(rows: &[RowData]) -> bool {
+    let mut shown = rows.iter().filter(|r| shows_finish(r)).peekable();
+    shown.peek().is_some() && shown.all(|r| r.failed)
+}
+
+/// Whether `row` wears its unseen finish, the tick or the ✕, alone or as a
+/// badge.
+fn shows_finish(row: &RowData) -> bool {
+    let mark = Mark::of(row);
+    mark == Mark::Tick || mark.badged(row)
 }
 
 /// A repository always gets the same colour, whichever order the groups come
@@ -626,6 +649,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                     needs,
                     used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                     unseen: ticks(&rows),
+                    failed: fails(&rows),
                     rows,
                 }
             })
@@ -681,6 +705,7 @@ fn groups(app: &App) -> Vec<GroupData> {
                         needs,
                         used: summed(rows.iter().filter_map(|r| r.used.as_ref())),
                         unseen: ticks(&rows),
+                        failed: fails(&rows),
                         rows,
                     }
                 })
@@ -1442,7 +1467,7 @@ fn header_badges(
     if !cat.unseen {
         return end;
     }
-    badge_tick(p, Pos2::new(tick_x, y), cat.color);
+    badge_tick(p, Pos2::new(tick_x, y), cat.failed, cat.color);
     tick_x - HEADER_TICK_GAP
 }
 
@@ -1545,9 +1570,10 @@ fn flag(p: &egui::Painter, at: Pos2, color: Color32) {
     ));
 }
 
-/// A tick: finished while you were elsewhere.
-fn tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    tick_scaled(p, at, 1.0, 1.8, color);
+/// A tick: finished while you were elsewhere. `failed`, a ✕ in its place:
+/// it finished, and the news is bad.
+fn tick(p: &egui::Painter, at: Pos2, failed: bool, color: Color32) {
+    tick_scaled(p, at, 1.0, 1.8, failed, color);
 }
 
 /// How far left of a tab's mark the badge tick sits: clear of the widest
@@ -1558,17 +1584,28 @@ const BADGE_OFFSET: f32 = 13.0;
 /// The tick as a badge beside a mark that is still running:
 /// three quarters the size and a touch thinner, so it reads as a note on
 /// the mark and not a second mark.
-fn badge_tick(p: &egui::Painter, at: Pos2, color: Color32) {
-    tick_scaled(p, at, 0.75, 1.5, color);
+fn badge_tick(p: &egui::Painter, at: Pos2, failed: bool, color: Color32) {
+    tick_scaled(p, at, 0.75, 1.5, failed, color);
 }
 
-/// A tick at `at`, `scale` times the full one, stroked `width` wide.
-fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, color: Color32) {
+/// A tick at `at`, `scale` times the full one, stroked `width` wide; with
+/// `failed`, the ✕: two strokes of the tick's weight, as tall as the tick
+/// and a touch narrower, so the two read as one size.
+fn tick_scaled(p: &egui::Painter, at: Pos2, scale: f32, width: f32, failed: bool, color: Color32) {
     let stroke = Stroke::new(width, color);
     let at_ = |x: f32, y: f32| at + Vec2::new(x, y) * scale;
+    if failed {
+        p.line_segment([at_(-CROSS, -CROSS), at_(CROSS, CROSS)], stroke);
+        p.line_segment([at_(-CROSS, CROSS), at_(CROSS, -CROSS)], stroke);
+        return;
+    }
     p.line_segment([at_(-4.5, 0.0), at_(-1.5, 3.5)], stroke);
     p.line_segment([at_(-1.5, 3.5), at_(4.5, -4.0)], stroke);
 }
+
+/// Half the ✕'s side at full size: its arms end where the tick's do, up
+/// and down, inside the tick's width.
+const CROSS: f32 = 3.5;
 
 /// A plain shell's mark at `at`: a square `side` points
 /// across, filled or hollow. Every Claude mark is round or drawn — spinner,
@@ -1845,7 +1882,7 @@ fn tab_row(
         }
         // Still: finished, nothing owed. The flag above is the one that
         // wants something; the two differ in shape and movement.
-        Mark::Tick => tick(&p, dot, color),
+        Mark::Tick => tick(&p, dot, row.failed, color),
         // A background shell or its subagents keep running while Claude
         // waits at its prompt. Worth showing — it is why a directory is
         // still churning — but it is not the agent working: it can take a
@@ -1877,7 +1914,7 @@ fn tab_row(
     // smaller, in the gutter left of the mark, so the mark keeps its place
     // and the title never moves as the badge comes and goes.
     if mark.badged(row) {
-        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), color);
+        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
     }
 
     // Inline rename?
@@ -3188,6 +3225,7 @@ mod tests {
             needs,
             used: None,
             unseen,
+            failed: false,
             rows: Vec::new(),
         };
         // (busy, needs, unseen) -> (dots, flag, tick, where the name ends):
@@ -3288,6 +3326,7 @@ mod tests {
             needs: 0,
             used: None,
             unseen: false,
+            failed: false,
             rows: Vec::new(),
         };
         let at = |breath: f32| {
@@ -3375,6 +3414,40 @@ mod tests {
         }));
     }
 
+    /// A header wears the ✕ only when every unseen finish under it failed;
+    /// one tick among them wins, and the header ticks.
+    #[test]
+    fn a_header_crosses_only_when_every_finish_under_it_failed() {
+        let failed = |r: RowData| RowData { failed: true, ..r };
+        let turn = || failed(row(ClaudeState::DoneUnseen));
+        let shell = || {
+            failed(RowData {
+                unseen: true,
+                ..row(ClaudeState::None)
+            })
+        };
+        let again = || {
+            failed(RowData {
+                unseen: true,
+                ..row(ClaudeState::Busy)
+            })
+        };
+        let good = || row(ClaudeState::DoneUnseen);
+        // Every finish failed, alone or as a badge: the ✕. Rows with no
+        // finish to show, or one already seen, have no say.
+        assert!(fails(&[turn()]));
+        assert!(fails(&[turn(), shell(), again()]));
+        assert!(fails(&[row(ClaudeState::Idle), again()]));
+        assert!(fails(&[failed(row(ClaudeState::Idle)), turn()]));
+        // One finish went well: the tick wins, whichever the order.
+        assert!(!fails(&[good(), turn()]));
+        assert!(!fails(&[turn(), shell(), good()]));
+        assert!(!fails(&[again(), good()]));
+        // Nothing unseen: no ✕ (and no tick).
+        assert!(!fails(&[]));
+        assert!(!fails(&[failed(row(ClaudeState::Idle))]));
+    }
+
     /// A row in `claude` state, started, live, in no background shell.
     fn row(claude: ClaudeState) -> RowData {
         RowData {
@@ -3391,6 +3464,7 @@ mod tests {
             running: false,
             unseen: claude == ClaudeState::DoneUnseen,
             used: None,
+            failed: false,
         }
     }
 
