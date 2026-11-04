@@ -2,7 +2,7 @@ import type { EngineInterface, PromptSubmitInput, RenderInput, RenderViewport, S
 
 import type { DisplayRow, Model, Page, PageEntry, WorkerView } from '../types'
 
-import { cells } from './cells'
+import { cells, cut } from './cells'
 import { askLine, doing, entriesOf, entriesOfFile, inRoom, noBrief, ownDropBlocks, pageRows, pendingAfter, startLine } from './page'
 import { changePage, readPage, readPageRow, readWorkerView, readView, say, writePage, writePaged, writePageRow, writeWorkerView } from './state'
 
@@ -27,6 +27,7 @@ const STORE_VIEW_CONFIG = 'worker-view-config'
 const LAID_OUT_MS = [150, 450]
 /** Long enough for the engine to have put a dropped line back in the box and kept its row. */
 const AFTER_DROP_MS = 30
+const DROP_MOST = 200
 // Claude Code's own prompt band, as it draws one in a worker's view.
 const PROMPT_BG = 'ansi256(237)'
 
@@ -330,7 +331,7 @@ export async function pageLine($: EngineInterface, e: PromptSubmitInput): Promis
  * this answers: taken out once it has if it went, and left there to try again if not.
  */
 async function ownDrop($: EngineInterface, e: PromptSubmitInput, status: string, sent: boolean, record?: string): Promise<{ drop: string }> {
-  const oneLine = (text: string) => text.split(/\s*\n\s*/).join(' ')
+  const oneLine = (text: string) => cut(text.split(/\s*\n\s*/).join(' '), DROP_MOST)
   const said = oneLine(status)
   const reason = oneLine(record ?? status)
   dropped = e.turnId === undefined ? reason : undefined
