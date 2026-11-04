@@ -143,8 +143,10 @@ pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("giverny-{uid}.sock"))
 }
 
-/// The `giverny relay` entrypoint. Fast, silent, always exits successfully —
-/// a relay failure must never disturb the Claude session that ran the hook.
+/// The `giverny relay` entrypoint. Fast, always exits successfully — a relay
+/// failure must never disturb the Claude session that ran the hook. Silent
+/// but for one thing: a Claude session told what happened while it was away
+/// ([`crate::away`]), whose records live beside the spool.
 pub fn run_relay(spool: &Path) {
     let mut input = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut input);
@@ -193,6 +195,13 @@ pub fn run_relay(spool: &Path) {
         event,
     };
     deliver(&msg, spool);
+    if msg.provider == "claude"
+        && let Some(now) = msg.emitted_at
+        && let Some(out) =
+            crate::away::reply(&spool.with_file_name(crate::away::DIR), &msg.event, now)
+    {
+        println!("{out}");
+    }
 }
 
 /// The tab whose own session ran this process: `$GIVERNY_TAB_ID`, unless the
