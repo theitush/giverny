@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import { drawBand, switchesOf } from '../src/band'
+import { barMoved, dragged, drawBand, loadSize, ownWindow, scrolled, sizeCommand, switchesOf } from '../src/band'
 import { answerMerge, hintWithoutAgents, insideGivernyTab, letManagerThrough } from '../src/giverny'
 import { clearDone, startPolling } from '../src/poll'
 import { toggleHidden } from '../src/state'
@@ -9,6 +9,8 @@ import { drawPage, goBack, noteScroll, PANE, pageClosed, startFollowing } from '
 // Wiring only: what each event runs lives in src/. Inside a Giverny tab every hook passes.
 
 const AFTER_RELOAD_MS = 1000
+const GRIP = 'grip'
+const BAR = 'bar'
 
 let begun = false
 let beginSoon = false
@@ -19,8 +21,9 @@ async function begin($: EngineInterface, wantUse: boolean): Promise<void> {
   try {
     await $.command.register({
       name: 'manager',
-      description: 'Show or hide the manager band: Running, Next up and Done from this session; `/manager back` leaves a worker for the manager; `/manager clear-done` clears its Done rows',
+      description: 'Show or hide the manager band: Running, Next up and Done from this session; `/manager back` leaves a worker for the manager; `/manager clear-done` clears its Done rows; `/manager size <rows>` or `auto` sets its height',
     })
+    await loadSize($)
     await startPolling($, wantUse)
     startFollowing($)
   } catch (err) {
@@ -45,6 +48,8 @@ export const register: Register = (on, options) => {
       await goBack($)
       return { text: 'Back to the manager.' }
     }
+    const size = /^size(?:\s+(.*))?$/.exec(e.args.trim())
+    if (size) return { text: await sizeCommand($, (size[1] ?? '').trim()) }
     const isHidden = await toggleHidden($)
     return { text: isHidden ? 'Manager band hidden.' : 'Manager band shown.' }
   })
@@ -83,6 +88,22 @@ export const register: Register = (on, options) => {
       })
     }
     return (await drawBand($, e, switches)) ?? next(e)
+  })
+
+  on('ui.message', { element: GRIP }, async ($, e) => {
+    await dragged($, e.data)
+    return {}
+  })
+
+  on('ui.message', { element: BAR }, async ($, e) => {
+    await barMoved($, e.data)
+    return {}
+  })
+
+  on('ui.scroll', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!ownWindow() || (await insideGivernyTab($))) return next(e)
+    await scrolled($, e.by)
+    return {}
   })
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {

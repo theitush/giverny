@@ -18,6 +18,11 @@ const NOT_CLEARED: { atMs?: number; agents: string[] } = { agents: [] }
 const cleared = atom({ plugin: 'manager', key: 'cleared' } as const, NOT_CLEARED, { shape: 'cleared-1' })
 const NO_PAGE: Page | null = null
 const page = atom({ plugin: 'manager', key: 'page' } as const, NO_PAGE, { shape: 'page-1' })
+/** The rows the person set the band to, under its rule; null: it follows its rows. */
+const NOT_SET: number | null = null
+const size = atom({ plugin: 'manager', key: 'size' } as const, NOT_SET, { shape: 'size-1' })
+/** The band's first row on show, when it shows fewer than it has. */
+const top = atom({ plugin: 'manager', key: 'top' } as const, 0)
 
 export function readView($: EngineInterface) {
   return read($, view)
@@ -59,4 +64,16 @@ export function writePage($: EngineInterface, value: Page | undefined) {
 /** A change to the open page, on what it holds by then: a line and a look at the file can cross. */
 export function changePage($: EngineInterface, change: (now: Page) => Page) {
   return update($, page, now => (now ? change(now) : now))
+}
+export function readSize($: EngineInterface): Promise<number | null> {
+  return read($, size)
+}
+export function writeSize($: EngineInterface, value: number | null) {
+  return update($, size, () => value)
+}
+export function readTop($: EngineInterface) {
+  return read($, top)
+}
+export function writeTop($: EngineInterface, value: number) {
+  return update($, top, () => value)
 }

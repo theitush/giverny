@@ -2,10 +2,13 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { DisplayRow, Model, Section } from '../types'
 
+import type { BarPost } from './bar-client'
+import type { GripPost } from './grip-client'
+
 import { cells, cellsIn, cut, cutExact, padEnd, padStart } from './cells'
 import { gb } from './lease'
 import { redrawSoon } from './poll'
-import { readHidden, readPage, readSaid, readView, toggleFold } from './state'
+import { readHidden, readPage, readSaid, readSize, readTop, readView, toggleFold, writeSize, writeTop } from './state'
 import { type Chrome, chromeOf, HOVER_TINT, loadInk, STAGE, STAGE_INK, tint, VIEWED_TINT } from './theme'
 import { backWords, drawBox, goBack, openRow } from './worker'
 
@@ -32,6 +35,7 @@ const CPU_W = 8
 const USE_MEM_W = 4
 /** The rows Claude Code adds under the prompt over a worker's view, `○ main` and a blank, which no plugin can stop. */
 export const RESERVED = 2
+const STORE_ROWS = 'band-rows'
 const STAGE_WORD: Record<Section, string> = { running: 'Running', next: 'NextUp', done: 'Done' }
 
 /** `[management_panel.columns]` of the doc, the manifest's `userConfig`. */
@@ -189,9 +193,127 @@ export function cutRuns(runs: Run[], at: number): [Run[], Run[]] {
   return [before, after]
 }
 
-/** A row's hover: its whole title (its id with none), then why it is where it is, each cut at `room`. */
-export function tipLines(r: DisplayRow, room: number): string[] {
-  return [r.title || r.key, ...r.why].filter(l => l !== '').map(l => cut(l, room))
+/**
+ * A row's hover, `Line::tip`, its whole title (its id with none), then why it is where it is, laid
+ * into `lines` lines of `room` cells: a part stays whole while it fits, and what still does not fit
+ * is cut at the end of the last line.
+ */
+export function tipLines(r: DisplayRow, room: number, lines: number): string[] {
+  const out: string[] = []
+  let line = ''
+  for (const part of [r.title || r.key, ...r.why].filter(l => l !== '')) {
+    let rest = line === '' ? part : `${line}${SEP}${part}`
+    if (line !== '' && cells(rest) > room && out.length < lines - 1) {
+      out.push(line)
+      rest = part
+    }
+    while (cells(rest) > room && out.length < lines - 1) {
+      const gs = cellsIn(rest)
+      out.push(gs.slice(0, room).join(''))
+      rest = gs.slice(room).join('')
+    }
+    line = rest
+  }
+  return line === '' ? out : [...out, cut(line, room)]
+}
+
+/** The fewest rows the person can size the band to, under its rule. */
+export const MIN_ROWS = 2
+const RULE_ROWS = 1
+/** The scroll bar stands in the cells the engine keeps right of the band, under its `[-]`. */
+const BAR_GAP = 2
+
+/**
+ * What the band shows under its rule: its rows from `top`, `shown` of them, then `blank` empty rows,
+ * `area` in all with the footer. `own`: a window of the plugin's, as the engine's cannot be shorter
+ * than the whole site.
+ */
+export type BandWindow = { top: number; shown: number; blank: number; area: number; own: boolean }
+
+/**
+ * Never set it is sized to its rows, as the panel's `pane_height`; set, it holds that height
+ * whatever the rows do. Past `room` the tree is taller than the site, and the engine scrolls it with
+ * its wheel and its `n more`, as it always has; set shorter, what is left is a window of the
+ * plugin's, with nothing drawn to say so but the panel's scroll bar.
+ */
+export function bandWindow(rows: number, footer: number, chosen: number | null, room: number, top: number): BandWindow {
+  if (chosen === null || chosen >= room) {
+    const area = Math.max(1, Math.min(chosen ?? rows + footer, room))
+    return { top: 0, shown: rows, blank: Math.max(0, area - footer - rows), area, own: false }
+  }
+  const area = Math.max(MIN_ROWS, chosen)
+  const shown = Math.min(rows, Math.max(1, area - footer))
+  return { top: Math.max(0, Math.min(top, rows - shown)), shown, blank: Math.max(0, area - footer - shown), area, own: shown < rows }
+}
+
+/** As the last drawing left them: what a drag and the wheel are clamped to. */
+const drawn = { room: 0, lastTop: 0, top: 0, shown: 0, own: false }
+
+/** The most rows the band can hold under its rule now. */
+export const roomNow = () => drawn.room
+
+/** A height as asked for into one the band keeps: what is whole, and at least the fewest. */
+const sane = (n: number) => Math.max(MIN_ROWS, Math.round(n))
+
+/** The height kept from the last session, if there is one. */
+export async function loadSize($: EngineInterface): Promise<void> {
+  try {
+    const kept = await $.store.get(STORE_ROWS)
+    if (typeof kept === 'number' && Number.isFinite(kept)) await writeSize($, sane(kept))
+  } catch {
+    // A store that cannot be read: it follows its rows.
+  }
+}
+
+/** `/manager size <rows>`, `auto`, as said back to the person. */
+export async function sizeCommand($: EngineInterface, arg: string): Promise<string> {
+  if (arg === 'auto') {
+    await writeSize($, null)
+    await $.store.delete(STORE_ROWS)
+    return 'The manager band follows its rows again.'
+  }
+  const n = /^\d+$/.test(arg) ? Number(arg) : undefined
+  if (n === undefined) return `Usage: /manager size <rows> | auto. Now ${(await readSize($)) ?? 'auto'}; the most that fits here is ${drawn.room} rows.`
+  const rows = sane(n)
+  await writeSize($, rows)
+  await $.store.set(STORE_ROWS, rows)
+  return drawn.room > 0 && rows > drawn.room ? `Manager band set to ${rows} rows; ${drawn.room} is the most that fits here now.` : `Manager band set to ${rows} rows.`
+}
+
+/** A move of the rule (src/grip-client.tsx): the height under the pointer's row. Its data came from code, so it is checked. */
+export async function dragged($: EngineInterface, data: unknown): Promise<void> {
+  const { y, rows, done } = (data ?? {}) as Partial<GripPost>
+  if (typeof y !== 'number' || typeof rows !== 'number') return
+  const value = sane(Math.min(rows - y, drawn.room))
+  await writeSize($, value)
+  if (done === true) await $.store.set(STORE_ROWS, value)
+}
+
+async function moveTop($: EngineInterface, to: number): Promise<void> {
+  const at = Math.max(0, Math.min(to, drawn.lastTop))
+  if (at !== drawn.top) {
+    drawn.top = at
+    await writeTop($, at)
+  }
+}
+
+/** Whether the band's window is the plugin's, so a scroll is this plugin's to do. */
+export const ownWindow = () => drawn.own
+
+/**
+ * A scroll key while the band holds the keys, in the plugin's window: an arrow never comes here, as
+ * there it walks the focus ring. A page key and Home and End come with the whole tree's rows, which
+ * cannot be told apart, so each moves a window's worth.
+ */
+export async function scrolled($: EngineInterface, by: number): Promise<void> {
+  await moveTop($, drawn.top + Math.sign(by) * Math.min(Math.abs(by), drawn.shown))
+}
+
+/** A press or a drag on the scroll bar (src/bar-client.tsx), its data checked as it came from code. */
+export async function barMoved($: EngineInterface, data: unknown): Promise<void> {
+  const { y, rows } = (data ?? {}) as Partial<BarPost>
+  if (typeof y !== 'number' || typeof rows !== 'number' || rows < 1) return
+  await moveTop($, Math.round((Math.max(0, Math.min(y, rows - 1)) / Math.max(1, rows - 1)) * drawn.lastTop))
 }
 
 const THEME_EVERY_MS = 30_000
@@ -226,24 +348,28 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const cols = Math.max(1, width - INSET)
   const table = layout(model.rows, Math.max(40, cols), on)
 
+  // The rows the worker's view takes under the prompt are the rows kept here when it is shut: the
+  // site's room falls by as many as the tree gives back, so the window is the same either way.
+  const hasWorkers = model.rows.some(r => r.workerId !== undefined)
+  const keeps = !viewing && hasWorkers
+  const boxRows = page?.ask ? 1 + (page.status !== '' ? 1 : 0) : 0
+  const footerRows = model.footer ? 1 : 0
+  const room = e.props.maxRows - RULE_ROWS - boxRows - (keeps ? RESERVED : 0)
+  const win = bandWindow(model.rows.length, footerRows, await readSize($), room, await readTop($))
+  drawn.room = room
+  drawn.top = win.top
+  drawn.shown = win.shown
+  drawn.lastTop = model.rows.length - win.shown
+  drawn.own = win.own
+  // Those rows are on screen only with the tree no taller than the site.
+  const under = keeps && footerRows + win.shown + win.blank <= room
+  const onRow = model.rows.slice(win.top, win.top + win.shown)
+  const thumb = Math.max(1, Math.round((win.shown * win.shown) / Math.max(1, model.rows.length)))
+  const thumbAt = drawn.lastTop > 0 ? Math.round((win.top / drawn.lastTop) * (win.shown - thumb)) : 0
+
   const fold = async (id: string) => {
     await toggleFold($, id)
     await redrawSoon()
-  }
-
-  // Every row's hover reads its whole title and why it is where it is, `Line::tip`: under the
-  // row, or over it where the band would clip it. Each is drawn after every row, as what is drawn
-  // later paints over what is before it, and shows by the row's hover group. It moves nothing.
-  const tip = (r: DisplayRow, i: number) => {
-    const lines = tipLines(r, cols - 2)
-    if (lines.length === 0) return undefined
-    const at = i + 1
-    const fits = at + 1 + lines.length <= model.rows.length + 1 + (model.footer ? 1 : 0)
-    return (
-      <Box position="absolute" top={2} left={INSET} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }} flexDirection="column" backgroundColor={chrome.tip}>
-        <Client key={`tip-${r.id}`} module="./tip-client.tsx" props={{ lines }} width={80} height={2} />
-      </Box>
-    )
   }
 
   const row = (r: DisplayRow) => {
@@ -289,6 +415,24 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
   const said = open ? '' : words
   const saying = open ? backWords(model, view, page, width - INSET - pillW - GAP - GAP - (words ? cells(words) + GAP : 0), words) : cut(said, width - INSET - GAP)
   const used = open ? INSET + pillW + (saying ? GAP + cells(saying) + GAP : GAP) : saying ? GAP + cells(saying) + GAP : 0
+  const ruleW = Math.max(0, width - used)
+
+  // Every row's hover reads its whole title and why it is where it is, `Line::tip`, once the
+  // pointer has rested (src/tip-client.tsx), and it covers no row: in the rows kept under the table
+  // when they are there, else on the rule. It shows by the row's hover group and moves nothing.
+  // Scrolled by the engine the rule goes with the rows and no row is free: the first one on show
+  // takes it, the one place this covers a row.
+  const tipAt = under ? INSET : open ? INSET + pillW + GAP : INSET
+  const tipTop = under ? 0 : e.props.scroll.offset
+  const tipRoom = Math.max(1, width - tipAt - 2)
+  const tip = (r: DisplayRow) => {
+    const lines = tipLines(r, tipRoom, under ? RESERVED : RULE_ROWS)
+    return (
+      <Box key={`hint-${r.id}`} position="absolute" top={tipTop} left={tipAt} display="none" hover={{ display: 'flex', scope: `row-${r.id}` }}>
+        <Client key={`tip-${r.id}`} module="./tip-client.tsx" props={{ lines, ink: chrome.tipInk, fill: chrome.tip }} width={tipRoom + 2} height={lines.length} />
+      </Box>
+    )
+  }
   const rule = (
     <Box flexDirection="row">
       {open && <Text>{' '.repeat(INSET)}</Text>}
@@ -299,7 +443,8 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
       )}
       {saying !== '' && <Text color={chrome.dim}>{`${' '.repeat(GAP)}${saying}${' '.repeat(GAP)}`}</Text>}
       {open && saying === '' && <Text>{' '.repeat(GAP)}</Text>}
-      <Text color={chrome.rule}>{'─'.repeat(Math.max(0, width - used))}</Text>
+      <Client key="grip" module="./grip-client.tsx" props={{ width: ruleW, rows: win.area, ink: chrome.rule, lit: chrome.accent }} width={ruleW} height={RULE_ROWS} />
+      {!under && onRow.map(tip)}
     </Box>
   )
 
@@ -308,13 +453,24 @@ export async function drawBand($: EngineInterface, e: RenderInput<'AbovePrompt'>
       {box}
       <Box flexDirection="column">
         {rule}
-        {model.rows.map(row)}
+        {onRow.map(row)}
         {model.footer ? <Text color={chrome.dim} wrap="truncate">{`${' '.repeat(INSET)}${cutExact(model.footer, cols)}`}</Text> : undefined}
-        {model.rows.map(tip)}
+        {win.blank > 0 && <Box height={win.blank} />}
+        {win.own && (
+          <Box position="absolute" top={RULE_ROWS} left={width + BAR_GAP}>
+            <Client
+              key="bar"
+              module="./bar-client.tsx"
+              props={{ rows: win.shown, thumb, at: thumbAt, ink: chrome.rule, lit: chrome.accent }}
+              width={1}
+              height={win.shown}
+            />
+          </Box>
+        )}
       </Box>
       {/* Claude Code's own rows under the prompt come over a worker's view and push the band up by
           as many: this room gives way to them, so the table stays on its screen lines. */}
-      {!viewing && model.rows.some(r => r.workerId !== undefined) && <Box height={RESERVED} />}
+      {keeps && <Box height={RESERVED}>{under && onRow.map(tip)}</Box>}
     </Box>
   )
 }
