@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "writer": "giverny/manage",
+  "rows": [
+    { "key": "auth-fix", "stage": "running", "title": "BUG: auth(#12): the refresh token races the first request", "started": "@-14m", "eta_s": 1800, "note": "building the test" },
+    { "key": "cache#88", "stage": "running", "title": "FEATURE: cache(#88): evict by size, not by age", "started": "@-41m", "eta_s": 1500, "note": "overran: rewriting the sweeper" },
+    { "key": "docs", "stage": "running", "title": "CLEANUP: docs: the setup page", "started": "@-20m", "paused_since": "@-5m", "eta_s": 1200 },
+    { "key": "ui-theme", "stage": "planned", "title": "FEATURE: ui: a light theme", "eta_s": 1500, "after": "cache#88" },
+    { "key": "migrate", "stage": "planned", "title": "RUN: db: the November migration", "eta_s": 900, "held": "a quiet machine" },
+    { "key": "bench", "stage": "planned", "title": "RESEARCH: how slow is the new parser", "eta_s": 2400, "lease": { "state": "queued", "ram_mb": 8192, "position": 2, "behind": "cache#88", "short": "ram" } },
+    { "key": "lint", "stage": "planned", "title": "CLEANUP: the lint backlog", "eta_s": 600 },
+    { "key": "login", "stage": "done", "title": "BUG: login: the redirect loop", "started": "@-90m", "ended": "@-55m", "eta_first_s": 1500, "landing": "Done" },
+    { "key": "search", "stage": "done", "title": "FEATURE: search: fuzzy matching", "started": "@-70m", "ended": "@-22m", "eta_first_s": 3000, "landing": "Review — ita", "review": "ita — the ranking — branch search" }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "manager",
+  "version": "0.1.0",
+  "description": "A manager session's Running, Next up and Done, from its giverny-manage feed and its live subagents, as a band above the prompt in plain Claude Code",
+  "types": "./types/index.d.ts"
+}
