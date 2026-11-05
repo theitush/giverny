@@ -4479,7 +4479,300 @@ fn count_frame(ctx: &egui::Context) {
     }
 }
 
+/// Input queued by `debug_cmd`, one frame's worth per entry.
+#[cfg(debug_assertions)]
+static DEBUG_INPUT: std::sync::Mutex<Vec<Vec<egui::Event>>> = std::sync::Mutex::new(Vec::new());
+
+/// Ctrl held down by `debug_cmd` (`ctrl down`, a `ctrltab`), until its
+/// `ctrl up`: every frame's modifiers say so, as a real held key's would.
+#[cfg(debug_assertions)]
+static DEBUG_CTRL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl App {
+    /// Debug builds only: `GIVERNY_DEBUG_CMD=<file>`. When the file shows up
+    /// it is taken, one command per line, and each is carried out as the
+    /// input it stands for, in-process, so a real window can be
+    /// driven and watched without synthetic input events:
+    ///
+    /// * `esc` — an Esc key press, into the terminal as typed;
+    /// * `type <text>` — the text, written to the active tab (`\r` in it: Enter);
+    /// * `text <text>` — the text as the keyboard types it into the window:
+    ///   into a worker page's box when one is up;
+    /// * `key <enter|shift-enter|up|down>` — that key press, as typed;
+    /// * `dump <file>` — the active tab's screen text into the file;
+    /// * `dragxy <x> <y> <x> <y>` — a pointer drag between two points;
+    /// * `wheel <lines> [<x> <y>]` — the wheel turned over a point (up when
+    ///   positive), by default the terminal's top row;
+    /// * `movexy <x> <y>`, `rclickxy <x> <y>`, `clickxy <x> <y>` — the pointer
+    ///   moved to a point and left there; a right click, a left click there;
+    /// * `settings <section>` — the settings screen, on that section (its
+    ///   rail title, `management panel`); `settings` alone closes it;
+    /// * `newtab`, `select <n>`, `close`, `quit` — a new tab, the n-th tab,
+    ///   closing the active tab, closing the window;
+    /// * `ctrl <down|up>` — Ctrl held down from now on, or let up;
+    ///   `ctrltab`, `ctrlshifttab`, `ctrlpgdn`, `ctrlpgup` — that chord
+    ///   pressed, leaving Ctrl held: a keyboard walk (giverny#365).
+    #[cfg(debug_assertions)]
+    fn debug_cmd(&mut self, ctx: &egui::Context) {
+        let Ok(file) = std::env::var("GIVERNY_DEBUG_CMD") else {
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(250));
+        // Input goes in ahead of the next frame, as the window's would
+        // (`raw_input_hook`): a press there, its release the frame after.
+        let feed = |events: Vec<egui::Event>| {
+            if let Ok(mut q) = DEBUG_INPUT.lock() {
+                q.push(events);
+            }
+            ctx.request_repaint();
+        };
+        let Ok(spec) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&file);
+        for line in spec.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
+            tracing::info!("debug cmd: {line}");
+            match cmd {
+                "esc" => {
+                    let key = |pressed| egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    feed(vec![key(true)]);
+                    feed(vec![key(false)]);
+                }
+                "type" => {
+                    let session = self
+                        .ws
+                        .active
+                        .and_then(|t| self.rt.get(&t))
+                        .and_then(|rt| rt.session.as_ref());
+                    if let Some(session) = session {
+                        // Typed, as the keyboard would: it counts as the
+                        // user's input (a command they ran, giverny#388).
+                        session.note_user_input();
+                        // `\r` in the text stands for Enter.
+                        session.write(arg.replace("\\r", "\r").into_bytes());
+                    }
+                }
+                "text" => feed(vec![egui::Event::Text(arg.to_string())]),
+                "key" => {
+                    let key = match arg {
+                        "enter" | "shift-enter" => egui::Key::Enter,
+                        "up" => egui::Key::ArrowUp,
+                        _ => egui::Key::ArrowDown,
+                    };
+                    let modifiers = if arg == "shift-enter" {
+                        egui::Modifiers::SHIFT
+                    } else {
+                        egui::Modifiers::NONE
+                    };
+                    let ev = |pressed| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    };
+                    feed(vec![ev(true)]);
+                    feed(vec![ev(false)]);
+                }
+                "dragxy" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let ends = match n.as_slice() {
+                        [x0, y0, x1, y1] => Some((egui::pos2(*x0, *y0), egui::pos2(*x1, *y1))),
+                        _ => None,
+                    };
+                    let Some((from, to)) = ends else {
+                        tracing::warn!("debug cmd: no such drag {arg}");
+                        continue;
+                    };
+                    let button = |pos, pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    feed(vec![egui::Event::PointerMoved(from)]);
+                    feed(vec![button(from, true)]);
+                    // The same cell twice is a plain click: press, release.
+                    let steps = if from == to { 0 } else { 8 };
+                    for k in 1..=steps {
+                        feed(vec![egui::Event::PointerMoved(
+                            from + (to - from) * (k as f32 / 8.0),
+                        )]);
+                    }
+                    feed(vec![button(to, false)]);
+                }
+                // `wheel <lines> [<x> <y>]`: the pointer there (by default
+                // just inside the terminal's top-left corner, over its top
+                // row) and the wheel turned that many lines, up when
+                // positive.
+                "wheel" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let pos = match n.as_slice() {
+                        [_, x, y] => Some(egui::pos2(*x, *y)),
+                        _ => Some(egui::pos2(500.0, 200.0)),
+                    };
+                    let (Some(&lines), Some(pos)) = (n.first(), pos) else {
+                        tracing::warn!("debug cmd: no such wheel {arg}");
+                        continue;
+                    };
+                    feed(vec![egui::Event::PointerMoved(pos)]);
+                    feed(vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, lines),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+                // `movexy <x> <y>`: the pointer there, and left there (a
+                // hover); `rclickxy <x> <y>`: a right click there.
+                "movexy" | "rclickxy" | "clickxy" => {
+                    let n: Vec<f32> = arg
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    let [x, y] = n.as_slice() else {
+                        tracing::warn!("debug cmd: no such point {arg}");
+                        continue;
+                    };
+                    let pos = egui::pos2(*x, *y);
+                    feed(vec![egui::Event::PointerMoved(pos)]);
+                    if cmd != "movexy" {
+                        let which = if cmd == "clickxy" {
+                            egui::PointerButton::Primary
+                        } else {
+                            egui::PointerButton::Secondary
+                        };
+                        let button = |pressed| egui::Event::PointerButton {
+                            pos,
+                            button: which,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        feed(vec![button(true)]);
+                        feed(vec![button(false)]);
+                    }
+                }
+                "settings" => {
+                    self.settings = giverny_core::settings::Section::ALL
+                        .iter()
+                        .find(|s| s.title() == arg)
+                        .map(|&section| settings_ui::SettingsState {
+                            section,
+                            search_focus: false,
+                            ..Default::default()
+                        });
+                }
+                "dump" => {
+                    let session = self
+                        .ws
+                        .active
+                        .and_then(|t| self.rt.get(&t))
+                        .and_then(|rt| rt.session.as_ref());
+                    if let Some(session) = session {
+                        let _ = std::fs::write(arg, session.screen_text());
+                    }
+                }
+                // `newtab`, `select <n>` (the n-th tab, from 0), `close`,
+                // `quit`: the window's own new tab, tab click, tab close and
+                // window close.
+                "newtab" => {
+                    let category = self
+                        .ws
+                        .active_tab()
+                        .map(|t| t.category)
+                        .or_else(|| self.ws.categories.first().map(|c| c.id));
+                    if let Some(category) = category {
+                        self.apply(
+                            ctx,
+                            Action::NewTab {
+                                category,
+                                cwd: None,
+                            },
+                        );
+                    }
+                }
+                "select" => {
+                    let tab = arg.parse::<usize>().ok().and_then(|n| self.ws.tabs.get(n));
+                    match tab.map(|t| t.id) {
+                        Some(id) => self.apply(ctx, Action::Select(id)),
+                        None => tracing::warn!("debug cmd: no tab {arg}"),
+                    }
+                }
+                "close" => {
+                    if let Some(id) = self.ws.active {
+                        self.apply(ctx, Action::CloseTab(id));
+                    }
+                }
+                "ctrl" => {
+                    DEBUG_CTRL.store(arg == "down", std::sync::atomic::Ordering::Relaxed);
+                    ctx.request_repaint();
+                }
+                "ctrltab" | "ctrlshifttab" | "ctrlpgdn" | "ctrlpgup" => {
+                    DEBUG_CTRL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let key = match cmd {
+                        "ctrlpgdn" => egui::Key::PageDown,
+                        "ctrlpgup" => egui::Key::PageUp,
+                        _ => egui::Key::Tab,
+                    };
+                    let mut modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+                    modifiers.shift = cmd == "ctrlshifttab";
+                    let ev = |pressed| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    };
+                    feed(vec![ev(true)]);
+                    feed(vec![ev(false)]);
+                }
+                "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                _ => tracing::warn!("debug cmd: unknown {line}"),
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
+    #[cfg(debug_assertions)]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if DEBUG_CTRL.load(std::sync::atomic::Ordering::Relaxed) {
+            raw_input.modifiers.ctrl = true;
+            raw_input.modifiers.command = !cfg!(target_os = "macos");
+            raw_input.focused = true;
+        }
+        if let Ok(mut q) = DEBUG_INPUT.lock()
+            && !q.is_empty()
+        {
+            let events = q.remove(0);
+            let keys = events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+            raw_input.events.extend(events);
+            // As if the window had the keyboard: egui drops a widget's
+            // focus while it has not, and the input is meant for it. The
+            // pointer alone moves no focus, as a real one does not.
+            raw_input.focused = true;
+            if keys {
+                self.focus_terminal = true;
+            }
+            ctx.request_repaint();
+        }
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         translucency::clear_color(self.see_through)
     }
@@ -4517,6 +4810,8 @@ impl eframe::App for App {
         self.deliver_pasted_images();
         self.process_pending(&ctx);
         self.process_sending(&ctx);
+        #[cfg(debug_assertions)]
+        self.debug_cmd(&ctx);
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
