@@ -4842,6 +4842,17 @@ impl eframe::App for App {
                 }
                 shown_line = line;
             }
+            // A Next up page whose row gained a worker becomes its page;
+            // a worker's page learns it finished.
+            if let (Some(line), Some(page)) =
+                (&shown_line, self.page.as_mut().filter(|p| p.tab == active))
+            {
+                let ask = row_open::Ask::of(&line.click, &page.name)
+                    .filter(|_| self.cfg.management_panel.prompt_box);
+                if page.follow_row(&line.click, ask) {
+                    ctx.request_repaint();
+                }
+            }
 
             if let Some(rt) = self.rt.get_mut(&active) {
                 if let Some(page) = self.page.as_mut().filter(|p| p.tab == active) {

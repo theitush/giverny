@@ -86,6 +86,10 @@ pub struct WorkerPage {
     button_line: usize,
     /// The prompt box, when a line typed in it goes to the manager.
     input: Option<Input>,
+    /// Lines sent to the manager while the page shows no transcript (a Next
+    /// up row's brief): they stay on the page, and move to the worker's
+    /// transcript when the row gains one ([`WorkerPage::follow_row`]).
+    echoes: Vec<String>,
 }
 
 /// The page's prompt box while it takes a line for the manager.
@@ -197,6 +201,7 @@ impl WorkerPage {
             at_top: false,
             button_line: 0,
             input: None,
+            echoes: Vec::new(),
         }
     }
 
@@ -236,15 +241,19 @@ impl WorkerPage {
     }
 
     /// `text` just went to the manager: show it now, until it lands in the
-    /// transcript. A page with no transcript has nowhere for it to land, and
-    /// shows none.
+    /// transcript. A brief's page keeps it under the brief until its row
+    /// gains a worker; a page of plain text has nowhere for it, and shows
+    /// none.
     pub fn echo(&mut self, text: &str) {
-        let Content::Transcript(v) = &mut self.content else {
-            return;
-        };
-        // What is in the file by now came before this line.
-        v.poll();
-        v.echoes.push(text.to_string());
+        match &mut self.content {
+            Content::Transcript(v) => {
+                // What is in the file by now came before this line.
+                v.poll();
+                v.echoes.push(text.to_string());
+            }
+            Content::Rows(_) => self.echoes.push(text.to_string()),
+            Content::Text(_) => return,
+        }
         self.generation += 1;
         self.page.to_end();
     }
@@ -252,10 +261,57 @@ impl WorkerPage {
     /// The line sent last never reached the manager: its echo goes. A send
     /// is refused while another is on its way, so the newest is this line's.
     pub fn drop_echo(&mut self) {
-        if let Content::Transcript(v) = &mut self.content
-            && v.echoes.pop().is_some()
-        {
+        let dropped = match &mut self.content {
+            Content::Transcript(v) => v.echoes.pop().is_some(),
+            Content::Rows(_) => self.echoes.pop().is_some(),
+            Content::Text(_) => false,
+        };
+        if dropped {
             self.generation += 1;
+        }
+    }
+
+    /// The panel's row for this page's, as it is now. A page of a Next up
+    /// row whose row gained a worker becomes that worker's page, followed
+    /// live as if opened from its Running row: the lines sent and the text
+    /// typed stay, and the box sends to the worker. A transcript page learns
+    /// that its worker finished. Anything else is left alone, so a page
+    /// scrolled up or selected in is not disturbed. True when it changed.
+    pub fn follow_row(&mut self, now: &RowClick, ask: Option<Ask>) -> bool {
+        use crate::row_open::{Plan, plan};
+        let Some(row) = &self.row else {
+            return false;
+        };
+        if !row.same_row(now) {
+            return false;
+        }
+        let Plan::Watch { transcript, live } = plan(now) else {
+            return false;
+        };
+        match &mut self.content {
+            Content::Transcript(v) => {
+                if v.live == live {
+                    return false;
+                }
+                v.live = live;
+                self.generation += 1;
+                true
+            }
+            Content::Rows(_) | Content::Text(_) => {
+                let mut fresh = Self::transcript(self.tab, self.name.clone(), transcript, live);
+                if let Content::Transcript(v) = &mut fresh.content {
+                    v.echoes = std::mem::take(&mut self.echoes);
+                }
+                self.content = fresh.content;
+                self.row = Some(now.clone());
+                if let (Some(input), Some(ask)) = (&mut self.input, ask) {
+                    input.ask = ask;
+                }
+                self.at_top = false;
+                self.generation += 1;
+                self.page.to_end();
+                true
+            }
         }
     }
 
@@ -272,7 +328,13 @@ impl WorkerPage {
                 .lines()
                 .map(|l| Row::one(Tone::Plain, format!("  {l}")))
                 .collect(),
-            Content::Rows(rows) => rows.clone(),
+            Content::Rows(rows) => {
+                let mut rows = rows.clone();
+                for echo in &self.echoes {
+                    rows.extend(transcript::echo_rows(echo));
+                }
+                rows
+            }
             Content::Transcript(v) => v.lines_for_view(),
         }
     }
@@ -764,6 +826,7 @@ impl TranscriptView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giverny_claude::feed::Stage;
 
     fn input() -> Input {
         Input {
@@ -1033,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_with_no_transcript_shows_no_echo() {
+    fn a_brief_keeps_the_line_sent_and_text_has_no_place_for_one() {
         let brief = transcript::prompt_rows("The brief.", None);
         let ask = Ask::Start {
             task: "acme#2".into(),
@@ -1041,7 +1104,11 @@ mod tests {
         let mut next_up = WorkerPage::rows(TabId(1), "acme#2".into(), brief).with_input(Some(ask));
         next_up.echo("add this");
         let said: Vec<String> = next_up.entries().iter().map(Row::plain).collect();
-        assert_eq!(said, vec!["❯ The brief."]);
+        assert_eq!(
+            said,
+            vec!["❯ The brief.", "❯ add this"],
+            "kept under the brief"
+        );
 
         let mut waiting = WorkerPage::text(TabId(1), "w".into(), "No transcript yet.".into());
         waiting.echo("hello");
@@ -1103,5 +1170,69 @@ mod tests {
         assert_eq!(status_lines(&i, 30).len(), 2, "wrapped to the grid");
         let empty = input_box(40, "acme#2", &i);
         assert!(plain(&empty[1]).starts_with("❯ Start this task now."));
+    }
+
+    fn row_click(stage: Stage, transcript: Option<PathBuf>) -> RowClick {
+        RowClick {
+            stage,
+            key: "acme#2".into(),
+            agent_id: transcript.as_ref().map(|_| "a1".to_string()),
+            finished: false,
+            name: "acme#2".into(),
+            transcript,
+            open: None,
+            brief: None,
+            note: None,
+            review: None,
+            facts: Vec::new(),
+        }
+    }
+
+    /// The bug: a Next up page stayed on the brief after its row gained a
+    /// worker. It becomes the worker's page, keeping the line sent and the
+    /// half-typed text, and its box now sends to the worker.
+    #[test]
+    fn a_next_up_page_turns_into_its_workers_when_the_row_gets_one() {
+        let dir = std::env::temp_dir().join(format!("giverny-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a1.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let planned = row_click(Stage::Planned, None);
+        let brief = transcript::prompt_rows("The brief.", None);
+        let start = Ask::Start {
+            task: "acme#2".into(),
+        };
+        let mut page = WorkerPage::rows(TabId(1), "acme#2".into(), brief)
+            .of_row(planned.clone())
+            .with_input(Some(start.clone()));
+        page.echo("add this");
+        page.input.as_mut().unwrap().text = "half".into();
+
+        // Still Next up, or a running row with no transcript yet: unchanged.
+        assert!(!page.follow_row(&planned, Some(start)));
+        assert!(!page.follow_row(&row_click(Stage::Running, None), None));
+        assert!(matches!(page.content, Content::Rows(_)));
+
+        let running = row_click(Stage::Running, Some(path));
+        let send = Ask::Send {
+            task: "acme#2".into(),
+            agent_id: "a1".into(),
+        };
+        assert!(page.follow_row(&running, Some(send.clone())));
+        assert!(matches!(page.content, Content::Transcript(_)));
+        assert_eq!(page.ask(), Some(&send));
+        assert_eq!(page.input.as_ref().unwrap().text, "half");
+        assert_eq!(page.row.as_ref().unwrap().stage, Stage::Running);
+        let said: Vec<String> = page.entries().iter().map(Row::plain).collect();
+        assert!(said.iter().any(|l| l == "❯ add this"), "{said:?}");
+
+        // A page that already follows is left alone, until the worker ends.
+        assert!(!page.follow_row(&running, Some(send)));
+        let mut done = running.clone();
+        done.finished = true;
+        assert!(page.follow_row(&done, None));
+        assert!(!page.follow_row(&done, None));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
