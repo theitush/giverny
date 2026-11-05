@@ -23,7 +23,6 @@ pub enum Section {
     Titles,
     Restore,
     Claude,
-    ManagementPanel,
     Codex,
     Keys,
     Updates,
@@ -38,7 +37,6 @@ impl Section {
         Section::Titles,
         Section::Restore,
         Section::Claude,
-        Section::ManagementPanel,
         Section::Codex,
         Section::Keys,
         Section::Updates,
@@ -52,7 +50,6 @@ impl Section {
             Section::Titles => "tabs & titles",
             Section::Restore => "restore",
             Section::Claude => "claude",
-            Section::ManagementPanel => "management panel",
             Section::Codex => "codex",
             Section::Keys => "keys",
             Section::Updates => "updates",
@@ -120,9 +117,8 @@ impl SettingDef {
         self.key.split('.')
     }
 
-    /// Everything above the leaf: `font`, or `management_panel.columns`.
     pub fn table(&self) -> &str {
-        self.key.rsplit_once('.').map_or(self.key, |(t, _)| t)
+        self.key.split('.').next().unwrap_or(self.key)
     }
 
     pub fn leaf(&self) -> &str {
@@ -575,25 +571,6 @@ pub const SETTINGS: &[SettingDef] = &[
         kind: Kind::Bool { default: false },
     },
     SettingDef {
-        key: "claude.management_panel",
-        label: "management panel",
-        // Shown at the top of Management panel; the key stays under
-        // [claude], with the other Claude Code switches.
-        section: Section::ManagementPanel,
-        doc: "Show the tab's subagents, running and done, in a table under the terminal.",
-        note: &[
-            "Every row comes from Claude Code's own files and needs no setup.",
-            "On, in each account you installed Giverny's hooks in, it adds a",
-            "subagentStatusLine (giverny relay --subagent-line) to that",
-            "account's settings.json, never over a line of your own. Off",
-            "removes it again. Done rows stay until /clear or a fresh claude",
-            "in the tab. The pane appears only in a tab whose session has",
-            "spawned a subagent; off, nothing is read or drawn.",
-        ],
-        needs_restart: false,
-        kind: Kind::Bool { default: false },
-    },
-    SettingDef {
         key: "claude.resume_after_limit",
         label: "resume after a limit",
         section: Section::Claude,
@@ -625,87 +602,6 @@ pub const SETTINGS: &[SettingDef] = &[
             min: 0,
             max: 1440,
         },
-    },
-    SettingDef {
-        key: "management_panel.prompt_box",
-        label: "worker page prompt box",
-        section: Section::ManagementPanel,
-        doc: "A line typed in a worker page's prompt box goes to the tab's manager, which passes it on.",
-        note: &[
-            "The line is pasted at the prompt of the tab's own Claude Code,",
-            "naming the worker, and submitted. It is not sent while Claude",
-            "Code waits on a permission, a question or a plan approval. Off,",
-            "the box is read-only.",
-        ],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    // The columns, in the order the management panel draws them: Settings
-    // shows their switches in this order. `management_panel.done_rows` and
-    // `done_last` have no row here; the pane still honours them when set by
-    // hand.
-    SettingDef {
-        key: "management_panel.columns.stage",
-        label: "stage",
-        section: Section::ManagementPanel,
-        doc: "STAGE: Running, NextUp or Done.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.id",
-        label: "id",
-        section: Section::ManagementPanel,
-        doc: "The feed's task key, else the subagent's name, else its model.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.title",
-        label: "title",
-        section: Section::ManagementPanel,
-        doc: "The task's title, else the subagent's description: the column that takes the room left.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.elapsed",
-        label: "elapsed",
-        section: Section::ManagementPanel,
-        doc: "How long the row has worked: a stopwatch while it runs.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.eta",
-        label: "eta",
-        section: Section::ManagementPanel,
-        doc: "A manager's estimate: time left, or how a Done row landed against it.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.now",
-        label: "now",
-        section: Section::ManagementPanel,
-        doc: "What the row is doing now: its last tool call, or how it ended.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
-    },
-    SettingDef {
-        key: "management_panel.columns.tokens",
-        label: "tokens",
-        section: Section::ManagementPanel,
-        doc: "The tokens the row has used.",
-        note: &[],
-        needs_restart: false,
-        kind: Kind::Bool { default: true },
     },
     SettingDef {
         key: "update.check",
@@ -800,13 +696,10 @@ pub fn write(base: &Path, def: &SettingDef, value: &Value) -> anyhow::Result<()>
     // Walk (creating) the tables above the leaf.
     let mut node = doc.as_table_mut();
     let parts: Vec<&str> = def.path().collect();
-    let parents = parts.len() - 1;
-    for (i, part) in parts[..parents].iter().enumerate() {
+    for part in &parts[..parts.len() - 1] {
         if !node.contains_key(part) {
             let mut table = toml_edit::Table::new();
-            // `[management_panel.columns]` alone, not an empty
-            // `[management_panel]` above it.
-            table.set_implicit(i + 1 < parents);
+            table.set_implicit(false);
             node.insert(part, toml_edit::Item::Table(table));
         }
         node = node
@@ -1071,6 +964,24 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(config::config_path(&dir)).unwrap()).unwrap();
         assert_eq!(cfg.window.opacity, 0.92);
         assert_eq!(cfg.theme.name, "monet-dark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings' writes leave keys this build does not know in the file, so a
+    /// manager reading `claude.management_panel` still reads what is there;
+    /// and a first run's template has no such key, which reads as off.
+    #[test]
+    fn a_write_keeps_keys_this_build_does_not_know() {
+        let dir = scratch("keeps-unknown");
+        let text = "[claude]\nmanagement_panel = true\n\n[management_panel.lease]\nram = \"1G\"\n";
+        std::fs::write(crate::config::config_path(&dir), text).unwrap();
+        let def = by_key("claude.auto_mode").unwrap();
+        write(&dir, def, &Value::Bool(true)).unwrap();
+        let after = std::fs::read_to_string(crate::config::config_path(&dir)).unwrap();
+        assert!(after.contains("management_panel = true"), "{after}");
+        assert!(after.contains("[management_panel.lease]"), "{after}");
+        assert!(after.contains("auto_mode = true"), "{after}");
+        assert!(!template().contains("management_panel"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

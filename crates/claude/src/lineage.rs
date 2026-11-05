@@ -3,9 +3,7 @@
 //! Everything started in a tab inherits `GIVERNY_TAB_ID`, including a
 //! `claude` the tab's claude starts in its shell and one started inside a
 //! terminal multiplexer the tab launched. Those are not the tab's session:
-//! their hooks must not move the tab's state or name its resume target, and
-//! their workers must not land in the tab's management panel or lose their own
-//! subagent panel to it.
+//! their hooks must not move the tab's state or name its resume target.
 //!
 //! The tab exports the app's process id ([`APP_PID_ENV`]). The tab's own
 //! claude is the one that reaches the app through its parents with no other

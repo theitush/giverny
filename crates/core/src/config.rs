@@ -18,83 +18,6 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
     pub update: UpdateConfig,
-    pub management_panel: ManagementPanelConfig,
-}
-
-/// `[management_panel]`: the rest of Settings → Management panel. The pane's
-/// own switch is `claude.management_panel`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ManagementPanelConfig {
-    /// Which Done rows the pane shows: `"all"`, `"hide"` or `"last"` (the
-    /// newest [`Self::done_last`]).
-    pub done_rows: String,
-    /// How many Done rows `done_rows = "last"` keeps.
-    pub done_last: u32,
-    /// One switch per pane column.
-    pub columns: PaneColumns,
-    /// The worker page's prompt box: a line typed there goes to the tab's
-    /// manager. Off, the box is read-only.
-    pub prompt_box: bool,
-}
-
-impl Default for ManagementPanelConfig {
-    fn default() -> Self {
-        ManagementPanelConfig {
-            done_rows: "all".into(),
-            done_last: 5,
-            columns: PaneColumns::default(),
-            prompt_box: true,
-        }
-    }
-}
-
-/// Which Done rows the management panel shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoneRows {
-    All,
-    Hide,
-    /// The newest this many.
-    Last(usize),
-}
-
-impl ManagementPanelConfig {
-    /// `done_rows` and `done_last` as one value; an unknown word shows all.
-    pub fn done(&self) -> DoneRows {
-        match self.done_rows.trim().to_ascii_lowercase().as_str() {
-            "hide" | "none" => DoneRows::Hide,
-            "last" => DoneRows::Last(self.done_last as usize),
-            _ => DoneRows::All,
-        }
-    }
-}
-
-/// `[management_panel.columns]`: the pane's columns, every one on by default.
-/// A column switched off takes no width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PaneColumns {
-    pub stage: bool,
-    pub id: bool,
-    pub title: bool,
-    pub elapsed: bool,
-    pub eta: bool,
-    pub now: bool,
-    pub tokens: bool,
-}
-
-impl Default for PaneColumns {
-    fn default() -> Self {
-        PaneColumns {
-            stage: true,
-            id: true,
-            title: true,
-            elapsed: true,
-            eta: true,
-            now: true,
-            tokens: true,
-        }
-    }
 }
 
 /// Automatically discovered Codex integration. Authentication stays in Codex.
@@ -133,9 +56,6 @@ pub struct ClaudeConfig {
     pub skip_resume_summary: bool,
     /// Pick a session back up when the usage window that stopped it reopens.
     pub resume_after_limit: bool,
-    /// Show the tab's subagents in a table under the terminal. Off by
-    /// default.
-    pub management_panel: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1025,6 +945,28 @@ mod tests {
         let cfg = load(&dir);
         assert_eq!(cfg.font.size, 13.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config from a build with a management panel, whose keys a manager
+    /// beside this build may also read: every one is only an unknown key, and
+    /// costs nothing else in the file. Nor does this build write that switch.
+    #[test]
+    fn a_panel_builds_config_keeps_everything_else() {
+        let text = "[font]\nsize = 20.0\n[claude]\nauto_mode = true\nmanagement_panel = true\n\
+                    [manager.limits]\nram = \"22G\"\n[management_panel]\ndone_rows = \"last\"\n\
+                    [management_panel.columns]\nstage = false\n[management_panel.lease]\nram = \"1G\"\n";
+        let parsed = parse_over(text, &Config::default()).unwrap();
+        assert!(parsed.invalid.is_empty());
+        assert_eq!(parsed.config.font.size, 20.0);
+        assert!(parsed.config.claude.auto_mode);
+        let mut unknown = parsed.unknown.clone();
+        unknown.sort_unstable();
+        assert_eq!(
+            unknown,
+            ["claude.management_panel", "management_panel", "manager"]
+        );
+        let written = toml::to_string(&parsed.config).unwrap();
+        assert!(!written.contains("management_panel"), "{written}");
     }
 
     #[test]

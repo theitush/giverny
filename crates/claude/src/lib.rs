@@ -6,18 +6,13 @@
 //! titles; and measures what Giverny's tabs use (CPU, memory, GPU) from
 //! `/proc`. Never reads credentials, never calls the network.
 
-pub mod away;
-pub mod feed;
 pub mod hooks;
 pub mod jobs;
 pub mod lineage;
-pub mod managers;
 pub mod profiles;
 pub mod registry;
 pub mod session_use;
-pub mod subagents;
 pub mod tokens;
-pub mod transcript;
 pub mod usage;
 pub mod use_reading;
 pub mod wsl;
