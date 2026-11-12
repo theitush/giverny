@@ -3919,6 +3919,11 @@ impl App {
     /// gets there.
     fn tab_shape(&self, profile_dir: Option<PathBuf>, was_in: Option<&Path>) -> TabShape {
         let mut env = self.claude_env();
+        // This build draws no management panel, whatever an older Giverny left
+        // in `config.toml` (`claude.management_panel`, now an unknown key). The
+        // manager plugin reads that key to decide whether to draw its band, so
+        // it is told here that no panel will, and draws it (giverny#522).
+        env.push(("GIVERNY_PANEL".into(), "none".into()));
         let shell = pty::windows_shell(self.cfg.behavior.windows_shell.as_str());
 
         // The account the category names wins over the shell preference: an
