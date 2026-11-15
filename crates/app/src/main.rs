@@ -5213,21 +5213,28 @@ impl App {
                         u16::try_from(col).unwrap_or(u16::MAX),
                         u16::try_from(row).unwrap_or(u16::MAX),
                     );
-                    let bytes: Vec<u8> = [true, false]
-                        .into_iter()
-                        .filter_map(|pressed| {
-                            giverny_term::input::encode_mouse(
-                                giverny_term::input::MouseCode::Left,
-                                col,
-                                row,
-                                pressed,
-                                false,
-                                egui::Modifiers::NONE,
-                                mode,
-                            )
-                        })
-                        .flatten()
-                        .collect();
+                    // As a hand does it: the pointer onto the Button, then
+                    // its press and release, in one write.
+                    use giverny_term::input::MouseCode;
+                    let bytes: Vec<u8> = [
+                        (MouseCode::NoButton, true, true),
+                        (MouseCode::Left, true, false),
+                        (MouseCode::Left, false, false),
+                    ]
+                    .into_iter()
+                    .filter_map(|(code, pressed, motion)| {
+                        giverny_term::input::encode_mouse(
+                            code,
+                            col,
+                            row,
+                            pressed,
+                            motion,
+                            egui::Modifiers::NONE,
+                            mode,
+                        )
+                    })
+                    .flatten()
+                    .collect();
                     session.write(bytes);
                 }
                 Tick::Wait => {}

@@ -1074,8 +1074,14 @@ pub const WALK_DEADLINE: Duration = Duration::from_secs(20);
 /// its ask every 150 ms. A claude started before the module was written
 /// draws none, and the walk goes by the strip instead.
 pub const BUTTON_WAIT: Duration = Duration::from_millis(900);
-/// How long the plugin's answer is waited for after the click.
+/// How long the plugin's answer is waited for after the first click.
 pub const REPLY_WAIT: Duration = Duration::from_millis(1500);
+/// How long the Button is on screen before it is clicked.
+pub const BUTTON_CALM: Duration = Duration::from_millis(80);
+/// How long an unanswered click waits before the Button, still up, is
+/// clicked again; and how many clicks in all.
+pub const CLICK_AGAIN: Duration = Duration::from_millis(300);
+const MAX_CLICKS: u8 = 4;
 /// The most `↑`s sent to bring the focus back up into the prompt: one per
 /// strip row above the selection, and one for the shells pill.
 const MAX_UPS: u8 = 12;
@@ -1083,10 +1089,17 @@ const MAX_UPS: u8 = 12;
 #[derive(Debug, Clone)]
 enum Phase {
     Start,
-    /// The plugin's way: waiting for its Button on screen.
-    Ask,
-    /// The Button is clicked: waiting for the plugin's answer.
-    Asked,
+    /// The plugin's way: waiting for its Button on screen, and since when
+    /// it has been there.
+    Ask {
+        seen: Option<Instant>,
+    },
+    /// The Button is clicked (`clicks` times, the last at `last`): waiting
+    /// for the plugin's answer.
+    Asked {
+        clicks: u8,
+        last: Instant,
+    },
     /// Waiting for the strip's rows.
     Strip,
     Attach(Box<Attach>),
@@ -1254,8 +1267,8 @@ impl Walk {
     pub fn phase_name(&self) -> &'static str {
         match self.phase {
             Phase::Start => "start",
-            Phase::Ask => "ask",
-            Phase::Asked => "asked",
+            Phase::Ask { .. } => "ask",
+            Phase::Asked { .. } => "asked",
             Phase::Strip => "strip",
             Phase::Attach(_) => "attach",
             Phase::Landing => "landing",
@@ -1268,7 +1281,11 @@ impl Walk {
     pub fn entering(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Start | Phase::Ask | Phase::Asked | Phase::Strip | Phase::Attach(_)
+            Phase::Start
+                | Phase::Ask { .. }
+                | Phase::Asked { .. }
+                | Phase::Strip
+                | Phase::Attach(_)
         )
     }
 
@@ -1286,6 +1303,12 @@ impl Walk {
     fn keys(&mut self, k: Keystroke, n: usize, seen: Seen, now: Instant) -> Tick {
         self.hold = Some((now, seen));
         press(k, n)
+    }
+
+    /// Where the plugin's Button for the walk's ask is on `screen`.
+    fn button(&self, screen: &str) -> Option<(usize, usize)> {
+        let label = giverny_claude::view_ask::label(self.plugin.as_deref()?);
+        giverny_claude::view_ask::find_label(screen, &label)
     }
 
     /// The view on screen is the goal's.
@@ -1325,44 +1348,71 @@ impl Walk {
                     // Already there: only the focus to see to.
                     self.go(Phase::Focus { pill_up: false }, now);
                 } else if self.plugin.is_some() {
-                    self.go(Phase::Ask, now);
+                    self.go(Phase::Ask { seen: None }, now);
                 } else {
                     self.go(Phase::Strip, now);
                 }
                 self.tick(now, look)
             }
-            Phase::Ask => {
-                let Some(nonce) = &self.plugin else {
-                    self.go(Phase::Strip, now);
-                    return self.tick(now, look);
-                };
-                let button = giverny_claude::view_ask::label(nonce);
-                if let Some((row, col)) = giverny_claude::view_ask::find_label(screen, &button) {
-                    self.go(Phase::Asked, now);
-                    return Tick::Click { row, col };
+            Phase::Ask { seen } => {
+                let seen = *seen;
+                let button = self.button(screen);
+                match (button, seen) {
+                    // Drawn whole: the frame that brought it may be half
+                    // written. Claude Code 2.1.325 in a Giverny tab often
+                    // leaves the first click unanswered (at 80 or 200 ms),
+                    // and answers the next: see `Asked`.
+                    (Some((row, col)), Some(at)) if now >= at + BUTTON_CALM => {
+                        self.go(
+                            Phase::Asked {
+                                clicks: 1,
+                                last: now,
+                            },
+                            now,
+                        );
+                        Tick::Click { row, col }
+                    }
+                    (Some(_), Some(_)) => Tick::Wait,
+                    (Some(_), None) => {
+                        self.phase = Phase::Ask { seen: Some(now) };
+                        Tick::Wait
+                    }
+                    (None, _) if self.plugin.is_some() && waited < BUTTON_WAIT => Tick::Wait,
+                    (None, _) => {
+                        self.plugin_missed = self.plugin.take().is_some();
+                        self.go(Phase::Strip, now);
+                        self.tick(now, look)
+                    }
                 }
-                if waited < BUTTON_WAIT {
-                    return Tick::Wait;
-                }
-                self.plugin = None;
-                self.plugin_missed = true;
-                self.go(Phase::Strip, now);
-                self.tick(now, look)
             }
-            Phase::Asked => match look.reply {
-                Some(Ok(())) => {
-                    self.go(Phase::Landing, now);
-                    self.tick(now, look)
+            Phase::Asked { clicks, last } => {
+                let (clicks, last) = (*clicks, *last);
+                match look.reply {
+                    Some(Ok(())) => {
+                        self.go(Phase::Landing, now);
+                        self.tick(now, look)
+                    }
+                    Some(Err(why)) => Tick::Stuck(Stuck::Denied(why.clone())),
+                    // The clicks went astray: the strip's way, then.
+                    None if waited >= REPLY_WAIT => {
+                        self.plugin = None;
+                        self.go(Phase::Strip, now);
+                        self.tick(now, look)
+                    }
+                    // The Button still up, unanswered: once pressed, the
+                    // module takes it down at once, so that click missed.
+                    None => match self.button(screen) {
+                        Some((row, col)) if now >= last + CLICK_AGAIN && clicks < MAX_CLICKS => {
+                            self.phase = Phase::Asked {
+                                clicks: clicks + 1,
+                                last: now,
+                            };
+                            Tick::Click { row, col }
+                        }
+                        _ => Tick::Wait,
+                    },
                 }
-                Some(Err(why)) => Tick::Stuck(Stuck::Denied(why.clone())),
-                // The click went astray: the strip's way, then.
-                None if waited >= REPLY_WAIT => {
-                    self.plugin = None;
-                    self.go(Phase::Strip, now);
-                    self.tick(now, look)
-                }
-                None => Tick::Wait,
-            },
+            }
             Phase::Strip => {
                 let ready = match &self.goal {
                     Goal::Main => strip_shown(screen),
@@ -2051,7 +2101,10 @@ mod tests {
         // It has, in the hint line: clicked, and nothing typed.
         let label = giverny_claude::view_ask::label("n1");
         let button = cc325(RULE, &format!("· {label}"), "●", &BUSY);
-        let Tick::Click { row, col } = w.tick(t0 + ms(200), look(&button, None)) else {
+        // Just drawn: not clicked until it has stood a moment.
+        assert_eq!(w.tick(t0 + ms(200), look(&button, None)), Tick::Wait);
+        let calm = t0 + ms(200) + BUTTON_CALM;
+        let Tick::Click { row, col } = w.tick(calm, look(&button, None)) else {
             panic!("the Button is clicked");
         };
         let line: Vec<char> = button.lines().nth(row).unwrap().chars().collect();
@@ -2059,8 +2112,13 @@ mod tests {
         let start = line.iter().collect::<String>()[..at].chars().count();
         assert!((start..start + label.len()).contains(&col), "on the Button");
         // Waiting for the module's answer.
-        assert_eq!(w.tick(t0 + ms(250), look(&main, None)), Tick::Wait);
+        assert_eq!(w.tick(calm + ms(10), look(&main, None)), Tick::Wait);
         assert_eq!(w.phase_name(), "asked");
+        // A Button still up, unanswered, is clicked again.
+        assert_eq!(
+            w.tick(calm + CLICK_AGAIN, look(&button, None)),
+            Tick::Click { row, col }
+        );
         // The view shows the worker, its description on the prompt's rule
         // and the draft carried along; the cursor is in its prompt.
         let ok = Ok(());
@@ -2070,7 +2128,7 @@ mod tests {
             "◯",
             &BUSY[1..],
         );
-        assert_eq!(w.tick(t0 + ms(300), look(&view, Some(&ok))), Tick::Done);
+        assert_eq!(w.tick(t0 + ms(900), look(&view, Some(&ok))), Tick::Done);
     }
 
     #[test]
@@ -2083,7 +2141,11 @@ mod tests {
             "◯",
             &BUSY[1..],
         );
-        assert!(matches!(w.tick(t0, look(&view, None)), Tick::Click { .. }));
+        assert_eq!(w.tick(t0, look(&view, None)), Tick::Wait);
+        assert!(matches!(
+            w.tick(t0 + BUTTON_CALM, look(&view, None)),
+            Tick::Click { .. }
+        ));
         let ok = Ok(());
         let main = cc325(RULE, "(shift+tab to cycle) · ← 2 agents", "●", &BUSY);
         assert_eq!(w.tick(t0 + ms(100), look(&main, Some(&ok))), Tick::Done);
@@ -2099,8 +2161,9 @@ mod tests {
             "●",
             &BUSY,
         );
+        assert_eq!(w.tick(t0, look(&button, None)), Tick::Wait);
         assert!(matches!(
-            w.tick(t0, look(&button, None)),
+            w.tick(t0 + BUTTON_CALM, look(&button, None)),
             Tick::Click { .. }
         ));
         let no = Err("no agent under that id".to_string());

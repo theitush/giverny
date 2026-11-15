@@ -327,7 +327,7 @@ Durations everywhere in the pane are written the way the ETA column writes them:
 
 ## What a click on a row opens
 
-A click on a **Running** row whose worker is mid-turn opens Claude Code's own view of that worker in the tab. Every other row opens Giverny's **worker page** in the same place (giverny#477): a worker whose turn has ended (finished, or asleep on a background shell of its own), a **Done** row and a **Next up** row, and a Running row's worker when the walk to its view cannot start. Claude Code keeps no view of those, so Giverny draws one as Claude Code would, and it takes the tab the way the running view does:
+A click on a **Running** row whose worker is mid-turn opens Claude Code's own view of that worker in the tab. Every other row opens Giverny's **worker page** in the same place (giverny#477): a worker whose turn has ended (finished, or asleep on a background shell of its own), a **Done** row and a **Next up** row, and a Running row's worker when its view cannot be reached. Claude Code keeps no view of those, so Giverny draws one as Claude Code would, and it takes the tab the way the running view does:
 
 - It fills the terminal's area, in the terminal's own grid, font, colours and worker background, with the worker's prompt on its grey band and each entry under it.
 - Claude Code's prompt box follows, its rules in the worker's colour and the task's name on the top one. A line typed there goes to the tab's manager (see **Lines from the worker page**). A page with nobody to send to (a note), or with `management_panel.prompt_box` off, keeps the box dimmed and `read-only`. Nothing typed on the page reaches the shell under it.
@@ -335,6 +335,15 @@ A click on a **Running** row whose worker is mid-turn opens Claude Code's own vi
 - The same "back to manager" button sits under the prompt box. It, Esc (on an empty box; on a line Esc clears it first), or a second click on the row goes back to the terminal.
 - A worker's page opens at the end of its transcript, on the worker's report once it has one, and follows the transcript as it grows. A **Done** one's does too: a line from the prompt box can wake the worker, and its reply lands there. A Next up row's brief, drawn as the worker's prompt, opens at its top.
 - The wheel, ↑/↓ and PgUp/PgDn scroll it, and a drag selects and copies. Space and Home/End scroll too while the box takes no line; while it does, they edit it (Home/End scroll with the box empty).
+
+### How the view is reached
+
+Since Claude Code 2.1.323, its agent list under the prompt names a busy worker by a model-written summary of what it is doing (`Running sleep 12 (3 of 10)`), never by its description, and two busy workers often read the same; the relay that tagged each row with its agent id no longer runs. So the view is opened by agent id, through the Giverny plugin (giverny#525):
+
+- The plugin carries a hooks module, `hooks/open.tsx`. Claude Code's mod API opens a worker's view by agent id (`$.ui.view({ agentId })`), but only while it answers the person's own input: from a timer, a watched file or an edit of the prompt it is refused. So a click writes an ask into the tab's file (`state/claude-view/giverny-<n>.json`, the worker's agent id and when), the module, reading that file every 150 ms, draws a Button for it in the hint line under the prompt, and Giverny clicks that Button with a mouse report. The press is the person's input, so the view moves; the module writes back how it went. Nothing is typed: the prompt's draft and its cursor stay as they were, and a draft comes along into the worker's view as Claude Code carries it. The tab's picture is held throughout, so the Button is never seen. A click Claude Code leaves unanswered while the Button is still up is made again, 300 ms on. An ask older than five seconds is never drawn.
+- The way back to the manager (the "back to manager" button, Esc, a second click on the row, a line sent from a worker page) goes the same way, with no agent id.
+- The module loads when a claude starts, like the plugin's hooks: a claude started before Giverny wrote it draws no Button. After 900 ms without one, Giverny walks Claude Code's agent list with the keyboard as before, finding the worker's row by its id tag (a Claude Code that still runs the relay), its description, or its place among the tab's running workers by start, when the list shows exactly that many; the view that opens is checked against the worker's description. For five minutes after that, clicks in that session go straight to the keyboard walk.
+- When Claude Code refuses the view (the worker has just left its list) or the walk cannot find the worker, the row opens the worker's page. Only a question or dialog in the way is said in words, since the person must answer it first.
 
 ### Lines from the worker page
 
