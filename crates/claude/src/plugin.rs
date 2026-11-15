@@ -69,6 +69,12 @@
 //!   of its own that its timeout moved there, or that has gone quiet, is
 //!   asked about once per command ([`crate::strays`], giverny#450).
 //!
+//! - `hooks/hooks.json` also names a hooks module, `hooks/open.tsx`
+//!   ([`crate::view_ask`], giverny#525): a click on a management-panel row
+//!   opens that worker's view through it, by agent id, now that Claude
+//!   Code's agent list names a busy worker by a summary of what it does.
+//!   Like the hooks, it reaches only claudes started after it was written.
+//!
 //! The skill is its own switch (`management_panel.manage_skill`, on by
 //! default): off, the plugin is written without `skills/` and without its
 //! prompt hook, so the tool hooks, the launchers and `/giverny:clear-done`
@@ -185,6 +191,9 @@ fn wrapper(exes: &[String], sub: &str) -> String {
 /// ([`crate::plugin_hook::handback`], giverny#478).
 pub const PRE_MATCHER: &str = "Bash|Edit|Write|MultiEdit|NotebookEdit|SubagentHandback";
 
+/// The hooks module `hooks.json` names, beside it: [`crate::view_ask::MODULE`].
+pub const OPEN_MODULE: &str = "open.tsx";
+
 fn session_hooks(skill: bool) -> Value {
     let hook = || {
         json!([{
@@ -213,14 +222,17 @@ fn session_hooks(skill: bool) -> Value {
                         and out of other sessions' work, \
                         \"manage this\" sent to the manage skill, \
                         task work pointed at it, \
-                        and sessions and subagents asked about commands they leave running",
+                        and sessions and subagents asked about commands they leave running, \
+                        and a management-panel row's click opened in the worker's view",
+        "modules": [format!("./{OPEN_MODULE}")],
         "hooks": hooks
     })
 }
 
 /// Every file of the marketplace: (path under the dir, contents, executable).
-/// `skill` false leaves the manage skill out.
-pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> {
+/// `skill` false leaves the manage skill out. `view_dir` is where the app
+/// puts its asks for the hooks module ([`crate::view_ask::dir`]).
+pub fn files(exes: &[String], skill: bool, view_dir: &Path) -> Vec<(&'static str, String, bool)> {
     let marketplace = json!({
         "name": MARKETPLACE,
         "owner": { "name": "Giverny" },
@@ -276,6 +288,11 @@ pub fn files(exes: &[String], skill: bool) -> Vec<(&'static str, String, bool)> 
             pretty(&session_hooks(skill)),
             false,
         ),
+        (
+            "plugins/giverny/hooks/open.tsx",
+            crate::view_ask::module_source(view_dir),
+            false,
+        ),
     ];
     if skill {
         out.push((SKILL_PATH, SKILL.to_string(), false));
@@ -320,9 +337,9 @@ pub fn exe_candidates() -> Vec<String> {
 /// Write the marketplace into `dir`, touching only files whose bytes differ,
 /// and removing anything else there (the directory is ours alone). Returns
 /// whether anything changed. `skill` false writes the plugin without its
-/// manage skill (and so prunes one written before).
-pub fn sync(dir: &Path, exes: &[String], skill: bool) -> std::io::Result<bool> {
-    let want = files(exes, skill);
+/// manage skill (and so prunes one written before). `view_dir`: see [`files`].
+pub fn sync(dir: &Path, exes: &[String], skill: bool, view_dir: &Path) -> std::io::Result<bool> {
+    let want = files(exes, skill, view_dir);
     let mut changed = false;
     for (rel, body, exec) in &want {
         let path = dir.join(rel);
@@ -643,6 +660,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn hooks_json_names_the_open_module_written_beside_it() {
+        let view = Path::new("/x/state/claude-view");
+        let all = files(&["/bin/giverny".to_string()], false, view);
+        let body = |rel: &str| {
+            all.iter()
+                .find(|f| f.0 == rel)
+                .map(|f| (f.1.clone(), f.2))
+                .unwrap_or_else(|| panic!("{rel} is not written"))
+        };
+        let (hooks, _) = body("plugins/giverny/hooks/hooks.json");
+        let hooks: Value = serde_json::from_str(&hooks).unwrap();
+        assert_eq!(hooks["modules"], json!([format!("./{OPEN_MODULE}")]));
+        let (module, exec) = body("plugins/giverny/hooks/open.tsx");
+        assert!(module.contains(r#"const DIR = "/x/state/claude-view""#));
+        assert!(!exec);
+        // Written whether or not the skill is.
+        assert!(
+            files(&[], true, view)
+                .iter()
+                .any(|f| f.0 == "plugins/giverny/hooks/open.tsx")
+        );
     }
 
     #[test]

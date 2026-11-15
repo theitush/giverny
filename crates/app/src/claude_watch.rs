@@ -2313,6 +2313,7 @@ impl ClaudeWatch {
                 &dir,
                 &giverny_claude::plugin::exe_candidates(),
                 skill,
+                &giverny_claude::view_ask::dir(base),
             ) {
                 Ok(true) => tracing::info!("giverny plugin written to {}", dir.display()),
                 Ok(false) => {}
