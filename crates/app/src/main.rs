@@ -10,6 +10,7 @@ mod hover_open;
 mod icon;
 mod job_end;
 mod keymap;
+mod list_hide;
 mod management_live;
 mod management_panel;
 mod oom;
@@ -6692,15 +6693,23 @@ impl eframe::App for App {
                 }
             }
 
+            // The tab's own Claude Code is the one in front of its shell: a
+            // claude in a multiplexer or a nested shell keeps its list.
+            let own_claude =
+                list_hide::own_claude(self.ws.tab(active).and_then(|t| t.foreground.as_deref()));
             if let Some(rt) = self.rt.get_mut(&active) {
                 // With the management panel on, Giverny stands in for Claude
                 // Code's strip: its `main` row is not drawn, and a worker's
-                // view gets a way back.
-                rt.view.marks_for = self
-                    .cfg
-                    .claude
-                    .management_panel
-                    .then_some(agent_open::row_marks as fn(&str) -> _);
+                // view gets a way back. In the tab's own Claude Code the
+                // whole agent list goes too (giverny#526).
+                let pane_on = self.cfg.claude.management_panel;
+                rt.view.marks_for = pane_on.then_some(if own_claude {
+                    list_hide::marks as fn(&str) -> _
+                } else {
+                    agent_open::row_marks
+                });
+                rt.view.tail_for =
+                    (pane_on && own_claude).then_some(list_hide::tail_rows as fn(&str) -> _);
                 rt.view.button_labels = BACK_LABELS;
                 rt.view.button_fill = self.chrome.accent;
                 rt.view.hold = holding;
