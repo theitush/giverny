@@ -123,6 +123,31 @@ impl RelayMsg {
             .filter(|a| !a.trim().is_empty())
     }
 
+    /// On `PostToolUse`: does this call say the session has a worker — a
+    /// call the worker made, or the session's own `Agent` (`Task` before
+    /// 2.1.x) call launching one? `Some` with the worker's id when the
+    /// payload gives it: its `agent_id`, or the launch result's `agentId`.
+    /// What gives a tab its management-panel table now that no live list
+    /// does (giverny#523).
+    pub fn names_worker(&self) -> Option<Option<&str>> {
+        if self.hook_event() != Some("PostToolUse") {
+            return None;
+        }
+        if self.from_subagent() {
+            return Some(self.agent_id());
+        }
+        let tool = self.event.get("tool_name").and_then(|v| v.as_str());
+        if !matches!(tool, Some("Agent" | "Task")) {
+            return None;
+        }
+        Some(
+            self.event
+                .pointer("/tool_response/agentId")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty()),
+        )
+    }
+
     /// On the session's own `PostToolUse` of `TaskStop`: the background task
     /// it stopped.
     pub fn stopped_task(&self) -> Option<&str> {
@@ -1948,6 +1973,49 @@ pub fn uninstall_from(settings_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_tool_use_names_the_worker_it_shows() {
+        let msg = |event: serde_json::Value| RelayMsg {
+            provider: "claude".into(),
+            wsl_distro: None,
+            emitted_at: None,
+            tab_id: Some("giverny-1".into()),
+            job: None,
+            config_dir: None,
+            event,
+        };
+        let worker = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1",
+            "agent_id": "a1", "tool_name": "Bash",
+        }));
+        assert_eq!(
+            worker.names_worker(),
+            Some(Some("a1")),
+            "the worker's own call"
+        );
+        let launch = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Agent",
+            "tool_response": {"status": "async_launched", "agentId": "a2"},
+        }));
+        assert_eq!(
+            launch.names_worker(),
+            Some(Some("a2")),
+            "the session's launch"
+        );
+        let bare = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Task",
+        }));
+        assert_eq!(bare.names_worker(), Some(None), "a launch with no id");
+        let own = msg(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash",
+        }));
+        assert_eq!(own.names_worker(), None, "the session's own work");
+        let stop = msg(serde_json::json!({
+            "hook_event_name": "Stop", "session_id": "s1", "agent_id": "a1",
+        }));
+        assert_eq!(stop.names_worker(), None);
+    }
 
     /// A short socket path of its own: a long one does not fit `sun_path`.
     #[cfg(unix)]

@@ -1172,6 +1172,13 @@ impl ClaudeWatch {
             entry.account = account;
         }
         let is_active = active == Some(tab_id);
+        // A worker's tool call, or the session's own launch of one: the
+        // tab's management-panel table, made if it has none, reads the disk
+        // now (giverny#523).
+        if let Some(worker) = msg.names_worker() {
+            self.agents
+                .worker_seen(tab_id, msg.session_id(), config_dir.clone(), worker);
+        }
         // The relay hooks run async, each its own process: a message can
         // reach Giverny after one the session sent after it. One stamped
         // before the newest of the session's own already applied is old
@@ -1464,6 +1471,10 @@ impl ClaudeWatch {
                     self.places = std::mem::take(&mut result.places);
                     self.scanned = result;
                     let live = &self.scanned.live;
+                    self.agents.set_hosts(
+                        live.iter()
+                            .map(|s| (s.entry.session_id.as_str(), s.entry.started_at_ms)),
+                    );
                     self.predate_hooks.retain(|(dir, pid)| {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)

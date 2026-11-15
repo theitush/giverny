@@ -1,12 +1,18 @@
-//! The management panel's live rows, per tab: where relayed `subagentStatusLine`
-//! ticks land.
+//! The management panel's live rows, per tab.
 //!
-//! `giverny relay --subagent-line` forwards Claude Code's live worker list
-//! with the tab it ran in (`GIVERNY_TAB_ID`, which reaches that command:
-//! verified against 2.1.280). [`ClaudeWatch`] hands each one here,
-//! and this keeps one [`Tracker`] per tab — Running rows from the ticks, Done
-//! rows from the transcripts once a worker leaves the list. The pane reads
-//! them through [`ManagementLive::tracker`]; nothing here draws anything.
+//! This keeps one [`Tracker`] per tab, and each reads its session's workers
+//! off the disk once a second ([`Tracker::refresh`]): Running while one has
+//! written since the claude now running the session started and has not
+//! landed, Done once it has. Which claude that is, and when it started, the
+//! session registry says ([`ManagementLive::set_hosts`], from
+//! [`ClaudeWatch`]'s scan). Claude Code before 2.1.323 also ran
+//! `giverny relay --subagent-line` with its live worker list, forwarded with
+//! the tab it ran in; [`ClaudeWatch`] still hands any such tick here, and it
+//! folds into the same rows ([`ManagementLive::apply_live`]). 2.1.323
+//! removed that setting (giverny#523), so a tab gets its table from the
+//! hooks that say its session has a worker ([`ManagementLive::worker_seen`]).
+//! The pane reads them through [`ManagementLive::tracker`]; nothing here
+//! draws anything.
 //!
 //! Rows are kept until the tab's conversation is cleared (`/clear`, which
 //! Claude Code reports as `SessionStart` with `source: "clear"`), a fresh
@@ -44,6 +50,10 @@ pub struct ManagementLive {
     /// the session is marked a manager (giverny#357): then it gets one, so
     /// its pane shows its Next up before its first spawn.
     waiting: HashMap<TabId, (String, Option<PathBuf>)>,
+    /// When the claude now running each live session started (its
+    /// registry `startedAt`), by session id: what tells a worker that runs
+    /// from one killed with an earlier claude of its conversation.
+    hosts: HashMap<String, u64>,
     /// Where the trackers are saved; `None` keeps them in memory only.
     path: Option<PathBuf>,
     dirty: bool,
@@ -69,6 +79,7 @@ impl ManagementLive {
             trackers,
             up: HashSet::new(),
             waiting: HashMap::new(),
+            hosts: HashMap::new(),
             path: Some(path),
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -83,6 +94,7 @@ impl ManagementLive {
             trackers: HashMap::new(),
             up: HashSet::new(),
             waiting: HashMap::new(),
+            hosts: HashMap::new(),
             path: None,
             dirty: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
@@ -183,6 +195,93 @@ impl ManagementLive {
         }
         tracker.apply_live(&snap, now_ms());
         self.dirty = true;
+    }
+
+    /// A hook from `tab`'s session names one of its workers: a tool call
+    /// the worker made (`agent`, its id), or the session's own `Agent` call
+    /// that launched one (its id when the result gave it). No live list says
+    /// a worker runs since Claude Code 2.1.323 (giverny#523), so this is
+    /// what gives a tab with no table one when the session's first worker
+    /// starts, as the first live tick did: bound to the session, shown, and
+    /// read from the disk on the next tick rather than within the second.
+    /// A worker the table already has Running changes nothing.
+    pub fn worker_seen(
+        &mut self,
+        tab: TabId,
+        session_id: Option<&str>,
+        config_dir: Option<PathBuf>,
+        agent: Option<&str>,
+    ) {
+        self.up.insert(tab);
+        let waiting = self.waiting.remove(&tab);
+        let session = session_id
+            .map(str::to_string)
+            .or_else(|| waiting.as_ref().map(|(sid, _)| sid.clone()));
+        let Some(tracker) = self.trackers.get_mut(&tab) else {
+            let config = config_dir
+                .or_else(|| waiting.and_then(|(_, c)| c))
+                .or_else(default_config_dir);
+            let mut fresh = Tracker::new(config);
+            if let Some(sid) = &session {
+                fresh.set_session(sid);
+            }
+            self.trackers.insert(tab, fresh);
+            self.dirty = true;
+            self.refresh_soon();
+            return;
+        };
+        if config_dir.is_some() && tracker.config_dir != config_dir {
+            tracker.config_dir = config_dir;
+        }
+        if let Some(sid) = session.as_deref() {
+            let known = tracker.session_id.as_deref() == Some(sid)
+                || tracker.aliases.iter().any(|a| a == sid);
+            if !known {
+                // Another conversation: a start this tab never heard of
+                // (giverny#242), as a tick from it would say.
+                if tracker.continues(sid) == Some(false) {
+                    *tracker = Tracker::new(tracker.config_dir.clone());
+                }
+                tracker.set_session(sid);
+                self.dirty = true;
+                self.refresh_soon();
+                return;
+            }
+        }
+        let running = agent.is_some_and(|id| tracker.get(id).is_some_and(|r| r.running()));
+        if !running {
+            self.refresh_soon();
+        }
+    }
+
+    /// Read the disk on the next tick.
+    fn refresh_soon(&mut self) {
+        self.last_refresh = Instant::now() - REFRESH_INTERVAL;
+    }
+
+    /// The live sessions and when the claude running each started, from the
+    /// session registry: `(session id, startedAt)`. A session two claudes
+    /// hold is taken at the earlier.
+    pub fn set_hosts<'a>(&mut self, live: impl IntoIterator<Item = (&'a str, u64)>) {
+        self.hosts.clear();
+        for (sid, started) in live {
+            if started == 0 {
+                continue;
+            }
+            let at = self.hosts.entry(sid.to_string()).or_insert(started);
+            *at = (*at).min(started);
+        }
+    }
+
+    /// When the claude running `tracker`'s session started, under any of
+    /// its ids: `None` when no live claude holds it.
+    fn host_of(&self, tracker: &Tracker) -> Option<u64> {
+        tracker
+            .session_id
+            .iter()
+            .chain(tracker.aliases.iter())
+            .filter_map(|sid| self.hosts.get(sid).copied())
+            .min()
     }
 
     /// A `SessionStart` in `tab`. `/clear` (`source: "clear"`) starts the
@@ -347,9 +446,18 @@ impl ManagementLive {
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.last_refresh = Instant::now();
             self.adopt_managers(&giverny_claude::feed::feed_dir());
-            for tracker in self.trackers.values_mut() {
+            let now = now_ms();
+            let hosts: Vec<(TabId, Option<u64>)> = self
+                .trackers
+                .iter()
+                .map(|(id, t)| (*id, self.host_of(t)))
+                .collect();
+            for (id, host) in hosts {
+                let Some(tracker) = self.trackers.get_mut(&id) else {
+                    continue;
+                };
                 let before = signature(tracker);
-                tracker.refresh();
+                tracker.refresh(host, now);
                 self.dirty |= signature(tracker) != before;
             }
         }
@@ -461,6 +569,50 @@ mod tests {
                 "description": "work", "startTime": 1_790_000_000_000u64,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn a_worker_hook_gives_its_tab_a_table_that_finds_it_on_disk() {
+        // Claude Code 2.1.323 and on: no tick ever comes. A fresh session
+        // waits with no table; its first worker's hook makes one, and the
+        // disk has the worker Running on the next tick.
+        let config = std::env::temp_dir().join(format!("giverny-ml-523-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let subs = config
+            .join("projects")
+            .join("-w")
+            .join("s1")
+            .join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(
+            subs.join("agent-a1.meta.json"),
+            r#"{"description":"pics","spawnDepth":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            subs.join("agent-a1.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-15T17:12:05Z\"}\n",
+        )
+        .unwrap();
+        let mut live = ManagementLive::in_memory();
+        live.session_started(TAB, Some("startup"), Some("s1"), Some(config.clone()));
+        assert!(live.tracker(TAB).is_none(), "a fresh session waits");
+        live.worker_seen(TAB, Some("s1"), None, Some("a1"));
+        let t = live.shown(TAB).expect("a table, shown");
+        assert_eq!(t.session_id.as_deref(), Some("s1"));
+        assert_eq!(t.config_dir.as_deref(), Some(config.as_path()));
+
+        // No claude known for the session: nothing runs yet.
+        live.tick(|_| true);
+        assert!(live.tracker(TAB).unwrap().get("a1").is_none());
+        // The registry has its claude, started before the worker wrote.
+        live.set_hosts([("s1", now_ms() - 600_000), ("s1", now_ms() - 900_000)]);
+        live.worker_seen(TAB, Some("s1"), None, Some("a1"));
+        live.tick(|_| true);
+        let r = live.tracker(TAB).unwrap().get("a1").expect("found on disk");
+        assert!(r.running());
+        assert_eq!(r.description.as_deref(), Some("pics"));
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[test]
