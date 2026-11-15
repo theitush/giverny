@@ -1441,6 +1441,10 @@ pub struct App {
     /// strip is the keyboard path into a worker's view, which the management
     /// panel otherwise hides.
     strip_asks: HashMap<TabId, Instant>,
+    /// Claude Code sessions whose claude drew no plugin Button when asked
+    /// (started before the plugin's module was written), and when: their
+    /// walks go by the strip for a while ([`NO_MODULE_FOR`]).
+    no_view_module: HashMap<String, Instant>,
     /// The pointer over the active tab's management panel, as the pane saw it
     /// last frame (`Views::take_hover`), and the watch deciding when a
     /// rest on a Running row starts its open early.
@@ -1477,6 +1481,12 @@ struct AttachJob {
     /// The row's title, for a note if the walk stops short.
     title: String,
     driver: agent_open::Walk,
+    /// The row clicked, into a worker's view: what opens instead when the
+    /// view cannot be reached.
+    click: Option<management_panel::RowClick>,
+    /// The ask the plugin's module answers, while the walk goes its way
+    /// (`giverny_claude::view_ask`); withdrawn when dropped.
+    ask: Option<ViewAsk>,
     /// When the walk began: the tab's picture is held from here until the
     /// view is final, and never longer than [`HOLD_MAX`].
     started: Instant,
@@ -1495,6 +1505,43 @@ struct AttachJob {
     hide_asked: bool,
 }
 
+/// A walk's ask to the tab's plugin module, taken back when the walk is
+/// done with it, however it ends.
+struct ViewAsk {
+    dir: PathBuf,
+    tab_id: String,
+    nonce: String,
+}
+
+impl ViewAsk {
+    /// Write the ask: tab `tab_id`'s claude is to show worker `agent`'s
+    /// view (`None`: the manager's).
+    fn write(dir: PathBuf, tab_id: String, agent: Option<&str>) -> Option<ViewAsk> {
+        let nonce = giverny_claude::view_ask::nonce();
+        match giverny_claude::view_ask::write_ask(&dir, &tab_id, &nonce, agent) {
+            Ok(()) => Some(ViewAsk { dir, tab_id, nonce }),
+            Err(err) => {
+                tracing::warn!("management panel: could not ask the plugin for a view: {err}");
+                None
+            }
+        }
+    }
+
+    fn reply(&self) -> Option<Result<(), String>> {
+        giverny_claude::view_ask::read_reply(&self.dir, &self.tab_id, &self.nonce)
+    }
+}
+
+impl Drop for ViewAsk {
+    fn drop(&mut self) {
+        giverny_claude::view_ask::withdraw(&self.dir, &self.tab_id);
+    }
+}
+
+/// How long a session whose claude drew no plugin Button walks by the
+/// strip before the Button is tried again there.
+const NO_MODULE_FOR: Duration = Duration::from_secs(300);
+
 impl AttachJob {
     fn new(tab: TabId, title: String, driver: agent_open::Walk) -> AttachJob {
         // The way in waits on the strip: the pty stays narrow until it is
@@ -1505,6 +1552,8 @@ impl AttachJob {
             tab,
             title,
             driver,
+            click: None,
+            ask: None,
             started: Instant::now(),
             settle: None,
             nudge,
@@ -2206,6 +2255,7 @@ impl App {
             sending: None,
             homing: None,
             strip_asks: HashMap::new(),
+            no_view_module: HashMap::new(),
             hover: None,
             hover_watch: None,
             screen_still: None,
@@ -4892,16 +4942,39 @@ impl App {
         {
             session.nudge_width(false);
         }
-        self.attach = Some(AttachJob::new(
-            parent,
-            title.to_string(),
-            agent_open::Walk::open(description, aliases, Instant::now()).by_id(agent_id),
-        ));
+        // Where the worker stands among the tab's running workers by start:
+        // a strip whose rows name none of them by description may still
+        // list them in that order (the view it opens is checked).
+        let running: Vec<&giverny_claude::subagents::SubagentRow> = {
+            let mut rows: Vec<_> = self
+                .claude
+                .agents
+                .tracker(parent)
+                .map(|t| t.rows().iter().filter(|r| r.running()).collect())
+                .unwrap_or_default();
+            rows.sort_by_key(|r| r.started_ms.unwrap_or(u64::MAX));
+            rows
+        };
+        let mut walk = agent_open::Walk::open(description, aliases, Instant::now()).by_id(agent_id);
+        if let Some(i) = running.iter().position(|r| r.id == agent_id) {
+            walk = walk.in_order(i, running.len());
+        }
+        // The plugin's Button opens the view by agent id, whatever the
+        // strip shows (giverny#525); the strip is the way only without it.
+        let ask = self.view_ask(parent, Some(agent_id));
+        if let Some(a) = &ask {
+            walk = walk.via_plugin(a.nonce.clone());
+        }
+        let mut job = AttachJob::new(parent, title.to_string(), walk);
+        job.click = Some(click.clone());
+        job.ask = ask;
+        self.attach = Some(job);
         // Asked now, not next frame: every frame of the relay's tick counts.
         self.sync_strip_asks();
         // And nudged now, for the same reason.
         if self.cfg.claude.management_panel
             && let Some(job) = &mut self.attach
+            && !job.driver.on_plugin_route()
             && let Some(session) = self.rt.get(&parent).and_then(|rt| rt.session.as_ref())
             && job.nudge.tick(Instant::now(), true) == Some(agent_open::Width::Narrow)
         {
@@ -4919,12 +4992,55 @@ impl App {
         if self.attach.is_some() || !self.tab_is_live(tab) {
             return;
         }
-        self.attach = Some(AttachJob::new(
-            tab,
-            "Back to the manager".into(),
-            agent_open::Walk::home(Instant::now()),
-        ));
+        let mut walk = agent_open::Walk::home(Instant::now());
+        let ask = self.view_ask(tab, None);
+        if let Some(a) = &ask {
+            walk = walk.via_plugin(a.nonce.clone());
+        }
+        let mut job = AttachJob::new(tab, "Back to the manager".into(), walk);
+        job.ask = ask;
+        self.attach = Some(job);
         ctx.request_repaint();
+    }
+
+    /// Whether a walk in `tab` tries the plugin's Button first
+    /// ([`Self::view_ask`]).
+    fn plugin_way(&self, tab: TabId) -> bool {
+        self.cfg.claude.management_panel
+            && giverny_claude::plugin::SUPPORTED
+            && self
+                .rt
+                .get(&tab)
+                .and_then(|rt| rt.session.as_ref())
+                .is_some_and(|s| s.mouse_reporting())
+            && self
+                .ws
+                .tab(tab)
+                .and_then(|t| t.claude_session.as_deref())
+                .is_none_or(|sid| {
+                    self.no_view_module
+                        .get(sid)
+                        .is_none_or(|at| at.elapsed() >= NO_MODULE_FOR)
+                })
+    }
+
+    /// Ask `tab`'s plugin module for worker `agent`'s view (`None`: the
+    /// manager's), when that way can be tried (giverny#525): the management
+    /// panel is on, so the plugin carries the module; the tab's Claude
+    /// Code takes mouse clicks, which is how its Button is pressed; and its
+    /// session's claude has not lately been found without the module.
+    fn view_ask(&mut self, tab: TabId, agent: Option<&str>) -> Option<ViewAsk> {
+        let now = Instant::now();
+        self.no_view_module
+            .retain(|_, at| now.duration_since(*at) < NO_MODULE_FOR);
+        if !self.plugin_way(tab) {
+            return None;
+        }
+        ViewAsk::write(
+            giverny_claude::view_ask::dir(self.paths.base()),
+            tab_env_id(tab),
+            agent,
+        )
     }
 
     /// Keep the relay's asks to show Claude Code's agent strip
@@ -5009,8 +5125,11 @@ impl App {
         // comes back, so it comes just after the walk lets the strip go,
         // and answers that with no second nudge.
         let to_worker = matches!(job.driver.goal, agent_open::Goal::Worker { .. });
+        // The plugin's way waits on no relay: nothing to nudge, and a
+        // width change under its click could move its Button.
         let waiting = pane_on
             && to_worker
+            && !job.driver.on_plugin_route()
             && match &job.settle {
                 None if !job.hide_asked && job.driver.entering() => true,
                 _ => job.hide_asked && !agent_open::strip_agents(&screen).is_empty(),
@@ -5039,12 +5158,28 @@ impl App {
                 && settle.done(now, &screen);
         } else {
             let undimmed = session.screen_text_undimmed();
+            let reply = job
+                .ask
+                .as_ref()
+                .filter(|_| job.driver.on_plugin_route())
+                .and_then(ViewAsk::reply);
             let look = agent_open::Look {
                 screen: &screen,
                 undimmed: &undimmed,
                 cursor: session.cursor_row(),
+                reply: reply.as_ref(),
             };
             let tick = job.driver.tick(now, look);
+            // Gone by the strip: the plugin's ask is taken back, and a
+            // claude that drew no Button is left to the strip a while.
+            if !job.driver.on_plugin_route() && job.ask.take().is_some() {
+                tracing::debug!("walk +{at:?}: by the strip");
+                if job.driver.plugin_missed()
+                    && let Some(sid) = self.ws.tab(job.tab).and_then(|t| t.claude_session.clone())
+                {
+                    self.no_view_module.insert(sid, now);
+                }
+            }
             let phase = job.driver.phase_name();
             if phase != job.phase {
                 tracing::debug!("walk +{at:?}: {} -> {phase}", job.phase);
@@ -5072,6 +5207,37 @@ impl App {
                     });
                     session.write(bytes.repeat(usize::from(n)));
                 }
+                Tick::Click { row, col } => {
+                    tracing::debug!("walk +{at:?}: click the plugin's button at {row},{col}");
+                    let mode = session.mode();
+                    let (col, row) = (
+                        u16::try_from(col).unwrap_or(u16::MAX),
+                        u16::try_from(row).unwrap_or(u16::MAX),
+                    );
+                    // As a hand does it: the pointer onto the Button, then
+                    // its press and release, in one write.
+                    use giverny_term::input::MouseCode;
+                    let bytes: Vec<u8> = [
+                        (MouseCode::NoButton, true, true),
+                        (MouseCode::Left, true, false),
+                        (MouseCode::Left, false, false),
+                    ]
+                    .into_iter()
+                    .filter_map(|(code, pressed, motion)| {
+                        giverny_term::input::encode_mouse(
+                            code,
+                            col,
+                            row,
+                            pressed,
+                            motion,
+                            egui::Modifiers::NONE,
+                            mode,
+                        )
+                    })
+                    .flatten()
+                    .collect();
+                    session.write(bytes);
+                }
                 Tick::Wait => {}
                 Tick::Done => {
                     tracing::debug!("walk +{at:?}: done, settling");
@@ -5097,11 +5263,27 @@ impl App {
                     };
                     let title = job.title.clone();
                     let tab = job.tab;
+                    // A worker whose view could not be reached opens as its
+                    // page: its transcript, live, and the box that messages
+                    // it (giverny#525). Only a question or dialog in the
+                    // way is said in words, as the person must answer it.
+                    let page = job
+                        .click
+                        .take()
+                        .filter(|_| why != agent_open::Stuck::NoPrompt);
                     self.attach = None;
                     self.settings = None;
                     self.keys_overlay = None;
-                    self.brief = Some(worker_page::WorkerPage::text(tab, title, text));
                     self.release_picture(tab);
+                    match page {
+                        Some(click) => {
+                            let plan = agent_open::plan(&click);
+                            self.carry_out_open(ctx, tab, plan, &click);
+                        }
+                        None => {
+                            self.brief = Some(worker_page::WorkerPage::text(tab, title, text));
+                        }
+                    }
                     return;
                 }
             }
@@ -5144,6 +5326,8 @@ impl App {
             && self.cfg.claude.management_panel
             && self.attach.is_none()
             && self.brief.is_none();
+        // The plugin's way needs no strip drawn ahead (giverny#525).
+        let free = free && active.is_none_or(|tab| !self.plugin_way(tab));
         let on_pane = hover
             .as_ref()
             .filter(|(tab, _)| Some(*tab) == active && self.tab_is_live(*tab))

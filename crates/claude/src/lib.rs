@@ -45,6 +45,7 @@ pub mod transcript;
 pub mod usage;
 pub mod use_reading;
 pub mod user_cap;
+pub mod view_ask;
 pub mod worker_log;
 pub mod worker_pids;
 pub mod wsl;

@@ -5,10 +5,22 @@
 //! and `main.rs::apply` only carries it out:
 //!
 //! * A **Running** worker opens straight into its view in the parent's
-//!   Claude Code: Giverny types the keys that
+//!   Claude Code. First by the plugin (giverny#525): Giverny asks its hooks
+//!   module for that agent id's view (`giverny_claude::view_ask`), the
+//!   module draws a Button for the ask in the hint line under the prompt,
+//!   and [`Walk`] clicks it ([`Tick::Click`]); the module's
+//!   `$.ui.view({ agentId })` opens the view, and nothing is typed, so the
+//!   prompt's draft and cursor stay as they were. Claude Code 2.1.323 and
+//!   later name a busy worker on their agent list by a summary of what it
+//!   does, so the list alone cannot tell two busy workers apart. A claude
+//!   started before the module was written draws no Button: then Giverny
+//!   types the keys that
 //!   put Claude Code in that subagent's interactive view, driven by
 //!   [`Walk`], which reads the parent's screen after every key rather than
-//!   typing blind. With the management panel on, the relay is asked to show
+//!   typing blind, finding the worker's row by its id tag, its description,
+//!   or its place among the running workers by start ([`Attach::in_order`]).
+//!   A view that cannot be reached opens the worker's page instead. With the
+//!   management panel on, the relay is asked to show
 //!   Claude Code's agent strip while the walk runs (`hooks::show_strip`),
 //!   since the strip is the only keyboard path to a worker's view; `/tasks`
 //!   is never used. The tab's picture is held from the click until the
@@ -697,6 +709,9 @@ pub enum Stuck {
     /// Enter opened a view, but another worker's (its prompt's rule says
     /// which).
     WrongView(String),
+    /// Claude Code refused the plugin's `$.ui.view`, saying why
+    /// (`no agent under that id`: the worker has left its list).
+    Denied(String),
 }
 
 impl Stuck {
@@ -731,6 +746,9 @@ impl Stuck {
                  what they are doing, and two looked alike. Press Esc to go back to the \
                  manager."
             ),
+            Stuck::Denied(why) => format!(
+                "Claude Code would not open the view of \u{201c}{description}\u{201d}: {why}."
+            ),
         }
     }
 }
@@ -745,6 +763,13 @@ pub enum Tick {
     /// in one write land as four keys), so a known number of steps along
     /// the strip costs one redraw, not one per step (giverny#495).
     Repeat(Keystroke, u8),
+    /// Click the primary mouse button on this cell of the parent's screen
+    /// (row, column, from 0): the plugin's Button
+    /// ([`giverny_claude::view_ask`]).
+    Click {
+        row: usize,
+        col: usize,
+    },
     /// Nothing yet; look again next frame.
     Wait,
     /// The foreground key is sent: the worker's view is open.
@@ -792,6 +817,11 @@ pub struct Attach {
     /// tags them while a walk asks for the strip) the row is
     /// found by it alone, whatever Claude Code labels it.
     id: Option<String>,
+    /// The worker's place among the tab's running workers in the order
+    /// they started, and how many there are: with no row by any name, a
+    /// strip listing exactly that many agents is taken to list them in
+    /// that order. The caller checks the view it opens.
+    order: Option<(usize, usize)>,
     /// ↓ has been sent out of the prompt.
     opened: bool,
     /// Enter on the worker has gone.
@@ -814,6 +844,7 @@ impl Attach {
             aliases: Vec::new(),
             only_agent: false,
             id: None,
+            order: None,
             opened: false,
             finishing: false,
             last_key: None,
@@ -843,6 +874,13 @@ impl Attach {
     /// Find the row by agent id `id` when the strip's rows carry ids.
     pub fn with_id(mut self, id: Option<String>) -> Attach {
         self.id = id.filter(|i| !i.is_empty());
+        self
+    }
+
+    /// With no row by any name, the `index`th of `count` agent rows, when
+    /// the strip lists exactly `count`. The caller must check the view.
+    pub fn in_order(mut self, order: Option<(usize, usize)>) -> Attach {
+        self.order = order.filter(|&(i, n)| i < n);
         self
     }
 
@@ -913,11 +951,13 @@ impl Attach {
                     .map(|(i, _)| i)
                     .collect();
                 // The strip's first row is `main`; the rest are agents.
-                let only = (by_id.is_none()
-                    && self.only_agent
-                    && items.len() == 2
-                    && items[0].label == "main")
-                    .then_some(1);
+                let listed = by_id.is_none() && items.first().is_some_and(|m| m.label == "main");
+                let only = (listed && self.only_agent && items.len() == 2)
+                    .then_some(1)
+                    .or_else(|| {
+                        let (i, n) = self.order?;
+                        (listed && items.len() == n + 1).then_some(1 + i)
+                    });
                 let target = match (hits.as_slice(), only) {
                     ([], Some(one)) => one,
                     ([], None) => return Tick::Stuck(Stuck::NotListed),
@@ -998,6 +1038,9 @@ pub struct Look<'a> {
     pub undimmed: &'a str,
     /// The terminal cursor's screen row, while the cursor is shown.
     pub cursor: Option<usize>,
+    /// The plugin's answer to the walk's ask, once there is one
+    /// ([`giverny_claude::view_ask::read_reply`]).
+    pub reply: Option<&'a Result<(), String>>,
 }
 
 /// Where a [`Walk`] takes the tab.
@@ -1011,6 +1054,9 @@ pub enum Goal {
         /// Its agent id, which the relay tags the strip's rows with while
         /// the strip is asked for: found by that first.
         agent_id: Option<String>,
+        /// Its place among the tab's running workers by start, and their
+        /// number ([`Attach::in_order`]).
+        order: Option<(usize, usize)>,
     },
     /// The main session's view: the manager.
     Main,
@@ -1024,6 +1070,18 @@ pub const STRIP_WAIT: Duration = Duration::from_secs(8);
 pub const STEP_WAIT: Duration = Duration::from_secs(3);
 /// The whole walk, start to finish.
 pub const WALK_DEADLINE: Duration = Duration::from_secs(20);
+/// How long the plugin's Button is waited for on screen: the module reads
+/// its ask every 150 ms. A claude started before the module was written
+/// draws none, and the walk goes by the strip instead.
+pub const BUTTON_WAIT: Duration = Duration::from_millis(900);
+/// How long the plugin's answer is waited for after the first click.
+pub const REPLY_WAIT: Duration = Duration::from_millis(1500);
+/// How long the Button is on screen before it is clicked.
+pub const BUTTON_CALM: Duration = Duration::from_millis(80);
+/// How long an unanswered click waits before the Button, still up, is
+/// clicked again; and how many clicks in all.
+pub const CLICK_AGAIN: Duration = Duration::from_millis(300);
+const MAX_CLICKS: u8 = 4;
 /// The most `↑`s sent to bring the focus back up into the prompt: one per
 /// strip row above the selection, and one for the shells pill.
 const MAX_UPS: u8 = 12;
@@ -1031,6 +1089,17 @@ const MAX_UPS: u8 = 12;
 #[derive(Debug, Clone)]
 enum Phase {
     Start,
+    /// The plugin's way: waiting for its Button on screen, and since when
+    /// it has been there.
+    Ask {
+        seen: Option<Instant>,
+    },
+    /// The Button is clicked (`clicks` times, the last at `last`): waiting
+    /// for the plugin's answer.
+    Asked {
+        clicks: u8,
+        last: Instant,
+    },
     /// Waiting for the strip's rows.
     Strip,
     Attach(Box<Attach>),
@@ -1093,6 +1162,12 @@ pub struct Walk {
     ups_to: Option<(Instant, Option<usize>)>,
     /// In the worker's view with the focus off the strip: its rows may go.
     off_strip: bool,
+    /// The plugin's way in, while it is the way: the ask's nonce
+    /// ([`giverny_claude::view_ask`]). `None` once the walk goes by the
+    /// strip.
+    plugin: Option<String>,
+    /// The plugin's Button never came: the tab's claude has no module.
+    plugin_missed: bool,
     deadline: Instant,
 }
 
@@ -1105,6 +1180,7 @@ impl Walk {
                 description: description.into(),
                 aliases,
                 agent_id: None,
+                order: None,
             },
             now,
         )
@@ -1117,6 +1193,34 @@ impl Walk {
             *agent_id = Some(id.into()).filter(|i: &String| !i.is_empty());
         }
         self
+    }
+
+    /// The worker's place among `count` running workers by start, for a
+    /// strip that names it by none of its labels ([`Attach::in_order`]).
+    pub fn in_order(mut self, index: usize, count: usize) -> Walk {
+        if let Goal::Worker { order, .. } = &mut self.goal {
+            *order = Some((index, count));
+        }
+        self
+    }
+
+    /// Go by the plugin's Button for ask `nonce` first, the caller having
+    /// written the ask ([`giverny_claude::view_ask::write_ask`]); by the
+    /// strip when no Button comes.
+    pub fn via_plugin(mut self, nonce: impl Into<String>) -> Walk {
+        self.plugin = Some(nonce.into());
+        self
+    }
+
+    /// Whether the walk goes by the plugin's Button: its ask stands.
+    pub fn on_plugin_route(&self) -> bool {
+        self.plugin.is_some()
+    }
+
+    /// Whether the plugin's Button never came: the tab's claude has no
+    /// module, so the next walk there may as well go by the strip.
+    pub fn plugin_missed(&self) -> bool {
+        self.plugin_missed
     }
 
     /// Back to the main view.
@@ -1134,6 +1238,8 @@ impl Walk {
             ups: 0,
             ups_to: None,
             off_strip: false,
+            plugin: None,
+            plugin_missed: false,
             deadline: now + WALK_DEADLINE,
         }
     }
@@ -1154,13 +1260,15 @@ impl Walk {
     /// needs no help: a worker's view keeps `main` on the strip whatever
     /// the relay hides.
     pub fn wants_strip(&self) -> bool {
-        matches!(self.goal, Goal::Worker { .. }) && !self.off_strip
+        matches!(self.goal, Goal::Worker { .. }) && !self.off_strip && self.plugin.is_none()
     }
 
     /// The phase the walk is in, for the timing log.
     pub fn phase_name(&self) -> &'static str {
         match self.phase {
             Phase::Start => "start",
+            Phase::Ask { .. } => "ask",
+            Phase::Asked { .. } => "asked",
             Phase::Strip => "strip",
             Phase::Attach(_) => "attach",
             Phase::Landing => "landing",
@@ -1171,7 +1279,14 @@ impl Walk {
     /// Whether the walk is still on its way to the goal's Enter: waiting
     /// for the strip, or stepping along it.
     pub fn entering(&self) -> bool {
-        matches!(self.phase, Phase::Start | Phase::Strip | Phase::Attach(_))
+        matches!(
+            self.phase,
+            Phase::Start
+                | Phase::Ask { .. }
+                | Phase::Asked { .. }
+                | Phase::Strip
+                | Phase::Attach(_)
+        )
     }
 
     fn go(&mut self, phase: Phase, now: Instant) {
@@ -1188,6 +1303,12 @@ impl Walk {
     fn keys(&mut self, k: Keystroke, n: usize, seen: Seen, now: Instant) -> Tick {
         self.hold = Some((now, seen));
         press(k, n)
+    }
+
+    /// Where the plugin's Button for the walk's ask is on `screen`.
+    fn button(&self, screen: &str) -> Option<(usize, usize)> {
+        let label = giverny_claude::view_ask::label(self.plugin.as_deref()?);
+        giverny_claude::view_ask::find_label(screen, &label)
     }
 
     /// The view on screen is the goal's.
@@ -1226,10 +1347,71 @@ impl Walk {
                 if self.arrived(screen, label.as_deref()) {
                     // Already there: only the focus to see to.
                     self.go(Phase::Focus { pill_up: false }, now);
+                } else if self.plugin.is_some() {
+                    self.go(Phase::Ask { seen: None }, now);
                 } else {
                     self.go(Phase::Strip, now);
                 }
                 self.tick(now, look)
+            }
+            Phase::Ask { seen } => {
+                let seen = *seen;
+                let button = self.button(screen);
+                match (button, seen) {
+                    // Drawn whole: the frame that brought it may be half
+                    // written. Claude Code 2.1.325 in a Giverny tab often
+                    // leaves the first click unanswered (at 80 or 200 ms),
+                    // and answers the next: see `Asked`.
+                    (Some((row, col)), Some(at)) if now >= at + BUTTON_CALM => {
+                        self.go(
+                            Phase::Asked {
+                                clicks: 1,
+                                last: now,
+                            },
+                            now,
+                        );
+                        Tick::Click { row, col }
+                    }
+                    (Some(_), Some(_)) => Tick::Wait,
+                    (Some(_), None) => {
+                        self.phase = Phase::Ask { seen: Some(now) };
+                        Tick::Wait
+                    }
+                    (None, _) if self.plugin.is_some() && waited < BUTTON_WAIT => Tick::Wait,
+                    (None, _) => {
+                        self.plugin_missed = self.plugin.take().is_some();
+                        self.go(Phase::Strip, now);
+                        self.tick(now, look)
+                    }
+                }
+            }
+            Phase::Asked { clicks, last } => {
+                let (clicks, last) = (*clicks, *last);
+                match look.reply {
+                    Some(Ok(())) => {
+                        self.go(Phase::Landing, now);
+                        self.tick(now, look)
+                    }
+                    Some(Err(why)) => Tick::Stuck(Stuck::Denied(why.clone())),
+                    // The clicks went astray: the strip's way, then.
+                    None if waited >= REPLY_WAIT => {
+                        self.plugin = None;
+                        self.go(Phase::Strip, now);
+                        self.tick(now, look)
+                    }
+                    // The Button still up, unanswered: once pressed, the
+                    // module takes it down at once, so that click missed.
+                    None => match self.button(screen) {
+                        Some((row, col)) if now >= last + CLICK_AGAIN && clicks < MAX_CLICKS => {
+                            self.phase = Phase::Asked {
+                                clicks: clicks + 1,
+                                last: now,
+                            };
+                            Tick::Click { row, col }
+                        }
+                        _ => Tick::Wait,
+                    },
+                }
             }
             Phase::Strip => {
                 let ready = match &self.goal {
@@ -1249,9 +1431,11 @@ impl Walk {
                         description,
                         aliases,
                         agent_id,
+                        order,
                     } => Attach::new(description.clone(), now)
                         .with_aliases(aliases.clone())
                         .with_id(agent_id.clone())
+                        .in_order(*order)
                         .or_only_agent(),
                 };
                 self.go(Phase::Attach(Box::new(attach)), now);
@@ -1863,6 +2047,170 @@ mod tests {
     // the strip and back-to-main work (main view, a worker's view, the strip focused or
     // not, the shells pill focused, the management panel's relay hiding rows)
     // and answers keys the way that one did.
+
+    // Claude Code 2.1.325 (fullscreen tui), in tmux with the plugin's
+    // module loaded (giverny#525): two busy background agents, each row
+    // named by a summary of what it does, never by its description, and a
+    // draft in the prompt that a click on a row must leave as it is.
+
+    const RULE: &str = "──────────────────────────────";
+    const BUSY: [&str; 2] = [
+        "◯ general-purpose  Running sleep 20 probe          1m 48s · ↓ 26.2k tokens",
+        "◯ general-purpose  Running sleep 20 (5 of 6)       1m 48s · ↓ 26.2k tokens",
+    ];
+
+    /// The screen: the prompt under `rule`, the hint line's `hint`, the
+    /// strip's `main` row marked `main`, then `rows`. The prompt is row 6.
+    fn cc325(rule: &str, hint: &str, main: &str, rows: &[&str]) -> String {
+        let mut s = format!(
+            "{TRANSCRIPT}{rule}\n❯ hello draft text\n{RULE}\n  Haiku 5.5  ·  session: 36.4k\n  \
+             ⏵⏵ auto mode on {hint}\n\n  {main} main\n"
+        );
+        for r in rows {
+            s.push_str(&format!("  {r}\n"));
+        }
+        s
+    }
+
+    fn look<'a>(screen: &'a str, reply: Option<&'a Result<(), String>>) -> Look<'a> {
+        Look {
+            screen,
+            undimmed: screen,
+            cursor: Some(6),
+            reply,
+        }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_plugin_opens_a_busy_worker_by_its_button() {
+        let t0 = Instant::now();
+        let mut w = Walk::open("beta probe", vec![], t0)
+            .by_id("a26b6666b8ea1592f")
+            .in_order(1, 2)
+            .via_plugin("n1");
+        assert!(w.on_plugin_route());
+        assert!(!w.wants_strip(), "no strip is asked for");
+        let main = cc325(RULE, "(shift+tab to cycle) · ← 2 agents", "●", &BUSY);
+        // The module has not drawn its Button yet.
+        assert_eq!(w.tick(t0, look(&main, None)), Tick::Wait);
+        assert_eq!(w.phase_name(), "ask");
+        // It has, in the hint line: clicked, and nothing typed.
+        let label = giverny_claude::view_ask::label("n1");
+        let button = cc325(RULE, &format!("· {label}"), "●", &BUSY);
+        // Just drawn: not clicked until it has stood a moment.
+        assert_eq!(w.tick(t0 + ms(200), look(&button, None)), Tick::Wait);
+        let calm = t0 + ms(200) + BUTTON_CALM;
+        let Tick::Click { row, col } = w.tick(calm, look(&button, None)) else {
+            panic!("the Button is clicked");
+        };
+        let line: Vec<char> = button.lines().nth(row).unwrap().chars().collect();
+        let at = line.iter().collect::<String>().find(&label).unwrap();
+        let start = line.iter().collect::<String>()[..at].chars().count();
+        assert!((start..start + label.len()).contains(&col), "on the Button");
+        // Waiting for the module's answer.
+        assert_eq!(w.tick(calm + ms(10), look(&main, None)), Tick::Wait);
+        assert_eq!(w.phase_name(), "asked");
+        // A Button still up, unanswered, is clicked again.
+        assert_eq!(
+            w.tick(calm + CLICK_AGAIN, look(&button, None)),
+            Tick::Click { row, col }
+        );
+        // The view shows the worker, its description on the prompt's rule
+        // and the draft carried along; the cursor is in its prompt.
+        let ok = Ok(());
+        let view = cc325(
+            "─── beta probe ───────────────",
+            "(shift+tab to cycle) · /tasks to see subagents",
+            "◯",
+            &BUSY[1..],
+        );
+        assert_eq!(w.tick(t0 + ms(900), look(&view, Some(&ok))), Tick::Done);
+    }
+
+    #[test]
+    fn the_plugin_takes_the_tab_home_too() {
+        let t0 = Instant::now();
+        let mut w = Walk::home(t0).via_plugin("h1");
+        let view = cc325(
+            "─── beta probe ───────────────",
+            &format!("· {}", giverny_claude::view_ask::label("h1")),
+            "◯",
+            &BUSY[1..],
+        );
+        assert_eq!(w.tick(t0, look(&view, None)), Tick::Wait);
+        assert!(matches!(
+            w.tick(t0 + BUTTON_CALM, look(&view, None)),
+            Tick::Click { .. }
+        ));
+        let ok = Ok(());
+        let main = cc325(RULE, "(shift+tab to cycle) · ← 2 agents", "●", &BUSY);
+        assert_eq!(w.tick(t0 + ms(100), look(&main, Some(&ok))), Tick::Done);
+    }
+
+    #[test]
+    fn a_refused_view_says_why() {
+        let t0 = Instant::now();
+        let mut w = Walk::open("alpha probe", vec![], t0).via_plugin("d2");
+        let button = cc325(
+            RULE,
+            &format!("· {}", giverny_claude::view_ask::label("d2")),
+            "●",
+            &BUSY,
+        );
+        assert_eq!(w.tick(t0, look(&button, None)), Tick::Wait);
+        assert!(matches!(
+            w.tick(t0 + BUTTON_CALM, look(&button, None)),
+            Tick::Click { .. }
+        ));
+        let no = Err("no agent under that id".to_string());
+        assert_eq!(
+            w.tick(t0 + ms(100), look(&button, Some(&no))),
+            Tick::Stuck(Stuck::Denied("no agent under that id".into()))
+        );
+    }
+
+    #[test]
+    fn with_no_button_the_walk_goes_by_the_strip() {
+        let t0 = Instant::now();
+        let mut w = Walk::open("beta probe", vec![], t0)
+            .in_order(1, 2)
+            .via_plugin("n3");
+        let main = cc325(RULE, "(shift+tab to cycle) · ← 2 agents", "●", &BUSY);
+        assert_eq!(w.tick(t0, look(&main, None)), Tick::Wait);
+        assert!(!w.plugin_missed());
+        // A claude started before the module was written draws none.
+        let t = w.tick(t0 + BUTTON_WAIT, look(&main, None));
+        assert!(w.plugin_missed() && !w.on_plugin_route() && w.wants_strip());
+        // Down out of the prompt, into the strip.
+        assert_eq!(t, Tick::Repeat(Keystroke::Down, 2));
+    }
+
+    #[test]
+    fn a_strip_of_summaries_is_taken_in_start_order() {
+        let t0 = Instant::now();
+        // No row is called by the worker's description or activity.
+        let mut lost = Attach::new("zeta worker", t0);
+        assert_eq!(
+            lost.tick(t0, &in_strip(0), &in_strip(0)),
+            Tick::Stuck(Stuck::NotListed)
+        );
+        // The second of two running workers: the strip's second agent row.
+        let mut by_order = Attach::new("zeta worker", t0).in_order(Some((1, 2)));
+        assert_eq!(
+            by_order.tick(t0, &in_strip(0), &in_strip(0)),
+            Tick::Repeat(Keystroke::Down, 2)
+        );
+        // A strip listing another number of agents is not guessed at.
+        let mut off = Attach::new("zeta worker", t0).in_order(Some((1, 3)));
+        assert_eq!(
+            off.tick(t0, &in_strip(0), &in_strip(0)),
+            Tick::Stuck(Stuck::NotListed)
+        );
+    }
 
     // ------------------------------------------------------- ask ----
 

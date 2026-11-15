@@ -171,6 +171,11 @@ impl TermSession {
         self.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// The program in the terminal asked for mouse clicks reported.
+    pub fn mouse_reporting(&self) -> bool {
+        self.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
     /// Resize grid + PTY when the geometry changed.
     pub fn resize(&mut self, size: GridSize) {
         if size == self.size || size.cols < 2 || size.rows < 2 {
