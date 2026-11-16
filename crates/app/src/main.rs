@@ -2,6 +2,8 @@
 
 mod agent_open;
 mod capture;
+#[cfg(debug_assertions)]
+mod demo_drive;
 mod chrome;
 mod claude_watch;
 mod codex_watch;
@@ -6401,6 +6403,7 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
+        demo_drive::raw_input(self, ctx, raw_input);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -6452,6 +6455,11 @@ impl eframe::App for App {
         self.debug_click(&ctx);
         #[cfg(debug_assertions)]
         self.debug_cmd(&ctx);
+        #[cfg(debug_assertions)]
+        {
+            demo_drive::take(self, &ctx);
+            demo_drive::paint_pointer(&ctx);
+        }
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
