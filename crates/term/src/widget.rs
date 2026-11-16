@@ -168,7 +168,8 @@ impl RenderShared {
 pub struct TabView {
     scroll_accum: f32,
     cached: Option<CachedFrame>,
-    had_focus: bool,
+    /// What the program was last told of the focus (`CSI ?1004h`).
+    focus: FocusReport,
     last_motion_cell: Option<(u16, u16)>,
     /// Buttons whose press landed on something drawn over the grid (an
     /// overlay in a layer above it) and so was not reported; their releases
@@ -317,7 +318,7 @@ impl Default for TabView {
         Self {
             scroll_accum: 0.0,
             cached: None,
-            had_focus: false,
+            focus: FocusReport::default(),
             last_motion_cell: None,
             swallowed_press: Buttons::default(),
             wheel_through: Vec::new(),
@@ -1173,17 +1174,116 @@ impl TabView {
         response: &Response,
         mode: TermMode,
     ) {
-        let has = response.has_focus();
-        if has != self.had_focus {
-            if mode.contains(TermMode::FOCUS_IN_OUT) {
-                session.write(if has {
-                    b"\x1b[I".to_vec()
-                } else {
-                    b"\x1b[O".to_vec()
-                });
-            }
-            self.had_focus = has;
+        let now = response.ctx.input(|i| i.time);
+        let (tell, wake) = self.focus.step(response.has_focus(), now);
+        if let Some(has) = tell
+            && mode.contains(TermMode::FOCUS_IN_OUT)
+        {
+            tracing::debug!("focus report: {}", if has { "in" } else { "out" });
+            session.write(if has {
+                b"\x1b[I".to_vec()
+            } else {
+                b"\x1b[O".to_vec()
+            });
         }
+        if let Some(wait) = wake {
+            response
+                .ctx
+                .request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        }
+    }
+}
+
+/// How long the terminal may be without the keyboard before its program is
+/// told (`CSI O`). A press anywhere outside the grid (a management-panel
+/// row, the rail, a header button) takes egui's focus off it for a frame or
+/// two before the app hands it back; told of that blip, Claude Code takes
+/// the next press inside 400 ms of the focus coming back for the click
+/// that brought the window forward and drops it, the Button a row's click
+/// presses included (giverny#527).
+const FOCUS_OUT_GRACE_S: f64 = 0.3;
+
+/// What a program that asked for focus reports has been told, and since
+/// when the terminal has been without the focus it was told it has.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct FocusReport {
+    told: bool,
+    lost_at: Option<f64>,
+}
+
+impl FocusReport {
+    /// The focus this frame (`has`, at `now` in seconds): the report due,
+    /// if any (`true` in, `false` out), and how soon to look again when a
+    /// loss is waiting out its grace. A gain is told at once; a loss only
+    /// once it has lasted [`FOCUS_OUT_GRACE_S`], and one that ends sooner
+    /// is never told at all.
+    fn step(&mut self, has: bool, now: f64) -> (Option<bool>, Option<f64>) {
+        if has {
+            self.lost_at = None;
+            if self.told {
+                return (None, None);
+            }
+            self.told = true;
+            return (Some(true), None);
+        }
+        if !self.told {
+            return (None, None);
+        }
+        let since = *self.lost_at.get_or_insert(now);
+        let left = since + FOCUS_OUT_GRACE_S - now;
+        if left > 0.0 {
+            return (None, Some(left));
+        }
+        self.told = false;
+        self.lost_at = None;
+        (Some(false), None)
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::{FOCUS_OUT_GRACE_S, FocusReport};
+
+    #[test]
+    fn a_gain_is_told_at_once_and_only_once() {
+        let mut f = FocusReport::default();
+        assert_eq!(
+            f.step(false, 0.0),
+            (None, None),
+            "never told: nothing to take back"
+        );
+        assert_eq!(f.step(true, 1.0).0, Some(true));
+        assert_eq!(f.step(true, 1.1), (None, None));
+    }
+
+    /// A press on a panel row: egui drops the grid's focus for a frame or
+    /// two, and the app hands it back. The program hears nothing of it.
+    #[test]
+    fn a_blip_is_never_told() {
+        let mut f = FocusReport::default();
+        f.step(true, 0.0);
+        let (tell, wake) = f.step(false, 1.0);
+        assert_eq!(tell, None);
+        assert!(wake.is_some_and(|w| (w - FOCUS_OUT_GRACE_S).abs() < 1e-9));
+        assert_eq!(f.step(false, 1.016).0, None);
+        assert_eq!(
+            f.step(true, 1.033),
+            (None, None),
+            "no focus-in for a loss never told"
+        );
+    }
+
+    #[test]
+    fn a_loss_that_lasts_is_told_once_its_grace_is_up() {
+        let mut f = FocusReport::default();
+        f.step(true, 0.0);
+        assert_eq!(f.step(false, 5.0).0, None);
+        let (tell, wake) = f.step(false, 5.1);
+        assert_eq!(tell, None);
+        assert!(wake.is_some_and(|w| (w - (FOCUS_OUT_GRACE_S - 0.1)).abs() < 1e-9));
+        assert_eq!(f.step(false, 5.0 + FOCUS_OUT_GRACE_S).0, Some(false));
+        assert_eq!(f.step(false, 9.0), (None, None));
+        assert_eq!(f.step(true, 9.5).0, Some(true));
     }
 }
 

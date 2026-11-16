@@ -1076,29 +1076,55 @@ pub const WALK_DEADLINE: Duration = Duration::from_secs(20);
 pub const BUTTON_WAIT: Duration = Duration::from_millis(900);
 /// How long the plugin's answer is waited for after the first click.
 pub const REPLY_WAIT: Duration = Duration::from_millis(1500);
-/// How long the Button is on screen before it is clicked.
-pub const BUTTON_CALM: Duration = Duration::from_millis(80);
+/// How long the Button is on screen before it is clicked. Claude Code
+/// 2.1.325 drops a click on a pressable less than 300 ms after it mounted
+/// as a stray (its "mount settle": the thing under the pointer may have
+/// just moved there), and it mounts a little before Giverny sees it drawn:
+/// clicked sooner, the first click was lost and only the next one, 300 ms
+/// on, worked (giverny#525, #527).
+pub const BUTTON_CALM: Duration = Duration::from_millis(320);
 /// How long an unanswered click waits before the Button, still up, is
-/// clicked again; and how many clicks in all.
+/// clicked again; and how many clicks in all. Claude Code also drops a
+/// press within 400 ms of the terminal's focus coming back (or one while
+/// it thinks the terminal has none) as the click that brought the window
+/// forward. The terminal no longer tells it of the blip a press on a
+/// panel row makes (`giverny_term`'s focus grace, giverny#527); a window
+/// brought forward by that very click still loses its first, and this is
+/// what follows.
 pub const CLICK_AGAIN: Duration = Duration::from_millis(300);
 const MAX_CLICKS: u8 = 4;
 /// The most `↑`s sent to bring the focus back up into the prompt: one per
 /// strip row above the selection, and one for the shells pill.
 const MAX_UPS: u8 = 12;
 
+/// Where the plugin's Button stands on screen (row, column) and since when:
+/// one that moved (the hint line redrawn under it) may have mounted again,
+/// and is let stand [`BUTTON_CALM`] there before it is clicked.
+type Placed = ((usize, usize), Instant);
+
+/// `seen` carried on to the Button found at `at` now: the same place keeps
+/// its time, a new one starts over.
+fn placed(seen: Option<Placed>, at: (usize, usize), now: Instant) -> Placed {
+    match seen {
+        Some((was, since)) if was == at => (was, since),
+        _ => (at, now),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Phase {
     Start,
-    /// The plugin's way: waiting for its Button on screen, and since when
-    /// it has been there.
+    /// The plugin's way: waiting for its Button on screen, and where and
+    /// since when it has stood there.
     Ask {
-        seen: Option<Instant>,
+        seen: Option<Placed>,
     },
     /// The Button is clicked (`clicks` times, the last at `last`): waiting
-    /// for the plugin's answer.
+    /// for the plugin's answer. `seen`: where it stands now, and since when.
     Asked {
         clicks: u8,
         last: Instant,
+        seen: Placed,
     },
     /// Waiting for the strip's rows.
     Strip,
@@ -1358,24 +1384,28 @@ impl Walk {
                 let seen = *seen;
                 let button = self.button(screen);
                 match (button, seen) {
-                    // Drawn whole: the frame that brought it may be half
-                    // written. Claude Code 2.1.325 in a Giverny tab often
-                    // leaves the first click unanswered (at 80 or 200 ms),
-                    // and answers the next: see `Asked`.
-                    (Some((row, col)), Some(at)) if now >= at + BUTTON_CALM => {
+                    // On screen for `BUTTON_CALM`: sooner, Claude Code
+                    // drops the click as a stray. One it takes for the
+                    // click that focused the window is dropped too: see
+                    // `CLICK_AGAIN`.
+                    (Some(at), seen) => {
+                        let seen = placed(seen, at, now);
+                        if now < seen.1 + BUTTON_CALM {
+                            self.phase = Phase::Ask { seen: Some(seen) };
+                            return Tick::Wait;
+                        }
                         self.go(
                             Phase::Asked {
                                 clicks: 1,
                                 last: now,
+                                seen,
                             },
                             now,
                         );
-                        Tick::Click { row, col }
-                    }
-                    (Some(_), Some(_)) => Tick::Wait,
-                    (Some(_), None) => {
-                        self.phase = Phase::Ask { seen: Some(now) };
-                        Tick::Wait
+                        Tick::Click {
+                            row: at.0,
+                            col: at.1,
+                        }
                     }
                     (None, _) if self.plugin.is_some() && waited < BUTTON_WAIT => Tick::Wait,
                     (None, _) => {
@@ -1385,8 +1415,8 @@ impl Walk {
                     }
                 }
             }
-            Phase::Asked { clicks, last } => {
-                let (clicks, last) = (*clicks, *last);
+            Phase::Asked { clicks, last, seen } => {
+                let (clicks, last, seen) = (*clicks, *last, *seen);
                 match look.reply {
                     Some(Ok(())) => {
                         self.go(Phase::Landing, now);
@@ -1401,15 +1431,30 @@ impl Walk {
                     }
                     // The Button still up, unanswered: once pressed, the
                     // module takes it down at once, so that click missed.
+                    // Clicked again where it stands now, once it has stood
+                    // there `BUTTON_CALM`.
                     None => match self.button(screen) {
-                        Some((row, col)) if now >= last + CLICK_AGAIN && clicks < MAX_CLICKS => {
-                            self.phase = Phase::Asked {
-                                clicks: clicks + 1,
-                                last: now,
-                            };
-                            Tick::Click { row, col }
+                        Some(at) => {
+                            let seen = placed(Some(seen), at, now);
+                            if now >= last + CLICK_AGAIN
+                                && now >= seen.1 + BUTTON_CALM
+                                && clicks < MAX_CLICKS
+                            {
+                                self.phase = Phase::Asked {
+                                    clicks: clicks + 1,
+                                    last: now,
+                                    seen,
+                                };
+                                Tick::Click {
+                                    row: at.0,
+                                    col: at.1,
+                                }
+                            } else {
+                                self.phase = Phase::Asked { clicks, last, seen };
+                                Tick::Wait
+                            }
                         }
-                        _ => Tick::Wait,
+                        None => Tick::Wait,
                     },
                 }
             }
@@ -2129,6 +2174,46 @@ mod tests {
             &BUSY[1..],
         );
         assert_eq!(w.tick(t0 + ms(900), look(&view, Some(&ok))), Tick::Done);
+    }
+
+    /// Claude Code 2.1.325 drops a click on a pressable less than 300 ms
+    /// after it mounted ("mount settle"): the Button is not clicked before
+    /// it has stood that long on screen, so the first click lands
+    /// (giverny#527).
+    #[test]
+    fn the_button_is_clicked_only_once_claude_code_takes_clicks_on_it() {
+        let t0 = Instant::now();
+        let mut w = Walk::open("beta probe", vec![], t0)
+            .by_id("a26b6666b8ea1592f")
+            .via_plugin("n3");
+        let label = giverny_claude::view_ask::label("n3");
+        let button = cc325(RULE, &format!("· {label}"), "●", &BUSY);
+        assert_eq!(w.tick(t0, look(&button, None)), Tick::Wait, "first seen");
+        for at in [50, 150, 299] {
+            assert_eq!(
+                w.tick(t0 + ms(at), look(&button, None)),
+                Tick::Wait,
+                "{at} ms after it was drawn"
+            );
+        }
+        let Tick::Click { col, .. } = w.tick(t0 + BUTTON_CALM, look(&button, None)) else {
+            panic!("clicked once it has stood long enough");
+        };
+        // Unanswered, and the hint line redrawn under it: the Button moved,
+        // so it may have mounted again. Clicked again where it is now, once
+        // it has stood there as long.
+        let moved = cc325(RULE, &format!("·    {label}"), "●", &BUSY);
+        let at = t0 + BUTTON_CALM + CLICK_AGAIN - ms(100);
+        assert_eq!(w.tick(at, look(&moved, None)), Tick::Wait, "just moved");
+        assert_eq!(
+            w.tick(t0 + BUTTON_CALM + CLICK_AGAIN, look(&moved, None)),
+            Tick::Wait,
+            "not yet stood there long enough"
+        );
+        let Tick::Click { col: again, .. } = w.tick(at + BUTTON_CALM, look(&moved, None)) else {
+            panic!("clicked again where it moved to");
+        };
+        assert!(again > col, "{again} > {col}");
     }
 
     #[test]
