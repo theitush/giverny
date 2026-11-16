@@ -7,7 +7,9 @@
 //!
 //! * `type <text>`: written to the active tab's terminal as typed
 //!   (`\r` Enter, `\e` Esc);
+//! * `slow <text>`: as `type`, a key at a time, as a hand types;
 //! * `text <text>`: the text as the keyboard types it into the window;
+//! * `slowtext <text>`: as `text`, a key at a time;
 //! * `key <enter|shift-enter|up|down|esc|backspace|tab>`: that key;
 //! * `move <x> <y> [ms]`: the pointer glides there and stays (a hover);
 //! * `click <x> <y> [ms]`, `rclick <x> <y> [ms]`: glide there, then a left
@@ -31,6 +33,10 @@ use crate::{Action, App};
 
 /// Input queued by the commands, one frame's worth per entry.
 static INPUT: Mutex<Vec<Vec<egui::Event>>> = Mutex::new(Vec::new());
+
+/// What `slow` has still to type into the active tab, and when it last typed.
+static SLOW: Mutex<(std::collections::VecDeque<char>, Option<Instant>)> =
+    Mutex::new((std::collections::VecDeque::new(), None));
 
 /// Where the driven pointer is, and the last click (where, when).
 static POINTER: Mutex<(Option<Pos2>, Option<(Pos2, Instant)>)> = Mutex::new((None, None));
@@ -78,6 +84,24 @@ pub fn take(app: &mut App, ctx: &egui::Context) {
         return;
     };
     ctx.request_repaint_after(Duration::from_millis(100));
+    if let Ok(mut slow) = SLOW.lock()
+        && !slow.0.is_empty()
+    {
+        if slow.1.is_none_or(|t| t.elapsed() >= Duration::from_millis(45)) {
+            let c = slow.0.pop_front().unwrap_or('\r');
+            slow.1 = Some(Instant::now());
+            let session = app
+                .ws
+                .active
+                .and_then(|t| app.rt.get(&t))
+                .and_then(|rt| rt.session.as_ref());
+            if let Some(session) = session {
+                session.note_user_input();
+                session.write(c.to_string().into_bytes());
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(15));
+    }
     let Ok(spec) = std::fs::read_to_string(&file) else {
         return;
     };
@@ -98,7 +122,20 @@ pub fn take(app: &mut App, ctx: &egui::Context) {
                     session.write(text.into_bytes());
                 }
             }
+            "slow" => {
+                if let Ok(mut slow) = SLOW.lock() {
+                    slow.0.extend(arg.replace("\\r", "\r").chars());
+                }
+                ctx.request_repaint();
+            }
             "text" => feed(ctx, vec![egui::Event::Text(arg.to_string())]),
+            "slowtext" => {
+                for c in arg.chars() {
+                    feed(ctx, vec![egui::Event::Text(c.to_string())]);
+                    feed(ctx, vec![]);
+                    feed(ctx, vec![]);
+                }
+            }
             "key" => {
                 let none = egui::Modifiers::NONE;
                 match arg {
