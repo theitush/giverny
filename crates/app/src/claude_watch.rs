@@ -2295,6 +2295,26 @@ impl ClaudeWatch {
     /// byte-identical. Off removes only what is ours, wherever it is.
     pub fn set_management_panel(&mut self, enable: bool, skill: bool, names: bool, base: &Path) {
         if self.leave_accounts {
+            // Debug builds only, for the giverny#534 demo: a side instance on
+            // config and feed dirs of its own (`GIVERNY_DEMO_PLUGIN`) still
+            // writes its own plugin and names switch there, so a test claude
+            // can load them with `--plugin-dir`. No account is touched.
+            #[cfg(debug_assertions)]
+            if std::env::var_os("GIVERNY_DEMO_PLUGIN").is_some() {
+                let _ = giverny_claude::names::set_on(&self.feeds, enable && names);
+                if enable && giverny_claude::plugin::SUPPORTED {
+                    let dir = giverny_claude::plugin::marketplace_dir(base);
+                    match giverny_claude::plugin::sync(
+                        &dir,
+                        &giverny_claude::plugin::exe_candidates(),
+                        skill,
+                        &giverny_claude::view_ask::dir(base),
+                    ) {
+                        Ok(_) => tracing::info!("demo: giverny plugin in {}", dir.display()),
+                        Err(err) => tracing::warn!("demo: giverny plugin not written: {err}"),
+                    }
+                }
+            }
             return;
         }
         match giverny_claude::names::set_on(&self.feeds, enable && names) {
