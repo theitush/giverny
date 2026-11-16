@@ -526,6 +526,7 @@ fn row_data(
     }
     let ct = app.claude.tabs.get(&t.id);
     if let Some(account) = ct.and_then(|c| c.account.as_deref()) {
+        let account = shown_account(account);
         sub = if sub.is_empty() {
             format!("@{account}")
         } else {
@@ -2527,6 +2528,16 @@ fn hooks_banner(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
 }
 
 /// Codex uses the same account row and meter geometry as Claude.
+/// An account's name as the rail shows it. Debug builds only: the giverny#530
+/// demo recording shows `GIVERNY_DEMO_ACCOUNT` in its place.
+fn shown_account(name: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(n) = std::env::var("GIVERNY_DEMO_ACCOUNT") {
+        return n;
+    }
+    name.to_string()
+}
+
 fn codex_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
     if !app.cfg.codex.enabled {
         return;
@@ -2808,7 +2819,7 @@ fn claude_accounts(app: &App, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(format!("@{}", acc.profile.name))
+                egui::RichText::new(format!("@{}", shown_account(&acc.profile.name)))
                     .font(FontId::monospace(10.5))
                     .color(fg),
             );

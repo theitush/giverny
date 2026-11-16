@@ -1,0 +1,60 @@
+start	1794833499997	
+cut	1794833499999	
+uncut	1794833500005	
+cap	1794833500007	#36|Every tab's CPU and memory, read from /proc once a second, at the right of its row.
+cap	1794833504131	#36|Under the account bars, the total for the app and everything it runs. Its hover says what it counts.
+cap	1794833508246	#36|A collapsed group's header adds its tabs up.
+cap	1794833512879	#37|A finish you haven't looked at: a tick when it went well, a cross when it failed (lint exited 1).
+cap	1794833516496	#37|The ACME header keeps the tick while any finish under it went well. Looking at the tab clears the cross.
+cut	1794833522729	
+uncut	1794833522734	
+cap	1794833522737	#34|Hover a live tab: a pause button beside its x. One click ends what the tab runs, and keeps the tab.
+cap	1794833528681	#34|Right-click a group: stop all. It asks first, and lists what would die.
+cut	1794833536532	
+uncut	1794833549037	
+cap	1794833549039	#33|Stop the notes tab's Claude Code, then start the tab again: it resumes the same conversation.
+cap	1794833564004	#33|On its next step the session is told what happened while it was away: here, its Claude Code restarted.
+speed	1794833568122	3
+speed	1794833578097	1
+cut	1794833584103	
+uncut	1794833586862	
+cap	1794833586864	#35|BACKGROUND lists Claude Code's background jobs. Hover one: its x runs claude stop.
+cap	1794833593095	#35|Right-click: open, stop agent, or delete agent... (claude rm, behind a confirm).
+cut	1794833599947	
+uncut	1794833609985	
+cap	1794833609988	#40|A manager writes a feed: one JSON file per session, specified in docs/management-panel.md. Written by hand here: four tasks, Next up.
+cap	1794833615105	#40|Each Next up row says what it waits for, and a click opens its brief.
+cap	1794833620835	#38|The manager (haiku here) starts two tasks. Their workers show as Running, read off Claude Code's own files.
+cap	1794833630776	#38|With the panel on, Claude Code's own agent list stays out of the picture, and its prompt doesn't move.
+cut	1794833635281	
+uncut	1794833635286	
+cap	1794833635289	#39|Click a row: the worker's page, drawn from its transcript, following it live.
+cap	1794833640409	#41|The page's prompt box sends a line to this worker, through the manager.
+cap	1794833645824	#41|The line shows on the page at once, dimmed, until the worker takes it at its next step.
+speed	1794833645827	3
+speed	1794833660831	1
+cut	1794833663836	
+uncut	1794833663841	
+cap	1794833663843	#41|In the manager's prompt it is a plain line naming the worker. The manager passes it on with SendMessage.
+cap	1794833668960	#38|Turn the panel off, and Claude Code draws its own agent list again.
+cap	1794833677519	#38|Back on: the list goes, and the panel is back.
+cut	1794833683373	
+uncut	1794833695175	
+cap	1794833695178	#38|Waiting for the workers to land.
+speed	1794833695180	4
+speed	1794833698273	1
+cap	1794833698276	#40|demo#1 is Done: its time against the estimate, and the feed's landing (Review by y0av).
+cut	1794833702781	
+uncut	1794833713262	
+cap	1794833713264	#41|demo#3 was after demo#1. From its Next up page, the box asks the manager to start it now.
+cap	1794833721333	#40|demo#3 moves from Next up to Running.
+cap	1794833725339	#40|Waiting for the workers to land.
+speed	1794833725341	4
+speed	1794833746091	1
+cap	1794833746094	#40|Done rows, newest first, each against its estimate. demo#4 stays Next up, held for review.
+cut	1794833751099	
+uncut	1794833759135	
+cap	1794833759137	#39 #40|A Done row's page: the worker's report, its time against the estimate, and the feed's Review line.
+cap	1794833766370	|The panel is off by default (claude.management_panel). Giverny writes nothing to Claude Code's settings for it.
+cut	1794833770876	
+end	1794833773596	
