@@ -285,7 +285,10 @@ impl View {
     /// Re-read the feed for `session`, at most once a [`POLL`] (or at once
     /// when the session changed). A session Claude Code re-id'd is looked
     /// up by its earlier ids too, newest first, until its files name the
-    /// new one (giverny#105).
+    /// new one (giverny#105). Those are its own conversation's alone: the
+    /// tab's table drops an id whose transcript has another root, as a
+    /// `/clear` or a resume into another conversation gives
+    /// ([`Tracker::continues`]).
     ///
     /// The manager mark is looked up with it ([`View::manager`]): a `stat`
     /// of the session's mark and its earlier ids', and of its

@@ -252,14 +252,18 @@ pub fn session_transcript(config_dir: &Path, session: &str) -> Option<PathBuf> {
 /// Lines of a transcript's head the conversation's root can hide in.
 const ROOT_SCAN: usize = 500;
 
-/// The conversation a transcript holds: the `uuid` of its first parentless
-/// user or assistant turn. Claude Code copies a conversation's records
+/// The conversation a transcript holds: the `uuid` of the record its chain
+/// starts from, the first one with no parent. That is a turn, or a record
+/// Claude Code writes before one: a conversation `/clear` (or a hooked
+/// startup) began opens with its `SessionStart` hook's record, and its first
+/// turn hangs off that, so a root read from turns alone would leave every
+/// such conversation without one. Claude Code copies a conversation's records
 /// forward when it re-ids a session, so this is the same before and after
 /// where the session id is not; `/clear` starts a new root, and a different
-/// conversation has its own (a key a manager can file its sessions by).
-/// `None` for a transcript with no turn of its own yet — a session
-/// just switched to in the agents view holds only headers until its next
-/// turn.
+/// conversation has its own (a key a manager can file its sessions by). A
+/// compaction's boundary starts no conversation. `None` for a transcript
+/// with no record of its own yet — a session just switched to in the agents
+/// view holds only headers until its next turn.
 pub fn conversation_root(transcript: &Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(transcript).ok()?;
@@ -276,8 +280,9 @@ pub fn conversation_root(transcript: &Path) -> Option<String> {
         }
         if !matches!(
             v.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
+            Some("user" | "assistant" | "attachment" | "system")
+        ) || v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
             continue;
         }
         let parent = v.get("parentUuid").and_then(Value::as_str);
@@ -1307,6 +1312,53 @@ impl Tracker {
         any.then_some(false)
     }
 
+    /// Forget the earlier ids that hold another conversation than the bound
+    /// session (a root of their own, not its root), and the rows found
+    /// under them: a table that took one for a re-id while the roots could
+    /// not be read keeps showing that conversation's workers, and the pane
+    /// its feed. An id whose root cannot be read stays. Reads transcript
+    /// heads, so call it when a session starts, not every tick. Returns
+    /// whether anything went.
+    pub fn forget_other_conversations(&mut self) -> bool {
+        if self.aliases.is_empty() {
+            return false;
+        }
+        let (Some(config), Some(session)) =
+            (self.config_dir.as_deref(), self.session_id.as_deref())
+        else {
+            return false;
+        };
+        let root = |sid: &str| session_transcript(config, sid).and_then(|p| conversation_root(&p));
+        let Some(own) = root(session) else {
+            return false;
+        };
+        let others: Vec<String> = self
+            .aliases
+            .iter()
+            .filter(|a| root(a).is_some_and(|r| r != own))
+            .cloned()
+            .collect();
+        if others.is_empty() {
+            return false;
+        }
+        self.aliases.retain(|a| !others.contains(a));
+        // A worker's transcript is `<session>/subagents/agent-<id>.jsonl`.
+        let under = |r: &SubagentRow| {
+            r.transcript
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|s| others.iter().any(|o| s == o.as_str()))
+        };
+        self.rows.retain(|r| !under(r));
+        // The readers are rebuilt for the ids left on the next refresh.
+        self.dirs.clear();
+        self.tails.clear();
+        self.resolved.clear();
+        true
+    }
+
     /// Bind to a session. A different id keeps the rows and records the old
     /// one as an alias — a resumed or re-id'd conversation is still the same
     /// session; call [`Tracker::clear`] as well if it is not.
@@ -2020,6 +2072,69 @@ mod tests {
         let r = t.get("a1").unwrap();
         assert!(!r.running());
         assert_eq!(r.ended_ms, Some(woke + 9030));
+    }
+
+    /// A transcript as Claude Code 2.1.325 writes a conversation `/clear`
+    /// began: a header, the `SessionStart:clear` hook's record with no
+    /// parent, and the first turn hanging off it.
+    fn cleared(path: &Path, root: &str) {
+        let lines = [
+            serde_json::json!({"type": "permission-mode", "permissionMode": "default"}),
+            serde_json::json!({"parentUuid": null, "isSidechain": false, "type": "attachment",
+                "uuid": root, "attachment": {"type": "hook_success", "hookName": "SessionStart:clear"}}),
+            serde_json::json!({"parentUuid": root, "isSidechain": false, "type": "user",
+                "uuid": format!("{root}-1"), "message": {"role": "user", "content": "hi"}}),
+        ];
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_table_lets_go_of_another_conversations_id() {
+        // Conversation A (`a`, a Done worker) and B (`b1`, re-id'd as `b2`:
+        // its records copied forward), both begun by a `/clear`.
+        let (config, subs, a) = layout("other-conversation", "a");
+        let proj = subs.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let t0 = now() - 600_000;
+        cleared(&a, "root-a");
+        spawn(&subs, "w1", t0);
+        meta(&subs, "w1", true, "");
+        append(&a, &notification_lines("w1", "completed", t0 + 2000));
+        cleared(&proj.join("b1.jsonl"), "root-b");
+        std::fs::copy(proj.join("b1.jsonl"), proj.join("b2.jsonl")).unwrap();
+        assert_eq!(conversation_root(&a).as_deref(), Some("root-a"));
+
+        // The cut: B is not A's conversation; A's own re-id is.
+        let mut t = Tracker::new(Some(config.clone()));
+        t.set_session("a");
+        t.refresh(Some(t0 - 600_000), now());
+        assert!(t.get("w1").is_some());
+        assert_eq!(t.continues("b2"), Some(false));
+        std::fs::copy(&a, proj.join("a2.jsonl")).unwrap();
+        assert_eq!(t.continues("a2"), Some(true));
+
+        // A table that took B for a re-id of A (before roots were read
+        // past a `/clear`'s opening record): A's id and its worker go,
+        // B's own earlier id stays.
+        t.set_session("b1");
+        t.set_session("b2");
+        assert!(t.forget_other_conversations());
+        assert_eq!(t.aliases, vec!["b1".to_string()]);
+        assert!(t.get("w1").is_none(), "A's worker went with its id");
+        t.refresh(Some(t0 - 600_000), now());
+        assert!(t.get("w1").is_none(), "and stays gone");
+        assert!(!t.forget_other_conversations());
+
+        // A compaction's boundary is not a conversation's start.
+        let compacted = proj.join("c.jsonl");
+        let lines = [
+            serde_json::json!({"parentUuid": null, "type": "system", "subtype": "compact_boundary", "uuid": "cb"}),
+            serde_json::json!({"parentUuid": "cb", "type": "user", "uuid": "u1"}),
+        ];
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(&compacted, text).unwrap();
+        assert_eq!(conversation_root(&compacted), None);
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[test]

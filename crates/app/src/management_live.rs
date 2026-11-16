@@ -297,7 +297,8 @@ impl ManagementLive {
     /// re-id'd (`compact`, or `fork`/`resume` for the agents view's switch
     /// and the move into a background host), or one whose root
     /// cannot be read yet — keeps the rows and records the new id beside the
-    /// old.
+    /// old; an earlier id that turns out to be another conversation is
+    /// dropped then, with its rows ([`Tracker::forget_other_conversations`]).
     ///
     /// `startup` is safe to take as new because Claude Code (2.1.283) raises
     /// it only where no conversation is carried in: a launch without
@@ -341,6 +342,13 @@ impl ManagementLive {
             *tracker = fresh;
         } else if let Some(sid) = session_id {
             tracker.set_session(sid);
+            // A table that took another conversation's id for a re-id
+            // before roots could be read lets it go now.
+            if tracker.forget_other_conversations() {
+                tracing::info!(
+                    "tab {tab:?}: dropped another conversation's ids and rows from {sid}'s table"
+                );
+            }
         }
         self.dirty = true;
     }
@@ -612,6 +620,54 @@ mod tests {
         let r = live.tracker(TAB).unwrap().get("a1").expect("found on disk");
         assert!(r.running());
         assert_eq!(r.description.as_deref(), Some("pics"));
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// `<sid>.jsonl` as Claude Code 2.1.325 writes a conversation `/clear`
+    /// began: its `SessionStart:clear` hook's record has no parent, and the
+    /// first turn hangs off it.
+    fn cleared(proj: &Path, sid: &str, root: &str) {
+        let lines = [
+            serde_json::json!({"parentUuid": null, "isSidechain": false, "type": "attachment",
+                "uuid": root, "attachment": {"type": "hook_success", "hookName": "SessionStart:clear"}}),
+            serde_json::json!({"parentUuid": root, "isSidechain": false, "type": "user",
+                "uuid": format!("{root}-1"), "message": {"role": "user", "content": "hi"}}),
+        ];
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(proj.join(format!("{sid}.jsonl")), text).unwrap();
+    }
+
+    #[test]
+    fn a_resume_keeps_its_own_conversations_rows_and_no_others() {
+        // A tab ran `old`, `/clear`ed into `new`, and came back from a
+        // restart on `old` before resuming `new` (a re-id's case
+        // beside it: `old` copied forward as `old2`).
+        let config = std::env::temp_dir().join(format!("giverny-ml-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let proj = config.join("projects").join("-w");
+        std::fs::create_dir_all(&proj).unwrap();
+        cleared(&proj, "old", "root-old");
+        cleared(&proj, "new", "root-new");
+        std::fs::copy(proj.join("old.jsonl"), proj.join("old2.jsonl")).unwrap();
+
+        let mut live = ManagementLive::in_memory();
+        live.session_started(TAB, Some("resume"), Some("old"), Some(config.clone()));
+        live.apply_live(TAB, None, &tick_json("old", &["a1"]));
+
+        // The same conversation re-id'd keeps its rows.
+        live.session_started(TAB, Some("resume"), Some("old2"), None);
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.session_id.as_deref(), Some("old2"));
+        assert_eq!(t.aliases, vec!["old".to_string()]);
+        assert!(t.get("a1").is_some());
+
+        // The conversation the `/clear` began is another: nothing of the
+        // one before, so the pane looks no feed, ETAs or mark up by it.
+        live.session_started(TAB, Some("resume"), Some("new"), None);
+        let t = live.tracker(TAB).unwrap();
+        assert_eq!(t.session_id.as_deref(), Some("new"));
+        assert!(t.aliases.is_empty(), "no earlier id: {:?}", t.aliases);
+        assert!(t.is_empty());
         let _ = std::fs::remove_dir_all(&config);
     }
 
