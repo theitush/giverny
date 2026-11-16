@@ -1,6 +1,8 @@
 //! Giverny — a native terminal built around Claude Code.
 
 mod capture;
+#[cfg(debug_assertions)]
+mod demo_drive;
 mod chrome;
 mod claude_watch;
 mod codex_watch;
@@ -3566,7 +3568,7 @@ impl App {
     /// the unseen-finish badge alike. A look at a tab that wore the tick
     /// flashes its management panel's rows that landed since the last one.
     fn mark_seen(&mut self, id: TabId) {
-        let ticked = self.unseen_done.contains(&id)
+        let ticked = self.unseen_done.contains_key(&id)
             || self.claude.state_of(id) == claude_watch::ClaudeState::DoneUnseen;
         if ticked {
             self.agent_views.flash_new_done(id);
@@ -4465,6 +4467,11 @@ fn count_frame(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
+    #[cfg(debug_assertions)]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        demo_drive::raw_input(self, ctx, raw_input);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         translucency::clear_color(self.see_through)
     }
@@ -4502,6 +4509,11 @@ impl eframe::App for App {
         self.deliver_pasted_images();
         self.process_pending(&ctx);
         self.process_sending(&ctx);
+        #[cfg(debug_assertions)]
+        {
+            demo_drive::take(self, &ctx);
+            demo_drive::paint_pointer(&ctx);
+        }
 
         // Claude awareness: hooks + registry + usage.
         let shell_pids: HashMap<TabId, u32> = self
