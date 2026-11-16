@@ -63,10 +63,14 @@
 //! **A `/clear` keeps the name** (giverny#508). The session a `/clear`
 //! starts is a new one, but it is the same agent to Ita: it takes back the
 //! name and room of the session it cleared in that tab ([`after_clear`]),
-//! found by `<feeds>/names/tabs/<GIVERNY_TAB_ID>`, which holds the id of the
-//! last session told its name there. Nothing else carries over: what is kept
-//! by session id stays with the old one. A new agent means a new tab, or a
-//! new claude in it.
+//! found by `<feeds>/names/tabs/<GIVERNY_TAB_ID>`, which lists the sessions
+//! told their name there, the last one last. A tab shows one claude at a
+//! time, so a live session among the earlier ones is a stale duplicate of
+//! this agent (a claude left over from an earlier Giverny run, giverny#532),
+//! not a rival: it keeps nobody from the name. A session of another tab
+//! holding the first name still does (giverny#425). Nothing else carries
+//! over: what is kept by session id stays with the old one. A new agent
+//! means a new tab, or a new claude in it.
 //!
 //! **`/resume` shows it** (giverny#496): a named session's custom title is
 //! kept `<Name> · <the text the picker would show without it>`
@@ -86,10 +90,13 @@ const ON: &str = "on";
 /// ([`tell`]), so the prompt hook's fallback ([`first_prompt`]) never tells
 /// it twice.
 const ASKED: &str = "asked";
-/// Under [`DIR`], a file per tab (named by its `GIVERNY_TAB_ID`) holding the
-/// id of the last session told its name there (giverny#508): who a `/clear`
-/// in that tab cleared ([`after_clear`]).
+/// Under [`DIR`], a file per tab (named by its `GIVERNY_TAB_ID`) listing the
+/// ids of the sessions told their name there, one a line, the last one last
+/// (giverny#508): who a `/clear` in that tab cleared, and the tab's earlier
+/// sessions, which hold nothing against it (giverny#532, [`after_clear`]).
 const TABS: &str = "tabs";
+/// The most sessions a tab's file in [`TABS`] lists: the latest ones.
+const TAB_SESSIONS: usize = 100;
 /// Under [`DIR`], the lock every rewrite of a names document is made under
 /// ([`lock`], giverny#433, giverny#441), so two sessions drawing at once
 /// never share a first name and a room is drawn once.
@@ -1324,24 +1331,27 @@ fn transcript_of(payload: &Value) -> Option<PathBuf> {
 /// agent to Ita, under a new id. Recorded under `session`, its root stamped
 /// in later as any start's ([`keep_root`]). None, and the session is drawn
 /// a name as ever, when the tab has no session told before it, that one has
-/// no name, or a live session other than the cleared one holds its first
-/// name meanwhile (giverny#425). The cleared session itself holds nothing
-/// against it, though Claude Code's registry may list it still, or its
-/// names document be fresh ([`FRESH`]).
+/// no name, or a live session of another tab holds its first name meanwhile
+/// (giverny#425). The cleared session holds nothing against it, though
+/// Claude Code's registry may list it still, or its names document be fresh
+/// ([`FRESH`]); nor does any earlier session of the tab ([`told_in`]): a tab
+/// shows one claude at a time, so one still listed live is a stale
+/// duplicate of this agent (giverny#532).
 fn after_clear(feeds: &Path, session: &str, tab: &str, live: &Live) -> Option<String> {
-    let cleared = std::fs::read_to_string(tab_file(feeds, tab)?).ok()?;
-    let cleared = cleared.trim();
-    if cleared == session || !safe(cleared) {
-        return None;
-    }
+    let told_file = tab_file(feeds, tab)?;
     let file = session_file(feeds, session)?;
     // Checked and taken in one step (giverny#433).
     let _lock = lock(feeds);
+    let told = told_in(&told_file);
+    let cleared = told.last()?;
+    if cleared == session {
+        return None;
+    }
     let doc = read_doc(&session_file(feeds, cleared)?)?;
     let name = doc_name(&doc)?;
     let mut held = holders(feeds, live, session, None);
     held.extend(fresh(feeds, live, session, None, FRESH));
-    held.retain(|h| h.session != cleared);
+    held.retain(|h| !told.contains(&h.session));
     if held_by(&held, &name).is_some() {
         return None;
     }
@@ -1355,13 +1365,32 @@ fn after_clear(feeds: &Path, session: &str, tab: &str, live: &Live) -> Option<St
     Some(name)
 }
 
-/// Note `session` as the one `tab` holds now (giverny#508), for a `/clear`
-/// there to find ([`after_clear`]).
+/// The sessions a tab's file in [`TABS`] lists, the last told last: a file
+/// from before giverny#532 holds the last one alone.
+fn told_in(file: &Path) -> Vec<String> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|s| safe(s))
+        .map(String::from)
+        .collect()
+}
+
+/// Note `session` as the one `tab` holds now (giverny#508), last in its list
+/// ([`TABS`]), for a `/clear` there to find ([`after_clear`]).
 fn keep_tab(feeds: &Path, tab: &str, session: &str) {
-    if let Some(file) = tab_file(feeds, tab) {
-        let _ = std::fs::create_dir_all(dir(feeds).join(TABS));
-        let _ = std::fs::write(file, session);
-    }
+    let Some(file) = tab_file(feeds, tab) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir(feeds).join(TABS));
+    // Read and rewritten in one step: a `/clear` reads it under the lock.
+    let _lock = lock(feeds);
+    let mut told = told_in(&file);
+    told.retain(|s| s != session);
+    told.push(session.to_string());
+    let from = told.len().saturating_sub(TAB_SESSIONS);
+    let _ = std::fs::write(file, told[from..].join("\n") + "\n");
 }
 
 /// Name `session` and say so ([`ask`]): the name it has ([`find`], else
@@ -1692,6 +1721,44 @@ mod tests {
         let _ = std::fs::remove_file(session_file(&feeds, "s2").unwrap());
         record_among(&feeds, "s9", "Rotem Ashby", None, drawn("x"), &live(&[])).unwrap();
         assert_eq!(after_clear(&feeds, "s2", "giverny-7", &live(&["s9"])), None);
+        let _ = std::fs::remove_dir_all(&feeds);
+    }
+
+    #[test]
+    fn a_stale_claude_of_the_same_tab_keeps_nobody_from_the_name() {
+        let feeds = scratch("stale");
+        let live = |ids: &[&str]| -> Live {
+            ids.iter()
+                .map(|i| (i.to_string(), PathBuf::new()))
+                .collect()
+        };
+        record_among(
+            &feeds,
+            "s1",
+            "Tess Giverny",
+            Some("r1"),
+            drawn("x"),
+            &live(&[]),
+        )
+        .unwrap();
+        keep_tab(&feeds, "giverny-56", "s1");
+        // s1 →/clear→ s2: the name is kept.
+        let name = after_clear(&feeds, "s2", "giverny-56", &live(&["s1", "s2"]));
+        assert_eq!(name.as_deref(), Some("Tess Giverny"));
+        keep_tab(&feeds, "giverny-56", "s2");
+        // s2 →/clear→ s3, with a claude left over from an earlier Giverny
+        // run still listed live on s1 (giverny#532): s1 is this tab's, a
+        // stale duplicate, not a rival.
+        let name = after_clear(&feeds, "s3", "giverny-56", &live(&["s1", "s2", "s3"]));
+        assert_eq!(name.as_deref(), Some("Tess Giverny"));
+        assert_eq!(read(&feeds, "s3").as_deref(), Some("Tess Giverny"));
+        // A session of another tab holding the first name still keeps it
+        // from s3 (giverny#425).
+        let _ = std::fs::remove_file(session_file(&feeds, "s3").unwrap());
+        record_among(&feeds, "s9", "Tess Ashby", None, drawn("x"), &live(&[])).unwrap();
+        keep_tab(&feeds, "giverny-80", "s9");
+        let name = after_clear(&feeds, "s3", "giverny-56", &live(&["s1", "s9"]));
+        assert_eq!(name, None);
         let _ = std::fs::remove_dir_all(&feeds);
     }
 
