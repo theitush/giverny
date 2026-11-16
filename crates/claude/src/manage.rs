@@ -2405,10 +2405,18 @@ fn task_still_runs(
     flags: &Flags,
     now: u64,
 ) -> StillRuns {
-    let doc = std::fs::read(file_for(dir, session))
+    let mut doc = std::fs::read(file_for(dir, session))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .filter(|d| writer_of(d).is_none_or(|w| w == WRITER));
+    // A worker spawned for the task holds its row by its description alone
+    // until its first tool call stamps its id there: give it the row here
+    // too (on this copy), so a `land` run straight after the spawn still
+    // finds it working (giverny#527).
+    if let Some(d) = doc.as_mut().filter(|d| has_unworkered(d)) {
+        let sessions = continuation::ids(d);
+        stamp_spawns(d, &spawns(flags.claude_dir.as_deref(), &sessions));
+    }
     still_runs(
         dir,
         ledger,
@@ -3600,6 +3608,50 @@ mod tests {
                 .unwrap()
                 .contains("w1 handed on from a")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `land` run straight after the spawn, before the worker's first
+    /// tool call has put its id on the row: the worker its spawn
+    /// description names is found all the same, and the land refused
+    /// (giverny#527, seen on Claude Code 2.1.325).
+    #[test]
+    fn land_refuses_a_task_whose_fresh_worker_has_no_id_on_its_row_yet() {
+        let dir = scratch("land-fresh");
+        let cfg = dir.join("claude");
+        let sub = cfg
+            .join("projects")
+            .join("-work")
+            .join("s1")
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let land = |line: &str, at: u64| {
+            let (cmd, mut flags) = parse_args(&args(line)).unwrap();
+            flags.claude_dir = Some(cfg.clone());
+            run_in(&dir, "s1", &cmd, &flags, at)
+        };
+        land("start a --eta 30", now - MIN).unwrap();
+        land("start b --eta 30", now - MIN).unwrap();
+        std::fs::write(
+            sub.join("agent-w1.meta.json"),
+            r#"{"agentType":"general-purpose","description":"a sleeper"}"#,
+        )
+        .unwrap();
+        let at = jiff::Timestamp::from_millisecond((now - MIN + 1000) as i64).unwrap();
+        std::fs::write(
+            sub.join("agent-w1.jsonl"),
+            format!("{{\"type\":\"user\",\"timestamp\":\"{at}\"}}\n"),
+        )
+        .unwrap();
+        let e = land("land a", now).unwrap_err();
+        assert!(e.contains("its worker w1 is still working"), "{e}");
+        assert_eq!(read_feed(&dir).rows[0].stage, Some(feed::Stage::Running));
+        // The task no worker was spawned for lands.
+        assert!(land("land b", now).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
