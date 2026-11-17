@@ -221,6 +221,14 @@ pub struct Work {
 /// How the notice reads a task's worker: the system, or a test's.
 pub trait Look {
     fn work(&self, row: &Map<String, Value>, key: &str, now: u64) -> Work;
+
+    /// The working cap notice due on the session's Running workers at `now`
+    /// (giverny#536): the hook's own look ([`crate::manage_cap::deliver`]),
+    /// stamped on the same rows, so neither tells a crossing twice. None
+    /// unless a look says otherwise.
+    fn cap(&self, _now: u64) -> Option<String> {
+        None
+    }
 }
 
 /// The real look: the row's clocks, the worker's transcript under the
@@ -265,6 +273,10 @@ impl Look for System<'_> {
             shells,
             transcript,
         }
+    }
+
+    fn cap(&self, now: u64) -> Option<String> {
+        crate::manage_cap::deliver(self.feed_dir, self.session, self.transcript, now)
     }
 }
 
@@ -506,13 +518,16 @@ pub enum Watch {
     Until(Option<u64>),
 }
 
-/// One look of `giverny manage watch` at `now`: the same check the hook
-/// makes ([`check`]), so a check told here is not told again on the hook,
-/// nor one told there here.
+/// One look of `giverny manage watch` at `now`: the same checks the hook
+/// makes — the progress check ([`check`]) and the working cap
+/// ([`Look::cap`], giverny#536) — so what is told here is not told again on
+/// the hook, nor what was told there here.
 pub fn watch_step(feed_dir: &Path, session: &str, now: u64, look: &dyn Look) -> Watch {
     let (told, doc) = check(feed_dir, session, None, now, look);
-    if let Some(t) = told {
-        return Watch::Told(t);
+    let cap = look.cap(now);
+    if told.is_some() || cap.is_some() {
+        let both: Vec<String> = told.into_iter().chain(cap).collect();
+        return Watch::Told(both.join("\n\n"));
     }
     let running = doc
         .as_ref()
@@ -582,10 +597,12 @@ fn feed_stamp(feed_dir: &Path, session: &str, file: &Path) -> (Option<u128>, boo
 
 /// `giverny manage watch`: wait until a progress check is due on this
 /// session's rows — a figure running out, a pending check's quiet ending,
-/// a new ask — print it and end, so the manager's background command ends
-/// and Claude Code wakes the manager even mid-idle. It only prints: it
-/// stops, pauses and re-estimates nothing. With nothing Running it ends at
-/// once; a second watch on the session ends at once too.
+/// a new ask — or a Running worker nears or passes the working cap
+/// (giverny#536, looked at every [`crate::manage_cap::LOOK_EVERY_MS`]),
+/// print it and end, so the manager's background command ends and Claude
+/// Code wakes the manager even mid-idle. It only prints: it stops, pauses
+/// and re-estimates nothing. With nothing Running it ends at once; a second
+/// watch on the session ends at once too.
 pub fn watch(feed_dir: &Path, session: &str, look: &dyn Look) -> String {
     if !safe(session) {
         return format!("giverny manage watch: not a session id: {session:?}");
@@ -609,7 +626,12 @@ pub fn watch(feed_dir: &Path, session: &str, look: &dyn Look) -> String {
                         nothing to watch; it ends. Start one again once a task runs."
                     .to_string();
             }
-            Watch::Until(t) => t,
+            // A worker's context grows with no change to the feed: the cap
+            // is looked at again on its own clock.
+            Watch::Until(t) => Some(
+                t.unwrap_or(u64::MAX)
+                    .min(now + crate::manage_cap::LOOK_EVERY_MS),
+            ),
         };
         let file = manage::file_for(feed_dir, session);
         let seen = feed_stamp(feed_dir, session, &file);

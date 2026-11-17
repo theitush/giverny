@@ -202,15 +202,17 @@ When you spawn one:
   stops and re-estimates nothing.
   - **Keep one `giverny-manage watch` running in the background** (Bash with
     `run_in_background`) while you have Running rows: it sleeps until the
-    next check falls due, prints it and exits, and its exit wakes you even
-    while you wait idle for your workers. Read its output file — that is the
+    next check falls due or a worker nears the context cap (below), prints
+    it and exits, and its exit wakes you even while you wait idle for your
+    workers. Read its output file — that is the
     check — act on it, then start a fresh `watch`. One that says nothing is
     Running needs no restart until a task runs again.
 - **A worker near the context cap.** Giverny keeps a working worker's
   context under a cap (450k tokens unless set otherwise in Settings →
   Management panel). When a Running worker reaches 85% of it, Giverny tells
-  you once, on your next tool call, naming the task, the worker, its context
-  and the cap; once more if it passes the cap. Then:
+  you once, on your next tool call or through your `watch` (which wakes you
+  for it), naming the task, the worker, its context and the cap; once more
+  if it passes the cap. Then:
   - tell the worker (SendMessage) to come to a safe point, commit and push
     its work, write its next step where the project keeps it, and end its
     turn with a short report;

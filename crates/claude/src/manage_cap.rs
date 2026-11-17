@@ -7,7 +7,10 @@
 //!
 //! **Giverny suggests, managers decide.** Nothing here stops, pauses or
 //! messages a worker. On the dispatcher's own tool call ([`deliver`], from
-//! the plugin's hook), a Running row whose worker has reached
+//! the plugin's hook), or from its `giverny manage watch` while it waits
+//! idle on its workers ([`crate::manage_progress::Look::cap`]: the watch
+//! looks every [`LOOK_EVERY_MS`] and ends printing the line, which wakes
+//! the manager), a Running row whose worker has reached
 //! [`NEAR_PERCENT`] of the cap is told to its manager, with what to do:
 //! SendMessage the worker to come to a safe point, commit and push, write
 //! its next step where the project keeps it and end its turn with a report;
@@ -21,7 +24,9 @@
 //! worker found back under the point (a compaction) has it cleared, so a
 //! new crossing is told again; a row now held by another worker starts
 //! over. A paused row is passed by, its stamp kept: its worker is stopped,
-//! and the first look after its resume tells it.
+//! and the first look after its resume tells it. The hook and the watch
+//! share the stamp and the look marker, so neither tells what the other
+//! told.
 //!
 //! **Cheap.** A session with no feed of its own and no manager mark costs
 //! two `stat`s; a manager's, one more between looks, at most one look every
@@ -41,15 +46,16 @@ use crate::{continuation, feed};
 
 /// Where the manager is told: this share of the cap, in percent (382.5k of
 /// the default 450k). The notice reaches the manager on its next own tool
-/// call, and the worker wraps up after that, so the point leaves room for
-/// both. Measured on this machine's 1,310 worker transcripts (2026-11-17),
+/// call or, idle, through its watch within a look or two (30 s apart), and
+/// the worker wraps up after that, so the point leaves room for both, and
+/// for a manager slow to act on it. Measured on this machine's 1,310 worker transcripts (2026-11-17),
 /// between 250k and 500k of context: a worker's context grew by 17k in five
 /// minutes at the median and 47k at the 95th percentile, and a worker's
 /// last eleven calls, about what a wrap-up takes (commit, push, a note, the
 /// report), added 7k at the median and 16k at the 95th percentile. At 85%
-/// the 67.5k left hold a manager that calls within five minutes plus a
-/// wrap-up, both at the 95th percentile (63k); at 90% the 45k would not,
-/// at the 90th (36k + 13k). A manager idle longer hears of it later.
+/// the 67.5k left hold five minutes of work before the wrap-up starts plus
+/// the wrap-up, both at the 95th percentile (63k); at 90% the 45k would
+/// not, at the 90th (36k + 13k).
 pub const NEAR_PERCENT: u64 = 85;
 
 /// At most one look per manager session in this span: a worker's context
@@ -474,6 +480,90 @@ mod tests {
         ctx.borrow_mut().insert("w9", 390_000);
         let fresh = at().expect("a new worker on the row");
         assert!(fresh.contains("worker w9"), "{fresh}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A test look for the watch: no work to read; the cap through the
+    /// hook's own path, with fixed limits.
+    struct Watching<'a> {
+        feeds: &'a Path,
+        transcript: &'a Path,
+    }
+
+    impl crate::manage_progress::Look for Watching<'_> {
+        fn work(&self, _: &Map<String, Value>, _: &str, _: u64) -> crate::manage_progress::Work {
+            Default::default()
+        }
+
+        fn cap(&self, now: u64) -> Option<String> {
+            deliver_with(self.feeds, "s1", Some(self.transcript), now, limits)
+        }
+    }
+
+    /// `giverny manage watch` carries the notice to an idle manager: a
+    /// crossing ends its step with the line, the same crossing is not told
+    /// again by the watch nor by the hook after it, and the cap is.
+    #[test]
+    fn the_watch_tells_a_crossing_once() {
+        use crate::manage_progress::{Watch, watch_step};
+        let dir = scratch("watch");
+        let feeds = dir.join("feeds");
+        let project = dir.join("projects").join("-work");
+        let subagents = project.join("s1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::create_dir_all(&feeds).unwrap();
+        let transcript = project.join("s1.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let worker = |n: u64| {
+            std::fs::write(
+                subagents.join("agent-w1.jsonl"),
+                format!(
+                    "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":{n}}}}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        feed(&feeds.join("s1.json"));
+        let look = Watching {
+            feeds: &feeds,
+            transcript: &transcript,
+        };
+        let now = 1_790_000_000_000u64;
+        worker(300_000);
+        assert!(matches!(
+            watch_step(&feeds, "s1", now, &look),
+            Watch::Until(_)
+        ));
+        worker(390_000);
+        let step = |at: u64| watch_step(&feeds, "s1", at, &look);
+        let Watch::Told(told) = step(now + LOOK_EVERY_MS) else {
+            panic!("the crossing ends the watch");
+        };
+        assert!(
+            told.contains("`t1`'s worker w1 carries 390k context, near the 450k cap"),
+            "{told}"
+        );
+        assert!(
+            matches!(step(now + 2 * LOOK_EVERY_MS), Watch::Until(_)),
+            "told once"
+        );
+        assert_eq!(
+            deliver_with(
+                &feeds,
+                "s1",
+                Some(&transcript),
+                now + 3 * LOOK_EVERY_MS,
+                limits
+            ),
+            None,
+            "nor again on the hook"
+        );
+        worker(460_000);
+        let Watch::Told(past) = step(now + 4 * LOOK_EVERY_MS) else {
+            panic!("past the cap ends it again");
+        };
+        assert!(past.contains("past the 450k cap"), "{past}");
+        assert!(matches!(step(now + 5 * LOOK_EVERY_MS), Watch::Until(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
