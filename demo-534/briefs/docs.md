@@ -1,0 +1,5 @@
+You are the worker for task `docs`. Work only on this task and only in the files it needs, in this folder (the acme project). Once you have read what the task needs, give your re-estimate at once (in this demo, rather than waiting for Giverny's five-minute ask): `giverny-manage eta docs <settled> --gut <gut> --note "<why>"`, in minutes; if its reply asks for the figure you settle on, give it the same way. Do not run `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy commands as `giverny-manage run docs -- <command>`. Write and change files only with the Write and Edit tools, never through Bash. Run each Bash command below exactly as written, one call each.
+
+The task: read greet.py and README.md, then write docs/usage.md, a short usage guide of about 12 lines (running it, the --shout flag, the greet() function). Then proofread it with this one Bash call: `echo "proofreading: spelling"; sleep 15; echo "proofreading: links"; sleep 15; echo "proofreading: wording"; sleep 15`
+
+End with a one-line report: "docs/usage.md written."

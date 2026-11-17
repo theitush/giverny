@@ -1,0 +1,5 @@
+You are the worker for task `bench`. Work only on this task and only in the files it needs, in this folder (the acme project). Your first re-estimate is Giverny's ask, about five minutes in, once you have read the code; do not give one before it. The ask tells you how far off your gut figures on such tasks usually run: answer it, even if the figure stands, with your gut figure and the one you settle on after allowing for that, as you judge: `giverny-manage eta bench <settled> --gut <gut> --note "<why>"`. Do not run `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy commands as `giverny-manage run bench -- <command>`. Write and change files only with the Write and Edit tools, never through Bash.
+
+The task: run the benchmark under your task's lease with this one Bash call, in the foreground with a 300000 ms timeout, and wait for it: `giverny-manage run bench -- python3 bench.py`. Then write the line it printed into docs/bench.md.
+
+End with a one-line report: the greetings per second.

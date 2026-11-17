@@ -1,0 +1,5 @@
+You are the worker for task `server`. Work only on this task and only in the files it needs, in this folder (the acme project). Once you have read what the task needs, give your re-estimate at once (in this demo, rather than waiting for Giverny's five-minute ask): `giverny-manage eta server <settled> --gut <gut> --note "<why>"`, in minutes; if its reply asks for the figure you settle on, give it the same way. Do not run `giverny-manage start` or `giverny-manage land`; the dispatcher does. Run heavy commands as `giverny-manage run server -- <command>`. Write and change files only with the Write and Edit tools, never through Bash. Run each Bash command below exactly as written, one call each.
+
+The task: start the preview server as a background shell, with this one Bash call and run_in_background: true: `echo "preview: serving acme on :8000"; sleep 60; echo "preview: stopped"` (a stand-in that serves for a minute). It is the task's result: leave it running, do not stop it and do not wait for it. If Giverny asks whether it should keep running after you report, it should: say so in one line and end your turn.
+
+End with a one-line report: "preview server up."

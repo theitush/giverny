@@ -1,0 +1,36 @@
+# giverny#534 take 4 (2026-11-17), local times. in/out = keep/leave, cap "<tags>|<text>", speed <x>.
+09:48:10.6 in
+09:48:10.6 cap fork|Ita's fork (agents-pane) only: none of this is in the PRs (y0av#33-#41). A haiku Claude Code starts in the ACME tab.
+09:48:16 cap names|Giverny names the session as it starts, its category as surname (Idris Acme), and titles the tab after it, as a place.
+09:48:20 cap names|Idris's Cabin: Claude's own title moves to the tab's hover.
+09:48:24 cap manager|The ask: "manage the five tasks in .claude/plan.md". A hook sends any "manage ..." prompt to the plugin's /giverny:manage skill.
+09:48:33 cap manager|The manager writes each task as a Next up row with its estimate: examples after docs (same file), deploy held with a reason.
+09:48:42 cap manager|claim (1G each on the machine's RAM ledger), start, and a haiku worker each. Running: elapsed, time left, now, tokens.
+09:48:50 cap manager|Its plan line: "your gut estimates on FEATURE tasks in acme have usually run about 1.7x too high" (from rehearsal rounds).
+09:48:56 cap manager|Hover a row: why it is where it is. New CPU / RAM column: what a task's giverny-manage run commands use, live.
+09:49:01 cap manager|server's worker ended its turn on a background shell of its own (sleep 60): asleep, not finished; it wakes when that ends.
+09:49:04.5 cap manager|examples starts when docs lands. deploy is held, not started, with the manager's reason.
+09:49:10 cap manager|Click a Running row: Claude Code's own view of that worker opens under Giverny's header; the status line is the worker's.
+09:49:22 cap manager|The worker's brief and what it is doing, live. "back to manager" returns to the manager's own view.
+09:49:31 cap caps|A plain shell tab. giverny-manage resources: the ledger, the limits (8 cores, 22G here), and the three 1G leases.
+09:49:45 cap caps|bench's command runs in a systemd scope of its own in giverny-claude.slice, as every tab's claude does (giverny-claude-<pid>.scope).
+09:49:58 cap manager|docs lands for review: Done against its estimate (-4m), its Review line in NOW. examples starts now that docs has landed.
+09:50:03 speed 2
+09:50:12 cap manager|server landed once its shell had ended, then examples. Each Done row says how it landed against its estimate.
+09:50:56 speed 1
+09:50:56 cap manager|bench's figure (1m) ran out: its ETA reads --1m. It lands at +1m.
+09:51:02.5 cap manager|Giverny's progress check on bench reached the manager through its watch, and the manager quotes it.
+09:51:09 cap manager|Typed: the docs review is done. The manager unholds deploy, claims, starts it and spawns its worker.
+09:51:15 speed 3
+09:51:52 speed 1
+09:51:52 cap manager|All five Done. /giverny:clear-done clears the Done rows, from the panel too.
+09:52:10 cap caps|Settings: the manage skill, name every session, the CPU / RAM column, the default lease, and the machine-wide limits.
+09:52:20 cap names|Settings, tabs & titles: name Claude tabs after their session.
+09:52:35 cap names|A second, plain session in INFRA: Shira Infra, in Shira's Library.
+09:52:42 cap guards|Asked to run kill -0 on the manager's claude: refused by Giverny's hook. One session never reaches into another's processes.
+09:53:00 cap guards|nohup runs, with a reminder once a session: it leaves the tab's cap; heavy work goes through giverny-manage run.
+09:53:20 cap eta|A subagent that is no manager's task: Giverny asks its spawner for an estimate (giverny-eta), and its row counts down ~2m.
+09:53:25 speed 2
+09:53:44 speed 1
+09:53:52 cap names|/resume lists the sessions by their names: Idris Acme, Runa Acme, Ekene Infra ...
+09:54:09 out
