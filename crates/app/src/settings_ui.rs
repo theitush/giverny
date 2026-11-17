@@ -340,10 +340,13 @@ fn skip_gpus(
 /// The table under the `columns` row: `management_panel.columns.*`.
 const COLUMNS: &str = "management_panel.columns.";
 
+/// The worker context rows: `management_panel.workers.*` (giverny#536).
+const WORKERS: &str = "management_panel.workers.";
+
 /// Settings → Management panel, in the order a person reads it: the pane,
 /// the skill and the names switch, the columns as one row of switches (in the pane's own order,
-/// which is `SETTINGS`'), then the default lease and the limits under their
-/// headings.
+/// which is `SETTINGS`'), then the default lease, the workers' context and
+/// the limits under their headings.
 #[allow(clippy::too_many_arguments)]
 fn management_panel_page(
     ui: &mut egui::Ui,
@@ -387,6 +390,9 @@ fn management_panel_page(
     draw(ui, state, actions, &|d| {
         matches!(d.kind, Kind::Lease { .. })
     });
+    ui.add_space(8.0);
+    heading(ui, "workers' context", c);
+    draw(ui, state, actions, &|d| d.key.starts_with(WORKERS));
     ui.add_space(8.0);
     heading(ui, "limits", c);
     draw(ui, state, actions, &|d| {

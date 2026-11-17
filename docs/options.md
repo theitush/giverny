@@ -50,6 +50,8 @@ Everything in `~/.config/giverny/config.toml`, and everything in the settings sc
 | `management_panel.columns.tokens` | `true` | The tokens the row has used. |
 | `management_panel.columns.usage` | `true` | What the row's `giverny manage run` commands use: live CPU and memory, a Done row's peak. |
 | `management_panel.lease.ram` | `"3G"` | Memory a task's lease holds when nothing says otherwise. Also each Claude tab's protected memory (`MemoryLow`) in `giverny-claude.slice`. A lease reserves RAM only: CPU is shared and measured. |
+| `management_panel.workers.reuse_max_tokens` | `200000` | A worker carrying more context than this many tokens is not handed a next task: its manager spawns a fresh worker with a brief instead. |
+| `management_panel.workers.context_cap_tokens` | `450000` | Keep a working worker's context under this many tokens: its manager is told when the worker nears it, in time to wrap up and hand the rest to a fresh worker. |
 | `manager.limits.cpu_cores` | `"auto"` | The hard CPU ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, a duty cycle on the busy commands). Cores are shared, never leased: a claim waits only while they are measured busy. auto = all but 2. |
 | `manager.limits.ram` | `"auto"` | Memory all manager sessions together may hand to workers, and the hard memory ceiling of every Claude tab and `manage run` together (`giverny-claude.slice`; on macOS held by Giverny itself, which kills the biggest command over it). auto = 70 %. |
 | `manager.limits.gpus` | `"auto"` | GPUs and VRAM manager sessions may use. auto = 90 % of each GPU's VRAM. |

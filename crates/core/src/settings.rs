@@ -812,6 +812,45 @@ pub const SETTINGS: &[SettingDef] = &[
             default: "3G",
         },
     },
+    // A manager's workers' context (giverny#536), counted as the TOKENS
+    // column counts it. Read by `giverny manage` and the plugin's hook
+    // from the file at each run.
+    SettingDef {
+        key: "management_panel.workers.reuse_max_tokens",
+        label: "reuse limit",
+        section: Section::ManagementPanel,
+        doc: "A worker carrying more context than this many tokens is not handed a next task: its manager spawns a fresh worker with a brief instead.",
+        note: &[
+            "Context as the TOKENS column counts it: the worker's last reply's.",
+            "`giverny-manage start <task> --agent <id>` refuses a worker over it",
+            "unless --heavy-ok, and a plain `start` suggests only idle workers",
+            "under it. Above the context cap it counts as the cap.",
+        ],
+        needs_restart: false,
+        kind: Kind::Int {
+            default: 200_000,
+            min: 0,
+            max: 1_000_000,
+        },
+    },
+    SettingDef {
+        key: "management_panel.workers.context_cap_tokens",
+        label: "context cap",
+        section: Section::ManagementPanel,
+        doc: "Keep a working worker's context under this many tokens: its manager is told when the worker nears it, in time to wrap up and hand the rest to a fresh worker.",
+        note: &[
+            "Told once, on the manager's next tool call, at 85% of the cap, and",
+            "once more if the worker passes it. Giverny stops nothing: the",
+            "manager has the worker commit, push and report, then gives what is",
+            "left of the task to a fresh worker with a brief.",
+        ],
+        needs_restart: false,
+        kind: Kind::Int {
+            default: 450_000,
+            min: 10_000,
+            max: 1_000_000,
+        },
+    },
     SettingDef {
         key: "manager.limits.cpu_cores",
         label: "CPU cores",
@@ -1415,6 +1454,27 @@ mod tests {
         let text = std::fs::read_to_string(config::config_path(&dir)).unwrap();
         assert!(!text.contains("[manager]\n"), "{text}");
         assert!(text.contains("[manager.limits]\ncpu_cores = 4"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The workers' context rows (giverny#536) write where `giverny manage`
+    /// and the hook read them, into a template file or one without the table.
+    #[test]
+    fn worker_context_rows_write_what_manage_reads() {
+        let dir = scratch("workers");
+        let path = config::config_path(&dir);
+        for start in [template(), "[font]\nsize = 13.0\n".to_string()] {
+            std::fs::write(&path, start).unwrap();
+            let def = by_key("management_panel.workers.reuse_max_tokens").unwrap();
+            write(&dir, def, &Value::Int(150_000)).unwrap();
+            let def = by_key("management_panel.workers.context_cap_tokens").unwrap();
+            write(&dir, def, &Value::Int(300_000)).unwrap();
+            let read = config::WorkerContext::load_from(&path);
+            assert_eq!(read.reuse_max_tokens, 150_000);
+            assert_eq!(read.context_cap_tokens, 300_000);
+            let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(cfg.management_panel.workers, read);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

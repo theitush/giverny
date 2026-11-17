@@ -18,6 +18,7 @@ pub mod jobs;
 pub mod leftovers;
 pub mod lineage;
 pub mod manage;
+pub mod manage_cap;
 pub mod manage_chores;
 pub mod manage_hint;
 pub mod manage_history;

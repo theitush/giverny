@@ -46,6 +46,8 @@ pub struct ManagementPanelConfig {
     pub columns: PaneColumns,
     /// What a task gets when nothing says otherwise.
     pub lease: DefaultLease,
+    /// How much context a manager's worker may carry (giverny#536).
+    pub workers: WorkerContext,
     /// The worker page's prompt box: a line typed there goes to the tab's
     /// manager. Off, the box is read-only.
     pub prompt_box: bool,
@@ -60,6 +62,7 @@ impl Default for ManagementPanelConfig {
             done_last: 5,
             columns: PaneColumns::default(),
             lease: DefaultLease::default(),
+            workers: WorkerContext::default(),
             prompt_box: true,
         }
     }
@@ -166,6 +169,83 @@ impl DefaultLease {
         std::fs::read_to_string(crate::limits::default_config_path())
             .map(|t| DefaultLease::from_config_str(&t))
             .unwrap_or_default()
+    }
+}
+
+/// `[management_panel.workers]`: how much context a manager session's worker
+/// may carry (giverny#536), counted as the pane's TOKENS column counts it:
+/// the context of the worker's last API response in its transcript.
+/// `giverny manage` and the plugin's hook read it from `config.toml` at
+/// each run ([`WorkerContext::load`]), so a change counts at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkerContext {
+    /// The reuse limit (giverny#280): a worker carrying more is not handed
+    /// a next task. `start --agent` refuses it unless `--heavy-ok`, and a
+    /// plain `start` suggests only idle workers under it.
+    pub reuse_max_tokens: u64,
+    /// The working cap: a Running row's worker is kept under it. Its
+    /// manager is told when the worker nears it, early enough to wrap up
+    /// under it, and once more if it passes it; Giverny stops nothing.
+    pub context_cap_tokens: u64,
+}
+
+impl Default for WorkerContext {
+    fn default() -> Self {
+        WorkerContext {
+            reuse_max_tokens: 200_000,
+            context_cap_tokens: 450_000,
+        }
+    }
+}
+
+impl WorkerContext {
+    /// Kept to what makes sense: a cap of at least one token, and a reuse
+    /// limit no higher than the cap, since a worker its manager is told to
+    /// wrap up is never one to hand a next task.
+    pub fn clamped(self) -> WorkerContext {
+        let cap = self.context_cap_tokens.max(1);
+        WorkerContext {
+            reuse_max_tokens: self.reuse_max_tokens.min(cap),
+            context_cap_tokens: cap,
+        }
+    }
+
+    /// `[management_panel.workers]` from a `config.toml`'s text, clamped
+    /// ([`Self::clamped`]). A key that is absent or not a whole number of
+    /// tokens is its default: neither limit is lost over a typo, here or
+    /// elsewhere in the file.
+    pub fn from_config_str(text: &str) -> WorkerContext {
+        let doc = toml::from_str::<toml::Table>(text).ok();
+        let table = doc
+            .as_ref()
+            .and_then(|d| d.get("management_panel"))
+            .and_then(|m| m.get("workers"));
+        let read = |key: &str, default: u64| {
+            table
+                .and_then(|t| t.get(key))
+                .and_then(toml::Value::as_integer)
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(default)
+        };
+        let d = WorkerContext::default();
+        WorkerContext {
+            reuse_max_tokens: read("reuse_max_tokens", d.reuse_max_tokens),
+            context_cap_tokens: read("context_cap_tokens", d.context_cap_tokens),
+        }
+        .clamped()
+    }
+
+    /// The limits in the `config.toml` at `path`; the defaults without one.
+    pub fn load_from(path: &Path) -> WorkerContext {
+        std::fs::read_to_string(path)
+            .map(|t| WorkerContext::from_config_str(&t))
+            .unwrap_or_default()
+    }
+
+    /// The limits in Giverny's own `config.toml`.
+    pub fn load() -> WorkerContext {
+        WorkerContext::load_from(&crate::limits::default_config_path())
     }
 }
 
@@ -1185,6 +1265,67 @@ mod tests {
         assert_eq!(kept.font.size, 31.0);
         assert!(kept.claude.auto_mode);
         assert!(!kept.claude.management_panel);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The worker limits (giverny#536): 200k and 450k unless set; a value
+    /// set is honoured; a bad one is its default, the other kept; a reuse
+    /// limit above the cap counts as the cap.
+    #[test]
+    fn worker_context_reads_its_table_and_keeps_reuse_under_the_cap() {
+        let d = WorkerContext::from_config_str("");
+        assert_eq!(
+            (d.reuse_max_tokens, d.context_cap_tokens),
+            (200_000, 450_000)
+        );
+        assert_eq!(d, WorkerContext::default());
+        let set = WorkerContext::from_config_str(
+            "[management_panel.workers]\nreuse_max_tokens = 150000\ncontext_cap_tokens = 300000\n",
+        );
+        assert_eq!(
+            (set.reuse_max_tokens, set.context_cap_tokens),
+            (150_000, 300_000)
+        );
+        let typo = WorkerContext::from_config_str(
+            "[management_panel.workers]\nreuse_max_tokens = \"lots\"\ncontext_cap_tokens = 500000\n",
+        );
+        assert_eq!(
+            (typo.reuse_max_tokens, typo.context_cap_tokens),
+            (200_000, 500_000)
+        );
+        let over = WorkerContext::from_config_str(
+            "[management_panel.workers]\nreuse_max_tokens = 600000\n",
+        );
+        assert_eq!(
+            (over.reuse_max_tokens, over.context_cap_tokens),
+            (450_000, 450_000)
+        );
+        let low = WorkerContext::from_config_str(
+            "[management_panel.workers]\ncontext_cap_tokens = 100000\n",
+        );
+        assert_eq!(
+            (low.reuse_max_tokens, low.context_cap_tokens),
+            (100_000, 100_000)
+        );
+        // A broken file elsewhere leaves the defaults standing.
+        assert_eq!(
+            WorkerContext::from_config_str("[font"),
+            WorkerContext::default()
+        );
+        let dir = scratch("workers");
+        assert_eq!(
+            WorkerContext::load_from(&config_path(&dir)),
+            WorkerContext::default()
+        );
+        std::fs::write(
+            config_path(&dir),
+            "[management_panel.workers]\nreuse_max_tokens = 80000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            WorkerContext::load_from(&config_path(&dir)).reuse_max_tokens,
+            80_000
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

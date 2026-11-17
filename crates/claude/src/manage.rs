@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
+use giverny_core::config::WorkerContext;
+
 use crate::worker_log::{self, WorkerLog};
 use crate::{continuation, feed, manage_history, names, resources, sleeps};
 
@@ -49,8 +51,10 @@ usage: giverny manage <command> [args] [--session <id>]
                [--note N] [--brief FILE] [--repo R]
                               the task's worker is starting now (Running);
                               --agent hands it to a worker that already holds
-                              another task, refused for one carrying over 100k
-                              context unless --heavy-ok; on a landed task,
+                              another task, refused for one carrying more
+                              context than the reuse limit (200k unless set in
+                              Settings → Management panel) unless --heavy-ok;
+                              on a landed task,
                               --agent <its own worker> reopens it once that
                               worker is woken (the time since it landed is
                               left out)
@@ -226,8 +230,8 @@ pub struct Flags {
     pub note: Option<String>,
     pub brief: Option<String>,
     pub agent: Option<String>,
-    /// `start --agent`: hand the task to a worker over
-    /// [`REUSE_MAX_TOKENS`] all the same.
+    /// `start --agent`: hand the task to a worker over the reuse limit
+    /// ([`reuse_max`]) all the same.
     pub heavy_ok: bool,
     pub outcome: Option<String>,
     pub review: Option<String>,
@@ -261,6 +265,9 @@ pub struct Flags {
     /// The Claude config dir to read spawn descriptions from: tests set it;
     /// else `$CLAUDE_CONFIG_DIR`, `$GIVERNY_PROFILE_DIR`, `~/.claude`.
     pub claude_dir: Option<PathBuf>,
+    /// The Giverny `config.toml` to read the reuse limit from ([`reuse_max`]):
+    /// tests set it; else Giverny's own.
+    pub giverny_config: Option<PathBuf>,
     /// Set by [`tell_record`], not parsed: the factor the giver of this
     /// command's guess had been shown for its track (giverny#371), kept on
     /// the row as `eta_told_x`. `None` is ×1.
@@ -1132,23 +1139,32 @@ fn idle_workers(doc: &Value, task: &str, now: u64) -> Vec<(String, String)> {
 const IDLE_HINT_MS: u64 = 30 * 60 * 1000;
 
 /// The most context a worker may carry and still be handed a next task
-/// (giverny#280). Every turn of a reused worker re-reads its whole context,
-/// so a heavy one makes the next task slow and dear, and its old context
-/// crowds the new one: above this a fresh worker with a full brief is
-/// better. `start --agent` refuses a worker over it unless `--heavy-ok`, and
-/// a plain `start` never suggests one.
-pub const REUSE_MAX_TOKENS: u64 = 100_000;
+/// (giverny#280): `[management_panel.workers] reuse_max_tokens` in Giverny's
+/// `config.toml` (`flags.giverny_config` in tests), read at each run so a
+/// change counts at once (giverny#536); 200k by default, and never above
+/// the working cap. Every turn of a reused worker re-reads its whole
+/// context, so a heavy one makes the next task slow and dear, and its old
+/// context crowds the new one: above this a fresh worker with a full brief
+/// is better. `start --agent` refuses a worker over it unless `--heavy-ok`,
+/// and a plain `start` never suggests one.
+fn reuse_max(flags: &Flags) -> u64 {
+    match &flags.giverny_config {
+        Some(path) => WorkerContext::load_from(path),
+        None => WorkerContext::load(),
+    }
+    .reuse_max_tokens
+}
 
-/// Whether a worker carrying `context` is too heavy to reuse. An unknown
-/// context (no transcript to read) is not.
-fn too_heavy(context: Option<u64>) -> bool {
-    context.is_some_and(|n| n > REUSE_MAX_TOKENS)
+/// Whether a worker carrying `context` is too heavy to reuse under the
+/// reuse limit `max`. An unknown context (no transcript to read) is not.
+fn too_heavy(context: Option<u64>, max: u64) -> bool {
+    context.is_some_and(|n| n > max)
 }
 
 /// The context worker `agent` carries now, as the panel's TOKENS column and
 /// the status line count it ([`crate::tokens::tokens_of`]): its transcript's
 /// last API response, under the first of `sessions` that has it.
-fn worker_context(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<u64> {
+pub(crate) fn worker_context(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Option<u64> {
     sessions.iter().find_map(|session| {
         let dir = session_subagents(cfg, session)?;
         crate::tokens::tokens_of(&crate::subagents::agent_transcript(&dir, agent))
@@ -1160,16 +1176,16 @@ fn worker_context(cfg: Option<&Path>, sessions: &[String], agent: &str) -> Optio
 type Idle = (String, String, Option<u64>);
 
 /// The lines `start <task>` with no `--agent` adds when workers of this
-/// manager session are idle: the newest-landed one under
-/// [`REUSE_MAX_TOKENS`] to hand it over with `--agent`, so its tokens are its
-/// own, and the ones over it named as better left alone.
-fn idle_hint(task: &str, idle: &[Idle]) -> Option<String> {
+/// manager session are idle: the newest-landed one under the reuse limit
+/// `max` ([`reuse_max`]) to hand it over with `--agent`, so its tokens are
+/// its own, and the ones over it named as better left alone.
+fn idle_hint(task: &str, idle: &[Idle], max: u64) -> Option<String> {
     let ctx = |c: &Option<u64>| match c {
         Some(n) => format!(", carrying {} context", crate::tokens::fmt_tokens(*n)),
         None => String::new(),
     };
-    let limit = crate::tokens::fmt_tokens(REUSE_MAX_TOKENS);
-    let (heavy, light): (Vec<&Idle>, Vec<&Idle>) = idle.iter().partition(|w| too_heavy(w.2));
+    let limit = crate::tokens::fmt_tokens(max);
+    let (heavy, light): (Vec<&Idle>, Vec<&Idle>) = idle.iter().partition(|w| too_heavy(w.2, max));
     let mut lines = Vec::new();
     if let Some((agent, key, c)) = light.first() {
         let more = match light.len() {
@@ -1201,9 +1217,9 @@ fn idle_hint(task: &str, idle: &[Idle]) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// `start <task> --agent <worker>`'s guard: refuse a worker over
-/// [`REUSE_MAX_TOKENS`] unless `--heavy-ok`, saying how heavy it is; with
-/// `--heavy-ok`, the note to add. A worker already holding `task`, or
+/// `start <task> --agent <worker>`'s guard: refuse a worker over the reuse
+/// limit `max` ([`reuse_max`]) unless `--heavy-ok`, saying how heavy it is;
+/// with `--heavy-ok`, the note to add. A worker already holding `task`, or
 /// spawned for it, is not being reused (the caller checks), and one whose
 /// context cannot be read is let through.
 fn heavy_guard(
@@ -1211,14 +1227,12 @@ fn heavy_guard(
     agent: &str,
     context: Option<u64>,
     heavy_ok: bool,
+    max: u64,
 ) -> Result<Option<String>, String> {
-    let Some(n) = context.filter(|_| too_heavy(context)) else {
+    let Some(n) = context.filter(|_| too_heavy(context, max)) else {
         return Ok(None);
     };
-    let (size, limit) = (
-        crate::tokens::fmt_tokens(n),
-        crate::tokens::fmt_tokens(REUSE_MAX_TOKENS),
-    );
+    let (size, limit) = (crate::tokens::fmt_tokens(n), crate::tokens::fmt_tokens(max));
     if heavy_ok {
         return Ok(Some(format!(
             "  {agent} carries {size} context, over the {limit} reuse limit: handed {task} \
@@ -2821,6 +2835,7 @@ fn run_feed(
                         agent,
                         worker_context(cfg, &sessions, agent),
                         flags.heavy_ok,
+                        reuse_max(&flags),
                     )?
                 }
                 _ => None,
@@ -2941,7 +2956,10 @@ fn run_feed(
                         (a, k, c)
                     })
                     .collect();
-                if let Some(hint) = idle_hint(task, &idle) {
+                // The limit is read only when a worker is idle.
+                if !idle.is_empty()
+                    && let Some(hint) = idle_hint(task, &idle, reuse_max(&flags))
+                {
                     msg = format!("{msg}\n{hint}");
                 }
             }
@@ -3652,6 +3670,69 @@ mod tests {
         assert_eq!(read_feed(&dir).rows[0].stage, Some(feed::Stage::Running));
         // The task no worker was spawned for lands.
         assert!(land("land b", now).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reuse limit is read from Giverny's `config.toml` at each run
+    /// (giverny#536): 200k without one, a value set there honoured, and
+    /// `start --agent` refused just past it unless `--heavy-ok`.
+    #[test]
+    fn start_agent_refuses_a_worker_past_the_configured_reuse_limit() {
+        let dir = scratch("reuse-limit");
+        let cfg = dir.join("claude");
+        let sub = cfg
+            .join("projects")
+            .join("-work")
+            .join("s1")
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let worker = |id: &str, n: u64| {
+            std::fs::write(
+                sub.join(format!("agent-{id}.jsonl")),
+                format!(
+                    "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":{n}}}}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let giverny = dir.join("config.toml");
+        let start = |line: &str| {
+            let (cmd, mut flags) = parse_args(&args(line)).unwrap();
+            flags.claude_dir = Some(cfg.clone());
+            flags.giverny_config = Some(giverny.clone());
+            run_in(&dir, "s1", &cmd, &flags, T0)
+        };
+        // No config.toml: the default, 200k.
+        worker("w1", 200_000);
+        worker("w2", 200_001);
+        assert!(
+            start("start a --agent w1").is_ok(),
+            "at the limit is not past it"
+        );
+        let e = start("start b --agent w2").unwrap_err();
+        assert!(
+            e.contains("w2 carries 200k context, over the 200k reuse limit"),
+            "{e}"
+        );
+        assert!(
+            !read_feed(&dir).rows.iter().any(|r| r.key == "b"),
+            "nothing written"
+        );
+        // Set lower: honoured at the next run, no restart.
+        std::fs::write(
+            &giverny,
+            "[management_panel.workers]\nreuse_max_tokens = 50000\n",
+        )
+        .unwrap();
+        worker("w3", 50_001);
+        let e = start("start c --agent w3").unwrap_err();
+        assert!(e.contains("over the 50k reuse limit"), "{e}");
+        assert!(e.contains("--heavy-ok"), "{e}");
+        let ok = start("start c --agent w3 --heavy-ok").unwrap();
+        assert!(
+            ok.contains("over the 50k reuse limit: handed c anyway"),
+            "{ok}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

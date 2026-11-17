@@ -46,7 +46,10 @@
 //!   land, a Next up task idle with nothing to wait on — told once each
 //!   ([`manage_chores`]), as is a task paused ten minutes with a `run`
 //!   command of it still going, with how to stop it
-//!   ([`manage_nudge::paused_runs`], giverny#471), and a worker that ended
+//!   ([`manage_nudge::paused_runs`], giverny#471), and a Running worker
+//!   whose context nears or passes the working cap, with how to wrap it up
+//!   and hand the rest to a fresh worker ([`crate::manage_cap`],
+//!   giverny#536), and a worker that ended
 //!   its turn with background shells of its own still running
 //!   ([`crate::bg_shells`], giverny#472: the shells a task's worker leaves
 //!   in the background are recorded on its `PostToolUse`, checked on its
@@ -354,6 +357,15 @@ pub fn run_with(
         resources::news(&ledger, session, now),
         manage_chores::deliver(dir, session, now),
         crate::manage_nudge::paused_runs(dir, session, now),
+        crate::manage_cap::deliver(
+            dir,
+            session,
+            payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .map(Path::new),
+            now,
+        ),
         crate::manage_progress::deliver(
             dir,
             session,
