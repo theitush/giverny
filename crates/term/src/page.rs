@@ -207,6 +207,7 @@ impl Page {
                 origin_px,
                 pixels_per_point: ppp,
                 cursor_visible: false,
+                cursor_hollow: false,
             };
             let built = mesh::build(&snapshot, &mut params);
             let mut meshes = Vec::with_capacity(built.glyphs.len() + 2);

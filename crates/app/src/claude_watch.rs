@@ -22,6 +22,29 @@ use crate::management_live::ManagementLive;
 
 pub use giverny_core::agent::AgentState as ClaudeState;
 
+/// The terminals on screen: what "you are looking at it" means for a done
+/// marker. One, or every terminal of a split row.
+#[derive(Debug, Clone, Default)]
+pub struct Shown(pub Vec<TabId>);
+
+impl Shown {
+    pub fn contains(&self, id: TabId) -> bool {
+        self.0.contains(&id)
+    }
+}
+
+impl From<Option<TabId>> for Shown {
+    fn from(id: Option<TabId>) -> Self {
+        Shown(id.into_iter().collect())
+    }
+}
+
+impl From<Vec<TabId>> for Shown {
+    fn from(ids: Vec<TabId>) -> Self {
+        Shown(ids)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeTab {
     pub state: ClaudeState,
@@ -447,7 +470,7 @@ pub struct ClaudeWatch {
     /// Second launches asking this window to come forward, each the
     /// connection to answer ([`hooks::spawn_listener`]).
     #[cfg(unix)]
-    raise_rx: Receiver<std::os::unix::net::UnixStream>,
+    raise_rx: Receiver<(std::os::unix::net::UnixStream, hooks::Ask)>,
     last_scan: Instant,
     /// The last registry scan, and whether every live session predates the
     /// settings file. Both are filesystem work — for an account inside WSL,
@@ -1127,11 +1150,11 @@ impl ClaudeWatch {
         Some(wsl::canonical_config_dir(&reported, &known).unwrap_or(reported))
     }
 
-    /// Apply one hook message. `active` = the currently focused tab.
+    /// Apply one hook message. `active` = the terminals on screen.
     pub fn handle_msg(
         &mut self,
         msg: &RelayMsg,
-        active: Option<TabId>,
+        active: impl Into<Shown>,
         tab_title: &str,
         effects: &mut WatchEffects,
     ) {
@@ -1171,7 +1194,7 @@ impl ClaudeWatch {
         if account.is_some() {
             entry.account = account;
         }
-        let is_active = active == Some(tab_id);
+        let is_active = active.into().contains(tab_id);
         // A worker's tool call, or the session's own launch of one: the
         // tab's management-panel table, made if it has none, reads the disk
         // now (giverny#523).
@@ -1432,10 +1455,11 @@ impl ClaudeWatch {
     pub fn tick(
         &mut self,
         shell_pids: &HashMap<TabId, u32>,
-        active: Option<TabId>,
+        active: impl Into<Shown>,
         titles: &HashMap<TabId, String>,
         opened: &HashMap<TabId, String>,
     ) -> WatchEffects {
+        let active: Shown = active.into();
         let mut effects = WatchEffects::default();
         self.remember_peaks();
 
@@ -1452,7 +1476,7 @@ impl ClaudeWatch {
                 .tab_of(msg)
                 .and_then(|id| titles.get(&id).cloned())
                 .unwrap_or_else(|| "tab".into());
-            self.handle_msg(msg, active, &title, &mut effects);
+            self.handle_msg(msg, active.clone(), &title, &mut effects);
         }
         self.hooks_drained = drained;
         // An empty title map is a workspace not built yet, not one with no
@@ -1479,7 +1503,7 @@ impl ClaudeWatch {
                         live.iter()
                             .any(|s| &s.config_dir == dir && s.entry.pid == *pid)
                     });
-                    self.merge_scan(shell_pids, active, &mut effects);
+                    self.merge_scan(shell_pids, active.clone(), &mut effects);
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => self.scan_rx = None,
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -1655,9 +1679,10 @@ impl ClaudeWatch {
     fn merge_scan(
         &mut self,
         shell_pids: &HashMap<TabId, u32>,
-        active: Option<TabId>,
+        active: impl Into<Shown>,
         effects: &mut WatchEffects,
     ) {
+        let active: Shown = active.into();
         for tab in self.tabs.values_mut() {
             tab.seen_in_scan = false;
         }
@@ -1776,7 +1801,7 @@ impl ClaudeWatch {
                 // seen already, as a `Stop` there would have it.
                 if entry.state == ClaudeState::DoneUnseen
                     && was != ClaudeState::DoneUnseen
-                    && active == Some(tab_id)
+                    && active.contains(tab_id)
                 {
                     entry.state = ClaudeState::Idle;
                 }
@@ -2716,7 +2741,7 @@ impl ClaudeWatch {
 
     /// Second launches waiting for this window to come forward and say so.
     #[cfg(unix)]
-    pub fn raise_requests(&self) -> Vec<std::os::unix::net::UnixStream> {
+    pub fn raise_requests(&self) -> Vec<(std::os::unix::net::UnixStream, hooks::Ask)> {
         self.raise_rx.try_iter().collect()
     }
 }

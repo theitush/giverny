@@ -16,6 +16,8 @@ use giverny_claude::jobs::End;
 use giverny_claude::use_reading::Use;
 
 const ROW_H: f32 = 40.0;
+/// A split's terminal, unfolded under its row: one line, no path.
+const MEMBER_H: f32 = 24.0;
 const HEADER_H: f32 = 26.0;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -376,6 +378,7 @@ fn braille(turns: f64) -> String {
 // Chrome colours come from the active theme (see `chrome`), reached through
 // `app.chrome`. Only geometry is constant here.
 
+#[derive(Clone)]
 struct RowData {
     id: TabId,
     title: String,
@@ -418,6 +421,10 @@ struct RowData {
     /// Code or not), from the reading the sidebar shows (giverny#267,
     /// giverny#289); `None` for a tab with no shell running.
     used: Option<Use>,
+    /// Terminals in the row: more than one for a split.
+    panes: usize,
+    /// The number of another window this row is on screen in.
+    elsewhere: Option<usize>,
 }
 
 /// What a group of rows is: a category you made, or a repository the tabs
@@ -590,7 +597,108 @@ fn row_data(
             .filter(|_| app.cfg.rail.tab_figures)
             .and_then(|rt| rt.session.as_ref()?.child_pid)
             .and_then(|shell| app.use_now.as_ref()?.tabs.get(&shell).copied()),
+        panes: 1,
+        elsewhere: app.shown_elsewhere(t.id),
     }
+}
+
+/// The row for `t`'s rail entry: its own, or for a split the row of all its
+/// terminals at once. A split wears the most pressing state among them, a
+/// flag over a spinner over a tick, so a terminal that wants you is never
+/// hidden behind a quiet neighbour; selecting it lands on the terminal you
+/// last typed in.
+fn row_for(
+    app: &App,
+    t: &giverny_core::tabs::Tab,
+    color: Color32,
+    under: Option<&Path>,
+) -> RowData {
+    let Some(group) = app.ws.group_of(t.id) else {
+        return row_data(app, t, color, under);
+    };
+    let members: Vec<RowData> = group
+        .tree
+        .leaves()
+        .into_iter()
+        .filter_map(|id| app.ws.tab(id))
+        .map(|m| row_data(app, m, color, under))
+        .collect();
+    merge_rows(members, group.focus).unwrap_or_else(|| row_data(app, t, color, under))
+}
+
+/// One row standing for several: see [`row_for`].
+fn merge_rows(members: Vec<RowData>, focus: TabId) -> Option<RowData> {
+    let first = members.first()?.clone();
+    let lead = members
+        .iter()
+        .find(|r| r.id == focus)
+        .cloned()
+        .unwrap_or(first);
+    let any = |f: fn(&RowData) -> bool| members.iter().any(f);
+    let claude = [
+        ClaudeState::NeedsYou,
+        ClaudeState::Busy,
+        ClaudeState::DoneUnseen,
+        ClaudeState::Idle,
+    ]
+    .into_iter()
+    .find(|s| members.iter().any(|r| r.started && r.claude == *s))
+    .unwrap_or(ClaudeState::None);
+    // Under the pointer, the titles' own names where a place stands in
+    // for one (giverny#435).
+    let hover = members.iter().any(|r| r.hover.is_some()).then(|| {
+        members
+            .iter()
+            .map(|r| r.hover.as_deref().unwrap_or(&r.title))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    });
+    Some(RowData {
+        title: members
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect::<Vec<_>>()
+            .join(" · "),
+        hover,
+        active: any(|r| r.active),
+        exited: members.iter().all(|r| r.exited),
+        started: any(|r| r.started),
+        resumes_claude: any(|r| r.resumes_claude),
+        claude,
+        agents: any(|r| r.agents),
+        // The square under the mark: a Claude among them runs a command.
+        command: any(runs_command),
+        running: any(|r| r.running),
+        unseen: any(|r| r.unseen),
+        // A ✕ wins over a tick: a finish that failed is the one to see.
+        failed: any(|r| r.unseen && r.failed),
+        // The row's figures are its terminals' together, as a group's are
+        // its rows'.
+        used: summed(members.iter().filter_map(|r| r.used.as_ref())),
+        panes: members.len(),
+        ..lead
+    })
+}
+
+/// Whether `t` stands for a row of the rail's groups: the first terminal of
+/// its row, in a row not made only of tabs opened from BACKGROUND (those
+/// are listed there, as their job's row).
+fn listed_row(app: &App, t: &giverny_core::tabs::Tab) -> bool {
+    app.ws.is_row_head(t.id)
+        && app
+            .ws
+            .row_tabs(t.id)
+            .iter()
+            .any(|&m| app.ws.tab(m).is_some_and(|m| m.bg_job.is_none()))
+}
+
+/// The terminals of `id`'s row that a stop would end (giverny#474).
+fn row_stoppable(app: &App, id: TabId) -> Vec<TabId> {
+    app.ws
+        .row_tabs(id)
+        .into_iter()
+        .filter(|&t| app.stoppable(t))
+        .collect()
 }
 
 /// Counts a header carries: how many, how many working, how many want you.
@@ -686,8 +794,8 @@ fn groups(app: &App) -> Vec<GroupData> {
                 let rows: Vec<RowData> = app
                     .ws
                     .tabs_in(c.id)
-                    .filter(|t| t.bg_job.is_none())
-                    .map(|t| row_data(app, t, color, None))
+                    .filter(|t| listed_row(app, t))
+                    .map(|t| row_for(app, t, color, None))
                     .collect();
                 let (count, busy, needs) = tallies(&rows);
                 GroupData {
@@ -712,7 +820,7 @@ fn groups(app: &App) -> Vec<GroupData> {
             // order: by name, with the tabs that are in no repository last —
             // they are the leftovers, not a place.
             let mut keys: Vec<Option<PathBuf>> = Vec::new();
-            for t in app.ws.tabs.iter().filter(|t| t.bg_job.is_none()) {
+            for t in app.ws.tabs.iter().filter(|t| listed_row(app, t)) {
                 if !keys.contains(&t.git_repo) {
                     keys.push(t.git_repo.clone());
                 }
@@ -733,8 +841,8 @@ fn groups(app: &App) -> Vec<GroupData> {
                         .ws
                         .tabs
                         .iter()
-                        .filter(|t| t.bg_job.is_none() && t.git_repo == key)
-                        .map(|t| row_data(app, t, color, key.as_deref()))
+                        .filter(|t| t.git_repo == key && listed_row(app, t))
+                        .map(|t| row_for(app, t, color, key.as_deref()))
                         .collect();
                     let (count, busy, needs) = tallies(&rows);
                     let category = rows
@@ -821,6 +929,8 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
         .input(|i| i.pointer.interact_pos())
         .filter(|_| arrangeable);
     let mut drop_target: Option<(CategoryId, usize, f32)> = None;
+    // A drop on a row's middle rather than between rows: merge into it.
+    let mut merge_target: Option<(TabId, Rect)> = None;
     // Where a dragged *category* would land: an index in rail order, and the
     // line to draw for it.
     let mut category_drop: Option<(usize, f32)> = None;
@@ -853,17 +963,45 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
                 if !cat.collapsed {
                     for (index, row) in cat.rows.iter().enumerate() {
                         let rect = tab_row(app, ui, row, fg, dim, &mut actions);
-                        // Above a row's midpoint drops before it, below after.
+                        // The middle of a row merges into it; above that
+                        // drops before it, below after.
                         if let Some(p) = pointer
-                            && app.dragging.is_some()
+                            && let Some(dragged) = app.dragging
                             && p.x >= rect.min.x
                             && p.x <= rect.max.x
                             && p.y >= rect.min.y - 2.0
                             && p.y <= rect.max.y + 2.0
                         {
-                            let after = p.y > rect.center().y;
-                            let y = if after { rect.max.y } else { rect.min.y };
-                            drop_target = Some((cat.category, index + usize::from(after), y));
+                            let rel = (p.y - rect.min.y) / rect.height();
+                            if (0.3..0.7).contains(&rel) && !app.ws.same_row(dragged, row.id) {
+                                merge_target = Some((row.id, rect));
+                                drop_target = None;
+                            } else {
+                                let after = p.y > rect.center().y;
+                                let y = if after { rect.max.y } else { rect.min.y };
+                                drop_target = Some((cat.category, index + usize::from(after), y));
+                                merge_target = None;
+                            }
+                        }
+                        // An unfolded split lists its terminals under it,
+                        // each one a handle to drag out or onto.
+                        let unfolded = app
+                            .ws
+                            .group_of(row.id)
+                            .is_some_and(|g| app.unfolded.contains(&g.id));
+                        if row.panes > 1 && unfolded {
+                            for member in app.ws.row_tabs(row.id) {
+                                let r = member_row(app, ui, member, row.color, fg, &mut actions);
+                                if let Some(p) = pointer
+                                    && let Some(dragged) = app.dragging
+                                    && r.contains(p)
+                                {
+                                    drop_target = None;
+                                    merge_target = (dragged != member
+                                        && !app.ws.same_row(dragged, member))
+                                    .then_some((member, r));
+                                }
+                            }
                         }
                     }
                 }
@@ -909,12 +1047,56 @@ pub fn show(app: &mut App, ui: &mut Ui) -> Vec<Action> {
             ui.painter()
                 .hline(x0..=x1, y, egui::Stroke::new(2.0, app.chrome.accent));
         }
+        if let Some((_, rect)) = merge_target {
+            let r = rect.shrink2(Vec2::new(4.0, 1.0));
+            ui.painter()
+                .rect_filled(r, 4.0, app.chrome.accent.gamma_multiply(0.16));
+            ui.painter().rect_stroke(
+                r,
+                4.0,
+                Stroke::new(1.5, app.chrome.accent),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                Pos2::new(r.max.x - 8.0, r.center().y),
+                Align2::RIGHT_CENTER,
+                "split with",
+                FontId::monospace(10.0),
+                app.chrome.accent,
+            );
+        }
         ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
         if ui.input(|i| i.pointer.any_released()) {
-            if let Some((cat, index, _)) = drop_target {
-                actions.push(Action::ReorderTab(dragged, cat, index));
+            let one = app.dragging_one;
+            if let Some((onto, _)) = merge_target {
+                actions.push(Action::Join {
+                    tab: dragged,
+                    onto,
+                    axis: giverny_core::panes::Axis::Row,
+                    before: false,
+                    whole_row: !one,
+                });
+                app.dragging = None;
+                app.dragging_one = false;
+            } else if let Some((cat, index, _)) = drop_target {
+                // One terminal dropped between rows leaves its split for a
+                // row of its own there; a whole row just moves.
+                actions.push(if one && app.ws.group_of(dragged).is_some() {
+                    Action::DetachTo(dragged, cat, index)
+                } else {
+                    Action::ReorderTab(dragged, cat, index)
+                });
+                app.dragging = None;
+                app.dragging_one = false;
+            } else if ui
+                .input(|i| i.pointer.latest_pos())
+                .is_some_and(|p| ui.max_rect().contains(p))
+            {
+                app.dragging = None;
+                app.dragging_one = false;
             }
-            app.dragging = None;
+            // Released over the terminals: a drop onto a split, which the
+            // central panel sees after the rail (`rail_drop_on_panes`).
         }
     }
 
@@ -1277,7 +1459,9 @@ fn category_header(
     };
 
     // Inline rename?
-    if let Some((RenameTarget::Category(id), buf)) = &mut app.rename
+    let here = app.overlay_here();
+    if here
+        && let Some((RenameTarget::Category(id), buf)) = &mut app.rename
         && as_category == Some(*id)
     {
         let id = *id;
@@ -1328,8 +1512,7 @@ fn category_header(
         let started: Vec<TabId> = cat
             .rows
             .iter()
-            .map(|r| r.id)
-            .filter(|&id| app.stoppable(id))
+            .flat_map(|r| row_stoppable(app, r.id))
             .collect();
         if !started.is_empty() && ui.button("stop all").clicked() {
             actions.push(Action::StopTabs(started));
@@ -1886,7 +2069,7 @@ fn runs_command(row: &RowData) -> bool {
 /// it: six pixels tall on the ×'s own line (it sits a pixel below the
 /// button's centre), a pixel wide each, two apart. On the half pixel, so
 /// each stroke covers one column whole rather than two by halves.
-fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
+pub fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.0, color);
     for dx in [-1.5, 1.5] {
         p.line_segment(
@@ -1894,6 +2077,146 @@ fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
             stroke,
         );
     }
+}
+
+/// A row's status mark (see [`Mark`]) at `dot`. `rect` is what an animated
+/// mark keeps repainting.
+fn draw_mark(
+    app: &App,
+    ui: &Ui,
+    p: &egui::Painter,
+    rect: Rect,
+    dot: Pos2,
+    row: &RowData,
+    dim: Color32,
+) {
+    let time = anim_time();
+    let mark = Mark::of(row);
+    let color = mark.color(row.color, dim);
+    match mark {
+        // Off, a working tab's spinner is not drawn, the only state left
+        // blank (a calm ring holds still, full size). The title stays
+        // where it is.
+        Mark::Busy => busy(ui, p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
+        Mark::Flag => {
+            // One breath every two seconds, sampled at the animation step.
+            // Off, no pulse: the flag held at full colour.
+            let pulse = if animating(ui) {
+                keep_animating(ui, rect);
+                breath(time)
+            } else {
+                1.0
+            };
+            flag(p, dot, color.gamma_multiply(pulse));
+        }
+        // Still: finished, nothing owed. The flag above is the one that
+        // wants something; the two differ in shape and movement. A ✕ for a
+        // finish that failed (giverny#488).
+        Mark::Tick => tick(p, dot, row.failed, color),
+        // Its subagents keep running while Claude waits at its prompt.
+        // Worth showing — it is why a directory is still churning — but it
+        // is not the agent working: it can take a message. So no spinner
+        // and no flag: a slow colour drifting through three small dots, the
+        // hum of something left running (#363). Off, they hold still and
+        // faded.
+        Mark::Wave => shell_dots(ui, p, rect, dot, color),
+        Mark::Idle => {
+            p.circle_filled(dot, DOT_R, color);
+        }
+        // A plain shell, which most tabs are most of the time: a small
+        // filled square at its prompt, breathing out to the hollow square
+        // and back while a command runs, and the small square hollow and in
+        // gray once the shell has exited (giverny#388, giverny#462). Squares read
+        // larger than circles of the same width, so each is a touch
+        // narrower than its round twin.
+        Mark::Running => breathing_square(ui, p, rect, dot, color),
+        Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
+            if let Some((side, filled)) = mark.still_square() {
+                square(p, dot, side, filled, color);
+            }
+        }
+        // A restored tab whose process has not started yet: small and
+        // gray, since any colour would claim something running.
+        Mark::NotStarted { claude: true } => {
+            p.circle_filled(dot, DOT_R, color);
+        }
+    }
+    // The unseen finish beside what runs after it (giverny#388): the tick,
+    // smaller, in the gutter left of the mark, so the mark keeps its place
+    // and the title never moves as the badge comes and goes.
+    if mark.badged(row) {
+        badge_tick(p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
+    }
+}
+
+/// A command the agent runs (giverny#510), a Bash call mid-turn or a
+/// background shell: a plain shell's breathing square at `at`, whatever
+/// the mark says. Nothing for a row that runs none ([`runs_command`]).
+fn command_square(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, row: &RowData) {
+    if runs_command(row) {
+        breathing_square(ui, p, rect, at, row.color);
+    }
+}
+
+/// The status mark of one terminal, for the header over it in a split:
+/// the rail's mark for that terminal alone, and at `command` the square
+/// of a command its agent runs (giverny#510), there being no second line
+/// under the mark to put it on.
+pub fn pane_mark(
+    app: &App,
+    ui: &Ui,
+    p: &egui::Painter,
+    rect: Rect,
+    dot: Pos2,
+    command: Pos2,
+    tab: TabId,
+) {
+    let Some(row) = pane_row(app, tab) else {
+        return;
+    };
+    draw_mark(app, ui, p, rect, dot, &row, app.chrome.dim);
+    command_square(ui, p, rect, command, &row);
+}
+
+/// One terminal's own row, as the rail would draw it alone.
+fn pane_row(app: &App, tab: TabId) -> Option<RowData> {
+    let t = app.ws.tab(tab)?;
+    let color = app
+        .ws
+        .category(t.category)
+        .map(|c| app.chrome.category(c.color_index))
+        .unwrap_or(app.chrome.dim);
+    Some(row_data(app, t, color, None))
+}
+
+/// Whether one terminal shows the pause button on hover (giverny#490), as
+/// its row would alone.
+pub fn pane_pausable(app: &App, tab: TabId) -> bool {
+    pane_row(app, tab).is_some_and(|r| pausable(&r)) && app.stoppable(tab)
+}
+
+/// Whether one terminal's agent runs a command: the header over it leaves
+/// room for the square ([`pane_mark`]).
+pub fn pane_runs_command(app: &App, tab: TabId) -> bool {
+    pane_row(app, tab).is_some_and(|r| runs_command(&r))
+}
+
+/// One terminal's CPU and memory, for the header over it in a split
+/// (giverny#267): what the rail sums into its row.
+pub fn pane_use(app: &App, tab: TabId) -> Option<Use> {
+    pane_row(app, tab)?.used
+}
+
+/// [`readout_inline`] for a split's header: one terminal's figures on one
+/// line, right-aligned to `right`. Returns where they start.
+pub fn pane_readout(
+    p: &egui::Painter,
+    right: f32,
+    y: f32,
+    u: &Use,
+    c: crate::chrome::Chrome,
+) -> f32 {
+    readout_inline(p, right, y, u, c)
 }
 
 fn tab_row(
@@ -1966,72 +2289,47 @@ fn tab_row(
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
-    let time = anim_time();
-    let mark = Mark::of(row);
-    let color = mark.color(row.color, dim);
-    match mark {
-        // Off, a working tab's spinner is not drawn, the only state left
-        // blank (a calm ring holds still, full size). The title stays
-        // where it is.
-        Mark::Busy => busy(ui, &p, rect, dot, color, BusyMark::of(&app.cfg.rail)),
-        Mark::Flag => {
-            // One breath every two seconds, sampled at the animation step.
-            // Off, no pulse: the flag held at full colour.
-            let pulse = if animating(ui) {
-                keep_animating(ui, rect);
-                breath(time)
+    draw_mark(app, ui, &p, rect, dot, row, dim);
+    // A split folds out to its terminals, left of its mark.
+    if row.panes > 1
+        && let Some(gid) = app.ws.group_of(row.id).map(|g| g.id)
+    {
+        let open = app.unfolded.contains(&gid);
+        let at = Pos2::new(rect.min.x + 19.0, rect.min.y + 13.0);
+        let hit = Rect::from_center_size(at, Vec2::splat(14.0));
+        let caret = ui.interact(hit, ui.id().with(("split-caret", gid.0)), Sense::click());
+        let color = if caret.hovered() { fg } else { dim };
+        let pts = if open {
+            vec![
+                at + Vec2::new(-3.5, -1.5),
+                at + Vec2::new(3.5, -1.5),
+                at + Vec2::new(0.0, 2.5),
+            ]
+        } else {
+            vec![
+                at + Vec2::new(-1.5, -3.5),
+                at + Vec2::new(2.5, 0.0),
+                at + Vec2::new(-1.5, 3.5),
+            ]
+        };
+        p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+        if caret.clicked() {
+            if open {
+                app.unfolded.remove(&gid);
             } else {
-                1.0
-            };
-            flag(&p, dot, color.gamma_multiply(pulse));
-        }
-        // Still: finished, nothing owed. The flag above is the one that
-        // wants something; the two differ in shape and movement.
-        Mark::Tick => tick(&p, dot, row.failed, color),
-        // Its subagents keep running while Claude waits at its prompt.
-        // Worth showing — it is why a directory is still churning — but it
-        // is not the agent working: it can take a message. So no spinner
-        // and no flag: a slow colour drifting through three small dots, the
-        // hum of something left running (#363). Off, they hold still and
-        // faded.
-        Mark::Wave => shell_dots(ui, &p, rect, dot, color),
-        Mark::Idle => {
-            p.circle_filled(dot, DOT_R, color);
-        }
-        // A plain shell, which most tabs are most of the time: a small
-        // filled square at its prompt, breathing out to the hollow square
-        // and back while a command runs, and the small square hollow and in
-        // gray once the shell has exited (giverny#388, giverny#462). Squares read
-        // larger than circles of the same width, so each is a touch
-        // narrower than its round twin.
-        Mark::Running => breathing_square(ui, &p, rect, dot, color),
-        Mark::Prompt | Mark::Exited | Mark::NotStarted { claude: false } => {
-            if let Some((side, filled)) = mark.still_square() {
-                square(&p, dot, side, filled, color);
+                app.unfolded.insert(gid);
             }
-        }
-        // A restored tab whose process has not started yet: small and
-        // gray, since any colour would claim something running.
-        Mark::NotStarted { claude: true } => {
-            p.circle_filled(dot, DOT_R, color);
+            return rect;
         }
     }
-    // The unseen finish beside what runs after it (giverny#388): the tick,
-    // smaller, in the gutter left of the mark, so the mark keeps its place
-    // and the title never moves as the badge comes and goes.
-    if mark.badged(row) {
-        badge_tick(&p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
-    }
-    // A command the agent runs (giverny#510), a Bash call mid-turn or a
-    // background shell: a plain shell's breathing square, on the second
-    // line under the mark, left of the path, whatever the mark says.
-    if runs_command(row) {
-        let under = Pos2::new(dot.x, rect.min.y + 29.0);
-        breathing_square(ui, &p, rect, under, row.color);
-    }
+    // A command the agent runs (giverny#510): on the second line under the
+    // mark, left of the path.
+    command_square(ui, &p, rect, Pos2::new(dot.x, rect.min.y + 29.0), row);
 
     // Inline rename?
-    if let Some((RenameTarget::Tab(id), buf)) = &mut app.rename
+    let here = app.overlay_here();
+    if here
+        && let Some((RenameTarget::Tab(id), buf)) = &mut app.rename
         && *id == row.id
     {
         let edit_rect = Rect::from_min_size(
@@ -2061,9 +2359,11 @@ fn tab_row(
     // bars' numbers are drawn, each coloured by its share of the whole
     // machine. While the pointer is on the row the close button takes the
     // corner and the figures fold onto the second line, CPU left of memory
-    // (giverny#295): they stay in sight, and the sub line gives way.
+    // (giverny#295): they stay in sight, and the sub line gives way. A
+    // split's row shows its terminals' together.
     let sub_y = rect.min.y + 29.0;
     let mut sub_end = rect.max.x - 8.0;
+    let figures_w = row.used.as_ref().map_or(0.0, readout_width);
     if let Some(u) = &row.used {
         if hovered {
             sub_end = readout_inline(&p, rect.max.x - 8.0, sub_y, u, c) - 6.0;
@@ -2072,13 +2372,36 @@ fn tab_row(
         }
     }
 
+    // A split says so at the row's end, where the close button would be
+    // when hovered, left of the figures: how its terminals are laid out
+    // matters less than that there are several behind one row.
+    let mut glyph_w = 0.0;
+    if !hovered {
+        let mut x = if figures_w > 0.0 {
+            rect.max.x - 8.0 - figures_w - 12.0
+        } else {
+            rect.max.x - 22.0
+        };
+        if row.panes > 1 {
+            split_glyph(&p, Pos2::new(x, rect.min.y + 13.0), row.panes, dim);
+            glyph_w += 18.0;
+            x -= 18.0;
+        }
+        // On screen in another window: that window's number, in a frame,
+        // so clicking here is known to bring it over.
+        if let Some(n) = row.elsewhere {
+            window_badge(&p, Pos2::new(x, rect.min.y + 13.0), n, dim);
+            glyph_w += 18.0;
+        }
+    }
+
     // The pause button left of the close (giverny#490): on a hovered live
     // row, idle shell included, and a title with no figures to keep it clear
-    // stops short of it.
-    let pause = hovered && pausable(row) && app.stoppable(row.id);
+    // stops short of it. A split's pauses every terminal of it that runs.
+    let pause = hovered && pausable(row) && !row_stoppable(app, row.id).is_empty();
 
     // Title (char-budget truncation; the rail is monospace).
-    let mut reserved = row.used.as_ref().map_or(0.0, readout_width);
+    let mut reserved = figures_w + glyph_w;
     if pause {
         reserved = reserved.max(PAUSE_W);
     }
@@ -2137,7 +2460,7 @@ fn tab_row(
             },
         );
         if close.clicked() {
-            actions.push(Action::CloseTab(row.id));
+            actions.push(close_row(row));
             return rect;
         }
     }
@@ -2162,7 +2485,9 @@ fn tab_row(
         };
         pause_mark(&p, pause_rect.center(), color);
         if button.clicked() {
-            actions.push(Action::StopTabNow(row.id));
+            for tab in row_stoppable(app, row.id) {
+                actions.push(Action::StopTabNow(tab));
+            }
             return rect;
         }
     }
@@ -2191,14 +2516,49 @@ fn tab_row(
                 }
             }
         });
-        ui.separator();
-        // Ends what runs here and keeps the tab for next time (giverny#474).
-        if row.started && app.stoppable(row.id) && ui.button("stop").clicked() {
-            actions.push(Action::StopTabs(vec![row.id]));
+        if ui.button("open in new window").clicked() {
+            actions.push(Action::MoveToWindow(row.id, None));
             ui.close();
         }
-        if ui.button("close").clicked() {
-            actions.push(Action::CloseTab(row.id));
+        let here = app.window_number();
+        let others: Vec<usize> = app
+            .window_numbers()
+            .into_iter()
+            .filter(|&n| n != here)
+            .collect();
+        if !others.is_empty() {
+            ui.menu_button("move to window", |ui| {
+                for n in others {
+                    if ui.button(format!("window {n}")).clicked() {
+                        actions.push(Action::MoveToWindow(row.id, Some(n)));
+                        ui.close();
+                    }
+                }
+            });
+        }
+        ui.separator();
+        // Ends what runs here and keeps the tab for next time (giverny#474):
+        // a split's every terminal that runs.
+        let stoppable = row_stoppable(app, row.id);
+        let stop = match stoppable.len() {
+            0 => None,
+            1 => Some("stop".to_string()),
+            n => Some(format!("stop all {n} terminals")),
+        };
+        if row.started
+            && let Some(stop) = stop
+            && ui.button(stop).clicked()
+        {
+            actions.push(Action::StopTabs(stoppable));
+            ui.close();
+        }
+        let label = if row.panes > 1 {
+            format!("close all {} terminals", row.panes)
+        } else {
+            "close".to_string()
+        };
+        if ui.button(label).clicked() {
+            actions.push(close_row(row));
             ui.close();
         }
         // A tab opened from BACKGROUND: closing it sends the job back
@@ -2217,19 +2577,20 @@ fn tab_row(
 
     if resp.drag_started() {
         app.dragging = Some(row.id);
+        app.dragging_one = false;
     }
     if resp.double_clicked() {
         actions.push(Action::StartRename(RenameTarget::Tab(row.id)));
     } else if resp.clicked() {
         actions.push(Action::Select(row.id));
     } else if resp.middle_clicked() {
-        actions.push(Action::CloseTab(row.id));
+        actions.push(close_row(row));
     }
     if hovered {
         ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
     }
     // The dragged row dims in place; the drop indicator shows where it lands.
-    if app.dragging == Some(row.id) {
+    if app.dragging == Some(row.id) && !app.dragging_one {
         p.rect_filled(
             rect.shrink2(Vec2::new(4.0, 1.0)),
             4.0,
@@ -2237,6 +2598,118 @@ fn tab_row(
         );
     }
     rect
+}
+
+/// One terminal of an unfolded split, under its row: its mark and title,
+/// a click to focus it, and a handle to drag it out of the split or onto
+/// another row.
+fn member_row(
+    app: &mut App,
+    ui: &mut Ui,
+    tab: TabId,
+    color: Color32,
+    fg: Color32,
+    actions: &mut Vec<Action>,
+) -> Rect {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, MEMBER_H), Sense::click_and_drag());
+    app.row_rects.push((rect, tab));
+    let p = ui.painter_at(rect);
+    let active = app.ws.active == Some(tab);
+    let hovered = ui.rect_contains_pointer(rect);
+    if active {
+        p.rect_filled(
+            Rect::from_min_size(
+                rect.min + Vec2::new(40.0, 3.0),
+                Vec2::new(2.0, MEMBER_H - 6.0),
+            ),
+            1.0,
+            color,
+        );
+    }
+    if hovered {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+        );
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+    }
+    let dot = Pos2::new(rect.min.x + 50.0, rect.center().y);
+    // The terminal's own figures at the line's end, folded onto one line
+    // as on a hovered row (giverny#295): the row above sums them. Left of
+    // them, the square of a command its agent runs (giverny#510).
+    let own = pane_row(app, tab);
+    let mut right = rect.max.x - 8.0;
+    if let Some(u) = own.as_ref().and_then(|r| r.used.as_ref()) {
+        right = readout_inline(&p, right, rect.center().y, u, app.chrome) - 6.0;
+    }
+    let command_at = Pos2::new(right - 4.0, rect.center().y);
+    if own.as_ref().is_some_and(runs_command) {
+        right -= 14.0;
+    }
+    pane_mark(app, ui, &p, rect, dot, command_at, tab);
+    let title = own.map(|r| r.title).unwrap_or_default();
+    let budget = ((right - (rect.min.x + 64.0)) / 6.8).max(4.0) as usize;
+    p.text(
+        Pos2::new(rect.min.x + 60.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        egui_line(&truncate_chars(&title, budget), None),
+        FontId::monospace(11.5),
+        if active { fg } else { fg.gamma_multiply(0.7) },
+    );
+    if resp.drag_started() {
+        app.dragging = Some(tab);
+        app.dragging_one = true;
+    } else if resp.clicked() {
+        actions.push(Action::Select(tab));
+    } else if resp.middle_clicked() {
+        actions.push(Action::CloseTab(tab));
+    }
+    if app.dragging == Some(tab) {
+        p.rect_filled(
+            rect.shrink2(Vec2::new(4.0, 1.0)),
+            4.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+        );
+    }
+    rect
+}
+
+/// A window's number in a small frame, centred on `at`.
+fn window_badge(p: &egui::Painter, at: Pos2, n: usize, color: Color32) {
+    let r = Rect::from_center_size(at, Vec2::new(13.0, 11.0));
+    p.rect_stroke(r, 2.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+    p.text(
+        r.center() + Vec2::new(0.0, 0.5),
+        Align2::CENTER_CENTER,
+        n.to_string(),
+        FontId::monospace(9.0),
+        color,
+    );
+}
+
+/// The rail's close for `row`: the terminal, or a split's every terminal.
+fn close_row(row: &RowData) -> Action {
+    if row.panes > 1 {
+        Action::CloseRow(row.id)
+    } else {
+        Action::CloseTab(row.id)
+    }
+}
+
+/// A small window cut into panes, centred on `at`: two side by side, or
+/// for three and more the right one split again.
+fn split_glyph(p: &egui::Painter, at: Pos2, panes: usize, color: Color32) {
+    let r = Rect::from_center_size(at, Vec2::new(12.0, 9.0));
+    let stroke = Stroke::new(1.0, color);
+    p.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Inside);
+    let mid = r.center().x.round() + 0.5;
+    p.line_segment([Pos2::new(mid, r.min.y), Pos2::new(mid, r.max.y)], stroke);
+    if panes > 2 {
+        let y = r.center().y.round() + 0.5;
+        p.line_segment([Pos2::new(mid, y), Pos2::new(r.max.x, y)], stroke);
+    }
 }
 
 /// WSLg lost its shared memory with Windows: say why the window lags and
@@ -3073,6 +3546,12 @@ fn level_color(pct: f64, critical: bool, c: crate::chrome::Chrome) -> Color32 {
     }
 }
 
+/// `s` cut to `max` characters and put in display order, for a label drawn
+/// outside the rail.
+pub fn fit(s: &str, max: usize) -> String {
+    egui_line(&truncate_chars(s, max), None).into_owned()
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -3551,7 +4030,90 @@ mod tests {
             unseen: claude == ClaudeState::DoneUnseen,
             failed: false,
             used: None,
+            panes: 1,
+            elsewhere: None,
         }
+    }
+
+    /// A split's row wears the most pressing of its terminals' states.
+    #[test]
+    fn a_split_row_shows_what_wants_you_first() {
+        let with = |id, claude| RowData {
+            id: TabId(id),
+            title: format!("t{id}"),
+            ..row(claude)
+        };
+        let merged = merge_rows(
+            vec![
+                with(1, ClaudeState::Busy),
+                with(2, ClaudeState::NeedsYou),
+                with(3, ClaudeState::Idle),
+            ],
+            TabId(3),
+        )
+        .unwrap();
+        assert_eq!(merged.claude, ClaudeState::NeedsYou);
+        assert_eq!(merged.id, TabId(3), "selecting it lands on the last focus");
+        assert_eq!(merged.title, "t1 · t2 · t3");
+        assert_eq!(merged.panes, 3);
+
+        let merged = merge_rows(
+            vec![with(1, ClaudeState::Idle), with(2, ClaudeState::DoneUnseen)],
+            TabId(1),
+        )
+        .unwrap();
+        assert_eq!(merged.claude, ClaudeState::DoneUnseen);
+        assert!(merged.unseen);
+    }
+
+    /// A split's row carries what agents-pane rows show: its terminals'
+    /// figures summed, a failed unseen finish as the ✕, and the command
+    /// square when a Claude among them runs one.
+    #[test]
+    fn a_split_row_sums_figures_and_keeps_a_failure() {
+        let unseen = |r: RowData| RowData { unseen: true, ..r };
+        let used = |cpu_pct, mem_mb| {
+            Some(Use {
+                cpu_pct,
+                mem_mb,
+                ..Use::default()
+            })
+        };
+        let merged = merge_rows(
+            vec![
+                RowData {
+                    id: TabId(1),
+                    used: used(10, 300),
+                    command: true,
+                    ..row(ClaudeState::Busy)
+                },
+                RowData {
+                    id: TabId(2),
+                    used: used(5, 200),
+                    failed: true,
+                    ..unseen(row(ClaudeState::None))
+                },
+            ],
+            TabId(1),
+        )
+        .unwrap();
+        assert_eq!(merged.used, used(15, 500));
+        assert!(merged.unseen && merged.failed);
+        assert!(runs_command(&merged));
+
+        // A failure nobody has to see any more is no ✕.
+        let merged = merge_rows(
+            vec![
+                RowData {
+                    failed: true,
+                    ..row(ClaudeState::Idle)
+                },
+                unseen(row(ClaudeState::None)),
+            ],
+            TabId(1),
+        )
+        .unwrap();
+        assert!(merged.unseen && !merged.failed);
     }
 
     /// Every state gets its own mark, and a plain shell's are squares no

@@ -229,6 +229,12 @@ pub struct TabView {
     /// text in the clipboard while the terminal had the keyboard: the app
     /// looks for files or an image there and pastes them (giverny#395).
     pub paste_image: bool,
+    /// Whether this terminal takes the keys meant for "the" terminal (search,
+    /// hints, Escape out of them). With several on screen only the focused
+    /// one does; set by the app before [`TabView::show`].
+    pub owns_keys: bool,
+    /// Whether the last frame was built with a hollow cursor.
+    last_hollow: bool,
 }
 
 /// What the app paints over a tab's grid (the management panel
@@ -289,6 +295,24 @@ fn cursor_blink(since: f64) -> (bool, Option<f64>) {
     (visible, Some(wait))
 }
 
+/// Hidden, scrolled-away and unfocused cursors have no animation clock.
+/// Becoming visible again starts solid, just like receiving focus.
+fn update_cursor_blink(
+    from: &mut Option<f64>,
+    now: f64,
+    active: bool,
+    typing: bool,
+) -> (bool, Option<f64>) {
+    if !active {
+        *from = None;
+        return (true, None);
+    }
+    if from.is_none() || typing {
+        *from = Some(now);
+    }
+    cursor_blink(now - from.unwrap())
+}
+
 /// Input that restarts the blink: what a person typing produces.
 fn is_typing(event: &egui::Event) -> bool {
     matches!(
@@ -342,6 +366,8 @@ impl Default for TabView {
             was_held: false,
             paste_chord: input::PasteChord::default(),
             paste_image: false,
+            owns_keys: true,
+            last_hollow: false,
         }
     }
 }
@@ -550,15 +576,14 @@ impl TabView {
             crate::pace::note_input();
         }
         crate::pace::note_frame(window_focused, predicted_dt);
-        if !focused {
-            self.blink_from = None;
-        } else if self.blink_from.is_none() || ui.input(|i| i.events.iter().any(is_typing)) {
-            self.blink_from = Some(now);
-        }
-        let (cursor_visible, next_edge) = match self.blink_from {
-            Some(from) => cursor_blink(now - from),
-            None => (true, None),
-        };
+        let blink_active =
+            focused && window_focused && self.owns_keys && session.cursor_on_screen();
+        let (cursor_visible, next_edge) = update_cursor_blink(
+            &mut self.blink_from,
+            now,
+            blink_active,
+            ui.input(|i| i.events.iter().any(is_typing)),
+        );
         if let Some(wait) = next_edge {
             // Plus egui's predicted frame time, which it takes off every
             // delayed repaint: without it the frame lands just before the
@@ -623,15 +648,18 @@ impl TabView {
             _ => bg,
         };
         let released = std::mem::replace(&mut self.was_held, held) && !held;
+        let hollow = !self.owns_keys;
         let needs_rebuild = !held
             && (session.take_dirty()
                 || released
                 || self.last_blink != cursor_visible
+                || self.last_hollow != hollow
                 || self.cached.as_ref().is_none_or(|c| {
                     c.origin_px != origin_px || c.generation != shared.generation || c.bg != bg
                 }));
         if !held {
             self.last_blink = cursor_visible;
+            self.last_hollow = hollow;
         }
         if needs_rebuild {
             // A worker's tab resolves the default background to its tint,
@@ -660,6 +688,7 @@ impl TabView {
                 origin_px,
                 pixels_per_point: ppp,
                 cursor_visible,
+                cursor_hollow: hollow,
             };
             let built = mesh::build(&snapshot, &mut params);
             let mut meshes = Vec::with_capacity(built.glyphs.len() + 2);
@@ -1299,7 +1328,8 @@ impl TabView {
         ppp: f32,
         m: CellMetrics,
     ) {
-        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::E));
+        let toggle = self.owns_keys
+            && ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::E));
         if toggle {
             self.hints = match self.hints.take() {
                 Some(_) => None,
@@ -1315,6 +1345,11 @@ impl TabView {
 
         // Read the choice before painting, so a hit closes in the same frame.
         let mut chosen: Option<(char, bool)> = None;
+        if !self.owns_keys {
+            // Focus moved to another terminal: its letters are its own to
+            // type, so the labels here go.
+            return;
+        }
         let mut close = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         ui.input_mut(|i| {
             i.events.retain(|ev| {
@@ -1488,7 +1523,8 @@ impl TabView {
         _m: CellMetrics,
     ) {
         // Open/close chords are consumed before the terminal sees them.
-        let toggle = ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F));
+        let toggle = self.owns_keys
+            && ui.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F));
         if toggle {
             self.search = match self.search.take() {
                 Some(s) => {
@@ -1508,6 +1544,9 @@ impl TabView {
         let mut close = false;
         let mut step: Option<Direction> = None;
         ui.input_mut(|i| {
+            if !self.owns_keys {
+                return;
+            }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 close = true;
             }
@@ -1758,7 +1797,26 @@ pub(crate) fn cell_at(rect: Rect, ppp: f32, m: CellMetrics, pos: Pos2) -> (u16, 
 
 #[cfg(test)]
 mod blink_tests {
-    use super::cursor_blink;
+    use super::{cursor_blink, update_cursor_blink};
+
+    #[test]
+    fn invisible_cursor_stops_waking_and_reappears_solid() {
+        let mut from = None;
+        assert!(update_cursor_blink(&mut from, 0.0, true, false).1.is_some());
+        assert!(!update_cursor_blink(&mut from, 0.5, true, false).0);
+        assert_eq!(
+            update_cursor_blink(&mut from, 0.6, false, false),
+            (true, None)
+        );
+        assert_eq!(
+            update_cursor_blink(&mut from, 5.0, false, true),
+            (true, None)
+        );
+        let (shown, wait) = update_cursor_blink(&mut from, 5.5, true, false);
+        assert!(shown && wait.is_some());
+        assert!(!update_cursor_blink(&mut from, 6.0, true, false).0);
+        assert!(update_cursor_blink(&mut from, 6.0, true, true).0);
+    }
 
     #[test]
     fn the_blink_wakes_only_at_its_edges_and_then_stops() {

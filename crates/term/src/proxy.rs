@@ -31,6 +31,9 @@ pub enum TabEvent {
 
 /// State shared between the UI thread and the proxy for inline replies.
 pub struct SharedTermState {
+    /// Changes that can affect a persisted dump, independent of rendering.
+    /// Writers increment this while holding the terminal lock.
+    pub(crate) snapshot_revision: AtomicU64,
     pub theme: RwLock<Theme>,
     pub size: RwLock<GridSize>,
     /// Images transmitted by the kitty graphics protocol.
@@ -39,6 +42,12 @@ pub struct SharedTermState {
     /// the widget tells that the program answered a resize
     /// ([`crate::tail`]).
     pub output_seq: AtomicU64,
+}
+
+impl SharedTermState {
+    pub(crate) fn note_snapshot_change(&self) {
+        self.snapshot_revision.fetch_add(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
