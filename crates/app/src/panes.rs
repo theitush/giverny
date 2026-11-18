@@ -174,7 +174,7 @@ pub fn header(
     if crate::rail::pane_runs_command(app, tab) {
         right -= 14.0;
     }
-    crate::rail::pane_mark(app, ui, &p, rect, dot, command_at, tab);
+    crate::rail::pane_mark(app, ui, &p, rect, dot, command_at, tab, false);
 
     let mut title = app.shown_title(t);
     if zoomed {

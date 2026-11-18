@@ -2080,13 +2080,17 @@ pub fn pause_mark(p: &egui::Painter, center: Pos2, color: Color32) {
 }
 
 /// A row's status mark (see [`Mark`]) at `dot`. `rect` is what an animated
-/// mark keeps repainting.
+/// mark keeps repainting. `badge` is where the badge tick of an unseen
+/// finish goes beside a mark that runs ([`Mark::badged`]); `None` draws
+/// none.
+#[allow(clippy::too_many_arguments)]
 fn draw_mark(
     app: &App,
     ui: &Ui,
     p: &egui::Painter,
     rect: Rect,
     dot: Pos2,
+    badge: Option<Pos2>,
     row: &RowData,
     dim: Color32,
 ) {
@@ -2144,9 +2148,16 @@ fn draw_mark(
     // The unseen finish beside what runs after it (giverny#388): the tick,
     // smaller, in the gutter left of the mark, so the mark keeps its place
     // and the title never moves as the badge comes and goes.
-    if mark.badged(row) {
-        badge_tick(p, dot - Vec2::new(BADGE_OFFSET, 0.0), row.failed, color);
+    if let Some(at) = badge
+        && mark.badged(row)
+    {
+        badge_tick(p, at, row.failed, color);
     }
+}
+
+/// Where a mark at `dot` wears its badge tick: in the gutter on its left.
+fn badge_beside(dot: Pos2) -> Pos2 {
+    dot - Vec2::new(BADGE_OFFSET, 0.0)
 }
 
 /// A command the agent runs (giverny#510), a Bash call mid-turn or a
@@ -2158,10 +2169,13 @@ fn command_square(ui: &Ui, p: &egui::Painter, rect: Rect, at: Pos2, row: &RowDat
     }
 }
 
-/// The status mark of one terminal, for the header over it in a split:
-/// the rail's mark for that terminal alone, and at `command` the square
-/// of a command its agent runs (giverny#510), there being no second line
-/// under the mark to put it on.
+/// The status mark of one terminal, for the header over it in a split or
+/// its line under an unfolded row: the rail's mark for that terminal
+/// alone, and at `command` the square of a command its agent runs
+/// (giverny#510), there being no second line under the mark to put it on.
+/// With `badged`, an unseen finish's badge tick left of the mark, as on a
+/// row; a header has no gutter for it, and its terminal is on screen.
+#[allow(clippy::too_many_arguments)]
 pub fn pane_mark(
     app: &App,
     ui: &Ui,
@@ -2170,11 +2184,13 @@ pub fn pane_mark(
     dot: Pos2,
     command: Pos2,
     tab: TabId,
+    badged: bool,
 ) {
     let Some(row) = pane_row(app, tab) else {
         return;
     };
-    draw_mark(app, ui, p, rect, dot, &row, app.chrome.dim);
+    let badge = badged.then(|| badge_beside(dot));
+    draw_mark(app, ui, p, rect, dot, badge, &row, app.chrome.dim);
     command_square(ui, p, rect, command, &row);
 }
 
@@ -2289,11 +2305,19 @@ fn tab_row(
     // its tabs start after that. Outdented children read as a list that lost
     // its heading.
     let dot = Pos2::new(rect.min.x + 32.0, rect.min.y + 13.0);
-    draw_mark(app, ui, &p, rect, dot, row, dim);
+    let group = (row.panes > 1)
+        .then(|| app.ws.group_of(row.id).map(|g| g.id))
+        .flatten();
+    // A split's fold caret holds the gutter left of its mark, where a row's
+    // badge tick goes: a split wears it a line down, under the caret, beside
+    // the command square's place.
+    let badge = match group {
+        Some(_) => Pos2::new(dot.x - BADGE_OFFSET, rect.min.y + 29.0),
+        None => badge_beside(dot),
+    };
+    draw_mark(app, ui, &p, rect, dot, Some(badge), row, dim);
     // A split folds out to its terminals, left of its mark.
-    if row.panes > 1
-        && let Some(gid) = app.ws.group_of(row.id).map(|g| g.id)
-    {
+    if let Some(gid) = group {
         let open = app.unfolded.contains(&gid);
         let at = Pos2::new(rect.min.x + 19.0, rect.min.y + 13.0);
         let hit = Rect::from_center_size(at, Vec2::splat(14.0));
@@ -2648,7 +2672,7 @@ fn member_row(
     if own.as_ref().is_some_and(runs_command) {
         right -= 14.0;
     }
-    pane_mark(app, ui, &p, rect, dot, command_at, tab);
+    pane_mark(app, ui, &p, rect, dot, command_at, tab, true);
     let title = own.map(|r| r.title).unwrap_or_default();
     let budget = ((right - (rect.min.x + 64.0)) / 6.8).max(4.0) as usize;
     p.text(
