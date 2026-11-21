@@ -270,6 +270,11 @@ impl Page {
             self.term.selection = Some(sel);
             copy = true;
         } else if response.drag_started_by(PointerButton::Primary) {
+            // From where the button went down, not where the pointer is once
+            // egui calls it a drag (giverny#542, as the tab's own selection).
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+            let (col, row, side) = cell_at(rect, ppp, m, origin);
+            let point = Point::new(Line(i32::from(row) - offset), Column(usize::from(col)));
             self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
         } else if response.dragged_by(PointerButton::Primary) {
             if let Some(sel) = &mut self.term.selection {
