@@ -2574,6 +2574,11 @@ impl App {
             }
             shape.env.extend(steer.env);
         }
+        // First, so anything the tab's shape says about the driver wins.
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+        if let Some(pair) = wslg::tab_env() {
+            shape.env.insert(0, pair);
+        }
         let cfg = SpawnCfg {
             shell: shape.shell,
             cwd: cwd.clone(),

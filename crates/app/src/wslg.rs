@@ -44,7 +44,7 @@ pub enum Gpu {
     /// Tried and did not work; why.
     Unavailable(String),
     /// Already on: `GALLIUM_DRIVER=d3d12` was in the environment, as it is
-    /// for a Giverny started from another one's tab or restarted by it.
+    /// for a Giverny restarted by another one.
     Inherited,
 }
 
@@ -52,8 +52,8 @@ pub enum Gpu {
 ///
 /// Must run before anything loads EGL or GL, and while the process is still
 /// single-threaded: it sets `GALLIUM_DRIVER`, which Mesa reads when it creates
-/// the screen. Child processes (the shells in each tab) inherit it, which is
-/// what WSLg's own guidance sets for GL applications anyway.
+/// the screen. Giverny's own children inherit it, but its tabs do not: see
+/// [`tab_env`].
 ///
 /// On by default; `GIVERNY_GPU=software` (or `off`) keeps Mesa's choice.
 pub fn enable_d3d12() -> Gpu {
@@ -66,21 +66,23 @@ pub fn enable_d3d12() -> Gpu {
     if !std::path::Path::new("/dev/dxg").exists() {
         return Gpu::NotApplicable;
     }
-    // A Giverny's own choice, handed down to everything it starts: its probe
-    // already passed on this machine. Without this, a Giverny opened from a
-    // tab, or restarted into a new version, saw a choice made, left OpenGL to
-    // wgpu, and wgpu took its GL backend on this same driver, a path nobody
-    // vetted and one that panics on a lost device.
+    // A Giverny's own choice, handed down to a Giverny it restarts into a new
+    // version: its probe already passed on this machine. Without this, the
+    // new one saw a choice made, left OpenGL to wgpu, and wgpu took its GL
+    // backend on this same driver, a path nobody vetted and one that panics
+    // on a lost device.
     if inherits_d3d12(std::env::var_os("GALLIUM_DRIVER").as_deref()) {
         return Gpu::Inherited;
     }
     // Someone has already chosen: respect it, including a choice of llvmpipe.
+    // An empty value is no choice: it is what a tab hands a Giverny opened
+    // in it ([`tab_env`]), and Mesa reads it as unset.
     for key in [
         "GALLIUM_DRIVER",
         "LIBGL_ALWAYS_SOFTWARE",
         "MESA_LOADER_DRIVER_OVERRIDE",
     ] {
-        if std::env::var_os(key).is_some() {
+        if chosen(std::env::var_os(key).as_deref()) {
             return Gpu::NotApplicable;
         }
     }
@@ -214,6 +216,31 @@ const READBACK_FAILED: &str = "readback failed";
 /// Whether `GALLIUM_DRIVER` already names the d3d12 driver.
 fn inherits_d3d12(driver: Option<&std::ffi::OsStr>) -> bool {
     driver.is_some_and(|d| d.eq_ignore_ascii_case("d3d12"))
+}
+
+/// Whether a Mesa variable makes a choice: set, and not to nothing.
+fn chosen(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+/// What a tab's environment gets for `GALLIUM_DRIVER`, where Giverny draws
+/// through d3d12: an empty value, so its programs keep off the GPU device
+/// Giverny draws with.
+///
+/// Tabs used to inherit `GALLIUM_DRIVER=d3d12`, so a browser started from
+/// one (Playwright's Chromium, then its Firefox) drew on the same device.
+/// When Windows removed the device under that browser, Mesa's d3d12 driver
+/// segfaulted inside Giverny's next swap (a NULL fence, `drisw.c`), and
+/// every tab went with it, while the browser lived on.
+/// An empty value is Mesa's default, llvmpipe under WSLg; a program that
+/// wants the GPU still asks for it by name, and a Giverny opened in a tab
+/// runs its own probe.
+pub fn tab_env() -> Option<(String, String)> {
+    tab_env_for(std::env::var_os("GALLIUM_DRIVER").as_deref())
+}
+
+fn tab_env_for(driver: Option<&std::ffi::OsStr>) -> Option<(String, String)> {
+    inherits_d3d12(driver).then(|| ("GALLIUM_DRIVER".to_string(), String::new()))
 }
 
 /// Mesa's d3d12 renderer string is `D3D12 (<adapter name>)`.
@@ -546,6 +573,31 @@ mod tests {
         assert!(!inherits_d3d12(Some(OsStr::new("llvmpipe"))));
         assert!(!inherits_d3d12(Some(OsStr::new(""))));
         assert!(!inherits_d3d12(None));
+    }
+
+    #[test]
+    fn an_empty_mesa_variable_is_no_choice() {
+        use std::ffi::OsStr;
+        assert!(chosen(Some(OsStr::new("llvmpipe"))));
+        assert!(chosen(Some(OsStr::new("1"))));
+        assert!(!chosen(Some(OsStr::new(""))));
+        assert!(!chosen(None));
+    }
+
+    #[test]
+    fn tabs_get_the_driver_emptied_only_where_giverny_draws_on_d3d12() {
+        use std::ffi::OsStr;
+        let emptied = Some(("GALLIUM_DRIVER".to_string(), String::new()));
+        assert_eq!(tab_env_for(Some(OsStr::new("d3d12"))), emptied);
+        assert_eq!(tab_env_for(Some(OsStr::new("D3D12"))), emptied);
+        // Someone else's choice reaches the tabs as it is.
+        assert_eq!(tab_env_for(Some(OsStr::new("llvmpipe"))), None);
+        assert_eq!(tab_env_for(None), None);
+        // What a tab hands a Giverny opened in it reads as no choice there,
+        // so that one probes for itself.
+        let (_, handed) = tab_env_for(Some(OsStr::new("d3d12"))).unwrap();
+        assert!(!chosen(Some(OsStr::new(&handed))));
+        assert!(!inherits_d3d12(Some(OsStr::new(&handed))));
     }
 
     #[test]
